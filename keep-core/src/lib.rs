@@ -1,14 +1,17 @@
-pub mod bunker;
+//! Keep Core - Sovereign key management for Nostr and Bitcoin
+//!
+//! This crate provides the core library functionality for Keep:
+//! - Encrypted storage using LMDB with XChaCha20-Poly1305
+//! - Key derivation using Argon2id
+//! - Nostr keypair management
+//! - Hidden volumes for plausible deniability
+
 pub mod crypto;
 pub mod error;
 pub mod hidden;
 pub mod keyring;
 pub mod keys;
-pub mod output;
-pub mod server;
-pub mod signer;
 pub mod storage;
-pub mod tui;
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +24,14 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 use crate::storage::Storage;
 
+/// Main Keep instance for managing encrypted key storage.
 pub struct Keep {
     storage: Storage,
     keyring: Keyring,
 }
 
 impl Keep {
+    /// Create a new Keep at the given path with the provided password.
     pub fn create(path: &Path, password: &str) -> Result<Self> {
         let storage = Storage::create(path, password, Argon2Params::DEFAULT)?;
 
@@ -36,6 +41,7 @@ impl Keep {
         })
     }
 
+    /// Open an existing Keep at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let storage = Storage::open(path)?;
 
@@ -45,6 +51,7 @@ impl Keep {
         })
     }
 
+    /// Unlock the Keep with the given password.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
         debug!("loading keys to keyring");
@@ -52,15 +59,18 @@ impl Keep {
         Ok(())
     }
 
+    /// Lock the Keep, clearing all keys from memory.
     pub fn lock(&mut self) {
         self.keyring.clear();
         self.storage.lock();
     }
 
+    /// Check if the Keep is currently unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.storage.is_unlocked()
     }
 
+    /// Generate a new Nostr keypair and store it with the given name.
     pub fn generate_key(&mut self, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -82,6 +92,7 @@ impl Keep {
         Ok(pubkey)
     }
 
+    /// Import an nsec (Nostr secret key) and store it with the given name.
     pub fn import_nsec(&mut self, nsec: &str, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -107,14 +118,17 @@ impl Keep {
         Ok(pubkey)
     }
 
+    /// Get the primary key slot from the keyring.
     pub fn get_primary_key(&self) -> Option<&keyring::KeySlot> {
         self.keyring.get_primary()
     }
 
+    /// List all stored key records.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         self.storage.list_keys()
     }
 
+    /// Delete a key by its public key.
     pub fn delete_key(&mut self, pubkey: &[u8; 32]) -> Result<()> {
         let id = crypto::blake2b_256(pubkey);
         self.storage.delete_key(&id)?;
@@ -122,10 +136,12 @@ impl Keep {
         Ok(())
     }
 
+    /// Get a reference to the keyring.
     pub fn keyring(&self) -> &Keyring {
         &self.keyring
     }
 
+    /// Get a mutable reference to the keyring.
     pub fn keyring_mut(&mut self) -> &mut Keyring {
         &mut self.keyring
     }
@@ -158,6 +174,7 @@ impl Keep {
     }
 }
 
+/// Get the default path for Keep storage (~/.keep).
 pub fn default_keep_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

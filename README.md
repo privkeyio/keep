@@ -5,7 +5,7 @@ Sovereign Key Management for Nostr and Bitcoin.
 ## Install
 
 ```bash
-cargo install --path .
+cargo install --path keep-cli
 ```
 
 ## Usage

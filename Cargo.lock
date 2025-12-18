@@ -1441,16 +1441,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "keep"
+name = "keep-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
- "bech32",
- "bincode",
  "bitflags",
- "blake2",
- "chacha20poly1305",
  "chrono",
  "clap",
  "console",
@@ -1458,24 +1453,43 @@ dependencies = [
  "ctrlc",
  "dialoguer",
  "dirs",
- "heed",
  "hex",
  "indicatif",
- "k256",
+ "keep-core",
  "nostr-sdk",
- "rand 0.8.5",
  "ratatui",
- "secrecy",
  "serde",
  "serde_json",
- "subtle",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "zeroize",
+]
+
+[[package]]
+name = "keep-core"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "bech32",
+ "bincode",
+ "blake2",
+ "chacha20poly1305",
+ "chrono",
+ "dirs",
+ "heed",
+ "hex",
+ "k256",
+ "rand 0.8.5",
+ "secrecy",
+ "serde",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
  "zeroize",
 ]
 

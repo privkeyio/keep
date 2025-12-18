@@ -1,3 +1,9 @@
+mod bunker;
+mod output;
+mod server;
+mod signer;
+mod tui;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,11 +15,12 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroize;
 
-use keep::error::{KeepError, Result};
-use keep::keys::bytes_to_npub;
-use keep::output::Output;
-use keep::server::Server;
-use keep::{default_keep_path, Keep};
+use keep_core::error::{KeepError, Result};
+use keep_core::keys::bytes_to_npub;
+use keep_core::{default_keep_path, Keep};
+
+use crate::output::Output;
+use crate::server::Server;
 
 fn get_password(prompt: &str) -> String {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
@@ -187,7 +194,7 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
     info!(size_mb, hidden, "creating keep");
 
     if hidden {
-        keep::hidden::HiddenStorage::create(
+        keep_core::hidden::HiddenStorage::create(
             path,
             &outer_password,
             hidden_password.as_deref(),
@@ -244,9 +251,9 @@ fn cmd_generate(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Resul
 }
 
 fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
-    use keep::keys::{KeyRecord, KeyType, NostrKeypair};
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
     debug!(name, "generating key in outer volume");
 
@@ -278,9 +285,9 @@ fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
 }
 
 fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
-    use keep::keys::{KeyRecord, KeyType, NostrKeypair};
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
     debug!(name, "generating key in hidden volume");
 
@@ -346,9 +353,9 @@ fn cmd_import(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
 }
 
 fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
-    use keep::keys::{KeyRecord, KeyType, NostrKeypair};
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
     debug!(name, "importing key to outer volume");
 
@@ -382,9 +389,9 @@ fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
 }
 
 fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
-    use keep::keys::{KeyRecord, KeyType, NostrKeypair};
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
     debug!(name, "importing key to hidden volume");
 
@@ -465,7 +472,7 @@ fn cmd_list(out: &Output, path: &PathBuf, hidden: bool) -> Result<()> {
 }
 
 fn cmd_list_outer(out: &Output, path: &PathBuf) -> Result<()> {
-    use keep::hidden::HiddenStorage;
+    use keep_core::hidden::HiddenStorage;
 
     debug!("listing keys in outer volume");
 
@@ -507,7 +514,7 @@ fn cmd_list_outer(out: &Output, path: &PathBuf) -> Result<()> {
 }
 
 fn cmd_list_hidden(out: &Output, path: &PathBuf) -> Result<()> {
-    use keep::hidden::HiddenStorage;
+    use keep_core::hidden::HiddenStorage;
 
     debug!("listing keys in hidden volume");
 
@@ -586,9 +593,9 @@ fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
 }
 
 fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto::{self, EncryptedData};
-    use keep::hidden::HiddenStorage;
-    use keep::keys::NostrKeypair;
+    use keep_core::crypto::{self, EncryptedData};
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::NostrKeypair;
 
     debug!(name, "exporting key from outer volume");
 
@@ -627,9 +634,9 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
 }
 
 fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto::{self, EncryptedData};
-    use keep::hidden::HiddenStorage;
-    use keep::keys::NostrKeypair;
+    use keep_core::crypto::{self, EncryptedData};
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keys::NostrKeypair;
 
     debug!(name, "exporting key from hidden volume");
 
@@ -706,8 +713,8 @@ fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
 }
 
 fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
 
     debug!(name, "deleting key from outer volume");
 
@@ -741,8 +748,8 @@ fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
 }
 
 fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
-    use keep::crypto;
-    use keep::hidden::HiddenStorage;
+    use keep_core::crypto;
+    use keep_core::hidden::HiddenStorage;
 
     debug!(name, "deleting key from hidden volume");
 
@@ -818,7 +825,7 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
 
     info!(relay, npub = %npub, "starting TUI");
 
-    let (mut tui, tui_tx) = keep::tui::Tui::new(bunker_url, npub, relay.to_string());
+    let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
 
@@ -828,16 +835,16 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
             let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                        keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                     ));
                     return;
                 }
             };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                    keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });
@@ -848,9 +855,9 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
 }
 
 fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) -> Result<()> {
-    use keep::crypto::{self, EncryptedData};
-    use keep::hidden::HiddenStorage;
-    use keep::keyring::Keyring;
+    use keep_core::crypto::{self, EncryptedData};
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keyring::Keyring;
 
     debug!(relay, headless, "starting server from outer volume");
 
@@ -897,7 +904,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
 
     info!(relay, npub = %npub, "starting TUI");
 
-    let (mut tui, tui_tx) = keep::tui::Tui::new(bunker_url, npub, relay.to_string());
+    let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
 
@@ -907,16 +914,16 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
             let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                        keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                     ));
                     return;
                 }
             };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                    keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });
@@ -927,9 +934,9 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
 }
 
 fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -> Result<()> {
-    use keep::crypto::{self, EncryptedData};
-    use keep::hidden::HiddenStorage;
-    use keep::keyring::Keyring;
+    use keep_core::crypto::{self, EncryptedData};
+    use keep_core::hidden::HiddenStorage;
+    use keep_core::keyring::Keyring;
 
     debug!(relay, headless, "starting server from hidden volume");
 
@@ -978,7 +985,7 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
 
     info!(relay, npub = %npub, "starting TUI for hidden volume");
 
-    let (mut tui, tui_tx) = keep::tui::Tui::new(bunker_url, npub, relay.to_string());
+    let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
 
@@ -988,16 +995,16 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
             let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                        keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                     ));
                     return;
                 }
             };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
-                    keep::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });

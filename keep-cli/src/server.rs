@@ -7,9 +7,10 @@ use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use keep_core::error::{KeepError, Result};
+use keep_core::keyring::Keyring;
+
 use crate::bunker::generate_bunker_url;
-use crate::error::{KeepError, Result};
-use crate::keyring::Keyring;
 use crate::signer::{AuditLog, PermissionManager, SignerHandler};
 use crate::tui::{LogEntry, TuiEvent};
 

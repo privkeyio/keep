@@ -7,8 +7,9 @@ use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::error::{KeepError, Result};
-use crate::keyring::Keyring;
+use keep_core::error::{KeepError, Result};
+use keep_core::keyring::Keyring;
+
 use crate::tui::{ApprovalRequest as TuiApprovalRequest, TuiEvent};
 
 use super::audit::{AuditAction, AuditEntry, AuditLog};
@@ -367,8 +368,8 @@ impl SignerHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyring::Keyring;
-    use crate::keys::{KeyType, NostrKeypair};
+    use keep_core::keyring::Keyring;
+    use keep_core::keys::{KeyType, NostrKeypair};
 
     fn setup_keyring() -> Arc<Mutex<Keyring>> {
         let mut keyring = Keyring::new();
