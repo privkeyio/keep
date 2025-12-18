@@ -17,7 +17,26 @@ keep import --name backup     # Import nsec
 keep list                     # List keys
 keep export --name main       # Export nsec
 keep delete --name main       # Delete key
+keep serve                    # Start NIP-46 remote signer
 ```
+
+## Remote Signing (NIP-46)
+
+Start the remote signer to use your keys with Nostr clients:
+
+```bash
+keep serve --relay wss://relay.damus.io
+```
+
+This displays a TUI with:
+- Bunker URL to paste into your Nostr client
+- Activity log of all signing requests
+- Approval prompts for signing events
+
+Controls:
+- `Y` / `Enter` - Approve request
+- `N` - Reject request
+- `Q` - Quit
 
 ## Environment Variables
 

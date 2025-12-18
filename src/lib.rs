@@ -1,8 +1,12 @@
+pub mod bunker;
 pub mod crypto;
 pub mod error;
 pub mod keyring;
 pub mod keys;
+pub mod server;
+pub mod signer;
 pub mod storage;
+pub mod tui;
 
 use std::path::{Path, PathBuf};
 

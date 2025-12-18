@@ -1,0 +1,344 @@
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use nostr_sdk::prelude::*;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+
+use crate::bunker::generate_bunker_url;
+use crate::error::{KeepError, Result};
+use crate::keyring::Keyring;
+use crate::signer::{AuditLog, PermissionManager, SignerHandler};
+use crate::tui::{LogEntry, TuiEvent};
+
+pub struct Server {
+    keys: Keys,
+    relay_url: String,
+    client: Client,
+    handler: Arc<SignerHandler>,
+    running: bool,
+    tui_tx: Option<Sender<TuiEvent>>,
+}
+
+impl Server {
+    pub async fn new(
+        keyring: Arc<Mutex<Keyring>>,
+        relay_url: &str,
+        tui_tx: Option<Sender<TuiEvent>>,
+    ) -> Result<Self> {
+        let keys = {
+            let kr = keyring.lock().await;
+            let slot = kr
+                .get_primary()
+                .ok_or_else(|| KeepError::Other("No signing key".into()))?;
+
+            let secret = SecretKey::from_slice(slot.expose_secret())
+                .map_err(|e| KeepError::Other(format!("Invalid secret key: {}", e)))?;
+
+            Keys::new(secret)
+        };
+
+        let client = Client::new(keys.clone());
+
+        client
+            .add_relay(relay_url)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
+        let handler = Arc::new(SignerHandler::new(keyring, permissions, audit));
+
+        Ok(Self {
+            keys,
+            relay_url: relay_url.to_string(),
+            client,
+            handler,
+            running: false,
+            tui_tx,
+        })
+    }
+
+    pub fn bunker_url(&self) -> String {
+        generate_bunker_url(&self.keys.public_key(), &self.relay_url, None)
+    }
+
+    pub fn pubkey(&self) -> PublicKey {
+        self.keys.public_key()
+    }
+
+    pub async fn start(&mut self) -> Result<()> {
+        info!("Connecting to relay: {}", self.relay_url);
+
+        self.client.connect().await;
+
+        let filter = Filter::new()
+            .kind(Kind::NostrConnect)
+            .pubkey(self.keys.public_key());
+
+        self.client
+            .subscribe(vec![filter], None)
+            .await
+            .map_err(|e| KeepError::Other(format!("Subscribe failed: {}", e)))?;
+
+        self.running = true;
+
+        info!("Listening for NIP-46 requests");
+        info!("Bunker URL: {}", self.bunker_url());
+
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        self.start().await?;
+
+        let handler = self.handler.clone();
+        let keys = self.keys.clone();
+        let client = self.client.clone();
+        let tui_tx = self.tui_tx.clone();
+
+        self.client
+            .handle_notifications(|notification| {
+                let handler = handler.clone();
+                let keys = keys.clone();
+                let client = client.clone();
+                let tui_tx = tui_tx.clone();
+
+                async move {
+                    if let RelayPoolNotification::Event { event, .. } = notification {
+                        if event.kind == Kind::NostrConnect {
+                            if let Err(e) =
+                                Self::handle_nip46_event(&handler, &keys, &client, &event, tui_tx.as_ref()).await
+                            {
+                                warn!("Error handling NIP-46 event: {}", e);
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
+            })
+            .await
+            .map_err(|e| KeepError::Other(format!("Notification handler error: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn handle_nip46_event(
+        handler: &SignerHandler,
+        keys: &Keys,
+        client: &Client,
+        event: &Event,
+        tui_tx: Option<&Sender<TuiEvent>>,
+    ) -> Result<()> {
+        let app_pubkey = event.pubkey;
+        let app_id = &app_pubkey.to_hex()[..8];
+
+        let decrypted = nip44::decrypt(keys.secret_key(), &app_pubkey, &event.content)
+            .map_err(|e| KeepError::Other(format!("Decrypt failed: {}", e)))?;
+
+        let request: Nip46Request = serde_json::from_str(&decrypted)
+            .map_err(|e| KeepError::Other(format!("Parse failed: {}", e)))?;
+
+        debug!("NIP-46 request: {} from {}", request.method, app_id);
+
+        let method = request.method.clone();
+        let response = Self::dispatch_request(handler, app_pubkey, request, tui_tx).await;
+
+        let success = response.error.is_none();
+        if let Some(tx) = tui_tx {
+            let detail = response.error.as_deref();
+            let _ = tx.send(TuiEvent::Log(
+                LogEntry::new(app_id, &method, success)
+                    .with_detail(detail.unwrap_or("")),
+            ));
+        }
+
+        let response_json = serde_json::to_string(&response)
+            .map_err(|e| KeepError::Other(format!("Serialize failed: {}", e)))?;
+
+        let encrypted = nip44::encrypt(
+            keys.secret_key(),
+            &app_pubkey,
+            &response_json,
+            nip44::Version::V2,
+        )
+        .map_err(|e| KeepError::Other(format!("Encrypt failed: {}", e)))?;
+
+        let response_event = EventBuilder::new(
+            Kind::NostrConnect,
+            encrypted,
+            vec![Tag::public_key(app_pubkey)],
+        )
+        .to_event(keys)
+        .map_err(|e| KeepError::Other(format!("Sign response failed: {}", e)))?;
+
+        if let Err(e) = client.send_event(response_event).await {
+            error!("Failed to send response: {}", e);
+        }
+
+        Ok(())
+    }
+
+    async fn dispatch_request(
+        handler: &SignerHandler,
+        app_pubkey: PublicKey,
+        request: Nip46Request,
+        _tui_tx: Option<&Sender<TuiEvent>>,
+    ) -> Nip46Response {
+        let id = request.id.clone();
+
+        match request.method.as_str() {
+            "connect" => {
+                let our_pubkey = request
+                    .params
+                    .first()
+                    .and_then(|s| PublicKey::from_hex(s).ok());
+                let secret = request.params.get(1).cloned();
+                let permissions = request.params.get(2).cloned();
+                match handler
+                    .handle_connect(app_pubkey, our_pubkey, secret, permissions)
+                    .await
+                {
+                    Ok(Some(s)) => Nip46Response::ok(id, &s),
+                    Ok(None) => Nip46Response::ok(id, "ack"),
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                }
+            }
+            "get_public_key" => match handler.handle_get_public_key(app_pubkey).await {
+                Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
+                Err(e) => Nip46Response::error(id, &e.to_string()),
+            },
+            "sign_event" => {
+                let event_json = request.params.first().ok_or("Missing event parameter");
+
+                match event_json {
+                    Ok(json) => match serde_json::from_str::<UnsignedEvent>(json) {
+                        Ok(unsigned) => {
+                            match handler.handle_sign_event(app_pubkey, unsigned).await {
+                                Ok(event) => {
+                                    let json = serde_json::to_string(&event).unwrap();
+                                    Nip46Response::ok(id, &json)
+                                }
+                                Err(e) => Nip46Response::error(id, &e.to_string()),
+                            }
+                        }
+                        Err(e) => Nip46Response::error(id, &format!("Invalid event: {}", e)),
+                    },
+                    Err(e) => Nip46Response::error(id, e),
+                }
+            }
+            "nip44_encrypt" => {
+                if request.params.len() < 2 {
+                    return Nip46Response::error(id, "Missing parameters");
+                }
+                let recipient = match PublicKey::from_hex(&request.params[0]) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
+                    }
+                };
+                match handler
+                    .handle_nip44_encrypt(app_pubkey, recipient, &request.params[1])
+                    .await
+                {
+                    Ok(ct) => Nip46Response::ok(id, &ct),
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                }
+            }
+            "nip44_decrypt" => {
+                if request.params.len() < 2 {
+                    return Nip46Response::error(id, "Missing parameters");
+                }
+                let sender = match PublicKey::from_hex(&request.params[0]) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
+                    }
+                };
+                match handler
+                    .handle_nip44_decrypt(app_pubkey, sender, &request.params[1])
+                    .await
+                {
+                    Ok(pt) => Nip46Response::ok(id, &pt),
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                }
+            }
+            "nip04_encrypt" => {
+                if request.params.len() < 2 {
+                    return Nip46Response::error(id, "Missing parameters");
+                }
+                let recipient = match PublicKey::from_hex(&request.params[0]) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
+                    }
+                };
+                match handler
+                    .handle_nip04_encrypt(app_pubkey, recipient, &request.params[1])
+                    .await
+                {
+                    Ok(ct) => Nip46Response::ok(id, &ct),
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                }
+            }
+            "nip04_decrypt" => {
+                if request.params.len() < 2 {
+                    return Nip46Response::error(id, "Missing parameters");
+                }
+                let sender = match PublicKey::from_hex(&request.params[0]) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
+                    }
+                };
+                match handler
+                    .handle_nip04_decrypt(app_pubkey, sender, &request.params[1])
+                    .await
+                {
+                    Ok(pt) => Nip46Response::ok(id, &pt),
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                }
+            }
+            "ping" => Nip46Response::ok(id, "pong"),
+            _ => Nip46Response::error(id, &format!("Unknown method: {}", request.method)),
+        }
+    }
+
+    pub async fn stop(&mut self) {
+        self.running = false;
+        self.client.disconnect().await.ok();
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Nip46Request {
+    id: String,
+    method: String,
+    #[serde(default)]
+    params: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Nip46Response {
+    id: String,
+    result: Option<String>,
+    error: Option<String>,
+}
+
+impl Nip46Response {
+    fn ok(id: String, result: &str) -> Self {
+        Self {
+            id,
+            result: Some(result.to_string()),
+            error: None,
+        }
+    }
+
+    fn error(id: String, error: &str) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(error.to_string()),
+        }
+    }
+}

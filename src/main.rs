@@ -1,13 +1,17 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Password};
 use indicatif::{ProgressBar, ProgressStyle};
+use nostr_sdk::prelude::ToBech32;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use keep::error::Result;
 use keep::keys::bytes_to_npub;
+use keep::server::Server;
 use keep::{default_keep_path, Keep};
 
 fn get_password(prompt: &str) -> String {
@@ -279,8 +283,52 @@ fn cmd_delete(path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(_path: &PathBuf, _relay: &str) -> Result<()> {
-    println!("{}", style("NIP-46 signer not implemented yet.").yellow());
-    println!("Coming in Phase 2!");
+fn cmd_serve(path: &PathBuf, relay: &str) -> Result<()> {
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password");
+    keep.unlock(&password)?;
+
+    let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let (bunker_url, npub) = rt.block_on(async {
+        let server = Server::new(keyring.clone(), relay, None).await?;
+        Ok::<_, keep::error::KeepError>((
+            server.bunker_url(),
+            server.pubkey().to_bech32().unwrap_or_default(),
+        ))
+    })?;
+
+    let (mut tui, tui_tx) = keep::tui::Tui::new(bunker_url, npub, relay.to_string());
+
+    let tui_tx_clone = tui_tx.clone();
+    let relay_clone = relay.to_string();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
+                        keep::tui::LogEntry::new("system", "server error", false)
+                            .with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
+
+            if let Err(e) = server.run().await {
+                let _ = tui_tx_clone.send(keep::tui::TuiEvent::Log(
+                    keep::tui::LogEntry::new("system", "server error", false)
+                        .with_detail(&e.to_string()),
+                ));
+            }
+        });
+    });
+
+    tui.run().map_err(|e| keep::error::KeepError::Other(e.to_string()))?;
+
     Ok(())
 }

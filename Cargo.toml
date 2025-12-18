@@ -28,6 +28,15 @@ console = "0.15"
 
 bech32 = "0.11"
 hex = "0.4"
+bitflags = "2.4"
+urlencoding = "2.1"
+url = "2.5"
+ctrlc = "3.4"
+ratatui = "0.29"
+crossterm = "0.28"
+
+nostr-sdk = { version = "0.35", features = ["nip46"] }
+tokio = { version = "1", features = ["full", "signal"] }
 
 thiserror = "1.0"
 anyhow = "1.0"
