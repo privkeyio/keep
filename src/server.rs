@@ -142,7 +142,7 @@ impl Server {
         debug!("NIP-46 request: {} from {}", request.method, app_id);
 
         let method = request.method.clone();
-        let response = Self::dispatch_request(handler, app_pubkey, request, tui_tx).await;
+        let response = Self::dispatch_request(handler, keys.public_key(), app_pubkey, request, tui_tx).await;
 
         let success = response.error.is_none();
         if let Some(tx) = tui_tx {
@@ -181,6 +181,7 @@ impl Server {
 
     async fn dispatch_request(
         handler: &SignerHandler,
+        user_pubkey: PublicKey,
         app_pubkey: PublicKey,
         request: Nip46Request,
         _tui_tx: Option<&Sender<TuiEvent>>,
@@ -209,22 +210,36 @@ impl Server {
                 Err(e) => Nip46Response::error(id, &e.to_string()),
             },
             "sign_event" => {
-                let event_json = request.params.first().ok_or("Missing event parameter");
+                let event_json = match request.params.first() {
+                    Some(json) => json,
+                    None => return Nip46Response::error(id, "Missing event parameter"),
+                };
 
-                match event_json {
-                    Ok(json) => match serde_json::from_str::<UnsignedEvent>(json) {
-                        Ok(unsigned) => {
-                            match handler.handle_sign_event(app_pubkey, unsigned).await {
-                                Ok(event) => {
-                                    let json = serde_json::to_string(&event).unwrap();
-                                    Nip46Response::ok(id, &json)
-                                }
-                                Err(e) => Nip46Response::error(id, &e.to_string()),
-                            }
-                        }
-                        Err(e) => Nip46Response::error(id, &format!("Invalid event: {}", e)),
-                    },
-                    Err(e) => Nip46Response::error(id, e),
+                let partial: PartialEvent = match serde_json::from_str(event_json) {
+                    Ok(p) => p,
+                    Err(e) => return Nip46Response::error(id, &format!("Invalid event: {}", e)),
+                };
+
+                let tags: Vec<Tag> = partial
+                    .tags
+                    .into_iter()
+                    .filter_map(|t| Tag::parse(&t).ok())
+                    .collect();
+
+                let unsigned = UnsignedEvent::new(
+                    user_pubkey,
+                    Timestamp::from(partial.created_at as u64),
+                    Kind::from(partial.kind),
+                    tags,
+                    &partial.content,
+                );
+
+                match handler.handle_sign_event(app_pubkey, unsigned).await {
+                    Ok(event) => {
+                        let json = serde_json::to_string(&event).unwrap();
+                        Nip46Response::ok(id, &json)
+                    }
+                    Err(e) => Nip46Response::error(id, &e.to_string()),
                 }
             }
             "nip44_encrypt" => {
@@ -316,6 +331,15 @@ struct Nip46Request {
     method: String,
     #[serde(default)]
     params: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PartialEvent {
+    kind: u16,
+    content: String,
+    #[serde(default)]
+    tags: Vec<Vec<String>>,
+    created_at: i64,
 }
 
 #[derive(Debug, serde::Serialize)]

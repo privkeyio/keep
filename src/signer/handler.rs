@@ -338,6 +338,7 @@ impl SignerHandler {
     }
 
     async fn request_approval(&self, request: ApprovalRequest) -> bool {
+        let method = request.method.clone();
         if let Some(ref tx) = self.tui_tx {
             let (response_tx, response_rx) = mpsc::channel();
             let id = self
@@ -359,7 +360,8 @@ impl SignerHandler {
                     .unwrap_or(false);
             }
         }
-        false
+        info!("Auto-approving {} (headless mode)", method);
+        true
     }
 }
 

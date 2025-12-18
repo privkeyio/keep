@@ -81,6 +81,8 @@ enum Commands {
     Serve {
         #[arg(short, long, default_value = "wss://relay.damus.io")]
         relay: String,
+        #[arg(long)]
+        headless: bool,
     },
 }
 
@@ -108,7 +110,7 @@ fn run() -> Result<()> {
         Commands::List => cmd_list(&path),
         Commands::Export { name } => cmd_export(&path, &name),
         Commands::Delete { name } => cmd_delete(&path, &name),
-        Commands::Serve { relay } => cmd_serve(&path, &relay),
+        Commands::Serve { relay, headless } => cmd_serve(&path, &relay, headless),
     }
 }
 
@@ -283,7 +285,7 @@ fn cmd_delete(path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(path: &PathBuf, relay: &str) -> Result<()> {
+fn cmd_serve(path: &PathBuf, relay: &str, headless: bool) -> Result<()> {
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password");
     keep.unlock(&password)?;
@@ -291,6 +293,16 @@ fn cmd_serve(path: &PathBuf, relay: &str) -> Result<()> {
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+
+    if headless {
+        rt.block_on(async {
+            let mut server = Server::new(keyring, relay, None).await?;
+            println!("Bunker URL: {}", server.bunker_url());
+            println!("Listening on {}...", relay);
+            server.run().await
+        })?;
+        return Ok(());
+    }
 
     let (bunker_url, npub) = rt.block_on(async {
         let server = Server::new(keyring.clone(), relay, None).await?;
