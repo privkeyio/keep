@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};

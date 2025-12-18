@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use console::{style, Term};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;

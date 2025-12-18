@@ -198,7 +198,7 @@ impl Storage {
 
         debug!("decrypting data key");
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        self.data_key = Some(SecretKey::from_slice(&decrypted)?);
+        self.data_key = Some(SecretKey::from_slice(decrypted.as_slice())?);
 
         debug!(path = ?self.path, "opening LMDB");
         let env = unsafe {
@@ -263,7 +263,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-        bincode::deserialize(&decrypted).map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
+        bincode::deserialize(decrypted.as_slice()).map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
     }
 
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
@@ -283,7 +283,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let record: KeyRecord = bincode::deserialize(&decrypted)
+            let record: KeyRecord = bincode::deserialize(decrypted.as_slice())
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 
             records.push(record);

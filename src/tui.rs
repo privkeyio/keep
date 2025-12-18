@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;

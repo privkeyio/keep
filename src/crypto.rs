@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
@@ -5,11 +7,37 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
 };
 use rand::RngCore;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KeepError, Result};
 
 pub const SALT_SIZE: usize = 32;
+
+#[derive(Clone)]
+pub struct SecretVec(Vec<u8>);
+
+impl SecretVec {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretVec {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl AsRef<[u8]> for SecretVec {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 pub const NONCE_SIZE: usize = 24;
 pub const KEY_SIZE: usize = 32;
 pub const TAG_SIZE: usize = 16;
@@ -157,12 +185,13 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     Ok(EncryptedData { ciphertext, nonce })
 }
 
-pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<Vec<u8>> {
+pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key.as_bytes()));
     let nonce = GenericArray::from_slice(&encrypted.nonce);
 
     cipher
         .decrypt(nonce, encrypted.ciphertext.as_ref())
+        .map(SecretVec::new)
         .map_err(|_| KeepError::DecryptionFailed)
 }
 

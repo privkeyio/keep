@@ -13,6 +13,7 @@ pub mod tui;
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
+use zeroize::Zeroize;
 
 use crate::crypto::{Argon2Params, SecretKey};
 use crate::error::{KeepError, Result};
@@ -138,12 +139,12 @@ impl Keep {
             let secret_bytes = crypto::decrypt(&encrypted, &data_key)?;
 
             let mut secret = [0u8; 32];
-            secret.copy_from_slice(&secret_bytes);
+            secret.copy_from_slice(secret_bytes.as_slice());
 
             self.keyring
                 .load_key(record.pubkey, secret, record.key_type, record.name)?;
 
-            secret.iter_mut().for_each(|b| *b = 0);
+            secret.zeroize();
         }
 
         Ok(())

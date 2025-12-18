@@ -7,6 +7,7 @@ use nostr_sdk::prelude::ToBech32;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroize;
 
 use keep::error::{KeepError, Result};
 use keep::keys::bytes_to_npub;
@@ -609,9 +610,9 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    secret.copy_from_slice(&secret_bytes);
+    secret.copy_from_slice(secret_bytes.as_slice());
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
-    secret.iter_mut().for_each(|b| *b = 0);
+    secret.zeroize();
 
     out.secret_warning();
     out.newline();
@@ -650,9 +651,9 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    secret.copy_from_slice(&secret_bytes);
+    secret.copy_from_slice(secret_bytes.as_slice());
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
-    secret.iter_mut().for_each(|b| *b = 0);
+    secret.zeroize();
 
     out.secret_warning();
     out.newline();
@@ -868,9 +869,9 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        secret.copy_from_slice(&secret_bytes);
+        secret.copy_from_slice(secret_bytes.as_slice());
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
-        secret.iter_mut().for_each(|b| *b = 0);
+        secret.zeroize();
     }
 
     let keyring = Arc::new(Mutex::new(keyring));
@@ -949,9 +950,9 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        secret.copy_from_slice(&secret_bytes);
+        secret.copy_from_slice(secret_bytes.as_slice());
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
-        secret.iter_mut().for_each(|b| *b = 0);
+        secret.zeroize();
     }
 
     let keyring = Arc::new(Mutex::new(keyring));

@@ -203,7 +203,7 @@ impl HiddenStorage {
         };
 
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        self.outer_key = Some(SecretKey::from_slice(&decrypted)?);
+        self.outer_key = Some(SecretKey::from_slice(decrypted.as_slice())?);
 
         let env = unsafe {
             EnvOpenOptions::new()
@@ -252,7 +252,7 @@ impl HiddenStorage {
             Err(_) => return Err(KeepError::InvalidPassword),
         };
 
-        let hidden_header = HiddenHeader::from_bytes_compact(&decrypted);
+        let hidden_header = HiddenHeader::from_bytes_compact(decrypted.as_slice());
 
         if !hidden_header.verify_checksum() {
             return Err(KeepError::InvalidPassword);
@@ -269,7 +269,7 @@ impl HiddenStorage {
         };
 
         let data_key_bytes = crypto::decrypt(&data_encrypted, &data_key_enc)?;
-        self.hidden_key = Some(SecretKey::from_slice(&data_key_bytes)?);
+        self.hidden_key = Some(SecretKey::from_slice(data_key_bytes.as_slice())?);
         self.hidden_header = Some(hidden_header);
         self.active_volume = Some(VolumeType::Hidden);
 
@@ -384,7 +384,7 @@ impl HiddenStorage {
             Err(_) => return Ok(Vec::new()),
         };
 
-        let records: Vec<KeyRecord> = bincode::deserialize(&decrypted).unwrap_or_default();
+        let records: Vec<KeyRecord> = bincode::deserialize(decrypted.as_slice()).unwrap_or_default();
         Ok(records)
     }
 
@@ -449,7 +449,7 @@ impl HiddenStorage {
             let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let record: KeyRecord = bincode::deserialize(&decrypted)
+            let record: KeyRecord = bincode::deserialize(decrypted.as_slice())
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 
             records.push(record);

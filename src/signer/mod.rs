@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod audit;
 pub mod handler;
 pub mod permissions;

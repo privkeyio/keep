@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, Argon2Params, SALT_SIZE};

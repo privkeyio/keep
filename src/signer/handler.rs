@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 

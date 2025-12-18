@@ -73,6 +73,7 @@ KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 - BLAKE2b checksums
 - LMDB encrypted storage
 - Secure memory handling with zeroize
+- Minimal unsafe code (LMDB only), enforced via `#![forbid(unsafe_code)]`
 - VeraCrypt-style hidden volumes with no detectable markers
 
 ## License

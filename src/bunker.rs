@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use nostr_sdk::prelude::*;
 
 pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&str>) -> String {
