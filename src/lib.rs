@@ -1,8 +1,10 @@
 pub mod bunker;
 pub mod crypto;
 pub mod error;
+pub mod hidden;
 pub mod keyring;
 pub mod keys;
+pub mod output;
 pub mod server;
 pub mod signer;
 pub mod storage;
