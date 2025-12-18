@@ -34,18 +34,15 @@ impl SignerHandler {
         keyring: Arc<Mutex<Keyring>>,
         permissions: Arc<Mutex<PermissionManager>>,
         audit: Arc<Mutex<AuditLog>>,
+        tui_tx: Option<Sender<TuiEvent>>,
     ) -> Self {
         Self {
             keyring,
             permissions,
             audit,
-            tui_tx: None,
+            tui_tx,
             next_approval_id: std::sync::atomic::AtomicU64::new(0),
         }
-    }
-
-    pub fn set_tui_tx(&mut self, tx: Sender<TuiEvent>) {
-        self.tui_tx = Some(tx);
     }
 
     pub async fn handle_connect(
@@ -389,7 +386,7 @@ mod tests {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        SignerHandler::new(keyring, permissions, audit)
+        SignerHandler::new(keyring, permissions, audit, None)
     }
 
     #[tokio::test]

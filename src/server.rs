@@ -47,7 +47,7 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
-        let handler = Arc::new(SignerHandler::new(keyring, permissions, audit));
+        let handler = Arc::new(SignerHandler::new(keyring, permissions, audit, tui_tx.clone()));
 
         Ok(Self {
             keys,
