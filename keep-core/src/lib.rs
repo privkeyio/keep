@@ -8,6 +8,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod frost;
 pub mod hidden;
 pub mod keyring;
 pub mod keys;
@@ -20,6 +21,7 @@ use zeroize::Zeroize;
 
 use crate::crypto::{Argon2Params, SecretKey};
 use crate::error::{KeepError, Result};
+use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 use crate::storage::Storage;
@@ -164,6 +166,153 @@ impl Keep {
         &mut self.keyring
     }
 
+    pub fn frost_generate(
+        &mut self,
+        threshold: u16,
+        total_shares: u16,
+        name: &str,
+    ) -> Result<Vec<SharePackage>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let config = ThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+        let (shares, _) = dealer.generate(name)?;
+
+        let data_key = self.get_data_key()?;
+        for share in &shares {
+            let stored = StoredShare::encrypt(share, &data_key)?;
+            self.storage.store_share(&stored)?;
+        }
+
+        Ok(shares)
+    }
+
+    pub fn frost_split(
+        &mut self,
+        key_name: &str,
+        threshold: u16,
+        total_shares: u16,
+    ) -> Result<Vec<SharePackage>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let slot = self
+            .keyring
+            .get_by_name(key_name)
+            .ok_or_else(|| KeepError::KeyNotFound(key_name.to_string()))?;
+
+        let secret = *slot.expose_secret();
+
+        let config = ThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+        let (shares, _) = dealer.split_existing(&secret, key_name)?;
+
+        let data_key = self.get_data_key()?;
+        for share in &shares {
+            let stored = StoredShare::encrypt(share, &data_key)?;
+            self.storage.store_share(&stored)?;
+        }
+
+        Ok(shares)
+    }
+
+    pub fn frost_list_shares(&self) -> Result<Vec<StoredShare>> {
+        self.storage.list_shares()
+    }
+
+    pub fn frost_export_share(
+        &self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+        passphrase: &str,
+    ) -> Result<ShareExport> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let shares = self.storage.list_shares()?;
+        let stored = shares
+            .iter()
+            .find(|s| {
+                s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
+            })
+            .ok_or_else(|| KeepError::KeyNotFound(format!("share {}", identifier)))?;
+
+        let data_key = self.get_data_key()?;
+        let share = stored.decrypt(&data_key)?;
+
+        ShareExport::from_share(&share, passphrase)
+    }
+
+    pub fn frost_import_share(&mut self, export: &ShareExport, passphrase: &str) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let share = export.to_share(passphrase, &format!("imported-{}", export.identifier))?;
+        let data_key = self.get_data_key()?;
+        let stored = StoredShare::encrypt(&share, &data_key)?;
+        self.storage.store_share(&stored)?;
+
+        Ok(())
+    }
+
+    pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
+        self.storage.delete_share(group_pubkey, identifier)
+    }
+
+    pub fn frost_get_share(&self, group_pubkey: &[u8; 32]) -> Result<frost::SharePackage> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let data_key = self.get_data_key()?;
+        let shares = self.storage.list_shares()?;
+        let stored = shares
+            .iter()
+            .find(|s| s.metadata.group_pubkey == *group_pubkey)
+            .ok_or_else(|| KeepError::KeyNotFound("No shares for group".into()))?;
+
+        stored.decrypt(&data_key)
+    }
+
+    pub fn frost_sign(&self, group_pubkey: &[u8; 32], message: &[u8]) -> Result<[u8; 64]> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let data_key = self.get_data_key()?;
+        let shares = self.storage.list_shares()?;
+        let our_shares: Vec<_> = shares
+            .iter()
+            .filter(|s| s.metadata.group_pubkey == *group_pubkey)
+            .collect();
+
+        if our_shares.is_empty() {
+            return Err(KeepError::KeyNotFound("No shares for group".into()));
+        }
+
+        let threshold = our_shares[0].metadata.threshold;
+
+        if our_shares.len() < threshold as usize {
+            return Err(KeepError::Frost(format!(
+                "Need {} shares to sign, only {} available",
+                threshold,
+                our_shares.len()
+            )));
+        }
+
+        let mut decrypted_shares = Vec::new();
+        for stored in our_shares.iter().take(threshold as usize) {
+            decrypted_shares.push(stored.decrypt(&data_key)?);
+        }
+
+        frost::sign_with_local_shares(&decrypted_shares, message)
+    }
+
     fn load_keys_to_keyring(&mut self) -> Result<()> {
         let data_key = self.get_data_key()?;
         let records = self.storage.list_keys()?;
@@ -187,6 +336,16 @@ impl Keep {
 
     fn get_data_key(&self) -> Result<SecretKey> {
         self.storage.data_key().cloned().ok_or(KeepError::Locked)
+    }
+
+    /// Returns the data encryption key used to encrypt stored secrets.
+    ///
+    /// # Errors
+    /// Returns [`KeepError::Locked`] if [`unlock()`](Self::unlock) has not been called.
+    ///
+    /// Exposed for FROST/FrostSigner integration to decrypt stored shares.
+    pub fn data_key(&self) -> Result<SecretKey> {
+        self.get_data_key()
     }
 }
 
@@ -265,5 +424,64 @@ mod tests {
         keep.generate_key("first").unwrap();
         let primary = keep.get_primary_key().unwrap();
         assert_eq!(primary.name, "first");
+    }
+
+    #[test]
+    fn test_frost_generate_and_sign() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+
+        let mut keep = test_keep(&path);
+
+        let shares = keep.frost_generate(2, 3, "frost-test").unwrap();
+        assert_eq!(shares.len(), 3);
+
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let message = b"test message to sign with FROST";
+        let signature = keep.frost_sign(&group_pubkey, message).unwrap();
+
+        assert_eq!(signature.len(), 64);
+
+        let stored_shares = keep.frost_list_shares().unwrap();
+        assert_eq!(stored_shares.len(), 3);
+    }
+
+    #[test]
+    fn test_frost_split_preserves_npub() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+
+        let mut keep = test_keep(&path);
+
+        let pubkey = keep.generate_key("to-split").unwrap();
+
+        let shares = keep.frost_split("to-split", 2, 3).unwrap();
+        assert_eq!(shares.len(), 3);
+
+        let frost_pubkey = *shares[0].group_pubkey();
+        assert_eq!(frost_pubkey, pubkey);
+
+        let message = b"sign with split key";
+        let signature = keep.frost_sign(&frost_pubkey, message).unwrap();
+        assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn test_frost_insufficient_shares_fails() {
+        use crate::frost::{SigningSession, ThresholdConfig, TrustedDealer};
+
+        let config = ThresholdConfig::two_of_three();
+        let dealer = TrustedDealer::new(config);
+        let (shares, _) = dealer.generate("test").unwrap();
+
+        let message = b"test".to_vec();
+        let kp0 = shares[0].key_package().unwrap();
+
+        let mut session = SigningSession::new(message, 2);
+        session.generate_commitment(&kp0).unwrap();
+
+        assert_eq!(session.commitments_needed(), 1);
+        assert!(!session.is_complete());
     }
 }

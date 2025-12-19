@@ -89,7 +89,7 @@ impl SecretKey {
 
     pub fn generate() -> Result<Self> {
         let mut bytes = [0u8; KEY_SIZE];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self::new(bytes)
     }
 
@@ -185,7 +185,7 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(decrypted.expose_borrowed()));
 
     let mut nonce = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let nonce_ga = GenericArray::from_slice(&nonce);
 
     let ciphertext = cipher
@@ -219,7 +219,7 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes
 }
 

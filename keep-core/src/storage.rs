@@ -8,9 +8,11 @@ use tracing::{debug, trace};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result};
+use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
+const SHARES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
 
 const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
@@ -152,6 +154,9 @@ impl Storage {
             {
                 let _ = wtxn
                     .open_table(KEYS_TABLE)
+                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+                let _ = wtxn
+                    .open_table(SHARES_TABLE)
                     .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
             }
             wtxn.commit()
@@ -354,6 +359,108 @@ impl Storage {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn store_share(&self, share: &StoredShare) -> Result<()> {
+        debug!(name = %share.metadata.name, "storing FROST share");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+
+        let serialized = bincode::serialize(share)
+            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        let encrypted_bytes = encrypted.to_bytes();
+
+        let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
+
+        let wtxn = db
+            .begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        {
+            let mut table = wtxn
+                .open_table(SHARES_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            table
+                .insert(id.as_slice(), encrypted_bytes.as_slice())
+                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+
+        Ok(())
+    }
+
+    pub fn list_shares(&self) -> Result<Vec<StoredShare>> {
+        trace!("listing FROST shares");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+
+        let rtxn = db
+            .begin_read()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let table = rtxn
+            .open_table(SHARES_TABLE)
+            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+
+        let mut shares = Vec::new();
+
+        for result in table
+            .iter()
+            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
+        {
+            let (_, encrypted_bytes) =
+                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+            let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+
+            let decrypted_bytes = decrypted.as_slice()?;
+            let share: StoredShare = bincode::deserialize(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
+
+            shares.push(share);
+        }
+
+        Ok(shares)
+    }
+
+    pub fn delete_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
+        debug!(id = identifier, "deleting FROST share");
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+
+        let id = share_id(group_pubkey, identifier);
+
+        let wtxn = db
+            .begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let existed;
+        {
+            let mut table = wtxn
+                .open_table(SHARES_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            existed = table
+                .remove(id.as_slice())
+                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
+                .is_some();
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+
+        if !existed {
+            return Err(KeepError::KeyNotFound(format!(
+                "share {} not found",
+                identifier
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
+    let mut data = [0u8; 34];
+    data[..32].copy_from_slice(group_pubkey);
+    data[32..34].copy_from_slice(&identifier.to_le_bytes());
+    crypto::blake2b_256(&data)
 }
 
 impl Drop for Storage {

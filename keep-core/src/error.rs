@@ -37,6 +37,9 @@ pub enum KeepError {
     #[error("Keep not found at {0}")]
     NotFound(String),
 
+    #[error("FROST error: {0}")]
+    Frost(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -11,7 +11,7 @@ use keep_core::error::{KeepError, Result};
 use keep_core::keyring::Keyring;
 
 use crate::bunker::generate_bunker_url;
-use crate::signer::{AuditLog, PermissionManager, SignerHandler};
+use crate::signer::{AuditLog, FrostSigner, PermissionManager, SignerHandler};
 use crate::tui::{LogEntry, TuiEvent};
 
 pub struct Server {
@@ -29,7 +29,21 @@ impl Server {
         relay_url: &str,
         tui_tx: Option<Sender<TuiEvent>>,
     ) -> Result<Self> {
-        let keys = {
+        Self::new_with_frost(keyring, None, None, relay_url, tui_tx).await
+    }
+
+    pub async fn new_with_frost(
+        keyring: Arc<Mutex<Keyring>>,
+        frost_signer: Option<FrostSigner>,
+        transport_secret: Option<[u8; 32]>,
+        relay_url: &str,
+        tui_tx: Option<Sender<TuiEvent>>,
+    ) -> Result<Self> {
+        let keys = if let Some(secret_bytes) = transport_secret {
+            let secret = SecretKey::from_slice(&secret_bytes)
+                .map_err(|e| KeepError::Other(format!("Invalid transport key: {}", e)))?;
+            Keys::new(secret)
+        } else {
             let kr = keyring.lock().await;
             let slot = kr
                 .get_primary()
@@ -50,21 +64,36 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
-        let handler = Arc::new(SignerHandler::new(
-            keyring,
-            permissions,
-            audit,
-            tui_tx.clone(),
-        ));
+        let mut handler = SignerHandler::new(keyring, permissions, audit, tui_tx.clone());
+        if let Some(frost) = frost_signer {
+            handler = handler.with_frost_signer(frost);
+        }
 
         Ok(Self {
             keys,
             relay_url: relay_url.to_string(),
             client,
-            handler,
+            handler: Arc::new(handler),
             running: false,
             tui_tx,
         })
+    }
+
+    pub async fn new_frost(
+        frost_signer: FrostSigner,
+        transport_secret: [u8; 32],
+        relay_url: &str,
+        tui_tx: Option<Sender<TuiEvent>>,
+    ) -> Result<Self> {
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        Self::new_with_frost(
+            keyring,
+            Some(frost_signer),
+            Some(transport_secret),
+            relay_url,
+            tui_tx,
+        )
+        .await
     }
 
     pub fn bunker_url(&self) -> String {

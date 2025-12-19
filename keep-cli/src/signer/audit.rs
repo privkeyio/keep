@@ -92,6 +92,7 @@ impl AuditEntry {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct AuditLog {
     entries: VecDeque<AuditEntry>,
     max_entries: usize,
