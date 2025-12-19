@@ -17,9 +17,10 @@ rand = "0.8"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 secrecy = "0.10"
 subtle = "2.5"
+memsecurity = { version = "3", features = ["encryption", "symm_asymm"] }
 
 # Storage
-heed = "0.20"
+redb = "2.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

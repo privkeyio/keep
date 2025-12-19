@@ -1,13 +1,16 @@
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use heed::types::*;
-use heed::{Database, Env, EnvOpenOptions};
+use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, trace};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result};
 use crate::keys::KeyRecord;
+
+const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 
 const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
@@ -107,7 +110,7 @@ pub struct Storage {
     path: PathBuf,
     header: Header,
     data_key: Option<SecretKey>,
-    env: Option<Env>,
+    db: Option<Database>,
 }
 
 impl Storage {
@@ -124,32 +127,36 @@ impl Storage {
 
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
 
-        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key");
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
 
-        let encrypted = crypto::encrypt(data_key.as_bytes(), &header_key)?;
+        let data_key_bytes = data_key.decrypt()?;
+        let encrypted = crypto::encrypt(data_key_bytes.expose_borrowed(), &header_key)?;
         header.nonce.copy_from_slice(&encrypted.nonce);
         header.encrypted_data_key.copy_from_slice(&encrypted.ciphertext);
 
         let header_path = path.join("keep.hdr");
         fs::write(&header_path, header.to_bytes())?;
 
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(100 * 1024 * 1024)
-                .max_dbs(10)
-                .open(path)?
-        };
+        let db_path = path.join("keep.db");
+        let db = Database::create(&db_path)
+            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
 
-        let mut wtxn = env.write_txn()?;
-        let _: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("keys"))?;
-        let _: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
-        wtxn.commit()?;
+        {
+            let wtxn = db.begin_write()
+                .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+            {
+                let _ = wtxn.open_table(KEYS_TABLE)
+                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            }
+            wtxn.commit()
+                .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
             header,
             data_key: Some(data_key),
-            env: Some(env),
+            db: Some(db),
         })
     }
 
@@ -173,7 +180,7 @@ impl Storage {
             path: path.to_path_buf(),
             header,
             data_key: None,
-            env: None,
+            db: None,
         })
     }
 
@@ -189,7 +196,7 @@ impl Storage {
             self.header.argon2_params(),
         )?;
 
-        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key");
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
 
         let encrypted = EncryptedData {
             nonce: self.header.nonce,
@@ -198,17 +205,15 @@ impl Storage {
 
         debug!("decrypting data key");
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        self.data_key = Some(SecretKey::from_slice(decrypted.as_slice())?);
+        let decrypted_bytes = decrypted.as_slice();
+        self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
-        debug!(path = ?self.path, "opening LMDB");
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(100 * 1024 * 1024)
-                .max_dbs(10)
-                .open(&self.path)?
-        };
+        debug!(path = ?self.path, "opening database");
+        let db_path = self.path.join("keep.db");
+        let db = Database::open(&db_path)
+            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
 
-        self.env = Some(env);
+        self.db = Some(db);
         debug!("storage unlocked");
 
         Ok(())
@@ -216,7 +221,7 @@ impl Storage {
 
     pub fn lock(&mut self) {
         self.data_key = None;
-        self.env = None;
+        self.db = None;
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -230,19 +235,24 @@ impl Storage {
     pub fn store_key(&self, record: &KeyRecord) -> Result<()> {
         debug!(name = %record.name, "storing key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let env = self.env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized =
-            bincode::serialize(record).map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+        let serialized = bincode::serialize(record)
+            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let mut wtxn = env.write_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env
-            .create_database(&mut wtxn, Some("keys"))?;
-        keys_db.put(&mut wtxn, &record.id, &encrypted_bytes)?;
-        wtxn.commit()?;
+        let wtxn = db.begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        {
+            let mut table = wtxn.open_table(KEYS_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())
+                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
 
         Ok(())
     }
@@ -250,40 +260,46 @@ impl Storage {
     pub fn load_key(&self, id: &[u8; 32]) -> Result<KeyRecord> {
         trace!(id = %hex::encode(id), "loading key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let env = self.env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = env.read_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env
-            .open_database(&rtxn, Some("keys"))?
-            .ok_or(KeepError::Other("Keys database not found".into()))?;
-        let encrypted_bytes = keys_db
-            .get(&rtxn, id)?
+        let rtxn = db.begin_read()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let table = rtxn.open_table(KEYS_TABLE)
+            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+
+        let encrypted_bytes = table.get(id.as_slice())
+            .map_err(|e| KeepError::Other(format!("Get error: {}", e)))?
             .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))?;
 
-        let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
+        let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-        bincode::deserialize(decrypted.as_slice()).map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
+        let decrypted_bytes = decrypted.as_slice();
+        bincode::deserialize(&decrypted_bytes)
+            .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
     }
 
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         trace!("listing keys");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let env = self.env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = env.read_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env
-            .open_database(&rtxn, Some("keys"))?
-            .ok_or(KeepError::Other("Keys database not found".into()))?;
+        let rtxn = db.begin_read()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let table = rtxn.open_table(KEYS_TABLE)
+            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
 
         let mut records = Vec::new();
 
-        for result in keys_db.iter(&rtxn)? {
-            let (_, encrypted_bytes) = result?;
-            let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
+        for result in table.iter()
+            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))? {
+            let (_, encrypted_bytes) = result
+                .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+            let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let record: KeyRecord = bincode::deserialize(decrypted.as_slice())
+            let decrypted_bytes = decrypted.as_slice();
+            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 
             records.push(record);
@@ -294,13 +310,20 @@ impl Storage {
 
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting key");
-        let env = self.env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let mut wtxn = env.write_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env
-            .create_database(&mut wtxn, Some("keys"))?;
-        let existed = keys_db.delete(&mut wtxn, id)?;
-        wtxn.commit()?;
+        let wtxn = db.begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let existed;
+        {
+            let mut table = wtxn.open_table(KEYS_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            existed = table.remove(id.as_slice())
+                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
+                .is_some();
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
 
         if !existed {
             return Err(KeepError::KeyNotFound(hex::encode(id)));

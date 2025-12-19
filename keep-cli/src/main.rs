@@ -10,6 +10,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Password};
 use nostr_sdk::prelude::ToBech32;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -22,27 +23,29 @@ use keep_core::{default_keep_path, Keep};
 use crate::output::Output;
 use crate::server::Server;
 
-fn get_password(prompt: &str) -> String {
+fn get_password(prompt: &str) -> SecretString {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
         debug!("using password from KEEP_PASSWORD env var");
-        return pw;
+        return SecretString::from(pw);
     }
-    Password::with_theme(&ColorfulTheme::default())
+    let pw = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .interact()
-        .unwrap()
+        .unwrap();
+    SecretString::from(pw)
 }
 
-fn get_password_with_confirm(prompt: &str, confirm: &str) -> String {
+fn get_password_with_confirm(prompt: &str, confirm: &str) -> SecretString {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
         debug!("using password from KEEP_PASSWORD env var");
-        return pw;
+        return SecretString::from(pw);
     }
-    Password::with_theme(&ColorfulTheme::default())
+    let pw = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .with_confirmation(confirm, "Passwords don't match")
         .interact()
-        .unwrap()
+        .unwrap();
+    SecretString::from(pw)
 }
 
 fn get_confirm(prompt: &str) -> bool {
@@ -106,7 +109,25 @@ enum Commands {
     },
 }
 
+fn setup_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+}
+
 fn main() {
+    setup_panic_hook();
+
+    ctrlc::set_handler(|| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        std::process::exit(130);
+    })
+    .ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -156,30 +177,31 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
 
     let outer_password = get_password_with_confirm(outer_prompt, outer_confirm);
 
-    if outer_password.len() < 8 {
+    if outer_password.expose_secret().len() < 8 {
         return Err(KeepError::Other("Password must be at least 8 characters".into()));
     }
 
-    let hidden_password = if hidden {
+    let hidden_password: Option<SecretString> = if hidden {
         out.newline();
         let hp = if let Ok(hp_env) = std::env::var("KEEP_HIDDEN_PASSWORD") {
             debug!("using hidden password from KEEP_HIDDEN_PASSWORD env var");
-            hp_env
+            SecretString::from(hp_env)
         } else {
-            Password::with_theme(&ColorfulTheme::default())
+            let pw = Password::with_theme(&ColorfulTheme::default())
                 .with_prompt("Enter HIDDEN password (must be different!)")
                 .with_confirmation("Confirm HIDDEN password", "Passwords don't match")
                 .interact()
-                .unwrap()
+                .unwrap();
+            SecretString::from(pw)
         };
 
-        if hp == outer_password {
+        if hp.expose_secret() == outer_password.expose_secret() {
             return Err(KeepError::Other(
                 "HIDDEN password must be DIFFERENT from OUTER password!".into(),
             ));
         }
 
-        if hp.len() < 8 {
+        if hp.expose_secret().len() < 8 {
             return Err(KeepError::Other("Password must be at least 8 characters".into()));
         }
 
@@ -196,13 +218,13 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
     if hidden {
         keep_core::hidden::HiddenStorage::create(
             path,
-            &outer_password,
-            hidden_password.as_deref(),
+            outer_password.expose_secret(),
+            hidden_password.as_ref().map(|s| s.expose_secret()),
             total_size,
             0.2,
         )?;
     } else {
-        Keep::create(path, &outer_password)?;
+        Keep::create(path, outer_password.expose_secret())?;
     }
 
     spinner.finish();
@@ -232,7 +254,7 @@ fn cmd_generate(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Resul
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let spinner = out.spinner("Generating key...");
@@ -261,7 +283,7 @@ fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let spinner = out.spinner("Generating key...");
@@ -295,7 +317,7 @@ fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     let spinner = out.spinner("Generating key...");
@@ -332,13 +354,13 @@ fn cmd_import(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let nsec = get_password("Enter nsec");
 
     let spinner = out.spinner("Importing key...");
-    let pubkey = keep.import_nsec(&nsec, name)?;
+    let pubkey = keep.import_nsec(nsec.expose_secret(), name)?;
     spinner.finish();
 
     let npub = bytes_to_npub(&pubkey);
@@ -363,13 +385,13 @@ fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let nsec = get_password("Enter nsec");
 
     let spinner = out.spinner("Importing key...");
-    let keypair = NostrKeypair::from_nsec(&nsec)?;
+    let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
@@ -399,13 +421,13 @@ fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     let nsec = get_password("Enter nsec");
 
     let spinner = out.spinner("Importing key...");
-    let keypair = NostrKeypair::from_nsec(&nsec)?;
+    let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
@@ -438,7 +460,7 @@ fn cmd_list(out: &Output, path: &PathBuf, hidden: bool) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let keys = keep.list_keys()?;
@@ -480,7 +502,7 @@ fn cmd_list_outer(out: &Output, path: &PathBuf) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -522,7 +544,7 @@ fn cmd_list_hidden(out: &Output, path: &PathBuf) -> Result<()> {
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -570,7 +592,7 @@ fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let slot = keep
@@ -603,7 +625,7 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -617,7 +639,8 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    secret.copy_from_slice(secret_bytes.as_slice());
+    let decrypted = secret_bytes.as_slice();
+    secret.copy_from_slice(&decrypted);
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
     secret.zeroize();
 
@@ -644,7 +667,7 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -658,7 +681,8 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    secret.copy_from_slice(secret_bytes.as_slice());
+    let decrypted = secret_bytes.as_slice();
+    secret.copy_from_slice(&decrypted);
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
     secret.zeroize();
 
@@ -688,7 +712,7 @@ fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let slot = keep
@@ -722,7 +746,7 @@ fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -757,7 +781,7 @@ fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     let keys = storage.list_keys()?;
@@ -799,7 +823,7 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(&password)?;
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
@@ -865,7 +889,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
     let password = get_password("Enter password");
 
     let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(&password)?;
+    storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
@@ -876,7 +900,8 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        secret.copy_from_slice(secret_bytes.as_slice());
+        let decrypted = secret_bytes.as_slice();
+    secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();
     }
@@ -944,7 +969,7 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
     let password = get_password("Enter HIDDEN password");
 
     let spinner = out.spinner("Unlocking hidden volume...");
-    storage.unlock_hidden(&password)?;
+    storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
     out.hidden_label();
@@ -957,7 +982,8 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        secret.copy_from_slice(secret_bytes.as_slice());
+        let decrypted = secret_bytes.as_slice();
+    secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();
     }

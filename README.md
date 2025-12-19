@@ -71,9 +71,10 @@ KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 - Argon2id key derivation (256MB memory, 4 iterations)
 - XChaCha20-Poly1305 AEAD encryption
 - BLAKE2b checksums
-- LMDB encrypted storage
+- redb encrypted storage (pure Rust, ACID transactions)
+- Keys encrypted in RAM using Ascon-128a (VeraCrypt-style protection)
 - Secure memory handling with zeroize
-- Minimal unsafe code (LMDB only), enforced via `#![forbid(unsafe_code)]`
+- Zero unsafe code - enforced via `#![forbid(unsafe_code)]` in all modules
 - VeraCrypt-style hidden volumes with no detectable markers
 
 ## License

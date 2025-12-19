@@ -1,10 +1,11 @@
+#![forbid(unsafe_code)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use heed::types::*;
-use heed::{Database, Env, EnvOpenOptions};
 use rand::RngCore;
+use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
@@ -14,7 +15,7 @@ use super::header::{
     HiddenHeader, OuterHeader, DATA_START_OFFSET, HEADER_SIZE, HIDDEN_HEADER_OFFSET,
 };
 
-const MIN_LMDB_SIZE: usize = 100 * 1024 * 1024;
+const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeType {
@@ -29,7 +30,7 @@ pub struct HiddenStorage {
     outer_key: Option<SecretKey>,
     hidden_key: Option<SecretKey>,
     active_volume: Option<VolumeType>,
-    outer_env: Option<Env>,
+    outer_db: Option<Database>,
 }
 
 impl HiddenStorage {
@@ -59,9 +60,10 @@ impl HiddenStorage {
             &outer_header.salt,
             Argon2Params::DEFAULT,
         )?;
-        let outer_header_key = crypto::derive_subkey(&outer_master_key, b"keep-outer-header");
+        let outer_header_key = crypto::derive_subkey(&outer_master_key, b"keep-outer-header")?;
 
-        let encrypted_outer = crypto::encrypt(outer_data_key.as_bytes(), &outer_header_key)?;
+        let outer_key_bytes = outer_data_key.decrypt()?;
+        let encrypted_outer = crypto::encrypt(outer_key_bytes.expose_borrowed(), &outer_header_key)?;
         outer_header.nonce.copy_from_slice(&encrypted_outer.nonce);
         outer_header
             .encrypted_data_key
@@ -79,9 +81,10 @@ impl HiddenStorage {
 
             let hidden_master_key =
                 crypto::derive_key(hp.as_bytes(), &salt, Argon2Params::DEFAULT)?;
-            let hidden_header_key = crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header");
+            let hidden_header_key = crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
 
-            let encrypted_hidden = crypto::encrypt(hidden_data_key.as_bytes(), &hidden_header_key)?;
+            let hidden_key_bytes = hidden_data_key.decrypt()?;
+            let encrypted_hidden = crypto::encrypt(hidden_key_bytes.expose_borrowed(), &hidden_header_key)?;
             hh.nonce.copy_from_slice(&encrypted_hidden.nonce);
             hh.encrypted_data_key
                 .copy_from_slice(&encrypted_hidden.ciphertext);
@@ -110,7 +113,7 @@ impl HiddenStorage {
                 Argon2Params::DEFAULT,
             )?;
             let hidden_header_enc_key =
-                crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header-enc");
+                crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header-enc")?;
 
             let encrypted_hh = crypto::encrypt(&hh.to_bytes_compact(), &hidden_header_enc_key)?;
 
@@ -138,17 +141,20 @@ impl HiddenStorage {
         file.sync_all()?;
         drop(file);
 
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(MIN_LMDB_SIZE)
-                .max_dbs(10)
-                .open(path)?
-        };
+        let db_path = path.join("keep.db");
+        let db = Database::create(&db_path)
+            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
 
-        let mut wtxn = env.write_txn()?;
-        let _: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("keys"))?;
-        let _: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
-        wtxn.commit()?;
+        {
+            let wtxn = db.begin_write()
+                .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+            {
+                let _ = wtxn.open_table(KEYS_TABLE)
+                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            }
+            wtxn.commit()
+                .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -157,7 +163,7 @@ impl HiddenStorage {
             outer_key: Some(outer_data_key),
             hidden_key: hidden_data_key,
             active_volume: Some(VolumeType::Outer),
-            outer_env: Some(env),
+            outer_db: Some(db),
         })
     }
 
@@ -180,7 +186,7 @@ impl HiddenStorage {
             outer_key: None,
             hidden_key: None,
             active_volume: None,
-            outer_env: None,
+            outer_db: None,
         })
     }
 
@@ -195,7 +201,7 @@ impl HiddenStorage {
             self.outer_header.argon2_params(),
         )?;
 
-        let header_key = crypto::derive_subkey(&master_key, b"keep-outer-header");
+        let header_key = crypto::derive_subkey(&master_key, b"keep-outer-header")?;
 
         let encrypted = EncryptedData {
             nonce: self.outer_header.nonce,
@@ -203,15 +209,14 @@ impl HiddenStorage {
         };
 
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        self.outer_key = Some(SecretKey::from_slice(decrypted.as_slice())?);
+        let decrypted_slice = decrypted.as_slice();
+        self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
 
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(MIN_LMDB_SIZE)
-                .max_dbs(10)
-                .open(&self.path)?
-        };
-        self.outer_env = Some(env);
+        let db_path = self.path.join("keep.db");
+        let db = Database::open(&db_path)
+            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
+
+        self.outer_db = Some(db);
         self.active_volume = Some(VolumeType::Outer);
 
         Ok(())
@@ -235,7 +240,7 @@ impl HiddenStorage {
 
         let master_key = crypto::derive_key(password.as_bytes(), &salt, Argon2Params::DEFAULT)?;
 
-        let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc");
+        let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc")?;
 
         let mut nonce = [0u8; 24];
         nonce.copy_from_slice(&hidden_area[..24]);
@@ -252,13 +257,14 @@ impl HiddenStorage {
             Err(_) => return Err(KeepError::InvalidPassword),
         };
 
-        let hidden_header = HiddenHeader::from_bytes_compact(decrypted.as_slice());
+        let decrypted_bytes = decrypted.as_slice();
+        let hidden_header = HiddenHeader::from_bytes_compact(&decrypted_bytes);
 
         if !hidden_header.verify_checksum() {
             return Err(KeepError::InvalidPassword);
         }
 
-        let data_key_enc = crypto::derive_subkey(&master_key, b"keep-hidden-header");
+        let data_key_enc = crypto::derive_subkey(&master_key, b"keep-hidden-header")?;
 
         let mut data_nonce = [0u8; 24];
         data_nonce.copy_from_slice(&hidden_header.nonce);
@@ -269,7 +275,8 @@ impl HiddenStorage {
         };
 
         let data_key_bytes = crypto::decrypt(&data_encrypted, &data_key_enc)?;
-        self.hidden_key = Some(SecretKey::from_slice(data_key_bytes.as_slice())?);
+        let data_key_slice = data_key_bytes.as_slice();
+        self.hidden_key = Some(SecretKey::from_slice(&data_key_slice)?);
         self.hidden_header = Some(hidden_header);
         self.active_volume = Some(VolumeType::Hidden);
 
@@ -293,7 +300,7 @@ impl HiddenStorage {
         self.hidden_key = None;
         self.hidden_header = None;
         self.active_volume = None;
-        self.outer_env = None;
+        self.outer_db = None;
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -326,7 +333,7 @@ impl HiddenStorage {
 
     fn store_key_outer(&self, record: &KeyRecord) -> Result<()> {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let env = self.outer_env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
         let serialized = bincode::serialize(record)
             .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
@@ -334,10 +341,16 @@ impl HiddenStorage {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let mut wtxn = env.write_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("keys"))?;
-        keys_db.put(&mut wtxn, &record.id, &encrypted_bytes)?;
-        wtxn.commit()?;
+        let wtxn = db.begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        {
+            let mut table = wtxn.open_table(KEYS_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())
+                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
 
         Ok(())
     }
@@ -384,7 +397,8 @@ impl HiddenStorage {
             Err(_) => return Ok(Vec::new()),
         };
 
-        let records: Vec<KeyRecord> = bincode::deserialize(decrypted.as_slice()).unwrap_or_default();
+        let decrypted_bytes = decrypted.as_slice();
+        let records: Vec<KeyRecord> = bincode::deserialize(&decrypted_bytes).unwrap_or_default();
         Ok(records)
     }
 
@@ -435,21 +449,24 @@ impl HiddenStorage {
 
     fn list_keys_outer(&self) -> Result<Vec<KeyRecord>> {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let env = self.outer_env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = env.read_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env
-            .open_database(&rtxn, Some("keys"))?
-            .ok_or(KeepError::Other("Keys database not found".into()))?;
+        let rtxn = db.begin_read()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let table = rtxn.open_table(KEYS_TABLE)
+            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
 
         let mut records = Vec::new();
 
-        for result in keys_db.iter(&rtxn)? {
-            let (_, encrypted_bytes) = result?;
-            let encrypted = EncryptedData::from_bytes(encrypted_bytes)?;
+        for result in table.iter()
+            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))? {
+            let (_, encrypted_bytes) = result
+                .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+            let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let record: KeyRecord = bincode::deserialize(decrypted.as_slice())
+            let decrypted_bytes = decrypted.as_slice();
+            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 
             records.push(record);
@@ -467,12 +484,20 @@ impl HiddenStorage {
     }
 
     fn delete_key_outer(&self, id: &[u8; 32]) -> Result<()> {
-        let env = self.outer_env.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let mut wtxn = env.write_txn()?;
-        let keys_db: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("keys"))?;
-        let existed = keys_db.delete(&mut wtxn, id)?;
-        wtxn.commit()?;
+        let wtxn = db.begin_write()
+            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let existed;
+        {
+            let mut table = wtxn.open_table(KEYS_TABLE)
+                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+            existed = table.remove(id.as_slice())
+                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
+                .is_some();
+        }
+        wtxn.commit()
+            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
 
         if !existed {
             return Err(KeepError::KeyNotFound(hex::encode(id)));

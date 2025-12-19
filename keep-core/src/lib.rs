@@ -155,7 +155,8 @@ impl Keep {
             let secret_bytes = crypto::decrypt(&encrypted, &data_key)?;
 
             let mut secret = [0u8; 32];
-            secret.copy_from_slice(secret_bytes.as_slice());
+            let decrypted = secret_bytes.as_slice();
+            secret.copy_from_slice(&decrypted);
 
             self.keyring
                 .load_key(record.pubkey, secret, record.key_type, record.name)?;
