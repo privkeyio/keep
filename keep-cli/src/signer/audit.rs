@@ -109,12 +109,14 @@ impl AuditLog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn open_file(&mut self, path: &Path) -> std::io::Result<()> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         self.file = Some(file);
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn set_callback<F>(&mut self, callback: F)
     where
         F: Fn(&AuditEntry) + Send + Sync + 'static,
@@ -140,10 +142,12 @@ impl AuditLog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn recent(&self, count: usize) -> impl Iterator<Item = &AuditEntry> {
         self.entries.iter().rev().take(count)
     }
 
+    #[allow(dead_code)]
     pub fn by_app<'a>(&'a self, pubkey: &'a str) -> impl Iterator<Item = &'a AuditEntry> {
         self.entries.iter().filter(move |e| e.app_pubkey == pubkey)
     }

@@ -125,7 +125,7 @@ impl Storage {
 
         let mut header = Header::new(params);
 
-        let data_key = SecretKey::generate();
+        let data_key = SecretKey::generate()?;
 
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
 
@@ -211,7 +211,7 @@ impl Storage {
 
         debug!("decrypting data key");
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        let decrypted_bytes = decrypted.as_slice();
+        let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
         debug!(path = ?self.path, "opening database");
@@ -286,7 +286,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-        let decrypted_bytes = decrypted.as_slice();
+        let decrypted_bytes = decrypted.as_slice()?;
         bincode::deserialize(&decrypted_bytes)
             .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
     }
@@ -314,7 +314,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let decrypted_bytes = decrypted.as_slice();
+            let decrypted_bytes = decrypted.as_slice()?;
             let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 

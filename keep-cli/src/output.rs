@@ -27,6 +27,7 @@ impl Output {
             .write_line(&format!("{} {}", style("✗").red().bold(), msg));
     }
 
+    #[allow(dead_code)]
     pub fn warn(&self, msg: &str) {
         let _ = self
             .term
@@ -188,6 +189,7 @@ impl Spinner {
         self.pb.finish_and_clear();
     }
 
+    #[allow(dead_code)]
     pub fn finish_with(&self, msg: &str) {
         self.pb.finish_with_message(msg.to_string());
     }

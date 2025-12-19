@@ -4,7 +4,7 @@ mod server;
 mod signer;
 mod tui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -23,40 +23,40 @@ use keep_core::{default_keep_path, Keep};
 use crate::output::Output;
 use crate::server::Server;
 
-fn get_password(prompt: &str) -> SecretString {
+fn get_password(prompt: &str) -> Result<SecretString> {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
         debug!("using password from KEEP_PASSWORD env var");
-        return SecretString::from(pw);
+        return Ok(SecretString::from(pw));
     }
     let pw = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .interact()
-        .unwrap();
-    SecretString::from(pw)
+        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
+    Ok(SecretString::from(pw))
 }
 
-fn get_password_with_confirm(prompt: &str, confirm: &str) -> SecretString {
+fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretString> {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
         debug!("using password from KEEP_PASSWORD env var");
-        return SecretString::from(pw);
+        return Ok(SecretString::from(pw));
     }
     let pw = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .with_confirmation(confirm, "Passwords don't match")
         .interact()
-        .unwrap();
-    SecretString::from(pw)
+        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
+    Ok(SecretString::from(pw))
 }
 
-fn get_confirm(prompt: &str) -> bool {
+fn get_confirm(prompt: &str) -> Result<bool> {
     if std::env::var("KEEP_YES").is_ok() {
-        return true;
+        return Ok(true);
     }
     Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .default(false)
         .interact()
-        .unwrap()
+        .map_err(|e| KeepError::Other(format!("Failed to read confirmation: {}", e)))
 }
 
 fn is_hidden_vault(path: &std::path::Path) -> bool {
@@ -160,7 +160,7 @@ fn run(out: &Output) -> Result<()> {
     }
 }
 
-fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<()> {
+fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
     if hidden {
         out.hidden_banner();
     }
@@ -175,7 +175,7 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
         ("Enter password", "Confirm password")
     };
 
-    let outer_password = get_password_with_confirm(outer_prompt, outer_confirm);
+    let outer_password = get_password_with_confirm(outer_prompt, outer_confirm)?;
 
     if outer_password.expose_secret().len() < 8 {
         return Err(KeepError::Other(
@@ -244,7 +244,7 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
     Ok(())
 }
 
-fn cmd_generate(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<()> {
+fn cmd_generate(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_generate_hidden(out, path, name);
     }
@@ -255,7 +255,7 @@ fn cmd_generate(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Resul
     debug!(name, "generating key");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
@@ -276,7 +276,7 @@ fn cmd_generate(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Resul
     Ok(())
 }
 
-fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_generate_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
@@ -284,7 +284,7 @@ fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "generating key in outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
@@ -315,7 +315,7 @@ fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
@@ -323,7 +323,7 @@ fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "generating key in hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -354,7 +354,7 @@ fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<()> {
+fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_import_hidden(out, path, name);
     }
@@ -365,13 +365,13 @@ fn cmd_import(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     debug!(name, "importing key");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec");
+    let nsec = get_password("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let pubkey = keep.import_nsec(nsec.expose_secret(), name)?;
@@ -388,7 +388,7 @@ fn cmd_import(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     Ok(())
 }
 
-fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
@@ -396,13 +396,13 @@ fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "importing key to outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec");
+    let nsec = get_password("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
@@ -429,7 +429,7 @@ fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
@@ -437,13 +437,13 @@ fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "importing key to hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec");
+    let nsec = get_password("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
@@ -470,7 +470,7 @@ fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(out: &Output, path: &PathBuf, hidden: bool) -> Result<()> {
+fn cmd_list(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_list_hidden(out, path);
     }
@@ -481,7 +481,7 @@ fn cmd_list(out: &Output, path: &PathBuf, hidden: bool) -> Result<()> {
     debug!("listing keys");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
@@ -517,13 +517,13 @@ fn cmd_list(out: &Output, path: &PathBuf, hidden: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list_outer(out: &Output, path: &PathBuf) -> Result<()> {
+fn cmd_list_outer(out: &Output, path: &Path) -> Result<()> {
     use keep_core::hidden::HiddenStorage;
 
     debug!("listing keys in outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
@@ -559,13 +559,13 @@ fn cmd_list_outer(out: &Output, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list_hidden(out: &Output, path: &PathBuf) -> Result<()> {
+fn cmd_list_hidden(out: &Output, path: &Path) -> Result<()> {
     use keep_core::hidden::HiddenStorage;
 
     debug!("listing keys in hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -602,7 +602,7 @@ fn cmd_list_hidden(out: &Output, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<()> {
+fn cmd_export(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_export_hidden(out, path, name);
     }
@@ -613,7 +613,7 @@ fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     debug!(name, "exporting key");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
@@ -629,7 +629,7 @@ fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     out.secret_warning();
     out.newline();
 
-    if get_confirm("Display nsec?") {
+    if get_confirm("Display nsec?")? {
         warn!(name, "nsec exported");
         out.newline();
         out.info(&keypair.to_nsec());
@@ -638,7 +638,7 @@ fn cmd_export(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     Ok(())
 }
 
-fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_export_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto::{self, EncryptedData};
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::NostrKeypair;
@@ -646,7 +646,7 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "exporting key from outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
@@ -663,7 +663,7 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    let decrypted = secret_bytes.as_slice();
+    let decrypted = secret_bytes.as_slice()?;
     secret.copy_from_slice(&decrypted);
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
     secret.zeroize();
@@ -671,7 +671,7 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     out.secret_warning();
     out.newline();
 
-    if get_confirm("Display nsec?") {
+    if get_confirm("Display nsec?")? {
         warn!(name, "nsec exported from outer volume");
         out.newline();
         out.info(&keypair.to_nsec());
@@ -680,7 +680,7 @@ fn cmd_export_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto::{self, EncryptedData};
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::NostrKeypair;
@@ -688,7 +688,7 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     debug!(name, "exporting key from hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -705,7 +705,7 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
 
     let mut secret = [0u8; 32];
-    let decrypted = secret_bytes.as_slice();
+    let decrypted = secret_bytes.as_slice()?;
     secret.copy_from_slice(&decrypted);
     let keypair = NostrKeypair::from_secret_bytes(&secret)?;
     secret.zeroize();
@@ -713,7 +713,7 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     out.secret_warning();
     out.newline();
 
-    if get_confirm("Display nsec?") {
+    if get_confirm("Display nsec?")? {
         warn!(name, "nsec exported from hidden volume");
         out.newline();
         out.info(&keypair.to_nsec());
@@ -722,7 +722,7 @@ fn cmd_export_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<()> {
+fn cmd_delete(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_delete_hidden(out, path, name);
     }
@@ -733,7 +733,7 @@ fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     debug!(name, "deleting key");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
@@ -746,7 +746,7 @@ fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
 
     let pubkey = slot.pubkey;
 
-    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name)) {
+    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name))? {
         out.info("Cancelled.");
         return Ok(());
     }
@@ -760,14 +760,14 @@ fn cmd_delete(out: &Output, path: &PathBuf, name: &str, hidden: bool) -> Result<
     Ok(())
 }
 
-fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_delete_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
 
     debug!(name, "deleting key from outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
@@ -781,7 +781,7 @@ fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
 
     let id = crypto::blake2b_256(&record.pubkey);
 
-    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name)) {
+    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name))? {
         out.info("Cancelled.");
         return Ok(());
     }
@@ -795,14 +795,14 @@ fn cmd_delete_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
+fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
 
     debug!(name, "deleting key from hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -819,7 +819,7 @@ fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     if !get_confirm(&format!(
         "Delete key '{}' from hidden volume? This cannot be undone!",
         name
-    )) {
+    ))? {
         out.info("Cancelled.");
         return Ok(());
     }
@@ -833,13 +833,7 @@ fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(
-    out: &Output,
-    path: &PathBuf,
-    relay: &str,
-    headless: bool,
-    hidden: bool,
-) -> Result<()> {
+fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_serve_hidden(out, path, relay, headless);
     }
@@ -850,7 +844,7 @@ fn cmd_serve(
     debug!(relay, headless, "starting server");
 
     let mut keep = Keep::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
@@ -914,7 +908,7 @@ fn cmd_serve(
     Ok(())
 }
 
-fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) -> Result<()> {
+fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
     use keep_core::crypto::{self, EncryptedData};
     use keep_core::hidden::HiddenStorage;
     use keep_core::keyring::Keyring;
@@ -922,7 +916,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
     debug!(relay, headless, "starting server from outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password");
+    let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
@@ -936,7 +930,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        let decrypted = secret_bytes.as_slice();
+        let decrypted = secret_bytes.as_slice()?;
         secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();
@@ -1000,7 +994,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
     Ok(())
 }
 
-fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -> Result<()> {
+fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
     use keep_core::crypto::{self, EncryptedData};
     use keep_core::hidden::HiddenStorage;
     use keep_core::keyring::Keyring;
@@ -1008,7 +1002,7 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
     debug!(relay, headless, "starting server from hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password");
+    let password = get_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -1024,7 +1018,7 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
         let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
-        let decrypted = secret_bytes.as_slice();
+        let decrypted = secret_bytes.as_slice()?;
         secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();

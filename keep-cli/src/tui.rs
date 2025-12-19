@@ -40,6 +40,7 @@ impl LogEntry {
     }
 }
 
+#[allow(dead_code)]
 pub struct ApprovalRequest {
     pub id: u64,
     pub app: String,
@@ -49,6 +50,7 @@ pub struct ApprovalRequest {
     pub response_tx: Sender<bool>,
 }
 
+#[allow(dead_code)]
 pub enum TuiEvent {
     Log(LogEntry),
     Approval(ApprovalRequest),

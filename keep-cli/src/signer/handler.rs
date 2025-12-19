@@ -16,6 +16,7 @@ use super::audit::{AuditAction, AuditEntry, AuditLog};
 use super::permissions::{Permission, PermissionManager};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ApprovalRequest {
     pub app_pubkey: PublicKey,
     pub app_name: String,

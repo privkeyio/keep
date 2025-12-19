@@ -45,16 +45,35 @@ impl HiddenStorage {
             return Err(KeepError::AlreadyExists(path.display().to_string()));
         }
 
+        if !(0.0..=1.0).contains(&hidden_ratio) {
+            return Err(KeepError::Other(format!(
+                "hidden_ratio must be between 0.0 and 1.0, got {}",
+                hidden_ratio
+            )));
+        }
+
         let hidden_size = if hidden_password.is_some() {
             ((total_size as f64) * (hidden_ratio as f64)) as u64
         } else {
             0
         };
+
+        let required_min = DATA_START_OFFSET
+            .checked_add(hidden_size)
+            .ok_or_else(|| KeepError::Other("Volume size overflow".into()))?;
+
+        if total_size < required_min {
+            return Err(KeepError::Other(format!(
+                "Total size {} too small, need at least {} bytes (header: {}, hidden: {})",
+                total_size, required_min, DATA_START_OFFSET, hidden_size
+            )));
+        }
+
         let outer_size = total_size - DATA_START_OFFSET - hidden_size;
 
         let mut outer_header = OuterHeader::new(Argon2Params::DEFAULT, outer_size, total_size);
 
-        let outer_data_key = SecretKey::generate();
+        let outer_data_key = SecretKey::generate()?;
         let outer_master_key = crypto::derive_key(
             outer_password.as_bytes(),
             &outer_header.salt,
@@ -70,18 +89,16 @@ impl HiddenStorage {
             .encrypted_data_key
             .copy_from_slice(&encrypted_outer.ciphertext);
 
-        let (hidden_header, hidden_data_key) = if let Some(hp) = hidden_password {
+        let (hidden_header, hidden_data_key, hidden_kdf_salt) = if let Some(hp) = hidden_password {
             let hidden_offset = DATA_START_OFFSET + outer_size;
             let mut hh = HiddenHeader::new(hidden_offset, hidden_size);
 
-            let hidden_data_key = SecretKey::generate();
+            let hidden_data_key = SecretKey::generate()?;
 
-            let hidden_salt = crypto::blake2b_256(hp.as_bytes());
-            let mut salt = [0u8; 32];
-            salt.copy_from_slice(&hidden_salt);
+            let kdf_salt: [u8; 32] = crypto::random_bytes();
 
             let hidden_master_key =
-                crypto::derive_key(hp.as_bytes(), &salt, Argon2Params::DEFAULT)?;
+                crypto::derive_key(hp.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
             let hidden_header_key =
                 crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
 
@@ -94,9 +111,9 @@ impl HiddenStorage {
 
             hh.checksum = hh.compute_checksum();
 
-            (Some(hh), Some(hidden_data_key))
+            (Some(hh), Some(hidden_data_key), Some(kdf_salt))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         fs::create_dir_all(path)?;
@@ -106,13 +123,11 @@ impl HiddenStorage {
         file.write_all(&outer_header.to_bytes())?;
 
         if let Some(ref hh) = hidden_header {
-            let hidden_salt = crypto::blake2b_256(hidden_password.unwrap().as_bytes());
-            let mut salt = [0u8; 32];
-            salt.copy_from_slice(&hidden_salt);
+            let kdf_salt = hidden_kdf_salt.unwrap();
 
             let hidden_master_key = crypto::derive_key(
                 hidden_password.unwrap().as_bytes(),
-                &salt,
+                &kdf_salt,
                 Argon2Params::DEFAULT,
             )?;
             let hidden_header_enc_key =
@@ -121,8 +136,9 @@ impl HiddenStorage {
             let encrypted_hh = crypto::encrypt(&hh.to_bytes_compact(), &hidden_header_enc_key)?;
 
             let mut hidden_area: [u8; HEADER_SIZE] = crypto::random_bytes();
-            hidden_area[..24].copy_from_slice(&encrypted_hh.nonce);
-            hidden_area[24..24 + encrypted_hh.ciphertext.len()]
+            hidden_area[..32].copy_from_slice(&kdf_salt);
+            hidden_area[32..56].copy_from_slice(&encrypted_hh.nonce);
+            hidden_area[56..56 + encrypted_hh.ciphertext.len()]
                 .copy_from_slice(&encrypted_hh.ciphertext);
             file.write_all(&hidden_area)?;
         } else {
@@ -214,7 +230,7 @@ impl HiddenStorage {
         };
 
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
-        let decrypted_slice = decrypted.as_slice();
+        let decrypted_slice = decrypted.as_slice()?;
         self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
 
         let db_path = self.path.join("keep.db");
@@ -239,22 +255,21 @@ impl HiddenStorage {
         let mut hidden_area = [0u8; HEADER_SIZE];
         file.read_exact(&mut hidden_area)?;
 
-        let hidden_salt = crypto::blake2b_256(password.as_bytes());
-        let mut salt = [0u8; 32];
-        salt.copy_from_slice(&hidden_salt);
+        let mut kdf_salt = [0u8; 32];
+        kdf_salt.copy_from_slice(&hidden_area[..32]);
 
-        let master_key = crypto::derive_key(password.as_bytes(), &salt, Argon2Params::DEFAULT)?;
+        let master_key = crypto::derive_key(password.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
 
         let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc")?;
 
         let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&hidden_area[..24]);
+        nonce.copy_from_slice(&hidden_area[32..56]);
 
-        const ENCRYPTED_HEADER_SIZE: usize = HiddenHeader::COMPACT_SIZE + 16;
+        const ENCRYPTED_HEADER_SIZE: usize = HiddenHeader::COMPACT_SIZE + crypto::TAG_SIZE;
 
         let encrypted = EncryptedData {
             nonce,
-            ciphertext: hidden_area[24..24 + ENCRYPTED_HEADER_SIZE].to_vec(),
+            ciphertext: hidden_area[56..56 + ENCRYPTED_HEADER_SIZE].to_vec(),
         };
 
         let decrypted = match crypto::decrypt(&encrypted, &header_enc_key) {
@@ -262,8 +277,8 @@ impl HiddenStorage {
             Err(_) => return Err(KeepError::InvalidPassword),
         };
 
-        let decrypted_bytes = decrypted.as_slice();
-        let hidden_header = HiddenHeader::from_bytes_compact(&decrypted_bytes);
+        let decrypted_bytes = decrypted.as_slice()?;
+        let hidden_header = HiddenHeader::from_bytes_compact(&decrypted_bytes)?;
 
         if !hidden_header.verify_checksum() {
             return Err(KeepError::InvalidPassword);
@@ -280,7 +295,7 @@ impl HiddenStorage {
         };
 
         let data_key_bytes = crypto::decrypt(&data_encrypted, &data_key_enc)?;
-        let data_key_slice = data_key_bytes.as_slice();
+        let data_key_slice = data_key_bytes.as_slice()?;
         self.hidden_key = Some(SecretKey::from_slice(&data_key_slice)?);
         self.hidden_header = Some(hidden_header);
         self.active_volume = Some(VolumeType::Hidden);
@@ -405,8 +420,20 @@ impl HiddenStorage {
             Err(_) => return Ok(Vec::new()),
         };
 
-        let decrypted_bytes = decrypted.as_slice();
-        let records: Vec<KeyRecord> = bincode::deserialize(&decrypted_bytes).unwrap_or_default();
+        let decrypted_bytes = match decrypted.as_slice() {
+            Ok(d) => d,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let records: Vec<KeyRecord> = match bincode::deserialize(&decrypted_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to deserialize hidden records (possible data corruption or wrong password)"
+                );
+                Vec::new()
+            }
+        };
         Ok(records)
     }
 
@@ -477,7 +504,7 @@ impl HiddenStorage {
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
-            let decrypted_bytes = decrypted.as_slice();
+            let decrypted_bytes = decrypted.as_slice()?;
             let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
 

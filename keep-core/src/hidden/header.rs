@@ -231,11 +231,19 @@ impl HiddenHeader {
 
     pub const COMPACT_SIZE: usize = 2 + 2 + SALT_SIZE + 24 + 48 + 4 + 8 + 8 + 32;
 
-    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Self {
+    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
         Self::from_bytes_compact(bytes)
     }
 
-    pub fn from_bytes_compact(bytes: &[u8]) -> Self {
+    pub fn from_bytes_compact(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::COMPACT_SIZE {
+            return Err(KeepError::Other(format!(
+                "Hidden header too short: {} bytes, expected at least {}",
+                bytes.len(),
+                Self::COMPACT_SIZE
+            )));
+        }
+
         let mut salt = [0u8; SALT_SIZE];
         salt.copy_from_slice(&bytes[4..4 + SALT_SIZE]);
 
@@ -250,22 +258,30 @@ impl HiddenHeader {
         let mut checksum = [0u8; 32];
         checksum.copy_from_slice(&bytes[offset + 20..offset + 52]);
 
-        Self {
+        Ok(Self {
             version: u16::from_le_bytes([bytes[0], bytes[1]]),
             reserved: u16::from_le_bytes([bytes[2], bytes[3]]),
             salt,
             nonce,
             encrypted_data_key,
-            _align_pad: u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+            _align_pad: u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: align_pad".into()))?,
+            ),
             hidden_data_offset: u64::from_le_bytes(
-                bytes[offset + 4..offset + 12].try_into().unwrap(),
+                bytes[offset + 4..offset + 12]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: data_offset".into()))?,
             ),
             hidden_data_size: u64::from_le_bytes(
-                bytes[offset + 12..offset + 20].try_into().unwrap(),
+                bytes[offset + 12..offset + 20]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: data_size".into()))?,
             ),
             checksum,
             padding: [0; 352],
-        }
+        })
     }
 }
 
@@ -293,7 +309,7 @@ mod tests {
     fn test_hidden_header_roundtrip() {
         let header = HiddenHeader::new(1024, 500);
         let bytes = header.to_bytes();
-        let parsed = HiddenHeader::from_bytes(&bytes);
+        let parsed = HiddenHeader::from_bytes(&bytes).unwrap();
 
         assert_eq!(parsed.version, header.version);
         assert_eq!(parsed.salt, header.salt);

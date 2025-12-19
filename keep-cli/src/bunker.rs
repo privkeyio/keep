@@ -15,6 +15,7 @@ pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&
     url
 }
 
+#[cfg(test)]
 pub fn parse_bunker_url(
     bunker_url: &str,
 ) -> Result<(PublicKey, Vec<String>, Option<String>), String> {

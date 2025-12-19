@@ -325,6 +325,7 @@ impl Server {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn stop(&mut self) {
         self.running = false;
         self.client.disconnect().await.ok();

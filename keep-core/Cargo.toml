@@ -32,7 +32,7 @@ hex = "0.4"
 thiserror = "1.0"
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.39", features = ["serde"] }
 
 # Paths
 dirs = "5.0"

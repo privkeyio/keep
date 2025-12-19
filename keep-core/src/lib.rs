@@ -1,7 +1,7 @@
 //! Keep Core - Sovereign key management for Nostr and Bitcoin
 //!
 //! This crate provides the core library functionality for Keep:
-//! - Encrypted storage using LMDB with XChaCha20-Poly1305
+//! - Encrypted storage using Redb with XChaCha20-Poly1305
 //! - Key derivation using Argon2id
 //! - Nostr keypair management
 //! - Hidden volumes for plausible deniability
@@ -173,7 +173,7 @@ impl Keep {
             let secret_bytes = crypto::decrypt(&encrypted, &data_key)?;
 
             let mut secret = [0u8; 32];
-            let decrypted = secret_bytes.as_slice();
+            let decrypted = secret_bytes.as_slice()?;
             secret.copy_from_slice(&decrypted);
 
             self.keyring

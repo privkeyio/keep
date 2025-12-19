@@ -67,6 +67,7 @@ impl PermissionManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn grant(&mut self, pubkey: PublicKey, name: String, permissions: Permission) {
         if let Some(app) = self.apps.get_mut(&pubkey) {
             app.permissions |= permissions;
@@ -84,6 +85,7 @@ impl PermissionManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn revoke(&mut self, pubkey: &PublicKey) {
         self.apps.remove(pubkey);
     }
@@ -95,6 +97,7 @@ impl PermissionManager {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self, pubkey: &PublicKey) -> bool {
         self.apps.contains_key(pubkey)
     }
@@ -124,10 +127,12 @@ impl PermissionManager {
         self.apps.get(pubkey)
     }
 
+    #[allow(dead_code)]
     pub fn list_apps(&self) -> impl Iterator<Item = &AppPermission> {
         self.apps.values()
     }
 
+    #[allow(dead_code)]
     pub fn set_auto_approve_kinds(&mut self, kinds: HashSet<Kind>) {
         self.global_auto_approve = kinds;
     }

@@ -65,7 +65,7 @@ KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 - XChaCha20-Poly1305 AEAD encryption
 - BLAKE2b checksums
 - redb encrypted storage (pure Rust, ACID transactions)
-- Keys encrypted in RAM using Ascon-128a (VeraCrypt-style protection)
+- Keys encrypted in RAM using Ascon-128a via the memsecurity crate
 - Secure memory handling with zeroize
 - Zero unsafe code - enforced via `#![forbid(unsafe_code)]` in all modules
 - VeraCrypt-style hidden volumes with no detectable markers
