@@ -152,7 +152,7 @@ impl HiddenStorage {
 
         while written < remaining {
             let to_write = ((remaining - written) as usize).min(buffer.len());
-            rand::thread_rng().fill_bytes(&mut buffer[..to_write]);
+            rand::rng().fill_bytes(&mut buffer[..to_write]);
             file.write_all(&buffer[..to_write])?;
             written += to_write as u64;
         }
@@ -465,7 +465,7 @@ impl HiddenStorage {
         let mut written = 0u64;
         while written < remaining {
             let to_write = ((remaining - written) as usize).min(buffer.len());
-            rand::thread_rng().fill_bytes(&mut buffer[..to_write]);
+            rand::rng().fill_bytes(&mut buffer[..to_write]);
             file.write_all(&buffer[..to_write])?;
             written += to_write as u64;
         }

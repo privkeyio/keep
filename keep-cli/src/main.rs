@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use zeroize::Zeroize;
 
 use keep_core::error::{KeepError, Result};
+use keep_core::frost::ShareExport;
 use keep_core::keys::bytes_to_npub;
 use keep_core::{default_keep_path, Keep};
 
@@ -107,6 +108,46 @@ enum Commands {
         #[arg(long)]
         headless: bool,
     },
+    Frost {
+        #[command(subcommand)]
+        command: FrostCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum FrostCommands {
+    Generate {
+        #[arg(short, long, default_value = "2")]
+        threshold: u16,
+        #[arg(short, long, default_value = "3")]
+        shares: u16,
+        #[arg(short, long, default_value = "default")]
+        name: String,
+    },
+    Split {
+        #[arg(short, long)]
+        key: String,
+        #[arg(short, long, default_value = "2")]
+        threshold: u16,
+        #[arg(short, long, default_value = "3")]
+        shares: u16,
+    },
+    List,
+    Export {
+        #[arg(short, long)]
+        share: u16,
+        #[arg(short, long)]
+        group: String,
+    },
+    Import,
+    Sign {
+        #[arg(short, long)]
+        message: String,
+        #[arg(short, long)]
+        group: String,
+        #[arg(long)]
+        interactive: bool,
+    },
 }
 
 fn setup_panic_hook() {
@@ -157,7 +198,466 @@ fn run(out: &Output) -> Result<()> {
         Commands::Export { name } => cmd_export(out, &path, &name, hidden),
         Commands::Delete { name } => cmd_delete(out, &path, &name, hidden),
         Commands::Serve { relay, headless } => cmd_serve(out, &path, &relay, headless, hidden),
+        Commands::Frost { command } => cmd_frost(out, &path, command),
     }
+}
+
+fn cmd_frost(out: &Output, path: &Path, command: FrostCommands) -> Result<()> {
+    match command {
+        FrostCommands::Generate {
+            threshold,
+            shares,
+            name,
+        } => cmd_frost_generate(out, path, threshold, shares, &name),
+        FrostCommands::Split {
+            key,
+            threshold,
+            shares,
+        } => cmd_frost_split(out, path, &key, threshold, shares),
+        FrostCommands::List => cmd_frost_list(out, path),
+        FrostCommands::Export { share, group } => cmd_frost_export(out, path, share, &group),
+        FrostCommands::Import => cmd_frost_import(out, path),
+        FrostCommands::Sign {
+            message,
+            group,
+            interactive,
+        } => cmd_frost_sign(out, path, &message, &group, interactive),
+    }
+}
+
+fn cmd_frost_generate(
+    out: &Output,
+    path: &Path,
+    threshold: u16,
+    total_shares: u16,
+    name: &str,
+) -> Result<()> {
+    debug!(threshold, total_shares, name, "generating FROST key");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let spinner = out.spinner("Generating FROST key shares...");
+    let shares = keep.frost_generate(threshold, total_shares, name)?;
+    spinner.finish();
+
+    if shares.is_empty() {
+        return Err(KeepError::Frost(
+            "no shares returned from frost_generate".into(),
+        ));
+    }
+
+    let group_pubkey = shares[0].group_pubkey();
+    let npub = bytes_to_npub(group_pubkey);
+
+    out.newline();
+    out.success("Generated FROST key group!");
+    out.field("Name", name);
+    out.key_field("Pubkey", &npub);
+    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.newline();
+
+    for share in &shares {
+        out.info(&format!(
+            "Share {}: stored locally",
+            share.metadata.identifier
+        ));
+    }
+
+    out.newline();
+    out.warn("BACKUP: Export shares to different locations for recovery!");
+
+    Ok(())
+}
+
+fn cmd_frost_split(
+    out: &Output,
+    path: &Path,
+    key_name: &str,
+    threshold: u16,
+    total_shares: u16,
+) -> Result<()> {
+    debug!(
+        key_name,
+        threshold, total_shares, "splitting key into FROST shares"
+    );
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let spinner = out.spinner("Splitting key into FROST shares...");
+    let shares = keep.frost_split(key_name, threshold, total_shares)?;
+    spinner.finish();
+
+    if shares.is_empty() {
+        return Err(KeepError::Frost(
+            "no shares returned from frost_split".into(),
+        ));
+    }
+
+    let group_pubkey = shares[0].group_pubkey();
+    let npub = bytes_to_npub(group_pubkey);
+
+    out.newline();
+    out.success("Split key into FROST shares!");
+    out.key_field("Pubkey (preserved)", &npub);
+    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.newline();
+
+    for share in &shares {
+        out.info(&format!(
+            "Share {}: stored locally",
+            share.metadata.identifier
+        ));
+    }
+
+    out.newline();
+    out.warn("BACKUP: Export shares to different locations for recovery!");
+
+    Ok(())
+}
+
+fn cmd_frost_list(out: &Output, path: &Path) -> Result<()> {
+    debug!("listing FROST shares");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let shares = keep.frost_list_shares()?;
+
+    if shares.is_empty() {
+        out.newline();
+        out.info("No FROST shares found. Use 'keep frost generate' to create some.");
+        return Ok(());
+    }
+
+    out.table_header(&[("NAME", 16), ("ID", 6), ("THRESHOLD", 12), ("PUBKEY", 28)]);
+
+    for share in &shares {
+        let npub = bytes_to_npub(&share.metadata.group_pubkey);
+        let display_npub = if npub.len() > 24 {
+            format!("{}...", &npub[..24])
+        } else {
+            npub
+        };
+        out.table_row(&[
+            (&share.metadata.name, 16, false),
+            (&share.metadata.identifier.to_string(), 6, false),
+            (
+                &format!(
+                    "{}-of-{}",
+                    share.metadata.threshold, share.metadata.total_shares
+                ),
+                12,
+                false,
+            ),
+            (&display_npub, 28, true),
+        ]);
+    }
+
+    out.newline();
+    out.info(&format!("{} share(s) total", shares.len()));
+
+    Ok(())
+}
+
+fn cmd_frost_export(out: &Output, path: &Path, identifier: u16, group_npub: &str) -> Result<()> {
+    debug!(identifier, group_npub, "exporting FROST share");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+
+    let export_password =
+        get_password_with_confirm("Enter passphrase for share export", "Confirm passphrase")?;
+
+    let spinner = out.spinner("Encrypting share for export...");
+    let export =
+        keep.frost_export_share(&group_pubkey, identifier, export_password.expose_secret())?;
+    spinner.finish();
+
+    let json = export.to_json()?;
+
+    out.newline();
+    out.success("Share exported!");
+    out.newline();
+    out.info("Copy this export data (JSON format):");
+    out.newline();
+    println!("{}", json);
+
+    Ok(())
+}
+
+fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
+    debug!("importing FROST share");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    out.info("Paste the share export JSON (end with empty line):");
+
+    let mut json = String::new();
+    loop {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| KeepError::Other(format!("Failed to read input: {}", e)))?;
+        if line.trim().is_empty() {
+            break;
+        }
+        json.push_str(&line);
+    }
+
+    let export = ShareExport::from_json(json.trim())?;
+    let import_password = get_password("Enter share passphrase")?;
+
+    let spinner = out.spinner("Decrypting and importing share...");
+    keep.frost_import_share(&export, import_password.expose_secret())?;
+    spinner.finish();
+
+    out.newline();
+    out.success(&format!(
+        "Imported share {} for group {}",
+        export.identifier, export.group_pubkey
+    ));
+
+    Ok(())
+}
+
+fn cmd_frost_sign(
+    out: &Output,
+    path: &Path,
+    message_hex: &str,
+    group_npub: &str,
+    interactive: bool,
+) -> Result<()> {
+    debug!(
+        message = message_hex,
+        group = group_npub,
+        interactive,
+        "FROST signing"
+    );
+
+    let message =
+        hex::decode(message_hex).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+
+    let shares = keep.frost_list_shares()?;
+    let our_shares: Vec<_> = shares
+        .iter()
+        .filter(|s| s.metadata.group_pubkey == group_pubkey)
+        .collect();
+
+    if our_shares.is_empty() {
+        return Err(KeepError::KeyNotFound(format!(
+            "No shares found for group {}",
+            group_npub
+        )));
+    }
+
+    let threshold = our_shares[0].metadata.threshold;
+    let total = our_shares[0].metadata.total_shares;
+
+    if interactive {
+        return cmd_frost_sign_interactive(out, &keep, &group_pubkey, &message, threshold, total);
+    }
+
+    if our_shares.len() < threshold as usize {
+        return Err(KeepError::Other(format!(
+            "Need {} shares to sign, only {} local. Use --interactive for multi-device signing.",
+            threshold,
+            our_shares.len()
+        )));
+    }
+
+    out.info(&format!(
+        "Signing with {}-of-{} local shares",
+        threshold, total
+    ));
+
+    let spinner = out.spinner("Generating signature...");
+    let sig_bytes = keep.frost_sign(&group_pubkey, &message)?;
+    spinner.finish();
+
+    out.newline();
+    out.success("Signature generated!");
+    out.newline();
+    println!("{}", hex::encode(sig_bytes));
+
+    Ok(())
+}
+
+fn cmd_frost_sign_interactive(
+    out: &Output,
+    keep: &Keep,
+    group_pubkey: &[u8; 32],
+    message: &[u8],
+    threshold: u16,
+    total: u16,
+) -> Result<()> {
+    use frost::{round1, round2, Identifier, SigningPackage};
+    use frost_secp256k1_tr as frost;
+    use keep_core::frost::FrostMessage;
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, Write};
+
+    out.info(&format!(
+        "Interactive FROST signing: {}-of-{}",
+        threshold, total
+    ));
+    out.newline();
+
+    let share = keep.frost_get_share(group_pubkey)?;
+    let kp = share.key_package()?;
+    let our_id = *kp.identifier();
+    let our_id_u16 = share.metadata.identifier;
+
+    let session_id: [u8; 32] = keep_core::crypto::blake2b_256(message);
+
+    out.info("Round 1: Generating commitment...");
+    let (our_nonces, our_commitment) =
+        round1::commit(kp.signing_share(), &mut frost::rand_core::OsRng);
+
+    let commit_bytes = our_commitment
+        .serialize()
+        .map_err(|e| KeepError::Frost(format!("Serialize commitment: {}", e)))?;
+    let commit_msg = FrostMessage::commitment(&session_id, our_id_u16, &commit_bytes);
+    let commit_json = commit_msg.to_json()?;
+
+    out.newline();
+    out.info("Send this commitment to other signers:");
+    println!("{}", commit_json);
+    out.newline();
+
+    let mut commitments: BTreeMap<Identifier, round1::SigningCommitments> = BTreeMap::new();
+    commitments.insert(our_id, our_commitment);
+
+    let needed = threshold as usize - 1;
+    out.info(&format!(
+        "Waiting for {} commitment(s). Paste each on one line:",
+        needed
+    ));
+
+    let stdin = std::io::stdin();
+    for i in 0..needed {
+        print!("[{}/{}] ", i + 1, needed);
+        std::io::stdout().flush().ok();
+
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+
+        let msg = FrostMessage::from_json(line.trim())?;
+        if msg.session_id != hex::encode(session_id) {
+            return Err(KeepError::Frost("Session ID mismatch".into()));
+        }
+
+        let payload = msg.payload_bytes()?;
+        let commit = round1::SigningCommitments::deserialize(&payload)
+            .map_err(|e| KeepError::Frost(format!("Invalid commitment: {}", e)))?;
+
+        let id = Identifier::try_from(msg.identifier)
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+        commitments.insert(id, commit);
+    }
+
+    out.newline();
+    out.info("Round 2: Generating signature share...");
+
+    let signing_package = SigningPackage::new(commitments.clone(), message);
+    let our_sig_share = round2::sign(&signing_package, &our_nonces, &kp)
+        .map_err(|e| KeepError::Frost(format!("Sign failed: {}", e)))?;
+
+    let share_bytes = our_sig_share.serialize();
+    let share_msg = FrostMessage::signature_share(&session_id, our_id_u16, &share_bytes);
+    let share_json = share_msg.to_json()?;
+
+    out.newline();
+    out.info("Send this signature share to the coordinator:");
+    println!("{}", share_json);
+    out.newline();
+
+    let mut sig_shares: BTreeMap<Identifier, round2::SignatureShare> = BTreeMap::new();
+    sig_shares.insert(our_id, our_sig_share);
+
+    out.info(&format!("Waiting for {} signature share(s):", needed));
+
+    for i in 0..needed {
+        print!("[{}/{}] ", i + 1, needed);
+        std::io::stdout().flush().ok();
+
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+
+        let msg = FrostMessage::from_json(line.trim())?;
+        if msg.session_id != hex::encode(session_id) {
+            return Err(KeepError::Frost("Session ID mismatch".into()));
+        }
+
+        let payload = msg.payload_bytes()?;
+        let sig_share = round2::SignatureShare::deserialize(&payload)
+            .map_err(|e| KeepError::Frost(format!("Invalid signature share: {}", e)))?;
+
+        let id = Identifier::try_from(msg.identifier)
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+        sig_shares.insert(id, sig_share);
+    }
+
+    out.newline();
+    out.info("Aggregating signature...");
+
+    let pubkey_pkg = share.pubkey_package()?;
+    let signature = frost::aggregate(&signing_package, &sig_shares, &pubkey_pkg)
+        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {}", e)))?;
+
+    let serialized = signature
+        .serialize()
+        .map_err(|e| KeepError::Frost(format!("Serialize signature: {}", e)))?;
+    let bytes = serialized.as_slice();
+    if bytes.len() != 64 {
+        return Err(KeepError::Frost("Invalid signature length".into()));
+    }
+
+    out.newline();
+    out.success("Signature generated!");
+    out.newline();
+    println!("{}", hex::encode(bytes));
+
+    Ok(())
 }
 
 fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
@@ -834,6 +1334,8 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
 }
 
 fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: bool) -> Result<()> {
+    use crate::signer::FrostSigner;
+
     if hidden {
         return cmd_serve_hidden(out, path, relay, headless);
     }
@@ -850,12 +1352,44 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
+    let shares = keep.frost_list_shares()?;
+    let frost_signer = if !shares.is_empty() {
+        let first_group = &shares[0].metadata.group_pubkey;
+        let group_shares: Vec<_> = shares
+            .iter()
+            .filter(|s| &s.metadata.group_pubkey == first_group)
+            .cloned()
+            .collect();
+        let threshold = group_shares[0].metadata.threshold as usize;
+        let total = group_shares.len();
+        if total >= threshold {
+            let data_key = keep.data_key()?;
+            let group_pubkey = *first_group;
+            match FrostSigner::new(group_pubkey, group_shares, data_key) {
+                Ok(signer) => {
+                    out.info(&format!("Using FROST signing ({}-of-{})", threshold, total));
+                    Some(signer)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     if headless {
         rt.block_on(async {
-            let mut server = Server::new(keyring, relay, None).await?;
+            let mut server = if let Some(frost) = frost_signer {
+                let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+                Server::new_frost(frost, transport_key, relay, None).await?
+            } else {
+                Server::new(keyring, relay, None).await?
+            };
             info!(relay, bunker_url = %server.bunker_url(), "server started");
             out.field("Bunker URL", &server.bunker_url());
             out.field("Relay", relay);
@@ -866,12 +1400,27 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
         return Ok(());
     }
 
-    let (bunker_url, npub) = rt.block_on(async {
-        let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((
-            server.bunker_url(),
-            server.pubkey().to_bech32().unwrap_or_default(),
-        ))
+    let (bunker_url, npub, keyring_for_tui, _, transport_key_for_tui) = rt.block_on(async {
+        if let Some(ref frost) = frost_signer {
+            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+            let server = Server::new_frost(frost.clone(), transport_key, relay, None).await?;
+            Ok::<_, KeepError>((
+                server.bunker_url(),
+                server.pubkey().to_bech32().unwrap_or_default(),
+                keyring.clone(),
+                true,
+                Some(transport_key),
+            ))
+        } else {
+            let server = Server::new(keyring.clone(), relay, None).await?;
+            Ok::<_, KeepError>((
+                server.bunker_url(),
+                server.pubkey().to_bech32().unwrap_or_default(),
+                keyring.clone(),
+                false,
+                None,
+            ))
+        }
     })?;
 
     info!(relay, npub = %npub, "starting TUI");
@@ -883,8 +1432,17 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut server =
-                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
+            let mut server = if let (Some(frost), Some(transport_key)) =
+                (frost_signer, transport_key_for_tui)
+            {
+                match Server::new_frost(
+                    frost,
+                    transport_key,
+                    &relay_clone,
+                    Some(tui_tx_clone.clone()),
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
@@ -893,7 +1451,19 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
                         ));
                         return;
                     }
-                };
+                }
+            } else {
+                match Server::new(keyring_for_tui, &relay_clone, Some(tui_tx_clone.clone())).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                            crate::tui::LogEntry::new("system", "server error", false)
+                                .with_detail(&e.to_string()),
+                        ));
+                        return;
+                    }
+                }
+            };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(

@@ -80,9 +80,9 @@ impl PermissionManager {
     }
 
     pub fn connect(&mut self, pubkey: PublicKey, name: String) {
-        if !self.apps.contains_key(&pubkey) {
-            self.apps.insert(pubkey, AppPermission::new(pubkey, name));
-        }
+        self.apps
+            .entry(pubkey)
+            .or_insert_with(|| AppPermission::new(pubkey, name));
     }
 
     #[allow(dead_code)]

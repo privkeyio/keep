@@ -13,6 +13,7 @@ use keep_core::keyring::Keyring;
 use crate::tui::{ApprovalRequest as TuiApprovalRequest, TuiEvent};
 
 use super::audit::{AuditAction, AuditEntry, AuditLog};
+use super::frost_signer::FrostSigner;
 use super::permissions::{Permission, PermissionManager};
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub struct ApprovalRequest {
 
 pub struct SignerHandler {
     keyring: Arc<Mutex<Keyring>>,
+    frost_signer: Option<Arc<Mutex<FrostSigner>>>,
     permissions: Arc<Mutex<PermissionManager>>,
     audit: Arc<Mutex<AuditLog>>,
     tui_tx: Option<Sender<TuiEvent>>,
@@ -42,11 +44,17 @@ impl SignerHandler {
     ) -> Self {
         Self {
             keyring,
+            frost_signer: None,
             permissions,
             audit,
             tui_tx,
             next_approval_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub fn with_frost_signer(mut self, signer: FrostSigner) -> Self {
+        self.frost_signer = Some(Arc::new(Mutex::new(signer)));
+        self
     }
 
     pub async fn handle_connect(
@@ -57,12 +65,18 @@ impl SignerHandler {
         _permissions: Option<String>,
     ) -> Result<Option<String>> {
         if let Some(expected) = our_pubkey {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::Other("No signing key".into()))?;
-            let actual = PublicKey::from_slice(&slot.pubkey)
-                .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?;
+            let actual = if let Some(ref frost) = self.frost_signer {
+                let signer = frost.lock().await;
+                PublicKey::from_slice(signer.group_pubkey())
+                    .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
+            } else {
+                let keyring = self.keyring.lock().await;
+                let slot = keyring
+                    .get_primary()
+                    .ok_or_else(|| KeepError::Other("No signing key".into()))?;
+                PublicKey::from_slice(&slot.pubkey)
+                    .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?
+            };
             if expected != actual {
                 return Err(KeepError::Other("Pubkey mismatch".into()));
             }
@@ -93,13 +107,18 @@ impl SignerHandler {
         }
         drop(pm);
 
-        let keyring = self.keyring.lock().await;
-        let slot = keyring
-            .get_primary()
-            .ok_or_else(|| KeepError::Other("No signing key".into()))?;
-
-        let pubkey = PublicKey::from_slice(&slot.pubkey)
-            .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?;
+        let pubkey = if let Some(ref frost) = self.frost_signer {
+            let signer = frost.lock().await;
+            PublicKey::from_slice(signer.group_pubkey())
+                .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
+        } else {
+            let keyring = self.keyring.lock().await;
+            let slot = keyring
+                .get_primary()
+                .ok_or_else(|| KeepError::Other("No signing key".into()))?;
+            PublicKey::from_slice(&slot.pubkey)
+                .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?
+        };
 
         let mut audit = self.audit.lock().await;
         audit.log(AuditEntry::new(AuditAction::GetPublicKey, app_pubkey));
@@ -154,7 +173,34 @@ impl SignerHandler {
             }
         }
 
-        let signed_event = {
+        let signed_event = if let Some(ref frost) = self.frost_signer {
+            let signer = frost.lock().await;
+            let pubkey = PublicKey::from_slice(signer.group_pubkey())
+                .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?;
+            let mut frost_event = UnsignedEvent::new(
+                pubkey,
+                unsigned_event.created_at,
+                unsigned_event.kind,
+                unsigned_event.tags.clone(),
+                unsigned_event.content.clone(),
+            );
+            frost_event.ensure_id();
+            let event_id = frost_event
+                .id
+                .ok_or_else(|| KeepError::Other("Failed to compute event ID".into()))?;
+            let sig_bytes = signer.sign(event_id.as_bytes())?;
+            let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+                .map_err(|e| KeepError::Other(format!("Invalid signature: {}", e)))?;
+            Event::new(
+                event_id,
+                pubkey,
+                frost_event.created_at,
+                frost_event.kind,
+                frost_event.tags,
+                frost_event.content,
+                sig,
+            )
+        } else {
             let keyring = self.keyring.lock().await;
             let slot = keyring
                 .get_primary()

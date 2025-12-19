@@ -40,6 +40,26 @@ Controls:
 - `N` - Reject request
 - `Q` - Quit
 
+## Threshold Signatures (FROST)
+
+Split keys into t-of-n shares for distributed signing:
+
+```bash
+keep frost generate --threshold 2 --shares 3    # Create 2-of-3 key
+keep frost split --key main -t 2 -s 3           # Split existing key
+keep frost list                                  # List shares
+keep frost export --share 1 --group npub1...    # Export share
+keep frost import                                # Import share
+keep frost sign --group npub1... --message <hex> # Sign with local shares
+keep frost sign --group npub1... --message <hex> --interactive  # Multi-device
+```
+
+When serving with FROST shares, the NIP-46 signer automatically uses threshold signing:
+
+```bash
+keep serve --headless   # Detects FROST shares and uses threshold signing
+```
+
 ## Hidden Volumes (Plausible Deniability)
 
 Create a vault with a hidden volume that is cryptographically undetectable:
@@ -69,6 +89,7 @@ KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 - Secure memory handling with zeroize
 - Zero unsafe code - enforced via `#![forbid(unsafe_code)]` in all modules
 - VeraCrypt-style hidden volumes with no detectable markers
+- FROST threshold signatures (BIP-340 compatible Schnorr)
 
 ## License
 
