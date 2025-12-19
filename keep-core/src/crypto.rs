@@ -1,15 +1,41 @@
+#![forbid(unsafe_code)]
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
     aead::{generic_array::GenericArray, Aead, KeyInit},
     XChaCha20Poly1305,
 };
+use memsecurity::{EncryptedMem, ZeroizeArray};
 use rand::RngCore;
-use zeroize::ZeroizeOnDrop;
+use zeroize::Zeroize;
 
 use crate::error::{KeepError, Result};
 
 pub const SALT_SIZE: usize = 32;
+
+pub struct SecretVec {
+    encrypted: EncryptedMem,
+}
+
+impl SecretVec {
+    pub fn new(mut data: Vec<u8>) -> Result<Self> {
+        let mut encrypted = EncryptedMem::new();
+        encrypted
+            .encrypt(&data)
+            .map_err(|_| KeepError::Other("Failed to encrypt secret in RAM".into()))?;
+        data.zeroize();
+        Ok(Self { encrypted })
+    }
+
+    pub fn as_slice(&self) -> Result<Vec<u8>> {
+        self.encrypted
+            .decrypt()
+            .map(|z| z.expose_borrowed().to_vec())
+            .map_err(|_| KeepError::Other("Failed to decrypt secret from RAM".into()))
+    }
+}
+
 pub const NONCE_SIZE: usize = 24;
 pub const KEY_SIZE: usize = 32;
 pub const TAG_SIZE: usize = 16;
@@ -47,25 +73,30 @@ impl Default for Argon2Params {
     }
 }
 
-#[derive(Clone, ZeroizeOnDrop)]
 pub struct SecretKey {
-    #[zeroize]
-    bytes: [u8; KEY_SIZE],
+    encrypted: EncryptedMem,
 }
 
 impl SecretKey {
-    pub fn new(bytes: [u8; KEY_SIZE]) -> Self {
-        Self { bytes }
+    pub fn new(mut bytes: [u8; KEY_SIZE]) -> Result<Self> {
+        let mut encrypted = EncryptedMem::new();
+        encrypted
+            .encrypt(&bytes)
+            .map_err(|_| KeepError::Other("Failed to encrypt key in RAM".into()))?;
+        bytes.zeroize();
+        Ok(Self { encrypted })
     }
 
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self> {
         let mut bytes = [0u8; KEY_SIZE];
         rand::thread_rng().fill_bytes(&mut bytes);
-        Self { bytes }
+        Self::new(bytes)
     }
 
-    pub fn as_bytes(&self) -> &[u8; KEY_SIZE] {
-        &self.bytes
+    pub fn decrypt(&self) -> Result<ZeroizeArray<KEY_SIZE>> {
+        self.encrypted
+            .decrypt_32byte()
+            .map_err(|_| KeepError::Other("Failed to decrypt key".into()))
     }
 
     pub fn from_slice(slice: &[u8]) -> Result<Self> {
@@ -74,17 +105,22 @@ impl SecretKey {
         }
         let mut bytes = [0u8; KEY_SIZE];
         bytes.copy_from_slice(slice);
-        Ok(Self { bytes })
+        Self::new(bytes)
     }
 }
 
-impl AsRef<[u8]> for SecretKey {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
+impl Clone for SecretKey {
+    fn clone(&self) -> Self {
+        let decrypted = self.decrypt().expect("decrypt failed");
+        Self::new(*decrypted.expose_borrowed()).expect("encrypt failed")
     }
 }
 
-pub fn derive_key(password: &[u8], salt: &[u8; SALT_SIZE], params: Argon2Params) -> Result<SecretKey> {
+pub fn derive_key(
+    password: &[u8],
+    salt: &[u8; SALT_SIZE],
+    params: Argon2Params,
+) -> Result<SecretKey> {
     let argon2_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -100,12 +136,13 @@ pub fn derive_key(password: &[u8], salt: &[u8; SALT_SIZE], params: Argon2Params)
         .hash_password_into(password, salt, &mut output)
         .map_err(|e| KeepError::Other(format!("Argon2 error: {}", e)))?;
 
-    Ok(SecretKey::new(output))
+    SecretKey::new(output)
 }
 
-pub fn derive_subkey(master_key: &SecretKey, context: &[u8]) -> SecretKey {
+pub fn derive_subkey(master_key: &SecretKey, context: &[u8]) -> Result<SecretKey> {
+    let decrypted = master_key.decrypt()?;
     let mut hasher = Blake2b512::new();
-    hasher.update(master_key.as_bytes());
+    hasher.update(decrypted.expose_borrowed());
     hasher.update(context);
     let result = hasher.finalize();
 
@@ -144,7 +181,8 @@ impl EncryptedData {
 }
 
 pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key.as_bytes()));
+    let decrypted = key.decrypt()?;
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(decrypted.expose_borrowed()));
 
     let mut nonce = [0u8; NONCE_SIZE];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -157,13 +195,16 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     Ok(EncryptedData { ciphertext, nonce })
 }
 
-pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key.as_bytes()));
+pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
+    let decrypted_key = key.decrypt()?;
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(decrypted_key.expose_borrowed()));
     let nonce = GenericArray::from_slice(&encrypted.nonce);
 
-    cipher
+    let plaintext = cipher
         .decrypt(nonce, encrypted.ciphertext.as_ref())
-        .map_err(|_| KeepError::DecryptionFailed)
+        .map_err(|_| KeepError::DecryptionFailed)?;
+
+    SecretVec::new(plaintext)
 }
 
 pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
@@ -194,27 +235,36 @@ mod tests {
         let key1 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
         let key2 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
 
-        assert_eq!(key1.as_bytes(), key2.as_bytes());
+        assert_eq!(
+            key1.decrypt().unwrap().expose_borrowed(),
+            key2.decrypt().unwrap().expose_borrowed()
+        );
 
         let key3 = derive_key(b"different", &salt, Argon2Params::TESTING).unwrap();
-        assert_ne!(key1.as_bytes(), key3.as_bytes());
+        assert_ne!(
+            key1.decrypt().unwrap().expose_borrowed(),
+            key3.decrypt().unwrap().expose_borrowed()
+        );
     }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let key = SecretKey::generate();
+        let key = SecretKey::generate().unwrap();
         let plaintext = b"Hello, Keep!";
 
         let encrypted = encrypt(plaintext, &key).unwrap();
         let decrypted = decrypt(&encrypted, &key).unwrap();
 
-        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+        assert_eq!(
+            plaintext.as_slice(),
+            decrypted.as_slice().unwrap().as_slice()
+        );
     }
 
     #[test]
     fn test_decrypt_wrong_key_fails() {
-        let key = SecretKey::generate();
-        let wrong_key = SecretKey::generate();
+        let key = SecretKey::generate().unwrap();
+        let wrong_key = SecretKey::generate().unwrap();
         let plaintext = b"Secret data";
 
         let encrypted = encrypt(plaintext, &key).unwrap();
@@ -225,24 +275,27 @@ mod tests {
 
     #[test]
     fn test_subkey_derivation() {
-        let master = SecretKey::generate();
+        let master = SecretKey::generate().unwrap();
 
-        let subkey1 = derive_subkey(&master, b"header");
-        let subkey2 = derive_subkey(&master, b"data");
+        let subkey1 = derive_subkey(&master, b"header").unwrap();
+        let subkey2 = derive_subkey(&master, b"data").unwrap();
 
-        assert_ne!(subkey1.as_bytes(), subkey2.as_bytes());
+        assert_ne!(
+            subkey1.decrypt().unwrap().expose_borrowed(),
+            subkey2.decrypt().unwrap().expose_borrowed()
+        );
 
-        let subkey1_again = derive_subkey(&master, b"header");
-        assert_eq!(subkey1.as_bytes(), subkey1_again.as_bytes());
+        let subkey1_again = derive_subkey(&master, b"header").unwrap();
+        assert_eq!(
+            subkey1.decrypt().unwrap().expose_borrowed(),
+            subkey1_again.decrypt().unwrap().expose_borrowed()
+        );
     }
 
     #[test]
-    fn test_secret_key_zeroize() {
-        let key = SecretKey::generate();
-        let bytes_copy = *key.as_bytes();
-
-        assert!(!bytes_copy.iter().all(|&b| b == 0));
-
-        drop(key);
+    fn test_secret_key_encrypted_in_ram() {
+        let key = SecretKey::generate().unwrap();
+        let decrypted = key.decrypt().unwrap();
+        assert!(!decrypted.expose_borrowed().iter().all(|&b| b == 0));
     }
 }

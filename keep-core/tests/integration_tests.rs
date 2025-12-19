@@ -1,12 +1,12 @@
 use std::path::Path;
 use tempfile::tempdir;
 
-use keep::crypto::Argon2Params;
-use keep::keys::NostrKeypair;
-use keep::Keep;
+use keep_core::crypto::Argon2Params;
+use keep_core::keys::NostrKeypair;
+use keep_core::Keep;
 
 fn create_test_keep(path: &Path) -> Keep {
-    keep::storage::Storage::create(path, "testpass123", Argon2Params::TESTING).unwrap();
+    keep_core::storage::Storage::create(path, "testpass123", Argon2Params::TESTING).unwrap();
     let mut keep = Keep::open(path).unwrap();
     keep.unlock("testpass123").unwrap();
     keep

@@ -1,12 +1,11 @@
+#![forbid(unsafe_code)]
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum KeepError {
     #[error("Invalid password")]
     InvalidPassword,
-
-    #[error("Storage error: {0}")]
-    Storage(#[from] heed::Error),
 
     #[error("Encryption error: {0}")]
     Encryption(String),

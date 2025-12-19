@@ -5,7 +5,7 @@ Sovereign Key Management for Nostr and Bitcoin.
 ## Install
 
 ```bash
-cargo install --path .
+cargo install --path keep-cli
 ```
 
 ## Usage
@@ -18,6 +18,8 @@ keep list                     # List keys
 keep export --name main       # Export nsec
 keep delete --name main       # Delete key
 keep serve                    # Start NIP-46 remote signer
+keep --hidden init            # Create vault with hidden volume
+keep --hidden list            # Access hidden volume
 ```
 
 ## Remote Signing (NIP-46)
@@ -38,18 +40,35 @@ Controls:
 - `N` - Reject request
 - `Q` - Quit
 
-## Environment Variables
+## Hidden Volumes (Plausible Deniability)
 
-- `KEEP_PASSWORD` - Password for non-interactive use
-- `KEEP_YES` - Skip confirmation prompts
-- `RUST_LOG` - Logging level (error, warn, info, debug, trace)
+Create a vault with a hidden volume that is cryptographically undetectable:
+
+```bash
+KEEP_PASSWORD="outerpass" KEEP_HIDDEN_PASSWORD="hiddenpass" keep --hidden init
+```
+
+Two separate volumes:
+- **Outer volume** (outerpass) - Store decoy keys here
+- **Hidden volume** (hiddenpass) - Store real keys here
+
+An attacker cannot prove the hidden volume exists. Under duress, reveal only the outer password.
+
+```bash
+KEEP_PASSWORD="outerpass" keep list                    # Shows decoy keys
+KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
+```
 
 ## Security
 
 - Argon2id key derivation (256MB memory, 4 iterations)
-- XChaCha20-Poly1305 encryption
-- LMDB encrypted storage
+- XChaCha20-Poly1305 AEAD encryption
+- BLAKE2b checksums
+- redb encrypted storage (pure Rust, ACID transactions)
+- Keys encrypted in RAM using Ascon-128a via the memsecurity crate
 - Secure memory handling with zeroize
+- Zero unsafe code - enforced via `#![forbid(unsafe_code)]` in all modules
+- VeraCrypt-style hidden volumes with no detectable markers
 
 ## License
 

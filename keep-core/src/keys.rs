@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -33,8 +35,8 @@ impl NostrKeypair {
     }
 
     pub fn from_secret_bytes(secret: &[u8; 32]) -> Result<Self> {
-        let signing_key =
-            SigningKey::from_bytes(secret).map_err(|_| KeepError::Other("Invalid secret key".into()))?;
+        let signing_key = SigningKey::from_bytes(secret)
+            .map_err(|_| KeepError::Other("Invalid secret key".into()))?;
         let verifying_key = signing_key.verifying_key();
 
         Ok(Self {
@@ -84,11 +86,11 @@ impl NostrKeypair {
     pub fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         use k256::schnorr::signature::Signer;
 
-        let signing_key =
-            SigningKey::from_bytes(&self.secret_key).map_err(|_| KeepError::Other("Invalid signing key".into()))?;
+        let signing_key = SigningKey::from_bytes(&self.secret_key)
+            .map_err(|_| KeepError::Other("Invalid signing key".into()))?;
 
         let signature = signing_key.sign(message);
-        Ok(signature.to_bytes().into())
+        Ok(signature.to_bytes())
     }
 }
 
@@ -114,7 +116,12 @@ pub struct KeyRecord {
 }
 
 impl KeyRecord {
-    pub fn new(pubkey: [u8; 32], key_type: KeyType, name: String, encrypted_secret: Vec<u8>) -> Self {
+    pub fn new(
+        pubkey: [u8; 32],
+        key_type: KeyType,
+        name: String,
+        encrypted_secret: Vec<u8>,
+    ) -> Self {
         let id = crypto::blake2b_256(&pubkey);
         let created_at = chrono::Utc::now().timestamp();
 

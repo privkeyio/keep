@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -107,12 +109,14 @@ impl AuditLog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn open_file(&mut self, path: &Path) -> std::io::Result<()> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         self.file = Some(file);
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn set_callback<F>(&mut self, callback: F)
     where
         F: Fn(&AuditEntry) + Send + Sync + 'static,
@@ -138,10 +142,12 @@ impl AuditLog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn recent(&self, count: usize) -> impl Iterator<Item = &AuditEntry> {
         self.entries.iter().rev().take(count)
     }
 
+    #[allow(dead_code)]
     pub fn by_app<'a>(&'a self, pubkey: &'a str) -> impl Iterator<Item = &'a AuditEntry> {
         self.entries.iter().filter(move |e| e.app_pubkey == pubkey)
     }
@@ -252,6 +258,9 @@ mod tests {
     fn test_audit_action_display() {
         assert_eq!(format!("{}", AuditAction::Connect), "connect");
         assert_eq!(format!("{}", AuditAction::SignEvent), "sign_event");
-        assert_eq!(format!("{}", AuditAction::PermissionDenied), "permission_denied");
+        assert_eq!(
+            format!("{}", AuditAction::PermissionDenied),
+            "permission_denied"
+        );
     }
 }
