@@ -421,7 +421,10 @@ mod tests {
         let handler = setup_handler();
         let app_pubkey = Keys::generate().public_key();
 
-        handler.handle_connect(app_pubkey, None, None, None).await.unwrap();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
 
         let result = handler.handle_get_public_key(app_pubkey).await;
         assert!(result.is_ok());
@@ -459,11 +462,18 @@ mod tests {
         let recipient_keys = Keys::generate();
         let recipient = recipient_keys.public_key();
 
-        handler.handle_connect(app_pubkey, None, None, None).await.unwrap();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
 
         {
             let mut pm = handler.permissions.lock().await;
-            pm.grant(app_pubkey, "Test".into(), Permission::NIP44_ENCRYPT | Permission::NIP44_DECRYPT);
+            pm.grant(
+                app_pubkey,
+                "Test".into(),
+                Permission::NIP44_ENCRYPT | Permission::NIP44_DECRYPT,
+            );
         }
 
         let plaintext = "Hello, Nostr!";
@@ -484,7 +494,10 @@ mod tests {
         let name = handler.get_app_name(&app_pubkey).await;
         assert_eq!(name, &app_pubkey.to_hex()[..8]);
 
-        handler.handle_connect(app_pubkey, None, None, None).await.unwrap();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
         let name = handler.get_app_name(&app_pubkey).await;
         assert!(name.starts_with("App "));
     }

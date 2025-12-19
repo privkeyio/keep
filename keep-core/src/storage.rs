@@ -100,7 +100,9 @@ impl Header {
             encrypted_data_key,
             argon2_memory_kib: u32::from_le_bytes([bytes[116], bytes[117], bytes[118], bytes[119]]),
             argon2_iterations: u32::from_le_bytes([bytes[120], bytes[121], bytes[122], bytes[123]]),
-            argon2_parallelism: u32::from_le_bytes([bytes[124], bytes[125], bytes[126], bytes[127]]),
+            argon2_parallelism: u32::from_le_bytes([
+                bytes[124], bytes[125], bytes[126], bytes[127],
+            ]),
             _padding: [0; 140],
         })
     }
@@ -132,7 +134,9 @@ impl Storage {
         let data_key_bytes = data_key.decrypt()?;
         let encrypted = crypto::encrypt(data_key_bytes.expose_borrowed(), &header_key)?;
         header.nonce.copy_from_slice(&encrypted.nonce);
-        header.encrypted_data_key.copy_from_slice(&encrypted.ciphertext);
+        header
+            .encrypted_data_key
+            .copy_from_slice(&encrypted.ciphertext);
 
         let header_path = path.join("keep.hdr");
         fs::write(&header_path, header.to_bytes())?;
@@ -142,10 +146,12 @@ impl Storage {
             .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
 
         {
-            let wtxn = db.begin_write()
+            let wtxn = db
+                .begin_write()
                 .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
             {
-                let _ = wtxn.open_table(KEYS_TABLE)
+                let _ = wtxn
+                    .open_table(KEYS_TABLE)
                     .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
             }
             wtxn.commit()
@@ -243,12 +249,15 @@ impl Storage {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let wtxn = db.begin_write()
+        let wtxn = db
+            .begin_write()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
         {
-            let mut table = wtxn.open_table(KEYS_TABLE)
+            let mut table = wtxn
+                .open_table(KEYS_TABLE)
                 .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())
+            table
+                .insert(record.id.as_slice(), encrypted_bytes.as_slice())
                 .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
         }
         wtxn.commit()
@@ -262,12 +271,15 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()
+        let rtxn = db
+            .begin_read()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn.open_table(KEYS_TABLE)
+        let table = rtxn
+            .open_table(KEYS_TABLE)
             .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
 
-        let encrypted_bytes = table.get(id.as_slice())
+        let encrypted_bytes = table
+            .get(id.as_slice())
             .map_err(|e| KeepError::Other(format!("Get error: {}", e)))?
             .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))?;
 
@@ -284,17 +296,21 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()
+        let rtxn = db
+            .begin_read()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn.open_table(KEYS_TABLE)
+        let table = rtxn
+            .open_table(KEYS_TABLE)
             .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
 
         let mut records = Vec::new();
 
-        for result in table.iter()
-            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))? {
-            let (_, encrypted_bytes) = result
-                .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        for result in table
+            .iter()
+            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
+        {
+            let (_, encrypted_bytes) =
+                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
@@ -312,13 +328,16 @@ impl Storage {
         debug!(id = %hex::encode(id), "deleting key");
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let wtxn = db.begin_write()
+        let wtxn = db
+            .begin_write()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
         let existed;
         {
-            let mut table = wtxn.open_table(KEYS_TABLE)
+            let mut table = wtxn
+                .open_table(KEYS_TABLE)
                 .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            existed = table.remove(id.as_slice())
+            existed = table
+                .remove(id.as_slice())
                 .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
                 .is_some();
         }

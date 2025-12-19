@@ -178,10 +178,14 @@ impl Tui {
                 Span::styled(&self.relay, Style::default().fg(Color::Cyan)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Bunker URL: ", Style::default().fg(Color::Gray)),
-            ]),
-            Line::from(Span::styled(&self.bunker_url, Style::default().fg(Color::Cyan))),
+            Line::from(vec![Span::styled(
+                "Bunker URL: ",
+                Style::default().fg(Color::Gray),
+            )]),
+            Line::from(Span::styled(
+                &self.bunker_url,
+                Style::default().fg(Color::Cyan),
+            )),
         ];
 
         let block = Block::default()
@@ -269,13 +273,18 @@ impl Tui {
                 Style::default().fg(Color::Gray),
             )));
             let preview: String = content.chars().take(200).collect();
-            lines.push(Line::from(Span::styled(preview, Style::default().fg(Color::White))));
+            lines.push(Line::from(Span::styled(
+                preview,
+                Style::default().fg(Color::White),
+            )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Press [Y] to approve, [N] to reject",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
 
         let block = Block::default()

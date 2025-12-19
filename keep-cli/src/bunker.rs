@@ -15,7 +15,9 @@ pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&
     url
 }
 
-pub fn parse_bunker_url(bunker_url: &str) -> Result<(PublicKey, Vec<String>, Option<String>), String> {
+pub fn parse_bunker_url(
+    bunker_url: &str,
+) -> Result<(PublicKey, Vec<String>, Option<String>), String> {
     if !bunker_url.starts_with("bunker://") {
         return Err("Invalid bunker URL: must start with bunker://".into());
     }
@@ -23,8 +25,7 @@ pub fn parse_bunker_url(bunker_url: &str) -> Result<(PublicKey, Vec<String>, Opt
     let url = ::url::Url::parse(bunker_url).map_err(|e| format!("Invalid URL: {}", e))?;
 
     let pubkey_hex = url.host_str().ok_or("Missing pubkey in URL")?;
-    let pubkey =
-        PublicKey::from_hex(pubkey_hex).map_err(|e| format!("Invalid pubkey: {}", e))?;
+    let pubkey = PublicKey::from_hex(pubkey_hex).map_err(|e| format!("Invalid pubkey: {}", e))?;
 
     let mut relays = Vec::new();
     let mut secret = None;

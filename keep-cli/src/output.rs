@@ -16,15 +16,21 @@ impl Output {
     }
 
     pub fn success(&self, msg: &str) {
-        let _ = self.term.write_line(&format!("{} {}", style("✓").green().bold(), msg));
+        let _ = self
+            .term
+            .write_line(&format!("{} {}", style("✓").green().bold(), msg));
     }
 
     pub fn error(&self, msg: &str) {
-        let _ = self.term.write_line(&format!("{} {}", style("✗").red().bold(), msg));
+        let _ = self
+            .term
+            .write_line(&format!("{} {}", style("✗").red().bold(), msg));
     }
 
     pub fn warn(&self, msg: &str) {
-        let _ = self.term.write_line(&format!("{} {}", style("!").yellow().bold(), msg));
+        let _ = self
+            .term
+            .write_line(&format!("{} {}", style("!").yellow().bold(), msg));
     }
 
     pub fn info(&self, msg: &str) {
@@ -36,11 +42,17 @@ impl Output {
     }
 
     pub fn field(&self, label: &str, value: &str) {
-        let _ = self.term.write_line(&format!("  {}: {}", style(label).dim(), value));
+        let _ = self
+            .term
+            .write_line(&format!("  {}: {}", style(label).dim(), value));
     }
 
     pub fn key_field(&self, label: &str, value: &str) {
-        let _ = self.term.write_line(&format!("  {}: {}", style(label).dim(), style(value).yellow()));
+        let _ = self.term.write_line(&format!(
+            "  {}: {}",
+            style(label).dim(),
+            style(value).yellow()
+        ));
     }
 
     pub fn newline(&self) {
@@ -130,7 +142,9 @@ impl Output {
         ));
         self.newline();
         self.info("To access hidden volume:");
-        let _ = self.term.write_line(&format!("  {}", style("keep --hidden <command>").cyan()));
+        let _ = self
+            .term
+            .write_line(&format!("  {}", style("keep --hidden <command>").cyan()));
     }
 
     pub fn init_notes(&self) {
@@ -153,7 +167,9 @@ impl Output {
     }
 
     pub fn hidden_label(&self) {
-        let _ = self.term.write_line(&format!("\n{}", style("[HIDDEN VOLUME]").red().bold()));
+        let _ = self
+            .term
+            .write_line(&format!("\n{}", style("[HIDDEN VOLUME]").red().bold()));
     }
 }
 

@@ -82,12 +82,21 @@ impl Keep {
         let data_key = self.get_data_key()?;
         let encrypted = crypto::encrypt(keypair.secret_bytes(), &data_key)?;
 
-        let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+        let record = KeyRecord::new(
+            pubkey,
+            KeyType::Nostr,
+            name.to_string(),
+            encrypted.to_bytes(),
+        );
 
         self.storage.store_key(&record)?;
 
-        self.keyring
-            .load_key(pubkey, *keypair.secret_bytes(), KeyType::Nostr, name.to_string())?;
+        self.keyring.load_key(
+            pubkey,
+            *keypair.secret_bytes(),
+            KeyType::Nostr,
+            name.to_string(),
+        )?;
 
         Ok(pubkey)
     }
@@ -108,12 +117,21 @@ impl Keep {
         let data_key = self.get_data_key()?;
         let encrypted = crypto::encrypt(keypair.secret_bytes(), &data_key)?;
 
-        let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+        let record = KeyRecord::new(
+            pubkey,
+            KeyType::Nostr,
+            name.to_string(),
+            encrypted.to_bytes(),
+        );
 
         self.storage.store_key(&record)?;
 
-        self.keyring
-            .load_key(pubkey, *keypair.secret_bytes(), KeyType::Nostr, name.to_string())?;
+        self.keyring.load_key(
+            pubkey,
+            *keypair.secret_bytes(),
+            KeyType::Nostr,
+            name.to_string(),
+        )?;
 
         Ok(pubkey)
     }
@@ -168,10 +186,7 @@ impl Keep {
     }
 
     fn get_data_key(&self) -> Result<SecretKey> {
-        self.storage
-            .data_key()
-            .cloned()
-            .ok_or(KeepError::Locked)
+        self.storage.data_key().cloned().ok_or(KeepError::Locked)
     }
 }
 

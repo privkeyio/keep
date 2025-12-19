@@ -59,13 +59,6 @@ KEEP_PASSWORD="outerpass" keep list                    # Shows decoy keys
 KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 ```
 
-## Environment Variables
-
-- `KEEP_PASSWORD` - Password for vault (outer password for hidden vaults)
-- `KEEP_HIDDEN_PASSWORD` - Hidden volume password (only for `--hidden init`)
-- `KEEP_YES` - Skip confirmation prompts
-- `RUST_LOG` - Logging level (error, warn, info, debug, trace)
-
 ## Security
 
 - Argon2id key derivation (256MB memory, 4 iterations)

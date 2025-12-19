@@ -118,7 +118,11 @@ impl Clone for SecretKey {
     }
 }
 
-pub fn derive_key(password: &[u8], salt: &[u8; SALT_SIZE], params: Argon2Params) -> Result<SecretKey> {
+pub fn derive_key(
+    password: &[u8],
+    salt: &[u8; SALT_SIZE],
+    params: Argon2Params,
+) -> Result<SecretKey> {
     let argon2_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -232,10 +236,16 @@ mod tests {
         let key1 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
         let key2 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
 
-        assert_eq!(key1.decrypt().unwrap().expose_borrowed(), key2.decrypt().unwrap().expose_borrowed());
+        assert_eq!(
+            key1.decrypt().unwrap().expose_borrowed(),
+            key2.decrypt().unwrap().expose_borrowed()
+        );
 
         let key3 = derive_key(b"different", &salt, Argon2Params::TESTING).unwrap();
-        assert_ne!(key1.decrypt().unwrap().expose_borrowed(), key3.decrypt().unwrap().expose_borrowed());
+        assert_ne!(
+            key1.decrypt().unwrap().expose_borrowed(),
+            key3.decrypt().unwrap().expose_borrowed()
+        );
     }
 
     #[test]
@@ -268,10 +278,16 @@ mod tests {
         let subkey1 = derive_subkey(&master, b"header").unwrap();
         let subkey2 = derive_subkey(&master, b"data").unwrap();
 
-        assert_ne!(subkey1.decrypt().unwrap().expose_borrowed(), subkey2.decrypt().unwrap().expose_borrowed());
+        assert_ne!(
+            subkey1.decrypt().unwrap().expose_borrowed(),
+            subkey2.decrypt().unwrap().expose_borrowed()
+        );
 
         let subkey1_again = derive_subkey(&master, b"header").unwrap();
-        assert_eq!(subkey1.decrypt().unwrap().expose_borrowed(), subkey1_again.decrypt().unwrap().expose_borrowed());
+        assert_eq!(
+            subkey1.decrypt().unwrap().expose_borrowed(),
+            subkey1_again.decrypt().unwrap().expose_borrowed()
+        );
     }
 
     #[test]

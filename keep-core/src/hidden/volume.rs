@@ -63,7 +63,8 @@ impl HiddenStorage {
         let outer_header_key = crypto::derive_subkey(&outer_master_key, b"keep-outer-header")?;
 
         let outer_key_bytes = outer_data_key.decrypt()?;
-        let encrypted_outer = crypto::encrypt(outer_key_bytes.expose_borrowed(), &outer_header_key)?;
+        let encrypted_outer =
+            crypto::encrypt(outer_key_bytes.expose_borrowed(), &outer_header_key)?;
         outer_header.nonce.copy_from_slice(&encrypted_outer.nonce);
         outer_header
             .encrypted_data_key
@@ -81,10 +82,12 @@ impl HiddenStorage {
 
             let hidden_master_key =
                 crypto::derive_key(hp.as_bytes(), &salt, Argon2Params::DEFAULT)?;
-            let hidden_header_key = crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
+            let hidden_header_key =
+                crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
 
             let hidden_key_bytes = hidden_data_key.decrypt()?;
-            let encrypted_hidden = crypto::encrypt(hidden_key_bytes.expose_borrowed(), &hidden_header_key)?;
+            let encrypted_hidden =
+                crypto::encrypt(hidden_key_bytes.expose_borrowed(), &hidden_header_key)?;
             hh.nonce.copy_from_slice(&encrypted_hidden.nonce);
             hh.encrypted_data_key
                 .copy_from_slice(&encrypted_hidden.ciphertext);
@@ -146,10 +149,12 @@ impl HiddenStorage {
             .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
 
         {
-            let wtxn = db.begin_write()
+            let wtxn = db
+                .begin_write()
                 .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
             {
-                let _ = wtxn.open_table(KEYS_TABLE)
+                let _ = wtxn
+                    .open_table(KEYS_TABLE)
                     .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
             }
             wtxn.commit()
@@ -341,12 +346,15 @@ impl HiddenStorage {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let wtxn = db.begin_write()
+        let wtxn = db
+            .begin_write()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
         {
-            let mut table = wtxn.open_table(KEYS_TABLE)
+            let mut table = wtxn
+                .open_table(KEYS_TABLE)
                 .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())
+            table
+                .insert(record.id.as_slice(), encrypted_bytes.as_slice())
                 .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
         }
         wtxn.commit()
@@ -451,17 +459,21 @@ impl HiddenStorage {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()
+        let rtxn = db
+            .begin_read()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn.open_table(KEYS_TABLE)
+        let table = rtxn
+            .open_table(KEYS_TABLE)
             .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
 
         let mut records = Vec::new();
 
-        for result in table.iter()
-            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))? {
-            let (_, encrypted_bytes) = result
-                .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        for result in table
+            .iter()
+            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
+        {
+            let (_, encrypted_bytes) =
+                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
@@ -486,13 +498,16 @@ impl HiddenStorage {
     fn delete_key_outer(&self, id: &[u8; 32]) -> Result<()> {
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let wtxn = db.begin_write()
+        let wtxn = db
+            .begin_write()
             .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
         let existed;
         {
-            let mut table = wtxn.open_table(KEYS_TABLE)
+            let mut table = wtxn
+                .open_table(KEYS_TABLE)
                 .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            existed = table.remove(id.as_slice())
+            existed = table
+                .remove(id.as_slice())
                 .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
                 .is_some();
         }

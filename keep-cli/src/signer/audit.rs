@@ -254,6 +254,9 @@ mod tests {
     fn test_audit_action_display() {
         assert_eq!(format!("{}", AuditAction::Connect), "connect");
         assert_eq!(format!("{}", AuditAction::SignEvent), "sign_event");
-        assert_eq!(format!("{}", AuditAction::PermissionDenied), "permission_denied");
+        assert_eq!(
+            format!("{}", AuditAction::PermissionDenied),
+            "permission_denied"
+        );
     }
 }

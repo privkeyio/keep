@@ -50,7 +50,12 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
-        let handler = Arc::new(SignerHandler::new(keyring, permissions, audit, tui_tx.clone()));
+        let handler = Arc::new(SignerHandler::new(
+            keyring,
+            permissions,
+            audit,
+            tui_tx.clone(),
+        ));
 
         Ok(Self {
             keys,
@@ -110,8 +115,14 @@ impl Server {
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
                         if event.kind == Kind::NostrConnect {
-                            if let Err(e) =
-                                Self::handle_nip46_event(&handler, &keys, &client, &event, tui_tx.as_ref()).await
+                            if let Err(e) = Self::handle_nip46_event(
+                                &handler,
+                                &keys,
+                                &client,
+                                &event,
+                                tui_tx.as_ref(),
+                            )
+                            .await
                             {
                                 warn!("Error handling NIP-46 event: {}", e);
                             }
@@ -145,14 +156,14 @@ impl Server {
         debug!("NIP-46 request: {} from {}", request.method, app_id);
 
         let method = request.method.clone();
-        let response = Self::dispatch_request(handler, keys.public_key(), app_pubkey, request, tui_tx).await;
+        let response =
+            Self::dispatch_request(handler, keys.public_key(), app_pubkey, request, tui_tx).await;
 
         let success = response.error.is_none();
         if let Some(tx) = tui_tx {
             let detail = response.error.as_deref();
             let _ = tx.send(TuiEvent::Log(
-                LogEntry::new(app_id, &method, success)
-                    .with_detail(detail.unwrap_or("")),
+                LogEntry::new(app_id, &method, success).with_detail(detail.unwrap_or("")),
             ));
         }
 
@@ -251,9 +262,7 @@ impl Server {
                 }
                 let recipient = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => {
-                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
-                    }
+                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
                 };
                 match handler
                     .handle_nip44_encrypt(app_pubkey, recipient, &request.params[1])
@@ -269,9 +278,7 @@ impl Server {
                 }
                 let sender = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => {
-                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
-                    }
+                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
                 };
                 match handler
                     .handle_nip44_decrypt(app_pubkey, sender, &request.params[1])
@@ -287,9 +294,7 @@ impl Server {
                 }
                 let recipient = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => {
-                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
-                    }
+                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
                 };
                 match handler
                     .handle_nip04_encrypt(app_pubkey, recipient, &request.params[1])
@@ -305,9 +310,7 @@ impl Server {
                 }
                 let sender = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => {
-                        return Nip46Response::error(id, &format!("Invalid pubkey: {}", e))
-                    }
+                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
                 };
                 match handler
                     .handle_nip04_decrypt(app_pubkey, sender, &request.params[1])

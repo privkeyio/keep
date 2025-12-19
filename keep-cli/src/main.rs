@@ -178,7 +178,9 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
     let outer_password = get_password_with_confirm(outer_prompt, outer_confirm);
 
     if outer_password.expose_secret().len() < 8 {
-        return Err(KeepError::Other("Password must be at least 8 characters".into()));
+        return Err(KeepError::Other(
+            "Password must be at least 8 characters".into(),
+        ));
     }
 
     let hidden_password: Option<SecretString> = if hidden {
@@ -202,7 +204,9 @@ fn cmd_init(out: &Output, path: &PathBuf, hidden: bool, size_mb: u64) -> Result<
         }
 
         if hp.expose_secret().len() < 8 {
-            return Err(KeepError::Other("Password must be at least 8 characters".into()));
+            return Err(KeepError::Other(
+                "Password must be at least 8 characters".into(),
+            ));
         }
 
         Some(hp)
@@ -291,7 +295,12 @@ fn cmd_generate_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
-    let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+    let record = KeyRecord::new(
+        pubkey,
+        KeyType::Nostr,
+        name.to_string(),
+        encrypted.to_bytes(),
+    );
     storage.store_key(&record)?;
     spinner.finish();
 
@@ -325,7 +334,12 @@ fn cmd_generate_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
-    let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+    let record = KeyRecord::new(
+        pubkey,
+        KeyType::Nostr,
+        name.to_string(),
+        encrypted.to_bytes(),
+    );
     storage.store_key(&record)?;
     spinner.finish();
 
@@ -395,7 +409,12 @@ fn cmd_import_outer(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
-    let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+    let record = KeyRecord::new(
+        pubkey,
+        KeyType::Nostr,
+        name.to_string(),
+        encrypted.to_bytes(),
+    );
     storage.store_key(&record)?;
     spinner.finish();
 
@@ -431,7 +450,12 @@ fn cmd_import_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
-    let record = KeyRecord::new(pubkey, KeyType::Nostr, name.to_string(), encrypted.to_bytes());
+    let record = KeyRecord::new(
+        pubkey,
+        KeyType::Nostr,
+        name.to_string(),
+        encrypted.to_bytes(),
+    );
     storage.store_key(&record)?;
     spinner.finish();
 
@@ -809,7 +833,13 @@ fn cmd_delete_hidden(out: &Output, path: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: bool) -> Result<()> {
+fn cmd_serve(
+    out: &Output,
+    path: &PathBuf,
+    relay: &str,
+    headless: bool,
+    hidden: bool,
+) -> Result<()> {
     if hidden {
         return cmd_serve_hidden(out, path, relay, headless);
     }
@@ -844,7 +874,10 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
 
     let (bunker_url, npub) = rt.block_on(async {
         let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((server.bunker_url(), server.pubkey().to_bech32().unwrap_or_default()))
+        Ok::<_, KeepError>((
+            server.bunker_url(),
+            server.pubkey().to_bech32().unwrap_or_default(),
+        ))
     })?;
 
     info!(relay, npub = %npub, "starting TUI");
@@ -856,19 +889,22 @@ fn cmd_serve(out: &Output, path: &PathBuf, relay: &str, headless: bool, hidden: 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                    ));
-                    return;
-                }
-            };
+            let mut server =
+                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                            crate::tui::LogEntry::new("system", "server error", false)
+                                .with_detail(&e.to_string()),
+                        ));
+                        return;
+                    }
+                };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    crate::tui::LogEntry::new("system", "server error", false)
+                        .with_detail(&e.to_string()),
                 ));
             }
         });
@@ -901,7 +937,7 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
         let decrypted = secret_bytes.as_slice();
-    secret.copy_from_slice(&decrypted);
+        secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();
     }
@@ -924,7 +960,10 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
 
     let (bunker_url, npub) = rt.block_on(async {
         let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((server.bunker_url(), server.pubkey().to_bech32().unwrap_or_default()))
+        Ok::<_, KeepError>((
+            server.bunker_url(),
+            server.pubkey().to_bech32().unwrap_or_default(),
+        ))
     })?;
 
     info!(relay, npub = %npub, "starting TUI");
@@ -936,19 +975,22 @@ fn cmd_serve_outer(out: &Output, path: &PathBuf, relay: &str, headless: bool) ->
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                    ));
-                    return;
-                }
-            };
+            let mut server =
+                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                            crate::tui::LogEntry::new("system", "server error", false)
+                                .with_detail(&e.to_string()),
+                        ));
+                        return;
+                    }
+                };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    crate::tui::LogEntry::new("system", "server error", false)
+                        .with_detail(&e.to_string()),
                 ));
             }
         });
@@ -983,7 +1025,7 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
         let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
         let mut secret = [0u8; 32];
         let decrypted = secret_bytes.as_slice();
-    secret.copy_from_slice(&decrypted);
+        secret.copy_from_slice(&decrypted);
         keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
         secret.zeroize();
     }
@@ -1006,7 +1048,10 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
 
     let (bunker_url, npub) = rt.block_on(async {
         let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((server.bunker_url(), server.pubkey().to_bech32().unwrap_or_default()))
+        Ok::<_, KeepError>((
+            server.bunker_url(),
+            server.pubkey().to_bech32().unwrap_or_default(),
+        ))
     })?;
 
     info!(relay, npub = %npub, "starting TUI for hidden volume");
@@ -1018,19 +1063,22 @@ fn cmd_serve_hidden(out: &Output, path: &PathBuf, relay: &str, headless: bool) -
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut server = match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                        crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                    ));
-                    return;
-                }
-            };
+            let mut server =
+                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
+                            crate::tui::LogEntry::new("system", "server error", false)
+                                .with_detail(&e.to_string()),
+                        ));
+                        return;
+                    }
+                };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    crate::tui::LogEntry::new("system", "server error", false)
+                        .with_detail(&e.to_string()),
                 ));
             }
         });
