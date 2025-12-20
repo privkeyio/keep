@@ -1,0 +1,32 @@
+[package]
+name = "keep-enclave-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Host-side enclave client for Keep"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+keep-core = { path = "../../keep-core" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1", features = ["alloc"] }
+ciborium = "0.2"
+
+zeroize = { version = "1.8", features = ["derive"] }
+thiserror = "1.0"
+hex = "0.4"
+tracing = "0.1"
+
+sha2 = "0.10"
+p384 = { version = "0.13", features = ["ecdsa"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+const-oid = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
+nix = { version = "0.29", features = ["socket"] }
+
+[features]
+default = []

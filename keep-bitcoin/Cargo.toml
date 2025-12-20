@@ -1,0 +1,23 @@
+[package]
+name = "keep-bitcoin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Bitcoin PSBT and Taproot support for Keep"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+
+bitcoin = { version = "0.32", features = ["serde", "base64"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+zeroize = { version = "1.8", features = ["derive"] }
+thiserror = "1.0"
+hex = "0.4"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"

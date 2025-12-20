@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "keep-core",
     "keep-cli",
+    "keep-enclave",
+    "keep-enclave/host",
+    "keep-bitcoin",
 ]
 
 [workspace.package]
@@ -13,6 +16,8 @@ repository = "https://github.com/privkeyio/keep"
 
 [workspace.dependencies]
 keep-core = { path = "keep-core" }
+keep-bitcoin = { path = "keep-bitcoin" }
+keep-enclave-host = { path = "keep-enclave/host" }
 
 # Crypto
 argon2 = "0.5"
@@ -20,6 +25,10 @@ chacha20poly1305 = "0.10"
 blake2 = "0.10"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.8"
+frost-secp256k1-tr = "2.2"
+
+# Bitcoin
+bitcoin = { version = "0.32", features = ["serde"] }
 
 # Secure memory
 zeroize = { version = "1.8", features = ["zeroize_derive"] }

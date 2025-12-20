@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 keep-core = { path = "../keep-core" }
+keep-bitcoin = { path = "../keep-bitcoin" }
+keep-enclave-host = { path = "../keep-enclave/host" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
