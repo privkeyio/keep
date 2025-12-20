@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -28,6 +30,9 @@ pub enum EnclaveError {
 
     #[error("FROST error: {0}")]
     Frost(String),
+
+    #[error("KMS error: {0}")]
+    Kms(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

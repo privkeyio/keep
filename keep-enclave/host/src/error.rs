@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -27,6 +29,9 @@ pub enum EnclaveError {
     #[error("Policy denied: {0}")]
     PolicyDenied(String),
 
+    #[error("Policy configuration failed: {0}")]
+    PolicyConfig(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
@@ -35,6 +40,9 @@ pub enum EnclaveError {
 
     #[error("Certificate error: {0}")]
     Certificate(String),
+
+    #[error("KMS error: {0}")]
+    Kms(String),
 
     #[error("Not in enclave environment")]
     NotInEnclave,

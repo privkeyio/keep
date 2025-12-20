@@ -1,12 +1,16 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{EnclaveError, Result};
-use k256::schnorr::{SigningKey, VerifyingKey};
+use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
+use signature::Signer;
 use std::collections::HashMap;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PsbtData {
     pub inputs: Vec<PsbtInput>,
+    pub outputs: Vec<PsbtOutput>,
     pub raw_psbt: Vec<u8>,
 }
 
@@ -15,6 +19,13 @@ pub struct PsbtInput {
     pub tap_internal_key: Option<[u8; 32]>,
     pub sighash: Option<Vec<u8>>,
     pub tap_key_sig: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PsbtOutput {
+    pub amount_sats: u64,
+    pub address: Option<String>,
+    pub is_change: bool,
 }
 
 #[derive(ZeroizeOnDrop)]
@@ -41,10 +52,18 @@ struct FrostNonces {
 }
 
 impl EnclaveSigner {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let mut ephemeral_secret = [0u8; 32];
-        let _ = getrandom(&mut ephemeral_secret);
+        getrandom(&mut ephemeral_secret)?;
 
+        Ok(Self {
+            keys: HashMap::new(),
+            frost_nonces: HashMap::new(),
+            ephemeral_secret,
+        })
+    }
+
+    pub fn with_ephemeral_secret(ephemeral_secret: [u8; 32]) -> Self {
         Self {
             keys: HashMap::new(),
             frost_nonces: HashMap::new(),
@@ -52,15 +71,17 @@ impl EnclaveSigner {
         }
     }
 
-    pub fn get_ephemeral_pubkey(&self) -> [u8; 32] {
-        if let Ok(signing_key) = SigningKey::from_bytes(&self.ephemeral_secret) {
-            let verifying_key = signing_key.verifying_key();
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(&verifying_key.to_bytes());
-            pubkey
-        } else {
-            [0u8; 32]
-        }
+    pub fn ephemeral_secret(&self) -> [u8; 32] {
+        self.ephemeral_secret
+    }
+
+    pub fn get_ephemeral_pubkey(&self) -> Result<[u8; 32]> {
+        let signing_key = SigningKey::from_bytes(&self.ephemeral_secret)
+            .map_err(|e| EnclaveError::InvalidKey(format!("Invalid ephemeral secret: {}", e)))?;
+        let verifying_key = signing_key.verifying_key();
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&verifying_key.to_bytes());
+        Ok(pubkey)
     }
 
     pub fn generate_key(&mut self, name: &str) -> Result<[u8; 32]> {
@@ -148,7 +169,9 @@ impl EnclaveSigner {
         let signing_key = SigningKey::from_bytes(&entry.secret)
             .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
 
-        let x_only_pubkey = signing_key.verifying_key().to_bytes();
+        let pubkey_bytes = signing_key.verifying_key().to_bytes();
+        let mut x_only_pubkey = [0u8; 32];
+        x_only_pubkey.copy_from_slice(&pubkey_bytes);
 
         let mut psbt: PsbtData = postcard::from_bytes(psbt_bytes)
             .map_err(|e| EnclaveError::Signing(format!("Invalid PSBT format: {}", e)))?;
@@ -225,17 +248,23 @@ impl EnclaveSigner {
 
 impl Default for EnclaveSigner {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("Failed to initialize EnclaveSigner")
     }
 }
 
 #[cfg(target_os = "linux")]
 fn getrandom(buf: &mut [u8]) -> Result<()> {
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-    use aws_nitro_enclaves_nsm_api::driver::nsm_process_request;
+    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+
+    let fd = nsm_init();
+    if fd < 0 {
+        return Err(EnclaveError::Nsm("Failed to initialize NSM".into()));
+    }
 
     let request = Request::GetRandom {};
-    let response = nsm_process_request(request);
+    let response = nsm_process_request(fd, request);
+    nsm_exit(fd);
 
     match response {
         Response::GetRandom { random } => {
@@ -261,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_generate_and_sign() {
-        let mut signer = EnclaveSigner::new();
+        let mut signer = EnclaveSigner::new().unwrap();
 
         let pubkey = signer.generate_key("test").unwrap();
         assert_eq!(pubkey.len(), 32);
@@ -273,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_import_key() {
-        let mut signer = EnclaveSigner::new();
+        let mut signer = EnclaveSigner::new().unwrap();
 
         let secret = [1u8; 32];
         let pubkey = signer.import_key("imported", &secret).unwrap();
@@ -285,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_key_not_found() {
-        let signer = EnclaveSigner::new();
+        let signer = EnclaveSigner::new().unwrap();
         let result = signer.sign("nonexistent", b"test");
         assert!(result.is_err());
     }

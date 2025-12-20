@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use crate::address::AddressDerivation;
@@ -80,7 +81,10 @@ impl BitcoinSigner {
 
     pub fn get_addresses(&self, count: u32) -> Result<Vec<String>> {
         let addresses = self.address_derivation.get_receive_addresses(count)?;
-        Ok(addresses.into_iter().map(|a| a.address.to_string()).collect())
+        Ok(addresses
+            .into_iter()
+            .map(|a| a.address.to_string())
+            .collect())
     }
 
     pub fn export_descriptor(&self, account: u32) -> Result<DescriptorExport> {

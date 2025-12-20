@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::address::AddressDerivation;
 use crate::error::{BitcoinError, Result};
 use bitcoin::Network;
@@ -37,7 +39,11 @@ impl DescriptorExport {
     }
 
     pub fn internal_descriptor(&self) -> Result<String> {
-        let desc = self.descriptor.split('#').next().unwrap_or(&self.descriptor);
+        let desc = self
+            .descriptor
+            .split('#')
+            .next()
+            .unwrap_or(&self.descriptor);
         let internal = desc.replace("/0/*)", "/1/*)");
         let checksum = compute_checksum(&internal)?;
         Ok(format!("{}#{}", internal, checksum))
@@ -69,7 +75,13 @@ impl DescriptorExport {
 
 fn compute_checksum(descriptor: &str) -> Result<String> {
     const CHECKSUM_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    const GENERATOR: [u64; 5] = [0xf5dee51989, 0xa9fdca3312, 0x1bab10e32d, 0x3706b1677a, 0x644d626ffd];
+    const GENERATOR: [u64; 5] = [
+        0xf5dee51989,
+        0xa9fdca3312,
+        0x1bab10e32d,
+        0x3706b1677a,
+        0x644d626ffd,
+    ];
 
     fn polymod(c: u64, val: u64) -> u64 {
         let mut c = c;

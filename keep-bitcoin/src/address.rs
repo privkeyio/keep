@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{BitcoinError, Result};
 use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv, Xpub};
 use bitcoin::key::Secp256k1;
@@ -62,9 +64,10 @@ impl AddressDerivation {
         let path = DerivationPath::from_str(&path_str)
             .map_err(|e| BitcoinError::DerivationPath(format!("Invalid path: {}", e)))?;
 
-        let child_xpriv = self.master_xpriv.derive_priv(&self.secp, &path).map_err(|e| {
-            BitcoinError::DerivationPath(format!("Derivation failed: {}", e))
-        })?;
+        let child_xpriv = self
+            .master_xpriv
+            .derive_priv(&self.secp, &path)
+            .map_err(|e| BitcoinError::DerivationPath(format!("Derivation failed: {}", e)))?;
 
         let child_keypair = child_xpriv.to_keypair(&self.secp);
         let (x_only_pk, _parity) = child_keypair.x_only_public_key();
@@ -106,9 +109,10 @@ impl AddressDerivation {
         let path = DerivationPath::from_str(&path_str)
             .map_err(|e| BitcoinError::DerivationPath(format!("Invalid path: {}", e)))?;
 
-        let account_xpriv = self.master_xpriv.derive_priv(&self.secp, &path).map_err(|e| {
-            BitcoinError::DerivationPath(format!("Derivation failed: {}", e))
-        })?;
+        let account_xpriv = self
+            .master_xpriv
+            .derive_priv(&self.secp, &path)
+            .map_err(|e| BitcoinError::DerivationPath(format!("Derivation failed: {}", e)))?;
 
         Ok(Xpub::from_priv(&self.secp, &account_xpriv))
     }

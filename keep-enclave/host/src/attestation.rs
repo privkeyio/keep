@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{EnclaveError, Result};
 use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use x509_cert::der::{Decode, Encode};
@@ -59,14 +61,16 @@ impl AttestationVerifier {
                 EnclaveError::Attestation(format!("Failed to parse attestation: {}", e))
             })?;
 
-        self.verify_certificate_chain(&attestation.cabundle, &cose)?;
+        self.verify_certificate_chain(&attestation.certificate, &attestation.cabundle, &cose)?;
 
         if let Some(doc_nonce) = &attestation.nonce {
             if doc_nonce.as_slice() != nonce {
                 return Err(EnclaveError::Attestation("Nonce mismatch".into()));
             }
         } else {
-            return Err(EnclaveError::Attestation("Missing nonce in attestation".into()));
+            return Err(EnclaveError::Attestation(
+                "Missing nonce in attestation".into(),
+            ));
         }
 
         if let Some(expected) = &self.expected_pcrs {
@@ -87,12 +91,51 @@ impl AttestationVerifier {
 
     fn verify_certificate_chain(
         &self,
+        signing_cert_der: &[u8],
         cabundle: &[Vec<u8>],
         cose: &CoseSign1,
     ) -> Result<()> {
+        let signing_cert = Certificate::from_der(signing_cert_der).map_err(|e| {
+            EnclaveError::Certificate(format!("Failed to parse signing cert: {}", e))
+        })?;
+
+        let signing_pubkey = extract_p384_pubkey(&signing_cert)?;
+        let sig_bytes = cose.signature.as_slice();
+        let signature = Signature::from_der(sig_bytes)
+            .map_err(|e| EnclaveError::Attestation(format!("Invalid COSE signature: {}", e)))?;
+
+        let to_verify = cose.sig_structure()?;
+        signing_pubkey
+            .verify(&to_verify, &signature)
+            .map_err(|_| EnclaveError::Attestation("COSE signature verification failed".into()))?;
+
         if cabundle.is_empty() {
             return Err(EnclaveError::Attestation("Empty certificate bundle".into()));
         }
+
+        let issuer_cert_der = &cabundle[0];
+        let issuer_cert = Certificate::from_der(issuer_cert_der).map_err(|e| {
+            EnclaveError::Certificate(format!("Failed to parse issuer cert: {}", e))
+        })?;
+
+        let issuer_pubkey = extract_p384_pubkey(&issuer_cert)?;
+        let tbs_bytes = signing_cert
+            .tbs_certificate
+            .to_der()
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+
+        let cert_sig_bytes = signing_cert.signature.as_bytes().ok_or_else(|| {
+            EnclaveError::Certificate("Missing signature bytes on signing cert".into())
+        })?;
+
+        let cert_signature = Signature::from_der(cert_sig_bytes)
+            .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {}", e)))?;
+
+        issuer_pubkey
+            .verify(&tbs_bytes, &cert_signature)
+            .map_err(|_| {
+                EnclaveError::Certificate("Signing certificate not issued by CA".into())
+            })?;
 
         let mut certs = Vec::with_capacity(cabundle.len());
         for cert_der in cabundle {
@@ -111,9 +154,10 @@ impl AttestationVerifier {
                 .to_der()
                 .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
 
-            let sig_bytes = subject.signature.as_bytes().ok_or_else(|| {
-                EnclaveError::Certificate("Missing signature bytes".into())
-            })?;
+            let sig_bytes = subject
+                .signature
+                .as_bytes()
+                .ok_or_else(|| EnclaveError::Certificate("Missing signature bytes".into()))?;
 
             let signature = Signature::from_der(sig_bytes)
                 .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {}", e)))?;
@@ -122,18 +166,6 @@ impl AttestationVerifier {
                 .verify(&tbs_bytes, &signature)
                 .map_err(|_| EnclaveError::Certificate("Certificate signature invalid".into()))?;
         }
-
-        let leaf_cert = &certs[0];
-        let leaf_pubkey = extract_p384_pubkey(leaf_cert)?;
-
-        let sig_bytes = cose.signature.as_slice();
-        let signature = Signature::from_der(sig_bytes)
-            .map_err(|e| EnclaveError::Attestation(format!("Invalid COSE signature: {}", e)))?;
-
-        let to_verify = cose.sig_structure()?;
-        leaf_pubkey
-            .verify(&to_verify, &signature)
-            .map_err(|_| EnclaveError::Attestation("COSE signature verification failed".into()))?;
 
         Ok(())
     }
@@ -167,9 +199,10 @@ impl AttestationVerifier {
 
 fn extract_p384_pubkey(cert: &Certificate) -> Result<VerifyingKey> {
     let spki = &cert.tbs_certificate.subject_public_key_info;
-    let key_bytes = spki.subject_public_key.as_bytes().ok_or_else(|| {
-        EnclaveError::Certificate("Missing public key bytes".into())
-    })?;
+    let key_bytes = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| EnclaveError::Certificate("Missing public key bytes".into()))?;
 
     VerifyingKey::from_sec1_bytes(key_bytes)
         .map_err(|e| EnclaveError::Certificate(format!("Invalid P-384 key: {}", e)))
@@ -183,8 +216,7 @@ struct AttestationDocument {
     #[serde(rename = "digest")]
     _digest: String,
     pcrs: std::collections::HashMap<u32, Vec<u8>>,
-    #[serde(rename = "certificate")]
-    _certificate: Vec<u8>,
+    certificate: Vec<u8>,
     cabundle: Vec<Vec<u8>>,
     public_key: Option<Vec<u8>>,
     user_data: Option<Vec<u8>>,
@@ -253,8 +285,9 @@ impl CoseSign1 {
         ]);
 
         let mut buf = Vec::new();
-        ciborium::into_writer(&structure, &mut buf)
-            .map_err(|e| EnclaveError::Attestation(format!("Failed to encode sig structure: {}", e)))?;
+        ciborium::into_writer(&structure, &mut buf).map_err(|e| {
+            EnclaveError::Attestation(format!("Failed to encode sig structure: {}", e))
+        })?;
         Ok(buf)
     }
 }

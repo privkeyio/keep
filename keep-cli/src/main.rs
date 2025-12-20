@@ -199,6 +199,8 @@ enum EnclaveCommands {
     Status {
         #[arg(long, default_value = "16")]
         cid: u32,
+        #[arg(long, help = "Use mock enclave for local testing")]
+        local: bool,
     },
     Verify {
         #[arg(long, default_value = "16")]
@@ -209,12 +211,16 @@ enum EnclaveCommands {
         pcr1: Option<String>,
         #[arg(long)]
         pcr2: Option<String>,
+        #[arg(long, help = "Use mock enclave for local testing")]
+        local: bool,
     },
     GenerateKey {
         #[arg(short, long)]
         name: String,
         #[arg(long, default_value = "16")]
         cid: u32,
+        #[arg(long, help = "Use mock enclave for local testing")]
+        local: bool,
     },
     Sign {
         #[arg(short, long)]
@@ -223,6 +229,8 @@ enum EnclaveCommands {
         message: String,
         #[arg(long, default_value = "16")]
         cid: u32,
+        #[arg(long, help = "Use mock enclave for local testing")]
+        local: bool,
     },
 }
 
@@ -1732,18 +1740,23 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 
 fn cmd_bitcoin(out: &Output, path: &Path, command: BitcoinCommands) -> Result<()> {
     match command {
-        BitcoinCommands::Address { key, count, network } => {
-            cmd_bitcoin_address(out, path, &key, count, &network)
-        }
-        BitcoinCommands::Descriptor { key, account, network } => {
-            cmd_bitcoin_descriptor(out, path, &key, account, &network)
-        }
-        BitcoinCommands::Sign { key, psbt, output, network } => {
-            cmd_bitcoin_sign(out, path, &key, &psbt, output.as_deref(), &network)
-        }
-        BitcoinCommands::Analyze { psbt, network } => {
-            cmd_bitcoin_analyze(out, &psbt, &network)
-        }
+        BitcoinCommands::Address {
+            key,
+            count,
+            network,
+        } => cmd_bitcoin_address(out, path, &key, count, &network),
+        BitcoinCommands::Descriptor {
+            key,
+            account,
+            network,
+        } => cmd_bitcoin_descriptor(out, path, &key, account, &network),
+        BitcoinCommands::Sign {
+            key,
+            psbt,
+            output,
+            network,
+        } => cmd_bitcoin_sign(out, path, &key, &psbt, output.as_deref(), &network),
+        BitcoinCommands::Analyze { psbt, network } => cmd_bitcoin_analyze(out, &psbt, &network),
     }
 }
 
@@ -1921,8 +1934,14 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
     out.header("PSBT Analysis");
     out.field("Inputs", &analysis.num_inputs.to_string());
     out.field("Outputs", &analysis.num_outputs.to_string());
-    out.field("Total Input", &format!("{} sats", analysis.total_input_sats));
-    out.field("Total Output", &format!("{} sats", analysis.total_output_sats));
+    out.field(
+        "Total Input",
+        &format!("{} sats", analysis.total_input_sats),
+    );
+    out.field(
+        "Total Output",
+        &format!("{} sats", analysis.total_output_sats),
+    );
     out.field("Fee", &format!("{} sats", analysis.fee_sats));
     out.newline();
 
@@ -1938,10 +1957,7 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
 
     if !analysis.signable_inputs.is_empty() {
         out.newline();
-        out.info(&format!(
-            "Signable inputs: {:?}",
-            analysis.signable_inputs
-        ));
+        out.info(&format!("Signable inputs: {:?}", analysis.signable_inputs));
     }
 
     Ok(())
@@ -1949,20 +1965,58 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
 
 fn cmd_enclave(out: &Output, command: EnclaveCommands) -> Result<()> {
     match command {
-        EnclaveCommands::Status { cid } => cmd_enclave_status(out, cid),
-        EnclaveCommands::Verify { cid, pcr0, pcr1, pcr2 } => {
-            cmd_enclave_verify(out, cid, pcr0.as_deref(), pcr1.as_deref(), pcr2.as_deref())
+        EnclaveCommands::Status { cid, local } => cmd_enclave_status(out, cid, local),
+        EnclaveCommands::Verify {
+            cid,
+            pcr0,
+            pcr1,
+            pcr2,
+            local,
+        } => cmd_enclave_verify(
+            out,
+            cid,
+            pcr0.as_deref(),
+            pcr1.as_deref(),
+            pcr2.as_deref(),
+            local,
+        ),
+        EnclaveCommands::GenerateKey { name, cid, local } => {
+            cmd_enclave_generate_key(out, &name, cid, local)
         }
-        EnclaveCommands::GenerateKey { name, cid } => cmd_enclave_generate_key(out, &name, cid),
-        EnclaveCommands::Sign { key, message, cid } => {
-            cmd_enclave_sign(out, &key, &message, cid)
-        }
+        EnclaveCommands::Sign {
+            key,
+            message,
+            cid,
+            local,
+        } => cmd_enclave_sign(out, &key, &message, cid, local),
     }
 }
 
-fn cmd_enclave_status(out: &Output, cid: u32) -> Result<()> {
+fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
     out.newline();
     out.header("Enclave Status");
+
+    if local {
+        out.field("Mode", "Local (Mock)");
+        let client = keep_enclave_host::MockEnclaveClient::new();
+        let mut nonce = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut nonce);
+
+        let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
+        match client.process_request(request) {
+            keep_enclave_host::EnclaveResponse::Attestation { .. } => {
+                out.success("Mock enclave is running");
+            }
+            keep_enclave_host::EnclaveResponse::Error { message, .. } => {
+                out.error(&format!("Mock enclave error: {}", message));
+            }
+            _ => {
+                out.error("Unexpected response from mock enclave");
+            }
+        }
+        return Ok(());
+    }
+
     out.field("Target CID", &cid.to_string());
 
     #[cfg(target_os = "linux")]
@@ -1995,9 +2049,34 @@ fn cmd_enclave_verify(
     pcr0: Option<&str>,
     pcr1: Option<&str>,
     pcr2: Option<&str>,
+    local: bool,
 ) -> Result<()> {
     out.newline();
     out.header("Enclave Attestation Verification");
+
+    if local {
+        out.field("Mode", "Local (Mock)");
+        let client = keep_enclave_host::MockEnclaveClient::new();
+        let mut nonce = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut nonce);
+
+        let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
+        match client.process_request(request) {
+            keep_enclave_host::EnclaveResponse::Attestation { document } => {
+                out.success("Mock attestation generated");
+                out.field("Document size", &format!("{} bytes", document.len()));
+                out.warn("Mock attestation - not cryptographically verified");
+            }
+            keep_enclave_host::EnclaveResponse::Error { message, .. } => {
+                out.error(&format!("Mock enclave error: {}", message));
+            }
+            _ => {
+                out.error("Unexpected response from mock enclave");
+            }
+        }
+        return Ok(());
+    }
+
     out.field("Target CID", &cid.to_string());
 
     #[cfg(target_os = "linux")]
@@ -2050,9 +2129,47 @@ fn cmd_enclave_verify(
     Ok(())
 }
 
-fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32) -> Result<()> {
+fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool) -> Result<()> {
     out.newline();
     out.header("Generate Key in Enclave");
+
+    if local {
+        out.field("Mode", "Local (Mock)");
+        let client = keep_enclave_host::MockEnclaveClient::new();
+
+        let request = keep_enclave_host::EnclaveRequest::GenerateKey {
+            name: name.to_string(),
+        };
+        match client.process_request(request) {
+            keep_enclave_host::EnclaveResponse::PublicKey {
+                pubkey,
+                name: key_name,
+            } => {
+                let pubkey_arr: [u8; 32] = match pubkey.as_slice().try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => {
+                        out.error(&format!(
+                            "Invalid pubkey length: expected 32, got {}",
+                            pubkey.len()
+                        ));
+                        return Ok(());
+                    }
+                };
+                let npub = keep_core::keys::bytes_to_npub(&pubkey_arr);
+                out.success("Key generated in mock enclave!");
+                out.field("Name", &key_name);
+                out.key_field("Pubkey", &npub);
+                out.warn("Mock key - persisted to /tmp for local testing");
+            }
+            keep_enclave_host::EnclaveResponse::Error { message, .. } => {
+                out.error(&format!("Mock enclave error: {}", message));
+            }
+            _ => {
+                out.error("Unexpected response from mock enclave");
+            }
+        }
+        return Ok(());
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -2064,7 +2181,13 @@ fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32) -> Result<()> {
             .map_err(|e| KeepError::Other(e.to_string()))?;
         spinner.finish();
 
-        let npub = keep_core::keys::bytes_to_npub(&pubkey);
+        let pubkey_arr: [u8; 32] = pubkey.as_slice().try_into().map_err(|_| {
+            KeepError::Other(format!(
+                "Invalid pubkey length: expected 32, got {}",
+                pubkey.len()
+            ))
+        })?;
+        let npub = keep_core::keys::bytes_to_npub(&pubkey_arr);
 
         out.success("Key generated in enclave!");
         out.field("Name", name);
@@ -2081,16 +2204,45 @@ fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32) -> Result<()> {
+fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32, local: bool) -> Result<()> {
     out.newline();
     out.header("Sign in Enclave");
+
+    let message_bytes =
+        hex::decode(message).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+
+    if local {
+        out.field("Mode", "Local (Mock)");
+        let client = keep_enclave_host::MockEnclaveClient::new();
+
+        let sign_request =
+            keep_enclave_host::EnclaveRequest::Sign(keep_enclave_host::SigningRequest {
+                key_id: key.to_string(),
+                message: message_bytes,
+                event_kind: None,
+                amount_sats: None,
+                destination: None,
+            });
+
+        match client.process_request(sign_request) {
+            keep_enclave_host::EnclaveResponse::Signature { signature } => {
+                out.success("Signature generated in mock enclave!");
+                out.newline();
+                println!("{}", hex::encode(&signature));
+            }
+            keep_enclave_host::EnclaveResponse::Error { message, .. } => {
+                out.error(&format!("Mock enclave error: {}", message));
+            }
+            _ => {
+                out.error("Unexpected response from mock enclave");
+            }
+        }
+        return Ok(());
+    }
 
     #[cfg(target_os = "linux")]
     {
         let client = keep_enclave_host::EnclaveClient::with_cid(cid);
-
-        let message_bytes = hex::decode(message)
-            .map_err(|_| KeepError::Other("Invalid message hex".into()))?;
 
         let request = keep_enclave_host::SigningRequest {
             key_id: key.to_string(),
@@ -2113,7 +2265,7 @@ fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32) -> Result<
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (key, message, cid);
+        let _ = (key, cid);
         out.warn("Enclave operations only available on Linux with Nitro");
     }
 

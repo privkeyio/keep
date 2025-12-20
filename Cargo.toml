@@ -7,6 +7,9 @@ members = [
     "keep-enclave/host",
     "keep-bitcoin",
 ]
+exclude = [
+    "keep-enclave/enclave",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,16 +1,38 @@
+#![forbid(unsafe_code)]
+
+use crate::kms::EncryptedWallet;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnclaveRequest {
-    GetAttestation { nonce: [u8; 32] },
-    GenerateKey { name: String },
-    ImportKey { name: String, secret: Vec<u8> },
+    GetAttestation {
+        nonce: [u8; 32],
+    },
+    GenerateKey {
+        name: String,
+    },
+    ImportKey {
+        name: String,
+        secret: Vec<u8>,
+    },
+    ImportEncryptedKey {
+        name: String,
+        encrypted: EncryptedWallet,
+    },
     Sign(SigningRequest),
     SignPsbt(PsbtSigningRequest),
     SetPolicy(PolicyConfig),
-    GetPublicKey { key_id: String },
-    FrostRound1 { key_id: String, message: Vec<u8> },
-    FrostRound2 { commitments: Vec<u8>, message: Vec<u8> },
+    GetPublicKey {
+        key_id: String,
+    },
+    FrostRound1 {
+        key_id: String,
+        message: Vec<u8>,
+    },
+    FrostRound2 {
+        commitments: Vec<u8>,
+        message: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,14 +52,32 @@ pub struct PsbtSigningRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnclaveResponse {
-    Attestation { document: Vec<u8> },
-    PublicKey { pubkey: [u8; 32], name: String },
-    Signature { signature: Vec<u8> },
-    SignedPsbt { psbt: Vec<u8>, signed_inputs: usize },
+    Attestation {
+        document: Vec<u8>,
+    },
+    PublicKey {
+        pubkey: Vec<u8>,
+        name: String,
+    },
+    Signature {
+        signature: Vec<u8>,
+    },
+    SignedPsbt {
+        psbt: Vec<u8>,
+        signed_inputs: usize,
+    },
     PolicySet,
-    FrostCommitment { commitment: Vec<u8>, nonces_id: [u8; 32] },
-    FrostShare { share: Vec<u8> },
-    Error { code: ErrorCode, message: String },
+    FrostCommitment {
+        commitment: Vec<u8>,
+        nonces_id: Vec<u8>,
+    },
+    FrostShare {
+        share: Vec<u8>,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

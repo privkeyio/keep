@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{BitcoinError, Result};
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
@@ -105,11 +107,12 @@ impl PsbtSigner {
         let prevouts: Vec<TxOut> = psbt
             .inputs
             .iter()
-            .map(|input| {
+            .enumerate()
+            .map(|(i, input)| {
                 input
                     .witness_utxo
                     .clone()
-                    .ok_or_else(|| BitcoinError::MissingWitnessUtxo(0))
+                    .ok_or_else(|| BitcoinError::MissingWitnessUtxo(i))
             })
             .collect::<Result<Vec<_>>>()?;
 

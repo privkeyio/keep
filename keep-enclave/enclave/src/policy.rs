@@ -1,5 +1,9 @@
+#![forbid(unsafe_code)]
+
 use crate::rate_limit::RateLimiter;
 use serde::{Deserialize, Serialize};
+
+const MAX_POLICY_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
@@ -93,8 +97,9 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {
-        for policy in &self.policies {
-            let decision = self.check_policy(policy, ctx);
+        for i in 0..self.policies.len() {
+            let policy = self.policies[i].clone();
+            let decision = self.check_policy(&policy, ctx);
             if decision != PolicyDecision::Allow {
                 return decision;
             }
@@ -104,7 +109,7 @@ impl PolicyEngine {
 
     fn check_policy(&mut self, policy: &Policy, ctx: &SigningContext<'_>) -> PolicyDecision {
         for rule in &policy.rules {
-            if !self.check_rule(rule, ctx) {
+            if !self.check_rule(rule, ctx, MAX_POLICY_DEPTH) {
                 return match policy.action {
                     PolicyAction::Deny => PolicyDecision::Deny(PolicyDenyReason::ExplicitDeny),
                     PolicyAction::RequireApproval => PolicyDecision::RequireApproval,
@@ -115,7 +120,11 @@ impl PolicyEngine {
         PolicyDecision::Allow
     }
 
-    fn check_rule(&mut self, rule: &PolicyRule, ctx: &SigningContext<'_>) -> bool {
+    fn check_rule(&mut self, rule: &PolicyRule, ctx: &SigningContext<'_>, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+
         match rule {
             PolicyRule::MaxAmountSats(max) => {
                 ctx.amount_sats.map(|a| a <= *max).unwrap_or(true)
@@ -146,6 +155,9 @@ impl PolicyEngine {
             }
 
             PolicyRule::AllowedHours { start, end } => {
+                if *start > 23 || *end > 23 {
+                    return false;
+                }
                 let hour = ((ctx.timestamp / 3600) % 24) as u8;
                 hour >= *start && hour < *end
             }
@@ -162,11 +174,11 @@ impl PolicyEngine {
             }
 
             PolicyRule::And(rules) => {
-                rules.iter().all(|r| self.check_rule(r, ctx))
+                rules.iter().all(|r| self.check_rule(r, ctx, depth - 1))
             }
 
             PolicyRule::Or(rules) => {
-                rules.iter().any(|r| self.check_rule(r, ctx))
+                rules.iter().any(|r| self.check_rule(r, ctx, depth - 1))
             }
         }
     }

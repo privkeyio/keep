@@ -1,9 +1,14 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{EnclaveError, Result};
 use crate::protocol::{
     EnclaveRequest, EnclaveResponse, ErrorCode, PolicyConfig, PsbtSigningRequest, SigningRequest,
     ENCLAVE_CID, VSOCK_PORT,
 };
 use tracing::{debug, warn};
+
+const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+const IO_TIMEOUT_SECS: u64 = 60;
 
 pub struct EnclaveClient {
     cid: u32,
@@ -28,9 +33,17 @@ impl EnclaveClient {
     #[cfg(target_os = "linux")]
     fn send_request(&self, request: &EnclaveRequest) -> Result<EnclaveResponse> {
         use std::io::{Read, Write};
+        use std::time::Duration;
 
         let mut stream = vsock::VsockStream::connect_with_cid_port(self.cid, self.port)
             .map_err(|e| EnclaveError::Vsock(format!("Connection failed: {}", e)))?;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)))
+            .map_err(|e| EnclaveError::Vsock(format!("Set read timeout failed: {}", e)))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)))
+            .map_err(|e| EnclaveError::Vsock(format!("Set write timeout failed: {}", e)))?;
 
         let request_bytes = postcard::to_allocvec(request)
             .map_err(|e| EnclaveError::Serialization(format!("Request encode failed: {}", e)))?;
@@ -48,6 +61,13 @@ impl EnclaveClient {
             .read_exact(&mut len_buf)
             .map_err(|e| EnclaveError::Vsock(format!("Read length failed: {}", e)))?;
         let response_len = u32::from_le_bytes(len_buf) as usize;
+
+        if response_len == 0 || response_len > MAX_RESPONSE_SIZE {
+            return Err(EnclaveError::Vsock(format!(
+                "Invalid response size: {} (max: {})",
+                response_len, MAX_RESPONSE_SIZE
+            )));
+        }
 
         let mut response_bytes = vec![0u8; response_len];
         stream
@@ -80,7 +100,7 @@ impl EnclaveClient {
         }
     }
 
-    pub fn generate_key(&self, name: &str) -> Result<[u8; 32]> {
+    pub fn generate_key(&self, name: &str) -> Result<Vec<u8>> {
         debug!(name, "Generating key in enclave");
         let request = EnclaveRequest::GenerateKey {
             name: name.to_string(),
@@ -97,7 +117,7 @@ impl EnclaveClient {
         }
     }
 
-    pub fn import_key(&self, name: &str, secret: &[u8]) -> Result<[u8; 32]> {
+    pub fn import_key(&self, name: &str, secret: &[u8]) -> Result<Vec<u8>> {
         debug!(name, "Importing key to enclave");
         let request = EnclaveRequest::ImportKey {
             name: name.to_string(),
@@ -167,14 +187,15 @@ impl EnclaveClient {
 
         match response {
             EnclaveResponse::PolicySet => Ok(()),
-            EnclaveResponse::Error { message, .. } => {
-                Err(EnclaveError::Attestation(format!("Policy set failed: {}", message)))
-            }
-            _ => Err(EnclaveError::Attestation("Unexpected response".into())),
+            EnclaveResponse::Error { message, .. } => Err(EnclaveError::PolicyConfig(format!(
+                "Policy set failed: {}",
+                message
+            ))),
+            _ => Err(EnclaveError::PolicyConfig("Unexpected response".into())),
         }
     }
 
-    pub fn get_public_key(&self, key_id: &str) -> Result<[u8; 32]> {
+    pub fn get_public_key(&self, key_id: &str) -> Result<Vec<u8>> {
         debug!(key_id, "Getting public key from enclave");
         let request = EnclaveRequest::GetPublicKey {
             key_id: key_id.to_string(),
@@ -191,7 +212,7 @@ impl EnclaveClient {
         }
     }
 
-    pub fn frost_round1(&self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+    pub fn frost_round1(&self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         debug!(key_id, "FROST round 1 in enclave");
         let request = EnclaveRequest::FrostRound1 {
             key_id: key_id.to_string(),

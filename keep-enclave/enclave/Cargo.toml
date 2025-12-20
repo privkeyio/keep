@@ -6,6 +6,8 @@ rust-version = "1.81"
 description = "AWS Nitro Enclave binary for Keep"
 license = "AGPL-3.0-or-later"
 
+[workspace]
+
 [[bin]]
 name = "keep-enclave"
 path = "src/main.rs"
@@ -14,6 +16,7 @@ path = "src/main.rs"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+signature = "2.2"
 
 frost-secp256k1-tr = { version = "2.2", default-features = false }
 
