@@ -13,6 +13,9 @@ use crate::protocol::{
     EnclaveRequest, EnclaveResponse, ErrorCode, PsbtSigningRequest, SigningRequest,
 };
 
+#[cfg(test)]
+use crate::protocol::NetworkParam;
+
 const KEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -60,17 +63,20 @@ impl MockEnclaveClient {
             EnclaveRequest::ImportEncryptedKey { name, encrypted } => {
                 self.mock_import_encrypted_key(&name, &encrypted)
             }
+            EnclaveRequest::ImportFrostKey {
+                name,
+                key_package,
+                pubkey_package,
+            } => self.mock_import_frost_key(&name, &key_package, &pubkey_package),
             EnclaveRequest::Sign(req) => self.mock_sign(req),
             EnclaveRequest::SignPsbt(req) => self.mock_sign_psbt(req),
             EnclaveRequest::GetPublicKey { key_id } => self.mock_get_public_key(&key_id),
             EnclaveRequest::SetPolicy(_) => EnclaveResponse::PolicySet,
-            EnclaveRequest::FrostRound1 { key_id, message } => {
-                self.mock_frost_round1(&key_id, &message)
-            }
-            EnclaveRequest::FrostRound2 {
-                commitments,
-                message,
-            } => self.mock_frost_round2(&commitments, &message),
+            EnclaveRequest::FrostRound1 {
+                key_id, message, ..
+            } => self.mock_frost_round1(&key_id, &message),
+            EnclaveRequest::FrostAddCommitment { .. } => EnclaveResponse::PolicySet,
+            EnclaveRequest::FrostRound2 { session_id, .. } => self.mock_frost_round2(session_id),
         }
     }
 
@@ -362,9 +368,21 @@ impl MockEnclaveClient {
         }
     }
 
+    fn mock_import_frost_key(
+        &self,
+        name: &str,
+        _key_package: &[u8],
+        _pubkey_package: &[u8],
+    ) -> EnclaveResponse {
+        EnclaveResponse::PublicKey {
+            pubkey: vec![0u8; 32],
+            name: name.to_string(),
+        }
+    }
+
     fn mock_frost_round1(&self, _key_id: &str, _message: &[u8]) -> EnclaveResponse {
-        let mut nonces_id = [0u8; 32];
-        if let Err(e) = getrandom::getrandom(&mut nonces_id) {
+        let mut session_id = [0u8; 32];
+        if let Err(e) = getrandom::getrandom(&mut session_id) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
                 message: format!("Random generation failed: {}", e),
@@ -372,12 +390,12 @@ impl MockEnclaveClient {
         }
 
         EnclaveResponse::FrostCommitment {
-            commitment: vec![0u8; 64],
-            nonces_id: nonces_id.to_vec(),
+            commitment: vec![0u8; 66],
+            nonces_id: session_id.to_vec(),
         }
     }
 
-    fn mock_frost_round2(&self, _commitments: &[u8], _message: &[u8]) -> EnclaveResponse {
+    fn mock_frost_round2(&self, _session_id: [u8; 32]) -> EnclaveResponse {
         EnclaveResponse::FrostShare {
             share: vec![0u8; 32],
         }
@@ -535,6 +553,8 @@ mod tests {
             event_kind: None,
             amount_sats: None,
             destination: None,
+            nonce: None,
+            timestamp: None,
         };
         let sign_response = client.mock_sign(sign_req);
         match sign_response {
@@ -585,6 +605,9 @@ mod tests {
         let req = PsbtSigningRequest {
             key_id: "btckey".to_string(),
             psbt: vec![0x70, 0x73, 0x62, 0x74],
+            network: NetworkParam::Testnet,
+            nonce: None,
+            timestamp: None,
         };
 
         let response = client.mock_sign_psbt(req);

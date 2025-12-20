@@ -2,8 +2,8 @@
 
 use crate::error::{EnclaveError, Result};
 use crate::protocol::{
-    EnclaveRequest, EnclaveResponse, ErrorCode, PolicyConfig, PsbtSigningRequest, SigningRequest,
-    ENCLAVE_CID, VSOCK_PORT,
+    EnclaveRequest, EnclaveResponse, ErrorCode, NetworkParam, PolicyConfig, PsbtSigningRequest,
+    SigningRequest, ENCLAVE_CID, VSOCK_PORT,
 };
 use tracing::{debug, warn};
 
@@ -135,6 +135,28 @@ impl EnclaveClient {
         }
     }
 
+    pub fn import_encrypted_key(
+        &self,
+        name: &str,
+        encrypted: crate::kms::EncryptedWallet,
+    ) -> Result<Vec<u8>> {
+        debug!(name, "Importing encrypted key to enclave");
+        let request = EnclaveRequest::ImportEncryptedKey {
+            name: name.to_string(),
+            encrypted,
+        };
+        let response = self.send_request(&request)?;
+
+        match response {
+            EnclaveResponse::PublicKey { pubkey, .. } => Ok(pubkey),
+            EnclaveResponse::Error { code, message } => {
+                warn!(?code, message, "Encrypted key import failed");
+                Err(EnclaveError::InvalidKey(message))
+            }
+            _ => Err(EnclaveError::InvalidKey("Unexpected response".into())),
+        }
+    }
+
     pub fn sign(&self, request: SigningRequest) -> Result<[u8; 64]> {
         debug!(key_id = %request.key_id, "Signing in enclave");
         let response = self.send_request(&EnclaveRequest::Sign(request))?;
@@ -158,11 +180,25 @@ impl EnclaveClient {
         }
     }
 
-    pub fn sign_psbt(&self, key_id: &str, psbt: &[u8]) -> Result<(Vec<u8>, usize)> {
+    pub fn sign_psbt(
+        &self,
+        key_id: &str,
+        psbt_bytes: &[u8],
+        network: NetworkParam,
+    ) -> Result<(Vec<u8>, usize)> {
         debug!(key_id, "Signing PSBT in enclave");
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).ok();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
         let request = EnclaveRequest::SignPsbt(PsbtSigningRequest {
             key_id: key_id.to_string(),
-            psbt: psbt.to_vec(),
+            psbt: psbt_bytes.to_vec(),
+            network,
+            nonce: Some(nonce),
+            timestamp,
         });
         let response = self.send_request(&request)?;
 
@@ -214,9 +250,17 @@ impl EnclaveClient {
 
     pub fn frost_round1(&self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         debug!(key_id, "FROST round 1 in enclave");
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).ok();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
         let request = EnclaveRequest::FrostRound1 {
             key_id: key_id.to_string(),
             message: message.to_vec(),
+            nonce: Some(nonce),
+            timestamp,
         };
         let response = self.send_request(&request)?;
 
@@ -233,11 +277,42 @@ impl EnclaveClient {
         }
     }
 
-    pub fn frost_round2(&self, commitments: &[u8], message: &[u8]) -> Result<Vec<u8>> {
+    pub fn frost_add_commitment(
+        &self,
+        session_id: [u8; 32],
+        identifier: &[u8],
+        commitment: &[u8],
+    ) -> Result<()> {
+        debug!("Adding FROST commitment");
+        let request = EnclaveRequest::FrostAddCommitment {
+            session_id,
+            identifier: identifier.to_vec(),
+            commitment: commitment.to_vec(),
+        };
+        let response = self.send_request(&request)?;
+
+        match response {
+            EnclaveResponse::PolicySet => Ok(()),
+            EnclaveResponse::Error { code, message } => {
+                warn!(?code, message, "FROST add commitment failed");
+                Err(EnclaveError::Signing(message))
+            }
+            _ => Err(EnclaveError::Signing("Unexpected response".into())),
+        }
+    }
+
+    pub fn frost_round2(&self, session_id: [u8; 32]) -> Result<Vec<u8>> {
         debug!("FROST round 2 in enclave");
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).ok();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
         let request = EnclaveRequest::FrostRound2 {
-            commitments: commitments.to_vec(),
-            message: message.to_vec(),
+            session_id,
+            nonce: Some(nonce),
+            timestamp,
         };
         let response = self.send_request(&request)?;
 
@@ -245,6 +320,30 @@ impl EnclaveClient {
             EnclaveResponse::FrostShare { share } => Ok(share),
             EnclaveResponse::Error { code, message } => {
                 warn!(?code, message, "FROST round 2 failed");
+                Err(EnclaveError::Signing(message))
+            }
+            _ => Err(EnclaveError::Signing("Unexpected response".into())),
+        }
+    }
+
+    pub fn import_frost_key(
+        &self,
+        name: &str,
+        key_package: &[u8],
+        pubkey_package: &[u8],
+    ) -> Result<Vec<u8>> {
+        debug!(name, "Importing FROST key to enclave");
+        let request = EnclaveRequest::ImportFrostKey {
+            name: name.to_string(),
+            key_package: key_package.to_vec(),
+            pubkey_package: pubkey_package.to_vec(),
+        };
+        let response = self.send_request(&request)?;
+
+        match response {
+            EnclaveResponse::PublicKey { pubkey, .. } => Ok(pubkey),
+            EnclaveResponse::Error { code, message } => {
+                warn!(?code, message, "Import FROST key failed");
                 Err(EnclaveError::Signing(message))
             }
             _ => Err(EnclaveError::Signing("Unexpected response".into())),

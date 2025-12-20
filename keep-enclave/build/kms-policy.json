@@ -1,0 +1,70 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowEnclaveDecrypt",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<EC2_INSTANCE_ROLE_ARN>"
+      },
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:<REGION>:<ACCOUNT_ID>:key/<KMS_KEY_ID>",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:PCR0": "<PCR0_VALUE>",
+          "kms:RecipientAttestation:PCR1": "<PCR1_VALUE>",
+          "kms:RecipientAttestation:PCR2": "<PCR2_VALUE>"
+        }
+      }
+    },
+    {
+      "Sid": "AllowEnclaveGenerateDataKey",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<EC2_INSTANCE_ROLE_ARN>"
+      },
+      "Action": "kms:GenerateDataKey",
+      "Resource": "arn:aws:kms:<REGION>:<ACCOUNT_ID>:key/<KMS_KEY_ID>",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:PCR0": "<PCR0_VALUE>",
+          "kms:RecipientAttestation:PCR1": "<PCR1_VALUE>",
+          "kms:RecipientAttestation:PCR2": "<PCR2_VALUE>"
+        }
+      }
+    },
+    {
+      "Sid": "AllowHostEncrypt",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<EC2_INSTANCE_ROLE_ARN>"
+      },
+      "Action": "kms:Encrypt",
+      "Resource": "arn:aws:kms:<REGION>:<ACCOUNT_ID>:key/<KMS_KEY_ID>"
+    },
+    {
+      "Sid": "AllowKeyAdministration",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<KMS_ADMIN_ROLE_ARN>"
+      },
+      "Action": [
+        "kms:Create*",
+        "kms:Describe*",
+        "kms:Enable*",
+        "kms:List*",
+        "kms:Put*",
+        "kms:Update*",
+        "kms:Revoke*",
+        "kms:Disable*",
+        "kms:Get*",
+        "kms:Delete*",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:TagResource",
+        "kms:UntagResource"
+      ],
+      "Resource": "arn:aws:kms:<REGION>:<ACCOUNT_ID>:key/<KMS_KEY_ID>"
+    }
+  ]
+}

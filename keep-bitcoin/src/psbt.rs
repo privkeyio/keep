@@ -112,7 +112,7 @@ impl PsbtSigner {
                 input
                     .witness_utxo
                     .clone()
-                    .ok_or_else(|| BitcoinError::MissingWitnessUtxo(i))
+                    .ok_or(BitcoinError::MissingWitnessUtxo(i))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -139,7 +139,7 @@ impl PsbtSigner {
             }
         }
 
-        for (pubkey, _) in &input.tap_key_origins {
+        for pubkey in input.tap_key_origins.keys() {
             if pubkey == &self.x_only_pubkey {
                 return Ok(true);
             }
@@ -184,7 +184,7 @@ impl PsbtSigner {
 
     fn is_change_output(&self, psbt: &Psbt, index: usize) -> bool {
         if let Some(output) = psbt.outputs.get(index) {
-            for (pubkey, _) in &output.tap_key_origins {
+            for pubkey in output.tap_key_origins.keys() {
                 if pubkey == &self.x_only_pubkey {
                     return true;
                 }

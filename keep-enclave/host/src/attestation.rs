@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{EnclaveError, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
 use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use std::time::{SystemTime, UNIX_EPOCH};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
@@ -42,11 +44,41 @@ pub struct VerifiedAttestation {
 
 pub struct AttestationVerifier {
     expected_pcrs: Option<ExpectedPcrs>,
+    root_cert: Certificate,
+}
+
+const AWS_NITRO_ROOT_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIICETCCAZagAwIBAgIRAPkxdWgbkK/hHUbMtOTn+FYwCgYIKoZIzj0EAwMwSTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoMBkFtYXpvbjEMMAoGA1UECwwDQVdTMRswGQYD
+VQQDDBJhd3Mubml0cm8tZW5jbGF2ZXMwHhcNMTkxMDI4MTMyODA1WhcNNDkxMDI4
+MTQyODA1WjBJMQswCQYDVQQGEwJVUzEPMA0GA1UECgwGQW1hem9uMQwwCgYDVQQL
+DANBV1MxGzAZBgNVBAMMEmF3cy5uaXRyby1lbmNsYXZlczB2MBAGByqGSM49AgEG
+BSuBBAAiA2IABPwCVOumCMHzaHDimtqQvkY4MpJzbolL//Zy2YlES1BR5TSksfbb
+48C8WBoyt7F2Bw7eEtaaP+ohG2bnUs990d0JX28TcPQXCEPZ3BABIeTPYwEoCWZE
+h8l5YoQwTcU/9KNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUkCW1DdkF
+R+eWw5b6cp3PmanfS5YwDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMDA2kAMGYC
+MQCjfy+Rocm9Xue4YnwWmNJVA44fA0P5W2OpYow9OYCVRaEevL8uO1XYru5xtMPW
+rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N
+IwLz3/Y=
+-----END CERTIFICATE-----"#;
+
+fn parse_pem_cert(pem: &str) -> Certificate {
+    let lines: Vec<&str> = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let b64 = lines.join("");
+    use base64::Engine;
+    let der = BASE64
+        .decode(&b64)
+        .expect("Invalid base64 in embedded root cert");
+    Certificate::from_der(&der).expect("Invalid DER in embedded root cert")
 }
 
 impl AttestationVerifier {
     pub fn new(expected_pcrs: Option<ExpectedPcrs>) -> Self {
-        Self { expected_pcrs }
+        let root_cert = parse_pem_cert(AWS_NITRO_ROOT_CERT_PEM);
+        Self {
+            expected_pcrs,
+            root_cert,
+        }
     }
 
     pub fn verify(&self, attestation_doc: &[u8], nonce: &[u8; 32]) -> Result<VerifiedAttestation> {
@@ -98,6 +130,7 @@ impl AttestationVerifier {
         let signing_cert = Certificate::from_der(signing_cert_der).map_err(|e| {
             EnclaveError::Certificate(format!("Failed to parse signing cert: {}", e))
         })?;
+        verify_cert_validity(&signing_cert)?;
 
         let signing_pubkey = extract_p384_pubkey(&signing_cert)?;
         let sig_bytes = cose.signature.as_slice();
@@ -117,6 +150,7 @@ impl AttestationVerifier {
         let issuer_cert = Certificate::from_der(issuer_cert_der).map_err(|e| {
             EnclaveError::Certificate(format!("Failed to parse issuer cert: {}", e))
         })?;
+        verify_cert_validity(&issuer_cert)?;
 
         let issuer_pubkey = extract_p384_pubkey(&issuer_cert)?;
         let tbs_bytes = signing_cert
@@ -141,6 +175,7 @@ impl AttestationVerifier {
         for cert_der in cabundle {
             let cert = Certificate::from_der(cert_der)
                 .map_err(|e| EnclaveError::Certificate(format!("Failed to parse cert: {}", e)))?;
+            verify_cert_validity(&cert)?;
             certs.push(cert);
         }
 
@@ -165,6 +200,24 @@ impl AttestationVerifier {
             issuer_pubkey
                 .verify(&tbs_bytes, &signature)
                 .map_err(|_| EnclaveError::Certificate("Certificate signature invalid".into()))?;
+        }
+
+        let chain_root = certs
+            .last()
+            .ok_or_else(|| EnclaveError::Certificate("Empty certificate chain".into()))?;
+
+        let chain_root_der = chain_root
+            .to_der()
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+        let expected_root_der = self
+            .root_cert
+            .to_der()
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+
+        if chain_root_der != expected_root_der {
+            return Err(EnclaveError::Certificate(
+                "Certificate chain does not terminate at AWS Nitro root CA".into(),
+            ));
         }
 
         Ok(())
@@ -206,6 +259,29 @@ fn extract_p384_pubkey(cert: &Certificate) -> Result<VerifyingKey> {
 
     VerifyingKey::from_sec1_bytes(key_bytes)
         .map_err(|e| EnclaveError::Certificate(format!("Invalid P-384 key: {}", e)))
+}
+
+fn verify_cert_validity(cert: &Certificate) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EnclaveError::Certificate("System clock error".into()))?
+        .as_secs();
+
+    let validity = &cert.tbs_certificate.validity;
+
+    let not_before = validity.not_before.to_unix_duration().as_secs();
+    let not_after = validity.not_after.to_unix_duration().as_secs();
+
+    if now < not_before {
+        return Err(EnclaveError::Certificate(
+            "Certificate not yet valid".into(),
+        ));
+    }
+    if now > not_after {
+        return Err(EnclaveError::Certificate("Certificate has expired".into()));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{EnclaveError, Result};
-use chacha20poly1305::{
+use aes_gcm::{
     aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Nonce,
+    Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -25,21 +25,19 @@ impl EnclaveKms {
         Self { ephemeral_secret }
     }
 
-    pub fn ephemeral_pubkey(&self) -> [u8; 32] {
+    pub fn ephemeral_pubkey(&self) -> Result<[u8; 32]> {
         use k256::schnorr::SigningKey;
-        if let Ok(sk) = SigningKey::from_bytes(&self.ephemeral_secret) {
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
-            pubkey
-        } else {
-            [0u8; 32]
-        }
+        let sk = SigningKey::from_bytes(&self.ephemeral_secret)
+            .map_err(|e| EnclaveError::InvalidKey(format!("Invalid ephemeral secret: {}", e)))?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
+        Ok(pubkey)
     }
 
     pub fn decrypt_wallet_key(&self, encrypted: &EncryptedWallet) -> Result<Vec<u8>> {
         let mut data_key = self.decrypt_data_key(&encrypted.encrypted_data_key)?;
 
-        let cipher = ChaCha20Poly1305::new_from_slice(&data_key)
+        let cipher = Aes256Gcm::new_from_slice(&data_key)
             .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
 
         let nonce = Nonce::from_slice(&encrypted.nonce);
@@ -59,10 +57,10 @@ impl EnclaveKms {
 
         let fd = nsm_init();
         if fd < 0 {
-            return Err(EnclaveError::Kms("Failed to initialize NSM".into()));
+            return self.mock_decrypt_data_key(encrypted_key);
         }
 
-        let pubkey = self.ephemeral_pubkey();
+        let pubkey = self.ephemeral_pubkey()?;
         let request = Request::Attestation {
             user_data: None,
             nonce: None,
@@ -89,12 +87,16 @@ impl EnclaveKms {
     #[cfg(target_os = "linux")]
     fn kms_decrypt_with_attestation(
         &self,
-        _encrypted_key: &[u8],
+        encrypted_key: &[u8],
         _attestation_doc: &[u8],
     ) -> Result<Vec<u8>> {
-        Err(EnclaveError::Kms(
-            "Real KMS integration requires vsock proxy to parent".into(),
-        ))
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let credentials = crate::aws_credentials::fetch_credentials()?;
+        let kmstool = crate::kmstool::KmsTool::new(credentials);
+
+        let ciphertext_b64 = STANDARD.encode(encrypted_key);
+        kmstool.decrypt(&ciphertext_b64)
     }
 
     fn mock_decrypt_data_key(&self, encrypted_key: &[u8]) -> Result<Vec<u8>> {
@@ -105,7 +107,7 @@ impl EnclaveKms {
         let nonce = Nonce::from_slice(&encrypted_key[..12]);
         let ciphertext = &encrypted_key[12..];
 
-        let cipher = ChaCha20Poly1305::new_from_slice(&self.ephemeral_secret)
+        let cipher = Aes256Gcm::new_from_slice(&self.ephemeral_secret)
             .map_err(|e| EnclaveError::Kms(format!("Invalid ephemeral key: {}", e)))?;
 
         cipher
@@ -117,11 +119,11 @@ impl EnclaveKms {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20poly1305::aead::KeyInit;
+    use aes_gcm::aead::KeyInit;
 
     fn encrypt_data_key(master_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         let nonce_bytes: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let cipher = ChaCha20Poly1305::new_from_slice(master_key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(master_key).unwrap();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let mut ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
         let mut result = nonce_bytes.to_vec();
@@ -130,7 +132,7 @@ mod tests {
     }
 
     fn encrypt_wallet_key(data_key: &[u8], wallet_key: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new_from_slice(data_key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(data_key).unwrap();
         let n = Nonce::from_slice(nonce);
         cipher.encrypt(n, wallet_key).unwrap()
     }

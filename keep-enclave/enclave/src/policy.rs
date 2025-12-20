@@ -159,12 +159,16 @@ impl PolicyEngine {
                     return false;
                 }
                 let hour = ((ctx.timestamp / 3600) % 24) as u8;
-                hour >= *start && hour < *end
+                if start <= end {
+                    hour >= *start && hour < *end
+                } else {
+                    hour >= *start || hour < *end
+                }
             }
 
             PolicyRule::BlockWeekends => {
                 let day = (ctx.timestamp / 86400 + 4) % 7;
-                day < 5
+                day != 0 && day != 6
             }
 
             PolicyRule::AllowedEventKinds(kinds) => {

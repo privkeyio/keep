@@ -2,23 +2,23 @@
 name = "keep-enclave-bin"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.83"
 description = "AWS Nitro Enclave binary for Keep"
 license = "AGPL-3.0-or-later"
-
-[workspace]
 
 [[bin]]
 name = "keep-enclave"
 path = "src/main.rs"
 
 [dependencies]
-k256 = { version = "0.13", default-features = false, features = ["schnorr", "alloc"] }
+k256 = { version = "0.13.4", default-features = false, features = ["schnorr", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["alloc"] }
 signature = "2.2"
 
 frost-secp256k1-tr = { version = "2.2", default-features = false }
+
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
@@ -27,6 +27,8 @@ ciborium = { version = "0.2", default-features = false }
 
 zeroize = { version = "1.8", features = ["derive"] }
 rand_core = { version = "0.6", default-features = false }
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 thiserror = "1.0"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
@@ -39,6 +41,8 @@ aws-nitro-enclaves-nsm-api = "0.4"
 [features]
 default = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
+# DANGER: Only enable for testing. Allows plaintext key import bypassing KMS.
+allow-plaintext-import = []
 
 [dependencies.tracing]
 version = "0.1"

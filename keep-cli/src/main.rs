@@ -232,6 +232,16 @@ enum EnclaveCommands {
         #[arg(long, help = "Use mock enclave for local testing")]
         local: bool,
     },
+    ImportKey {
+        #[arg(short, long)]
+        name: String,
+        #[arg(long, help = "Import from keep vault key")]
+        from_vault: Option<String>,
+        #[arg(long, default_value = "16")]
+        cid: u32,
+        #[arg(long, help = "Use mock enclave for local testing")]
+        local: bool,
+    },
 }
 
 fn setup_panic_hook() {
@@ -284,7 +294,7 @@ fn run(out: &Output) -> Result<()> {
         Commands::Serve { relay, headless } => cmd_serve(out, &path, &relay, headless, hidden),
         Commands::Frost { command } => cmd_frost(out, &path, command),
         Commands::Bitcoin { command } => cmd_bitcoin(out, &path, command),
-        Commands::Enclave { command } => cmd_enclave(out, command),
+        Commands::Enclave { command } => cmd_enclave(out, &path, command),
     }
 }
 
@@ -1760,12 +1770,16 @@ fn cmd_bitcoin(out: &Output, path: &Path, command: BitcoinCommands) -> Result<()
     }
 }
 
-fn parse_network(s: &str) -> keep_bitcoin::Network {
+fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
     match s.to_lowercase().as_str() {
-        "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-        "signet" => keep_bitcoin::Network::Signet,
-        "regtest" => keep_bitcoin::Network::Regtest,
-        _ => keep_bitcoin::Network::Testnet,
+        "mainnet" | "bitcoin" => Ok(keep_bitcoin::Network::Bitcoin),
+        "testnet" => Ok(keep_bitcoin::Network::Testnet),
+        "signet" => Ok(keep_bitcoin::Network::Signet),
+        "regtest" => Ok(keep_bitcoin::Network::Regtest),
+        _ => Err(KeepError::InvalidNetwork(format!(
+            "'{}' (valid: mainnet, testnet, signet, regtest)",
+            s
+        ))),
     }
 }
 
@@ -1788,11 +1802,12 @@ fn cmd_bitcoin_address(
         .get_by_name(key_name)
         .ok_or_else(|| KeepError::KeyNotFound(key_name.into()))?;
 
-    let secret = *slot.expose_secret();
-    let net = parse_network(network);
+    let mut secret = *slot.expose_secret();
+    let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
+    secret.zeroize();
 
     out.newline();
     out.header("Bitcoin Addresses (BIP-86 Taproot)");
@@ -1829,11 +1844,12 @@ fn cmd_bitcoin_descriptor(
         .get_by_name(key_name)
         .ok_or_else(|| KeepError::KeyNotFound(key_name.into()))?;
 
-    let secret = *slot.expose_secret();
-    let net = parse_network(network);
+    let mut secret = *slot.expose_secret();
+    let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
+    secret.zeroize();
 
     let export = signer
         .export_descriptor(account)
@@ -1878,11 +1894,12 @@ fn cmd_bitcoin_sign(
         .get_by_name(key_name)
         .ok_or_else(|| KeepError::KeyNotFound(key_name.into()))?;
 
-    let secret = *slot.expose_secret();
-    let net = parse_network(network);
+    let mut secret = *slot.expose_secret();
+    let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
+    secret.zeroize();
 
     let psbt_data = std::fs::read_to_string(psbt_path)
         .map_err(|e| KeepError::Other(format!("Failed to read PSBT: {}", e)))?;
@@ -1921,7 +1938,7 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
     let psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
         .map_err(|e| KeepError::Other(e.to_string()))?;
 
-    let net = parse_network(network);
+    let net = parse_network(network)?;
     let dummy_secret = [1u8; 32];
     let signer = keep_bitcoin::BitcoinSigner::new(dummy_secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
@@ -1963,7 +1980,7 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
     Ok(())
 }
 
-fn cmd_enclave(out: &Output, command: EnclaveCommands) -> Result<()> {
+fn cmd_enclave(out: &Output, path: &Path, command: EnclaveCommands) -> Result<()> {
     match command {
         EnclaveCommands::Status { cid, local } => cmd_enclave_status(out, cid, local),
         EnclaveCommands::Verify {
@@ -1989,6 +2006,12 @@ fn cmd_enclave(out: &Output, command: EnclaveCommands) -> Result<()> {
             cid,
             local,
         } => cmd_enclave_sign(out, &key, &message, cid, local),
+        EnclaveCommands::ImportKey {
+            name,
+            from_vault,
+            cid,
+            local,
+        } => cmd_enclave_import_key(out, path, &name, from_vault.as_deref(), cid, local),
     }
 }
 
@@ -2222,6 +2245,8 @@ fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32, local: boo
                 event_kind: None,
                 amount_sats: None,
                 destination: None,
+                nonce: None,
+                timestamp: None,
             });
 
         match client.process_request(sign_request) {
@@ -2250,6 +2275,8 @@ fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32, local: boo
             event_kind: None,
             amount_sats: None,
             destination: None,
+            nonce: None,
+            timestamp: None,
         };
 
         let spinner = out.spinner("Signing in enclave...");
@@ -2266,6 +2293,110 @@ fn cmd_enclave_sign(out: &Output, key: &str, message: &str, cid: u32, local: boo
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (key, cid);
+        out.warn("Enclave operations only available on Linux with Nitro");
+    }
+
+    Ok(())
+}
+
+fn cmd_enclave_import_key(
+    out: &Output,
+    path: &Path,
+    name: &str,
+    from_vault: Option<&str>,
+    cid: u32,
+    local: bool,
+) -> Result<()> {
+    out.newline();
+    out.header("Import Key to Enclave");
+
+    let mut secret = if let Some(vault_key) = from_vault {
+        out.field("Source", &format!("vault key '{}'", vault_key));
+
+        let mut keep = Keep::open(path)?;
+        let password = get_password("Enter password")?;
+
+        let spinner = out.spinner("Unlocking vault...");
+        keep.unlock(password.expose_secret())?;
+        spinner.finish();
+
+        let slot = keep
+            .keyring()
+            .get_by_name(vault_key)
+            .ok_or_else(|| KeepError::KeyNotFound(vault_key.into()))?;
+
+        let keypair = slot.to_nostr_keypair()?;
+        keypair.secret_bytes().to_vec()
+    } else {
+        out.field("Source", "stdin (hex)");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        let decoded =
+            hex::decode(input.trim()).map_err(|_| KeepError::Other("Invalid hex".into()))?;
+        input.zeroize();
+        decoded
+    };
+
+    if local {
+        out.field("Mode", "Local (Mock)");
+        let client = keep_enclave_host::MockEnclaveClient::new();
+
+        let request = keep_enclave_host::EnclaveRequest::ImportKey {
+            name: name.to_string(),
+            secret: secret.clone(),
+        };
+        secret.zeroize();
+
+        match client.process_request(request) {
+            keep_enclave_host::EnclaveResponse::PublicKey { pubkey, .. } => {
+                let npub = if pubkey.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&pubkey);
+                    keep_core::keys::bytes_to_npub(&arr)
+                } else {
+                    hex::encode(&pubkey)
+                };
+                out.success("Key imported to mock enclave!");
+                out.key_field("Pubkey", &npub);
+                out.warn("Mock key - persisted to /tmp for local testing");
+            }
+            keep_enclave_host::EnclaveResponse::Error { message, .. } => {
+                out.error(&format!("Mock enclave error: {}", message));
+            }
+            _ => {
+                out.error("Unexpected response from mock enclave");
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let client = keep_enclave_host::EnclaveClient::with_cid(cid);
+
+        let spinner = out.spinner("Importing key to enclave...");
+        let result = client.import_key(name, &secret);
+        secret.zeroize();
+        let pubkey = result.map_err(|e| KeepError::Other(e.to_string()))?;
+        spinner.finish();
+
+        let npub = if pubkey.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pubkey);
+            keep_core::keys::bytes_to_npub(&arr)
+        } else {
+            hex::encode(&pubkey)
+        };
+        out.success("Key imported to enclave!");
+        out.key_field("Pubkey", &npub);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (name, cid);
+        secret.zeroize();
         out.warn("Enclave operations only available on Linux with Nitro");
     }
 

@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod aws_credentials;
 mod error;
 mod kms;
+#[cfg(target_os = "linux")]
+mod kmstool;
 mod policy;
 mod rate_limit;
 mod signer;

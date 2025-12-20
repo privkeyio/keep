@@ -7,39 +7,20 @@ use crate::error::{BitcoinError, Result};
 use crate::psbt::{PsbtAnalysis, PsbtSigner};
 use bitcoin::psbt::Psbt;
 use bitcoin::Network;
-use zeroize::ZeroizeOnDrop;
 
-#[derive(ZeroizeOnDrop)]
 pub struct BitcoinSigner {
-    #[allow(dead_code)]
-    secret: [u8; 32],
-    #[zeroize(skip)]
     network: Network,
-    #[zeroize(skip)]
     address_derivation: AddressDerivation,
-    #[zeroize(skip)]
     psbt_signer: PsbtSigner,
-    #[zeroize(skip)]
     policy: Option<SigningPolicy>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SigningPolicy {
     pub max_amount_sats: Option<u64>,
     pub address_allowlist: Option<Vec<String>>,
     pub address_blocklist: Option<Vec<String>>,
     pub require_change_output: bool,
-}
-
-impl Default for SigningPolicy {
-    fn default() -> Self {
-        Self {
-            max_amount_sats: None,
-            address_allowlist: None,
-            address_blocklist: None,
-            require_change_output: false,
-        }
-    }
 }
 
 impl BitcoinSigner {
@@ -48,7 +29,6 @@ impl BitcoinSigner {
         let psbt_signer = PsbtSigner::new(&secret, network)?;
 
         Ok(Self {
-            secret,
             network,
             address_derivation,
             psbt_signer,

@@ -40,6 +40,9 @@ pub enum KeepError {
     #[error("FROST error: {0}")]
     Frost(String),
 
+    #[error("Invalid network: {0}")]
+    InvalidNetwork(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

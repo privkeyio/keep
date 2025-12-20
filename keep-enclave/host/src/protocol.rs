@@ -25,13 +25,26 @@ pub enum EnclaveRequest {
     GetPublicKey {
         key_id: String,
     },
+    ImportFrostKey {
+        name: String,
+        key_package: Vec<u8>,
+        pubkey_package: Vec<u8>,
+    },
     FrostRound1 {
         key_id: String,
         message: Vec<u8>,
+        nonce: Option<[u8; 32]>,
+        timestamp: Option<u64>,
+    },
+    FrostAddCommitment {
+        session_id: [u8; 32],
+        identifier: Vec<u8>,
+        commitment: Vec<u8>,
     },
     FrostRound2 {
-        commitments: Vec<u8>,
-        message: Vec<u8>,
+        session_id: [u8; 32],
+        nonce: Option<[u8; 32]>,
+        timestamp: Option<u64>,
     },
 }
 
@@ -42,12 +55,25 @@ pub struct SigningRequest {
     pub event_kind: Option<u32>,
     pub amount_sats: Option<u64>,
     pub destination: Option<String>,
+    pub nonce: Option<[u8; 32]>,
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PsbtSigningRequest {
     pub key_id: String,
     pub psbt: Vec<u8>,
+    pub network: NetworkParam,
+    pub nonce: Option<[u8; 32]>,
+    pub timestamp: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum NetworkParam {
+    Bitcoin,
+    Testnet,
+    Signet,
+    Regtest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
