@@ -1,0 +1,7 @@
+# AWS Nitro Enclaves SDK v0.4.2 (x86_64-unknown-linux-gnu)
+# Source: https://github.com/aws/aws-nitro-enclaves-sdk-c
+#
+# To regenerate after downloading new binaries:
+#   sha256sum kmstool_enclave_cli libnsm.so
+6b151442e024456e52f65e5369a3bb647093618ac516f66e06854f37ec336ade  /app/kmstool_enclave_cli
+032f54092d362a479dd69076a68e1344d887c14c085ff0d94065db6b19780644  /usr/lib64/libnsm.so

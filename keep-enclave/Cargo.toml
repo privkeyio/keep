@@ -1,0 +1,13 @@
+[package]
+name = "keep-enclave"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "AWS Nitro Enclave signer for Keep"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+keep-enclave-host = { path = "host" }
+
+[features]
+default = []

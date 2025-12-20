@@ -1,4 +1,5 @@
 /target
+keep-enclave/enclave/target/
 *.swp
 *.swo
 *~
