@@ -35,6 +35,10 @@ Keep uses AWS Nitro Enclaves to provide hardware-isolated signing for Nostr and 
 └─────────────────────────────────────────────────────────┘
 ```
 
+## Prerequisites
+
+**First**, download the required AWS Nitro SDK binaries by following [keep-enclave/build/README.md](../keep-enclave/build/README.md). The enclave build will fail without these.
+
 ## Automated Deployment (CDK)
 
 For automated infrastructure provisioning:
