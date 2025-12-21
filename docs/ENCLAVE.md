@@ -346,6 +346,21 @@ keep enclave sign --key test --message <hex> --local
 
 **Warning:** `--local` mode is NOT secure. Keys are stored unencrypted. For development only.
 
+### QEMU Nitro Emulation
+
+QEMU 8.0+ supports a `nitro-enclave` machine type for local testing without AWS:
+
+```bash
+qemu-system-x86_64 -M nitro-enclave,vsock=parent \
+  -kernel keep-enclave.eif \
+  -m 512 -nographic --enable-kvm -cpu host
+```
+
+This lets you test vsock communication and boot flow locally. Limitations:
+- No real attestation (PCRs are mock values)
+- No KMS integration
+- Requires Linux with KVM support
+
 ## Troubleshooting
 
 ### Enclave Won't Start

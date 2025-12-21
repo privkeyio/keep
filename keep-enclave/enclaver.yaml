@@ -1,0 +1,13 @@
+version: v1
+name: keep-enclave
+sources:
+  app: keep-enclave:local
+target: keep-enclave:enclave
+defaults:
+  memory_mb: 512
+ingress:
+  - listen_port: 5000
+egress:
+  allow:
+    - 169.254.169.254
+    - kms.us-east-1.amazonaws.com
