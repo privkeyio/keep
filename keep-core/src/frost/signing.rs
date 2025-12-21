@@ -317,12 +317,8 @@ mod tests {
         let commit0 = session0.generate_commitment(&kp0).unwrap();
         let commit1 = session1.generate_commitment(&kp1).unwrap();
 
-        session0
-            .add_commitment(*kp1.identifier(), commit1.clone())
-            .unwrap();
-        session1
-            .add_commitment(*kp0.identifier(), commit0.clone())
-            .unwrap();
+        session0.add_commitment(*kp1.identifier(), commit1).unwrap();
+        session1.add_commitment(*kp0.identifier(), commit0).unwrap();
 
         assert_eq!(session0.state(), SessionState::CollectingShares);
         assert_eq!(session1.state(), SessionState::CollectingShares);

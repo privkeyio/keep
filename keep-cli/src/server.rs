@@ -114,7 +114,7 @@ impl Server {
             .pubkey(self.keys.public_key());
 
         self.client
-            .subscribe(vec![filter], None)
+            .subscribe(filter, None)
             .await
             .map_err(|e| KeepError::Other(format!("Subscribe failed: {}", e)))?;
 
@@ -207,15 +207,12 @@ impl Server {
         )
         .map_err(|e| KeepError::Other(format!("Encrypt failed: {}", e)))?;
 
-        let response_event = EventBuilder::new(
-            Kind::NostrConnect,
-            encrypted,
-            vec![Tag::public_key(app_pubkey)],
-        )
-        .to_event(keys)
-        .map_err(|e| KeepError::Other(format!("Sign response failed: {}", e)))?;
+        let response_event = EventBuilder::new(Kind::NostrConnect, encrypted)
+            .tag(Tag::public_key(app_pubkey))
+            .sign_with_keys(keys)
+            .map_err(|e| KeepError::Other(format!("Sign response failed: {}", e)))?;
 
-        if let Err(e) = client.send_event(response_event).await {
+        if let Err(e) = client.send_event(&response_event).await {
             error!("Failed to send response: {}", e);
         }
 
@@ -357,7 +354,7 @@ impl Server {
     #[allow(dead_code)]
     pub async fn stop(&mut self) {
         self.running = false;
-        self.client.disconnect().await.ok();
+        self.client.disconnect().await;
     }
 }
 

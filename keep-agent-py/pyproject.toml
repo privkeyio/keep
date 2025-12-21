@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "keep-agent"
+version = "0.1.0"
+description = "Python SDK for Keep - secure signing for AI agents"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Security :: Cryptography",
+]
+keywords = ["nostr", "bitcoin", "signing", "ai", "agent"]
+
+[project.optional-dependencies]
+langchain = ["langchain>=1.2.0"]
+crewai = ["crewai>=0.175.0"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "keep_agent._bindings"
