@@ -8,6 +8,21 @@ Sovereign Key Management for Nostr and Bitcoin.
 cargo install --path keep-cli
 ```
 
+## Development
+
+```bash
+# Build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Run with debug output
+RUST_LOG=debug cargo run --bin keep -- <command>
+```
+
+Requires Rust 1.70+.
+
 ## Usage
 
 ```bash
@@ -117,6 +132,14 @@ An attacker cannot prove the hidden volume exists. Under duress, reveal only the
 KEEP_PASSWORD="outerpass" keep list                    # Shows decoy keys
 KEEP_PASSWORD="hiddenpass" keep --hidden list          # Shows real keys
 ```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `KEEP_PASSWORD` | Vault password (avoids interactive prompt) |
+| `KEEP_HIDDEN_PASSWORD` | Hidden volume password (with `--hidden` flag) |
+| `KEEP_PATH` | Custom vault path (default: `~/.keep`) |
 
 ## Security
 

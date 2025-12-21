@@ -1,42 +1,48 @@
 # Enclave Build
 
-## Required Binaries
+## Local Testing (No AWS Required)
 
-Before building, download these binaries from the AWS Nitro Enclaves SDK:
+Test the enclave logic locally before deploying to AWS:
+
+```bash
+# Build local Docker image
+docker build -f keep-enclave/build/Dockerfile.local -t keep-enclave:local .
+
+# Run (will fail on vsock - expected outside enclave)
+docker run --rm keep-enclave:local
+```
+
+## Using Enclaver (Recommended)
+
+[Enclaver](https://github.com/edgebitio/enclaver) simplifies enclave builds:
+
+```bash
+# Install enclaver
+curl -sL https://github.com/edgebitio/enclaver/releases/latest/download/enclaver-linux-x86_64.tar.gz | tar xz
+sudo mv enclaver /usr/local/bin/
+
+# Build local image first
+docker build -f keep-enclave/build/Dockerfile.local -t keep-enclave:local .
+
+# Build enclave with enclaver
+enclaver build -f keep-enclave/enclaver.yaml
+
+# Deploy on AWS Nitro instance
+enclaver run keep-enclave:enclave
+```
+
+## Full AWS Build (with KMS)
+
+For production builds with KMS integration, you need AWS SDK binaries.
+
+### Required Binaries
 
 | Binary | Source | Description |
 |--------|--------|-------------|
-| `kmstool_enclave_cli` | [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c/releases) | KMS integration for attestation-based decryption |
-| `libnsm.so` | [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c/releases) | Nitro Secure Module library |
+| `kmstool_enclave_cli` | [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c) | KMS integration for attestation-based decryption |
+| `libnsm.so` | [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c) | Nitro Secure Module library |
 
-### Download from Official Release
-
-```bash
-cd keep-enclave/build
-
-# Download v0.4.2 binaries (x86_64)
-curl -LO https://github.com/aws/aws-nitro-enclaves-sdk-c/releases/download/v0.4.2/kmstool_enclave_cli
-curl -LO https://github.com/aws/aws-nitro-enclaves-sdk-c/releases/download/v0.4.2/libnsm.so
-chmod +x kmstool_enclave_cli
-
-# Generate checksums
-sha256sum kmstool_enclave_cli libnsm.so
-```
-
-### Update Checksums (Required)
-
-The build will fail until you update `checksums.sha256` with real hashes:
-
-```bash
-# Get the hashes
-sha256sum kmstool_enclave_cli libnsm.so
-
-# Edit checksums.sha256 - replace the placeholder zeros with actual hashes
-# Format: <64-char-sha256-hash>  /app/kmstool_enclave_cli
-#         <64-char-sha256-hash>  /usr/lib64/libnsm.so
-```
-
-### Build from Source (Alternative)
+### Build from Source
 
 ```bash
 git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git

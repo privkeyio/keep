@@ -457,7 +457,7 @@ impl EnclaveSigner {
         let key_package = frost::keys::KeyPackage::deserialize(&entry.key_package_bytes)
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
-        let signing_package = frost::SigningPackage::new(session.commitments, &session.message);
+        let signing_package = frost::SigningPackage::new(session.commitments.clone(), &session.message);
 
         let signature_share = frost::round2::sign(&signing_package, &session.nonces, &key_package)
             .map_err(|e| EnclaveError::Signing(format!("FROST signing failed: {}", e)))?;
