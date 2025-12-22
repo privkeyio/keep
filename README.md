@@ -105,6 +105,85 @@ keep enclave sign --key test --message <hex> --local
 
 See [docs/ENCLAVE.md](docs/ENCLAVE.md) for deployment.
 
+## Agent SDK
+
+Secure signing for AI agents with constrained sessions.
+
+### Python
+
+```bash
+pip install keep-agent
+```
+
+```python
+from keep_agent import AgentSession, SessionScope, RateLimit
+
+session = AgentSession(
+    scope=SessionScope.nostr_only(),
+    rate_limit=RateLimit.conservative(),
+    duration_hours=24,
+)
+
+# Check permissions before signing
+if session.check_operation("sign_nostr_event"):
+    session.record_request()
+
+info = session.get_session_info()
+print(f"Requests remaining: {info.requests_remaining}")
+```
+
+### LangChain
+
+```python
+from keep_agent import AgentSession
+from keep_agent.langchain import KeepSignerTool
+
+session = AgentSession()
+tool = KeepSignerTool(session=session)
+# Use with any LangChain agent
+```
+
+### CrewAI
+
+```python
+from keep_agent import AgentSession
+from keep_agent.crewai import create_keep_tools
+
+session = AgentSession()
+tools = create_keep_tools(session)
+# Use with CrewAI agents
+```
+
+### TypeScript
+
+```bash
+npm install @keep/agent
+```
+
+```typescript
+import { KeepAgentSession, createNostrScope } from '@keep/agent';
+
+const session = new KeepAgentSession(createNostrScope());
+const info = await session.getSessionInfo();
+```
+
+### MCP Server (Claude/Cursor)
+
+```json
+{
+  "servers": {
+    "keep-signer": {
+      "command": "keep",
+      "args": ["mcp-server"],
+      "env": {
+        "KEEP_SESSION_TOKEN": "keep_sess_...",
+        "KEEP_BUNKER_URL": "bunker://npub1.../wss://relay.example.com"
+      }
+    }
+  }
+}
+```
+
 ## Hidden Volumes
 
 Plausibly deniable storage—hidden volume is cryptographically undetectable:

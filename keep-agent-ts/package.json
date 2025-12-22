@@ -1,0 +1,54 @@
+{
+  "name": "@keep/agent",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Keep - secure signing for AI agents",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./errors": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "nostr",
+    "bitcoin",
+    "signing",
+    "ai",
+    "agent",
+    "frost",
+    "threshold"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/privkeyio/keep"
+  },
+  "napi": {
+    "name": "keep-agent",
+    "triples": {
+      "defaults": true,
+      "additional": []
+    }
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.4.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build": "napi build --platform --release && tsc",
+    "build:debug": "napi build --platform && tsc",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "node test.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib",
+    "*.node"
+  ]
+}

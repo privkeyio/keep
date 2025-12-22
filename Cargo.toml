@@ -6,9 +6,12 @@ members = [
     "keep-enclave",
     "keep-enclave/host",
     "keep-bitcoin",
+    "keep-agent",
 ]
 exclude = [
     "keep-enclave/enclave",
+    "keep-agent-py",
+    "keep-agent-ts",
 ]
 
 [workspace.package]
@@ -21,6 +24,7 @@ repository = "https://github.com/privkeyio/keep"
 keep-core = { path = "keep-core" }
 keep-bitcoin = { path = "keep-bitcoin" }
 keep-enclave-host = { path = "keep-enclave/host" }
+keep-agent = { path = "keep-agent" }
 
 # Crypto
 argon2 = "0.5"
@@ -42,7 +46,7 @@ subtle = "2.5"
 heed = "0.20"
 
 # Nostr
-nostr-sdk = { version = "0.35", features = ["nip46"] }
+nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 
 # Async
 tokio = { version = "1", features = ["full", "signal"] }

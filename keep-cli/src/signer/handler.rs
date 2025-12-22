@@ -213,6 +213,7 @@ impl SignerHandler {
 
             unsigned_event
                 .sign(&keys)
+                .await
                 .map_err(|e| KeepError::Other(format!("Signing failed: {}", e)))?
         };
 

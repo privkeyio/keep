@@ -1,0 +1,32 @@
+[package]
+name = "keep-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent SDK for Keep - secure signing for AI agents"
+
+[features]
+default = []
+mcp = ["dep:serde_json"]
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+keep-bitcoin = { path = "../keep-bitcoin" }
+
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+nostr-sdk = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

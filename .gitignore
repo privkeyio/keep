@@ -1,5 +1,7 @@
 /target
 keep-enclave/enclave/target/
+keep-agent-py/target/
+keep-agent-ts/target/
 *.swp
 *.swo
 *~
@@ -8,3 +10,10 @@ keep-enclave/enclave/target/
 .vscode/
 *.iml
 .env
+.venv/
+node_modules/
+*.node
+__pycache__/
+*.pyc
+*.pyo
+*.so
