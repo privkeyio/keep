@@ -6,7 +6,7 @@ from aws_cdk import (
     CfnOutput,
     aws_ec2,
     aws_iam,
-    aws_ecr_assets,
+    aws_ecr,
     aws_autoscaling,
     aws_elasticloadbalancingv2,
     aws_kms,
@@ -21,13 +21,12 @@ class KeepEnclaveStack(Stack):
         encryption_key = aws_kms.Key(self, "EncryptionKey", enable_key_rotation=True)
         encryption_key.apply_removal_policy(aws_cdk.RemovalPolicy.DESTROY)
 
-        enclave_image = aws_ecr_assets.DockerImageAsset(
+        enclave_repo = aws_ecr.Repository.from_repository_name(
             self,
-            "KeepEnclaveImage",
-            directory="../..",
-            file="keep-enclave/build/Dockerfile.enclave",
-            platform=aws_ecr_assets.Platform.LINUX_AMD64,
+            "KeepEnclaveRepo",
+            repository_name="keep-enclave",
         )
+        enclave_image_uri = f"{enclave_repo.repository_uri}:latest"
 
         vpc = aws_ec2.Vpc(
             self,
@@ -89,6 +88,12 @@ class KeepEnclaveStack(Stack):
         nitro_sg.add_ingress_rule(
             aws_ec2.Peer.ipv4(vpc.vpc_cidr_block), aws_ec2.Port.tcp(443)
         )
+        nitro_sg.add_ingress_rule(
+            aws_ec2.Peer.any_ipv4(), aws_ec2.Port.tcp(443), "Allow HTTPS from internet"
+        )
+        nitro_sg.add_ingress_rule(
+            aws_ec2.Peer.any_ipv4(), aws_ec2.Port.tcp(22), "Allow SSH from internet"
+        )
 
         amzn_linux = aws_ec2.MachineImage.latest_amazon_linux2()
 
@@ -104,7 +109,7 @@ class KeepEnclaveStack(Stack):
         )
 
         encryption_key.grant_encrypt_decrypt(role)
-        enclave_image.repository.grant_pull(role)
+        enclave_repo.grant_pull(role)
 
         block_device = aws_ec2.BlockDevice(
             device_name="/dev/xvda",
@@ -119,7 +124,7 @@ class KeepEnclaveStack(Stack):
         )
 
         mappings = {
-            "__ENCLAVE_IMAGE_URI__": enclave_image.image_uri,
+            "__ENCLAVE_IMAGE_URI__": enclave_image_uri,
             "__REGION__": self.region,
             "__KMS_KEY_ID__": encryption_key.key_id,
         }
@@ -136,8 +141,21 @@ class KeepEnclaveStack(Stack):
             machine_image=amzn_linux,
             block_devices=[block_device],
             role=role,
-            security_group=nitro_sg,
             http_put_response_hop_limit=2,
+            key_name="keep-enclave",
+        )
+
+        # Configure network interface with public IP and security group
+        cfn_launch_template = launch_template.node.default_child
+        cfn_launch_template.add_property_override(
+            "LaunchTemplateData.NetworkInterfaces",
+            [
+                {
+                    "DeviceIndex": 0,
+                    "AssociatePublicIpAddress": True,
+                    "Groups": [nitro_sg.security_group_id],
+                }
+            ],
         )
 
         nlb = aws_elasticloadbalancingv2.NetworkLoadBalancer(
@@ -158,7 +176,7 @@ class KeepEnclaveStack(Stack):
             launch_template=launch_template,
             vpc=vpc,
             vpc_subnets=aws_ec2.SubnetSelection(
-                subnet_type=aws_ec2.SubnetType.PRIVATE_WITH_EGRESS
+                subnet_type=aws_ec2.SubnetType.PUBLIC
             ),
             update_policy=aws_autoscaling.UpdatePolicy.rolling_update(),
         )
