@@ -91,9 +91,6 @@ class KeepEnclaveStack(Stack):
         nitro_sg.add_ingress_rule(
             aws_ec2.Peer.any_ipv4(), aws_ec2.Port.tcp(443), "Allow HTTPS from internet"
         )
-        nitro_sg.add_ingress_rule(
-            aws_ec2.Peer.any_ipv4(), aws_ec2.Port.tcp(22), "Allow SSH from internet"
-        )
 
         amzn_linux = aws_ec2.MachineImage.latest_amazon_linux2()
 
