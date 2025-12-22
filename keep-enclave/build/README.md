@@ -19,7 +19,7 @@ docker build -f keep-enclave/build/Dockerfile.local -t keep-enclave:local .
 enclaver build -f keep-enclave/enclaver.yaml
 ```
 
-Deploy to EC2:
+Deploy to EC2 (use [CDK](../../docs/ENCLAVE.md#automated-deployment-cdk) or [Manual](../../docs/ENCLAVE.md#manual-deployment) to provision an instance first):
 
 ```bash
 docker save keep-enclave:enclave | gzip > keep-enclave.tar.gz
