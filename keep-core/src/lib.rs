@@ -223,6 +223,16 @@ impl Keep {
         self.storage.list_shares()
     }
 
+    fn find_stored_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<StoredShare> {
+        let shares = self.storage.list_shares()?;
+        shares
+            .into_iter()
+            .find(|s| {
+                s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
+            })
+            .ok_or_else(|| KeepError::KeyNotFound(format!("No share {} for group", identifier)))
+    }
+
     pub fn frost_export_share(
         &self,
         group_pubkey: &[u8; 32],
@@ -233,14 +243,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let shares = self.storage.list_shares()?;
-        let stored = shares
-            .iter()
-            .find(|s| {
-                s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
-            })
-            .ok_or_else(|| KeepError::KeyNotFound(format!("share {}", identifier)))?;
-
+        let stored = self.find_stored_share(group_pubkey, identifier)?;
         let data_key = self.get_data_key()?;
         let share = stored.decrypt(&data_key)?;
 
@@ -276,6 +279,20 @@ impl Keep {
             .find(|s| s.metadata.group_pubkey == *group_pubkey)
             .ok_or_else(|| KeepError::KeyNotFound("No shares for group".into()))?;
 
+        stored.decrypt(&data_key)
+    }
+
+    pub fn frost_get_share_by_index(
+        &self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+    ) -> Result<frost::SharePackage> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let stored = self.find_stored_share(group_pubkey, identifier)?;
+        let data_key = self.get_data_key()?;
         stored.decrypt(&data_key)
     }
 

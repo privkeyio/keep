@@ -13,7 +13,7 @@ use keep_core::keyring::Keyring;
 use crate::tui::{ApprovalRequest as TuiApprovalRequest, TuiEvent};
 
 use super::audit::{AuditAction, AuditEntry, AuditLog};
-use super::frost_signer::FrostSigner;
+use super::frost_signer::{FrostSigner, NetworkFrostSigner};
 use super::permissions::{Permission, PermissionManager};
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,7 @@ pub struct ApprovalRequest {
 pub struct SignerHandler {
     keyring: Arc<Mutex<Keyring>>,
     frost_signer: Option<Arc<Mutex<FrostSigner>>>,
+    network_frost_signer: Option<Arc<NetworkFrostSigner>>,
     permissions: Arc<Mutex<PermissionManager>>,
     audit: Arc<Mutex<AuditLog>>,
     tui_tx: Option<Sender<TuiEvent>>,
@@ -45,6 +46,7 @@ impl SignerHandler {
         Self {
             keyring,
             frost_signer: None,
+            network_frost_signer: None,
             permissions,
             audit,
             tui_tx,
@@ -57,6 +59,11 @@ impl SignerHandler {
         self
     }
 
+    pub fn with_network_frost_signer(mut self, signer: NetworkFrostSigner) -> Self {
+        self.network_frost_signer = Some(Arc::new(signer));
+        self
+    }
+
     pub async fn handle_connect(
         &self,
         app_pubkey: PublicKey,
@@ -65,7 +72,10 @@ impl SignerHandler {
         _permissions: Option<String>,
     ) -> Result<Option<String>> {
         if let Some(expected) = our_pubkey {
-            let actual = if let Some(ref frost) = self.frost_signer {
+            let actual = if let Some(ref net_frost) = self.network_frost_signer {
+                PublicKey::from_slice(net_frost.group_pubkey())
+                    .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
+            } else if let Some(ref frost) = self.frost_signer {
                 let signer = frost.lock().await;
                 PublicKey::from_slice(signer.group_pubkey())
                     .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
@@ -107,7 +117,10 @@ impl SignerHandler {
         }
         drop(pm);
 
-        let pubkey = if let Some(ref frost) = self.frost_signer {
+        let pubkey = if let Some(ref net_frost) = self.network_frost_signer {
+            PublicKey::from_slice(net_frost.group_pubkey())
+                .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
+        } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;
             PublicKey::from_slice(signer.group_pubkey())
                 .map_err(|e| KeepError::Other(format!("Invalid FROST pubkey: {}", e)))?
@@ -173,7 +186,33 @@ impl SignerHandler {
             }
         }
 
-        let signed_event = if let Some(ref frost) = self.frost_signer {
+        let signed_event = if let Some(ref net_frost) = self.network_frost_signer {
+            let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
+                .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?;
+            let mut frost_event = UnsignedEvent::new(
+                pubkey,
+                unsigned_event.created_at,
+                unsigned_event.kind,
+                unsigned_event.tags.clone(),
+                unsigned_event.content.clone(),
+            );
+            frost_event.ensure_id();
+            let event_id = frost_event
+                .id
+                .ok_or_else(|| KeepError::Other("Failed to compute event ID".into()))?;
+            let sig_bytes = net_frost.sign(event_id.as_bytes()).await?;
+            let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+                .map_err(|e| KeepError::Other(format!("Invalid signature: {}", e)))?;
+            Event::new(
+                event_id,
+                pubkey,
+                frost_event.created_at,
+                frost_event.kind,
+                frost_event.tags,
+                frost_event.content,
+                sig,
+            )
+        } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;
             let pubkey = PublicKey::from_slice(signer.group_pubkey())
                 .map_err(|e| KeepError::Other(format!("Invalid pubkey: {}", e)))?;

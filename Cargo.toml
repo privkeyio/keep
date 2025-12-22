@@ -7,6 +7,7 @@ members = [
     "keep-enclave/host",
     "keep-bitcoin",
     "keep-agent",
+    "keep-frost-net",
 ]
 exclude = [
     "keep-enclave/enclave",
@@ -25,6 +26,7 @@ keep-core = { path = "keep-core" }
 keep-bitcoin = { path = "keep-bitcoin" }
 keep-enclave-host = { path = "keep-enclave/host" }
 keep-agent = { path = "keep-agent" }
+keep-frost-net = { path = "keep-frost-net" }
 
 # Crypto
 argon2 = "0.5"

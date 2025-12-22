@@ -11,7 +11,7 @@ use keep_core::error::{KeepError, Result};
 use keep_core::keyring::Keyring;
 
 use crate::bunker::generate_bunker_url;
-use crate::signer::{AuditLog, FrostSigner, PermissionManager, SignerHandler};
+use crate::signer::{AuditLog, FrostSigner, NetworkFrostSigner, PermissionManager, SignerHandler};
 use crate::tui::{LogEntry, TuiEvent};
 
 pub struct Server {
@@ -94,6 +94,39 @@ impl Server {
             tui_tx,
         )
         .await
+    }
+
+    pub async fn new_network_frost(
+        network_signer: NetworkFrostSigner,
+        transport_secret: [u8; 32],
+        relay_url: &str,
+        tui_tx: Option<Sender<TuiEvent>>,
+    ) -> Result<Self> {
+        let secret = SecretKey::from_slice(&transport_secret)
+            .map_err(|e| KeepError::Other(format!("Invalid transport key: {}", e)))?;
+        let keys = Keys::new(secret);
+
+        let client = Client::new(keys.clone());
+
+        client
+            .add_relay(relay_url)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
+        let handler = SignerHandler::new(keyring, permissions, audit, tui_tx.clone())
+            .with_network_frost_signer(network_signer);
+
+        Ok(Self {
+            keys,
+            relay_url: relay_url.to_string(),
+            client,
+            handler: Arc::new(handler),
+            running: false,
+            tui_tx,
+        })
     }
 
     pub fn bunker_url(&self) -> String {

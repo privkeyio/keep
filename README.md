@@ -52,7 +52,7 @@ keep serve                    # Start NIP-46 remote signer
 Sign from any NIP-46 compatible client without exposing your private key:
 
 ```bash
-keep serve --relay wss://relay.damus.io
+keep serve --relay wss://nos.lol
 ```
 
 Displays a bunker URL to paste into your client. Approve requests with `Y`, reject with `N`, quit with `Q`.
@@ -80,7 +80,20 @@ keep frost list                                 # List shares
 keep frost export --share 1 --group npub1...   # Export share
 keep frost import                               # Import share
 keep frost sign --group npub1... --message <hex>
-keep frost sign --group npub1... --message <hex> --interactive  # Multi-device
+```
+
+### Network Coordination
+
+Sign across devices over nostr relays:
+
+```bash
+# On device 2 (signer)
+keep frost network serve --group npub1... --relay wss://nos.lol
+
+# On device 1 (initiator)
+keep frost network peers --group npub1...      # Check online peers
+keep frost network sign --group npub1... --message "hello"
+keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"
 ```
 
 ## Enclave (AWS Nitro)

@@ -103,10 +103,14 @@ enum Commands {
         name: String,
     },
     Serve {
-        #[arg(short, long, default_value = "wss://relay.damus.io")]
+        #[arg(short, long, default_value = "wss://nos.lol")]
         relay: String,
         #[arg(long)]
         headless: bool,
+        #[arg(long)]
+        frost_group: Option<String>,
+        #[arg(long, default_value = "wss://nos.lol")]
+        frost_relay: String,
     },
     Frost {
         #[command(subcommand)]
@@ -167,6 +171,50 @@ enum FrostCommands {
         group: String,
         #[arg(long)]
         interactive: bool,
+    },
+    Network {
+        #[command(subcommand)]
+        command: FrostNetworkCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum FrostNetworkCommands {
+    Serve {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+        #[arg(short, long)]
+        share: Option<u16>,
+    },
+    Peers {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+    },
+    Sign {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        message: String,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+        #[arg(short, long)]
+        share: Option<u16>,
+    },
+    SignEvent {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        kind: u16,
+        #[arg(short, long)]
+        content: String,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+        #[arg(short, long)]
+        share: Option<u16>,
     },
 }
 
@@ -303,7 +351,20 @@ fn run(out: &Output) -> Result<()> {
         Commands::List => cmd_list(out, &path, hidden),
         Commands::Export { name } => cmd_export(out, &path, &name, hidden),
         Commands::Delete { name } => cmd_delete(out, &path, &name, hidden),
-        Commands::Serve { relay, headless } => cmd_serve(out, &path, &relay, headless, hidden),
+        Commands::Serve {
+            relay,
+            headless,
+            frost_group,
+            frost_relay,
+        } => cmd_serve(
+            out,
+            &path,
+            &relay,
+            headless,
+            hidden,
+            frost_group.as_deref(),
+            &frost_relay,
+        ),
         Commands::Frost { command } => cmd_frost(out, &path, command),
         Commands::Bitcoin { command } => cmd_bitcoin(out, &path, command),
         Commands::Enclave { command } => cmd_enclave(out, &path, command),
@@ -412,7 +473,430 @@ fn cmd_frost(out: &Output, path: &Path, command: FrostCommands) -> Result<()> {
             group,
             interactive,
         } => cmd_frost_sign(out, path, &message, &group, interactive),
+        FrostCommands::Network { command } => cmd_frost_network(out, path, command),
     }
+}
+
+fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -> Result<()> {
+    match command {
+        FrostNetworkCommands::Serve {
+            group,
+            relay,
+            share,
+        } => cmd_frost_network_serve(out, path, &group, &relay, share),
+        FrostNetworkCommands::Peers { group, relay } => {
+            cmd_frost_network_peers(out, path, &group, &relay)
+        }
+        FrostNetworkCommands::Sign {
+            group,
+            message,
+            relay,
+            share,
+        } => cmd_frost_network_sign(out, path, &group, &message, &relay, share),
+        FrostNetworkCommands::SignEvent {
+            group,
+            kind,
+            content,
+            relay,
+            share,
+        } => cmd_frost_network_sign_event(out, path, &group, kind, &content, &relay, share),
+    }
+}
+
+fn cmd_frost_network_serve(
+    out: &Output,
+    path: &Path,
+    group_npub: &str,
+    relay: &str,
+    share_index: Option<u16>,
+) -> Result<()> {
+    debug!(group = group_npub, relay, share = ?share_index, "starting FROST network node");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+    let threshold = share.metadata.threshold;
+    let share_index = share.metadata.identifier;
+    let total_shares = share.metadata.total_shares;
+
+    out.newline();
+    out.header("FROST Network Node");
+    out.field("Group", group_npub);
+    out.field("Share", &share_index.to_string());
+    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        out.info("Starting FROST coordination node...");
+
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let npub = node.pubkey().to_bech32().unwrap_or_default();
+        out.field("Node pubkey", &npub);
+        out.newline();
+        out.info("Listening for FROST messages... (Ctrl+C to stop)");
+
+        let mut event_rx = node.subscribe();
+        let event_task = tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
+                        let name_str = name.unwrap_or_else(|| "unnamed".to_string());
+                        eprintln!("Peer discovered: Share {} ({})", share_index, name_str);
+                    }
+                    Ok(keep_frost_net::KfpNodeEvent::SignatureComplete {
+                        session_id,
+                        signature,
+                    }) => {
+                        eprintln!(
+                            "Signature complete for session {}: {}",
+                            hex::encode(&session_id[..8]),
+                            hex::encode(signature)
+                        );
+                    }
+                    Ok(keep_frost_net::KfpNodeEvent::SigningFailed { session_id, error }) => {
+                        eprintln!(
+                            "Signing failed for session {}: {}",
+                            hex::encode(&session_id[..8]),
+                            error
+                        );
+                    }
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        node.run()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        event_task.abort();
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_peers(out: &Output, path: &Path, group_npub: &str, relay: &str) -> Result<()> {
+    debug!(group = group_npub, relay, "checking FROST peers");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+
+    let share = keep.frost_get_share(&group_pubkey)?;
+
+    out.newline();
+    out.header("FROST Network Peers");
+    out.field("Group", group_npub);
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        let spinner = out.spinner("Connecting and discovering peers...");
+
+        let node = std::sync::Arc::new(
+            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?,
+        );
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!("FROST node error: {}", e);
+                }
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        spinner.finish();
+        node_handle.abort();
+
+        let status = node.peer_status();
+
+        if status.is_empty() {
+            out.info("No peers discovered yet.");
+            out.info("Run 'keep frost network serve' on other devices first.");
+        } else {
+            out.table_header(&[("SHARE", 8), ("STATUS", 10), ("NAME", 20)]);
+
+            for (share_index, peer_status, name) in status {
+                let status_str = match peer_status {
+                    keep_frost_net::PeerStatus::Online => "Online",
+                    keep_frost_net::PeerStatus::Offline => "Offline",
+                    keep_frost_net::PeerStatus::Unknown => "Unknown",
+                };
+                let name_str = name.unwrap_or_else(|| "-".to_string());
+                out.table_row(&[
+                    (&share_index.to_string(), 8, false),
+                    (status_str, 10, false),
+                    (&name_str, 20, false),
+                ]);
+            }
+        }
+
+        out.newline();
+        out.info(&format!("{} peer(s) online", node.online_peers()));
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_sign(
+    out: &Output,
+    path: &Path,
+    group_npub: &str,
+    message: &str,
+    relay: &str,
+    share_index: Option<u16>,
+) -> Result<()> {
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let share = if let Some(idx) = share_index {
+        keep.frost_get_share_by_index(&group_pubkey, idx)?
+    } else {
+        keep.frost_get_share(&group_pubkey)?
+    };
+
+    out.newline();
+    out.header("FROST Network Sign");
+    out.field("Group", group_npub);
+    out.field(
+        "Share",
+        &format!("{} ({})", share.metadata.identifier, share.metadata.name),
+    );
+    out.field(
+        "Threshold",
+        &format!(
+            "{}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        ),
+    );
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    rt.block_on(async {
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        out.info("Starting FROST coordination node...");
+        out.field(
+            "Node pubkey",
+            &node.pubkey().to_bech32().unwrap_or_default(),
+        );
+        out.newline();
+
+        let node = std::sync::Arc::new(node);
+        let node_clone = node.clone();
+        let _handle = tokio::spawn(async move {
+            let _ = node_clone.run().await;
+        });
+
+        out.info("Discovering peers...");
+        for i in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if node.online_peers() > 0 {
+                break;
+            }
+            if i < 11 {
+                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+            }
+        }
+
+        if node.online_peers() == 0 {
+            return Err(KeepError::Frost("No peers online after 24s.".into()));
+        }
+
+        out.success(&format!("Found {} online peer(s)", node.online_peers()));
+        out.newline();
+
+        out.info("Waiting for peers to discover us...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let spinner = out.spinner("Requesting signature from network...");
+        let signature = node
+            .request_signature(message.as_bytes().to_vec(), "raw")
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+
+        out.newline();
+        out.success("Signature complete!");
+        out.field("Signature", &hex::encode(signature));
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_sign_event(
+    out: &Output,
+    path: &Path,
+    group_npub: &str,
+    kind: u16,
+    content: &str,
+    relay: &str,
+    share_index: Option<u16>,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let share = if let Some(idx) = share_index {
+        keep.frost_get_share_by_index(&group_pubkey, idx)?
+    } else {
+        keep.frost_get_share(&group_pubkey)?
+    };
+    let pubkey_hex = hex::encode(group_pubkey);
+
+    out.newline();
+    out.header("FROST Network Sign Event");
+    out.field("Group", group_npub);
+    out.field(
+        "Share",
+        &format!("{} ({})", share.metadata.identifier, share.metadata.name),
+    );
+    out.field(
+        "Threshold",
+        &format!(
+            "{}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        ),
+    );
+    out.field("Relay", relay);
+    out.field("Kind", &kind.to_string());
+    out.newline();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    rt.block_on(async {
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        out.info("Starting FROST coordination node...");
+        out.field(
+            "Node pubkey",
+            &node.pubkey().to_bech32().unwrap_or_default(),
+        );
+        out.newline();
+
+        let node = std::sync::Arc::new(node);
+        let node_clone = node.clone();
+        let _handle = tokio::spawn(async move {
+            let _ = node_clone.run().await;
+        });
+
+        out.info("Discovering peers...");
+        for i in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if node.online_peers() > 0 {
+                break;
+            }
+            if i < 11 {
+                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+            }
+        }
+
+        if node.online_peers() == 0 {
+            return Err(KeepError::Frost("No peers online after 24s.".into()));
+        }
+
+        out.success(&format!("Found {} online peer(s)", node.online_peers()));
+        out.newline();
+
+        out.info("Waiting for peers to discover us...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| KeepError::Other(format!("System clock error: {}", e)))?
+            .as_secs();
+        let tags: Vec<Vec<String>> = vec![];
+        let serialized = serde_json::json!([0, pubkey_hex, created_at, kind, tags, content]);
+
+        let mut hasher = Sha256::new();
+        hasher.update(serialized.to_string().as_bytes());
+        let event_id = hasher.finalize();
+        let event_id_hex = hex::encode(&event_id);
+
+        out.field("Event ID", &event_id_hex);
+
+        let spinner = out.spinner("Requesting signature from network...");
+        let signature = node
+            .request_signature(event_id.to_vec(), "nostr_event")
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+
+        let signed_event = serde_json::json!({
+            "id": event_id_hex,
+            "pubkey": pubkey_hex,
+            "created_at": created_at,
+            "kind": kind,
+            "tags": tags,
+            "content": content,
+            "sig": hex::encode(&signature)
+        });
+
+        out.newline();
+        out.success("Event signed!");
+        out.newline();
+        let output = serde_json::to_string_pretty(&signed_event)
+            .map_err(|e| KeepError::Other(format!("Failed to serialize event: {}", e)))?;
+        println!("{}", output);
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
 }
 
 fn cmd_frost_generate(
@@ -1523,8 +2007,16 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: bool) -> Result<()> {
-    use crate::signer::FrostSigner;
+fn cmd_serve(
+    out: &Output,
+    path: &Path,
+    relay: &str,
+    headless: bool,
+    hidden: bool,
+    frost_group: Option<&str>,
+    frost_relay: &str,
+) -> Result<()> {
+    use crate::signer::{FrostSigner, NetworkFrostSigner};
 
     if hidden {
         return cmd_serve_hidden(out, path, relay, headless);
@@ -1533,7 +2025,7 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
         return cmd_serve_outer(out, path, relay, headless);
     }
 
-    debug!(relay, headless, "starting server");
+    debug!(relay, headless, ?frost_group, "starting server");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -1541,6 +2033,57 @@ fn cmd_serve(out: &Output, path: &Path, relay: &str, headless: bool, hidden: boo
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
     spinner.finish();
+
+    if let Some(group_npub) = frost_group {
+        let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+        let share = keep.frost_get_share(&group_pubkey)?;
+        let threshold = share.metadata.threshold;
+        let total_shares = share.metadata.total_shares;
+
+        out.newline();
+        out.header("NIP-46 Bunker (FROST Network Mode)");
+        out.field("Group", group_npub);
+        out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+        out.field("FROST Relay", frost_relay);
+        out.field("Bunker Relay", relay);
+        out.newline();
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+        return rt.block_on(async {
+            out.info("Connecting to FROST network...");
+            let node = keep_frost_net::KfpNode::new(share, vec![frost_relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+            node.announce()
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+            let node = std::sync::Arc::new(node);
+            let node_for_task = node.clone();
+            let _node_handle = tokio::spawn(async move {
+                if let Err(e) = node_for_task.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            });
+
+            let net_signer = NetworkFrostSigner::with_shared_node(group_pubkey, node);
+            out.success("Connected to FROST network");
+
+            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+
+            let mut server =
+                Server::new_network_frost(net_signer, transport_key, relay, None).await?;
+            let bunker_url = server.bunker_url();
+            out.field("Bunker URL", &bunker_url);
+            out.newline();
+            out.info("Listening for NIP-46 requests...");
+            out.info("(Sign requests will coordinate with FROST peers)");
+            server.run().await
+        });
+    }
 
     let shares = keep.frost_list_shares()?;
     let frost_signer = if !shares.is_empty() {
