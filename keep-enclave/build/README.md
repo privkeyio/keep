@@ -38,8 +38,11 @@ Requires `kmstool_enclave_cli` and `libnsm.so` from [aws-nitro-enclaves-sdk-c](h
 git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git
 cd aws-nitro-enclaves-sdk-c && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
-cp bin/kmstool-enclave-cli lib/libnsm.so ../../keep-enclave/build/
-sha256sum kmstool_enclave_cli libnsm.so > checksums.sha256
+cp bin/kmstool-enclave-cli ../../keep-enclave/build/kmstool_enclave_cli
+cp lib/libnsm.so ../../keep-enclave/build/
+cd ../../keep-enclave/build/
+echo "$(sha256sum kmstool_enclave_cli | cut -d' ' -f1)  /app/kmstool_enclave_cli" > checksums.sha256
+echo "$(sha256sum libnsm.so | cut -d' ' -f1)  /usr/lib64/libnsm.so" >> checksums.sha256
 ```
 
 Then build:
