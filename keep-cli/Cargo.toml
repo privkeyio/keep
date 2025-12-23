@@ -14,6 +14,7 @@ keep-core = { path = "../keep-core" }
 keep-bitcoin = { path = "../keep-bitcoin" }
 keep-enclave-host = { path = "../keep-enclave/host" }
 keep-agent = { path = "../keep-agent", features = ["mcp"] }
+keep-frost-net = { path = "../keep-frost-net" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -40,8 +41,9 @@ hex = "0.4"
 urlencoding = "2.1"
 url = "2.5"
 
-# FROST
+# FROST / Crypto
 frost-secp256k1-tr = "2.2.0"
+sha2 = "0.10.9"
 rand = "0.9"
 
 # Misc

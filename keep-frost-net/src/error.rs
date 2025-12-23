@@ -1,0 +1,47 @@
+#![forbid(unsafe_code)]
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum FrostNetError {
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+
+    #[error("Session error: {0}")]
+    Session(String),
+
+    #[error("Peer error: {0}")]
+    Peer(String),
+
+    #[error("Crypto error: {0}")]
+    Crypto(String),
+
+    #[error("Transport error: {0}")]
+    Transport(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Not enough peers online: need {needed}, have {available}")]
+    InsufficientPeers { needed: usize, available: usize },
+
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+
+    #[error("Untrusted peer: {0}")]
+    UntrustedPeer(String),
+
+    #[error("Replay detected: {0}")]
+    ReplayDetected(String),
+
+    #[error("Keep error: {0}")]
+    Keep(#[from] keep_core::error::KeepError),
+
+    #[error("Nostr error: {0}")]
+    Nostr(String),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type Result<T> = std::result::Result<T, FrostNetError>;

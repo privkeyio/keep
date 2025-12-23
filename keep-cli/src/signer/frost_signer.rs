@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use keep_core::crypto::SecretKey;
 use keep_core::error::{KeepError, Result};
 use keep_core::frost::StoredShare;
+use keep_frost_net::KfpNode;
 
 #[derive(Clone)]
 pub struct FrostSigner {
@@ -64,5 +67,35 @@ impl FrostSigner {
         }
 
         keep_core::frost::sign_with_local_shares(&decrypted, message)
+    }
+}
+
+pub struct NetworkFrostSigner {
+    group_pubkey: [u8; 32],
+    node: Arc<KfpNode>,
+}
+
+impl NetworkFrostSigner {
+    #[allow(dead_code)]
+    pub fn new(group_pubkey: [u8; 32], node: KfpNode) -> Self {
+        Self {
+            group_pubkey,
+            node: Arc::new(node),
+        }
+    }
+
+    pub fn with_shared_node(group_pubkey: [u8; 32], node: Arc<KfpNode>) -> Self {
+        Self { group_pubkey, node }
+    }
+
+    pub fn group_pubkey(&self) -> &[u8; 32] {
+        &self.group_pubkey
+    }
+
+    pub async fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
+        self.node
+            .request_signature(message.to_vec(), "nostr_event")
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))
     }
 }

@@ -6,6 +6,6 @@ pub mod handler;
 pub mod permissions;
 
 pub use audit::AuditLog;
-pub use frost_signer::FrostSigner;
+pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;
 pub use permissions::PermissionManager;
