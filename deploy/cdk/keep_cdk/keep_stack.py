@@ -6,7 +6,7 @@ from aws_cdk import (
     CfnOutput,
     aws_ec2,
     aws_iam,
-    aws_ecr_assets,
+    aws_ecr,
     aws_autoscaling,
     aws_elasticloadbalancingv2,
     aws_kms,
@@ -18,16 +18,19 @@ class KeepEnclaveStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # Image tag for enclave container - set via CDK context or use default
+        # Deploy with: cdk deploy -c image_tag=v1.2.3
+        image_tag = self.node.try_get_context("image_tag") or "v1.0.0"
+
         encryption_key = aws_kms.Key(self, "EncryptionKey", enable_key_rotation=True)
         encryption_key.apply_removal_policy(aws_cdk.RemovalPolicy.DESTROY)
 
-        enclave_image = aws_ecr_assets.DockerImageAsset(
+        enclave_repo = aws_ecr.Repository.from_repository_name(
             self,
-            "KeepEnclaveImage",
-            directory="../..",
-            file="keep-enclave/build/Dockerfile.enclave",
-            platform=aws_ecr_assets.Platform.LINUX_AMD64,
+            "KeepEnclaveRepo",
+            repository_name="keep-enclave",
         )
+        enclave_image_uri = f"{enclave_repo.repository_uri}:{image_tag}"
 
         vpc = aws_ec2.Vpc(
             self,
@@ -86,8 +89,11 @@ class KeepEnclaveStack(Stack):
             description="Keep Enclave EC2 security group",
         )
 
+        # Only allow HTTPS traffic from within the VPC (via NLB)
         nitro_sg.add_ingress_rule(
-            aws_ec2.Peer.ipv4(vpc.vpc_cidr_block), aws_ec2.Port.tcp(443)
+            aws_ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            aws_ec2.Port.tcp(443),
+            "Allow HTTPS from VPC (internal NLB traffic)",
         )
 
         amzn_linux = aws_ec2.MachineImage.latest_amazon_linux2()
@@ -104,7 +110,7 @@ class KeepEnclaveStack(Stack):
         )
 
         encryption_key.grant_encrypt_decrypt(role)
-        enclave_image.repository.grant_pull(role)
+        enclave_repo.grant_pull(role)
 
         block_device = aws_ec2.BlockDevice(
             device_name="/dev/xvda",
@@ -119,7 +125,7 @@ class KeepEnclaveStack(Stack):
         )
 
         mappings = {
-            "__ENCLAVE_IMAGE_URI__": enclave_image.image_uri,
+            "__ENCLAVE_IMAGE_URI__": enclave_image_uri,
             "__REGION__": self.region,
             "__KMS_KEY_ID__": encryption_key.key_id,
         }
@@ -136,8 +142,9 @@ class KeepEnclaveStack(Stack):
             machine_image=amzn_linux,
             block_devices=[block_device],
             role=role,
-            security_group=nitro_sg,
             http_put_response_hop_limit=2,
+            security_group=nitro_sg,
+            # No key_name - use SSM Session Manager for access via AmazonSSMManagedInstanceCore role
         )
 
         nlb = aws_elasticloadbalancingv2.NetworkLoadBalancer(
@@ -184,3 +191,4 @@ class KeepEnclaveStack(Stack):
         CfnOutput(self, "KMSKeyArn", value=encryption_key.key_arn)
         CfnOutput(self, "NLBDns", value=nlb.load_balancer_dns_name)
         CfnOutput(self, "ASGName", value=asg.auto_scaling_group_name)
+        CfnOutput(self, "ImageTag", value=image_tag)

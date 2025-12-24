@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock /build/
 WORKDIR /build/keep-enclave/enclave
 RUN cargo build --release
 
-FROM amazonlinux:2023-minimal AS runtime
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal AS runtime
 
 RUN dnf install -y \
     socat \

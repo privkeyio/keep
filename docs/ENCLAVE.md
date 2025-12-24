@@ -61,8 +61,11 @@ sudo mv enclaver /usr/local/bin/
 
 docker build -f keep-enclave/build/Dockerfile.local -t keep-enclave:local .
 enclaver build -f keep-enclave/enclaver.yaml
+```
 
-# Deploy to EC2
+Deploy to EC2 (use [CDK](#automated-deployment-cdk) or [Manual](#manual-deployment) to provision an instance first):
+
+```bash
 docker save keep-enclave:enclave | gzip > keep-enclave.tar.gz
 scp -i ~/.ssh/keep-enclave.pem keep-enclave.tar.gz ec2-user@<IP>:~/
 
@@ -77,16 +80,38 @@ Still need [KMS setup](#kms-setup) for key persistence.
 
 ## Automated Deployment (CDK)
 
+Create ECR repository and push enclave image first:
+
+```bash
+aws ecr create-repository --repository-name keep-enclave
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
+docker build -f keep-enclave/build/Dockerfile.enclave -t keep-enclave:v1.0.0 .
+docker tag keep-enclave:v1.0.0 <account>.dkr.ecr.us-east-1.amazonaws.com/keep-enclave:v1.0.0
+docker push <account>.dkr.ecr.us-east-1.amazonaws.com/keep-enclave:v1.0.0
+```
+
+Deploy infrastructure:
+
 ```bash
 cd deploy/cdk
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-CDK_DEPLOY_ACCOUNT=<account> CDK_DEPLOY_REGION=us-east-1 cdk deploy
+CDK_DEPLOY_ACCOUNT=<account> CDK_DEPLOY_REGION=us-east-1 cdk deploy -c image_tag=v1.0.0
 ```
 
-Provisions VPC, ASG, NLB, KMS, ECR. Update KMS policy with PCRs after build.
+Provisions VPC, ASG, NLB, KMS. Update KMS policy with PCRs after build.
 
 ## Manual Deployment
+
+### IAM Role
+
+```bash
+aws iam create-role --role-name keep-enclave-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam create-instance-profile --instance-profile-name keep-enclave-profile
+aws iam add-role-to-instance-profile --instance-profile-name keep-enclave-profile --role-name keep-enclave-role
+export EC2_ROLE_ARN=$(aws iam get-role --role-name keep-enclave-role --query 'Role.Arn' --output text)
+```
 
 ### SSH Key
 
@@ -104,9 +129,12 @@ aws ec2 run-instances \
   --instance-type m5.xlarge \
   --enclave-options 'Enabled=true' \
   --key-name keep-enclave \
+  --iam-instance-profile Name=keep-enclave-profile \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20}}]' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=keep-enclave}]'
 ```
+
+Note: AMI `ami-0c02fb55956c7d316` is for us-east-1. Find your region's Amazon Linux 2 AMI via `aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 --query 'Parameter.Value' --output text`.
 
 Supported: `m5.xlarge`, `m6i.xlarge`, `c5.xlarge`, `r5.xlarge` (and 2xlarge variants).
 
@@ -137,14 +165,21 @@ scp -i ~/.ssh/keep-enclave.pem keep-enclave/build/keep-enclave.eif ec2-user@<IP>
 
 ```bash
 aws kms create-key --description "Keep Enclave" --tags TagKey=Project,TagValue=keep
-export KMS_KEY_ID=<key-id>
+export KMS_KEY_ID=<key-id-from-output>
 aws kms create-alias --alias-name alias/keep-enclave --target-key-id $KMS_KEY_ID
 ```
 
-Edit `keep-enclave/build/kms-policy.json`, replace placeholders (`<EC2_INSTANCE_ROLE_ARN>`, `<PCR0>`, etc.), then:
+Edit `keep-enclave/build/kms-policy.json`, replace all placeholders:
+- `<EC2_INSTANCE_ROLE_ARN>`: Role ARN from IAM setup (use `echo $EC2_ROLE_ARN`)
+- `<KMS_ADMIN_ROLE_ARN>`: Your IAM user/role ARN for key administration
+- `<REGION>`: AWS region (e.g., `us-east-1`)
+- `<ACCOUNT_ID>`: Your AWS account ID
+- `<KMS_KEY_ID>`: Key ID from above
+- `<PCR0_VALUE>`, `<PCR1_VALUE>`, `<PCR2_VALUE>`: From `pcrs.json` after build
 
 ```bash
-aws kms put-key-policy --key-id $KMS_KEY_ID --policy-name default --policy file://kms-policy.json
+aws kms put-key-policy --key-id $KMS_KEY_ID --policy-name default \
+  --policy file://keep-enclave/build/kms-policy.json
 ```
 
 ## Run Enclave

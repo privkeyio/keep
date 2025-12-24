@@ -17,3 +17,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.so
+cdk.out/
+cdk.context.json
+*.tar.gz

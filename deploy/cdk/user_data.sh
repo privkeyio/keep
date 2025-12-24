@@ -111,6 +111,23 @@ User=ec2-user
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/keep-vsock-proxy.service <<EOF
+[Unit]
+Description=TCP to vsock proxy for Keep Enclave
+After=keep-enclave.service
+Requires=keep-enclave.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:443,fork,reuseaddr VSOCK-CONNECT:16:5000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now keep-enclave.service
+systemctl enable --now keep-vsock-proxy.service
 --//--
