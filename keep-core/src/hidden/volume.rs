@@ -1,3 +1,33 @@
+//! Hidden volume implementation for plausible deniability.
+//!
+//! # Architecture
+//!
+//! The hidden volume system provides two encrypted storage areas within a single vault file:
+//!
+//! - **Outer volume**: Standard encrypted storage, unlocked with the primary password
+//! - **Hidden volume**: Secondary encrypted storage, cryptographically indistinguishable from random data
+//!
+//! # File Layout
+//!
+//! ```text
+//! ┌─────────────────────┐  0
+//! │   Outer Header      │  256 bytes - salt, encrypted data key, argon2 params
+//! ├─────────────────────┤  256
+//! │   Hidden Header     │  256 bytes - encrypted with separate KDF salt (looks random)
+//! ├─────────────────────┤  512 (DATA_START_OFFSET)
+//! │   Outer Data Area   │  Variable size - redb database for outer volume
+//! ├─────────────────────┤
+//! │   Hidden Data Area  │  Variable size - serialized records for hidden volume
+//! └─────────────────────┘
+//! ```
+//!
+//! # Security Properties
+//!
+//! - Hidden header is encrypted and indistinguishable from random bytes
+//! - Wrong password for hidden volume produces same error as "no hidden volume"
+//! - Both volumes use independent Argon2id key derivation
+//! - Unlock attempts both decryptions to prevent timing attacks
+
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File, OpenOptions};
@@ -161,20 +191,14 @@ impl HiddenStorage {
         drop(file);
 
         let db_path = path.join("keep.db");
-        let db = Database::create(&db_path)
-            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
+        let db = Database::create(&db_path)?;
 
         {
-            let wtxn = db
-                .begin_write()
-                .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+            let wtxn = db.begin_write()?;
             {
-                let _ = wtxn
-                    .open_table(KEYS_TABLE)
-                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+                let _ = wtxn.open_table(KEYS_TABLE)?;
             }
-            wtxn.commit()
-                .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+            wtxn.commit()?;
         }
 
         Ok(Self {
@@ -234,8 +258,7 @@ impl HiddenStorage {
         self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
 
         let db_path = self.path.join("keep.db");
-        let db = Database::open(&db_path)
-            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
+        let db = Database::open(&db_path)?;
 
         self.outer_db = Some(db);
         self.active_volume = Some(VolumeType::Outer);
@@ -304,15 +327,14 @@ impl HiddenStorage {
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
-        if self.unlock_outer(password).is_ok() {
-            return Ok(VolumeType::Outer);
-        }
+        let outer_result = self.unlock_outer(password);
+        let hidden_result = self.unlock_hidden(password);
 
-        if self.unlock_hidden(password).is_ok() {
-            return Ok(VolumeType::Hidden);
+        match (outer_result.is_ok(), hidden_result.is_ok()) {
+            (true, _) => Ok(VolumeType::Outer),
+            (false, true) => Ok(VolumeType::Hidden),
+            _ => Err(KeepError::InvalidPassword),
         }
-
-        Err(KeepError::InvalidPassword)
     }
 
     pub fn lock(&mut self) {
@@ -355,25 +377,17 @@ impl HiddenStorage {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(record)
-            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+        let serialized = bincode::serialize(record)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         {
-            let mut table = wtxn
-                .open_table(KEYS_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            table
-                .insert(record.id.as_slice(), encrypted_bytes.as_slice())
-                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+            let mut table = wtxn.open_table(KEYS_TABLE)?;
+            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())?;
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         Ok(())
     }
@@ -443,8 +457,7 @@ impl HiddenStorage {
         data_key: &SecretKey,
         hidden_header: &HiddenHeader,
     ) -> Result<()> {
-        let serialized = bincode::serialize(records)
-            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+        let serialized = bincode::serialize(records)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
@@ -486,27 +499,18 @@ impl HiddenStorage {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db
-            .begin_read()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn
-            .open_table(KEYS_TABLE)
-            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+        let rtxn = db.begin_read()?;
+        let table = rtxn.open_table(KEYS_TABLE)?;
 
         let mut records = Vec::new();
 
-        for result in table
-            .iter()
-            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
-        {
-            let (_, encrypted_bytes) =
-                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        for result in table.iter()? {
+            let (_, encrypted_bytes) = result?;
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
-                .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
+            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)?;
 
             records.push(record);
         }
@@ -525,21 +529,13 @@ impl HiddenStorage {
     fn delete_key_outer(&self, id: &[u8; 32]) -> Result<()> {
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         let existed;
         {
-            let mut table = wtxn
-                .open_table(KEYS_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            existed = table
-                .remove(id.as_slice())
-                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
-                .is_some();
+            let mut table = wtxn.open_table(KEYS_TABLE)?;
+            existed = table.remove(id.as_slice())?.is_some();
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         if !existed {
             return Err(KeepError::KeyNotFound(hex::encode(id)));
@@ -750,6 +746,88 @@ mod tests {
             let outer_keys = storage.list_keys().unwrap();
             assert_eq!(outer_keys.len(), 1);
             assert_eq!(outer_keys[0].name, "outer key");
+        }
+    }
+
+    #[test]
+    fn test_sequential_key_operations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-sequential");
+
+        let storage =
+            HiddenStorage::create(&path, "password", None, 10 * 1024 * 1024, 0.0).unwrap();
+
+        for i in 0..4 {
+            let record = KeyRecord::new(
+                crypto::random_bytes(),
+                KeyType::Nostr,
+                format!("key-{}", i),
+                vec![i as u8],
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        let keys = storage.list_keys().unwrap();
+        assert_eq!(keys.len(), 4);
+
+        drop(storage);
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("password").unwrap();
+        let keys = storage.list_keys().unwrap();
+        assert_eq!(keys.len(), 4);
+    }
+
+    #[test]
+    fn test_volume_isolation_sequential() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-isolation-sequential");
+
+        {
+            let storage =
+                HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2)
+                    .unwrap();
+
+            for i in 0..3 {
+                let record = KeyRecord::new(
+                    crypto::random_bytes(),
+                    KeyType::Nostr,
+                    format!("outer-{}", i),
+                    vec![i as u8],
+                );
+                storage.store_key(&record).unwrap();
+            }
+        }
+
+        {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_hidden("hidden").unwrap();
+
+            for i in 0..2 {
+                let record = KeyRecord::new(
+                    crypto::random_bytes(),
+                    KeyType::Nostr,
+                    format!("hidden-{}", i),
+                    vec![100 + i as u8],
+                );
+                storage.store_key(&record).unwrap();
+            }
+        }
+
+        {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_outer("outer").unwrap();
+            let keys = storage.list_keys().unwrap();
+            assert_eq!(keys.len(), 3);
+            assert!(keys.iter().all(|k| k.name.starts_with("outer-")));
+        }
+
+        {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_hidden("hidden").unwrap();
+            let keys = storage.list_keys().unwrap();
+            assert_eq!(keys.len(), 2);
+            assert!(keys.iter().all(|k| k.name.starts_with("hidden-")));
         }
     }
 }

@@ -83,11 +83,11 @@ async fn test_peer_discovery_with_running_nodes() {
 
     let discovery_result = timeout(Duration::from_secs(15), async {
         loop {
-            if let Ok(event) = rx1.recv().await {
-                if let keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name } = event {
-                    println!("DISCOVERED peer: share {} ({:?})", share_index, name);
-                    return true;
-                }
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) =
+                rx1.recv().await
+            {
+                println!("DISCOVERED peer: share {} ({:?})", share_index, name);
+                return true;
             }
         }
     })

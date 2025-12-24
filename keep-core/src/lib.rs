@@ -367,10 +367,10 @@ impl Keep {
 }
 
 /// Get the default path for Keep storage (~/.keep).
-pub fn default_keep_path() -> PathBuf {
+pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".keep")
+        .map(|p| p.join(".keep"))
+        .ok_or(KeepError::HomeNotFound)
 }
 
 #[cfg(test)]

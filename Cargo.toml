@@ -44,9 +44,6 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 secrecy = "0.10"
 subtle = "2.5"
 
-# Storage
-heed = "0.20"
-
 # Nostr
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 

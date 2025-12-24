@@ -144,23 +144,15 @@ impl Storage {
         fs::write(&header_path, header.to_bytes())?;
 
         let db_path = path.join("keep.db");
-        let db = Database::create(&db_path)
-            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
+        let db = Database::create(&db_path)?;
 
         {
-            let wtxn = db
-                .begin_write()
-                .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+            let wtxn = db.begin_write()?;
             {
-                let _ = wtxn
-                    .open_table(KEYS_TABLE)
-                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-                let _ = wtxn
-                    .open_table(SHARES_TABLE)
-                    .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+                let _ = wtxn.open_table(KEYS_TABLE)?;
+                let _ = wtxn.open_table(SHARES_TABLE)?;
             }
-            wtxn.commit()
-                .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+            wtxn.commit()?;
         }
 
         Ok(Self {
@@ -221,8 +213,7 @@ impl Storage {
 
         debug!(path = ?self.path, "opening database");
         let db_path = self.path.join("keep.db");
-        let db = Database::open(&db_path)
-            .map_err(|e| KeepError::Other(format!("Database error: {}", e)))?;
+        let db = Database::open(&db_path)?;
 
         self.db = Some(db);
         debug!("storage unlocked");
@@ -248,25 +239,17 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(record)
-            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+        let serialized = bincode::serialize(record)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         {
-            let mut table = wtxn
-                .open_table(KEYS_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            table
-                .insert(record.id.as_slice(), encrypted_bytes.as_slice())
-                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+            let mut table = wtxn.open_table(KEYS_TABLE)?;
+            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())?;
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         Ok(())
     }
@@ -276,24 +259,18 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db
-            .begin_read()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn
-            .open_table(KEYS_TABLE)
-            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+        let rtxn = db.begin_read()?;
+        let table = rtxn.open_table(KEYS_TABLE)?;
 
         let encrypted_bytes = table
-            .get(id.as_slice())
-            .map_err(|e| KeepError::Other(format!("Get error: {}", e)))?
+            .get(id.as_slice())?
             .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))?;
 
         let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
-        bincode::deserialize(&decrypted_bytes)
-            .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))
+        Ok(bincode::deserialize(&decrypted_bytes)?)
     }
 
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
@@ -301,27 +278,18 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db
-            .begin_read()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn
-            .open_table(KEYS_TABLE)
-            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+        let rtxn = db.begin_read()?;
+        let table = rtxn.open_table(KEYS_TABLE)?;
 
         let mut records = Vec::new();
 
-        for result in table
-            .iter()
-            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
-        {
-            let (_, encrypted_bytes) =
-                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        for result in table.iter()? {
+            let (_, encrypted_bytes) = result?;
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)
-                .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
+            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)?;
 
             records.push(record);
         }
@@ -333,21 +301,13 @@ impl Storage {
         debug!(id = %hex::encode(id), "deleting key");
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         let existed;
         {
-            let mut table = wtxn
-                .open_table(KEYS_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            existed = table
-                .remove(id.as_slice())
-                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
-                .is_some();
+            let mut table = wtxn.open_table(KEYS_TABLE)?;
+            existed = table.remove(id.as_slice())?.is_some();
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         if !existed {
             return Err(KeepError::KeyNotFound(hex::encode(id)));
@@ -365,27 +325,19 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(share)
-            .map_err(|e| KeepError::Other(format!("Serialization error: {}", e)))?;
+        let serialized = bincode::serialize(share)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
         let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         {
-            let mut table = wtxn
-                .open_table(SHARES_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            table
-                .insert(id.as_slice(), encrypted_bytes.as_slice())
-                .map_err(|e| KeepError::Other(format!("Insert error: {}", e)))?;
+            let mut table = wtxn.open_table(SHARES_TABLE)?;
+            table.insert(id.as_slice(), encrypted_bytes.as_slice())?;
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         Ok(())
     }
@@ -395,27 +347,18 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db
-            .begin_read()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
-        let table = rtxn
-            .open_table(SHARES_TABLE)
-            .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
+        let rtxn = db.begin_read()?;
+        let table = rtxn.open_table(SHARES_TABLE)?;
 
         let mut shares = Vec::new();
 
-        for result in table
-            .iter()
-            .map_err(|e| KeepError::Other(format!("Iter error: {}", e)))?
-        {
-            let (_, encrypted_bytes) =
-                result.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        for result in table.iter()? {
+            let (_, encrypted_bytes) = result?;
             let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let share: StoredShare = bincode::deserialize(&decrypted_bytes)
-                .map_err(|e| KeepError::Other(format!("Deserialization error: {}", e)))?;
+            let share: StoredShare = bincode::deserialize(&decrypted_bytes)?;
 
             shares.push(share);
         }
@@ -429,21 +372,13 @@ impl Storage {
 
         let id = share_id(group_pubkey, identifier);
 
-        let wtxn = db
-            .begin_write()
-            .map_err(|e| KeepError::Other(format!("Transaction error: {}", e)))?;
+        let wtxn = db.begin_write()?;
         let existed;
         {
-            let mut table = wtxn
-                .open_table(SHARES_TABLE)
-                .map_err(|e| KeepError::Other(format!("Table error: {}", e)))?;
-            existed = table
-                .remove(id.as_slice())
-                .map_err(|e| KeepError::Other(format!("Remove error: {}", e)))?
-                .is_some();
+            let mut table = wtxn.open_table(SHARES_TABLE)?;
+            existed = table.remove(id.as_slice())?.is_some();
         }
-        wtxn.commit()
-            .map_err(|e| KeepError::Other(format!("Commit error: {}", e)))?;
+        wtxn.commit()?;
 
         if !existed {
             return Err(KeepError::KeyNotFound(format!(

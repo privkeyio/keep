@@ -43,11 +43,50 @@ pub enum KeepError {
     #[error("Invalid network: {0}")]
     InvalidNetwork(String),
 
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+
+    #[error("Home directory not found")]
+    HomeNotFound,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<redb::DatabaseError> for KeepError {
+    fn from(e: redb::DatabaseError) -> Self {
+        KeepError::Database(e.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for KeepError {
+    fn from(e: redb::TransactionError) -> Self {
+        KeepError::Database(e.to_string())
+    }
+}
+
+impl From<redb::TableError> for KeepError {
+    fn from(e: redb::TableError) -> Self {
+        KeepError::Database(e.to_string())
+    }
+}
+
+impl From<redb::StorageError> for KeepError {
+    fn from(e: redb::StorageError) -> Self {
+        KeepError::Database(e.to_string())
+    }
+}
+
+impl From<redb::CommitError> for KeepError {
+    fn from(e: redb::CommitError) -> Self {
+        KeepError::Database(e.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, KeepError>;
