@@ -107,12 +107,17 @@ impl SecretKey {
         bytes.copy_from_slice(slice);
         Self::new(bytes)
     }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        let decrypted = self.decrypt()?;
+        Self::new(*decrypted.expose_borrowed())
+    }
 }
 
 impl Clone for SecretKey {
     fn clone(&self) -> Self {
-        let decrypted = self.decrypt().expect("decrypt failed");
-        Self::new(*decrypted.expose_borrowed()).expect("encrypt failed")
+        self.try_clone()
+            .expect("SecretKey clone failed: RAM encryption invariant violated")
     }
 }
 

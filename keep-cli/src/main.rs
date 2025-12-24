@@ -339,7 +339,10 @@ fn main() {
 
 fn run(out: &Output) -> Result<()> {
     let cli = Cli::parse();
-    let path = cli.path.unwrap_or_else(default_keep_path);
+    let path = match cli.path {
+        Some(p) => p,
+        None => default_keep_path()?,
+    };
     let hidden = cli.hidden;
 
     debug!(path = %path.display(), hidden, "starting command");
@@ -866,7 +869,7 @@ fn cmd_frost_network_sign_event(
         let mut hasher = Sha256::new();
         hasher.update(serialized.to_string().as_bytes());
         let event_id = hasher.finalize();
-        let event_id_hex = hex::encode(&event_id);
+        let event_id_hex = hex::encode(event_id);
 
         out.field("Event ID", &event_id_hex);
 
@@ -884,7 +887,7 @@ fn cmd_frost_network_sign_event(
             "kind": kind,
             "tags": tags,
             "content": content,
-            "sig": hex::encode(&signature)
+            "sig": hex::encode(signature)
         });
 
         out.newline();

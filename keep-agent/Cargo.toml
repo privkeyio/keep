@@ -26,6 +26,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 urlencoding = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
