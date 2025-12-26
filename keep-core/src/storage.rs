@@ -10,6 +10,7 @@ use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
+use crate::rate_limit;
 
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 const SHARES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
@@ -192,6 +193,10 @@ impl Storage {
             return Ok(());
         }
 
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
+        }
+
         debug!("deriving master key");
         let master_key = crypto::derive_key(
             password.as_bytes(),
@@ -207,7 +212,13 @@ impl Storage {
         };
 
         debug!("decrypting data key");
-        let decrypted = crypto::decrypt(&encrypted, &header_key)?;
+        let decrypted = match crypto::decrypt(&encrypted, &header_key) {
+            Ok(d) => d,
+            Err(e) => {
+                rate_limit::record_failure(&self.path);
+                return Err(e);
+            }
+        };
         let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
@@ -216,6 +227,7 @@ impl Storage {
         let db = Database::open(&db_path)?;
 
         self.db = Some(db);
+        rate_limit::record_success(&self.path);
         debug!("storage unlocked");
 
         Ok(())
@@ -466,5 +478,49 @@ mod tests {
         storage.delete_key(&record.id).unwrap();
         let keys = storage.list_keys().unwrap();
         assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn test_storage_rate_limiting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rate-limit");
+
+        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+
+        for _ in 0..5 {
+            let mut storage = Storage::open(&path).unwrap();
+            let result = storage.unlock("wrong");
+            assert!(matches!(result, Err(KeepError::DecryptionFailed)));
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        let result = storage.unlock("wrong");
+        assert!(matches!(result, Err(KeepError::RateLimited(_))));
+
+        rate_limit::record_success(&path);
+    }
+
+    #[test]
+    fn test_storage_rate_limit_resets_on_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rate-limit-reset");
+
+        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+
+        for _ in 0..4 {
+            let mut storage = Storage::open(&path).unwrap();
+            let _ = storage.unlock("wrong");
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.unlock("correct").unwrap();
+        }
+
+        for _ in 0..4 {
+            let mut storage = Storage::open(&path).unwrap();
+            let result = storage.unlock("wrong");
+            assert!(matches!(result, Err(KeepError::DecryptionFailed)));
+        }
     }
 }
