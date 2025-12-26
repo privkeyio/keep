@@ -282,7 +282,10 @@ impl HiddenStorage {
                 Ok(())
             }
             Err(e) => {
-                rate_limit::record_failure(&self.path);
+                // Only record failure for authentication-related errors
+                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
+                }
                 Err(e)
             }
         }
@@ -363,7 +366,10 @@ impl HiddenStorage {
                 Ok(())
             }
             Err(e) => {
-                rate_limit::record_failure(&self.path);
+                // Only record failure for authentication-related errors
+                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
+                }
                 Err(e)
             }
         }
@@ -377,16 +383,31 @@ impl HiddenStorage {
         let outer_result = self.try_unlock_outer(password);
         let hidden_result = self.try_unlock_hidden(password);
 
-        match (outer_result.is_ok(), hidden_result.is_ok()) {
-            (true, _) => {
+        match (outer_result, hidden_result) {
+            (Ok(()), _) => {
                 rate_limit::record_success(&self.path);
                 Ok(VolumeType::Outer)
             }
-            (false, true) => {
+            (Err(_), Ok(())) => {
                 rate_limit::record_success(&self.path);
                 Ok(VolumeType::Hidden)
             }
-            _ => {
+            (Err(outer_err), Err(hidden_err)) => {
+                // Helper to check if an error is authentication-related
+                let is_auth_error = |e: &KeepError| {
+                    matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed)
+                };
+
+                // If either error is a non-auth error (IO, database, etc.), return it
+                // without recording a rate-limit failure
+                if !is_auth_error(&outer_err) {
+                    return Err(outer_err);
+                }
+                if !is_auth_error(&hidden_err) {
+                    return Err(hidden_err);
+                }
+
+                // Both errors are authentication failures - record failure and return
                 rate_limit::record_failure(&self.path);
                 Err(KeepError::InvalidPassword)
             }
