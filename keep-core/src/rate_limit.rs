@@ -77,7 +77,7 @@ impl RateLimiter {
     }
 }
 
-pub fn check_rate_limit(path: &Path) -> Result<(), Duration> {
+pub(crate) fn check_rate_limit(path: &Path) -> Result<(), Duration> {
     let normalized = normalize_path(path);
     let Ok(mut limiter) = RATE_LIMITER.lock() else {
         return Err(Duration::from_secs(MAX_DELAY_SECS));
@@ -91,7 +91,7 @@ pub fn check_rate_limit(path: &Path) -> Result<(), Duration> {
     }
 }
 
-pub fn record_failure(path: &Path) {
+pub(crate) fn record_failure(path: &Path) {
     let normalized = normalize_path(path);
     let Ok(mut limiter) = RATE_LIMITER.lock() else {
         return;
@@ -100,7 +100,7 @@ pub fn record_failure(path: &Path) {
     entry.record_failure();
 }
 
-pub fn record_success(path: &Path) {
+pub(crate) fn record_success(path: &Path) {
     let normalized = normalize_path(path);
     let Ok(mut limiter) = RATE_LIMITER.lock() else {
         return;
