@@ -7,6 +7,9 @@ pub enum KeepError {
     #[error("Invalid password")]
     InvalidPassword,
 
+    #[error("Rate limited: try again in {0} seconds")]
+    RateLimited(u64),
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 
