@@ -215,7 +215,9 @@ impl Storage {
         let decrypted = match crypto::decrypt(&encrypted, &header_key) {
             Ok(d) => d,
             Err(e) => {
-                rate_limit::record_failure(&self.path);
+                if matches!(e, KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
+                }
                 return Err(e);
             }
         };
@@ -496,8 +498,6 @@ mod tests {
         let mut storage = Storage::open(&path).unwrap();
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
-
-        rate_limit::record_success(&path);
     }
 
     #[test]

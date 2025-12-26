@@ -925,8 +925,6 @@ mod tests {
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock_outer("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
-
-        rate_limit::record_success(&path);
     }
 
     #[test]
@@ -945,8 +943,6 @@ mod tests {
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock_hidden("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
-
-        rate_limit::record_success(&path);
     }
 
     #[test]
@@ -965,7 +961,5 @@ mod tests {
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
-
-        rate_limit::record_success(&path);
     }
 }
