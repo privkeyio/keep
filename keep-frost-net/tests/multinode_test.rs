@@ -8,15 +8,23 @@ use keep_core::frost::{ThresholdConfig, TrustedDealer};
 use keep_frost_net::{
     AnnouncePayload, KfpMessage, KfpNode, SessionManager, SessionState, SignRequestPayload,
 };
+use nostr_relay_builder::prelude::*;
 
-fn get_test_relay() -> String {
-    std::env::var("FROST_TEST_RELAY").unwrap_or_else(|_| "wss://nos.lol".to_string())
+async fn graceful_shutdown(
+    shutdown_tx: Option<mpsc::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    if let Some(tx) = shutdown_tx {
+        let _ = tx.try_send(());
+    }
+    let _ = timeout(Duration::from_secs(2), handle).await;
 }
 
 #[tokio::test]
-#[ignore = "requires external relay; set FROST_TEST_RELAY env var or run with --ignored"]
 async fn test_node_creation_and_announcement() {
-    let relay = get_test_relay();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
     let config = ThresholdConfig::two_of_three();
     let dealer = TrustedDealer::new(config);
     let (mut shares, _pubkey_pkg) = dealer.generate("test-multinode").unwrap();
@@ -37,16 +45,13 @@ async fn test_node_creation_and_announcement() {
 
     node1.announce().await.expect("Node 1 announce failed");
     node2.announce().await.expect("Node 2 announce failed");
-
-    println!("Both nodes announced successfully");
-    println!("Node 1 pubkey: {:?}", node1.pubkey());
-    println!("Node 2 pubkey: {:?}", node2.pubkey());
 }
 
 #[tokio::test]
-#[ignore = "requires external relay; set FROST_TEST_RELAY env var or run with --ignored"]
 async fn test_peer_discovery_with_running_nodes() {
-    let relay = get_test_relay();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
     let config = ThresholdConfig::two_of_three();
     let dealer = TrustedDealer::new(config);
     let (mut shares, _pubkey_pkg) = dealer.generate("test-discovery").unwrap();
@@ -61,12 +66,6 @@ async fn test_peer_discovery_with_running_nodes() {
     let mut node2 = KfpNode::new(share2, vec![relay])
         .await
         .expect("Failed to create node 2");
-
-    println!(
-        "Node 1 share: {}, Node 2 share: {}",
-        node1.share_index(),
-        node2.share_index()
-    );
 
     let mut rx1 = node1.subscribe();
 
@@ -83,37 +82,21 @@ async fn test_peer_discovery_with_running_nodes() {
 
     let discovery_result = timeout(Duration::from_secs(15), async {
         loop {
-            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) =
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, .. }) =
                 rx1.recv().await
             {
-                println!("DISCOVERED peer: share {} ({:?})", share_index, name);
+                // Node 1 should discover Node 2, not itself
+                assert_eq!(share_index, 2, "Node 1 should discover Node 2");
                 return true;
             }
         }
     })
     .await;
 
-    async fn graceful_shutdown(
-        shutdown_tx: Option<mpsc::Sender<()>>,
-        handle: tokio::task::JoinHandle<()>,
-        name: &str,
-    ) {
-        if let Some(tx) = shutdown_tx {
-            let _ = tx.try_send(());
-        }
-        match timeout(Duration::from_secs(2), handle).await {
-            Ok(_) => println!("{} shutdown gracefully", name),
-            Err(_) => println!("{} shutdown timed out", name),
-        }
-    }
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
 
-    graceful_shutdown(shutdown1, node1_handle, "Node 1").await;
-    graceful_shutdown(shutdown2, node2_handle, "Node 2").await;
-
-    match discovery_result {
-        Ok(true) => println!("SUCCESS: Peer discovery verified!"),
-        _ => println!("Peer discovery timed out (relay latency or filtering)"),
-    }
+    assert!(discovery_result.is_ok(), "Peer discovery timed out");
 }
 
 #[tokio::test]
@@ -171,11 +154,12 @@ async fn test_session_management() {
 }
 
 #[tokio::test]
-#[ignore = "requires external relay; set FROST_TEST_RELAY env var or run with --ignored"]
 async fn test_full_signing_flow() {
     use std::sync::Arc;
 
-    let relay = get_test_relay();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
     let config = ThresholdConfig::two_of_three();
     let dealer = TrustedDealer::new(config);
     let (mut shares, _pubkey_pkg) = dealer.generate("test-signing").unwrap();
@@ -196,11 +180,6 @@ async fn test_full_signing_flow() {
         .await
         .expect("Failed to create node 3");
 
-    println!(
-        "Created nodes: share 1, 2, 3 with group {:?}",
-        hex::encode(node1.group_pubkey())
-    );
-
     let shutdown1 = node1.take_shutdown_handle();
     let shutdown2 = node2.take_shutdown_handle();
     let shutdown3 = node3.take_shutdown_handle();
@@ -220,13 +199,7 @@ async fn test_full_signing_flow() {
         let _ = node3_for_run.run().await;
     });
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    println!(
-        "Nodes running, node 3 has {} online peers",
-        node3.online_peers()
-    );
-
-    println!("Attempting signature from node 3...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let message = b"Hello, FROST!".to_vec();
     let sign_result = timeout(Duration::from_secs(30), async {
@@ -234,28 +207,12 @@ async fn test_full_signing_flow() {
     })
     .await;
 
-    async fn graceful_shutdown(
-        shutdown_tx: Option<mpsc::Sender<()>>,
-        handle: tokio::task::JoinHandle<()>,
-        name: &str,
-    ) {
-        if let Some(tx) = shutdown_tx {
-            let _ = tx.try_send(());
-        }
-        match timeout(Duration::from_secs(2), handle).await {
-            Ok(_) => println!("{} shutdown gracefully", name),
-            Err(_) => println!("{} shutdown timed out", name),
-        }
-    }
-
-    graceful_shutdown(shutdown1, node1_handle, "Node 1").await;
-    graceful_shutdown(shutdown2, node2_handle, "Node 2").await;
-    graceful_shutdown(shutdown3, node3_handle, "Node 3").await;
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
 
     match sign_result {
         Ok(Ok(signature)) => {
-            println!("SUCCESS: Signature obtained!");
-            println!("Signature: {}", hex::encode(signature));
             assert_eq!(signature.len(), 64);
         }
         Ok(Err(e)) => {
