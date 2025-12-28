@@ -14,7 +14,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use keep_core::error::{KeepError, Result};
 use keep_core::frost::ShareExport;
@@ -176,6 +176,10 @@ enum FrostCommands {
         #[command(subcommand)]
         command: FrostNetworkCommands,
     },
+    Hardware {
+        #[command(subcommand)]
+        command: FrostHardwareCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -203,6 +207,8 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        hardware: Option<String>,
     },
     SignEvent {
         #[arg(short, long)]
@@ -215,6 +221,44 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        hardware: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FrostHardwareCommands {
+    Ping {
+        #[arg(short, long)]
+        device: String,
+    },
+    List {
+        #[arg(short, long)]
+        device: String,
+    },
+    Import {
+        #[arg(short, long)]
+        device: String,
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        share: u16,
+    },
+    Delete {
+        #[arg(short, long)]
+        device: String,
+        #[arg(short, long)]
+        group: String,
+    },
+    Sign {
+        #[arg(short, long)]
+        device: String,
+        #[arg(short, long)]
+        group: String,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        commitments: String,
     },
 }
 
@@ -477,6 +521,7 @@ fn cmd_frost(out: &Output, path: &Path, command: FrostCommands) -> Result<()> {
             interactive,
         } => cmd_frost_sign(out, path, &message, &group, interactive),
         FrostCommands::Network { command } => cmd_frost_network(out, path, command),
+        FrostCommands::Hardware { command } => cmd_frost_hardware(out, path, command),
     }
 }
 
@@ -495,15 +540,280 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             message,
             relay,
             share,
-        } => cmd_frost_network_sign(out, path, &group, &message, &relay, share),
+            hardware,
+        } => cmd_frost_network_sign(
+            out,
+            path,
+            &group,
+            &message,
+            &relay,
+            share,
+            hardware.as_deref(),
+        ),
         FrostNetworkCommands::SignEvent {
             group,
             kind,
             content,
             relay,
             share,
-        } => cmd_frost_network_sign_event(out, path, &group, kind, &content, &relay, share),
+            hardware,
+        } => cmd_frost_network_sign_event(
+            out,
+            path,
+            &group,
+            kind,
+            &content,
+            &relay,
+            share,
+            hardware.as_deref(),
+        ),
     }
+}
+
+fn cmd_frost_hardware(out: &Output, path: &Path, command: FrostHardwareCommands) -> Result<()> {
+    match command {
+        FrostHardwareCommands::Ping { device } => cmd_frost_hardware_ping(out, &device),
+        FrostHardwareCommands::List { device } => cmd_frost_hardware_list(out, &device),
+        FrostHardwareCommands::Import {
+            device,
+            group,
+            share,
+        } => cmd_frost_hardware_import(out, path, &device, &group, share),
+        FrostHardwareCommands::Delete { device, group } => {
+            cmd_frost_hardware_delete(out, &device, &group)
+        }
+        FrostHardwareCommands::Sign {
+            device,
+            group,
+            session_id,
+            commitments,
+        } => cmd_frost_hardware_sign(out, &device, &group, &session_id, &commitments),
+    }
+}
+
+fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
+    use crate::signer::HardwareSigner;
+
+    out.newline();
+    out.header("Hardware Signer Ping");
+    out.field("Device", device);
+    out.newline();
+
+    let spinner = out.spinner("Connecting to hardware signer...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Sending ping...");
+    let version = signer
+        .ping()
+        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    spinner.finish();
+
+    out.success(&format!("Hardware signer v{} - OK", version));
+    Ok(())
+}
+
+fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
+    use crate::signer::HardwareSigner;
+
+    out.newline();
+    out.header("Hardware Signer Shares");
+    out.field("Device", device);
+    out.newline();
+
+    let spinner = out.spinner("Connecting...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Listing shares...");
+    let shares = signer
+        .list_shares()
+        .map_err(|e| KeepError::Other(format!("List failed: {}", e)))?;
+    spinner.finish();
+
+    if shares.is_empty() {
+        out.info("No shares stored on hardware");
+    } else {
+        out.info(&format!("Found {} share(s):", shares.len()));
+        for share in shares {
+            out.field("  Group", &share);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_frost_hardware_import(
+    out: &Output,
+    path: &Path,
+    device: &str,
+    group_npub: &str,
+    share_index: u16,
+) -> Result<()> {
+    use crate::signer::hardware::serialize_share_for_hardware;
+    use crate::signer::HardwareSigner;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let stored_share = keep.frost_get_share_by_index(&group_pubkey, share_index)?;
+
+    out.newline();
+    out.header("Hardware Import");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.field(
+        "Share",
+        &format!(
+            "{} ({})",
+            stored_share.metadata.identifier, stored_share.metadata.name
+        ),
+    );
+    out.field(
+        "Threshold",
+        &format!(
+            "{}-of-{}",
+            stored_share.metadata.threshold, stored_share.metadata.total_shares
+        ),
+    );
+    out.newline();
+
+    let key_package = stored_share.key_package()?;
+    let pubkey_package = stored_share.pubkey_package()?;
+
+    let secret_share = key_package.signing_share();
+    let verifying_share = key_package.verifying_share();
+
+    let secret_serialized = secret_share.serialize();
+    let secret_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        secret_serialized
+            .as_slice()
+            .try_into()
+            .map_err(|_| KeepError::Frost("Invalid secret share length".into()))?,
+    );
+
+    let verifying_share_bytes = verifying_share
+        .serialize()
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying share: {}", e)))?;
+    let mut pubkey_compressed = [0u8; 33];
+    pubkey_compressed.copy_from_slice(&verifying_share_bytes);
+
+    let group_vk = pubkey_package.verifying_key();
+    let group_vk_bytes = group_vk
+        .serialize()
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize group key: {}", e)))?;
+    let mut group_pubkey_compressed = [0u8; 33];
+    group_pubkey_compressed.copy_from_slice(&group_vk_bytes);
+
+    let hardware_share: Zeroizing<Vec<u8>> = Zeroizing::new(serialize_share_for_hardware(
+        &secret_bytes,
+        &pubkey_compressed,
+        &group_pubkey_compressed,
+        stored_share.metadata.identifier,
+        stored_share.metadata.total_shares,
+        stored_share.metadata.threshold,
+    ));
+
+    let share_hex: Zeroizing<String> = Zeroizing::new(hex::encode(&*hardware_share));
+
+    let spinner = out.spinner("Connecting to hardware...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Verifying connection...");
+    let version = signer
+        .ping()
+        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    spinner.finish();
+    out.field("Hardware version", &version);
+
+    let spinner = out.spinner("Importing share to hardware...");
+    signer
+        .import_share(group_npub, &share_hex)
+        .map_err(|e| KeepError::Other(format!("Import failed: {}", e)))?;
+    spinner.finish();
+
+    out.success("Share imported successfully");
+    out.info("The share is now stored on the hardware device.");
+    out.info("You can safely delete the share from this machine.");
+    Ok(())
+}
+
+fn cmd_frost_hardware_delete(out: &Output, device: &str, group_npub: &str) -> Result<()> {
+    use crate::signer::HardwareSigner;
+
+    out.newline();
+    out.header("Hardware Delete Share");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.newline();
+
+    if !get_confirm("Delete share from hardware? This cannot be undone.")? {
+        out.info("Cancelled");
+        return Ok(());
+    }
+
+    let spinner = out.spinner("Connecting...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Deleting share...");
+    signer
+        .delete_share(group_npub)
+        .map_err(|e| KeepError::Other(format!("Delete failed: {}", e)))?;
+    spinner.finish();
+
+    out.success("Share deleted from hardware");
+    Ok(())
+}
+
+fn cmd_frost_hardware_sign(
+    out: &Output,
+    device: &str,
+    group_npub: &str,
+    session_id_hex: &str,
+    commitments_hex: &str,
+) -> Result<()> {
+    use crate::signer::HardwareSigner;
+
+    let session_id_bytes = hex::decode(session_id_hex)
+        .map_err(|_| KeepError::Other("Invalid session_id hex".into()))?;
+    if session_id_bytes.len() != 32 {
+        return Err(KeepError::Other("session_id must be 32 bytes".into()));
+    }
+    let mut session_id = [0u8; 32];
+    session_id.copy_from_slice(&session_id_bytes);
+
+    out.newline();
+    out.header("FROST Hardware Sign (Round 2)");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.field("Session ID", session_id_hex);
+    out.newline();
+
+    let spinner = out.spinner("Connecting...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Generating signature share...");
+    let (sig_share, index) = signer
+        .frost_sign(group_npub, &session_id, commitments_hex)
+        .map_err(|e| KeepError::Other(format!("Sign failed: {}", e)))?;
+    spinner.finish();
+
+    out.field("Share index", &index.to_string());
+    out.field("Signature share", &hex::encode(&sig_share));
+    out.success("Round 2 complete");
+    Ok(())
 }
 
 fn cmd_frost_network_serve(
@@ -685,7 +995,12 @@ fn cmd_frost_network_sign(
     message: &str,
     relay: &str,
     share_index: Option<u16>,
+    hardware: Option<&str>,
 ) -> Result<()> {
+    if let Some(device) = hardware {
+        return cmd_frost_network_sign_hardware(out, group_npub, message, relay, device);
+    }
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
@@ -774,6 +1089,68 @@ fn cmd_frost_network_sign(
     Ok(())
 }
 
+fn cmd_frost_network_sign_hardware(
+    out: &Output,
+    group_npub: &str,
+    message: &str,
+    _relay: &str,
+    device: &str,
+) -> Result<()> {
+    use crate::signer::HardwareSigner;
+
+    let message_bytes =
+        hex::decode(message).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+
+    if message_bytes.len() != 32 {
+        return Err(KeepError::Other(
+            "Message must be 32 bytes (64 hex chars)".into(),
+        ));
+    }
+
+    let mut message_arr = [0u8; 32];
+    message_arr.copy_from_slice(&message_bytes);
+
+    let session_id: [u8; 32] = rand::random();
+
+    out.newline();
+    out.header("FROST Hardware Sign");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.field("Message", message);
+    out.newline();
+
+    let spinner = out.spinner("Connecting to hardware...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Verifying connection...");
+    let version = signer
+        .ping()
+        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    spinner.finish();
+    out.field("Hardware version", &version);
+
+    let spinner = out.spinner("Creating commitment (round 1)...");
+    let (commitment, index) = signer
+        .frost_commit(group_npub, &session_id, &message_arr)
+        .map_err(|e| KeepError::Other(format!("Commitment failed: {}", e)))?;
+    spinner.finish();
+
+    out.field("Share index", &index.to_string());
+    out.field("Commitment", &hex::encode(&commitment));
+    out.newline();
+
+    out.info("Round 1 complete. Commitment generated.");
+    out.info("To complete signing, collect commitments from other signers");
+    out.info("and call frost_sign with the aggregated commitments.");
+    out.newline();
+    out.field("Session ID", &hex::encode(session_id));
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_frost_network_sign_event(
     out: &Output,
     path: &Path,
@@ -782,8 +1159,17 @@ fn cmd_frost_network_sign_event(
     content: &str,
     relay: &str,
     share_index: Option<u16>,
+    hardware: Option<&str>,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
+
+    if hardware.is_some() {
+        return Err(KeepError::Other(
+            "Hardware signing for events requires computing the event hash first. \
+             Use 'keep frost network sign --hardware' with the pre-computed event hash."
+                .into(),
+        ));
+    }
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;

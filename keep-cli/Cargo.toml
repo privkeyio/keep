@@ -46,6 +46,9 @@ frost-secp256k1-tr = "2.2.0"
 sha2 = "0.10.9"
 rand = "0.9"
 
+# Serial
+serialport = "4.8.1"
+
 # Misc
 bitflags = { version = "2.4", features = ["serde"] }
 ctrlc = { version = "3.4", features = ["termination"] }
