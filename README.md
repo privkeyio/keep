@@ -150,6 +150,21 @@ keep frost network sign --group npub1... --message "hello"
 keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"
 ```
 
+### Hardware Signing
+
+Store FROST shares on a hardware signer (serial JSON-RPC device):
+
+```bash
+# Test connection
+keep frost hardware ping --device /dev/ttyUSB0
+
+# Import share to hardware
+keep frost hardware import --device /dev/ttyUSB0 --group npub1... --share 1
+
+# Network sign using hardware
+keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyUSB0
+```
+
 ---
 
 ## Agent SDK

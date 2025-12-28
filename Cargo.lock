@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "keep-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "hex",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "keep-bitcoin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "keep-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bitflags 2.10.0",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "keep-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "bech32",
@@ -1733,14 +1733,14 @@ dependencies = [
 
 [[package]]
 name = "keep-enclave"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "keep-enclave-host",
 ]
 
 [[package]]
 name = "keep-enclave-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "keep-frost-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "frost-secp256k1-tr",
