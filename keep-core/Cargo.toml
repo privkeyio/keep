@@ -1,6 +1,6 @@
 [package]
 name = "keep-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.81"
 description = "Core library for Keep - sovereign key management for Nostr and Bitcoin"
