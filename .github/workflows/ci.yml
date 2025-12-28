@@ -12,9 +12,11 @@ jobs:
     if: github.event.pull_request.draft != true
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - run: cargo fmt -- --check
+      - run: cargo clippy -- -D warnings
       - run: cargo build --release
       - run: cargo test
