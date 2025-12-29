@@ -385,10 +385,12 @@ impl HiddenStorage {
 
         match (outer_result, hidden_result) {
             (Ok(()), _) => {
+                self.active_volume = Some(VolumeType::Outer);
                 rate_limit::record_success(&self.path);
                 Ok(VolumeType::Outer)
             }
             (Err(_), Ok(())) => {
+                self.active_volume = Some(VolumeType::Hidden);
                 rate_limit::record_success(&self.path);
                 Ok(VolumeType::Hidden)
             }
