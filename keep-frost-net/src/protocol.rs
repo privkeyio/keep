@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 pub const KFP_EVENT_KIND: u16 = 24242;
 pub const KFP_VERSION: u8 = 1;
 
+pub const MAX_MESSAGE_SIZE: usize = 65536;
+pub const MAX_COMMITMENT_SIZE: usize = 128;
+pub const MAX_SIGNATURE_SHARE_SIZE: usize = 64;
+pub const MAX_PARTICIPANTS: usize = 256;
+pub const MAX_NAME_LENGTH: usize = 256;
+pub const MAX_CAPABILITY_LENGTH: usize = 64;
+pub const MAX_CAPABILITIES: usize = 32;
+pub const MAX_ERROR_CODE_LENGTH: usize = 64;
+pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KfpMessage {
@@ -56,7 +66,58 @@ impl KfpMessage {
     }
 
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        use serde::de::Error;
+        let msg: Self = serde_json::from_str(json)?;
+        msg.validate().map_err(serde_json::Error::custom)?;
+        Ok(msg)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            KfpMessage::Announce(p) => {
+                if let Some(ref name) = p.name {
+                    if name.len() > MAX_NAME_LENGTH {
+                        return Err("Name exceeds maximum length");
+                    }
+                }
+                if p.capabilities.len() > MAX_CAPABILITIES {
+                    return Err("Too many capabilities");
+                }
+                for cap in &p.capabilities {
+                    if cap.len() > MAX_CAPABILITY_LENGTH {
+                        return Err("Capability string exceeds maximum length");
+                    }
+                }
+            }
+            KfpMessage::SignRequest(p) => {
+                if p.message.len() > MAX_MESSAGE_SIZE {
+                    return Err("Message exceeds maximum size");
+                }
+                if p.participants.len() > MAX_PARTICIPANTS {
+                    return Err("Participants list exceeds maximum size");
+                }
+            }
+            KfpMessage::Commitment(p) => {
+                if p.commitment.len() > MAX_COMMITMENT_SIZE {
+                    return Err("Commitment exceeds maximum size");
+                }
+            }
+            KfpMessage::SignatureShare(p) => {
+                if p.signature_share.len() > MAX_SIGNATURE_SHARE_SIZE {
+                    return Err("Signature share exceeds maximum size");
+                }
+            }
+            KfpMessage::Error(p) => {
+                if p.code.len() > MAX_ERROR_CODE_LENGTH {
+                    return Err("Error code exceeds maximum length");
+                }
+                if p.message.len() > MAX_ERROR_MESSAGE_LENGTH {
+                    return Err("Error message exceeds maximum length");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -389,5 +450,112 @@ mod tests {
     fn test_message_type() {
         let msg = KfpMessage::Ping(PingPayload::new());
         assert_eq!(msg.message_type(), "ping");
+    }
+
+    #[test]
+    fn test_message_size_limit() {
+        let oversized_message = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let payload =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], oversized_message, "raw", vec![1, 2]);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_participants_limit() {
+        let too_many_participants: Vec<u16> = (0..=MAX_PARTICIPANTS as u16).collect();
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            "raw",
+            too_many_participants,
+        );
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_commitment_size_limit() {
+        let oversized_commitment = vec![0u8; MAX_COMMITMENT_SIZE + 1];
+        let payload = CommitmentPayload::new([1u8; 32], 1, oversized_commitment);
+        let msg = KfpMessage::Commitment(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_signature_share_size_limit() {
+        let oversized_share = vec![0u8; MAX_SIGNATURE_SHARE_SIZE + 1];
+        let payload = SignatureSharePayload::new([1u8; 32], 1, oversized_share);
+        let msg = KfpMessage::SignatureShare(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_valid_message_passes_validation() {
+        let payload =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], vec![1, 2, 3], "raw", vec![1, 2]);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_announce_name_limit() {
+        let oversized_name = "a".repeat(MAX_NAME_LENGTH + 1);
+        let payload = AnnouncePayload::new([1u8; 32], 1).with_name(&oversized_name);
+        let msg = KfpMessage::Announce(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_announce_capabilities_count_limit() {
+        let too_many_caps: Vec<String> = (0..=MAX_CAPABILITIES)
+            .map(|i| format!("cap{}", i))
+            .collect();
+        let mut payload = AnnouncePayload::new([1u8; 32], 1);
+        payload.capabilities = too_many_caps;
+        let msg = KfpMessage::Announce(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_announce_capability_length_limit() {
+        let oversized_cap = "a".repeat(MAX_CAPABILITY_LENGTH + 1);
+        let mut payload = AnnouncePayload::new([1u8; 32], 1);
+        payload.capabilities = vec![oversized_cap];
+        let msg = KfpMessage::Announce(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_error_code_limit() {
+        let oversized_code = "a".repeat(MAX_ERROR_CODE_LENGTH + 1);
+        let payload = ErrorPayload::new(&oversized_code, "test");
+        let msg = KfpMessage::Error(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_error_message_limit() {
+        let oversized_message = "a".repeat(MAX_ERROR_MESSAGE_LENGTH + 1);
+        let payload = ErrorPayload::new("test", &oversized_message);
+        let msg = KfpMessage::Error(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_valid_announce_passes_validation() {
+        let payload = AnnouncePayload::new([1u8; 32], 1)
+            .with_name("Test Node")
+            .with_capabilities(vec!["sign".into()]);
+        let msg = KfpMessage::Announce(payload);
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_valid_error_passes_validation() {
+        let payload = ErrorPayload::new("invalid_session", "Session not found");
+        let msg = KfpMessage::Error(payload);
+        assert!(msg.validate().is_ok());
     }
 }

@@ -189,6 +189,13 @@ impl KfpEventBuilder {
     }
 
     pub fn decrypt_message(keys: &Keys, event: &Event) -> Result<KfpMessage> {
+        const MAX_ENCRYPTED_CONTENT_SIZE: usize = MAX_MESSAGE_SIZE * 2;
+        if event.content.len() > MAX_ENCRYPTED_CONTENT_SIZE {
+            return Err(FrostNetError::Protocol(
+                "Content exceeds maximum size".into(),
+            ));
+        }
+
         let is_addressed_to_us = event.tags.iter().any(|t| {
             if let Some(TagStandard::PublicKey { public_key, .. }) = t.as_standardized() {
                 public_key == &keys.public_key()
@@ -203,6 +210,12 @@ impl KfpEventBuilder {
         } else {
             event.content.clone()
         };
+
+        if content.len() > MAX_MESSAGE_SIZE {
+            return Err(FrostNetError::Protocol(
+                "Decrypted content exceeds maximum size".into(),
+            ));
+        }
 
         KfpMessage::from_json(&content).map_err(FrostNetError::Json)
     }
