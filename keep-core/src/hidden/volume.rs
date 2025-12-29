@@ -40,6 +40,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
 use crate::keys::KeyRecord;
+use crate::rate_limit;
 
 use super::header::{
     HiddenHeader, OuterHeader, DATA_START_OFFSET, HEADER_SIZE, HIDDEN_HEADER_OFFSET,
@@ -235,7 +236,7 @@ impl HiddenStorage {
         })
     }
 
-    pub fn unlock_outer(&mut self, password: &str) -> Result<()> {
+    fn try_unlock_outer(&mut self, password: &str) -> Result<()> {
         if self.outer_key.is_some() {
             return Ok(());
         }
@@ -266,7 +267,31 @@ impl HiddenStorage {
         Ok(())
     }
 
-    pub fn unlock_hidden(&mut self, password: &str) -> Result<()> {
+    pub fn unlock_outer(&mut self, password: &str) -> Result<()> {
+        if self.outer_key.is_some() {
+            return Ok(());
+        }
+
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
+        }
+
+        match self.try_unlock_outer(password) {
+            Ok(()) => {
+                rate_limit::record_success(&self.path);
+                Ok(())
+            }
+            Err(e) => {
+                // Only record failure for authentication-related errors
+                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn try_unlock_hidden(&mut self, password: &str) -> Result<()> {
         if self.hidden_key.is_some() {
             return Ok(());
         }
@@ -326,14 +351,66 @@ impl HiddenStorage {
         Ok(())
     }
 
-    pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
-        let outer_result = self.unlock_outer(password);
-        let hidden_result = self.unlock_hidden(password);
+    pub fn unlock_hidden(&mut self, password: &str) -> Result<()> {
+        if self.hidden_key.is_some() {
+            return Ok(());
+        }
 
-        match (outer_result.is_ok(), hidden_result.is_ok()) {
-            (true, _) => Ok(VolumeType::Outer),
-            (false, true) => Ok(VolumeType::Hidden),
-            _ => Err(KeepError::InvalidPassword),
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
+        }
+
+        match self.try_unlock_hidden(password) {
+            Ok(()) => {
+                rate_limit::record_success(&self.path);
+                Ok(())
+            }
+            Err(e) => {
+                // Only record failure for authentication-related errors
+                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
+        }
+
+        let outer_result = self.try_unlock_outer(password);
+        let hidden_result = self.try_unlock_hidden(password);
+
+        match (outer_result, hidden_result) {
+            (Ok(()), _) => {
+                rate_limit::record_success(&self.path);
+                Ok(VolumeType::Outer)
+            }
+            (Err(_), Ok(())) => {
+                rate_limit::record_success(&self.path);
+                Ok(VolumeType::Hidden)
+            }
+            (Err(outer_err), Err(hidden_err)) => {
+                // Helper to check if an error is authentication-related
+                let is_auth_error = |e: &KeepError| {
+                    matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed)
+                };
+
+                // If either error is a non-auth error (IO, database, etc.), return it
+                // without recording a rate-limit failure
+                if !is_auth_error(&outer_err) {
+                    return Err(outer_err);
+                }
+                if !is_auth_error(&hidden_err) {
+                    return Err(hidden_err);
+                }
+
+                // Both errors are authentication failures - record failure and return
+                rate_limit::record_failure(&self.path);
+                Err(KeepError::InvalidPassword)
+            }
         }
     }
 
@@ -829,5 +906,60 @@ mod tests {
             assert_eq!(keys.len(), 2);
             assert!(keys.iter().all(|k| k.name.starts_with("hidden-")));
         }
+    }
+
+    #[test]
+    fn test_rate_limiting_outer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rate-outer");
+
+        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+
+        for _ in 0..5 {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            let result = storage.unlock_outer("wrong");
+            assert!(result.is_err());
+            assert!(!matches!(result, Err(KeepError::RateLimited(_))));
+        }
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock_outer("wrong");
+        assert!(matches!(result, Err(KeepError::RateLimited(_))));
+    }
+
+    #[test]
+    fn test_rate_limiting_hidden() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rate-hidden");
+
+        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+
+        for _ in 0..5 {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            let result = storage.unlock_hidden("wrong");
+            assert!(matches!(result, Err(KeepError::InvalidPassword)));
+        }
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock_hidden("wrong");
+        assert!(matches!(result, Err(KeepError::RateLimited(_))));
+    }
+
+    #[test]
+    fn test_rate_limiting_combined_unlock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rate-combined");
+
+        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+
+        for _ in 0..5 {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            let result = storage.unlock("wrong");
+            assert!(matches!(result, Err(KeepError::InvalidPassword)));
+        }
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock("wrong");
+        assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
 }

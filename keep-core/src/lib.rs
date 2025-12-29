@@ -12,6 +12,7 @@ pub mod frost;
 pub mod hidden;
 pub mod keyring;
 pub mod keys;
+pub(crate) mod rate_limit;
 pub mod storage;
 
 use std::path::{Path, PathBuf};
