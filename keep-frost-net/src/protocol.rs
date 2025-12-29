@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const KFP_EVENT_KIND: u16 = 24242;
 pub const KFP_VERSION: u8 = 1;
+pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 300;
 
 pub const MAX_MESSAGE_SIZE: usize = 65536;
 pub const MAX_COMMITMENT_SIZE: usize = 128;
@@ -167,7 +168,7 @@ pub struct SignRequestPayload {
     pub message: Vec<u8>,
     pub message_type: String,
     pub participants: Vec<u16>,
-    pub timestamp: u64,
+    pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
@@ -186,7 +187,7 @@ impl SignRequestPayload {
             message,
             message_type: message_type.to_string(),
             participants,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            created_at: chrono::Utc::now().timestamp() as u64,
             metadata: None,
         }
     }
@@ -194,6 +195,13 @@ impl SignRequestPayload {
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = Some(metadata);
         self
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
     }
 }
 
@@ -575,5 +583,25 @@ mod tests {
         );
         let msg = KfpMessage::SignRequest(payload);
         assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_replay_window_validation() {
+        let payload =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], vec![3, 4, 5], "raw", vec![1, 2]);
+
+        assert!(payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+        assert!(payload.is_within_replay_window(60));
+        assert!(payload.is_within_replay_window(1));
+
+        let mut old_payload = payload.clone();
+        old_payload.created_at = chrono::Utc::now().timestamp() as u64 - 400;
+        assert!(!old_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+        assert!(old_payload.is_within_replay_window(500));
+
+        let mut future_payload = payload.clone();
+        future_payload.created_at = chrono::Utc::now().timestamp() as u64 + 400;
+        assert!(!future_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+        assert!(future_payload.is_within_replay_window(500));
     }
 }

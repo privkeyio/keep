@@ -52,6 +52,7 @@ pub struct KfpNode {
     event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
+    replay_window_secs: u64,
 }
 
 impl KfpNode {
@@ -118,6 +119,7 @@ impl KfpNode {
             event_tx,
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
+            replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
         })
     }
 
@@ -131,6 +133,10 @@ impl KfpNode {
 
     pub fn share_index(&self) -> u16 {
         self.share.metadata.identifier
+    }
+
+    pub fn set_replay_window(&mut self, secs: u64) {
+        self.replay_window_secs = secs;
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<KfpNodeEvent> {
@@ -390,6 +396,18 @@ impl KfpNode {
             .contains(&self.share.metadata.identifier)
         {
             return Ok(());
+        }
+
+        if !request.is_within_replay_window(self.replay_window_secs) {
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                created_at = request.created_at,
+                "Rejecting sign request: outside replay window"
+            );
+            return Err(FrostNetError::ReplayDetected(format!(
+                "Request created_at {} outside {} second window",
+                request.created_at, self.replay_window_secs
+            )));
         }
 
         info!(

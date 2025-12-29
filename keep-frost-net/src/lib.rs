@@ -68,7 +68,7 @@ pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{Peer, PeerManager, PeerStatus};
 pub use protocol::{
     AnnouncePayload, CommitmentPayload, ErrorPayload, KfpMessage, PingPayload, PongPayload,
-    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, KFP_EVENT_KIND,
-    KFP_VERSION,
+    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
+    DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND, KFP_VERSION,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
