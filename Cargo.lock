@@ -1799,6 +1799,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
