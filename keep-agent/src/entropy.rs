@@ -75,6 +75,11 @@ fn fill_from_nsm(buf: &mut [u8]) -> bool {
         match response {
             Response::GetRandom { random } => {
                 let copy_len = (buf.len() - filled).min(random.len());
+                if copy_len == 0 {
+                    // Empty response would cause infinite loop
+                    nsm_exit(fd);
+                    return false;
+                }
                 buf[filled..filled + copy_len].copy_from_slice(&random[..copy_len]);
                 filled += copy_len;
             }
