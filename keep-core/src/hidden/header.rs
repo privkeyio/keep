@@ -128,18 +128,36 @@ impl OuterHeader {
             salt,
             nonce,
             encrypted_data_key,
-            argon2_memory_kib: u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+            argon2_memory_kib: u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_memory_kib".into()))?,
+            ),
             argon2_iterations: u32::from_le_bytes(
-                bytes[offset + 4..offset + 8].try_into().unwrap(),
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_iterations".into()))?,
             ),
             argon2_parallelism: u32::from_le_bytes(
-                bytes[offset + 8..offset + 12].try_into().unwrap(),
+                bytes[offset + 8..offset + 12]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_parallelism".into()))?,
             ),
-            _align_pad: u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
+            _align_pad: u32::from_le_bytes(
+                bytes[offset + 12..offset + 16]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: align_pad".into()))?,
+            ),
             outer_data_size: u64::from_le_bytes(
-                bytes[offset + 16..offset + 24].try_into().unwrap(),
+                bytes[offset + 16..offset + 24]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: outer_data_size".into()))?,
             ),
-            total_size: u64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().unwrap()),
+            total_size: u64::from_le_bytes(
+                bytes[offset + 24..offset + 32]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: total_size".into()))?,
+            ),
             padding: [0; 360],
         })
     }
