@@ -129,19 +129,19 @@ impl OuterHeader {
             nonce,
             encrypted_data_key,
             argon2_memory_kib: u32::from_le_bytes(
-                bytes[offset..offset + 4].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_memory_kib".into())
-                })?,
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_memory_kib".into()))?,
             ),
             argon2_iterations: u32::from_le_bytes(
-                bytes[offset + 4..offset + 8].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_iterations".into())
-                })?,
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_iterations".into()))?,
             ),
             argon2_parallelism: u32::from_le_bytes(
-                bytes[offset + 8..offset + 12].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_parallelism".into())
-                })?,
+                bytes[offset + 8..offset + 12]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: argon2_parallelism".into()))?,
             ),
             _align_pad: u32::from_le_bytes(
                 bytes[offset + 12..offset + 16]
@@ -149,9 +149,9 @@ impl OuterHeader {
                     .map_err(|_| KeepError::Other("Invalid outer header: align_pad".into()))?,
             ),
             outer_data_size: u64::from_le_bytes(
-                bytes[offset + 16..offset + 24].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: outer_data_size".into())
-                })?,
+                bytes[offset + 16..offset + 24]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid outer header: outer_data_size".into()))?,
             ),
             total_size: u64::from_le_bytes(
                 bytes[offset + 24..offset + 32]
