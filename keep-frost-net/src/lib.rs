@@ -71,4 +71,4 @@ pub use protocol::{
     SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, KFP_EVENT_KIND,
     KFP_VERSION,
 };
-pub use session::{NetworkSession, SessionManager, SessionState};
+pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};

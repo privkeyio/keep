@@ -131,13 +131,17 @@ async fn test_frost_protocol_message_flow() {
 
 #[tokio::test]
 async fn test_session_management() {
+    use keep_frost_net::derive_session_id;
+
     let mut manager = SessionManager::new();
 
-    let session_id = [1u8; 32];
     let message = b"test message".to_vec();
+    let participants = vec![1, 2, 3];
+    let threshold = 2;
+    let session_id = derive_session_id(&message, &participants, threshold);
 
     let session = manager
-        .create_session(session_id, message.clone(), 2, vec![1, 2, 3])
+        .create_session(session_id, message.clone(), threshold, participants.clone())
         .unwrap();
 
     assert_eq!(session.state(), SessionState::AwaitingCommitments);
@@ -146,8 +150,17 @@ async fn test_session_management() {
     assert!(session.is_participant(2));
     assert!(!session.is_participant(4));
 
-    let result = manager.create_session(session_id, message, 2, vec![1, 2]);
-    assert!(result.is_err());
+    // Attempting to create with different participants should fail (session ID mismatch)
+    let result = manager.create_session(session_id, message.clone(), threshold, vec![1, 2]);
+    let err = result
+        .err()
+        .expect("should fail with mismatched participants");
+    assert!(err.to_string().contains("mismatch"));
+
+    // Attempting to create duplicate session with same params should fail
+    let result = manager.create_session(session_id, message.clone(), threshold, participants);
+    let err = result.err().expect("should fail with duplicate session");
+    assert!(err.to_string().contains("already active"));
 
     manager.complete_session(&session_id);
     assert!(manager.is_replay(&session_id));
