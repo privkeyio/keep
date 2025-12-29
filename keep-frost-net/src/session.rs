@@ -10,6 +10,7 @@ use frost_secp256k1_tr::{
     round2::SignatureShare,
     Identifier, Signature, SigningPackage,
 };
+use zeroize::Zeroize;
 
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
@@ -256,6 +257,14 @@ impl NetworkSession {
 
     pub fn elapsed(&self) -> Duration {
         self.created_at.elapsed()
+    }
+}
+
+impl Drop for NetworkSession {
+    fn drop(&mut self) {
+        if let Some(ref mut nonces) = self.our_nonces {
+            nonces.zeroize();
+        }
     }
 }
 
