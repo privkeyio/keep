@@ -285,12 +285,13 @@ impl KfpNode {
             .into_iter()
             .cloned()
             .collect();
-        let policies = self.policies.read().clone();
-
-        let mut eligible_peers: Vec<_> = signing_peers
-            .into_iter()
-            .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
-            .collect();
+        let mut eligible_peers: Vec<_> = {
+            let policies = self.policies.read();
+            signing_peers
+                .into_iter()
+                .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .collect()
+        };
 
         if eligible_peers.len() + 1 < threshold {
             return Err(FrostNetError::InsufficientPeers {
