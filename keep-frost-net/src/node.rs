@@ -945,7 +945,7 @@ impl KfpNode {
             let mut sessions = self.sessions.write();
             let session = sessions.create_session(
                 session_id,
-                message.clone(),
+                message,
                 self.share.metadata.threshold,
                 participants.clone(),
             )?;
