@@ -280,6 +280,42 @@ impl KfpNode {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    fn select_eligible_peers(
+        &self,
+        threshold: usize,
+    ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+        let peers = self.peers.read();
+
+        let mut eligible_peers: Vec<_> = peers
+            .get_signing_peers()
+            .into_iter()
+            .filter(|p| self.can_send_to(&p.pubkey))
+            .collect();
+
+        if eligible_peers.len() + 1 < threshold {
+            return Err(FrostNetError::InsufficientPeers {
+                needed: threshold - 1,
+                available: eligible_peers.len(),
+            });
+        }
+
+        eligible_peers.sort_by_key(|p| p.share_index);
+
+        let selected_peers: Vec<_> = eligible_peers.into_iter().take(threshold - 1).collect();
+
+        let participant_peers = selected_peers
+            .iter()
+            .map(|p| (p.share_index, p.pubkey))
+            .collect();
+
+        let mut participants: Vec<u16> = selected_peers.iter().map(|p| p.share_index).collect();
+        participants.push(self.share.metadata.identifier);
+        participants.sort();
+
+        Ok((participants, participant_peers))
+    }
+
     pub async fn announce(&self) -> Result<()> {
         let event = KfpEventBuilder::announcement(
             &self.keys,
@@ -900,41 +936,7 @@ impl KfpNode {
     ) -> Result<[u8; 64]> {
         let threshold = self.share.metadata.threshold;
 
-        let (participants, participant_peers) = {
-            let peers = self.peers.read();
-
-            let mut eligible_peers: Vec<_> = peers
-                .get_signing_peers()
-                .into_iter()
-                .filter(|p| self.can_send_to(&p.pubkey))
-                .collect();
-
-            if eligible_peers.len() + 1 < threshold as usize {
-                return Err(FrostNetError::InsufficientPeers {
-                    needed: threshold as usize - 1,
-                    available: eligible_peers.len(),
-                });
-            }
-
-            eligible_peers.sort_by_key(|p| p.share_index);
-
-            let selected_peers: Vec<_> = eligible_peers
-                .into_iter()
-                .take(threshold as usize - 1)
-                .collect();
-
-            let participant_peers: Vec<(u16, PublicKey)> = selected_peers
-                .iter()
-                .map(|p| (p.share_index, p.pubkey))
-                .collect();
-
-            let mut participants: Vec<u16> =
-                selected_peers.iter().map(|p| p.share_index).collect();
-            participants.push(self.share.metadata.identifier);
-            participants.sort();
-
-            (participants, participant_peers)
-        };
+        let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
 
         let session_id = derive_session_id(&message, &participants, threshold);
 
