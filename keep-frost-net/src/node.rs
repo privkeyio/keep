@@ -276,7 +276,7 @@ impl KfpNode {
         };
 
         if let Some(info) = info {
-            self.hooks.read().post_sign(&info, signature);
+            (*self.hooks.read()).clone().post_sign(&info, signature);
         }
     }
 
@@ -629,7 +629,7 @@ impl KfpNode {
             participants: request.participants.clone(),
         };
 
-        self.hooks.read().pre_sign(&session_info)?;
+        (*self.hooks.read()).clone().pre_sign(&session_info)?;
 
         let commitment = {
             let mut sessions = self.sessions.write();
@@ -978,7 +978,7 @@ impl KfpNode {
                 .map(SessionInfo::from)
                 .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
         };
-        if let Err(e) = self.hooks.read().pre_sign(&session_info) {
+        if let Err(e) = (*self.hooks.read()).clone().pre_sign(&session_info) {
             self.cleanup_session_on_hook_failure(&session_id);
             return Err(e);
         }
