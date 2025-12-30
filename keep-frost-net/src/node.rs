@@ -8,6 +8,7 @@ use std::time::Duration;
 use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
+use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
@@ -263,15 +264,18 @@ impl KfpNode {
     }
 
     fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
-        let session_info = {
+        let info = {
             let mut sessions = self.sessions.write();
-            let info = sessions.get_session(session_id).map(SessionInfo::from);
-            if info.is_some() {
+            if let Some(session) = sessions.get_session(session_id) {
+                let info = SessionInfo::from(session);
                 sessions.complete_session(session_id);
+                Some(info)
+            } else {
+                None
             }
-            info
         };
-        if let Some(info) = session_info {
+
+        if let Some(info) = info {
             self.hooks.read().post_sign(&info, signature);
         }
     }
@@ -300,7 +304,7 @@ impl KfpNode {
             });
         }
 
-        eligible_peers.sort_by_key(|p| p.share_index);
+        eligible_peers.shuffle(&mut rand::thread_rng());
 
         let selected_peers: Vec<_> = eligible_peers.into_iter().take(threshold - 1).collect();
 
