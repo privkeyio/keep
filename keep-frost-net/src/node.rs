@@ -67,8 +67,20 @@ impl From<&NetworkSession> for SessionInfo {
     }
 }
 
+/// Hooks for observing and controlling the signing process.
+///
+/// Implementations should be non-blocking and return quickly to avoid
+/// delaying the signing protocol.
 pub trait SigningHooks: Send + Sync {
+    /// Called before a node participates in a signing session.
+    ///
+    /// Returning an `Err` will abort the signing session.
     fn pre_sign(&self, session: &SessionInfo) -> Result<()>;
+
+    /// Called after a signature has been successfully generated.
+    ///
+    /// This is for notification purposes and cannot fail. Long-running
+    /// operations should be offloaded to a separate task.
     fn post_sign(&self, session: &SessionInfo, signature: &[u8; 64]);
 }
 
