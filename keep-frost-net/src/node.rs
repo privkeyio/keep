@@ -836,7 +836,7 @@ impl KfpNode {
 
         let (participants, participant_peers) = {
             let peers = self.peers.read();
-            let participants = peers
+            let selected = peers
                 .select_participants(threshold as usize)
                 .ok_or_else(|| {
                     let online = peers.online_count();
@@ -846,19 +846,22 @@ impl KfpNode {
                     }
                 })?;
 
-            let participant_peers: Vec<(u16, PublicKey)> = participants
+            let participant_peers: Vec<(u16, PublicKey)> = selected
                 .iter()
                 .filter(|&&idx| idx != self.share.metadata.identifier)
                 .filter_map(|&idx| peers.get_peer(idx))
-                .filter(|p| p.is_online(std::time::Duration::from_secs(60)))
                 .filter(|p| self.can_send_to(&p.pubkey))
                 .map(|p| (p.share_index, p.pubkey))
                 .collect();
 
+            let mut participants: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
+            participants.push(self.share.metadata.identifier);
+            participants.sort();
+
             (participants, participant_peers)
         };
 
-        if participant_peers.len() + 1 < threshold as usize {
+        if participants.len() < threshold as usize {
             return Err(FrostNetError::PolicyViolation(
                 "Not enough peers allowed by policy to meet threshold".into(),
             ));
