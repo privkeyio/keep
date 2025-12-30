@@ -92,7 +92,7 @@ pub struct KfpNode {
     sessions: Arc<RwLock<SessionManager>>,
     peers: Arc<RwLock<PeerManager>>,
     policies: Arc<RwLock<HashMap<PublicKey, PeerPolicy>>>,
-    hooks: Arc<dyn SigningHooks>,
+    hooks: RwLock<Arc<dyn SigningHooks>>,
     event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
@@ -161,7 +161,7 @@ impl KfpNode {
             sessions: Arc::new(RwLock::new(session_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
             policies: Arc::new(RwLock::new(HashMap::new())),
-            hooks: Arc::new(NoOpHooks),
+            hooks: RwLock::new(Arc::new(NoOpHooks)),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
@@ -214,8 +214,8 @@ impl KfpNode {
         self.policies.read().get(pubkey).cloned()
     }
 
-    pub fn set_hooks(&mut self, hooks: Arc<dyn SigningHooks>) {
-        self.hooks = hooks;
+    pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
+        *self.hooks.write() = hooks;
     }
 
     fn can_send_to(&self, pubkey: &PublicKey) -> bool {
@@ -232,6 +232,17 @@ impl KfpNode {
             .get(pubkey)
             .map(|p| p.allow_receive)
             .unwrap_or(true)
+    }
+
+    fn cleanup_session_on_hook_failure(&self, session_id: &[u8; 32]) {
+        self.sessions.write().complete_session(session_id);
+    }
+
+    fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
+        let sessions = self.sessions.read();
+        if let Some(session) = sessions.get_session(session_id) {
+            self.hooks.read().post_sign(session, signature);
+        }
     }
 
     pub async fn announce(&self) -> Result<()> {
@@ -521,9 +532,9 @@ impl KfpNode {
                 );
                 *existing_commitment
             } else {
-                if let Err(e) = self.hooks.pre_sign(session, &request.message) {
+                if let Err(e) = self.hooks.read().pre_sign(session, &request.message) {
                     drop(sessions);
-                    self.sessions.write().complete_session(&request.session_id);
+                    self.cleanup_session_on_hook_failure(&request.session_id);
                     return Err(e);
                 }
 
@@ -742,15 +753,9 @@ impl KfpNode {
                 "Signature complete!"
             );
 
-            {
-                let sessions = self.sessions.read();
-                if let Some(session) = sessions.get_session(&payload.session_id) {
-                    self.hooks.post_sign(session, &sig);
-                }
-            }
+            self.invoke_post_sign_hook(&payload.session_id, &sig);
 
-            let mut sessions = self.sessions.write();
-            sessions.complete_session(&payload.session_id);
+            self.sessions.write().complete_session(&payload.session_id);
 
             let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
                 session_id: payload.session_id,
@@ -789,15 +794,9 @@ impl KfpNode {
             "Received completed signature"
         );
 
-        {
-            let sessions = self.sessions.read();
-            if let Some(session) = sessions.get_session(&payload.session_id) {
-                self.hooks.post_sign(session, &payload.signature);
-            }
-        }
+        self.invoke_post_sign_hook(&payload.session_id, &payload.signature);
 
-        let mut sessions = self.sessions.write();
-        sessions.complete_session(&payload.session_id);
+        self.sessions.write().complete_session(&payload.session_id);
 
         let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
             session_id: payload.session_id,
@@ -847,10 +846,11 @@ impl KfpNode {
                     }
                 })?;
 
-            let participant_peers: Vec<(u16, PublicKey)> = peers
-                .get_online_peers()
+            let participant_peers: Vec<(u16, PublicKey)> = participants
                 .iter()
-                .filter(|p| participants.contains(&p.share_index))
+                .filter(|&&idx| idx != self.share.metadata.identifier)
+                .filter_map(|&idx| peers.get_peer(idx))
+                .filter(|p| p.is_online(std::time::Duration::from_secs(60)))
                 .filter(|p| self.can_send_to(&p.pubkey))
                 .map(|p| (p.share_index, p.pubkey))
                 .collect();
@@ -904,9 +904,9 @@ impl KfpNode {
         {
             let sessions = self.sessions.read();
             if let Some(session) = sessions.get_session(&session_id) {
-                if let Err(e) = self.hooks.pre_sign(session, &message) {
+                if let Err(e) = self.hooks.read().pre_sign(session, &message) {
                     drop(sessions);
-                    self.sessions.write().complete_session(&session_id);
+                    self.cleanup_session_on_hook_failure(&session_id);
                     return Err(e);
                 }
             }
