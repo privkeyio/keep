@@ -202,6 +202,8 @@ impl Argon2Params {
         iterations: 6,
         parallelism: 4,
     };
+
+    pub const LEGACY_PARAMS: &'static [Self] = &[];
 }
 
 impl Default for Argon2Params {
