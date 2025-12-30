@@ -279,10 +279,7 @@ impl KfpNode {
     }
 
     #[allow(clippy::type_complexity)]
-    fn select_eligible_peers(
-        &self,
-        threshold: usize,
-    ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+    fn select_eligible_peers(&self, threshold: usize) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         let peers = self.peers.read();
         let policies = self.policies.read();
 
