@@ -901,37 +901,39 @@ impl KfpNode {
 
         let (participants, participant_peers) = {
             let peers = self.peers.read();
-            let selected = peers
-                .select_participants(threshold as usize)
-                .ok_or_else(|| {
-                    let online = peers.online_count();
-                    FrostNetError::InsufficientPeers {
-                        needed: threshold as usize - 1,
-                        available: online,
-                    }
-                })?;
 
-            let participant_peers: Vec<(u16, PublicKey)> = selected
-                .iter()
-                .filter(|&&idx| idx != self.share.metadata.identifier)
-                .filter_map(|&idx| peers.get_peer(idx))
+            let mut eligible_peers: Vec<_> = peers
+                .get_signing_peers()
+                .into_iter()
                 .filter(|p| self.can_send_to(&p.pubkey))
+                .collect();
+
+            if eligible_peers.len() + 1 < threshold as usize {
+                return Err(FrostNetError::InsufficientPeers {
+                    needed: threshold as usize - 1,
+                    available: eligible_peers.len(),
+                });
+            }
+
+            eligible_peers.sort_by_key(|p| p.share_index);
+
+            let selected_peers: Vec<_> = eligible_peers
+                .into_iter()
+                .take(threshold as usize - 1)
+                .collect();
+
+            let participant_peers: Vec<(u16, PublicKey)> = selected_peers
+                .iter()
                 .map(|p| (p.share_index, p.pubkey))
                 .collect();
 
             let mut participants: Vec<u16> =
-                participant_peers.iter().map(|(idx, _)| *idx).collect();
+                selected_peers.iter().map(|p| p.share_index).collect();
             participants.push(self.share.metadata.identifier);
             participants.sort();
 
             (participants, participant_peers)
         };
-
-        if participants.len() < threshold as usize {
-            return Err(FrostNetError::PolicyViolation(
-                "Not enough peers allowed by policy to meet threshold".into(),
-            ));
-        }
 
         let session_id = derive_session_id(&message, &participants, threshold);
 
