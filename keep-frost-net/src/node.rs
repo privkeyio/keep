@@ -265,13 +265,11 @@ impl KfpNode {
     fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
         let session_info = {
             let mut sessions = self.sessions.write();
-            if let Some(session) = sessions.get_session(session_id) {
-                let info = SessionInfo::from(session);
+            let info = sessions.get_session(session_id).map(SessionInfo::from);
+            if info.is_some() {
                 sessions.complete_session(session_id);
-                Some(info)
-            } else {
-                None
             }
+            info
         };
         if let Some(info) = session_info {
             self.hooks.read().post_sign(&info, signature);
