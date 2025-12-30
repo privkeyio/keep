@@ -299,7 +299,9 @@ impl Storage {
             }
         }
 
-        rate_limit::record_failure(&self.path);
+        if matches!(last_error, KeepError::DecryptionFailed) {
+            rate_limit::record_failure(&self.path);
+        }
         Err(last_error)
     }
 

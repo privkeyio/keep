@@ -5,29 +5,29 @@ use std::hash::Hash;
 
 use zeroize::Zeroize;
 
-pub fn zeroize_and_remove<K, V>(map: &mut HashMap<K, V>, key: &K) -> Option<V>
+pub fn zeroize_and_remove<K, V>(map: &mut HashMap<K, V>, key: &K) -> bool
 where
     K: Eq + Hash,
     V: Zeroize,
 {
     if let Some(mut value) = map.remove(key) {
         value.zeroize();
-        Some(value)
+        true
     } else {
-        None
+        false
     }
 }
 
-pub fn zeroize_and_remove_btree<K, V>(map: &mut BTreeMap<K, V>, key: &K) -> Option<V>
+pub fn zeroize_and_remove_btree<K, V>(map: &mut BTreeMap<K, V>, key: &K) -> bool
 where
     K: Ord,
     V: Zeroize,
 {
     if let Some(mut value) = map.remove(key) {
         value.zeroize();
-        Some(value)
+        true
     } else {
-        None
+        false
     }
 }
 
@@ -53,9 +53,7 @@ mod tests {
         map.insert(key, secret);
 
         let removed = zeroize_and_remove(&mut map, &key);
-        assert!(removed.is_some());
-        let removed = removed.unwrap();
-        assert_eq!(removed.0, [0u8; 32]);
+        assert!(removed);
         assert!(!map.contains_key(&key));
     }
 
@@ -63,7 +61,7 @@ mod tests {
     fn test_zeroize_and_remove_hashmap_missing_key() {
         let mut map: HashMap<&str, Secret> = HashMap::new();
         let removed = zeroize_and_remove(&mut map, &"missing");
-        assert!(removed.is_none());
+        assert!(!removed);
     }
 
     #[test]
@@ -74,9 +72,7 @@ mod tests {
         map.insert(key, secret);
 
         let removed = zeroize_and_remove_btree(&mut map, &key);
-        assert!(removed.is_some());
-        let removed = removed.unwrap();
-        assert_eq!(removed.0, [0u8; 32]);
+        assert!(removed);
         assert!(!map.contains_key(&key));
     }
 
@@ -84,6 +80,6 @@ mod tests {
     fn test_zeroize_and_remove_btreemap_missing_key() {
         let mut map: BTreeMap<&str, Secret> = BTreeMap::new();
         let removed = zeroize_and_remove_btree(&mut map, &"missing");
-        assert!(removed.is_none());
+        assert!(!removed);
     }
 }
