@@ -281,27 +281,28 @@ impl KfpNode {
 
     #[allow(clippy::type_complexity)]
     fn select_eligible_peers(&self, threshold: usize) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
-        let mut eligible_peers: Vec<Peer> = {
+        let selected_peers: Vec<Peer> = {
             let peers = self.peers.read();
             let policies = self.policies.read();
-            peers
+            let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
                 .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .collect();
+
+            if eligible_peers.len() + 1 < threshold {
+                return Err(FrostNetError::InsufficientPeers {
+                    needed: threshold - 1,
+                    available: eligible_peers.len(),
+                });
+            }
+
+            eligible_peers
+                .choose_multiple(&mut rand::thread_rng(), threshold - 1)
+                .copied()
                 .cloned()
                 .collect()
         };
-
-        if eligible_peers.len() + 1 < threshold {
-            return Err(FrostNetError::InsufficientPeers {
-                needed: threshold - 1,
-                available: eligible_peers.len(),
-            });
-        }
-
-        eligible_peers.shuffle(&mut rand::thread_rng());
-
-        let selected_peers: Vec<_> = eligible_peers.into_iter().take(threshold - 1).collect();
 
         let participant_peers = selected_peers
             .iter()
