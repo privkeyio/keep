@@ -957,13 +957,14 @@ impl KfpNode {
 
         let session_info = {
             let sessions = self.sessions.read();
-            sessions.get_session(&session_id).map(SessionInfo::from)
+            sessions
+                .get_session(&session_id)
+                .map(SessionInfo::from)
+                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
         };
-        if let Some(info) = session_info {
-            if let Err(e) = self.hooks.read().pre_sign(&info, &message) {
-                self.cleanup_session_on_hook_failure(&session_id);
-                return Err(e);
-            }
+        if let Err(e) = self.hooks.read().pre_sign(&session_info, &message) {
+            self.cleanup_session_on_hook_failure(&session_id);
+            return Err(e);
         }
 
         let our_commit_bytes = our_commitment
