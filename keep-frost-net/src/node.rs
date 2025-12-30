@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,48 @@ use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
-use crate::session::{derive_session_id, SessionManager};
+use crate::session::{derive_session_id, NetworkSession, SessionManager};
+
+#[derive(Clone, Debug)]
+pub struct PeerPolicy {
+    pub pubkey: PublicKey,
+    pub allow_send: bool,
+    pub allow_receive: bool,
+}
+
+impl PeerPolicy {
+    pub fn new(pubkey: PublicKey) -> Self {
+        Self {
+            pubkey,
+            allow_send: true,
+            allow_receive: true,
+        }
+    }
+
+    pub fn allow_send(mut self, allow: bool) -> Self {
+        self.allow_send = allow;
+        self
+    }
+
+    pub fn allow_receive(mut self, allow: bool) -> Self {
+        self.allow_receive = allow;
+        self
+    }
+}
+
+pub trait SigningHooks: Send + Sync {
+    fn pre_sign(&self, session: &NetworkSession, message: &[u8]) -> Result<()>;
+    fn post_sign(&self, session: &NetworkSession, signature: &[u8; 64]);
+}
+
+pub struct NoOpHooks;
+
+impl SigningHooks for NoOpHooks {
+    fn pre_sign(&self, _session: &NetworkSession, _message: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn post_sign(&self, _session: &NetworkSession, _signature: &[u8; 64]) {}
+}
 
 #[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
@@ -49,6 +91,8 @@ pub struct KfpNode {
     group_pubkey: [u8; 32],
     sessions: Arc<RwLock<SessionManager>>,
     peers: Arc<RwLock<PeerManager>>,
+    policies: Arc<RwLock<HashMap<PublicKey, PeerPolicy>>>,
+    hooks: Arc<dyn SigningHooks>,
     event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
@@ -116,6 +160,8 @@ impl KfpNode {
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
+            policies: Arc::new(RwLock::new(HashMap::new())),
+            hooks: Arc::new(NoOpHooks),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
@@ -154,6 +200,38 @@ impl KfpNode {
             .iter()
             .map(|p| (p.share_index, p.status.clone(), p.name.clone()))
             .collect()
+    }
+
+    pub fn set_peer_policy(&self, policy: PeerPolicy) {
+        self.policies.write().insert(policy.pubkey, policy);
+    }
+
+    pub fn remove_peer_policy(&self, pubkey: &PublicKey) {
+        self.policies.write().remove(pubkey);
+    }
+
+    pub fn get_peer_policy(&self, pubkey: &PublicKey) -> Option<PeerPolicy> {
+        self.policies.read().get(pubkey).cloned()
+    }
+
+    pub fn set_hooks(&mut self, hooks: Arc<dyn SigningHooks>) {
+        self.hooks = hooks;
+    }
+
+    fn can_send_to(&self, pubkey: &PublicKey) -> bool {
+        self.policies
+            .read()
+            .get(pubkey)
+            .map(|p| p.allow_send)
+            .unwrap_or(true)
+    }
+
+    fn can_receive_from(&self, pubkey: &PublicKey) -> bool {
+        self.policies
+            .read()
+            .get(pubkey)
+            .map(|p| p.allow_receive)
+            .unwrap_or(true)
     }
 
     pub async fn announce(&self) -> Result<()> {
@@ -410,6 +488,14 @@ impl KfpNode {
             )));
         }
 
+        if !self.can_receive_from(&from) {
+            debug!(from = %from, "Rejecting sign request: policy denies receive");
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {} not allowed to send sign requests",
+                from
+            )));
+        }
+
         info!(
             session_id = %hex::encode(request.session_id),
             message_type = %request.message_type,
@@ -428,8 +514,6 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            // If we already have nonces for this session, resend existing commitment
-            // This prevents nonce regeneration on duplicate requests while allowing retry
             if let Some(existing_commitment) = session.our_commitment() {
                 debug!(
                     session_id = %hex::encode(request.session_id),
@@ -437,7 +521,12 @@ impl KfpNode {
                 );
                 *existing_commitment
             } else {
-                // Generate nonces for new session participation
+                if let Err(e) = self.hooks.pre_sign(session, &request.message) {
+                    drop(sessions);
+                    self.sessions.write().complete_session(&request.session_id);
+                    return Err(e);
+                }
+
                 let (nonces, commitment) =
                     frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
@@ -445,7 +534,6 @@ impl KfpNode {
                 session.set_our_commitment(commitment);
                 session.add_commitment(self.share.metadata.identifier, commitment)?;
 
-                // Record consumption AFTER nonces are generated to prevent reuse across restarts
                 sessions.record_nonce_consumption(&request.session_id)?;
 
                 commitment
@@ -654,6 +742,13 @@ impl KfpNode {
                 "Signature complete!"
             );
 
+            {
+                let sessions = self.sessions.read();
+                if let Some(session) = sessions.get_session(&payload.session_id) {
+                    self.hooks.post_sign(session, &sig);
+                }
+            }
+
             let mut sessions = self.sessions.write();
             sessions.complete_session(&payload.session_id);
 
@@ -694,6 +789,13 @@ impl KfpNode {
             "Received completed signature"
         );
 
+        {
+            let sessions = self.sessions.read();
+            if let Some(session) = sessions.get_session(&payload.session_id) {
+                self.hooks.post_sign(session, &payload.signature);
+            }
+        }
+
         let mut sessions = self.sessions.write();
         sessions.complete_session(&payload.session_id);
 
@@ -733,9 +835,9 @@ impl KfpNode {
     ) -> Result<[u8; 64]> {
         let threshold = self.share.metadata.threshold;
 
-        let participants = {
+        let (participants, participant_peers) = {
             let peers = self.peers.read();
-            peers
+            let participants = peers
                 .select_participants(threshold as usize)
                 .ok_or_else(|| {
                     let online = peers.online_count();
@@ -743,8 +845,24 @@ impl KfpNode {
                         needed: threshold as usize - 1,
                         available: online,
                     }
-                })?
+                })?;
+
+            let participant_peers: Vec<(u16, PublicKey)> = peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| participants.contains(&p.share_index))
+                .filter(|p| self.can_send_to(&p.pubkey))
+                .map(|p| (p.share_index, p.pubkey))
+                .collect();
+
+            (participants, participant_peers)
         };
+
+        if participant_peers.len() + 1 < threshold as usize {
+            return Err(FrostNetError::PolicyViolation(
+                "Not enough peers allowed by policy to meet threshold".into(),
+            ));
+        }
 
         let session_id = derive_session_id(&message, &participants, threshold);
 
@@ -770,7 +888,7 @@ impl KfpNode {
             let mut sessions = self.sessions.write();
             let session = sessions.create_session(
                 session_id,
-                message,
+                message.clone(),
                 self.share.metadata.threshold,
                 participants.clone(),
             )?;
@@ -783,14 +901,16 @@ impl KfpNode {
             sessions.record_nonce_consumption(&session_id)?;
         }
 
-        let participant_peers: Vec<(u16, PublicKey)> = self
-            .peers
-            .read()
-            .get_online_peers()
-            .iter()
-            .filter(|p| participants.contains(&p.share_index))
-            .map(|p| (p.share_index, p.pubkey))
-            .collect();
+        {
+            let sessions = self.sessions.read();
+            if let Some(session) = sessions.get_session(&session_id) {
+                if let Err(e) = self.hooks.pre_sign(session, &message) {
+                    drop(sessions);
+                    self.sessions.write().complete_session(&session_id);
+                    return Err(e);
+                }
+            }
+        }
 
         let our_commit_bytes = our_commitment
             .serialize()
