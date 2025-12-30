@@ -70,7 +70,8 @@ impl From<&NetworkSession> for SessionInfo {
 /// Hooks for observing and controlling the signing process.
 ///
 /// Implementations should be non-blocking and return quickly to avoid
-/// delaying the signing protocol.
+/// delaying the signing protocol. To prevent deadlocks, hook implementations
+/// must not call `KfpNode::set_hooks` from within a hook.
 pub trait SigningHooks: Send + Sync {
     /// Called before a node participates in a signing session.
     ///
