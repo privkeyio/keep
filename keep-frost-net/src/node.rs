@@ -585,9 +585,9 @@ impl KfpNode {
 
         let commitment = {
             let mut sessions = self.sessions.write();
-            let session = sessions.get_session_mut(&request.session_id).ok_or_else(|| {
-                FrostNetError::SessionNotFound(hex::encode(request.session_id))
-            })?;
+            let session = sessions
+                .get_session_mut(&request.session_id)
+                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(request.session_id)))?;
 
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
@@ -904,7 +904,8 @@ impl KfpNode {
                 .map(|p| (p.share_index, p.pubkey))
                 .collect();
 
-            let mut participants: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
+            let mut participants: Vec<u16> =
+                participant_peers.iter().map(|(idx, _)| *idx).collect();
             participants.push(self.share.metadata.identifier);
             participants.sort();
 
