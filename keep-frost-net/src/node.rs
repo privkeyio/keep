@@ -282,18 +282,14 @@ impl KfpNode {
 
     #[allow(clippy::type_complexity)]
     fn select_eligible_peers(&self, threshold: usize) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
-        let signing_peers: Vec<Peer> = self
-            .peers
-            .read()
-            .get_signing_peers()
-            .into_iter()
-            .cloned()
-            .collect();
-        let mut eligible_peers: Vec<_> = {
+        let mut eligible_peers: Vec<Peer> = {
+            let peers = self.peers.read();
             let policies = self.policies.read();
-            signing_peers
+            peers
+                .get_signing_peers()
                 .into_iter()
                 .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .cloned()
                 .collect()
         };
 
