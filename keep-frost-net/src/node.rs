@@ -48,18 +48,37 @@ impl PeerPolicy {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub session_id: [u8; 32],
+    pub message: Vec<u8>,
+    pub threshold: u16,
+    pub participants: Vec<u16>,
+}
+
+impl From<&NetworkSession> for SessionInfo {
+    fn from(session: &NetworkSession) -> Self {
+        Self {
+            session_id: *session.session_id(),
+            message: session.message().to_vec(),
+            threshold: session.threshold(),
+            participants: session.participants().to_vec(),
+        }
+    }
+}
+
 pub trait SigningHooks: Send + Sync {
-    fn pre_sign(&self, session: &NetworkSession, message: &[u8]) -> Result<()>;
-    fn post_sign(&self, session: &NetworkSession, signature: &[u8; 64]);
+    fn pre_sign(&self, session: &SessionInfo, message: &[u8]) -> Result<()>;
+    fn post_sign(&self, session: &SessionInfo, signature: &[u8; 64]);
 }
 
 pub struct NoOpHooks;
 
 impl SigningHooks for NoOpHooks {
-    fn pre_sign(&self, _session: &NetworkSession, _message: &[u8]) -> Result<()> {
+    fn pre_sign(&self, _session: &SessionInfo, _message: &[u8]) -> Result<()> {
         Ok(())
     }
-    fn post_sign(&self, _session: &NetworkSession, _signature: &[u8; 64]) {}
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
 #[derive(Clone, Debug)]
@@ -239,9 +258,12 @@ impl KfpNode {
     }
 
     fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
-        let sessions = self.sessions.read();
-        if let Some(session) = sessions.get_session(session_id) {
-            self.hooks.read().post_sign(session, signature);
+        let session_info = {
+            let sessions = self.sessions.read();
+            sessions.get_session(session_id).map(SessionInfo::from)
+        };
+        if let Some(info) = session_info {
+            self.hooks.read().post_sign(&info, signature);
         }
     }
 
@@ -515,7 +537,7 @@ impl KfpNode {
 
         let key_package = self.share.key_package()?;
 
-        let commitment = {
+        let (session_info, existing_commitment) = {
             let mut sessions = self.sessions.write();
 
             let session = sessions.get_or_create_session(
@@ -524,31 +546,59 @@ impl KfpNode {
                 self.share.metadata.threshold,
                 request.participants.clone(),
             )?;
+            (SessionInfo::from(&*session), session.our_commitment().copied())
+        };
 
-            if let Some(existing_commitment) = session.our_commitment() {
-                debug!(
-                    session_id = %hex::encode(request.session_id),
-                    "Resending existing commitment for session"
-                );
-                *existing_commitment
-            } else {
-                if let Err(e) = self.hooks.read().pre_sign(session, &request.message) {
-                    drop(sessions);
-                    self.cleanup_session_on_hook_failure(&request.session_id);
-                    return Err(e);
-                }
+        if let Some(existing) = existing_commitment {
+            debug!(
+                session_id = %hex::encode(request.session_id),
+                "Resending existing commitment for session"
+            );
+            let commit_bytes = existing
+                .serialize()
+                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
 
-                let (nonces, commitment) =
-                    frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+            let payload = CommitmentPayload::new(
+                request.session_id,
+                self.share.metadata.identifier,
+                commit_bytes.to_vec(),
+            );
 
-                session.set_our_nonces(nonces);
-                session.set_our_commitment(commitment);
-                session.add_commitment(self.share.metadata.identifier, commitment)?;
+            let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-                sessions.record_nonce_consumption(&request.session_id)?;
+            debug!(
+                session_id = %hex::encode(request.session_id),
+                "Sent commitment"
+            );
 
-                commitment
-            }
+            return Ok(());
+        }
+
+        if let Err(e) = self.hooks.read().pre_sign(&session_info, &request.message) {
+            self.cleanup_session_on_hook_failure(&request.session_id);
+            return Err(e);
+        }
+
+        let commitment = {
+            let mut sessions = self.sessions.write();
+            let session = sessions.get_session_mut(&request.session_id).ok_or_else(|| {
+                FrostNetError::SessionNotFound(hex::encode(request.session_id))
+            })?;
+
+            let (nonces, commitment) =
+                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+
+            session.set_our_nonces(nonces);
+            session.set_our_commitment(commitment);
+            session.add_commitment(self.share.metadata.identifier, commitment)?;
+
+            sessions.record_nonce_consumption(&request.session_id)?;
+
+            commitment
         };
 
         let commit_bytes = commitment
@@ -904,14 +954,14 @@ impl KfpNode {
             sessions.record_nonce_consumption(&session_id)?;
         }
 
-        {
+        let session_info = {
             let sessions = self.sessions.read();
-            if let Some(session) = sessions.get_session(&session_id) {
-                if let Err(e) = self.hooks.read().pre_sign(session, &message) {
-                    drop(sessions);
-                    self.cleanup_session_on_hook_failure(&session_id);
-                    return Err(e);
-                }
+            sessions.get_session(&session_id).map(SessionInfo::from)
+        };
+        if let Some(info) = session_info {
+            if let Err(e) = self.hooks.read().pre_sign(&info, &message) {
+                self.cleanup_session_on_hook_failure(&session_id);
+                return Err(e);
             }
         }
 

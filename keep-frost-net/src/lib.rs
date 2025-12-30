@@ -63,7 +63,7 @@ mod session;
 
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
-pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SigningHooks};
+pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{Peer, PeerManager, PeerStatus};
 pub use protocol::{
