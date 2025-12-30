@@ -68,14 +68,14 @@ impl From<&NetworkSession> for SessionInfo {
 }
 
 pub trait SigningHooks: Send + Sync {
-    fn pre_sign(&self, session: &SessionInfo, message: &[u8]) -> Result<()>;
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()>;
     fn post_sign(&self, session: &SessionInfo, signature: &[u8; 64]);
 }
 
 pub struct NoOpHooks;
 
 impl SigningHooks for NoOpHooks {
-    fn pre_sign(&self, _session: &SessionInfo, _message: &[u8]) -> Result<()> {
+    fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
         Ok(())
     }
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
@@ -580,9 +580,7 @@ impl KfpNode {
             participants: request.participants.clone(),
         };
 
-        self.hooks
-            .read()
-            .pre_sign(&session_info, &request.message)?;
+        self.hooks.read().pre_sign(&session_info)?;
 
         let commitment = {
             let mut sessions = self.sessions.write();
@@ -967,7 +965,7 @@ impl KfpNode {
                 .map(SessionInfo::from)
                 .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
         };
-        if let Err(e) = self.hooks.read().pre_sign(&session_info, &message) {
+        if let Err(e) = self.hooks.read().pre_sign(&session_info) {
             self.cleanup_session_on_hook_failure(&session_id);
             return Err(e);
         }
