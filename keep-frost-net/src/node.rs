@@ -250,14 +250,6 @@ impl KfpNode {
         *self.hooks.write() = hooks;
     }
 
-    fn can_send_to(&self, pubkey: &PublicKey) -> bool {
-        self.policies
-            .read()
-            .get(pubkey)
-            .map(|p| p.allow_send)
-            .unwrap_or(true)
-    }
-
     fn can_receive_from(&self, pubkey: &PublicKey) -> bool {
         self.policies
             .read()
@@ -272,8 +264,14 @@ impl KfpNode {
 
     fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
         let session_info = {
-            let sessions = self.sessions.read();
-            sessions.get_session(session_id).map(SessionInfo::from)
+            let mut sessions = self.sessions.write();
+            if let Some(session) = sessions.get_session(session_id) {
+                let info = SessionInfo::from(session);
+                sessions.complete_session(session_id);
+                Some(info)
+            } else {
+                None
+            }
         };
         if let Some(info) = session_info {
             self.hooks.read().post_sign(&info, signature);
@@ -286,11 +284,12 @@ impl KfpNode {
         threshold: usize,
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         let peers = self.peers.read();
+        let policies = self.policies.read();
 
         let mut eligible_peers: Vec<_> = peers
             .get_signing_peers()
             .into_iter()
-            .filter(|p| self.can_send_to(&p.pubkey))
+            .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
             .collect();
 
         if eligible_peers.len() + 1 < threshold {
@@ -857,8 +856,6 @@ impl KfpNode {
 
             self.invoke_post_sign_hook(&payload.session_id, &sig);
 
-            self.sessions.write().complete_session(&payload.session_id);
-
             let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
                 session_id: payload.session_id,
                 signature: sig,
@@ -897,8 +894,6 @@ impl KfpNode {
         );
 
         self.invoke_post_sign_hook(&payload.session_id, &payload.signature);
-
-        self.sessions.write().complete_session(&payload.session_id);
 
         let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
             session_id: payload.session_id,
