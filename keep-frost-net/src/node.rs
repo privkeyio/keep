@@ -537,16 +537,11 @@ impl KfpNode {
 
         let key_package = self.share.key_package()?;
 
-        let (session_info, existing_commitment) = {
-            let mut sessions = self.sessions.write();
-
-            let session = sessions.get_or_create_session(
-                request.session_id,
-                request.message.clone(),
-                self.share.metadata.threshold,
-                request.participants.clone(),
-            )?;
-            (SessionInfo::from(&*session), session.our_commitment().copied())
+        let existing_commitment = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&request.session_id)
+                .and_then(|s| s.our_commitment().copied())
         };
 
         if let Some(existing) = existing_commitment {
@@ -578,16 +573,26 @@ impl KfpNode {
             return Ok(());
         }
 
-        if let Err(e) = self.hooks.read().pre_sign(&session_info, &request.message) {
-            self.cleanup_session_on_hook_failure(&request.session_id);
-            return Err(e);
-        }
+        let session_info = SessionInfo {
+            session_id: request.session_id,
+            message: request.message.clone(),
+            threshold: self.share.metadata.threshold,
+            participants: request.participants.clone(),
+        };
+
+        self.hooks
+            .read()
+            .pre_sign(&session_info, &request.message)?;
 
         let commitment = {
             let mut sessions = self.sessions.write();
-            let session = sessions
-                .get_session_mut(&request.session_id)
-                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(request.session_id)))?;
+
+            let session = sessions.get_or_create_session(
+                request.session_id,
+                request.message.clone(),
+                self.share.metadata.threshold,
+                request.participants.clone(),
+            )?;
 
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
