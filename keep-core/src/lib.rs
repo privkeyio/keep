@@ -14,6 +14,7 @@ pub mod keyring;
 pub mod keys;
 pub(crate) mod rate_limit;
 pub mod storage;
+pub mod vault;
 
 use std::path::{Path, PathBuf};
 
