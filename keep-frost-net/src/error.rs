@@ -37,6 +37,13 @@ pub enum FrostNetError {
     #[error("Nonce already consumed for session: {0}")]
     NonceConsumed(String),
 
+    #[error("Rehydration limit exceeded: {used}/{max} for session {session_id}")]
+    RehydrationLimitExceeded {
+        session_id: String,
+        used: u16,
+        max: u16,
+    },
+
     #[error("Keep error: {0}")]
     Keep(#[from] keep_core::error::KeepError),
 

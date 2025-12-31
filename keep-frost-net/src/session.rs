@@ -12,6 +12,8 @@ use frost_secp256k1_tr::{
 };
 use zeroize::Zeroize;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
 use crate::protocol::KFP_VERSION;
@@ -42,13 +44,28 @@ pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -
     keep_core::crypto::blake2b_256(&preimage)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     AwaitingCommitments,
     AwaitingShares,
     Complete,
     Failed,
     Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedSessionState {
+    pub session_id: [u8; 32],
+    pub message: Vec<u8>,
+    pub threshold: u16,
+    pub participants: Vec<u16>,
+    pub state: SessionState,
+    pub commitments: Vec<(Vec<u8>, Vec<u8>)>,
+    pub signature_shares: Vec<(Vec<u8>, Vec<u8>)>,
+    pub our_nonces: Option<Vec<u8>>,
+    pub our_commitment: Option<Vec<u8>>,
+    pub rehydrations_used: u16,
+    pub max_rehydrations: u16,
 }
 
 pub struct NetworkSession {
@@ -64,6 +81,8 @@ pub struct NetworkSession {
     our_nonces: Option<NonceWrapper>,
     our_commitment: Option<SigningCommitments>,
     signature: Option<Signature>,
+    rehydrations_used: u16,
+    max_rehydrations: u16,
 }
 
 impl NetworkSession {
@@ -86,7 +105,14 @@ impl NetworkSession {
             our_nonces: None,
             our_commitment: None,
             signature: None,
+            rehydrations_used: 0,
+            max_rehydrations: 3,
         }
+    }
+
+    pub fn with_max_rehydrations(mut self, max: u16) -> Self {
+        self.max_rehydrations = max;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -285,6 +311,131 @@ impl NetworkSession {
     pub fn take_our_nonces(&mut self) -> Option<SigningNonces> {
         self.our_nonces.take().map(|w| w.0)
     }
+
+    pub fn rehydrations_used(&self) -> u16 {
+        self.rehydrations_used
+    }
+
+    pub fn max_rehydrations(&self) -> u16 {
+        self.max_rehydrations
+    }
+
+    pub fn can_rehydrate(&self) -> bool {
+        self.rehydrations_used < self.max_rehydrations
+    }
+
+    pub fn to_cached_state(&self) -> Result<CachedSessionState> {
+        let commitments = self
+            .commitments
+            .iter()
+            .map(|(id, c)| {
+                let c_bytes = c
+                    .serialize()
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+                Ok((id.serialize(), c_bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let signature_shares = self
+            .signature_shares
+            .iter()
+            .map(|(id, s)| (id.serialize(), s.serialize()))
+            .collect::<Vec<_>>();
+
+        let our_nonces = self
+            .our_nonces
+            .as_ref()
+            .map(|n| {
+                n.0.serialize()
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize nonces: {}", e)))
+            })
+            .transpose()?;
+
+        let our_commitment = self
+            .our_commitment
+            .as_ref()
+            .map(|c| {
+                c.serialize()
+                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(CachedSessionState {
+            session_id: self.session_id,
+            message: self.message.clone(),
+            threshold: self.threshold,
+            participants: self.participants.clone(),
+            state: self.state,
+            commitments,
+            signature_shares,
+            our_nonces,
+            our_commitment,
+            rehydrations_used: self.rehydrations_used,
+            max_rehydrations: self.max_rehydrations,
+        })
+    }
+
+    pub fn from_cached_state(cached: CachedSessionState) -> Result<Self> {
+        if cached.rehydrations_used >= cached.max_rehydrations {
+            return Err(FrostNetError::RehydrationLimitExceeded {
+                session_id: hex::encode(cached.session_id),
+                used: cached.rehydrations_used,
+                max: cached.max_rehydrations,
+            });
+        }
+
+        let mut commitments = BTreeMap::new();
+        for (id_bytes, c_bytes) in cached.commitments {
+            let id = Identifier::deserialize(&id_bytes)
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {}", e)))?;
+            let commitment = SigningCommitments::deserialize(&c_bytes)
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))?;
+            commitments.insert(id, commitment);
+        }
+
+        let mut signature_shares = BTreeMap::new();
+        for (id_bytes, s_bytes) in cached.signature_shares {
+            let id = Identifier::deserialize(&id_bytes)
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {}", e)))?;
+            let share = SignatureShare::deserialize(&s_bytes)
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize share: {}", e)))?;
+            signature_shares.insert(id, share);
+        }
+
+        let our_nonces = cached
+            .our_nonces
+            .map(|bytes| {
+                SigningNonces::deserialize(&bytes)
+                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize nonces: {}", e)))
+            })
+            .transpose()?
+            .map(NonceWrapper);
+
+        let our_commitment = cached
+            .our_commitment
+            .map(|bytes| {
+                SigningCommitments::deserialize(&bytes)
+                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            session_id: cached.session_id,
+            message: cached.message,
+            threshold: cached.threshold,
+            participants: cached.participants,
+            state: cached.state,
+            created_at: Instant::now(),
+            timeout: Duration::from_secs(30),
+            commitments,
+            signature_shares,
+            our_nonces,
+            our_commitment,
+            signature: None,
+            rehydrations_used: cached.rehydrations_used + 1,
+            max_rehydrations: cached.max_rehydrations,
+        })
+    }
 }
 
 pub struct SessionManager {
@@ -294,9 +445,9 @@ pub struct SessionManager {
     max_completed_history: usize,
     session_timeout: Duration,
     nonce_store: Option<Arc<dyn NonceStore>>,
+    max_rehydrations: u16,
 }
 
-/// Validates that the provided session_id matches the expected derived ID.
 fn validate_session_id(
     session_id: [u8; 32],
     message: &[u8],
@@ -323,6 +474,7 @@ impl SessionManager {
             max_completed_history: 1000,
             session_timeout: Duration::from_secs(300),
             nonce_store: None,
+            max_rehydrations: 3,
         }
     }
 
@@ -333,6 +485,11 @@ impl SessionManager {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.session_timeout = timeout;
+        self
+    }
+
+    pub fn with_max_rehydrations(mut self, max: u16) -> Self {
+        self.max_rehydrations = max;
         self
     }
 
@@ -463,6 +620,57 @@ impl SessionManager {
             store.record(session_id)?;
         }
         Ok(())
+    }
+
+    pub fn rehydrate_session(&mut self, cached: CachedSessionState) -> Result<&mut NetworkSession> {
+        let session_id = cached.session_id;
+
+        if self.completed_sessions.contains(&session_id) {
+            return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
+        }
+
+        if let Some(ref store) = self.nonce_store {
+            if store.is_consumed(&session_id) {
+                return Err(FrostNetError::NonceConsumed(hex::encode(session_id)));
+            }
+        }
+
+        if self.active_sessions.contains_key(&session_id) {
+            let existing = self.active_sessions.get(&session_id).unwrap();
+            if !existing.is_expired() {
+                return Err(FrostNetError::Session("Session already active".into()));
+            }
+            self.active_sessions.remove(&session_id);
+        }
+
+        let mut session = NetworkSession::from_cached_state(cached)?;
+        session.timeout = self.session_timeout;
+        session.max_rehydrations = self.max_rehydrations;
+
+        self.active_sessions.insert(session_id, session);
+        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+    }
+
+    pub fn cache_and_remove_session(
+        &mut self,
+        session_id: &[u8; 32],
+    ) -> Result<Option<CachedSessionState>> {
+        if let Some(session) = self.active_sessions.get(session_id) {
+            let state = session.state();
+            if state == SessionState::Complete || state == SessionState::Failed {
+                self.active_sessions.remove(session_id);
+                return Ok(None);
+            }
+            if !session.can_rehydrate() {
+                self.active_sessions.remove(session_id);
+                return Ok(None);
+            }
+            let cached = session.to_cached_state()?;
+            self.active_sessions.remove(session_id);
+            Ok(Some(cached))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -610,5 +818,115 @@ mod tests {
         manager
             .create_session(session_id, message, 2, participants)
             .unwrap();
+    }
+
+    #[test]
+    fn test_session_rehydration_tracking() {
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+        let session = NetworkSession::new(session_id, message, 2, participants);
+        assert_eq!(session.rehydrations_used(), 0);
+        assert_eq!(session.max_rehydrations(), 3);
+        assert!(session.can_rehydrate());
+    }
+
+    #[test]
+    fn test_session_cache_and_rehydrate() {
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+        let session = NetworkSession::new(session_id, message.clone(), 2, participants.clone());
+        let cached = session.to_cached_state().unwrap();
+
+        assert_eq!(cached.session_id, session_id);
+        assert_eq!(cached.message, message);
+        assert_eq!(cached.threshold, 2);
+        assert_eq!(cached.participants, participants);
+        assert_eq!(cached.rehydrations_used, 0);
+
+        let rehydrated = NetworkSession::from_cached_state(cached).unwrap();
+        assert_eq!(rehydrated.rehydrations_used(), 1);
+        assert!(rehydrated.can_rehydrate());
+    }
+
+    #[test]
+    fn test_rehydration_limit_enforcement() {
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+        let session = NetworkSession::new(session_id, message, 2, participants)
+            .with_max_rehydrations(2);
+
+        let cached = session.to_cached_state().unwrap();
+        let session = NetworkSession::from_cached_state(cached).unwrap();
+        assert_eq!(session.rehydrations_used(), 1);
+
+        let cached = session.to_cached_state().unwrap();
+        let session = NetworkSession::from_cached_state(cached).unwrap();
+        assert_eq!(session.rehydrations_used(), 2);
+        assert!(!session.can_rehydrate());
+
+        let cached = session.to_cached_state().unwrap();
+        let result = NetworkSession::from_cached_state(cached);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_session_manager_rehydration() {
+        let mut manager = SessionManager::new().with_max_rehydrations(3);
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+
+        manager
+            .create_session(session_id, message, 2, participants)
+            .unwrap();
+
+        let cached = manager.cache_and_remove_session(&session_id).unwrap();
+        assert!(cached.is_some());
+        assert!(manager.get_session(&session_id).is_none());
+
+        let cached = cached.unwrap();
+        manager.rehydrate_session(cached).unwrap();
+        let session = manager.get_session(&session_id).unwrap();
+        assert_eq!(session.rehydrations_used(), 1);
+    }
+
+    #[test]
+    fn test_cached_session_state_serialization() {
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+        let session = NetworkSession::new(session_id, message, 2, participants);
+        let cached = session.to_cached_state().unwrap();
+
+        let json = serde_json::to_string(&cached).unwrap();
+        let deserialized: CachedSessionState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.session_id, cached.session_id);
+        assert_eq!(deserialized.message, cached.message);
+        assert_eq!(deserialized.rehydrations_used, cached.rehydrations_used);
+    }
+
+    #[test]
+    fn test_expired_session_can_be_cached() {
+        let mut manager = SessionManager::new().with_timeout(Duration::from_millis(1));
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+
+        manager
+            .create_session(session_id, message, 2, participants)
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let session = manager.get_session(&session_id).unwrap();
+        assert_eq!(session.state(), SessionState::Expired);
+
+        let cached = manager.cache_and_remove_session(&session_id).unwrap();
+        assert!(cached.is_some());
+        assert!(manager.get_session(&session_id).is_none());
     }
 }
