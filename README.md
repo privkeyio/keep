@@ -152,11 +152,14 @@ keep frost network sign-event --group npub1... --kind 1 --content "Posted via FR
 
 ### Hardware Signing
 
-Store FROST shares on a hardware signer (serial JSON-RPC device):
+Store FROST shares on an air-gapped hardware signer. See [keep-esp32](https://github.com/privkeyio/keep-esp32) for firmware.
 
 ```bash
 # Test connection
 keep frost hardware ping --device /dev/ttyUSB0
+
+# List shares on device
+keep frost hardware list --device /dev/ttyUSB0
 
 # Import share to hardware
 keep frost hardware import --device /dev/ttyUSB0 --group npub1... --share 1

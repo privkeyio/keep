@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use frost_secp256k1_tr::{
@@ -11,6 +12,7 @@ use frost_secp256k1_tr::{
 };
 
 use crate::error::{FrostNetError, Result};
+use crate::nonce_store::NonceStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -255,6 +257,7 @@ pub struct SessionManager {
     completed_order: VecDeque<[u8; 32]>,
     max_completed_history: usize,
     session_timeout: Duration,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl SessionManager {
@@ -265,7 +268,13 @@ impl SessionManager {
             completed_order: VecDeque::new(),
             max_completed_history: 1000,
             session_timeout: Duration::from_secs(300),
+            nonce_store: None,
         }
+    }
+
+    pub fn with_nonce_store(mut self, store: Arc<dyn NonceStore>) -> Self {
+        self.nonce_store = Some(store);
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -282,6 +291,12 @@ impl SessionManager {
     ) -> Result<&mut NetworkSession> {
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
+        }
+
+        if let Some(ref store) = self.nonce_store {
+            if store.is_consumed(&session_id) {
+                return Err(FrostNetError::NonceConsumed(hex::encode(session_id)));
+            }
         }
 
         if self.active_sessions.contains_key(&session_id) {
@@ -316,6 +331,12 @@ impl SessionManager {
     ) -> Result<&mut NetworkSession> {
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
+        }
+
+        if let Some(ref store) = self.nonce_store {
+            if store.is_consumed(&session_id) {
+                return Err(FrostNetError::NonceConsumed(hex::encode(session_id)));
+            }
         }
 
         if let Some(existing) = self.active_sessions.get(&session_id) {
@@ -371,6 +392,20 @@ impl SessionManager {
     pub fn is_replay(&self, session_id: &[u8; 32]) -> bool {
         self.completed_sessions.contains(session_id)
     }
+
+    pub fn is_nonce_consumed(&self, session_id: &[u8; 32]) -> bool {
+        if let Some(ref store) = self.nonce_store {
+            return store.is_consumed(session_id);
+        }
+        false
+    }
+
+    pub fn record_nonce_consumption(&self, session_id: &[u8; 32]) -> Result<()> {
+        if let Some(ref store) = self.nonce_store {
+            store.record(session_id)?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for SessionManager {
@@ -382,6 +417,7 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nonce_store::MemoryNonceStore;
 
     #[test]
     fn test_session_lifecycle() {
@@ -414,5 +450,45 @@ mod tests {
         assert!(session.is_participant(1));
         assert!(session.is_participant(2));
         assert!(!session.is_participant(4));
+    }
+
+    #[test]
+    fn test_nonce_consumption_tracking() {
+        let store = Arc::new(MemoryNonceStore::new());
+        let mut manager = SessionManager::new().with_nonce_store(store.clone());
+
+        let session_id = [42u8; 32];
+
+        manager.record_nonce_consumption(&session_id).unwrap();
+        assert!(manager.is_nonce_consumed(&session_id));
+
+        let result = manager.create_session(session_id, vec![], 2, vec![1, 2]);
+        assert!(matches!(result, Err(FrostNetError::NonceConsumed(_))));
+    }
+
+    #[test]
+    fn test_nonce_consumption_blocks_get_or_create() {
+        let store = Arc::new(MemoryNonceStore::new());
+        let mut manager = SessionManager::new().with_nonce_store(store.clone());
+
+        let session_id = [43u8; 32];
+
+        store.record(&session_id).unwrap();
+
+        let result = manager.get_or_create_session(session_id, vec![], 2, vec![1, 2]);
+        assert!(matches!(result, Err(FrostNetError::NonceConsumed(_))));
+    }
+
+    #[test]
+    fn test_session_without_nonce_store() {
+        let mut manager = SessionManager::new();
+        let session_id = [44u8; 32];
+
+        assert!(!manager.is_nonce_consumed(&session_id));
+        manager.record_nonce_consumption(&session_id).unwrap();
+
+        manager
+            .create_session(session_id, vec![], 2, vec![1, 2])
+            .unwrap();
     }
 }
