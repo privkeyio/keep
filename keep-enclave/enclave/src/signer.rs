@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use crate::audit::SigningAuditLog;
 use crate::error::{EnclaveError, Result};
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
@@ -10,8 +11,10 @@ use frost_secp256k1_tr as frost;
 use k256::schnorr::SigningKey;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use signature::Signer;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[allow(unsafe_code)]
@@ -175,6 +178,8 @@ pub struct EnclaveSigner {
     #[zeroize(skip)]
     frost_sessions: HashMap<[u8; 32], FrostSession>,
     ephemeral_secret: MlockedBox<32>,
+    #[zeroize(skip)]
+    audit_log: Arc<SigningAuditLog>,
 }
 
 #[derive(ZeroizeOnDrop)]
@@ -208,21 +213,33 @@ impl EnclaveSigner {
         let mut ephemeral_secret = [0u8; 32];
         getrandom(&mut ephemeral_secret)?;
 
+        let audit_hmac_key = derive_audit_hmac_key(&ephemeral_secret);
+        let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
+
         Ok(Self {
             keys: HashMap::new(),
             frost_keys: HashMap::new(),
             frost_sessions: HashMap::new(),
             ephemeral_secret: MlockedBox::new(&mut ephemeral_secret),
+            audit_log,
         })
     }
 
     pub fn with_ephemeral_secret(mut ephemeral_secret: [u8; 32]) -> Self {
+        let audit_hmac_key = derive_audit_hmac_key(&ephemeral_secret);
+        let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
+
         Self {
             keys: HashMap::new(),
             frost_keys: HashMap::new(),
             frost_sessions: HashMap::new(),
             ephemeral_secret: MlockedBox::new(&mut ephemeral_secret),
+            audit_log,
         }
+    }
+
+    pub fn audit_log(&self) -> &SigningAuditLog {
+        &self.audit_log
     }
 
     pub fn create_kms(&self) -> crate::kms::EnclaveKms {
@@ -296,7 +313,7 @@ impl EnclaveSigner {
         Ok(entry.pubkey)
     }
 
-    pub fn sign(&self, key_id: &str, message: &[u8]) -> Result<[u8; 64]> {
+    pub fn sign(&mut self, key_id: &str, message: &[u8]) -> Result<[u8; 64]> {
         let entry = self
             .keys
             .get(key_id)
@@ -311,11 +328,13 @@ impl EnclaveSigner {
         let mut result = [0u8; 64];
         result.copy_from_slice(&sig_bytes);
 
+        self.audit_log.log_single_sign(key_id, message, &result);
+
         Ok(result)
     }
 
     pub fn sign_psbt(
-        &self,
+        &mut self,
         key_id: &str,
         psbt_bytes: &[u8],
         network: Network,
@@ -375,6 +394,9 @@ impl EnclaveSigner {
         }
 
         let signed_bytes = psbt.serialize();
+
+        self.audit_log.log_psbt_sign(key_id, psbt_bytes, signed_count);
+
         Ok((signed_bytes, signed_count, analysis))
     }
 
@@ -560,6 +582,8 @@ impl EnclaveSigner {
             key_id: key_id.to_string(),
         });
 
+        self.audit_log.log_frost_round1(key_id, message, session_id);
+
         Ok((commitment_bytes, session_id))
     }
 
@@ -588,8 +612,10 @@ impl EnclaveSigner {
         let session = self.frost_sessions.remove(&session_id)
             .ok_or_else(|| EnclaveError::Signing("Session not found".into()))?;
 
-        let entry = self.frost_keys.get(&session.key_id)
-            .ok_or_else(|| EnclaveError::KeyNotFound(session.key_id.clone()))?;
+        let key_id = session.key_id.clone();
+
+        let entry = self.frost_keys.get(&key_id)
+            .ok_or_else(|| EnclaveError::KeyNotFound(key_id.clone()))?;
 
         let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
@@ -599,7 +625,11 @@ impl EnclaveSigner {
         let signature_share = frost::round2::sign(&signing_package, &session.nonces, &key_package)
             .map_err(|e| EnclaveError::Signing(format!("FROST signing failed: {}", e)))?;
 
-        Ok(signature_share.serialize())
+        let share_bytes = signature_share.serialize();
+
+        self.audit_log.log_frost_round2(&key_id, session_id, &share_bytes);
+
+        Ok(share_bytes)
     }
 
     pub fn list_keys(&self) -> Vec<(&str, [u8; 32])> {
@@ -614,6 +644,13 @@ impl Default for EnclaveSigner {
     fn default() -> Self {
         Self::new().expect("Failed to initialize EnclaveSigner")
     }
+}
+
+fn derive_audit_hmac_key(ephemeral_secret: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep-enclave-audit-hmac-v1");
+    hasher.update(ephemeral_secret);
+    hasher.finalize().into()
 }
 
 #[cfg(target_os = "linux")]
@@ -689,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_key_not_found() {
-        let signer = test_signer();
+        let mut signer = test_signer();
         let result = signer.sign("nonexistent", b"test");
         assert!(result.is_err());
     }

@@ -8,6 +8,7 @@
 
 #[cfg(target_os = "linux")]
 mod aws_credentials;
+mod audit;
 mod error;
 mod kms;
 #[cfg(target_os = "linux")]
