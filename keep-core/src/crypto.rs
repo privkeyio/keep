@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
@@ -6,11 +6,148 @@ use chacha20poly1305::{
     aead::{generic_array::GenericArray, Aead, KeyInit},
     XChaCha20Poly1305,
 };
-use memsecurity::{EncryptedMem, ZeroizeArray};
+use memsecurity::EncryptedMem;
 use rand::RngCore;
 use zeroize::Zeroize;
 
 use crate::error::{KeepError, Result};
+
+#[allow(unsafe_code)]
+mod mlock {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use zeroize::Zeroize;
+
+    pub struct MlockedBox<const N: usize> {
+        ptr: *mut [u8; N],
+        locked: bool,
+    }
+
+    impl<const N: usize> MlockedBox<N> {
+        /// Creates a new mlocked box from a mutable reference, zeroing the source.
+        ///
+        /// The source data is copied into mlocked memory and then immediately
+        /// zeroed to prevent secrets from remaining on the stack.
+        pub fn new(data: &mut [u8; N]) -> Self {
+            let layout = Layout::new::<[u8; N]>();
+            let ptr = unsafe { alloc_zeroed(layout) as *mut [u8; N] };
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+
+            // Copy data to mlocked memory
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, N) };
+
+            // Zero the source immediately
+            data.zeroize();
+
+            let locked = unsafe { memsec::mlock(ptr as *mut u8, N) };
+
+            Self { ptr, locked }
+        }
+
+        #[allow(dead_code)]
+        pub fn is_locked(&self) -> bool {
+            self.locked
+        }
+    }
+
+    impl<const N: usize> std::ops::Deref for MlockedBox<N> {
+        type Target = [u8; N];
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.ptr }
+        }
+    }
+
+    impl<const N: usize> std::ops::DerefMut for MlockedBox<N> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { &mut *self.ptr }
+        }
+    }
+
+    impl<const N: usize> Drop for MlockedBox<N> {
+        fn drop(&mut self) {
+            unsafe {
+                memsec::memzero(self.ptr as *mut u8, N);
+                if self.locked {
+                    memsec::munlock(self.ptr as *mut u8, N);
+                }
+                dealloc(self.ptr as *mut u8, Layout::new::<[u8; N]>());
+            }
+        }
+    }
+
+    impl<const N: usize> Zeroize for MlockedBox<N> {
+        fn zeroize(&mut self) {
+            unsafe { memsec::memzero(self.ptr as *mut u8, N) };
+        }
+    }
+
+    unsafe impl<const N: usize> Send for MlockedBox<N> {}
+    unsafe impl<const N: usize> Sync for MlockedBox<N> {}
+
+    pub struct MlockedVec {
+        ptr: *mut u8,
+        len: usize,
+        capacity: usize,
+        locked: bool,
+    }
+
+    impl MlockedVec {
+        /// Creates a new mlocked vec, taking ownership and locking the memory.
+        ///
+        /// Note: The Vec's memory is locked in place. The original allocation
+        /// is preserved (not copied), so this is efficient for large data.
+        pub fn new(mut data: Vec<u8>) -> Self {
+            let len = data.len();
+            let capacity = data.capacity();
+            let ptr = data.as_mut_ptr();
+            std::mem::forget(data);
+
+            let locked = unsafe { memsec::mlock(ptr, capacity) };
+
+            Self {
+                ptr,
+                len,
+                capacity,
+                locked,
+            }
+        }
+
+        #[allow(dead_code)]
+        pub fn is_locked(&self) -> bool {
+            self.locked
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl Drop for MlockedVec {
+        fn drop(&mut self) {
+            unsafe {
+                // Zero the full capacity, not just len, to catch any leftover data
+                memsec::memzero(self.ptr, self.capacity);
+                if self.locked {
+                    memsec::munlock(self.ptr, self.capacity);
+                }
+                let _ = Vec::from_raw_parts(self.ptr, self.len, self.capacity);
+            }
+        }
+    }
+
+    impl Zeroize for MlockedVec {
+        fn zeroize(&mut self) {
+            unsafe { memsec::memzero(self.ptr, self.capacity) };
+        }
+    }
+
+    unsafe impl Send for MlockedVec {}
+    unsafe impl Sync for MlockedVec {}
+}
+
+pub use mlock::{MlockedBox, MlockedVec};
 
 pub const SALT_SIZE: usize = 32;
 
@@ -93,10 +230,13 @@ impl SecretKey {
         Self::new(bytes)
     }
 
-    pub fn decrypt(&self) -> Result<ZeroizeArray<KEY_SIZE>> {
-        self.encrypted
+    pub fn decrypt(&self) -> Result<MlockedBox<KEY_SIZE>> {
+        let decrypted = self
+            .encrypted
             .decrypt_32byte()
-            .map_err(|_| KeepError::Other("Failed to decrypt key".into()))
+            .map_err(|_| KeepError::Other("Failed to decrypt key".into()))?;
+        let mut bytes = *decrypted.expose_borrowed();
+        Ok(MlockedBox::new(&mut bytes))
     }
 
     pub fn from_slice(slice: &[u8]) -> Result<Self> {
@@ -110,7 +250,7 @@ impl SecretKey {
 
     pub fn try_clone(&self) -> Result<Self> {
         let decrypted = self.decrypt()?;
-        Self::new(*decrypted.expose_borrowed())
+        Self::new(*decrypted)
     }
 }
 
@@ -147,7 +287,7 @@ pub fn derive_key(
 pub fn derive_subkey(master_key: &SecretKey, context: &[u8]) -> Result<SecretKey> {
     let decrypted = master_key.decrypt()?;
     let mut hasher = Blake2b512::new();
-    hasher.update(decrypted.expose_borrowed());
+    hasher.update(*decrypted);
     hasher.update(context);
     let result = hasher.finalize();
 
@@ -187,7 +327,7 @@ impl EncryptedData {
 
 pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     let decrypted = key.decrypt()?;
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(decrypted.expose_borrowed()));
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted));
 
     let mut nonce = [0u8; NONCE_SIZE];
     rand::rng().fill_bytes(&mut nonce);
@@ -202,7 +342,7 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
 
 pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
     let decrypted_key = key.decrypt()?;
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(decrypted_key.expose_borrowed()));
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted_key));
     let nonce = GenericArray::from_slice(&encrypted.nonce);
 
     let plaintext = cipher
@@ -240,16 +380,10 @@ mod tests {
         let key1 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
         let key2 = derive_key(password, &salt, Argon2Params::TESTING).unwrap();
 
-        assert_eq!(
-            key1.decrypt().unwrap().expose_borrowed(),
-            key2.decrypt().unwrap().expose_borrowed()
-        );
+        assert_eq!(&*key1.decrypt().unwrap(), &*key2.decrypt().unwrap());
 
         let key3 = derive_key(b"different", &salt, Argon2Params::TESTING).unwrap();
-        assert_ne!(
-            key1.decrypt().unwrap().expose_borrowed(),
-            key3.decrypt().unwrap().expose_borrowed()
-        );
+        assert_ne!(&*key1.decrypt().unwrap(), &*key3.decrypt().unwrap());
     }
 
     #[test]
@@ -285,15 +419,12 @@ mod tests {
         let subkey1 = derive_subkey(&master, b"header").unwrap();
         let subkey2 = derive_subkey(&master, b"data").unwrap();
 
-        assert_ne!(
-            subkey1.decrypt().unwrap().expose_borrowed(),
-            subkey2.decrypt().unwrap().expose_borrowed()
-        );
+        assert_ne!(&*subkey1.decrypt().unwrap(), &*subkey2.decrypt().unwrap());
 
         let subkey1_again = derive_subkey(&master, b"header").unwrap();
         assert_eq!(
-            subkey1.decrypt().unwrap().expose_borrowed(),
-            subkey1_again.decrypt().unwrap().expose_borrowed()
+            &*subkey1.decrypt().unwrap(),
+            &*subkey1_again.decrypt().unwrap()
         );
     }
 
@@ -301,6 +432,6 @@ mod tests {
     fn test_secret_key_encrypted_in_ram() {
         let key = SecretKey::generate().unwrap();
         let decrypted = key.decrypt().unwrap();
-        assert!(!decrypted.expose_borrowed().iter().all(|&b| b == 0));
+        assert!(!decrypted.iter().all(|&b| b == 0));
     }
 }

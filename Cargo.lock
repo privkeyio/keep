@@ -1729,6 +1729,7 @@ dependencies = [
  "fs2",
  "hex",
  "k256",
+ "memsec 0.7.0",
  "memsecurity",
  "rand 0.9.2",
  "redb",
@@ -1942,6 +1943,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "memsec"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c797b9d6bb23aab2fc369c65f871be49214f5c759af65bde26ffaaa2b646b492"
+dependencies = [
+ "getrandom 0.2.16",
+ "libc",
+ "windows-sys 0.45.0",
+]
+
+[[package]]
 name = "memsecurity"
 version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1952,7 +1964,7 @@ dependencies = [
  "blake3",
  "borsh",
  "bytes",
- "memsec",
+ "memsec 0.6.3",
  "once_cell",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
