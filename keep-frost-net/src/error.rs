@@ -34,6 +34,9 @@ pub enum FrostNetError {
     #[error("Replay detected: {0}")]
     ReplayDetected(String),
 
+    #[error("Nonce already consumed for session: {0}")]
+    NonceConsumed(String),
+
     #[error("Keep error: {0}")]
     Keep(#[from] keep_core::error::KeepError),
 

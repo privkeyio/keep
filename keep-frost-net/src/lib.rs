@@ -56,6 +56,7 @@
 mod error;
 mod event;
 mod node;
+mod nonce_store;
 mod peer;
 mod protocol;
 mod session;
@@ -63,6 +64,7 @@ mod session;
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{KfpNode, KfpNodeEvent};
+pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{Peer, PeerManager, PeerStatus};
 pub use protocol::{
     AnnouncePayload, CommitmentPayload, ErrorPayload, KfpMessage, PingPayload, PongPayload,
