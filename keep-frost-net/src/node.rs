@@ -8,7 +8,7 @@ use std::time::Duration;
 use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
-use ::rand::prelude::IndexedRandom;
+use ::rand::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
