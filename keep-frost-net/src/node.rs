@@ -8,7 +8,7 @@ use std::time::Duration;
 use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
+use ::rand::prelude::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
@@ -298,7 +298,7 @@ impl KfpNode {
             }
 
             eligible_peers
-                .choose_multiple(&mut rand::thread_rng(), threshold - 1)
+                .choose_multiple(&mut ::rand::rng(), threshold - 1)
                 .copied()
                 .cloned()
                 .collect()
