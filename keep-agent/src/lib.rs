@@ -13,7 +13,7 @@ pub mod session;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
-pub use attestation::{verify_peer_attestation, ExpectedPcrs, PeerAttestation};
+pub use attestation::{verify_peer_attestation, ExpectedPcrs, PeerAttestation, VerificationConfig};
 pub use client::{AgentClient, ApprovalStatus, PendingSession};
 pub use entropy::{get_entropy, is_nitro_enclave};
 pub use error::{AgentError, Result};
