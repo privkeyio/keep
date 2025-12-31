@@ -139,6 +139,47 @@ pub struct AnnouncePayload {
     pub timestamp: u64,
     pub capabilities: Vec<String>,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<EnclaveAttestation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EnclaveAttestation {
+    #[serde(with = "hex_vec")]
+    pub pcr0: Vec<u8>,
+    #[serde(with = "hex_vec")]
+    pub pcr1: Vec<u8>,
+    #[serde(with = "hex_vec")]
+    pub pcr2: Vec<u8>,
+    #[serde(with = "hex_vec")]
+    pub enclave_pubkey: Vec<u8>,
+    pub timestamp: u64,
+}
+
+impl EnclaveAttestation {
+    pub fn new(
+        pcr0: Vec<u8>,
+        pcr1: Vec<u8>,
+        pcr2: Vec<u8>,
+        enclave_pubkey: Vec<u8>,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            pcr0,
+            pcr1,
+            pcr2,
+            enclave_pubkey,
+            timestamp,
+        }
+    }
+
+    pub fn pcrs_map(&self) -> std::collections::HashMap<u32, Vec<u8>> {
+        let mut map = std::collections::HashMap::new();
+        map.insert(0, self.pcr0.clone());
+        map.insert(1, self.pcr1.clone());
+        map.insert(2, self.pcr2.clone());
+        map
+    }
 }
 
 impl AnnouncePayload {
@@ -158,6 +199,7 @@ impl AnnouncePayload {
             timestamp,
             capabilities: vec!["sign".into()],
             name: None,
+            attestation: None,
         }
     }
 
@@ -168,6 +210,11 @@ impl AnnouncePayload {
 
     pub fn with_capabilities(mut self, caps: Vec<String>) -> Self {
         self.capabilities = caps;
+        self
+    }
+
+    pub fn with_attestation(mut self, attestation: EnclaveAttestation) -> Self {
+        self.attestation = Some(attestation);
         self
     }
 }
@@ -644,5 +691,57 @@ mod tests {
         future_payload.created_at = chrono::Utc::now().timestamp() as u64 + 400;
         assert!(!future_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
         assert!(future_payload.is_within_replay_window(500));
+    }
+
+    #[test]
+    fn test_announce_with_attestation_serialization() {
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 48],
+            vec![1u8; 48],
+            vec![2u8; 48],
+            vec![3u8; 32],
+            1234567890,
+        );
+        let payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890)
+            .with_name("test-enclave")
+            .with_attestation(attestation);
+        let msg = KfpMessage::Announce(payload);
+
+        let json = msg.to_json().unwrap();
+        let parsed: KfpMessage = KfpMessage::from_json(&json).unwrap();
+
+        match parsed {
+            KfpMessage::Announce(p) => {
+                assert_eq!(p.share_index, 1);
+                assert_eq!(p.name, Some("test-enclave".into()));
+                let att = p.attestation.expect("attestation should be present");
+                assert_eq!(att.pcr0.len(), 48);
+                assert_eq!(att.pcr1.len(), 48);
+                assert_eq!(att.pcr2.len(), 48);
+                assert_eq!(att.pcr0[0], 0);
+                assert_eq!(att.pcr1[0], 1);
+                assert_eq!(att.pcr2[0], 2);
+                assert_eq!(att.enclave_pubkey.len(), 32);
+                assert_eq!(att.timestamp, 1234567890);
+            }
+            _ => panic!("expected Announce"),
+        }
+    }
+
+    #[test]
+    fn test_announce_without_attestation_serialization() {
+        let payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890);
+        let msg = KfpMessage::Announce(payload);
+
+        let json = msg.to_json().unwrap();
+        assert!(!json.contains("attestation"));
+
+        let parsed: KfpMessage = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::Announce(p) => {
+                assert!(p.attestation.is_none());
+            }
+            _ => panic!("expected Announce"),
+        }
     }
 }

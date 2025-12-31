@@ -4,6 +4,16 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AgentError {
+    #[error("Attestation verification failed: {0}")]
+    Attestation(String),
+
+    #[error("PCR mismatch: PCR{pcr} expected {expected}, got {actual}")]
+    PcrMismatch {
+        pcr: u32,
+        expected: String,
+        actual: String,
+    },
+
     #[error("Session expired")]
     SessionExpired,
 

@@ -19,7 +19,7 @@ use crate::audit::{SigningAuditLog, SigningOperation};
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
-use crate::peer::{Peer, PeerManager, PeerStatus};
+use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
 use crate::session::{derive_session_id, NetworkSession, SessionManager};
 
@@ -102,6 +102,62 @@ pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
+pub struct ExpectedPcrs {
+    pub pcr0: [u8; 48],
+    pub pcr1: [u8; 48],
+    pub pcr2: [u8; 48],
+}
+
+impl ExpectedPcrs {
+    pub fn new(pcr0: [u8; 48], pcr1: [u8; 48], pcr2: [u8; 48]) -> Self {
+        Self { pcr0, pcr1, pcr2 }
+    }
+
+    pub fn from_hex(pcr0: &str, pcr1: &str, pcr2: &str) -> Result<Self> {
+        let parse = |s: &str| -> Result<[u8; 48]> {
+            let bytes = hex::decode(s)
+                .map_err(|e| FrostNetError::Attestation(format!("Invalid hex: {}", e)))?;
+            bytes
+                .try_into()
+                .map_err(|_| FrostNetError::Attestation("PCR must be 48 bytes".into()))
+        };
+        Ok(Self {
+            pcr0: parse(pcr0)?,
+            pcr1: parse(pcr1)?,
+            pcr2: parse(pcr2)?,
+        })
+    }
+}
+
+pub fn verify_peer_attestation(
+    attestation: &EnclaveAttestation,
+    expected_pcrs: &ExpectedPcrs,
+) -> Result<()> {
+    verify_pcr(&attestation.pcr0, 0, &expected_pcrs.pcr0)?;
+    verify_pcr(&attestation.pcr1, 1, &expected_pcrs.pcr1)?;
+    verify_pcr(&attestation.pcr2, 2, &expected_pcrs.pcr2)?;
+    Ok(())
+}
+
+fn verify_pcr(actual: &[u8], index: u32, expected: &[u8; 48]) -> Result<()> {
+    if actual.len() != 48 {
+        return Err(FrostNetError::PcrMismatch {
+            pcr: index,
+            expected: hex::encode(expected),
+            actual: format!("invalid length: {}", actual.len()),
+        });
+    }
+    if actual != expected {
+        return Err(FrostNetError::PcrMismatch {
+            pcr: index,
+            expected: hex::encode(expected),
+            actual: hex::encode(actual),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
     PeerDiscovered {
         share_index: u16,
@@ -137,6 +193,7 @@ pub struct KfpNode {
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
     replay_window_secs: u64,
     audit_log: Arc<SigningAuditLog>,
+    expected_pcrs: Option<ExpectedPcrs>,
 }
 
 impl KfpNode {
@@ -210,7 +267,21 @@ impl KfpNode {
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
+            expected_pcrs: None,
         })
+    }
+
+    pub fn with_expected_pcrs(mut self, pcrs: ExpectedPcrs) -> Self {
+        self.expected_pcrs = Some(pcrs);
+        self
+    }
+
+    pub fn set_expected_pcrs(&mut self, pcrs: ExpectedPcrs) {
+        self.expected_pcrs = Some(pcrs);
+    }
+
+    pub fn require_attestation(&self) -> bool {
+        self.expected_pcrs.is_some()
     }
 
     pub fn pubkey(&self) -> PublicKey {
@@ -556,7 +627,6 @@ impl KfpNode {
             return Ok(());
         }
 
-        // Validate timestamp to prevent replay attacks
         let now = chrono::Utc::now().timestamp() as u64;
         if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
             debug!(
@@ -585,6 +655,32 @@ impl KfpNode {
             payload.timestamp,
         )?;
 
+        let attestation_status = self.verify_announce_attestation(&payload);
+
+        if self.expected_pcrs.is_some() {
+            if let AttestationStatus::Failed(ref reason) = attestation_status {
+                warn!(
+                    share_index = payload.share_index,
+                    reason = %reason,
+                    "Rejecting peer with failed attestation"
+                );
+                return Err(FrostNetError::Attestation(format!(
+                    "Peer {} attestation failed: {}",
+                    payload.share_index, reason
+                )));
+            }
+            if attestation_status == AttestationStatus::NotProvided {
+                warn!(
+                    share_index = payload.share_index,
+                    "Rejecting peer without attestation (attestation required)"
+                );
+                return Err(FrostNetError::Attestation(format!(
+                    "Peer {} did not provide attestation",
+                    payload.share_index
+                )));
+            }
+        }
+
         let mut peer = Peer::new(pubkey, payload.share_index)
             .with_capabilities(payload.capabilities)
             .with_verifying_share(payload.verifying_share);
@@ -592,6 +688,8 @@ impl KfpNode {
         if let Some(name) = payload.name {
             peer = peer.with_name(&name);
         }
+
+        peer = peer.with_attestation_status(attestation_status);
 
         let name_clone = peer.name.clone();
         self.peers.write().add_peer(peer);
@@ -608,6 +706,23 @@ impl KfpNode {
         });
 
         Ok(())
+    }
+
+    fn verify_announce_attestation(&self, payload: &AnnouncePayload) -> AttestationStatus {
+        let attestation = match &payload.attestation {
+            Some(att) => att,
+            None => return AttestationStatus::NotProvided,
+        };
+
+        let expected = match &self.expected_pcrs {
+            Some(pcrs) => pcrs,
+            None => return AttestationStatus::Verified,
+        };
+
+        match verify_peer_attestation(attestation, expected) {
+            Ok(()) => AttestationStatus::Verified,
+            Err(e) => AttestationStatus::Failed(e.to_string()),
+        }
     }
 
     async fn handle_sign_request(
@@ -1253,5 +1368,72 @@ mod tests {
 
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
+    }
+
+    #[test]
+    fn test_expected_pcrs_from_hex() {
+        let pcr0 = "0".repeat(96); // 48 bytes = 96 hex chars
+        let pcr1 = "1".repeat(96);
+        let pcr2 = "2".repeat(96);
+        let pcrs = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).unwrap();
+        assert_eq!(pcrs.pcr0[0], 0x00);
+        assert_eq!(pcrs.pcr1[0], 0x11);
+        assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    #[test]
+    fn test_expected_pcrs_from_hex_invalid_length() {
+        let pcr0 = "00".repeat(47); // Wrong length
+        let pcr1 = "1".repeat(96);
+        let pcr2 = "2".repeat(96);
+        let result = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_peer_attestation_success() {
+        let attestation =
+            EnclaveAttestation::new(vec![0u8; 48], vec![1u8; 48], vec![2u8; 48], vec![], 0);
+        let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
+        assert!(verify_peer_attestation(&attestation, &expected).is_ok());
+    }
+
+    #[test]
+    fn test_verify_peer_attestation_mismatch() {
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 48],
+            vec![99u8; 48], // Mismatch on PCR1
+            vec![2u8; 48],
+            vec![],
+            0,
+        );
+        let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
+        let result = verify_peer_attestation(&attestation, &expected);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FrostNetError::PcrMismatch { pcr, .. } => assert_eq!(pcr, 1),
+            _ => panic!("Expected PcrMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_verify_peer_attestation_invalid_length() {
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 32], // Wrong length
+            vec![1u8; 48],
+            vec![2u8; 48],
+            vec![],
+            0,
+        );
+        let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
+        let result = verify_peer_attestation(&attestation, &expected);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FrostNetError::PcrMismatch { pcr, actual, .. } => {
+                assert_eq!(pcr, 0);
+                assert!(actual.contains("invalid length"));
+            }
+            _ => panic!("Expected PcrMismatch error"),
+        }
     }
 }
