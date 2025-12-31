@@ -14,6 +14,9 @@ pub enum AgentError {
         actual: String,
     },
 
+    #[error("Attestation timestamp out of range: {0}")]
+    AttestationTimestamp(String),
+
     #[error("Session expired")]
     SessionExpired,
 
