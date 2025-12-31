@@ -13,9 +13,14 @@ pub enum PeerStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttestationStatus {
+    /// Attestation was verified successfully against expected PCRs.
     Verified,
+    /// Peer did not provide attestation data.
     NotProvided,
+    /// Attestation verification failed.
     Failed(String),
+    /// Node is not configured to verify attestations (no expected PCRs set).
+    NotConfigured,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +57,10 @@ impl Peer {
     }
 
     pub fn is_attested(&self) -> bool {
-        self.attestation_status == AttestationStatus::Verified
+        matches!(
+            self.attestation_status,
+            AttestationStatus::Verified | AttestationStatus::NotConfigured
+        )
     }
 
     pub fn with_name(mut self, name: &str) -> Self {

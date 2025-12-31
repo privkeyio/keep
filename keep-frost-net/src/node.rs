@@ -716,7 +716,7 @@ impl KfpNode {
 
         let expected = match &self.expected_pcrs {
             Some(pcrs) => pcrs,
-            None => return AttestationStatus::Verified,
+            None => return AttestationStatus::NotConfigured,
         };
 
         match verify_peer_attestation(attestation, expected) {
