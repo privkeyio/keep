@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
 use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use parking_lot::RwLock;
 use tracing::info;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -44,8 +44,7 @@ impl SigningAuditEntry {
         our_index: u16,
         operation: &SigningOperation,
     ) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(hmac_key)
-            .expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
 
         mac.update(&timestamp_ms.to_le_bytes());
         mac.update(session_id);
@@ -180,10 +179,7 @@ impl SigningAuditLog {
     }
 
     pub fn verify_all(&self) -> bool {
-        self.entries
-            .read()
-            .iter()
-            .all(|e| e.verify(&self.hmac_key))
+        self.entries.read().iter().all(|e| e.verify(&self.hmac_key))
     }
 
     pub fn get_entries_for_session(&self, session_id: &[u8; 32]) -> Vec<SigningAuditEntry> {

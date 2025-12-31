@@ -1081,7 +1081,6 @@ impl KfpNode {
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
-
         {
             let mut sessions = self.sessions.write();
             let session = sessions.create_session(

@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
