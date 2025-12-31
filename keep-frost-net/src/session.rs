@@ -210,6 +210,14 @@ impl NetworkSession {
 
         match frost_secp256k1_tr::aggregate(&signing_package, &self.signature_shares, pubkey_pkg) {
             Ok(signature) => {
+                pubkey_pkg
+                    .verifying_key()
+                    .verify(&self.message, &signature)
+                    .map_err(|e| {
+                        self.state = SessionState::Failed;
+                        FrostNetError::Crypto(format!("Signature verification failed: {}", e))
+                    })?;
+
                 let serialized = signature
                     .serialize()
                     .map_err(|e| FrostNetError::Crypto(format!("Serialize signature: {}", e)))?;
