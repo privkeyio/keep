@@ -14,6 +14,7 @@ pub const MAX_CAPABILITY_LENGTH: usize = 64;
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
+pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -92,6 +93,9 @@ impl KfpMessage {
             KfpMessage::SignRequest(p) => {
                 if p.message.len() > MAX_MESSAGE_SIZE {
                     return Err("Message exceeds maximum size");
+                }
+                if p.message_type.len() > MAX_MESSAGE_TYPE_LENGTH {
+                    return Err("Message type exceeds maximum length");
                 }
                 if p.participants.len() > MAX_PARTICIPANTS {
                     return Err("Participants list exceeds maximum size");
@@ -557,5 +561,19 @@ mod tests {
         let payload = ErrorPayload::new("invalid_session", "Session not found");
         let msg = KfpMessage::Error(payload);
         assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_message_type_limit() {
+        let oversized_type = "a".repeat(MAX_MESSAGE_TYPE_LENGTH + 1);
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            &oversized_type,
+            vec![1, 2],
+        );
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
     }
 }
