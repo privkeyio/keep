@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use keep_core::frost::SharePackage;
 
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
+use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
 use crate::session::SessionManager;
@@ -54,6 +56,23 @@ pub struct KfpNode {
 
 impl KfpNode {
     pub async fn new(share: SharePackage, relays: Vec<String>) -> Result<Self> {
+        Self::with_nonce_store(share, relays, None).await
+    }
+
+    pub async fn with_nonce_store_path(
+        share: SharePackage,
+        relays: Vec<String>,
+        nonce_store_path: &Path,
+    ) -> Result<Self> {
+        let store = FileNonceStore::new(nonce_store_path)?;
+        Self::with_nonce_store(share, relays, Some(Arc::new(store) as Arc<dyn NonceStore>)).await
+    }
+
+    pub async fn with_nonce_store(
+        share: SharePackage,
+        relays: Vec<String>,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+    ) -> Result<Self> {
         let keys = derive_keys_from_share(&share)?;
         let client = Client::new(keys.clone());
 
@@ -78,12 +97,23 @@ impl KfpNode {
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
+        let session_manager = match nonce_store {
+            Some(store) => {
+                info!(
+                    consumed_count = store.count(),
+                    "Loaded nonce consumption store"
+                );
+                SessionManager::new().with_nonce_store(store)
+            }
+            None => SessionManager::new(),
+        };
+
         Ok(Self {
             keys,
             client,
             share,
             group_pubkey,
-            sessions: Arc::new(RwLock::new(SessionManager::new())),
+            sessions: Arc::new(RwLock::new(session_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
@@ -372,6 +402,7 @@ impl KfpNode {
 
         let commitment = {
             let mut sessions = self.sessions.write();
+
             let session = sessions.get_or_create_session(
                 request.session_id,
                 request.message.clone(),
@@ -379,14 +410,28 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            let (nonces, commitment) =
-                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+            // If we already have nonces for this session, resend existing commitment
+            // This prevents nonce regeneration on duplicate requests while allowing retry
+            if let Some(existing_commitment) = session.our_commitment() {
+                debug!(
+                    session_id = %hex::encode(request.session_id),
+                    "Resending existing commitment for session"
+                );
+                *existing_commitment
+            } else {
+                // Generate nonces for new session participation
+                let (nonces, commitment) =
+                    frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
-            session.set_our_nonces(nonces);
-            session.set_our_commitment(commitment);
-            session.add_commitment(self.share.metadata.identifier, commitment)?;
+                session.set_our_nonces(nonces);
+                session.set_our_commitment(commitment);
+                session.add_commitment(self.share.metadata.identifier, commitment)?;
 
-            commitment
+                // Record consumption AFTER nonces are generated to prevent reuse across restarts
+                sessions.record_nonce_consumption(&request.session_id)?;
+
+                commitment
+            }
         };
 
         let commit_bytes = commitment
@@ -711,6 +756,9 @@ impl KfpNode {
             session.set_our_nonces(nonces);
             session.set_our_commitment(our_commitment);
             session.add_commitment(self.share.metadata.identifier, our_commitment)?;
+
+            // Record consumption AFTER nonces are generated to prevent reuse across restarts
+            sessions.record_nonce_consumption(&session_id)?;
         }
 
         let participant_peers: Vec<(u16, PublicKey)> = self
