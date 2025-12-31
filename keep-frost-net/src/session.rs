@@ -29,12 +29,6 @@ impl Zeroize for NonceWrapper {
     }
 }
 
-impl Drop for NonceWrapper {
-    fn drop(&mut self) {
-        // Nonces should be consumed via take() during signing
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     AwaitingCommitments,
@@ -116,10 +110,6 @@ impl NetworkSession {
 
     pub fn set_our_nonces(&mut self, nonces: SigningNonces) {
         self.our_nonces = Some(NonceWrapper(nonces));
-    }
-
-    pub fn our_nonces(&self) -> Option<&SigningNonces> {
-        self.our_nonces.as_ref().map(|w| &w.0)
     }
 
     pub fn set_our_commitment(&mut self, commitment: SigningCommitments) {
@@ -278,12 +268,9 @@ impl NetworkSession {
     pub fn elapsed(&self) -> Duration {
         self.created_at.elapsed()
     }
-}
 
-impl Drop for NetworkSession {
-    fn drop(&mut self) {
-        // NonceWrapper handles cleanup via its own Drop impl
-        drop(self.our_nonces.take());
+    pub fn take_our_nonces(&mut self) -> Option<SigningNonces> {
+        self.our_nonces.take().map(|w| w.0)
     }
 }
 

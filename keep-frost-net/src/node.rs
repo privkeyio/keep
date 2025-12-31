@@ -516,22 +516,23 @@ impl KfpNode {
     async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
         let key_package = self.share.key_package()?;
 
-        let sig_share = {
-            let sessions = self.sessions.read();
-            let session = match sessions.get_session(session_id) {
+        let (signing_package, nonces) = {
+            let mut sessions = self.sessions.write();
+            let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
                 None => return Err(FrostNetError::SessionNotFound(hex::encode(session_id))),
             };
 
             let signing_package = session.get_signing_package()?;
-
             let nonces = session
-                .our_nonces()
+                .take_our_nonces()
                 .ok_or_else(|| FrostNetError::Session("No nonces stored for session".into()))?;
 
-            frost_secp256k1_tr::round2::sign(&signing_package, nonces, &key_package)
-                .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {}", e)))?
+            (signing_package, nonces)
         };
+
+        let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
+            .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {}", e)))?;
 
         {
             let mut sessions = self.sessions.write();

@@ -60,12 +60,6 @@ impl Zeroize for NonceWrapper {
     }
 }
 
-impl Drop for NonceWrapper {
-    fn drop(&mut self) {
-        // Nonces should be consumed via take() during signing
-    }
-}
-
 impl SigningSession {
     pub fn new(message: Vec<u8>, threshold: u16) -> Self {
         let session_id = Self::compute_session_id(&message);
