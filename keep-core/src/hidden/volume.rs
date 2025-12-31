@@ -113,8 +113,7 @@ impl HiddenStorage {
         let outer_header_key = crypto::derive_subkey(&outer_master_key, b"keep-outer-header")?;
 
         let outer_key_bytes = outer_data_key.decrypt()?;
-        let encrypted_outer =
-            crypto::encrypt(outer_key_bytes.expose_borrowed(), &outer_header_key)?;
+        let encrypted_outer = crypto::encrypt(&*outer_key_bytes, &outer_header_key)?;
         outer_header.nonce.copy_from_slice(&encrypted_outer.nonce);
         outer_header
             .encrypted_data_key
@@ -134,8 +133,7 @@ impl HiddenStorage {
                 crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
 
             let hidden_key_bytes = hidden_data_key.decrypt()?;
-            let encrypted_hidden =
-                crypto::encrypt(hidden_key_bytes.expose_borrowed(), &hidden_header_key)?;
+            let encrypted_hidden = crypto::encrypt(&*hidden_key_bytes, &hidden_header_key)?;
             hh.nonce.copy_from_slice(&encrypted_hidden.nonce);
             hh.encrypted_data_key
                 .copy_from_slice(&encrypted_hidden.ciphertext);

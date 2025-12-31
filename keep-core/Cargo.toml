@@ -16,6 +16,7 @@ frost-secp256k1-tr = "2.2.0"
 
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 secrecy = "0.10"
+memsec = "0.7"
 subtle = "2.5"
 memsecurity = { version = "3", features = ["encryption", "symm_asymm"] }
 redb = "2.4"

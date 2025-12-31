@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use crate::error::{EnclaveError, Result};
 use bitcoin::psbt::Psbt;
@@ -13,6 +13,137 @@ use serde::{Deserialize, Serialize};
 use signature::Signer;
 use std::collections::{BTreeMap, HashMap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[allow(unsafe_code)]
+mod mlock {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use zeroize::Zeroize;
+
+    pub struct MlockedBox<const N: usize> {
+        ptr: *mut [u8; N],
+        locked: bool,
+    }
+
+    impl<const N: usize> MlockedBox<N> {
+        /// Creates a new mlocked box from a mutable reference, zeroing the source.
+        ///
+        /// The source data is copied into mlocked memory and then immediately
+        /// zeroed to prevent secrets from remaining on the stack.
+        pub fn new(data: &mut [u8; N]) -> Self {
+            let layout = Layout::new::<[u8; N]>();
+            let ptr = unsafe { alloc_zeroed(layout) as *mut [u8; N] };
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+
+            // Copy data to mlocked memory
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, N) };
+
+            // Zero the source immediately
+            data.zeroize();
+
+            let locked = unsafe { memsec::mlock(ptr as *mut u8, N) };
+
+            Self { ptr, locked }
+        }
+
+        #[allow(dead_code)]
+        pub fn is_locked(&self) -> bool {
+            self.locked
+        }
+    }
+
+    impl<const N: usize> std::ops::Deref for MlockedBox<N> {
+        type Target = [u8; N];
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.ptr }
+        }
+    }
+
+    impl<const N: usize> Drop for MlockedBox<N> {
+        fn drop(&mut self) {
+            unsafe {
+                memsec::memzero(self.ptr as *mut u8, N);
+                if self.locked {
+                    memsec::munlock(self.ptr as *mut u8, N);
+                }
+                dealloc(self.ptr as *mut u8, Layout::new::<[u8; N]>());
+            }
+        }
+    }
+
+    impl<const N: usize> Zeroize for MlockedBox<N> {
+        fn zeroize(&mut self) {
+            unsafe { memsec::memzero(self.ptr as *mut u8, N) };
+        }
+    }
+
+    unsafe impl<const N: usize> Send for MlockedBox<N> {}
+    unsafe impl<const N: usize> Sync for MlockedBox<N> {}
+
+    pub struct MlockedVec {
+        ptr: *mut u8,
+        len: usize,
+        capacity: usize,
+        locked: bool,
+    }
+
+    impl MlockedVec {
+        /// Creates a new mlocked vec, taking ownership and locking the memory.
+        ///
+        /// Note: The Vec's memory is locked in place. The original allocation
+        /// is preserved (not copied), so this is efficient for large data.
+        pub fn new(mut data: Vec<u8>) -> Self {
+            let len = data.len();
+            let capacity = data.capacity();
+            let ptr = data.as_mut_ptr();
+            std::mem::forget(data);
+
+            let locked = unsafe { memsec::mlock(ptr, capacity) };
+
+            Self {
+                ptr,
+                len,
+                capacity,
+                locked,
+            }
+        }
+
+        #[allow(dead_code)]
+        pub fn is_locked(&self) -> bool {
+            self.locked
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl Drop for MlockedVec {
+        fn drop(&mut self) {
+            unsafe {
+                // Zero the full capacity, not just len, to catch any leftover data
+                memsec::memzero(self.ptr, self.capacity);
+                if self.locked {
+                    memsec::munlock(self.ptr, self.capacity);
+                }
+                let _ = Vec::from_raw_parts(self.ptr, self.len, self.capacity);
+            }
+        }
+    }
+
+    impl Zeroize for MlockedVec {
+        fn zeroize(&mut self) {
+            unsafe { memsec::memzero(self.ptr, self.capacity) };
+        }
+    }
+
+    unsafe impl Send for MlockedVec {}
+    unsafe impl Sync for MlockedVec {}
+}
+
+use mlock::{MlockedBox, MlockedVec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PsbtAnalysis {
@@ -37,21 +168,21 @@ pub struct EnclaveSigner {
     frost_keys: HashMap<String, FrostKeyEntry>,
     #[zeroize(skip)]
     frost_sessions: HashMap<[u8; 32], FrostSession>,
-    ephemeral_secret: [u8; 32],
+    ephemeral_secret: MlockedBox<32>,
 }
 
 #[derive(ZeroizeOnDrop)]
 struct KeyEntry {
-    secret: [u8; 32],
+    secret: MlockedBox<32>,
     #[zeroize(skip)]
     pubkey: [u8; 32],
     #[zeroize(skip)]
     name: String,
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(ZeroizeOnDrop)]
 struct FrostKeyEntry {
-    key_package_bytes: Vec<u8>,
+    key_package_bytes: MlockedVec,
     #[zeroize(skip)]
     pubkey_package_bytes: Vec<u8>,
 }
@@ -75,25 +206,25 @@ impl EnclaveSigner {
             keys: HashMap::new(),
             frost_keys: HashMap::new(),
             frost_sessions: HashMap::new(),
-            ephemeral_secret,
+            ephemeral_secret: MlockedBox::new(&mut ephemeral_secret),
         })
     }
 
-    pub fn with_ephemeral_secret(ephemeral_secret: [u8; 32]) -> Self {
+    pub fn with_ephemeral_secret(mut ephemeral_secret: [u8; 32]) -> Self {
         Self {
             keys: HashMap::new(),
             frost_keys: HashMap::new(),
             frost_sessions: HashMap::new(),
-            ephemeral_secret,
+            ephemeral_secret: MlockedBox::new(&mut ephemeral_secret),
         }
     }
 
     pub fn create_kms(&self) -> crate::kms::EnclaveKms {
-        crate::kms::EnclaveKms::new(self.ephemeral_secret)
+        crate::kms::EnclaveKms::new(*self.ephemeral_secret)
     }
 
     pub fn get_ephemeral_pubkey(&self) -> Result<[u8; 32]> {
-        let signing_key = SigningKey::from_bytes(&self.ephemeral_secret)
+        let signing_key = SigningKey::from_bytes(&*self.ephemeral_secret)
             .map_err(|e| EnclaveError::InvalidKey(format!("Invalid ephemeral secret: {}", e)))?;
         let verifying_key = signing_key.verifying_key();
         let mut pubkey = [0u8; 32];
@@ -114,7 +245,7 @@ impl EnclaveSigner {
         pubkey.copy_from_slice(&pubkey_bytes);
 
         let entry = KeyEntry {
-            secret,
+            secret: MlockedBox::new(&mut secret),
             pubkey,
             name: name.to_string(),
         };
@@ -141,7 +272,7 @@ impl EnclaveSigner {
         pubkey.copy_from_slice(&pubkey_bytes);
 
         let entry = KeyEntry {
-            secret: secret_arr,
+            secret: MlockedBox::new(&mut secret_arr),
             pubkey,
             name: name.to_string(),
         };
@@ -165,7 +296,7 @@ impl EnclaveSigner {
             .get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
 
-        let signing_key = SigningKey::from_bytes(&entry.secret)
+        let signing_key = SigningKey::from_bytes(&*entry.secret)
             .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
 
         let signature = signing_key.sign(message);
@@ -189,7 +320,7 @@ impl EnclaveSigner {
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
 
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &entry.secret)
+        let keypair = Keypair::from_seckey_slice(&secp, &*entry.secret)
             .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
         let (x_only_pubkey, _) = keypair.x_only_public_key();
 
@@ -327,7 +458,7 @@ impl EnclaveSigner {
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
 
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &entry.secret)
+        let keypair = Keypair::from_seckey_slice(&secp, &*entry.secret)
             .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
         let (x_only_pubkey, _) = keypair.x_only_public_key();
 
@@ -385,7 +516,7 @@ impl EnclaveSigner {
         self.frost_keys.insert(
             name.to_string(),
             FrostKeyEntry {
-                key_package_bytes,
+                key_package_bytes: MlockedVec::new(key_package_bytes),
                 pubkey_package_bytes,
             },
         );
@@ -401,7 +532,7 @@ impl EnclaveSigner {
         let entry = self.frost_keys.get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
 
-        let key_package = frost::keys::KeyPackage::deserialize(&entry.key_package_bytes)
+        let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
         let mut rng = OsRng;
@@ -454,7 +585,7 @@ impl EnclaveSigner {
         let entry = self.frost_keys.get(&session.key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(session.key_id.clone()))?;
 
-        let key_package = frost::keys::KeyPackage::deserialize(&entry.key_package_bytes)
+        let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
         let signing_package = frost::SigningPackage::new(session.commitments.clone(), &session.message);

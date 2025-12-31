@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 mod aws_credentials;
