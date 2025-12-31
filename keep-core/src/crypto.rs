@@ -85,9 +85,69 @@ mod mlock {
 
     unsafe impl<const N: usize> Send for MlockedBox<N> {}
     unsafe impl<const N: usize> Sync for MlockedBox<N> {}
+
+    pub struct MlockedVec {
+        ptr: *mut u8,
+        len: usize,
+        capacity: usize,
+        locked: bool,
+    }
+
+    impl MlockedVec {
+        /// Creates a new mlocked vec, taking ownership and locking the memory.
+        ///
+        /// Note: The Vec's memory is locked in place. The original allocation
+        /// is preserved (not copied), so this is efficient for large data.
+        pub fn new(mut data: Vec<u8>) -> Self {
+            let len = data.len();
+            let capacity = data.capacity();
+            let ptr = data.as_mut_ptr();
+            std::mem::forget(data);
+
+            let locked = unsafe { memsec::mlock(ptr, capacity) };
+
+            Self {
+                ptr,
+                len,
+                capacity,
+                locked,
+            }
+        }
+
+        #[allow(dead_code)]
+        pub fn is_locked(&self) -> bool {
+            self.locked
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl Drop for MlockedVec {
+        fn drop(&mut self) {
+            unsafe {
+                // Zero the full capacity, not just len, to catch any leftover data
+                memsec::memzero(self.ptr, self.capacity);
+                if self.locked {
+                    memsec::munlock(self.ptr, self.capacity);
+                }
+                let _ = Vec::from_raw_parts(self.ptr, self.len, self.capacity);
+            }
+        }
+    }
+
+    impl Zeroize for MlockedVec {
+        fn zeroize(&mut self) {
+            unsafe { memsec::memzero(self.ptr, self.capacity) };
+        }
+    }
+
+    unsafe impl Send for MlockedVec {}
+    unsafe impl Sync for MlockedVec {}
 }
 
-pub use mlock::MlockedBox;
+pub use mlock::{MlockedBox, MlockedVec};
 
 pub const SALT_SIZE: usize = 32;
 
@@ -171,7 +231,8 @@ impl SecretKey {
     }
 
     pub fn decrypt(&self) -> Result<MlockedBox<KEY_SIZE>> {
-        let decrypted = self.encrypted
+        let decrypted = self
+            .encrypted
             .decrypt_32byte()
             .map_err(|_| KeepError::Other("Failed to decrypt key".into()))?;
         let mut bytes = *decrypted.expose_borrowed();

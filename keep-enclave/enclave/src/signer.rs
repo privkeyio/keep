@@ -61,6 +61,12 @@ mod mlock {
         }
     }
 
+    impl<const N: usize> std::ops::DerefMut for MlockedBox<N> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { &mut *self.ptr }
+        }
+    }
+
     impl<const N: usize> Drop for MlockedBox<N> {
         fn drop(&mut self) {
             unsafe {

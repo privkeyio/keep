@@ -1,3 +1,9 @@
+// SAFETY: We use `deny(unsafe_code)` instead of `forbid(unsafe_code)` to allow a single,
+// reviewed exception in the `mlock` module (signer.rs). That module uses unsafe code for:
+// - Memory locking via mlock(2) to prevent secrets from being swapped to disk
+// - Secure zeroing of sensitive data via memsec::memzero before deallocation
+// The unsafe code is intentionally scoped to MlockedBox and MlockedVec types only.
+// Reviewed in commit 731ef80 (mlock memory safety audit). Any new unsafe usage requires review.
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
