@@ -14,19 +14,32 @@ use zeroize::Zeroize;
 
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
+use crate::protocol::KFP_VERSION;
 
-// SECURITY NOTE: NonceWrapper provides no actual zeroization because SigningNonces
-// from frost-secp256k1-tr doesn't implement Zeroize. During normal operation, nonces
-// are consumed via take() ensuring single use. However, if a session is dropped early
-// (e.g., on error paths before signing completes), the nonce data may remain in memory
-// until the allocator reuses that memory. This is a limitation of the upstream FROST
-// library. For high-security applications, consider process isolation.
 struct NonceWrapper(SigningNonces);
 
 impl Zeroize for NonceWrapper {
     fn zeroize(&mut self) {
-        // SigningNonces doesn't implement Zeroize - see security note above
+        // SigningNonces doesn't implement Zeroize - limitation of upstream FROST library
     }
+}
+
+pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -> [u8; 32] {
+    let mut sorted_participants = participants.to_vec();
+    sorted_participants.sort();
+
+    let mut preimage = Vec::with_capacity(64 + message.len() + participants.len() * 2);
+    preimage.extend_from_slice(b"keep-frost-session-v1");
+    preimage.push(KFP_VERSION);
+    preimage.extend_from_slice(&threshold.to_be_bytes());
+    preimage.extend_from_slice(&(sorted_participants.len() as u16).to_be_bytes());
+    for p in &sorted_participants {
+        preimage.extend_from_slice(&p.to_be_bytes());
+    }
+    preimage.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    preimage.extend_from_slice(message);
+
+    keep_core::crypto::blake2b_256(&preimage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +296,24 @@ pub struct SessionManager {
     nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
+/// Validates that the provided session_id matches the expected derived ID.
+fn validate_session_id(
+    session_id: [u8; 32],
+    message: &[u8],
+    participants: &[u16],
+    threshold: u16,
+) -> Result<()> {
+    let expected_id = derive_session_id(message, participants, threshold);
+    if session_id != expected_id {
+        return Err(FrostNetError::Session(format!(
+            "Session ID mismatch: expected {}, got {}",
+            hex::encode(expected_id),
+            hex::encode(session_id)
+        )));
+    }
+    Ok(())
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self {
@@ -312,6 +343,8 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold)?;
+
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
         }
@@ -352,6 +385,8 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold)?;
+
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
         }
@@ -444,9 +479,11 @@ mod tests {
 
     #[test]
     fn test_session_lifecycle() {
-        let session_id = [1u8; 32];
         let message = b"test message".to_vec();
-        let session = NetworkSession::new(session_id, message, 2, vec![1, 2, 3]);
+        let participants = vec![1, 2, 3];
+        let threshold = 2;
+        let session_id = derive_session_id(&message, &participants, threshold);
+        let session = NetworkSession::new(session_id, message, threshold, participants);
 
         assert_eq!(session.state(), SessionState::AwaitingCommitments);
         assert_eq!(session.commitments_needed(), 2);
@@ -455,24 +492,78 @@ mod tests {
     #[test]
     fn test_session_manager_replay_protection() {
         let mut manager = SessionManager::new();
-        let session_id = [1u8; 32];
+        let message = vec![];
+        let participants = vec![1, 2];
+        let threshold = 2;
+        let session_id = derive_session_id(&message, &participants, threshold);
 
         manager
-            .create_session(session_id, vec![], 2, vec![1, 2])
+            .create_session(session_id, message.clone(), threshold, participants.clone())
             .unwrap();
         manager.complete_session(&session_id);
 
-        let result = manager.create_session(session_id, vec![], 2, vec![1, 2]);
+        let result = manager.create_session(session_id, message, threshold, participants);
         assert!(result.is_err());
         assert!(manager.is_replay(&session_id));
     }
 
     #[test]
     fn test_participant_check() {
-        let session = NetworkSession::new([1u8; 32], vec![], 2, vec![1, 2, 3]);
+        let message = vec![];
+        let participants = vec![1, 2, 3];
+        let threshold = 2;
+        let session_id = derive_session_id(&message, &participants, threshold);
+        let session = NetworkSession::new(session_id, message, threshold, participants);
         assert!(session.is_participant(1));
         assert!(session.is_participant(2));
         assert!(!session.is_participant(4));
+    }
+
+    #[test]
+    fn test_derive_session_id_deterministic() {
+        let message = b"test message".to_vec();
+        let participants = vec![1, 2, 3];
+        let threshold = 2;
+
+        let id1 = derive_session_id(&message, &participants, threshold);
+        let id2 = derive_session_id(&message, &participants, threshold);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_derive_session_id_sorted_participants() {
+        let message = b"test".to_vec();
+
+        let id1 = derive_session_id(&message, &[1, 2, 3], 2);
+        let id2 = derive_session_id(&message, &[3, 1, 2], 2);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_derive_session_id_different_params() {
+        let message = b"test".to_vec();
+        let participants = vec![1, 2, 3];
+
+        let id1 = derive_session_id(&message, &participants, 2);
+        let id2 = derive_session_id(&message, &participants, 3);
+        assert_ne!(id1, id2);
+
+        let id3 = derive_session_id(&message, &[1, 2], 2);
+        assert_ne!(id1, id3);
+
+        let id4 = derive_session_id(b"other", &participants, 2);
+        assert_ne!(id1, id4);
+    }
+
+    #[test]
+    fn test_session_id_mismatch_rejected() {
+        let mut manager = SessionManager::new();
+        let bad_session_id = [0u8; 32];
+
+        let result = manager.create_session(bad_session_id, vec![], 2, vec![1, 2]);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("mismatch"));
     }
 
     #[test]
@@ -480,12 +571,14 @@ mod tests {
         let store = Arc::new(MemoryNonceStore::new());
         let mut manager = SessionManager::new().with_nonce_store(store.clone());
 
-        let session_id = [42u8; 32];
+        let message = vec![];
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
 
         manager.record_nonce_consumption(&session_id).unwrap();
         assert!(manager.is_nonce_consumed(&session_id));
 
-        let result = manager.create_session(session_id, vec![], 2, vec![1, 2]);
+        let result = manager.create_session(session_id, message, 2, participants);
         assert!(matches!(result, Err(FrostNetError::NonceConsumed(_))));
     }
 
@@ -494,24 +587,28 @@ mod tests {
         let store = Arc::new(MemoryNonceStore::new());
         let mut manager = SessionManager::new().with_nonce_store(store.clone());
 
-        let session_id = [43u8; 32];
+        let message = vec![];
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
 
         store.record(&session_id).unwrap();
 
-        let result = manager.get_or_create_session(session_id, vec![], 2, vec![1, 2]);
+        let result = manager.get_or_create_session(session_id, message, 2, participants);
         assert!(matches!(result, Err(FrostNetError::NonceConsumed(_))));
     }
 
     #[test]
     fn test_session_without_nonce_store() {
         let mut manager = SessionManager::new();
-        let session_id = [44u8; 32];
+        let message = vec![];
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
 
         assert!(!manager.is_nonce_consumed(&session_id));
         manager.record_nonce_consumption(&session_id).unwrap();
 
         manager
-            .create_session(session_id, vec![], 2, vec![1, 2])
+            .create_session(session_id, message, 2, participants)
             .unwrap();
     }
 }

@@ -18,7 +18,7 @@ use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
-use crate::session::SessionManager;
+use crate::session::{derive_session_id, SessionManager};
 
 #[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
@@ -713,19 +713,22 @@ impl KfpNode {
         message: Vec<u8>,
         message_type: &str,
     ) -> Result<[u8; 64]> {
-        let session_id: [u8; 32] = keep_core::crypto::random_bytes::<32>();
-        let threshold = self.share.metadata.threshold as usize;
+        let threshold = self.share.metadata.threshold;
 
         let participants = {
             let peers = self.peers.read();
-            peers.select_participants(threshold).ok_or_else(|| {
-                let online = peers.online_count();
-                FrostNetError::InsufficientPeers {
-                    needed: threshold - 1,
-                    available: online,
-                }
-            })?
+            peers
+                .select_participants(threshold as usize)
+                .ok_or_else(|| {
+                    let online = peers.online_count();
+                    FrostNetError::InsufficientPeers {
+                        needed: threshold as usize - 1,
+                        available: online,
+                    }
+                })?
         };
+
+        let session_id = derive_session_id(&message, &participants, threshold);
 
         info!(
             session_id = %hex::encode(session_id),
