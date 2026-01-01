@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod attestation;
 pub mod client;
 pub mod error;
 pub mod frost;
@@ -11,6 +12,7 @@ pub mod session;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+pub use attestation::{verify_peer_attestation, ExpectedPcrs, PeerAttestation, VerificationConfig};
 pub use client::{AgentClient, ApprovalStatus, PendingSession};
 pub use error::{AgentError, Result};
 pub use frost::{FrostCommitment, FrostCoordinator, FrostParticipant, FrostSignatureShare};

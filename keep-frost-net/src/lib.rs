@@ -63,12 +63,12 @@ mod session;
 
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
-pub use node::{KfpNode, KfpNodeEvent};
+pub use node::{verify_peer_attestation, ExpectedPcrs, KfpNode, KfpNodeEvent};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
-pub use peer::{Peer, PeerManager, PeerStatus};
+pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
-    AnnouncePayload, CommitmentPayload, ErrorPayload, KfpMessage, PingPayload, PongPayload,
-    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, KFP_EVENT_KIND,
-    KFP_VERSION,
+    AnnouncePayload, CommitmentPayload, EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload,
+    PongPayload, SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
+    KFP_EVENT_KIND, KFP_VERSION,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
