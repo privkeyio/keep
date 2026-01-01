@@ -58,7 +58,7 @@ mod event;
 mod node;
 mod nonce_store;
 mod peer;
-mod proof;
+pub mod proof;
 mod protocol;
 mod session;
 

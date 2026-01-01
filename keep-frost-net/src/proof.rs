@@ -46,10 +46,21 @@ pub fn verify_proof(
     share_index: u16,
     timestamp: u64,
 ) -> Result<()> {
+    // Validate SEC1 compressed point prefix (0x02 = even y, 0x03 = odd y)
+    // BIP-340 x-only keys use even-y representation, so we only accept 0x02 prefix
+    // to ensure signing/verification consistency
+    let prefix = verifying_share[0];
+    if prefix != 0x02 {
+        return Err(FrostNetError::Crypto(format!(
+            "Invalid verifying share prefix: expected 0x02, got 0x{:02x}",
+            prefix
+        )));
+    }
+
     let message = compute_proof_message(group_pubkey, share_index, verifying_share, timestamp);
     let x_only: [u8; 32] = verifying_share[1..33]
         .try_into()
-        .expect("slice of correct length");
+        .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
     let verifying_key = VerifyingKey::from_bytes(&x_only)
         .map_err(|e| FrostNetError::Crypto(format!("Invalid verifying share: {}", e)))?;
     let signature = Signature::try_from(proof_signature.as_slice())
@@ -165,5 +176,42 @@ mod tests {
 
         let result = verify_proof(&verifying_share, &signature, &group_pubkey, 2u16, timestamp);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_rejects_odd_y_prefix() {
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut signing_share = [0u8; 32];
+        signing_share.copy_from_slice(&signing_key.to_bytes());
+
+        // Create verifying share with odd-y prefix (0x03)
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x03; // Invalid: odd y prefix
+        verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+        let group_pubkey = [1u8; 32];
+        let share_index = 1u16;
+        let timestamp = 1234567890u64;
+
+        let signature = sign_proof(
+            &signing_share,
+            &group_pubkey,
+            share_index,
+            &verifying_share,
+            timestamp,
+        )
+        .unwrap();
+
+        let result = verify_proof(
+            &verifying_share,
+            &signature,
+            &group_pubkey,
+            share_index,
+            timestamp,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("prefix"));
     }
 }

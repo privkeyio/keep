@@ -95,6 +95,11 @@ impl SigningHooks for NoOpHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Maximum age for announcement timestamps (5 minutes)
+pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
+/// Maximum clock skew tolerance for future timestamps (30 seconds)
+pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+
 #[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
     PeerDiscovered {
@@ -541,24 +546,21 @@ impl KfpNode {
             return Ok(());
         }
 
-        // Validate timestamp to prevent replay attacks (5 minute window, 30 second future tolerance)
+        // Validate timestamp to prevent replay attacks
         let now = chrono::Utc::now().timestamp() as u64;
-        const MAX_AGE_SECS: u64 = 300; // 5 minutes
-        const MAX_FUTURE_SECS: u64 = 30; // 30 seconds clock skew tolerance
-
-        if payload.timestamp + MAX_AGE_SECS < now {
+        if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
             debug!(
                 timestamp = payload.timestamp,
-                now = now,
-                "Rejecting stale announcement"
+                now, "Rejecting stale announcement"
             );
-            return Err(FrostNetError::Protocol("Announcement timestamp too old".into()));
+            return Err(FrostNetError::Protocol(
+                "Announcement timestamp too old".into(),
+            ));
         }
-        if payload.timestamp > now + MAX_FUTURE_SECS {
+        if payload.timestamp > now + ANNOUNCE_MAX_FUTURE_SECS {
             debug!(
                 timestamp = payload.timestamp,
-                now = now,
-                "Rejecting future-dated announcement"
+                now, "Rejecting future-dated announcement"
             );
             return Err(FrostNetError::Protocol(
                 "Announcement timestamp in future".into(),

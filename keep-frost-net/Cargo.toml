@@ -12,7 +12,7 @@ keep-core = { path = "../keep-core" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 frost-secp256k1-tr = "2.2"
 rand_09 = { package = "rand", version = "0.9" }
-k256 = { version = "0.13", features = ["schnorr"] }
+k256 = { version = "0.13.4", features = ["schnorr"] }
 
 tokio = { version = "1", features = ["full", "sync"] }
 parking_lot = "0.12"
@@ -31,3 +31,4 @@ zeroize = "1.8"
 tempfile = "3.10"
 tokio-test = "0.4"
 nostr-relay-builder = "0.44"
+chrono = "0.4"

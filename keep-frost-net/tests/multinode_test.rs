@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use k256::schnorr::SigningKey;
 use keep_core::frost::{ThresholdConfig, TrustedDealer};
 use keep_frost_net::{
     AnnouncePayload, KfpMessage, KfpNode, SessionManager, SessionState, SignRequestPayload,
@@ -101,9 +102,41 @@ async fn test_peer_discovery_with_running_nodes() {
 
 #[tokio::test]
 async fn test_frost_protocol_message_flow() {
-    let announce =
-        AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890).with_name("Test Node");
-    let msg = KfpMessage::Announce(announce);
+    // Generate real cryptographic keys for proof
+    let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+    let verifying_key = signing_key.verifying_key();
+
+    let mut signing_share = [0u8; 32];
+    signing_share.copy_from_slice(&signing_key.to_bytes());
+
+    let mut verifying_share = [0u8; 33];
+    verifying_share[0] = 0x02;
+    verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+    let group_pubkey = [1u8; 32];
+    let share_index = 1u16;
+    let timestamp = chrono::Utc::now().timestamp() as u64;
+
+    // Create real proof signature
+    let proof_signature = keep_frost_net::proof::sign_proof(
+        &signing_share,
+        &group_pubkey,
+        share_index,
+        &verifying_share,
+        timestamp,
+    )
+    .expect("Failed to sign proof");
+
+    let announce = AnnouncePayload::new(
+        group_pubkey,
+        share_index,
+        verifying_share,
+        proof_signature,
+        timestamp,
+    )
+    .with_name("Test Node");
+
+    let msg = KfpMessage::Announce(announce.clone());
     let json = msg.to_json().unwrap();
 
     assert!(json.contains("announce"));
@@ -111,6 +144,18 @@ async fn test_frost_protocol_message_flow() {
 
     let parsed = KfpMessage::from_json(&json).unwrap();
     assert_eq!(parsed.message_type(), "announce");
+
+    // Verify the proof in the parsed message
+    if let KfpMessage::Announce(payload) = &parsed {
+        keep_frost_net::proof::verify_proof(
+            &payload.verifying_share,
+            &payload.proof_signature,
+            &payload.group_pubkey,
+            payload.share_index,
+            payload.timestamp,
+        )
+        .expect("Proof verification should succeed");
+    }
 
     let sign_req = SignRequestPayload::new(
         [2u8; 32],
@@ -128,6 +173,85 @@ async fn test_frost_protocol_message_flow() {
     assert_eq!(parsed.message_type(), "sign_request");
     assert!(parsed.session_id().is_some());
     assert!(parsed.group_pubkey().is_some());
+}
+
+#[tokio::test]
+async fn test_proof_verification_with_real_keys() {
+    // Test valid proof creation and verification
+    let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+    let verifying_key = signing_key.verifying_key();
+
+    let mut signing_share = [0u8; 32];
+    signing_share.copy_from_slice(&signing_key.to_bytes());
+
+    let mut verifying_share = [0u8; 33];
+    verifying_share[0] = 0x02;
+    verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+    let group_pubkey = [42u8; 32];
+    let share_index = 5u16;
+    let timestamp = chrono::Utc::now().timestamp() as u64;
+
+    let signature = keep_frost_net::proof::sign_proof(
+        &signing_share,
+        &group_pubkey,
+        share_index,
+        &verifying_share,
+        timestamp,
+    )
+    .expect("Signing should succeed");
+
+    // Valid verification
+    keep_frost_net::proof::verify_proof(
+        &verifying_share,
+        &signature,
+        &group_pubkey,
+        share_index,
+        timestamp,
+    )
+    .expect("Verification should succeed");
+
+    // Test with wrong share index (should fail)
+    let wrong_index_result = keep_frost_net::proof::verify_proof(
+        &verifying_share,
+        &signature,
+        &group_pubkey,
+        share_index + 1, // Wrong index
+        timestamp,
+    );
+    assert!(wrong_index_result.is_err(), "Wrong share index should fail");
+
+    // Test with wrong group pubkey (should fail)
+    let wrong_group_result = keep_frost_net::proof::verify_proof(
+        &verifying_share,
+        &signature,
+        &[99u8; 32], // Wrong group pubkey
+        share_index,
+        timestamp,
+    );
+    assert!(
+        wrong_group_result.is_err(),
+        "Wrong group pubkey should fail"
+    );
+
+    // Test with mismatched verifying share (should fail)
+    let other_signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+    let other_verifying_key = other_signing_key.verifying_key();
+    let mut wrong_verifying_share = [0u8; 33];
+    wrong_verifying_share[0] = 0x02;
+    wrong_verifying_share[1..33].copy_from_slice(&other_verifying_key.to_bytes());
+
+    let wrong_share_result = keep_frost_net::proof::verify_proof(
+        &wrong_verifying_share,
+        &signature,
+        &group_pubkey,
+        share_index,
+        timestamp,
+    );
+    assert!(
+        wrong_share_result.is_err(),
+        "Mismatched verifying share should fail"
+    );
 }
 
 #[tokio::test]
