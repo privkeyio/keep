@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
+use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -48,7 +48,8 @@ pub struct SessionToken(String);
 
 impl SessionToken {
     pub fn generate() -> Self {
-        let bytes: [u8; 32] = rand::rng().random();
+        let mut bytes = [0u8; 32];
+        OsRng.try_fill_bytes(&mut bytes).expect("OS RNG failed");
         Self(format!("keep_sess_{}", hex::encode(bytes)))
     }
 
