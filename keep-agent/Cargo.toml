@@ -9,6 +9,7 @@ description = "Agent SDK for Keep - secure signing for AI agents"
 [features]
 default = []
 mcp = ["dep:serde_json"]
+enclave = ["dep:aws-nitro-enclaves-nsm-api"]
 
 [dependencies]
 keep-core = { path = "../keep-core" }
@@ -27,6 +28,9 @@ rand = { workspace = true }
 subtle = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
