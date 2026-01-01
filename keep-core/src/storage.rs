@@ -193,7 +193,8 @@ impl Storage {
             return Ok(());
         }
 
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+        let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
         }
 
@@ -216,7 +217,7 @@ impl Storage {
             Ok(d) => d,
             Err(e) => {
                 if matches!(e, KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path);
+                    rate_limit::record_failure(&self.path, &hmac_key);
                 }
                 return Err(e);
             }

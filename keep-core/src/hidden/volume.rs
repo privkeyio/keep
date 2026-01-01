@@ -270,7 +270,8 @@ impl HiddenStorage {
             return Ok(());
         }
 
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+        let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
         }
 
@@ -280,9 +281,8 @@ impl HiddenStorage {
                 Ok(())
             }
             Err(e) => {
-                // Only record failure for authentication-related errors
                 if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path);
+                    rate_limit::record_failure(&self.path, &hmac_key);
                 }
                 Err(e)
             }
@@ -354,7 +354,8 @@ impl HiddenStorage {
             return Ok(());
         }
 
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+        let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
         }
 
@@ -364,9 +365,8 @@ impl HiddenStorage {
                 Ok(())
             }
             Err(e) => {
-                // Only record failure for authentication-related errors
                 if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path);
+                    rate_limit::record_failure(&self.path, &hmac_key);
                 }
                 Err(e)
             }
@@ -374,7 +374,8 @@ impl HiddenStorage {
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path) {
+        let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
         }
 
@@ -393,13 +394,10 @@ impl HiddenStorage {
                 Ok(VolumeType::Hidden)
             }
             (Err(outer_err), Err(hidden_err)) => {
-                // Helper to check if an error is authentication-related
                 let is_auth_error = |e: &KeepError| {
                     matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed)
                 };
 
-                // If either error is a non-auth error (IO, database, etc.), return it
-                // without recording a rate-limit failure
                 if !is_auth_error(&outer_err) {
                     return Err(outer_err);
                 }
@@ -407,8 +405,7 @@ impl HiddenStorage {
                     return Err(hidden_err);
                 }
 
-                // Both errors are authentication failures - record failure and return
-                rate_limit::record_failure(&self.path);
+                rate_limit::record_failure(&self.path, &hmac_key);
                 Err(KeepError::InvalidPassword)
             }
         }

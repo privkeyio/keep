@@ -10,9 +10,24 @@ use frost_secp256k1_tr::{
     round2::SignatureShare,
     Identifier, Signature, SigningPackage,
 };
+use zeroize::Zeroize;
 
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
+
+// SECURITY NOTE: NonceWrapper provides no actual zeroization because SigningNonces
+// from frost-secp256k1-tr doesn't implement Zeroize. During normal operation, nonces
+// are consumed via take() ensuring single use. However, if a session is dropped early
+// (e.g., on error paths before signing completes), the nonce data may remain in memory
+// until the allocator reuses that memory. This is a limitation of the upstream FROST
+// library. For high-security applications, consider process isolation.
+struct NonceWrapper(SigningNonces);
+
+impl Zeroize for NonceWrapper {
+    fn zeroize(&mut self) {
+        // SigningNonces doesn't implement Zeroize - see security note above
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -33,7 +48,7 @@ pub struct NetworkSession {
     timeout: Duration,
     commitments: BTreeMap<Identifier, SigningCommitments>,
     signature_shares: BTreeMap<Identifier, SignatureShare>,
-    our_nonces: Option<SigningNonces>,
+    our_nonces: Option<NonceWrapper>,
     our_commitment: Option<SigningCommitments>,
     signature: Option<Signature>,
 }
@@ -94,11 +109,7 @@ impl NetworkSession {
     }
 
     pub fn set_our_nonces(&mut self, nonces: SigningNonces) {
-        self.our_nonces = Some(nonces);
-    }
-
-    pub fn our_nonces(&self) -> Option<&SigningNonces> {
-        self.our_nonces.as_ref()
+        self.our_nonces = Some(NonceWrapper(nonces));
     }
 
     pub fn set_our_commitment(&mut self, commitment: SigningCommitments) {
@@ -256,6 +267,10 @@ impl NetworkSession {
 
     pub fn elapsed(&self) -> Duration {
         self.created_at.elapsed()
+    }
+
+    pub fn take_our_nonces(&mut self) -> Option<SigningNonces> {
+        self.our_nonces.take().map(|w| w.0)
     }
 }
 
