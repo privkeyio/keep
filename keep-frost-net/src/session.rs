@@ -55,17 +55,23 @@ pub enum SessionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSessionState {
-    pub session_id: [u8; 32],
-    pub message: Vec<u8>,
-    pub threshold: u16,
-    pub participants: Vec<u16>,
-    pub state: SessionState,
-    pub commitments: Vec<(Vec<u8>, Vec<u8>)>,
-    pub signature_shares: Vec<(Vec<u8>, Vec<u8>)>,
-    pub our_nonces: Option<Vec<u8>>,
-    pub our_commitment: Option<Vec<u8>>,
-    pub rehydrations_used: u16,
-    pub max_rehydrations: u16,
+    session_id: [u8; 32],
+    message: Vec<u8>,
+    threshold: u16,
+    participants: Vec<u16>,
+    state: SessionState,
+    commitments: Vec<(Vec<u8>, Vec<u8>)>,
+    signature_shares: Vec<(Vec<u8>, Vec<u8>)>,
+    our_nonces: Option<Vec<u8>>,
+    our_commitment: Option<Vec<u8>>,
+    rehydrations_used: u16,
+    max_rehydrations: u16,
+}
+
+impl CachedSessionState {
+    pub fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
+    }
 }
 
 pub struct NetworkSession {
@@ -623,7 +629,7 @@ impl SessionManager {
     }
 
     pub fn rehydrate_session(&mut self, cached: CachedSessionState) -> Result<&mut NetworkSession> {
-        let session_id = cached.session_id;
+        let session_id = *cached.session_id();
 
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
@@ -645,7 +651,6 @@ impl SessionManager {
 
         let mut session = NetworkSession::from_cached_state(cached)?;
         session.timeout = self.session_timeout;
-        session.max_rehydrations = self.max_rehydrations;
 
         self.active_sessions.insert(session_id, session);
         Ok(self.active_sessions.get_mut(&session_id).unwrap())
@@ -839,13 +844,13 @@ mod tests {
         let session = NetworkSession::new(session_id, message.clone(), 2, participants.clone());
         let cached = session.to_cached_state().unwrap();
 
-        assert_eq!(cached.session_id, session_id);
-        assert_eq!(cached.message, message);
-        assert_eq!(cached.threshold, 2);
-        assert_eq!(cached.participants, participants);
-        assert_eq!(cached.rehydrations_used, 0);
+        assert_eq!(*cached.session_id(), session_id);
 
         let rehydrated = NetworkSession::from_cached_state(cached).unwrap();
+        assert_eq!(*rehydrated.session_id(), session_id);
+        assert_eq!(rehydrated.message(), message.as_slice());
+        assert_eq!(rehydrated.threshold(), 2);
+        assert_eq!(rehydrated.participants(), participants.as_slice());
         assert_eq!(rehydrated.rehydrations_used(), 1);
         assert!(rehydrated.can_rehydrate());
     }
@@ -898,15 +903,16 @@ mod tests {
         let message = b"test".to_vec();
         let participants = vec![1, 2];
         let session_id = derive_session_id(&message, &participants, 2);
-        let session = NetworkSession::new(session_id, message, 2, participants);
+        let session = NetworkSession::new(session_id, message.clone(), 2, participants);
         let cached = session.to_cached_state().unwrap();
 
         let json = serde_json::to_string(&cached).unwrap();
         let deserialized: CachedSessionState = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.session_id, cached.session_id);
-        assert_eq!(deserialized.message, cached.message);
-        assert_eq!(deserialized.rehydrations_used, cached.rehydrations_used);
+        assert_eq!(deserialized.session_id(), cached.session_id());
+        let rehydrated = NetworkSession::from_cached_state(deserialized).unwrap();
+        assert_eq!(*rehydrated.session_id(), session_id);
+        assert_eq!(rehydrated.message(), message.as_slice());
     }
 
     #[test]
