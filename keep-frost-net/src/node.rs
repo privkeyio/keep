@@ -95,6 +95,11 @@ impl SigningHooks for NoOpHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Maximum age for announcement timestamps (5 minutes)
+pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
+/// Maximum clock skew tolerance for future timestamps (30 seconds)
+pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+
 #[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
     PeerDiscovered {
@@ -317,10 +322,33 @@ impl KfpNode {
     }
 
     pub async fn announce(&self) -> Result<()> {
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {}", e)))?;
+
+        let signing_share = key_package.signing_share();
+        let signing_share_serialized = signing_share.serialize();
+        let signing_share_bytes: [u8; 32] = signing_share_serialized
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+
+        let verifying_share = key_package.verifying_share();
+        let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
+            FrostNetError::Crypto(format!("Failed to serialize verifying share: {}", e))
+        })?;
+        let verifying_share_bytes: [u8; 33] = verifying_share_serialized
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
+
         let event = KfpEventBuilder::announcement(
             &self.keys,
             &self.group_pubkey,
             self.share.metadata.identifier,
+            &signing_share_bytes,
+            &verifying_share_bytes,
             Some(&self.share.metadata.name),
         )?;
 
@@ -518,8 +546,38 @@ impl KfpNode {
             return Ok(());
         }
 
-        let mut peer =
-            Peer::new(pubkey, payload.share_index).with_capabilities(payload.capabilities);
+        // Validate timestamp to prevent replay attacks
+        let now = chrono::Utc::now().timestamp() as u64;
+        if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
+            debug!(
+                timestamp = payload.timestamp,
+                now, "Rejecting stale announcement"
+            );
+            return Err(FrostNetError::Protocol(
+                "Announcement timestamp too old".into(),
+            ));
+        }
+        if payload.timestamp > now + ANNOUNCE_MAX_FUTURE_SECS {
+            debug!(
+                timestamp = payload.timestamp,
+                now, "Rejecting future-dated announcement"
+            );
+            return Err(FrostNetError::Protocol(
+                "Announcement timestamp in future".into(),
+            ));
+        }
+
+        crate::proof::verify_proof(
+            &payload.verifying_share,
+            &payload.proof_signature,
+            &payload.group_pubkey,
+            payload.share_index,
+            payload.timestamp,
+        )?;
+
+        let mut peer = Peer::new(pubkey, payload.share_index)
+            .with_capabilities(payload.capabilities)
+            .with_verifying_share(payload.verifying_share);
 
         if let Some(name) = payload.name {
             peer = peer.with_name(&name);
@@ -531,7 +589,7 @@ impl KfpNode {
         info!(
             share_index = payload.share_index,
             name = ?name_clone,
-            "Peer discovered"
+            "Peer discovered with valid proof-of-share"
         );
 
         let _ = self.event_tx.send(KfpNodeEvent::PeerDiscovered {

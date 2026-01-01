@@ -3,6 +3,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::error::{FrostNetError, Result};
+use crate::proof;
 use crate::protocol::*;
 
 pub struct KfpEventBuilder;
@@ -12,9 +13,26 @@ impl KfpEventBuilder {
         keys: &Keys,
         group_pubkey: &[u8; 32],
         share_index: u16,
+        signing_share: &[u8; 32],
+        verifying_share: &[u8; 33],
         name: Option<&str>,
     ) -> Result<Event> {
-        let mut payload = AnnouncePayload::new(*group_pubkey, share_index);
+        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let proof_signature = proof::sign_proof(
+            signing_share,
+            group_pubkey,
+            share_index,
+            verifying_share,
+            timestamp,
+        )?;
+
+        let mut payload = AnnouncePayload::new(
+            *group_pubkey,
+            share_index,
+            *verifying_share,
+            proof_signature,
+            timestamp,
+        );
         if let Some(n) = name {
             payload = payload.with_name(n);
         }
@@ -261,13 +279,30 @@ impl KfpEventBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::schnorr::SigningKey;
 
     #[test]
     fn test_announcement_event() {
         let keys = Keys::generate();
         let group_pubkey = [1u8; 32];
 
-        let event = KfpEventBuilder::announcement(&keys, &group_pubkey, 1, Some("test")).unwrap();
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let mut signing_share = [0u8; 32];
+        signing_share.copy_from_slice(&signing_key.to_bytes());
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x02;
+        verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+        let event = KfpEventBuilder::announcement(
+            &keys,
+            &group_pubkey,
+            1,
+            &signing_share,
+            &verifying_share,
+            Some("test"),
+        )
+        .unwrap();
 
         assert_eq!(event.kind, Kind::Custom(KFP_EVENT_KIND));
 
@@ -276,6 +311,20 @@ mod tests {
 
         let group = KfpEventBuilder::get_group_pubkey(&event);
         assert_eq!(group, Some(group_pubkey));
+
+        let parsed = KfpMessage::from_json(&event.content).unwrap();
+        if let KfpMessage::Announce(payload) = parsed {
+            crate::proof::verify_proof(
+                &payload.verifying_share,
+                &payload.proof_signature,
+                &payload.group_pubkey,
+                payload.share_index,
+                payload.timestamp,
+            )
+            .expect("proof verification should succeed");
+        } else {
+            panic!("expected Announce message");
+        }
     }
 
     #[test]

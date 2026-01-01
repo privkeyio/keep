@@ -132,16 +132,30 @@ pub struct AnnouncePayload {
     #[serde(with = "hex_bytes")]
     pub group_pubkey: [u8; 32],
     pub share_index: u16,
+    #[serde(with = "hex_bytes_33")]
+    pub verifying_share: [u8; 33],
+    #[serde(with = "hex_bytes_64")]
+    pub proof_signature: [u8; 64],
+    pub timestamp: u64,
     pub capabilities: Vec<String>,
     pub name: Option<String>,
 }
 
 impl AnnouncePayload {
-    pub fn new(group_pubkey: [u8; 32], share_index: u16) -> Self {
+    pub fn new(
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        verifying_share: [u8; 33],
+        proof_signature: [u8; 64],
+        timestamp: u64,
+    ) -> Self {
         Self {
             version: KFP_VERSION,
             group_pubkey,
             share_index,
+            verifying_share,
+            proof_signature,
+            timestamp,
             capabilities: vec!["sign".into()],
             name: None,
         }
@@ -347,6 +361,28 @@ mod hex_bytes {
     }
 }
 
+mod hex_bytes_33 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 33 bytes"))
+    }
+}
+
 mod hex_bytes_64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -425,7 +461,8 @@ mod tests {
 
     #[test]
     fn test_announce_serialization() {
-        let payload = AnnouncePayload::new([1u8; 32], 1).with_name("test");
+        let payload =
+            AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890).with_name("test");
         let msg = KfpMessage::Announce(payload);
 
         let json = msg.to_json().unwrap();
@@ -435,6 +472,9 @@ mod tests {
             KfpMessage::Announce(p) => {
                 assert_eq!(p.share_index, 1);
                 assert_eq!(p.name, Some("test".into()));
+                assert_eq!(p.verifying_share, [2u8; 33]);
+                assert_eq!(p.proof_signature, [3u8; 64]);
+                assert_eq!(p.timestamp, 1234567890);
             }
             _ => panic!("expected Announce"),
         }
@@ -514,7 +554,8 @@ mod tests {
     #[test]
     fn test_announce_name_limit() {
         let oversized_name = "a".repeat(MAX_NAME_LENGTH + 1);
-        let payload = AnnouncePayload::new([1u8; 32], 1).with_name(&oversized_name);
+        let payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890)
+            .with_name(&oversized_name);
         let msg = KfpMessage::Announce(payload);
         assert!(msg.validate().is_err());
     }
@@ -524,7 +565,7 @@ mod tests {
         let too_many_caps: Vec<String> = (0..=MAX_CAPABILITIES)
             .map(|i| format!("cap{}", i))
             .collect();
-        let mut payload = AnnouncePayload::new([1u8; 32], 1);
+        let mut payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890);
         payload.capabilities = too_many_caps;
         let msg = KfpMessage::Announce(payload);
         assert!(msg.validate().is_err());
@@ -533,7 +574,7 @@ mod tests {
     #[test]
     fn test_announce_capability_length_limit() {
         let oversized_cap = "a".repeat(MAX_CAPABILITY_LENGTH + 1);
-        let mut payload = AnnouncePayload::new([1u8; 32], 1);
+        let mut payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890);
         payload.capabilities = vec![oversized_cap];
         let msg = KfpMessage::Announce(payload);
         assert!(msg.validate().is_err());
@@ -557,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_valid_announce_passes_validation() {
-        let payload = AnnouncePayload::new([1u8; 32], 1)
+        let payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890)
             .with_name("Test Node")
             .with_capabilities(vec!["sign".into()]);
         let msg = KfpMessage::Announce(payload);
