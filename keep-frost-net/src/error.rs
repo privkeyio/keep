@@ -31,6 +31,9 @@ pub enum FrostNetError {
     #[error("Untrusted peer: {0}")]
     UntrustedPeer(String),
 
+    #[error("Policy violation: {0}")]
+    PolicyViolation(String),
+
     #[error("Replay detected: {0}")]
     ReplayDetected(String),
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use std::time::Duration;
 use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
+use rand_09::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
@@ -18,7 +20,80 @@ use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
-use crate::session::{derive_session_id, SessionManager};
+use crate::session::{derive_session_id, NetworkSession, SessionManager};
+
+#[derive(Clone, Debug)]
+pub struct PeerPolicy {
+    pub pubkey: PublicKey,
+    pub allow_send: bool,
+    pub allow_receive: bool,
+}
+
+impl PeerPolicy {
+    pub fn new(pubkey: PublicKey) -> Self {
+        Self {
+            pubkey,
+            allow_send: true,
+            allow_receive: true,
+        }
+    }
+
+    pub fn allow_send(mut self, allow: bool) -> Self {
+        self.allow_send = allow;
+        self
+    }
+
+    pub fn allow_receive(mut self, allow: bool) -> Self {
+        self.allow_receive = allow;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub session_id: [u8; 32],
+    pub message: Vec<u8>,
+    pub threshold: u16,
+    pub participants: Vec<u16>,
+}
+
+impl From<&NetworkSession> for SessionInfo {
+    fn from(session: &NetworkSession) -> Self {
+        Self {
+            session_id: *session.session_id(),
+            message: session.message().to_vec(),
+            threshold: session.threshold(),
+            participants: session.participants().to_vec(),
+        }
+    }
+}
+
+/// Hooks for observing and controlling the signing process.
+///
+/// Implementations should be non-blocking and return quickly to avoid
+/// delaying the signing protocol. To prevent deadlocks, hook implementations
+/// must not call `KfpNode::set_hooks` from within a hook.
+pub trait SigningHooks: Send + Sync {
+    /// Called before a node participates in a signing session.
+    ///
+    /// Returning an `Err` will abort the signing session.
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()>;
+
+    /// Called after a signature has been successfully generated.
+    ///
+    /// This is for notification purposes and cannot fail. Long-running
+    /// operations should be offloaded to a separate task.
+    fn post_sign(&self, session: &SessionInfo, signature: &[u8; 64]);
+}
+
+pub struct NoOpHooks;
+
+impl SigningHooks for NoOpHooks {
+    fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+}
 
 #[derive(Clone, Debug)]
 pub enum KfpNodeEvent {
@@ -49,6 +124,8 @@ pub struct KfpNode {
     group_pubkey: [u8; 32],
     sessions: Arc<RwLock<SessionManager>>,
     peers: Arc<RwLock<PeerManager>>,
+    policies: Arc<RwLock<HashMap<PublicKey, PeerPolicy>>>,
+    hooks: RwLock<Arc<dyn SigningHooks>>,
     event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
@@ -116,6 +193,8 @@ impl KfpNode {
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
+            policies: Arc::new(RwLock::new(HashMap::new())),
+            hooks: RwLock::new(Arc::new(NoOpHooks)),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
@@ -154,6 +233,87 @@ impl KfpNode {
             .iter()
             .map(|p| (p.share_index, p.status.clone(), p.name.clone()))
             .collect()
+    }
+
+    pub fn set_peer_policy(&self, policy: PeerPolicy) {
+        self.policies.write().insert(policy.pubkey, policy);
+    }
+
+    pub fn remove_peer_policy(&self, pubkey: &PublicKey) {
+        self.policies.write().remove(pubkey);
+    }
+
+    pub fn get_peer_policy(&self, pubkey: &PublicKey) -> Option<PeerPolicy> {
+        self.policies.read().get(pubkey).cloned()
+    }
+
+    pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
+        *self.hooks.write() = hooks;
+    }
+
+    fn can_receive_from(&self, pubkey: &PublicKey) -> bool {
+        self.policies
+            .read()
+            .get(pubkey)
+            .map(|p| p.allow_receive)
+            .unwrap_or(true)
+    }
+
+    fn cleanup_session_on_hook_failure(&self, session_id: &[u8; 32]) {
+        self.sessions.write().complete_session(session_id);
+    }
+
+    fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
+        let info = {
+            let mut sessions = self.sessions.write();
+            let info = sessions.get_session(session_id).map(SessionInfo::from);
+            if info.is_some() {
+                sessions.complete_session(session_id);
+            }
+            info
+        };
+
+        if let Some(info) = info {
+            let hooks = self.hooks.read().clone();
+            hooks.post_sign(&info, signature);
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn select_eligible_peers(&self, threshold: usize) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+        let selected_peers: Vec<Peer> = {
+            let peers = self.peers.read();
+            let policies = self.policies.read();
+            let eligible_peers: Vec<_> = peers
+                .get_signing_peers()
+                .into_iter()
+                .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .collect();
+
+            if eligible_peers.len() + 1 < threshold {
+                return Err(FrostNetError::InsufficientPeers {
+                    needed: threshold - 1,
+                    available: eligible_peers.len(),
+                });
+            }
+
+            eligible_peers
+                .choose_multiple(&mut rand_09::rng(), threshold - 1)
+                .copied()
+                .cloned()
+                .collect()
+        };
+
+        let participant_peers = selected_peers
+            .iter()
+            .map(|p| (p.share_index, p.pubkey))
+            .collect();
+
+        let mut participants: Vec<u16> = selected_peers.iter().map(|p| p.share_index).collect();
+        participants.push(self.share.metadata.identifier);
+        participants.sort();
+
+        Ok((participants, participant_peers))
     }
 
     pub async fn announce(&self) -> Result<()> {
@@ -410,6 +570,14 @@ impl KfpNode {
             )));
         }
 
+        if !self.can_receive_from(&from) {
+            debug!(from = %from, "Rejecting sign request: policy denies receive");
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {} not allowed to send sign requests",
+                from
+            )));
+        }
+
         info!(
             session_id = %hex::encode(request.session_id),
             message_type = %request.message_type,
@@ -417,6 +585,52 @@ impl KfpNode {
         );
 
         let key_package = self.share.key_package()?;
+
+        let existing_commitment = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&request.session_id)
+                .and_then(|s| s.our_commitment().copied())
+        };
+
+        if let Some(existing) = existing_commitment {
+            debug!(
+                session_id = %hex::encode(request.session_id),
+                "Resending existing commitment for session"
+            );
+            let commit_bytes = existing
+                .serialize()
+                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+
+            let payload = CommitmentPayload::new(
+                request.session_id,
+                self.share.metadata.identifier,
+                commit_bytes.to_vec(),
+            );
+
+            let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+            debug!(
+                session_id = %hex::encode(request.session_id),
+                "Sent commitment"
+            );
+
+            return Ok(());
+        }
+
+        let session_info = SessionInfo {
+            session_id: request.session_id,
+            message: request.message.clone(),
+            threshold: self.share.metadata.threshold,
+            participants: request.participants.clone(),
+        };
+
+        let hooks = self.hooks.read().clone();
+        hooks.pre_sign(&session_info)?;
 
         let commitment = {
             let mut sessions = self.sessions.write();
@@ -428,28 +642,16 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            // If we already have nonces for this session, resend existing commitment
-            // This prevents nonce regeneration on duplicate requests while allowing retry
-            if let Some(existing_commitment) = session.our_commitment() {
-                debug!(
-                    session_id = %hex::encode(request.session_id),
-                    "Resending existing commitment for session"
-                );
-                *existing_commitment
-            } else {
-                // Generate nonces for new session participation
-                let (nonces, commitment) =
-                    frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+            let (nonces, commitment) =
+                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
-                session.set_our_nonces(nonces);
-                session.set_our_commitment(commitment);
-                session.add_commitment(self.share.metadata.identifier, commitment)?;
+            session.set_our_nonces(nonces);
+            session.set_our_commitment(commitment);
+            session.add_commitment(self.share.metadata.identifier, commitment)?;
 
-                // Record consumption AFTER nonces are generated to prevent reuse across restarts
-                sessions.record_nonce_consumption(&request.session_id)?;
+            sessions.record_nonce_consumption(&request.session_id)?;
 
-                commitment
-            }
+            commitment
         };
 
         let commit_bytes = commitment
@@ -654,8 +856,7 @@ impl KfpNode {
                 "Signature complete!"
             );
 
-            let mut sessions = self.sessions.write();
-            sessions.complete_session(&payload.session_id);
+            self.invoke_post_sign_hook(&payload.session_id, &sig);
 
             let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
                 session_id: payload.session_id,
@@ -694,8 +895,7 @@ impl KfpNode {
             "Received completed signature"
         );
 
-        let mut sessions = self.sessions.write();
-        sessions.complete_session(&payload.session_id);
+        self.invoke_post_sign_hook(&payload.session_id, &payload.signature);
 
         let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
             session_id: payload.session_id,
@@ -733,18 +933,7 @@ impl KfpNode {
     ) -> Result<[u8; 64]> {
         let threshold = self.share.metadata.threshold;
 
-        let participants = {
-            let peers = self.peers.read();
-            peers
-                .select_participants(threshold as usize)
-                .ok_or_else(|| {
-                    let online = peers.online_count();
-                    FrostNetError::InsufficientPeers {
-                        needed: threshold as usize - 1,
-                        available: online,
-                    }
-                })?
-        };
+        let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
 
         let session_id = derive_session_id(&message, &participants, threshold);
 
@@ -783,14 +972,18 @@ impl KfpNode {
             sessions.record_nonce_consumption(&session_id)?;
         }
 
-        let participant_peers: Vec<(u16, PublicKey)> = self
-            .peers
-            .read()
-            .get_online_peers()
-            .iter()
-            .filter(|p| participants.contains(&p.share_index))
-            .map(|p| (p.share_index, p.pubkey))
-            .collect();
+        let session_info = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&session_id)
+                .map(SessionInfo::from)
+                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
+        };
+        let hooks = self.hooks.read().clone();
+        if let Err(e) = hooks.pre_sign(&session_info) {
+            self.cleanup_session_on_hook_failure(&session_id);
+            return Err(e);
+        }
 
         let our_commit_bytes = our_commitment
             .serialize()
