@@ -203,6 +203,20 @@ impl Argon2Params {
         parallelism: 4,
     };
 
+    /// Legacy parameter sets for backward compatibility when opening old vaults.
+    ///
+    /// # History and Scope
+    /// - **No production vaults** were ever created with `TESTING` parameters.
+    ///   Production code has always used `DEFAULT` or `HIGH`.
+    /// - This list exists to support **test/development environments only**, where
+    ///   vaults may have been created with weak parameters for faster iteration.
+    /// - The fallback mechanism in `Storage::unlock_any_version` tries the header's
+    ///   stored parameters first. This list is only consulted if header-based
+    ///   decryption fails (e.g., due to header corruption or very old test vaults).
+    ///
+    /// # Deprecation
+    /// This may be removed in a future major version. Test vaults should be
+    /// recreated with `DEFAULT` parameters when possible.
     pub const LEGACY_PARAMS: &'static [Self] = &[Self::TESTING];
 }
 
