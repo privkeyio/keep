@@ -482,7 +482,17 @@ fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
     crypto::blake2b_256(&data)
 }
 
-pub fn decrypt_vault_any_version(
+/// Decrypt a vault's data key, trying the header's Argon2 params first, then legacy params.
+///
+/// # Rate Limiting
+///
+/// This function does **not** enforce rate limiting. Callers must check
+/// [`rate_limit::check_rate_limit`] before calling and call
+/// [`rate_limit::record_failure`] or [`rate_limit::record_success`] afterward.
+///
+/// For public API usage, prefer [`Storage::unlock`] or [`Storage::unlock_any_version`],
+/// which handle rate limiting automatically.
+pub(crate) fn decrypt_vault_any_version(
     password: &str,
     salt: &[u8; SALT_SIZE],
     nonce: &[u8; 24],
