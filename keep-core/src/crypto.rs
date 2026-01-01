@@ -203,7 +203,7 @@ impl Argon2Params {
         parallelism: 4,
     };
 
-    pub const LEGACY_PARAMS: &'static [Self] = &[];
+    pub const LEGACY_PARAMS: &'static [Self] = &[Self::TESTING];
 }
 
 impl Default for Argon2Params {

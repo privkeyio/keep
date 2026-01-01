@@ -245,64 +245,31 @@ impl Storage {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
         }
 
-        let encrypted = EncryptedData {
-            nonce: self.header.nonce,
-            ciphertext: self.header.encrypted_data_key.to_vec(),
-        };
+        match decrypt_vault_any_version(
+            password,
+            &self.header.salt,
+            &self.header.nonce,
+            &self.header.encrypted_data_key,
+            self.header.argon2_params(),
+        ) {
+            Ok(data_key) => {
+                self.data_key = Some(data_key);
 
-        let params_to_try = std::iter::once(self.header.argon2_params())
-            .chain(Argon2Params::LEGACY_PARAMS.iter().copied());
+                let db_path = self.path.join("keep.db");
+                let db = Database::open(&db_path)?;
+                self.db = Some(db);
 
-        let mut last_error = KeepError::DecryptionFailed;
-
-        for params in params_to_try {
-            trace!(
-                "trying KDF params: memory={}KiB, iterations={}, parallelism={}",
-                params.memory_kib,
-                params.iterations,
-                params.parallelism
-            );
-
-            let master_key =
-                match crypto::derive_key(password.as_bytes(), &self.header.salt, params) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        last_error = e;
-                        continue;
-                    }
-                };
-
-            let header_key = match crypto::derive_subkey(&master_key, b"keep-header-key") {
-                Ok(k) => k,
-                Err(e) => {
-                    last_error = e;
-                    continue;
+                rate_limit::record_success(&self.path);
+                debug!("storage unlocked");
+                Ok(())
+            }
+            Err(e) => {
+                if matches!(e, KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path);
                 }
-            };
-
-            match crypto::decrypt(&encrypted, &header_key) {
-                Ok(decrypted) => {
-                    let decrypted_bytes = decrypted.as_slice()?;
-                    self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
-
-                    let db_path = self.path.join("keep.db");
-                    let db = Database::open(&db_path)?;
-                    self.db = Some(db);
-
-                    rate_limit::record_success(&self.path);
-                    debug!("storage unlocked");
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_error = e;
-                }
+                Err(e)
             }
         }
-
-        if matches!(last_error, KeepError::DecryptionFailed) {
-            rate_limit::record_failure(&self.path);
-        }
-        Err(last_error)
     }
 
     pub fn lock(&mut self) {
@@ -666,5 +633,20 @@ mod tests {
         let mut storage = Storage::open(&path).unwrap();
         let result = storage.unlock_any_version("wrong");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unlock_any_version_legacy_params() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-legacy-params");
+
+        let legacy_params = Argon2Params::LEGACY_PARAMS[0];
+        Storage::create(&path, "legacy-password", legacy_params).unwrap();
+
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(!storage.is_unlocked());
+
+        storage.unlock_any_version("legacy-password").unwrap();
+        assert!(storage.is_unlocked());
     }
 }
