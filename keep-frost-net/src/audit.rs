@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(unused_assignments)]
 
 use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
@@ -8,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -97,9 +99,12 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SigningAuditLog {
     hmac_key: [u8; 32],
+    #[zeroize(skip)]
     entries: Arc<RwLock<VecDeque<SigningAuditEntry>>>,
+    #[zeroize(skip)]
     max_entries: usize,
 }
 

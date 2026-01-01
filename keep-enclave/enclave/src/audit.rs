@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -109,9 +110,12 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SigningAuditLog {
     hmac_key: [u8; 32],
+    #[zeroize(skip)]
     entries: VecDeque<SigningAuditEntry>,
+    #[zeroize(skip)]
     max_entries: usize,
 }
 

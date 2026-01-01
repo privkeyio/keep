@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::Signer;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[allow(unsafe_code)]
@@ -178,8 +177,7 @@ pub struct EnclaveSigner {
     #[zeroize(skip)]
     frost_sessions: HashMap<[u8; 32], FrostSession>,
     ephemeral_secret: MlockedBox<32>,
-    #[zeroize(skip)]
-    audit_log: Arc<SigningAuditLog>,
+    audit_log: SigningAuditLog,
 }
 
 #[derive(ZeroizeOnDrop)]
@@ -214,7 +212,7 @@ impl EnclaveSigner {
         getrandom(&mut ephemeral_secret)?;
 
         let audit_hmac_key = derive_audit_hmac_key(&ephemeral_secret);
-        let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
+        let audit_log = SigningAuditLog::new(audit_hmac_key);
 
         Ok(Self {
             keys: HashMap::new(),
@@ -227,7 +225,7 @@ impl EnclaveSigner {
 
     pub fn with_ephemeral_secret(mut ephemeral_secret: [u8; 32]) -> Self {
         let audit_hmac_key = derive_audit_hmac_key(&ephemeral_secret);
-        let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
+        let audit_log = SigningAuditLog::new(audit_hmac_key);
 
         Self {
             keys: HashMap::new(),

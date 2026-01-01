@@ -1231,7 +1231,7 @@ fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
 fn derive_audit_hmac_key(keys: &Keys, group_pubkey: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"keep-frost-audit-hmac-v1");
-    hasher.update(keys.public_key().to_bytes());
+    hasher.update(keys.secret_key().secret_bytes());
     hasher.update(group_pubkey);
     hasher.finalize().into()
 }
