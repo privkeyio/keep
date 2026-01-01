@@ -362,7 +362,7 @@ impl NetworkSession {
             .as_ref()
             .map(|c| {
                 c.serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))
             })
             .transpose()?;
 
@@ -382,6 +382,16 @@ impl NetworkSession {
     }
 
     pub fn from_cached_state(cached: CachedSessionState) -> Result<Self> {
+        let expected_id =
+            derive_session_id(&cached.message, &cached.participants, cached.threshold);
+        if cached.session_id != expected_id {
+            return Err(FrostNetError::Session(format!(
+                "Session ID mismatch: expected {}, got {}",
+                hex::encode(expected_id),
+                hex::encode(cached.session_id)
+            )));
+        }
+
         if cached.rehydrations_used >= cached.max_rehydrations {
             return Err(FrostNetError::RehydrationLimitExceeded {
                 session_id: hex::encode(cached.session_id),
@@ -860,8 +870,8 @@ mod tests {
         let message = b"test".to_vec();
         let participants = vec![1, 2];
         let session_id = derive_session_id(&message, &participants, 2);
-        let session = NetworkSession::new(session_id, message, 2, participants)
-            .with_max_rehydrations(2);
+        let session =
+            NetworkSession::new(session_id, message, 2, participants).with_max_rehydrations(2);
 
         let cached = session.to_cached_state().unwrap();
         let session = NetworkSession::from_cached_state(cached).unwrap();
