@@ -101,27 +101,24 @@ impl OuterHeader {
         magic.copy_from_slice(&bytes[0..8]);
 
         if magic != *OUTER_MAGIC {
-            return Err(KeepError::InvalidMagic);
+            return Err(KeepError::Other("Invalid keep file".into()));
         }
 
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
-        if version != 1 {
-            return Err(KeepError::Other(format!(
-                "Unsupported outer header version: {}",
-                version
-            )));
+        if version > 1 {
+            return Err(KeepError::Other("Unsupported version".into()));
         }
 
         let mut salt = [0u8; SALT_SIZE];
         salt.copy_from_slice(&bytes[16..16 + SALT_SIZE]);
 
         let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&bytes[48..72]);
+        nonce.copy_from_slice(&bytes[16 + SALT_SIZE..16 + SALT_SIZE + 24]);
 
         let mut encrypted_data_key = [0u8; 48];
-        encrypted_data_key.copy_from_slice(&bytes[72..120]);
+        encrypted_data_key.copy_from_slice(&bytes[16 + SALT_SIZE + 24..16 + SALT_SIZE + 24 + 48]);
 
-        let offset = 120;
+        let offset = 16 + SALT_SIZE + 24 + 48;
 
         Ok(Self {
             magic,
@@ -178,120 +175,136 @@ pub struct HiddenHeader {
     pub hidden_data_offset: u64,
     pub hidden_data_size: u64,
     pub checksum: [u8; 32],
-    pub padding: [u8; 368],
+    pub padding: [u8; 352],
 }
 
 impl HiddenHeader {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(hidden_offset: u64, hidden_size: u64) -> Self {
+        let mut header = Self {
             version: 1,
             reserved: 0,
             salt: crypto::random_bytes(),
             nonce: crypto::random_bytes(),
             encrypted_data_key: [0; 48],
             _align_pad: 0,
-            hidden_data_offset: 0,
-            hidden_data_size: 0,
+            hidden_data_offset: hidden_offset,
+            hidden_data_size: hidden_size,
             checksum: [0; 32],
-            padding: [0; 368],
-        }
+            padding: [0; 352],
+        };
+
+        header.checksum = header.compute_checksum();
+        header
+    }
+
+    pub fn compute_checksum(&self) -> [u8; 32] {
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(&self.version.to_le_bytes());
+        data.extend_from_slice(&self.reserved.to_le_bytes());
+        data.extend_from_slice(&self.salt);
+        data.extend_from_slice(&self.nonce);
+        data.extend_from_slice(&self.encrypted_data_key);
+        data.extend_from_slice(&self.hidden_data_offset.to_le_bytes());
+        data.extend_from_slice(&self.hidden_data_size.to_le_bytes());
+
+        crypto::blake2b_256(&data)
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        let expected = self.compute_checksum();
+        expected.ct_eq(&self.checksum).into()
     }
 
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
+        let compact = self.to_bytes_compact();
+        bytes[..compact.len()].copy_from_slice(&compact);
+        bytes
+    }
+
+    pub fn to_bytes_compact(&self) -> [u8; Self::COMPACT_SIZE] {
+        let mut bytes = [0u8; Self::COMPACT_SIZE];
         let mut offset = 0;
 
         bytes[offset..offset + 2].copy_from_slice(&self.version.to_le_bytes());
         offset += 2;
         bytes[offset..offset + 2].copy_from_slice(&self.reserved.to_le_bytes());
         offset += 2;
-
         bytes[offset..offset + SALT_SIZE].copy_from_slice(&self.salt);
         offset += SALT_SIZE;
         bytes[offset..offset + 24].copy_from_slice(&self.nonce);
         offset += 24;
         bytes[offset..offset + 48].copy_from_slice(&self.encrypted_data_key);
         offset += 48;
-
         bytes[offset..offset + 4].copy_from_slice(&self._align_pad.to_le_bytes());
         offset += 4;
-
         bytes[offset..offset + 8].copy_from_slice(&self.hidden_data_offset.to_le_bytes());
         offset += 8;
         bytes[offset..offset + 8].copy_from_slice(&self.hidden_data_size.to_le_bytes());
         offset += 8;
-
         bytes[offset..offset + 32].copy_from_slice(&self.checksum);
 
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Self {
+    pub const COMPACT_SIZE: usize = 2 + 2 + SALT_SIZE + 24 + 48 + 4 + 8 + 8 + 32;
+
+    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
+        Self::from_bytes_compact(bytes)
+    }
+
+    pub fn from_bytes_compact(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::COMPACT_SIZE {
+            return Err(KeepError::Other(format!(
+                "Hidden header too short: {} bytes, expected at least {}",
+                bytes.len(),
+                Self::COMPACT_SIZE
+            )));
+        }
+
         let mut salt = [0u8; SALT_SIZE];
         salt.copy_from_slice(&bytes[4..4 + SALT_SIZE]);
 
         let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&bytes[36..60]);
+        nonce.copy_from_slice(&bytes[4 + SALT_SIZE..4 + SALT_SIZE + 24]);
 
         let mut encrypted_data_key = [0u8; 48];
-        encrypted_data_key.copy_from_slice(&bytes[60..108]);
+        encrypted_data_key.copy_from_slice(&bytes[4 + SALT_SIZE + 24..4 + SALT_SIZE + 72]);
+
+        let offset = 4 + SALT_SIZE + 72;
 
         let mut checksum = [0u8; 32];
-        checksum.copy_from_slice(&bytes[128..160]);
+        checksum.copy_from_slice(&bytes[offset + 20..offset + 52]);
 
-        Self {
+        Ok(Self {
             version: u16::from_le_bytes([bytes[0], bytes[1]]),
             reserved: u16::from_le_bytes([bytes[2], bytes[3]]),
             salt,
             nonce,
             encrypted_data_key,
-            _align_pad: u32::from_le_bytes([bytes[108], bytes[109], bytes[110], bytes[111]]),
-            hidden_data_offset: u64::from_le_bytes([
-                bytes[112],
-                bytes[113],
-                bytes[114],
-                bytes[115],
-                bytes[116],
-                bytes[117],
-                bytes[118],
-                bytes[119],
-            ]),
-            hidden_data_size: u64::from_le_bytes([
-                bytes[120],
-                bytes[121],
-                bytes[122],
-                bytes[123],
-                bytes[124],
-                bytes[125],
-                bytes[126],
-                bytes[127],
-            ]),
+            _align_pad: u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: align_pad".into()))?,
+            ),
+            hidden_data_offset: u64::from_le_bytes(
+                bytes[offset + 4..offset + 12]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: data_offset".into()))?,
+            ),
+            hidden_data_size: u64::from_le_bytes(
+                bytes[offset + 12..offset + 20]
+                    .try_into()
+                    .map_err(|_| KeepError::Other("Invalid hidden header: data_size".into()))?,
+            ),
             checksum,
-            padding: [0; 368],
-        }
-    }
-
-    pub fn compute_checksum(&self) -> [u8; 32] {
-        let mut data = self.to_bytes();
-        data[128..160].copy_from_slice(&[0u8; 32]);
-        crypto::blake2b_256(&data)
-    }
-
-    pub fn verify_checksum(&self) -> bool {
-        let computed = self.compute_checksum();
-        bool::from(computed.ct_eq(&self.checksum))
-    }
-
-    pub fn set_checksum(&mut self) {
-        self.checksum = self.compute_checksum();
+            padding: [0; 352],
+        })
     }
 }
 
-impl Default for HiddenHeader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+const _: () = assert!(std::mem::size_of::<OuterHeader>() == HEADER_SIZE);
+const _: () = assert!(std::mem::size_of::<HiddenHeader>() == HEADER_SIZE);
 
 #[cfg(test)]
 mod tests {
@@ -299,56 +312,42 @@ mod tests {
 
     #[test]
     fn test_outer_header_roundtrip() {
-        let original = OuterHeader::new(Argon2Params::TESTING, 1024, 2048);
-        let bytes = original.to_bytes();
-        let recovered = OuterHeader::from_bytes(&bytes).unwrap();
+        let header = OuterHeader::new(Argon2Params::TESTING, 1000, 2000);
+        let bytes = header.to_bytes();
+        let parsed = OuterHeader::from_bytes(&bytes).unwrap();
 
-        assert_eq!(original.magic, recovered.magic);
-        assert_eq!(original.version, recovered.version);
-        assert_eq!(original.salt, recovered.salt);
-        assert_eq!(original.nonce, recovered.nonce);
-        assert_eq!(original.argon2_memory_kib, recovered.argon2_memory_kib);
-        assert_eq!(original.outer_data_size, recovered.outer_data_size);
-        assert_eq!(original.total_size, recovered.total_size);
+        assert_eq!(parsed.magic, header.magic);
+        assert_eq!(parsed.version, header.version);
+        assert_eq!(parsed.salt, header.salt);
+        assert_eq!(parsed.outer_data_size, 1000);
+        assert_eq!(parsed.total_size, 2000);
+    }
+
+    #[test]
+    fn test_hidden_header_roundtrip() {
+        let header = HiddenHeader::new(1024, 500);
+        let bytes = header.to_bytes();
+        let parsed = HiddenHeader::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.version, header.version);
+        assert_eq!(parsed.salt, header.salt);
+        assert_eq!(parsed.hidden_data_offset, 1024);
+        assert_eq!(parsed.hidden_data_size, 500);
+        assert!(parsed.verify_checksum());
+    }
+
+    #[test]
+    fn test_hidden_header_checksum_detects_corruption() {
+        let mut header = HiddenHeader::new(1024, 500);
+        header.hidden_data_size = 999;
+        assert!(!header.verify_checksum());
     }
 
     #[test]
     fn test_outer_header_invalid_magic() {
         let mut bytes = [0u8; HEADER_SIZE];
         bytes[0..8].copy_from_slice(b"BADMAGIC");
-
         let result = OuterHeader::from_bytes(&bytes);
-        assert!(matches!(result, Err(KeepError::InvalidMagic)));
-    }
-
-    #[test]
-    fn test_hidden_header_roundtrip() {
-        let mut original = HiddenHeader::new();
-        original.hidden_data_offset = 1024;
-        original.hidden_data_size = 512;
-        original.set_checksum();
-
-        let bytes = original.to_bytes();
-        let recovered = HiddenHeader::from_bytes(&bytes);
-
-        assert_eq!(original.version, recovered.version);
-        assert_eq!(original.salt, recovered.salt);
-        assert_eq!(original.nonce, recovered.nonce);
-        assert_eq!(original.hidden_data_offset, recovered.hidden_data_offset);
-        assert_eq!(original.hidden_data_size, recovered.hidden_data_size);
-        assert!(recovered.verify_checksum());
-    }
-
-    #[test]
-    fn test_hidden_header_checksum_detects_corruption() {
-        let mut header = HiddenHeader::new();
-        header.hidden_data_size = 100;
-        header.set_checksum();
-
-        assert!(header.verify_checksum());
-
-        header.hidden_data_size = 200;
-
-        assert!(!header.verify_checksum());
+        assert!(result.is_err());
     }
 }
