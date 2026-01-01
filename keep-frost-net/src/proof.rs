@@ -89,7 +89,7 @@ mod tests {
         let mut signing_share = [0u8; 32];
         signing_share.copy_from_slice(&signing_key.to_bytes());
 
-        let verifying_share = to_compressed_pubkey(&verifying_key);
+        let verifying_share = to_compressed_pubkey(verifying_key);
 
         let group_pubkey = [1u8; 32];
         let share_index = 1u16;
@@ -122,7 +122,7 @@ mod tests {
         let mut signing_share = [0u8; 32];
         signing_share.copy_from_slice(&signing_key.to_bytes());
 
-        let verifying_share = to_compressed_pubkey(&verifying_key);
+        let verifying_share = to_compressed_pubkey(verifying_key);
 
         let group_pubkey = [1u8; 32];
         let share_index = 1u16;
@@ -139,7 +139,7 @@ mod tests {
 
         let wrong_signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
         let wrong_verifying_key = wrong_signing_key.verifying_key();
-        let wrong_verifying_share = to_compressed_pubkey(&wrong_verifying_key);
+        let wrong_verifying_share = to_compressed_pubkey(wrong_verifying_key);
 
         let result = verify_proof(
             &wrong_verifying_share,
@@ -159,7 +159,7 @@ mod tests {
         let mut signing_share = [0u8; 32];
         signing_share.copy_from_slice(&signing_key.to_bytes());
 
-        let verifying_share = to_compressed_pubkey(&verifying_key);
+        let verifying_share = to_compressed_pubkey(verifying_key);
 
         let group_pubkey = [1u8; 32];
         let share_index = 1u16;
