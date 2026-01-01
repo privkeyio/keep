@@ -1788,6 +1788,7 @@ dependencies = [
  "chrono",
  "frost-secp256k1-tr",
  "hex",
+ "k256",
  "keep-core",
  "nostr-relay-builder",
  "nostr-sdk",

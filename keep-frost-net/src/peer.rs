@@ -15,6 +15,7 @@ pub enum PeerStatus {
 pub struct Peer {
     pub pubkey: PublicKey,
     pub share_index: u16,
+    pub verifying_share: Option<[u8; 33]>,
     pub capabilities: Vec<String>,
     pub name: Option<String>,
     pub last_seen: Instant,
@@ -27,6 +28,7 @@ impl Peer {
         Self {
             pubkey,
             share_index,
+            verifying_share: None,
             capabilities: vec!["sign".into()],
             name: None,
             last_seen: Instant::now(),
@@ -42,6 +44,11 @@ impl Peer {
 
     pub fn with_capabilities(mut self, caps: Vec<String>) -> Self {
         self.capabilities = caps;
+        self
+    }
+
+    pub fn with_verifying_share(mut self, verifying_share: [u8; 33]) -> Self {
+        self.verifying_share = Some(verifying_share);
         self
     }
 

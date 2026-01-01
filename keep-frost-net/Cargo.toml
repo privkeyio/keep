@@ -12,6 +12,7 @@ keep-core = { path = "../keep-core" }
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 frost-secp256k1-tr = "2.2"
 rand_09 = { package = "rand", version = "0.9" }
+k256 = { version = "0.13", features = ["schnorr"] }
 
 tokio = { version = "1", features = ["full", "sync"] }
 parking_lot = "0.12"

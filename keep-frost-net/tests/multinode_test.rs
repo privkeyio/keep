@@ -101,7 +101,8 @@ async fn test_peer_discovery_with_running_nodes() {
 
 #[tokio::test]
 async fn test_frost_protocol_message_flow() {
-    let announce = AnnouncePayload::new([1u8; 32], 1).with_name("Test Node");
+    let announce =
+        AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890).with_name("Test Node");
     let msg = KfpMessage::Announce(announce);
     let json = msg.to_json().unwrap();
 
