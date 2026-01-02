@@ -5,6 +5,7 @@ use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv, Xpub};
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::All;
 use bitcoin::{Address, Network, XOnlyPublicKey};
+use keep_core::crypto::MlockedBox;
 use std::str::FromStr;
 
 #[derive(Clone, Debug)]
@@ -16,7 +17,7 @@ pub struct DerivedAddress {
 }
 
 pub struct AddressDerivation {
-    master_xpriv: Xpriv,
+    secret: MlockedBox<32>,
     secp: Secp256k1<All>,
     network: Network,
 }
@@ -25,19 +26,20 @@ impl AddressDerivation {
     pub fn new(secret: &[u8; 32], network: Network) -> Result<Self> {
         let secp = Secp256k1::new();
 
-        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(secret)
+        let _ = bitcoin::secp256k1::SecretKey::from_slice(secret)
             .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))?;
 
-        let master_xpriv = Xpriv::new_master(network, secret).map_err(|e| {
-            BitcoinError::DerivationPath(format!("Failed to create master key: {}", e))
-        })?;
-
-        let _ = secret_key;
-
+        let mut secret_copy = *secret;
         Ok(Self {
-            master_xpriv,
+            secret: MlockedBox::new(&mut secret_copy),
             secp,
             network,
+        })
+    }
+
+    fn master_xpriv(&self) -> Result<Xpriv> {
+        Xpriv::new_master(self.network, &*self.secret).map_err(|e| {
+            BitcoinError::DerivationPath(format!("Failed to create master key: {}", e))
         })
     }
 
@@ -64,8 +66,8 @@ impl AddressDerivation {
         let path = DerivationPath::from_str(&path_str)
             .map_err(|e| BitcoinError::DerivationPath(format!("Invalid path: {}", e)))?;
 
-        let child_xpriv = self
-            .master_xpriv
+        let master_xpriv = self.master_xpriv()?;
+        let child_xpriv = master_xpriv
             .derive_priv(&self.secp, &path)
             .map_err(|e| BitcoinError::DerivationPath(format!("Derivation failed: {}", e)))?;
 
@@ -94,8 +96,8 @@ impl AddressDerivation {
         (0..count).map(|i| self.get_receive_address(i)).collect()
     }
 
-    pub fn master_fingerprint(&self) -> Fingerprint {
-        self.master_xpriv.fingerprint(&self.secp)
+    pub fn master_fingerprint(&self) -> Result<Fingerprint> {
+        Ok(self.master_xpriv()?.fingerprint(&self.secp))
     }
 
     pub fn account_xpub(&self, account: u32) -> Result<Xpub> {
@@ -109,8 +111,8 @@ impl AddressDerivation {
         let path = DerivationPath::from_str(&path_str)
             .map_err(|e| BitcoinError::DerivationPath(format!("Invalid path: {}", e)))?;
 
-        let account_xpriv = self
-            .master_xpriv
+        let master_xpriv = self.master_xpriv()?;
+        let account_xpriv = master_xpriv
             .derive_priv(&self.secp, &path)
             .map_err(|e| BitcoinError::DerivationPath(format!("Derivation failed: {}", e)))?;
 
@@ -163,7 +165,7 @@ mod tests {
         let secret = [4u8; 32];
         let derivation = AddressDerivation::new(&secret, Network::Bitcoin).unwrap();
 
-        let fp = derivation.master_fingerprint();
+        let fp = derivation.master_fingerprint().unwrap();
         assert_ne!(fp.to_bytes(), [0u8; 4]);
     }
 }

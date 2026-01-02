@@ -317,7 +317,7 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("testnet");
 
-                if let Some(secret) = self.secret_key {
+                if let Some(mut secret) = self.secret_key {
                     let network = match network_str {
                         "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
                         "signet" => keep_bitcoin::Network::Signet,
@@ -328,7 +328,7 @@ impl McpServer {
                     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
                         .map_err(|e| AgentError::Other(format!("Invalid PSBT: {}", e)))?;
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(secret, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let analysis = signer
@@ -411,7 +411,7 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("testnet");
 
-                if let Some(secret) = self.secret_key {
+                if let Some(mut secret) = self.secret_key {
                     let network = match network_str {
                         "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
                         "signet" => keep_bitcoin::Network::Signet,
@@ -419,7 +419,7 @@ impl McpServer {
                         _ => keep_bitcoin::Network::Testnet,
                     };
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(secret, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let address = signer
