@@ -168,6 +168,41 @@ keep frost hardware import --device /dev/ttyUSB0 --group npub1... --share 1
 keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyUSB0
 ```
 
+### Distributed Key Generation (DKG)
+
+Generate threshold keys without any single party knowing the full private key. Each participant runs independently and coordinates via Nostr relay.
+
+```bash
+# Participant 1 (on first device)
+keep frost network dkg \
+  --group mygroup \
+  --threshold 2 \
+  --participants 3 \
+  --index 1 \
+  --relay wss://nos.lol \
+  --hardware /dev/ttyUSB0
+
+# Participant 2 (on second device, run simultaneously)
+keep frost network dkg \
+  --group mygroup \
+  --threshold 2 \
+  --participants 3 \
+  --index 2 \
+  --relay wss://nos.lol \
+  --hardware /dev/ttyUSB0
+
+# Participant 3 (on third device, run simultaneously)
+keep frost network dkg \
+  --group mygroup \
+  --threshold 2 \
+  --participants 3 \
+  --index 3 \
+  --relay wss://nos.lol \
+  --hardware /dev/ttyUSB0
+```
+
+All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
+
 ---
 
 ## Agent SDK

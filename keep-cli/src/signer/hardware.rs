@@ -72,7 +72,14 @@ impl HardwareSigner {
         self.port.flush()?;
 
         let mut response_line = String::new();
-        self.reader.read_line(&mut response_line)?;
+        for _ in 0..10 {
+            response_line.clear();
+            self.reader.read_line(&mut response_line)?;
+            let trimmed = response_line.trim();
+            if trimmed.starts_with('{') && trimmed.contains("\"id\"") {
+                break;
+            }
+        }
 
         let response: RpcResponse = serde_json::from_str(response_line.trim())
             .context("Failed to parse hardware response")?;
@@ -208,6 +215,152 @@ impl HardwareSigner {
 
         Ok((sig_share, index))
     }
+
+    pub fn dkg_init(
+        &mut self,
+        group: &str,
+        threshold: u8,
+        participant_count: u8,
+        our_index: u8,
+    ) -> Result<()> {
+        let params = serde_json::json!({
+            "group": group,
+            "threshold": threshold,
+            "participant_count": participant_count,
+            "our_index": our_index,
+        });
+        self.call("dkg_init", Some(params))?;
+        Ok(())
+    }
+
+    pub fn dkg_round1(&mut self) -> Result<DkgRound1Data> {
+        let result = self.call("dkg_round1", None)?;
+        let participant_index: u8 = result["participant_index"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing participant_index"))?
+            .try_into()
+            .map_err(|_| anyhow!("participant_index out of range"))?;
+        let num_coefficients: u8 = result["num_coefficients"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing num_coefficients"))?
+            .try_into()
+            .map_err(|_| anyhow!("num_coefficients out of range"))?;
+        let coefficient_commitments = result["coefficient_commitments"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing coefficient_commitments"))?
+            .to_string();
+        let zkp_r = result["zkp_r"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing zkp_r"))?
+            .to_string();
+        let zkp_z = result["zkp_z"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing zkp_z"))?
+            .to_string();
+
+        Ok(DkgRound1Data {
+            participant_index,
+            num_coefficients,
+            coefficient_commitments,
+            zkp_r,
+            zkp_z,
+        })
+    }
+
+    pub fn dkg_round1_peer(&mut self, peer_index: u8, dkg_data: &str) -> Result<bool> {
+        let params = serde_json::json!({
+            "peer_index": peer_index,
+            "dkg_data": dkg_data,
+        });
+        let result = self.call("dkg_round1_peer", Some(params))?;
+        let validated = result["validated"].as_bool().unwrap_or(false);
+        Ok(validated)
+    }
+
+    pub fn dkg_round2(&mut self) -> Result<Vec<DkgShare>> {
+        let result = self.call("dkg_round2", None)?;
+        let shares_arr = result["shares"]
+            .as_array()
+            .ok_or_else(|| anyhow!("Missing shares array"))?;
+
+        let mut shares = Vec::new();
+        for s in shares_arr {
+            let recipient_index: u8 = s["recipient_index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("Missing recipient_index"))?
+                .try_into()
+                .map_err(|_| anyhow!("recipient_index out of range"))?;
+            let share = s["share"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing share"))?
+                .to_string();
+            shares.push(DkgShare {
+                recipient_index,
+                share,
+            });
+        }
+        Ok(shares)
+    }
+
+    pub fn dkg_receive_share(&mut self, peer_index: u8, share: &str) -> Result<()> {
+        let params = serde_json::json!({
+            "peer_index": peer_index,
+            "share": share,
+        });
+        self.call("dkg_receive_share", Some(params))?;
+        Ok(())
+    }
+
+    pub fn dkg_finalize(&mut self) -> Result<DkgFinalizeResult> {
+        let result = self.call("dkg_finalize", None)?;
+        let group_pubkey = result["group_pubkey"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing group_pubkey"))?
+            .to_string();
+        let our_index: u8 = result["our_index"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing our_index"))?
+            .try_into()
+            .map_err(|_| anyhow!("our_index out of range"))?;
+        Ok(DkgFinalizeResult {
+            group_pubkey,
+            our_index,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DkgRound1Data {
+    pub participant_index: u8,
+    pub num_coefficients: u8,
+    pub coefficient_commitments: String,
+    pub zkp_r: String,
+    pub zkp_z: String,
+}
+
+impl DkgRound1Data {
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "participant_index": self.participant_index,
+            "num_coefficients": self.num_coefficients,
+            "coefficient_commitments": self.coefficient_commitments,
+            "zkp_r": self.zkp_r,
+            "zkp_z": self.zkp_z,
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DkgShare {
+    pub recipient_index: u8,
+    pub share: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DkgFinalizeResult {
+    pub group_pubkey: String,
+    pub our_index: u8,
 }
 
 pub fn serialize_share_for_hardware(
