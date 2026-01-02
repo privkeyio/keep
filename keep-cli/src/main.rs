@@ -198,6 +198,25 @@ enum FrostNetworkCommands {
         #[arg(short, long, default_value = "wss://nos.lol")]
         relay: String,
     },
+    Dkg {
+        #[arg(short, long, help = "Group name for the new keyset")]
+        group: String,
+        #[arg(
+            short,
+            long,
+            default_value = "2",
+            help = "Signature threshold (t in t-of-n)"
+        )]
+        threshold: u8,
+        #[arg(short = 'n', long, default_value = "3", help = "Total participants")]
+        participants: u8,
+        #[arg(short = 'i', long, help = "Our participant index (1-indexed)")]
+        index: u8,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        hardware: String,
+    },
     Sign {
         #[arg(short, long)]
         group: String,
@@ -535,6 +554,22 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
         FrostNetworkCommands::Peers { group, relay } => {
             cmd_frost_network_peers(out, path, &group, &relay)
         }
+        FrostNetworkCommands::Dkg {
+            group,
+            threshold,
+            participants,
+            index,
+            relay,
+            hardware,
+        } => cmd_frost_network_dkg(
+            out,
+            &group,
+            threshold,
+            participants,
+            index,
+            &relay,
+            &hardware,
+        ),
         FrostNetworkCommands::Sign {
             group,
             message,
@@ -1282,6 +1317,322 @@ fn cmd_frost_network_sign_event(
         let output = serde_json::to_string_pretty(&signed_event)
             .map_err(|e| KeepError::Other(format!("Failed to serialize event: {}", e)))?;
         println!("{}", output);
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_dkg(
+    out: &Output,
+    group: &str,
+    threshold: u8,
+    participants: u8,
+    our_index: u8,
+    relay: &str,
+    device: &str,
+) -> Result<()> {
+    use crate::signer::HardwareSigner;
+    use nostr_sdk::prelude::*;
+
+    out.newline();
+    out.header("FROST Distributed Key Generation");
+    out.field("Group", group);
+    out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+    out.field("Our index", &our_index.to_string());
+    out.field("Relay", relay);
+    out.field("Device", device);
+    out.newline();
+
+    let spinner = out.spinner("Connecting to hardware...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Verifying connection...");
+    let version = signer
+        .ping()
+        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    spinner.finish();
+    out.field("Hardware version", &version);
+
+    let spinner = out.spinner("Initializing DKG session...");
+    signer
+        .dkg_init(group, threshold, participants, our_index)
+        .map_err(|e| KeepError::Other(format!("DKG init failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Generating Round 1 commitment...");
+    let round1 = signer
+        .dkg_round1()
+        .map_err(|e| KeepError::Other(format!("DKG round 1 failed: {}", e)))?;
+    spinner.finish();
+
+    out.success("Round 1 complete");
+    out.field("Participant", &round1.participant_index.to_string());
+    out.field("Coefficients", &round1.num_coefficients.to_string());
+    out.newline();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        let keys = Keys::generate();
+        let client = Client::new(keys.clone());
+        client
+            .add_relay(relay)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+        client
+            .connect()
+            .await;
+
+        out.info("Connected to relay");
+        out.field("Our pubkey", &keys.public_key().to_bech32().unwrap_or_default());
+        out.newline();
+
+        let round1_json = round1.to_json();
+        let content = serde_json::json!({
+            "group": group,
+            "round": 1,
+            "data": round1_json,
+        }).to_string();
+
+        let event = EventBuilder::new(Kind::Custom(21102), &content)
+            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
+            .tag(Tag::custom(TagKind::custom("participant_index"), vec![our_index.to_string()]))
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign event: {}", e)))?;
+
+        let spinner = out.spinner("Publishing Round 1 to relay...");
+        client
+            .send_event(&event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+        spinner.finish();
+
+        out.success("Round 1 published to relay");
+        out.field("Event ID", &event.id.to_hex());
+        out.newline();
+
+        let filter = Filter::new()
+            .kind(Kind::Custom(21102))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
+
+        out.info(&format!(
+            "Waiting for {} other participants to publish Round 1...",
+            participants - 1
+        ));
+
+        let mut validated_peers: std::collections::HashMap<u8, PublicKey> =
+            std::collections::HashMap::new();
+        let expected_peers = participants - 1;
+        let timeout = std::time::Duration::from_secs(300);
+        let start = std::time::Instant::now();
+
+        while validated_peers.len() < expected_peers as usize {
+            if start.elapsed() > timeout {
+                return Err(KeepError::Other("Timeout waiting for peer Round 1 data".into()));
+            }
+
+            let events = client
+                .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| KeepError::Other(format!("Fetch failed: {}", e)))?;
+
+            for ev in events.iter() {
+                if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+
+                if let Ok(content) = serde_json::from_str::<serde_json::Value>(&ev.content) {
+                    if let Some(data) = content.get("data").and_then(|d| d.as_str()) {
+                        if let Ok(peer_data) = serde_json::from_str::<serde_json::Value>(data) {
+                            let peer_idx = peer_data.get("participant_index")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u8;
+
+                            if peer_idx > 0 && peer_idx != our_index && !validated_peers.contains_key(&peer_idx) {
+                                match signer.dkg_round1_peer(peer_idx, data) {
+                                    Ok(validated) => {
+                                        if validated {
+                                            validated_peers.insert(peer_idx, ev.pubkey);
+                                            out.success(&format!(
+                                                "Received and validated Round 1 from participant {}",
+                                                peer_idx
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        out.warn(&format!(
+                                            "Failed to validate peer {} data: {}",
+                                            peer_idx, e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if validated_peers.len() < expected_peers as usize {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        out.success(&format!("Collected Round 1 from all {} participants", participants));
+        out.newline();
+
+        let spinner = out.spinner("Generating Round 2 shares...");
+        let shares = signer
+            .dkg_round2()
+            .map_err(|e| KeepError::Other(format!("DKG round 2 failed: {}", e)))?;
+        spinner.finish();
+
+        out.success(&format!("Generated {} shares for other participants", shares.len()));
+
+        for share in &shares {
+            let recipient_pubkey = validated_peers.get(&share.recipient_index).ok_or_else(|| {
+                KeepError::Other(format!(
+                    "No public key found for recipient {}",
+                    share.recipient_index
+                ))
+            })?;
+
+            let share_content = serde_json::json!({
+                "group": group,
+                "round": 2,
+                "sender_index": our_index,
+                "recipient_index": share.recipient_index,
+                "share": share.share,
+            })
+            .to_string();
+
+            let encrypted_content =
+                nip44::encrypt(keys.secret_key(), recipient_pubkey, &share_content, nip44::Version::V2)
+                    .map_err(|e| KeepError::Other(format!("Failed to encrypt share: {}", e)))?;
+
+            let share_event = EventBuilder::new(Kind::Custom(21103), &encrypted_content)
+                .tag(Tag::public_key(*recipient_pubkey))
+                .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
+                .tag(Tag::custom(
+                    TagKind::custom("sender_index"),
+                    vec![our_index.to_string()],
+                ))
+                .tag(Tag::custom(
+                    TagKind::custom("recipient_index"),
+                    vec![share.recipient_index.to_string()],
+                ))
+                .sign_with_keys(&keys)
+                .map_err(|e| KeepError::Other(format!("Failed to sign share event: {}", e)))?;
+
+            client
+                .send_event(&share_event)
+                .await
+                .map_err(|e| KeepError::Other(format!("Failed to publish share: {}", e)))?;
+
+            out.info(&format!(
+                "Published encrypted share for participant {}",
+                share.recipient_index
+            ));
+        }
+
+        out.newline();
+        out.info(&format!(
+            "Waiting for {} shares from other participants...",
+            participants - 1
+        ));
+
+        let share_filter = Filter::new()
+            .kind(Kind::Custom(21103))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
+
+        let mut received_from_peers: std::collections::HashSet<u8> =
+            std::collections::HashSet::new();
+        let start = std::time::Instant::now();
+
+        while received_from_peers.len() < expected_peers as usize {
+            if start.elapsed() > timeout {
+                return Err(KeepError::Other("Timeout waiting for peer shares".into()));
+            }
+
+            let events = client
+                .fetch_events(share_filter.clone(), std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| KeepError::Other(format!("Fetch shares failed: {}", e)))?;
+
+            for ev in events.iter() {
+                if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+
+                let recipient_idx_tag = ev.tags.iter().find_map(|t| {
+                    let tag = t.as_slice();
+                    if tag.first()? == "recipient_index" {
+                        tag.get(1).and_then(|s| s.parse::<u8>().ok())
+                    } else {
+                        None
+                    }
+                });
+
+                if recipient_idx_tag != Some(our_index) {
+                    continue;
+                }
+
+                let decrypted = match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                if let Ok(content) = serde_json::from_str::<serde_json::Value>(&decrypted) {
+                    let sender_idx = content
+                        .get("sender_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u8;
+
+                    if sender_idx > 0 && !received_from_peers.contains(&sender_idx) {
+                        if let Some(share_hex) = content.get("share").and_then(|s| s.as_str()) {
+                            match signer.dkg_receive_share(sender_idx, share_hex) {
+                                Ok(()) => {
+                                    received_from_peers.insert(sender_idx);
+                                    out.success(&format!(
+                                        "Received share from participant {}",
+                                        sender_idx
+                                    ));
+                                }
+                                Err(e) => {
+                                    out.warn(&format!(
+                                        "Failed to process share from {}: {}",
+                                        sender_idx, e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if received_from_peers.len() < expected_peers as usize {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        out.newline();
+        let spinner = out.spinner("Finalizing DKG...");
+        let result = signer
+            .dkg_finalize()
+            .map_err(|e| KeepError::Other(format!("DKG finalize failed: {}", e)))?;
+        spinner.finish();
+
+        out.newline();
+        out.success("DKG Complete!");
+        out.field("Group public key", &result.group_pubkey);
+        out.field("Our index", &result.our_index.to_string());
+        out.newline();
+        out.info("Share has been stored on the hardware device.");
+        out.info(&format!("Group '{}' is now ready for threshold signing.", group));
+
         Ok::<_, KeepError>(())
     })?;
 
