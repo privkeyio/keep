@@ -3,9 +3,8 @@
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
-use zeroize::ZeroizeOnDrop;
 
-use crate::crypto;
+use crate::crypto::{self, MlockedBox};
 use crate::error::{KeepError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,32 +14,30 @@ pub enum KeyType {
     FrostShare,
 }
 
-#[derive(ZeroizeOnDrop)]
 pub struct NostrKeypair {
-    #[zeroize]
-    secret_key: [u8; 32],
+    secret_key: MlockedBox<32>,
     public_key: [u8; 32],
 }
 
 impl NostrKeypair {
     pub fn generate() -> Self {
-        let secret_bytes: [u8; 32] = crypto::random_bytes();
+        let mut secret_bytes: [u8; 32] = crypto::random_bytes();
         let signing_key = SigningKey::from_bytes(&secret_bytes).expect("valid key");
         let verifying_key = signing_key.verifying_key();
 
         Self {
-            secret_key: secret_bytes,
+            secret_key: MlockedBox::new(&mut secret_bytes),
             public_key: verifying_key.to_bytes().into(),
         }
     }
 
-    pub fn from_secret_bytes(secret: &[u8; 32]) -> Result<Self> {
+    pub fn from_secret_bytes(secret: &mut [u8; 32]) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(secret)
             .map_err(|_| KeepError::Other("Invalid secret key".into()))?;
         let verifying_key = signing_key.verifying_key();
 
         Ok(Self {
-            secret_key: *secret,
+            secret_key: MlockedBox::new(secret),
             public_key: verifying_key.to_bytes().into(),
         })
     }
@@ -58,12 +55,12 @@ impl NostrKeypair {
 
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&data);
-        Self::from_secret_bytes(&secret)
+        Self::from_secret_bytes(&mut secret)
     }
 
     pub fn to_nsec(&self) -> String {
         let hrp = Hrp::parse("nsec").unwrap();
-        bech32::encode::<Bech32m>(hrp, &self.secret_key).unwrap()
+        bech32::encode::<Bech32m>(hrp, &*self.secret_key).unwrap()
     }
 
     pub fn to_npub(&self) -> String {
@@ -86,7 +83,7 @@ impl NostrKeypair {
     pub fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         use k256::schnorr::signature::Signer;
 
-        let signing_key = SigningKey::from_bytes(&self.secret_key)
+        let signing_key = SigningKey::from_bytes(&*self.secret_key)
             .map_err(|_| KeepError::Other("Invalid signing key".into()))?;
 
         let signature = signing_key.sign(message);
@@ -96,8 +93,9 @@ impl NostrKeypair {
 
 impl Clone for NostrKeypair {
     fn clone(&self) -> Self {
+        let mut secret_copy = *self.secret_key;
         Self {
-            secret_key: self.secret_key,
+            secret_key: MlockedBox::new(&mut secret_copy),
             public_key: self.public_key,
         }
     }
