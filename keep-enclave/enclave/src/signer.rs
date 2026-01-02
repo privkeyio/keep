@@ -151,7 +151,8 @@ mod mlock {
     unsafe impl Sync for MlockedVec {}
 }
 
-use mlock::{MlockedBox, MlockedVec};
+pub use mlock::MlockedBox;
+use mlock::MlockedVec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PsbtAnalysis {
@@ -241,7 +242,8 @@ impl EnclaveSigner {
     }
 
     pub fn create_kms(&self) -> crate::kms::EnclaveKms {
-        crate::kms::EnclaveKms::new(*self.ephemeral_secret)
+        let mut secret_copy = *self.ephemeral_secret;
+        crate::kms::EnclaveKms::new(&mut secret_copy)
     }
 
     pub fn get_ephemeral_pubkey(&self) -> Result<[u8; 32]> {

@@ -6,6 +6,7 @@ use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::Signature as TaprootSignature;
 use bitcoin::{Address, Network, TxOut, XOnlyPublicKey};
+use keep_core::crypto::MlockedBox;
 
 #[derive(Debug, Clone)]
 pub struct PsbtAnalysis {
@@ -27,14 +28,14 @@ pub struct OutputInfo {
 }
 
 pub struct PsbtSigner {
-    keypair: Keypair,
+    secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
     secp: Secp256k1<bitcoin::secp256k1::All>,
     network: Network,
 }
 
 impl PsbtSigner {
-    pub fn new(secret: &[u8; 32], network: Network) -> Result<Self> {
+    pub fn new(secret: &mut [u8; 32], network: Network) -> Result<Self> {
         let secp = Secp256k1::new();
 
         let keypair = Keypair::from_seckey_slice(&secp, secret)
@@ -43,7 +44,7 @@ impl PsbtSigner {
         let (x_only_pubkey, _parity) = keypair.x_only_public_key();
 
         Ok(Self {
-            keypair,
+            secret: MlockedBox::new(secret),
             x_only_pubkey,
             secp,
             network,
@@ -52,6 +53,11 @@ impl PsbtSigner {
 
     pub fn x_only_public_key(&self) -> XOnlyPublicKey {
         self.x_only_pubkey
+    }
+
+    fn keypair(&self) -> Result<Keypair> {
+        Keypair::from_seckey_slice(&self.secp, &*self.secret)
+            .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))
     }
 
     pub fn analyze(&self, psbt: &Psbt) -> Result<PsbtAnalysis> {
@@ -170,7 +176,8 @@ impl PsbtSigner {
         let msg = Message::from_digest_slice(sighash.as_ref())
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &self.keypair);
+        let keypair = self.keypair()?;
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
         let taproot_sig = TaprootSignature {
             signature: sig,
@@ -227,8 +234,8 @@ mod tests {
 
     #[test]
     fn test_psbt_signer_creation() {
-        let secret = [1u8; 32];
-        let signer = PsbtSigner::new(&secret, Network::Testnet).unwrap();
+        let mut secret = [1u8; 32];
+        let signer = PsbtSigner::new(&mut secret, Network::Testnet).unwrap();
 
         let pubkey = signer.x_only_public_key();
         assert_eq!(pubkey.serialize().len(), 32);

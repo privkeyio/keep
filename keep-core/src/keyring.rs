@@ -33,7 +33,8 @@ impl KeySlot {
     }
 
     pub fn to_nostr_keypair(&self) -> Result<NostrKeypair> {
-        NostrKeypair::from_secret_bytes(self.secret.expose_secret())
+        let mut secret_copy = *self.secret.expose_secret();
+        NostrKeypair::from_secret_bytes(&mut secret_copy)
     }
 }
 
