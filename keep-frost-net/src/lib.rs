@@ -53,6 +53,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod error;
 mod event;
 mod node;
@@ -62,6 +63,7 @@ pub mod proof;
 mod protocol;
 mod session;
 
+pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks};

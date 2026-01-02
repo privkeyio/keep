@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use keep_core::frost::SharePackage;
 
+use crate::audit::{SigningAuditLog, SigningOperation};
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
@@ -135,6 +136,7 @@ pub struct KfpNode {
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
     replay_window_secs: u64,
+    audit_log: Arc<SigningAuditLog>,
 }
 
 impl KfpNode {
@@ -191,6 +193,9 @@ impl KfpNode {
             None => SessionManager::new(),
         };
 
+        let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
+        let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
+
         Ok(Self {
             keys,
             client,
@@ -204,6 +209,7 @@ impl KfpNode {
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
+            audit_log,
         })
     }
 
@@ -225,6 +231,10 @@ impl KfpNode {
 
     pub fn subscribe(&self) -> broadcast::Receiver<KfpNodeEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn audit_log(&self) -> &SigningAuditLog {
+        &self.audit_log
     }
 
     pub fn online_peers(&self) -> usize {
@@ -733,6 +743,15 @@ impl KfpNode {
             "Sent commitment"
         );
 
+        self.audit_log.log_signing_operation(
+            request.session_id,
+            &request.message,
+            None,
+            request.participants,
+            self.share.metadata.identifier,
+            SigningOperation::CommitmentSent,
+        );
+
         Ok(())
     }
 
@@ -826,11 +845,11 @@ impl KfpNode {
             share_bytes.to_vec(),
         );
 
-        let session_participants: Vec<u16> = {
+        let (session_participants, session_message): (Vec<u16>, Vec<u8>) = {
             let sessions = self.sessions.read();
             sessions
                 .get_session(session_id)
-                .map(|s| s.participants().to_vec())
+                .map(|s| (s.participants().to_vec(), s.message().to_vec()))
                 .unwrap_or_default()
         };
 
@@ -852,6 +871,15 @@ impl KfpNode {
         }
 
         debug!(session_id = %hex::encode(session_id), "Sent signature share");
+
+        self.audit_log.log_signing_operation(
+            *session_id,
+            &session_message,
+            None,
+            session_participants,
+            self.share.metadata.identifier,
+            SigningOperation::SignatureShareSent,
+        );
 
         Ok(())
     }
@@ -891,27 +919,41 @@ impl KfpNode {
 
         self.peers.write().update_last_seen(payload.share_index);
 
-        let signature = {
+        let (signature, session_message, session_participants) = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(&payload.session_id) {
                 Some(s) => s,
                 None => return Ok(()),
             };
 
+            let msg = session.message().to_vec();
+            let parts = session.participants().to_vec();
+
             session.add_signature_share(payload.share_index, sig_share)?;
 
-            if session.has_all_shares() {
+            let sig = if session.has_all_shares() {
                 let pubkey_pkg = self.share.pubkey_package()?;
                 session.try_aggregate(&pubkey_pkg)?
             } else {
                 None
-            }
+            };
+
+            (sig, msg, parts)
         };
 
         if let Some(sig) = signature {
             info!(
                 session_id = %hex::encode(payload.session_id),
                 "Signature complete!"
+            );
+
+            self.audit_log.log_signing_operation(
+                payload.session_id,
+                &session_message,
+                Some(&sig),
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureCompleted,
             );
 
             self.invoke_post_sign_hook(&payload.session_id, &sig);
@@ -951,6 +993,23 @@ impl KfpNode {
         info!(
             session_id = %hex::encode(payload.session_id),
             "Received completed signature"
+        );
+
+        let (session_message, session_participants) = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&payload.session_id)
+                .map(|s| (s.message().to_vec(), s.participants().to_vec()))
+                .unwrap_or_default()
+        };
+
+        self.audit_log.log_signing_operation(
+            payload.session_id,
+            &session_message,
+            Some(&payload.signature),
+            session_participants,
+            self.share.metadata.identifier,
+            SigningOperation::SignatureReceived,
         );
 
         self.invoke_post_sign_hook(&payload.session_id, &payload.signature);
@@ -999,6 +1058,15 @@ impl KfpNode {
             session_id = %hex::encode(session_id),
             participants = ?participants,
             "Initiating signing request"
+        );
+
+        self.audit_log.log_signing_operation(
+            session_id,
+            &message,
+            None,
+            participants.clone(),
+            self.share.metadata.identifier,
+            SigningOperation::SignRequestInitiated,
         );
 
         let request = SignRequestPayload::new(
@@ -1072,7 +1140,7 @@ impl KfpNode {
         let mut rx = self.event_tx.subscribe();
         let timeout = Duration::from_secs(30);
 
-        match tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 match rx.recv().await {
                     Ok(KfpNodeEvent::SignatureComplete {
@@ -1098,9 +1166,10 @@ impl KfpNode {
                 }
             }
         })
-        .await
-        {
-            Ok(result) => result,
+        .await;
+
+        match result {
+            Ok(r) => r,
             Err(_) => Err(FrostNetError::Timeout("Signing request timed out".into())),
         }
     }
@@ -1157,6 +1226,14 @@ fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
     let secret_key = SecretKey::from_slice(&derived)
         .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {}", e)))?;
     Ok(Keys::new(secret_key))
+}
+
+fn derive_audit_hmac_key(keys: &Keys, group_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep-frost-audit-hmac-v1");
+    hasher.update(keys.secret_key().secret_bytes());
+    hasher.update(group_pubkey);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
