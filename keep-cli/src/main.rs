@@ -1648,6 +1648,13 @@ fn cmd_frost_generate(
 ) -> Result<()> {
     debug!(threshold, total_shares, name, "generating FROST key");
 
+    out.newline();
+    out.warn("WARNING: Trusted dealer mode - for testing/development only.");
+    out.warn("The full private key exists on this machine during generation.");
+    out.warn("For production, use 'keep frost network dkg' for distributed key generation");
+    out.warn("where the full key never exists on any single device.");
+    out.newline();
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 

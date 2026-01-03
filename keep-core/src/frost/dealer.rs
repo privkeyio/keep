@@ -47,6 +47,15 @@ impl ThresholdConfig {
     }
 }
 
+/// **WARNING: Testing/development only. Do not use in production.**
+///
+/// The trusted dealer approach generates the full private key on a single machine during
+/// key generation, which creates a single point of compromise. If that machine is breached
+/// during generation, all funds are at risk.
+///
+/// For production use, use distributed key generation (`keep frost network dkg`) where each
+/// participant contributes entropy independently and the full private key is never computed
+/// or exists on any single device.
 pub struct TrustedDealer {
     config: ThresholdConfig,
 }
