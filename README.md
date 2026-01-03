@@ -172,6 +172,17 @@ keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol -
 
 Generate threshold keys without any single party knowing the full private key. Each participant runs independently and coordinates via Nostr relay.
 
+**Security: DKG vs Trusted Dealer**
+
+| Aspect | Trusted Dealer (`frost generate`) | Distributed DKG (`frost network dkg`) |
+|--------|-----------------------------------|---------------------------------------|
+| Key exposure | Full key exists on one machine | Full key never exists anywhere |
+| Entropy source | Single machine | All participants contribute |
+| Compromise risk | Single point of failure | Requires threshold breach |
+| Use case | Testing/development | Production |
+
+The trusted dealer approach (`keep frost generate`) generates the full private key on a single machine. If that machine is compromised during generation, all funds are at risk. Distributed DKG ensures the complete key is never computed—each participant generates their share from independent entropy, so no single device ever holds enough information to reconstruct the key.
+
 ```bash
 # Participant 1 (on first device)
 keep frost network dkg \
