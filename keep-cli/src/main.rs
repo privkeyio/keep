@@ -1913,7 +1913,11 @@ async fn check_warden_policy(
 
     out.info("Checking Warden policy...");
 
-    let result = check_policy(warden_url, group_npub, message_hex, 0, None).await?;
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("operation".to_string(), serde_json::json!("frost_sign"));
+    metadata.insert("message_hash".to_string(), serde_json::json!(message_hex));
+
+    let result = check_policy(warden_url, group_npub, "", 0, Some(metadata)).await?;
 
     match result {
         PolicyCheckResult::Allowed => {
