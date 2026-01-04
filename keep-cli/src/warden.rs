@@ -220,23 +220,33 @@ pub async fn wait_for_approval(
             .await
             .map_err(|e| KeepError::Other(format!("Workflow status check failed: {}", e)))?;
 
-        if response.status().is_success() {
-            #[derive(Deserialize)]
-            struct WorkflowStatus {
-                status: String,
-            }
-
-            let status: WorkflowStatus = response
-                .json()
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
                 .await
-                .map_err(|e| KeepError::Other(format!("Failed to parse status: {}", e)))?;
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            return Err(KeepError::Other(format!(
+                "Workflow status check failed: status={} body={}",
+                status, body
+            )));
+        }
 
-            match status.status.as_str() {
-                "approved" => return Ok(true),
-                "denied" | "rejected" => return Ok(false),
-                "expired" => return Err(KeepError::Other("Approval workflow expired".to_string())),
-                _ => {}
-            }
+        #[derive(Deserialize)]
+        struct WorkflowStatus {
+            status: String,
+        }
+
+        let status: WorkflowStatus = response
+            .json()
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to parse status: {}", e)))?;
+
+        match status.status.as_str() {
+            "approved" => return Ok(true),
+            "denied" | "rejected" => return Ok(false),
+            "expired" => return Err(KeepError::Other("Approval workflow expired".to_string())),
+            _ => {}
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
