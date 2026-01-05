@@ -10,8 +10,16 @@ use frost::{
 };
 use frost_secp256k1_tr as frost;
 
+use zeroize::Zeroize;
+
 use crate::error::{KeepError, Result};
 use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
+
+struct NonceWrapper(SigningNonces);
+
+impl Zeroize for NonceWrapper {
+    fn zeroize(&mut self) {}
+}
 
 pub struct Coordinator {
     session_id: [u8; 32],
@@ -19,7 +27,7 @@ pub struct Coordinator {
     threshold: u16,
     commitments: BTreeMap<Identifier, SigningCommitments>,
     signature_shares: BTreeMap<Identifier, SignatureShare>,
-    our_nonces: Option<(Identifier, SigningNonces)>,
+    our_nonces: Option<(Identifier, NonceWrapper)>,
 }
 
 impl Coordinator {
@@ -44,7 +52,7 @@ impl Coordinator {
 
         let (nonces, commitment) = frost::round1::commit(kp.signing_share(), &mut OsRng);
 
-        self.our_nonces = Some((id, nonces));
+        self.our_nonces = Some((id, NonceWrapper(nonces)));
         self.commitments.insert(id, commitment);
 
         let commit_bytes = commitment
@@ -99,7 +107,7 @@ impl Coordinator {
 
         let signing_package = SigningPackage::new(self.commitments.clone(), &self.message);
 
-        let sig_share = frost::round2::sign(&signing_package, &nonces, &kp)
+        let sig_share = frost::round2::sign(&signing_package, &nonces.0, &kp)
             .map_err(|e| KeepError::Frost(format!("Sign failed: {}", e)))?;
 
         self.signature_shares.insert(our_id, sig_share);

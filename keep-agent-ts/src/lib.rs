@@ -362,7 +362,7 @@ impl KeepAgentSession {
             .check_operation(&Operation::SignPsbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let secret = self
+        let mut secret = self
             .secret_key
             .ok_or_else(|| Error::from_reason("No secret key configured"))?;
 
@@ -376,7 +376,7 @@ impl KeepAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(&psbt_base64)
             .map_err(|e| Error::from_reason(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let analysis = signer
@@ -446,7 +446,7 @@ impl KeepAgentSession {
             .check_operation(&Operation::GetBitcoinAddress)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let secret = self
+        let mut secret = self
             .secret_key
             .ok_or_else(|| Error::from_reason("No secret key configured"))?;
 
@@ -457,7 +457,7 @@ impl KeepAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         signer

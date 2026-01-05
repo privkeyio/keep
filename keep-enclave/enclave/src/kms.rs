@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{EnclaveError, Result};
+use crate::signer::MlockedBox;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedWallet {
@@ -15,19 +16,20 @@ pub struct EncryptedWallet {
     pub nonce: [u8; 12],
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct EnclaveKms {
-    ephemeral_secret: [u8; 32],
+    ephemeral_secret: MlockedBox<32>,
 }
 
 impl EnclaveKms {
-    pub fn new(ephemeral_secret: [u8; 32]) -> Self {
-        Self { ephemeral_secret }
+    pub fn new(ephemeral_secret: &mut [u8; 32]) -> Self {
+        Self {
+            ephemeral_secret: MlockedBox::new(ephemeral_secret),
+        }
     }
 
     pub fn ephemeral_pubkey(&self) -> Result<[u8; 32]> {
         use k256::schnorr::SigningKey;
-        let sk = SigningKey::from_bytes(&self.ephemeral_secret)
+        let sk = SigningKey::from_bytes(&*self.ephemeral_secret)
             .map_err(|e| EnclaveError::InvalidKey(format!("Invalid ephemeral secret: {}", e)))?;
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
@@ -107,7 +109,7 @@ impl EnclaveKms {
         let nonce = Nonce::from_slice(&encrypted_key[..12]);
         let ciphertext = &encrypted_key[12..];
 
-        let cipher = Aes256Gcm::new_from_slice(&self.ephemeral_secret)
+        let cipher = Aes256Gcm::new_from_slice(&*self.ephemeral_secret)
             .map_err(|e| EnclaveError::Kms(format!("Invalid ephemeral key: {}", e)))?;
 
         cipher
@@ -139,14 +141,15 @@ mod tests {
 
     #[test]
     fn test_mock_decrypt_roundtrip() {
-        let ephemeral_secret = [42u8; 32];
-        let kms = EnclaveKms::new(ephemeral_secret);
+        let mut ephemeral_secret = [42u8; 32];
+        let ephemeral_secret_copy = ephemeral_secret;
+        let kms = EnclaveKms::new(&mut ephemeral_secret);
 
         let data_key = [99u8; 32];
         let wallet_key = b"my_secret_wallet_key_32_bytes!!!";
         let nonce: [u8; 12] = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
 
-        let encrypted_data_key = encrypt_data_key(&ephemeral_secret, &data_key);
+        let encrypted_data_key = encrypt_data_key(&ephemeral_secret_copy, &data_key);
         let encrypted_wallet_key = encrypt_wallet_key(&data_key, wallet_key, &nonce);
 
         let encrypted = EncryptedWallet {
@@ -162,8 +165,8 @@ mod tests {
     #[test]
     fn test_wrong_ephemeral_key_fails() {
         let ephemeral_secret = [42u8; 32];
-        let wrong_secret = [99u8; 32];
-        let kms = EnclaveKms::new(wrong_secret);
+        let mut wrong_secret = [99u8; 32];
+        let kms = EnclaveKms::new(&mut wrong_secret);
 
         let data_key = [88u8; 32];
         let wallet_key = b"secret";

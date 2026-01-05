@@ -14,7 +14,7 @@ pub struct DescriptorExport {
 impl DescriptorExport {
     pub fn from_derivation(derivation: &AddressDerivation, account: u32) -> Result<Self> {
         let network = derivation.network();
-        let fingerprint = derivation.master_fingerprint();
+        let fingerprint = derivation.master_fingerprint()?;
         let xpub = derivation.account_xpub(account)?;
 
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };

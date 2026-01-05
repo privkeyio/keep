@@ -24,9 +24,9 @@ pub struct SigningPolicy {
 }
 
 impl BitcoinSigner {
-    pub fn new(secret: [u8; 32], network: Network) -> Result<Self> {
-        let address_derivation = AddressDerivation::new(&secret, network)?;
-        let psbt_signer = PsbtSigner::new(&secret, network)?;
+    pub fn new(secret: &mut [u8; 32], network: Network) -> Result<Self> {
+        let address_derivation = AddressDerivation::new(secret, network)?;
+        let psbt_signer = PsbtSigner::new(secret, network)?;
 
         Ok(Self {
             network,
@@ -149,8 +149,8 @@ impl BitcoinSigner {
         self.psbt_signer.x_only_public_key().serialize()
     }
 
-    pub fn fingerprint(&self) -> String {
-        self.address_derivation.master_fingerprint().to_string()
+    pub fn fingerprint(&self) -> Result<String> {
+        Ok(self.address_derivation.master_fingerprint()?.to_string())
     }
 }
 
@@ -160,8 +160,8 @@ mod tests {
 
     #[test]
     fn test_bitcoin_signer() {
-        let secret = [1u8; 32];
-        let signer = BitcoinSigner::new(secret, Network::Testnet).unwrap();
+        let mut secret = [1u8; 32];
+        let signer = BitcoinSigner::new(&mut secret, Network::Testnet).unwrap();
 
         let addr = signer.get_receive_address(0).unwrap();
         assert!(addr.starts_with("tb1p"));
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_signer_with_policy() {
-        let secret = [2u8; 32];
+        let mut secret = [2u8; 32];
         let policy = SigningPolicy {
             max_amount_sats: Some(100_000),
             address_allowlist: None,
@@ -177,7 +177,7 @@ mod tests {
             require_change_output: false,
         };
 
-        let signer = BitcoinSigner::new(secret, Network::Testnet)
+        let signer = BitcoinSigner::new(&mut secret, Network::Testnet)
             .unwrap()
             .with_policy(policy);
 
@@ -186,8 +186,8 @@ mod tests {
 
     #[test]
     fn test_export_descriptor() {
-        let secret = [3u8; 32];
-        let signer = BitcoinSigner::new(secret, Network::Testnet).unwrap();
+        let mut secret = [3u8; 32];
+        let signer = BitcoinSigner::new(&mut secret, Network::Testnet).unwrap();
 
         let export = signer.export_descriptor(0).unwrap();
         assert!(export.descriptor.contains("tr("));
@@ -195,8 +195,8 @@ mod tests {
 
     #[test]
     fn test_multiple_addresses() {
-        let secret = [4u8; 32];
-        let signer = BitcoinSigner::new(secret, Network::Testnet).unwrap();
+        let mut secret = [4u8; 32];
+        let signer = BitcoinSigner::new(&mut secret, Network::Testnet).unwrap();
 
         let addresses = signer.get_addresses(5).unwrap();
         assert_eq!(addresses.len(), 5);

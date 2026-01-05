@@ -2586,8 +2586,7 @@ fn cmd_export_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     let mut secret = [0u8; 32];
     let decrypted = secret_bytes.as_slice()?;
     secret.copy_from_slice(&decrypted);
-    let keypair = NostrKeypair::from_secret_bytes(&secret)?;
-    secret.zeroize();
+    let keypair = NostrKeypair::from_secret_bytes(&mut secret)?;
 
     out.secret_warning();
     out.newline();
@@ -2628,8 +2627,7 @@ fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     let mut secret = [0u8; 32];
     let decrypted = secret_bytes.as_slice()?;
     secret.copy_from_slice(&decrypted);
-    let keypair = NostrKeypair::from_secret_bytes(&secret)?;
-    secret.zeroize();
+    let keypair = NostrKeypair::from_secret_bytes(&mut secret)?;
 
     out.secret_warning();
     out.newline();
@@ -3189,9 +3187,8 @@ fn cmd_bitcoin_address(
     let mut secret = *slot.expose_secret();
     let net = parse_network(network)?;
 
-    let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
+    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
-    secret.zeroize();
 
     out.newline();
     out.header("Bitcoin Addresses (BIP-86 Taproot)");
@@ -3231,9 +3228,8 @@ fn cmd_bitcoin_descriptor(
     let mut secret = *slot.expose_secret();
     let net = parse_network(network)?;
 
-    let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
+    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
-    secret.zeroize();
 
     let export = signer
         .export_descriptor(account)
@@ -3281,9 +3277,8 @@ fn cmd_bitcoin_sign(
     let mut secret = *slot.expose_secret();
     let net = parse_network(network)?;
 
-    let signer = keep_bitcoin::BitcoinSigner::new(secret, net)
+    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
-    secret.zeroize();
 
     let psbt_data = std::fs::read_to_string(psbt_path)
         .map_err(|e| KeepError::Other(format!("Failed to read PSBT: {}", e)))?;
@@ -3323,8 +3318,8 @@ fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<(
         .map_err(|e| KeepError::Other(e.to_string()))?;
 
     let net = parse_network(network)?;
-    let dummy_secret = [1u8; 32];
-    let signer = keep_bitcoin::BitcoinSigner::new(dummy_secret, net)
+    let mut dummy_secret = [1u8; 32];
+    let signer = keep_bitcoin::BitcoinSigner::new(&mut dummy_secret, net)
         .map_err(|e| KeepError::Other(e.to_string()))?;
 
     let analysis = signer
