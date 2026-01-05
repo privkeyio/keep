@@ -6,7 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-use rand::rngs::OsRng;
 use rand::RngCore;
 
 #[cfg(all(target_os = "linux", feature = "enclave"))]
@@ -53,7 +52,7 @@ pub fn get_entropy<const N: usize>() -> [u8; N] {
         return buf;
     }
 
-    OsRng.fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 
