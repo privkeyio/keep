@@ -1909,7 +1909,9 @@ async fn check_warden_policy(
     group_npub: &str,
     message_hex: &str,
 ) -> Result<()> {
-    use crate::warden::{check_policy, wait_for_approval, PolicyCheckResult};
+    use crate::warden::{check_policy, get_warden_token, wait_for_approval, PolicyCheckResult};
+
+    let token = get_warden_token();
 
     out.info("Checking Warden policy...");
 
@@ -1917,7 +1919,7 @@ async fn check_warden_policy(
     metadata.insert("operation".to_string(), serde_json::json!("frost_sign"));
     metadata.insert("message_hash".to_string(), serde_json::json!(message_hex));
 
-    let result = check_policy(warden_url, group_npub, "", 0, Some(metadata)).await?;
+    let result = check_policy(warden_url, token.clone(), group_npub, "", 0, Some(metadata)).await?;
 
     match result {
         PolicyCheckResult::Allowed => {
@@ -1962,7 +1964,7 @@ async fn check_warden_policy(
 
             let spinner = out.spinner("Waiting for approval...");
 
-            match wait_for_approval(warden_url, transaction_id, MAX_WAIT_SECS).await {
+            match wait_for_approval(warden_url, token, transaction_id, MAX_WAIT_SECS).await {
                 Ok(true) => {
                     spinner.finish();
                     out.success("Approval granted");

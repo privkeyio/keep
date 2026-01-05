@@ -81,26 +81,33 @@ pub struct EvaluationResult {
 pub struct WardenClient {
     base_url: String,
     client: Client,
+    token: Option<String>,
 }
 
 impl WardenClient {
-    pub fn new(base_url: &str) -> Result<Self> {
+    pub fn new(base_url: &str, token: Option<String>) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| KeepError::Other(format!("Failed to create HTTP client: {}", e)))?;
 
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            client,
+            token,
+        })
     }
 
     pub async fn evaluate(&self, request: &TransactionRequest) -> Result<EvaluationResult> {
         let url = format!("{}/v1/policies/evaluate", self.base_url);
 
-        let response = self
-            .client
-            .post(&url)
-            .json(request)
+        let mut req = self.client.post(&url).json(request);
+        if let Some(ref token) = self.token {
+            req = req.bearer_auth(token);
+        }
+
+        let response = req
             .send()
             .await
             .map_err(|e| KeepError::Other(format!("Warden request failed: {}", e)))?;
@@ -138,14 +145,19 @@ pub enum PolicyCheckResult {
     },
 }
 
+pub fn get_warden_token() -> Option<String> {
+    std::env::var("WARDEN_TOKEN").ok()
+}
+
 pub async fn check_policy(
     warden_url: &str,
+    token: Option<String>,
     source_wallet: &str,
     destination: &str,
     amount_sats: u64,
     metadata: Option<HashMap<String, serde_json::Value>>,
 ) -> Result<PolicyCheckResult> {
-    let client = WardenClient::new(warden_url)?;
+    let client = WardenClient::new(warden_url, token)?;
 
     let mut request = TransactionRequest::new(
         source_wallet.to_string(),
@@ -178,10 +190,11 @@ pub async fn check_policy(
 
 pub async fn wait_for_approval(
     warden_url: &str,
+    token: Option<String>,
     transaction_id: Uuid,
     timeout_secs: u64,
 ) -> Result<bool> {
-    let client = WardenClient::new(warden_url)?;
+    let client = WardenClient::new(warden_url, token)?;
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -196,9 +209,12 @@ pub async fn wait_for_approval(
             client.base_url, transaction_id
         );
 
-        let response = client
-            .client
-            .get(&url)
+        let mut req = client.client.get(&url);
+        if let Some(ref token) = client.token {
+            req = req.bearer_auth(token);
+        }
+
+        let response = req
             .send()
             .await
             .map_err(|e| KeepError::Other(format!("Workflow status check failed: {}", e)))?;
