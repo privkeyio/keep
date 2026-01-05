@@ -240,6 +240,18 @@ enum FrostNetworkCommands {
             help = "Warden URL for policy check (e.g., http://localhost:3000)"
         )]
         warden_url: Option<String>,
+        #[arg(
+            short,
+            long,
+            help = "Signature threshold (required for hardware signing)"
+        )]
+        threshold: Option<u16>,
+        #[arg(
+            short = 'n',
+            long,
+            help = "Total participants (required for hardware signing)"
+        )]
+        participants: Option<u16>,
     },
     SignEvent {
         #[arg(short, long)]
@@ -254,6 +266,38 @@ enum FrostNetworkCommands {
         share: Option<u16>,
         #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
         hardware: Option<String>,
+    },
+    GroupCreate {
+        #[arg(long, help = "Group name/identifier")]
+        name: String,
+        #[arg(short, long, help = "Signature threshold (t in t-of-n)")]
+        threshold: u8,
+        #[arg(short = 'n', long, help = "Total participants")]
+        participants: u8,
+        #[arg(
+            short,
+            long,
+            default_value = "wss://nos.lol",
+            help = "Relay URLs (can specify multiple)"
+        )]
+        relay: Vec<String>,
+        #[arg(long, help = "Participant npubs (can specify multiple)")]
+        participant_npub: Vec<String>,
+    },
+    NoncePrecommit {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long, default_value = "wss://nos.lol")]
+        relay: String,
+        #[arg(long, help = "Hardware signer device path")]
+        hardware: String,
+        #[arg(
+            short,
+            long,
+            default_value = "10",
+            help = "Number of nonces to pre-generate"
+        )]
+        count: u32,
     },
 }
 
@@ -597,6 +641,8 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             share,
             hardware,
             warden_url,
+            threshold,
+            participants,
         } => cmd_frost_network_sign(
             out,
             path,
@@ -606,6 +652,8 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             share,
             hardware.as_deref(),
             warden_url.as_deref(),
+            threshold,
+            participants,
         ),
         FrostNetworkCommands::SignEvent {
             group,
@@ -624,6 +672,26 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             share,
             hardware.as_deref(),
         ),
+        FrostNetworkCommands::GroupCreate {
+            name,
+            threshold,
+            participants,
+            relay,
+            participant_npub,
+        } => cmd_frost_network_group_create(
+            out,
+            &name,
+            threshold,
+            participants,
+            &relay,
+            &participant_npub,
+        ),
+        FrostNetworkCommands::NoncePrecommit {
+            group,
+            relay,
+            hardware,
+            count,
+        } => cmd_frost_network_nonce_precommit(out, path, &group, &relay, &hardware, count),
     }
 }
 
@@ -1055,9 +1123,40 @@ fn cmd_frost_network_sign(
     share_index: Option<u16>,
     hardware: Option<&str>,
     warden_url: Option<&str>,
+    threshold: Option<u16>,
+    participants: Option<u16>,
 ) -> Result<()> {
     if let Some(device) = hardware {
-        return cmd_frost_network_sign_hardware(out, group_npub, message, relay, device);
+        let (threshold, participants) = match (threshold, participants) {
+            (Some(t), Some(p)) => (t, p),
+            _ => {
+                let mut signer = crate::signer::HardwareSigner::new(device)
+                    .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+                let info = signer
+                    .get_share_info(group_npub)
+                    .map_err(|e| KeepError::Other(format!("Failed to get share info: {}", e)))?;
+                (
+                    threshold.unwrap_or(info.threshold),
+                    participants.unwrap_or(info.participants),
+                )
+            }
+        };
+        if threshold < 2 || threshold > participants {
+            return Err(KeepError::Other(format!(
+                "Invalid threshold: must be 2 <= threshold ({}) <= participants ({})",
+                threshold, participants
+            )));
+        }
+        return cmd_frost_network_sign_hardware(
+            out,
+            path,
+            group_npub,
+            message,
+            relay,
+            device,
+            threshold,
+            participants,
+        );
     }
 
     // Check warden policy FIRST before touching vault
@@ -1163,14 +1262,19 @@ fn cmd_frost_network_sign(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_frost_network_sign_hardware(
     out: &Output,
+    path: &Path,
     group_npub: &str,
     message: &str,
-    _relay: &str,
+    relay: &str,
     device: &str,
+    threshold: u16,
+    participants: u16,
 ) -> Result<()> {
-    use crate::signer::HardwareSigner;
+    use crate::signer::{HardwareSigner, NonceStore};
+    use nostr_sdk::prelude::*;
 
     let message_bytes =
         hex::decode(message).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
@@ -1187,11 +1291,20 @@ fn cmd_frost_network_sign_hardware(
     let session_id: [u8; 32] = rand::random();
 
     out.newline();
-    out.header("FROST Hardware Sign");
+    out.header("FROST Hardware Sign via Relay");
     out.field("Device", device);
     out.field("Group", group_npub);
     out.field("Message", message);
+    out.field("Relay", relay);
     out.newline();
+
+    let mut nonce_store = NonceStore::open(path)
+        .map_err(|e| KeepError::Other(format!("Failed to open nonce store: {}", e)))?;
+    let (available, used) = nonce_store.nonce_stats(group_npub);
+    out.info(&format!(
+        "Nonce status: {} available, {} used",
+        available, used
+    ));
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device)
@@ -1206,20 +1319,349 @@ fn cmd_frost_network_sign_hardware(
     out.field("Hardware version", &version);
 
     let spinner = out.spinner("Creating commitment (round 1)...");
-    let (commitment, index) = signer
+    let (commitment, our_index) = signer
         .frost_commit(group_npub, &session_id, &message_arr)
         .map_err(|e| KeepError::Other(format!("Commitment failed: {}", e)))?;
     spinner.finish();
 
-    out.field("Share index", &index.to_string());
-    out.field("Commitment", &hex::encode(&commitment));
+    let commitment_hex = hex::encode(&commitment);
+
+    if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
+        return Err(KeepError::Other(
+            "SECURITY: Nonce has already been used. Aborting to prevent key compromise.".into(),
+        ));
+    }
+
+    nonce_store
+        .add_nonce(group_npub, &commitment_hex)
+        .map_err(|e| KeepError::Other(format!("Failed to track nonce: {}", e)))?;
+
+    if our_index == 0 || our_index > participants {
+        return Err(KeepError::Other(format!(
+            "Hardware returned invalid share index {}, expected 1..={}",
+            our_index, participants
+        )));
+    }
+
+    out.field("Share index", &our_index.to_string());
+    out.field("Commitment", &commitment_hex);
+    out.field("Session ID", &hex::encode(session_id));
     out.newline();
 
-    out.info("Round 1 complete. Commitment generated.");
-    out.info("To complete signing, collect commitments from other signers");
-    out.info("and call frost_sign with the aggregated commitments.");
-    out.newline();
-    out.field("Session ID", &hex::encode(session_id));
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        let keys = Keys::generate();
+        let client = Client::new(keys.clone());
+        client
+            .add_relay(relay)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+        client.connect().await;
+
+        out.info("Connected to relay");
+        out.field(
+            "Node pubkey",
+            &keys.public_key().to_bech32().unwrap_or_default(),
+        );
+        out.newline();
+
+        let request_content = serde_json::json!({
+            "message_type": "raw",
+            "payload": message,
+            "request_id": hex::encode(session_id),
+        })
+        .to_string();
+
+        let request_event = EventBuilder::new(Kind::Custom(21104), &request_content)
+            .tag(Tag::custom(
+                TagKind::custom("d"),
+                vec![group_npub.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("request_id"),
+                vec![hex::encode(session_id)],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("message_type"),
+                vec!["raw".to_string()],
+            ))
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign request: {}", e)))?;
+
+        let spinner = out.spinner("Publishing sign request (Kind 21104)...");
+        client
+            .send_event(&request_event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish request: {}", e)))?;
+        spinner.finish();
+        out.field("Request Event ID", &request_event.id.to_hex());
+
+        let response_content = serde_json::json!({
+            "request_id": hex::encode(session_id),
+            "participant_index": our_index,
+            "commitment": hex::encode(&commitment),
+        })
+        .to_string();
+
+        let response_event = EventBuilder::new(Kind::Custom(21105), &response_content)
+            .tag(Tag::custom(
+                TagKind::custom("e"),
+                vec![
+                    request_event.id.to_hex(),
+                    relay.to_string(),
+                    "reply".to_string(),
+                ],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("request_id"),
+                vec![hex::encode(session_id)],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("participant_index"),
+                vec![our_index.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("status"),
+                vec!["commitment".to_string()],
+            ))
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign response: {}", e)))?;
+
+        let spinner = out.spinner("Publishing our commitment (Kind 21105)...");
+        client
+            .send_event(&response_event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish commitment: {}", e)))?;
+        spinner.finish();
+
+        let filter = Filter::new().kind(Kind::Custom(21105)).custom_tag(
+            SingleLetterTag::lowercase(Alphabet::E),
+            request_event.id.to_hex(),
+        );
+
+        out.info("Waiting for peer commitments...");
+        out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+        let mut peer_commitments: std::collections::HashMap<u16, String> =
+            std::collections::HashMap::new();
+        peer_commitments.insert(our_index, hex::encode(&commitment));
+
+        let timeout = std::time::Duration::from_secs(120);
+        let start = std::time::Instant::now();
+
+        while peer_commitments.len() < threshold as usize {
+            if start.elapsed() > timeout {
+                return Err(KeepError::Other(
+                    "Timeout waiting for peer commitments".into(),
+                ));
+            }
+
+            let events = client
+                .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| KeepError::Other(format!("Fetch failed: {}", e)))?;
+
+            let our_session_id_hex = hex::encode(session_id);
+            for ev in events.iter() {
+                if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+
+                if let Ok(content) = serde_json::from_str::<serde_json::Value>(&ev.content) {
+                    let peer_request_id = content
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if peer_request_id != our_session_id_hex {
+                        continue;
+                    }
+
+                    let peer_idx = content
+                        .get("participant_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16;
+                    let peer_commitment = content
+                        .get("commitment")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if peer_idx == 0 || peer_idx > participants {
+                        continue;
+                    }
+                    if peer_commitment.is_empty() || hex::decode(peer_commitment).is_err() {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        peer_commitments.entry(peer_idx)
+                    {
+                        e.insert(peer_commitment.to_string());
+                        out.success(&format!(
+                            "Received commitment from participant {}",
+                            peer_idx
+                        ));
+                    }
+                }
+            }
+
+            if peer_commitments.len() < threshold as usize {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        out.newline();
+        out.success(&format!("Collected {} commitments", peer_commitments.len()));
+
+        let mut sorted_indices: Vec<u16> = peer_commitments.keys().copied().collect();
+        sorted_indices.sort();
+        let commitments_str: String = sorted_indices
+            .iter()
+            .map(|idx| format!("{}:{}", idx, peer_commitments.get(idx).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let spinner = out.spinner("Generating signature share (round 2)...");
+        let (sig_share, _) = signer
+            .frost_sign(group_npub, &session_id, &commitments_str)
+            .map_err(|e| KeepError::Other(format!("Signing failed: {}", e)))?;
+        spinner.finish();
+
+        out.field("Signature share", &hex::encode(&sig_share));
+
+        let share_content = serde_json::json!({
+            "request_id": hex::encode(session_id),
+            "participant_index": our_index,
+            "partial_signature": hex::encode(&sig_share),
+        })
+        .to_string();
+
+        let share_event = EventBuilder::new(Kind::Custom(21105), &share_content)
+            .tag(Tag::custom(
+                TagKind::custom("e"),
+                vec![
+                    request_event.id.to_hex(),
+                    relay.to_string(),
+                    "reply".to_string(),
+                ],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("request_id"),
+                vec![hex::encode(session_id)],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("participant_index"),
+                vec![our_index.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("status"),
+                vec!["signed".to_string()],
+            ))
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign share event: {}", e)))?;
+
+        let spinner = out.spinner("Publishing signature share...");
+        client
+            .send_event(&share_event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish share: {}", e)))?;
+        spinner.finish();
+
+        out.info("Waiting for peer signature shares...");
+        let mut peer_shares: std::collections::HashMap<u16, String> =
+            std::collections::HashMap::new();
+        peer_shares.insert(our_index, hex::encode(&sig_share));
+        let start = std::time::Instant::now();
+
+        while peer_shares.len() < threshold as usize {
+            if start.elapsed() > timeout {
+                return Err(KeepError::Other(
+                    "Timeout waiting for peer signature shares".into(),
+                ));
+            }
+
+            let events = client
+                .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| KeepError::Other(format!("Fetch failed: {}", e)))?;
+
+            let our_session_id_hex = hex::encode(session_id);
+            for ev in events.iter() {
+                if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+
+                if let Ok(content) = serde_json::from_str::<serde_json::Value>(&ev.content) {
+                    let peer_request_id = content
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if peer_request_id != our_session_id_hex {
+                        continue;
+                    }
+
+                    let status = content.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status != "signed" {
+                        continue;
+                    }
+
+                    let peer_idx = content
+                        .get("participant_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16;
+                    let peer_sig = content
+                        .get("partial_signature")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if peer_idx == 0 || peer_idx > participants {
+                        continue;
+                    }
+                    if peer_sig.is_empty() || hex::decode(peer_sig).is_err() {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        peer_shares.entry(peer_idx)
+                    {
+                        e.insert(peer_sig.to_string());
+                        out.success(&format!(
+                            "Received signature share from participant {}",
+                            peer_idx
+                        ));
+                    }
+                }
+            }
+
+            if peer_shares.len() < threshold as usize {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        out.newline();
+        out.success(&format!("Collected {} signature shares", peer_shares.len()));
+
+        let mut sorted_share_indices: Vec<u16> = peer_shares.keys().copied().collect();
+        sorted_share_indices.sort();
+        let shares_hex: String = sorted_share_indices
+            .iter()
+            .map(|idx| format!("{}:{}", idx, peer_shares.get(idx).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        out.newline();
+        out.success("Hardware signing complete!");
+        out.field("Signature shares", &shares_hex);
+        out.newline();
+        out.info(
+            "Use 'keep frost aggregate-shares' with these shares to produce the final signature.",
+        );
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    let session_id_hex = hex::encode(session_id);
+    nonce_store
+        .mark_nonce_used(group_npub, &commitment_hex, Some(&session_id_hex))
+        .map_err(|e| KeepError::Other(format!("Failed to mark nonce as used: {}", e)))?;
 
     Ok(())
 }
@@ -1674,6 +2116,260 @@ fn cmd_frost_network_dkg(
 
         Ok::<_, KeepError>(())
     })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_group_create(
+    out: &Output,
+    name: &str,
+    threshold: u8,
+    participants: u8,
+    relays: &[String],
+    participant_npubs: &[String],
+) -> Result<()> {
+    use nostr_sdk::prelude::*;
+    use sha2::{Digest, Sha256};
+
+    out.newline();
+    out.header("FROST Group Announcement (Kind 21101)");
+    out.field("Name", name);
+    out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+    out.newline();
+
+    if threshold < 2 || threshold > participants {
+        return Err(KeepError::Other(format!(
+            "Invalid threshold: must be 2 <= threshold ({}) <= participants ({})",
+            threshold, participants
+        )));
+    }
+
+    if participant_npubs.len() != participants as usize {
+        return Err(KeepError::Other(format!(
+            "Expected {} participant npubs, got {}",
+            participants,
+            participant_npubs.len()
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"frost-group-id-v1");
+    hasher.update(name.as_bytes());
+    hasher.update([threshold]);
+    hasher.update([participants]);
+    for npub in participant_npubs {
+        hasher.update(npub.as_bytes());
+    }
+    let group_id: [u8; 32] = hasher.finalize().into();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        let keys = Keys::generate();
+        let client = Client::new(keys.clone());
+
+        for relay in relays {
+            client
+                .add_relay(relay)
+                .await
+                .map_err(|e| KeepError::Other(format!("Failed to add relay {}: {}", relay, e)))?;
+        }
+        client.connect().await;
+
+        out.info("Connected to relays");
+        out.field("Coordinator pubkey", &keys.public_key().to_bech32().unwrap_or_default());
+        out.newline();
+
+        let mut tags = vec![
+            Tag::custom(TagKind::custom("d"), vec![hex::encode(group_id)]),
+            Tag::custom(TagKind::custom("threshold"), vec![threshold.to_string()]),
+            Tag::custom(TagKind::custom("participants"), vec![participants.to_string()]),
+        ];
+
+        for (i, npub) in participant_npubs.iter().enumerate() {
+            let relay_hint = relays.first().map(|s| s.as_str()).unwrap_or("");
+            tags.push(Tag::custom(
+                TagKind::custom("p"),
+                vec![npub.clone(), relay_hint.to_string(), (i + 1).to_string()],
+            ));
+        }
+
+        for relay in relays {
+            tags.push(Tag::custom(TagKind::custom("relay"), vec![relay.clone()]));
+        }
+
+        let content = serde_json::json!({
+            "name": name,
+            "description": format!("{}-of-{} FROST threshold signing group", threshold, participants),
+        }).to_string();
+
+        let mut builder = EventBuilder::new(Kind::Custom(21101), &content);
+        for tag in tags {
+            builder = builder.tag(tag);
+        }
+
+        let event = builder
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign event: {}", e)))?;
+
+        let spinner = out.spinner("Publishing group announcement...");
+        client
+            .send_event(&event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+        spinner.finish();
+
+        out.newline();
+        out.success("Group announcement published!");
+        out.field("Event ID", &event.id.to_hex());
+        out.field("Group ID", &hex::encode(group_id));
+        out.newline();
+
+        for (i, npub) in participant_npubs.iter().enumerate() {
+            out.info(&format!("Participant {}: {}", i + 1, npub));
+        }
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn cmd_frost_network_nonce_precommit(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    relay: &str,
+    device: &str,
+    count: u32,
+) -> Result<()> {
+    use crate::signer::{HardwareSigner, NonceStore};
+    use nostr_sdk::prelude::*;
+
+    out.newline();
+    out.header("FROST Nonce Pre-commitment (Kind 21106)");
+    out.field("Group", group);
+    out.field("Relay", relay);
+    out.field("Device", device);
+    out.field("Nonce count", &count.to_string());
+    out.newline();
+
+    let mut nonce_store = NonceStore::open(path)
+        .map_err(|e| KeepError::Other(format!("Failed to open nonce store: {}", e)))?;
+
+    let (available, used) = nonce_store.nonce_stats(group);
+    if available > 0 {
+        out.info(&format!(
+            "Existing nonces: {} available, {} used",
+            available, used
+        ));
+    }
+
+    let spinner = out.spinner("Connecting to hardware...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Verifying connection...");
+    let version = signer
+        .ping()
+        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    spinner.finish();
+    out.field("Hardware version", &version);
+
+    let (_pubkey_hex, share_index) = signer
+        .get_share_pubkey(group)
+        .map_err(|e| KeepError::Other(format!("Failed to get share pubkey: {}", e)))?;
+    out.field("Share index", &share_index.to_string());
+    out.newline();
+
+    let spinner = out.spinner(&format!("Generating {} nonce commitments...", count));
+    let mut nonces = Vec::new();
+    let mut commitments_hex = Vec::new();
+    for i in 0..count {
+        let dummy_session: [u8; 32] = rand::random();
+        let dummy_message: [u8; 32] = rand::random();
+        let (commitment, _) = signer
+            .frost_commit(group, &dummy_session, &dummy_message)
+            .map_err(|e| KeepError::Other(format!("Commitment {} failed: {}", i, e)))?;
+        let commitment_hex = hex::encode(&commitment);
+        commitments_hex.push(commitment_hex.clone());
+        nonces.push(serde_json::json!({
+            "index": i,
+            "commitment": commitment_hex,
+        }));
+    }
+    spinner.finish();
+
+    let spinner = out.spinner("Storing nonces locally...");
+    for commitment_hex in &commitments_hex {
+        nonce_store
+            .add_nonce(group, commitment_hex)
+            .map_err(|e| KeepError::Other(format!("Failed to store nonce: {}", e)))?;
+    }
+    spinner.finish();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+
+    rt.block_on(async {
+        let keys = Keys::generate();
+        let client = Client::new(keys.clone());
+
+        client
+            .add_relay(relay)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+        client.connect().await;
+
+        out.info("Connected to relay");
+        out.field(
+            "Node pubkey",
+            &keys.public_key().to_bech32().unwrap_or_default(),
+        );
+
+        let content = serde_json::json!({
+            "nonces": nonces,
+        })
+        .to_string();
+
+        let event = EventBuilder::new(Kind::Custom(21106), &content)
+            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
+            .tag(Tag::custom(
+                TagKind::custom("participant_index"),
+                vec![share_index.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("nonce_start"),
+                vec!["0".to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("nonce_count"),
+                vec![count.to_string()],
+            ))
+            .sign_with_keys(&keys)
+            .map_err(|e| KeepError::Other(format!("Failed to sign event: {}", e)))?;
+
+        let spinner = out.spinner("Publishing nonce commitments...");
+        client
+            .send_event(&event)
+            .await
+            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+        spinner.finish();
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    let (available, used) = nonce_store.nonce_stats(group);
+    out.newline();
+    out.success(&format!("Published {} nonce commitments!", count));
+    out.newline();
+    out.info(&format!(
+        "Nonce status for group: {} available, {} used",
+        available, used
+    ));
+    out.warn("Each nonce can only be used once. Reusing nonces compromises security.");
 
     Ok(())
 }
