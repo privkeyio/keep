@@ -129,6 +129,9 @@ impl ExpectedPcrs {
     }
 }
 
+pub const ATTESTATION_MAX_AGE_SECS: u64 = 300;
+pub const ATTESTATION_MAX_FUTURE_SECS: u64 = 30;
+
 pub fn verify_peer_attestation(
     attestation: &EnclaveAttestation,
     expected_pcrs: &ExpectedPcrs,
@@ -136,6 +139,35 @@ pub fn verify_peer_attestation(
     verify_pcr(&attestation.pcr0, 0, &expected_pcrs.pcr0)?;
     verify_pcr(&attestation.pcr1, 1, &expected_pcrs.pcr1)?;
     verify_pcr(&attestation.pcr2, 2, &expected_pcrs.pcr2)?;
+    verify_attestation_timestamp(attestation.timestamp)?;
+    Ok(())
+}
+
+fn verify_attestation_timestamp(timestamp_ms: u64) -> Result<()> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| FrostNetError::Attestation("System clock error".into()))?
+        .as_millis() as u64;
+
+    let max_age_ms = ATTESTATION_MAX_AGE_SECS * 1000;
+    let max_future_ms = ATTESTATION_MAX_FUTURE_SECS * 1000;
+
+    if timestamp_ms < now_ms.saturating_sub(max_age_ms) {
+        let age_secs = now_ms.saturating_sub(timestamp_ms) / 1000;
+        return Err(FrostNetError::Attestation(format!(
+            "Attestation timestamp too old: {}s (max {}s)",
+            age_secs, ATTESTATION_MAX_AGE_SECS
+        )));
+    }
+
+    if timestamp_ms > now_ms.saturating_add(max_future_ms) {
+        let future_secs = timestamp_ms.saturating_sub(now_ms) / 1000;
+        return Err(FrostNetError::Attestation(format!(
+            "Attestation timestamp in future: {}s (max {}s)",
+            future_secs, ATTESTATION_MAX_FUTURE_SECS
+        )));
+    }
+
     Ok(())
 }
 
@@ -1390,10 +1422,22 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn current_timestamp_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
     #[test]
     fn test_verify_peer_attestation_success() {
-        let attestation =
-            EnclaveAttestation::new(vec![0u8; 48], vec![1u8; 48], vec![2u8; 48], vec![], 0);
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 48],
+            vec![1u8; 48],
+            vec![2u8; 48],
+            vec![],
+            current_timestamp_ms(),
+        );
         let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
         assert!(verify_peer_attestation(&attestation, &expected).is_ok());
     }
@@ -1402,10 +1446,10 @@ mod tests {
     fn test_verify_peer_attestation_mismatch() {
         let attestation = EnclaveAttestation::new(
             vec![0u8; 48],
-            vec![99u8; 48], // Mismatch on PCR1
+            vec![99u8; 48],
             vec![2u8; 48],
             vec![],
-            0,
+            current_timestamp_ms(),
         );
         let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
         let result = verify_peer_attestation(&attestation, &expected);
@@ -1419,11 +1463,11 @@ mod tests {
     #[test]
     fn test_verify_peer_attestation_invalid_length() {
         let attestation = EnclaveAttestation::new(
-            vec![0u8; 32], // Wrong length
+            vec![0u8; 32],
             vec![1u8; 48],
             vec![2u8; 48],
             vec![],
-            0,
+            current_timestamp_ms(),
         );
         let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
         let result = verify_peer_attestation(&attestation, &expected);
@@ -1434,6 +1478,44 @@ mod tests {
                 assert!(actual.contains("invalid length"));
             }
             _ => panic!("Expected PcrMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_verify_peer_attestation_timestamp_too_old() {
+        let old_timestamp = current_timestamp_ms() - (ATTESTATION_MAX_AGE_SECS + 60) * 1000;
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 48],
+            vec![1u8; 48],
+            vec![2u8; 48],
+            vec![],
+            old_timestamp,
+        );
+        let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
+        let result = verify_peer_attestation(&attestation, &expected);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FrostNetError::Attestation(msg) => assert!(msg.contains("too old")),
+            e => panic!("Expected Attestation error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_verify_peer_attestation_timestamp_in_future() {
+        let future_timestamp = current_timestamp_ms() + (ATTESTATION_MAX_FUTURE_SECS + 60) * 1000;
+        let attestation = EnclaveAttestation::new(
+            vec![0u8; 48],
+            vec![1u8; 48],
+            vec![2u8; 48],
+            vec![],
+            future_timestamp,
+        );
+        let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
+        let result = verify_peer_attestation(&attestation, &expected);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FrostNetError::Attestation(msg) => assert!(msg.contains("future")),
+            e => panic!("Expected Attestation error, got {:?}", e),
         }
     }
 }
