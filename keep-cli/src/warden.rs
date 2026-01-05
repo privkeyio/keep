@@ -262,3 +262,86 @@ pub async fn wait_for_approval(
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_allow_decision() {
+        let json = r#"{
+            "decision": {"type": "ALLOW", "rule_id": "allow-all", "reason": "allowed"},
+            "policy_id": "550e8400-e29b-41d4-a716-446655440000",
+            "policy_version": "1.0",
+            "evaluated_at": "2024-01-01T00:00:00Z",
+            "evaluation_time_us": 100,
+            "rules_evaluated": 1,
+            "trace": []
+        }"#;
+        let result: EvaluationResult = serde_json::from_str(json).unwrap();
+        assert!(matches!(result.decision, PolicyDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_deny_decision() {
+        let json = r#"{
+            "decision": {"type": "DENY", "rule_id": "deny-all", "reason": "blocked"},
+            "policy_id": "550e8400-e29b-41d4-a716-446655440000",
+            "policy_version": "1.0",
+            "evaluated_at": "2024-01-01T00:00:00Z",
+            "evaluation_time_us": 100,
+            "rules_evaluated": 1,
+            "trace": []
+        }"#;
+        let result: EvaluationResult = serde_json::from_str(json).unwrap();
+        assert!(matches!(result.decision, PolicyDecision::Deny { .. }));
+        if let PolicyDecision::Deny { rule_id, reason } = result.decision {
+            assert_eq!(rule_id, "deny-all");
+            assert_eq!(reason, "blocked");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_require_approval_decision() {
+        let json = r#"{
+            "decision": {
+                "type": "REQUIRE_APPROVAL",
+                "rule_id": "large-tx",
+                "approval_config": {
+                    "quorum": 2,
+                    "from_groups": ["treasury", "security"],
+                    "timeout_hours": 24
+                }
+            },
+            "policy_id": "550e8400-e29b-41d4-a716-446655440000",
+            "policy_version": "1.0",
+            "evaluated_at": "2024-01-01T00:00:00Z",
+            "evaluation_time_us": 100,
+            "rules_evaluated": 1,
+            "trace": []
+        }"#;
+        let result: EvaluationResult = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            result.decision,
+            PolicyDecision::RequireApproval { .. }
+        ));
+        if let PolicyDecision::RequireApproval {
+            rule_id,
+            approval_config,
+        } = result.decision
+        {
+            assert_eq!(rule_id, "large-tx");
+            assert_eq!(approval_config.quorum, 2);
+            assert_eq!(approval_config.from_groups, vec!["treasury", "security"]);
+            assert_eq!(approval_config.timeout_hours, 24);
+        }
+    }
+
+    #[test]
+    fn test_serialize_transaction_request() {
+        let tx = TransactionRequest::new("wallet-1".into(), "bc1q...".into(), 100000);
+        let json = serde_json::to_string(&tx).unwrap();
+        assert!(json.contains("wallet-1"));
+        assert!(json.contains("100000"));
+    }
+}
