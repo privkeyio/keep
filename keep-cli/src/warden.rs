@@ -1,5 +1,3 @@
-#![cfg(feature = "warden")]
-
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -31,11 +29,6 @@ impl TransactionRequest {
             metadata: HashMap::new(),
         }
     }
-
-    pub fn with_metadata(mut self, key: &str, value: serde_json::Value) -> Self {
-        self.metadata.insert(key.to_string(), value);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,20 +58,6 @@ pub enum PolicyDecision {
         rule_id: String,
         approval_config: ApprovalConfig,
     },
-}
-
-impl PolicyDecision {
-    pub fn is_allow(&self) -> bool {
-        matches!(self, PolicyDecision::Allow { .. })
-    }
-
-    pub fn is_deny(&self) -> bool {
-        matches!(self, PolicyDecision::Deny { .. })
-    }
-
-    pub fn is_require_approval(&self) -> bool {
-        matches!(self, PolicyDecision::RequireApproval { .. })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +182,6 @@ pub async fn wait_for_approval(
     timeout_secs: u64,
 ) -> Result<bool> {
     let client = WardenClient::new(warden_url)?;
-    let url = format!("{}/v1/workflows/{}/status", client.base_url, transaction_id);
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -212,6 +190,11 @@ pub async fn wait_for_approval(
         if start.elapsed() >= timeout {
             return Err(KeepError::Other("Approval timeout exceeded".to_string()));
         }
+
+        let url = format!(
+            "{}/v1/transactions/{}/approval-status",
+            client.base_url, transaction_id
+        );
 
         let response = client
             .client
@@ -233,20 +216,31 @@ pub async fn wait_for_approval(
         }
 
         #[derive(Deserialize)]
-        struct WorkflowStatus {
+        struct WorkflowStatusResponse {
             status: String,
         }
 
-        let status: WorkflowStatus = response
+        let response: WorkflowStatusResponse = response
             .json()
             .await
             .map_err(|e| KeepError::Other(format!("Failed to parse status: {}", e)))?;
 
-        match status.status.as_str() {
-            "approved" => return Ok(true),
-            "denied" | "rejected" => return Ok(false),
-            "expired" => return Err(KeepError::Other("Approval workflow expired".to_string())),
-            _ => {}
+        match response.status.as_str() {
+            "APPROVED" => return Ok(true),
+            "REJECTED" => return Ok(false),
+            "TIMED_OUT" => {
+                return Err(KeepError::Other("Approval workflow timed out".to_string()))
+            }
+            "CANCELLED" => {
+                return Err(KeepError::Other("Approval workflow cancelled".to_string()))
+            }
+            "PENDING" => {}
+            other => {
+                return Err(KeepError::Other(format!(
+                    "Unknown workflow status: {}",
+                    other
+                )))
+            }
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
