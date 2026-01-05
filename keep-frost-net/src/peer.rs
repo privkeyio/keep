@@ -11,6 +11,18 @@ pub enum PeerStatus {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttestationStatus {
+    /// Attestation was verified successfully against expected PCRs.
+    Verified,
+    /// Peer did not provide attestation data.
+    NotProvided,
+    /// Attestation verification failed.
+    Failed(String),
+    /// Node is not configured to verify attestations (no expected PCRs set).
+    NotConfigured,
+}
+
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub pubkey: PublicKey,
@@ -21,6 +33,7 @@ pub struct Peer {
     pub last_seen: Instant,
     pub status: PeerStatus,
     pub protocol_version: u8,
+    pub attestation_status: AttestationStatus,
 }
 
 impl Peer {
@@ -34,7 +47,20 @@ impl Peer {
             last_seen: Instant::now(),
             status: PeerStatus::Online,
             protocol_version: crate::KFP_VERSION,
+            attestation_status: AttestationStatus::NotProvided,
         }
+    }
+
+    pub fn with_attestation_status(mut self, status: AttestationStatus) -> Self {
+        self.attestation_status = status;
+        self
+    }
+
+    pub fn is_attested(&self) -> bool {
+        matches!(
+            self.attestation_status,
+            AttestationStatus::Verified | AttestationStatus::NotConfigured
+        )
     }
 
     pub fn with_name(mut self, name: &str) -> Self {
@@ -127,6 +153,20 @@ impl PeerManager {
         self.get_online_peers()
             .into_iter()
             .filter(|p| p.can_sign())
+            .collect()
+    }
+
+    /// Returns signing peers that have verified attestation.
+    ///
+    /// Useful for "soft attestation" mode where attestation is tracked but not
+    /// strictly required - allows preferring attested peers when available.
+    /// When attestation is required via `KfpNode::with_expected_pcrs()`, this
+    /// returns the same result as `get_signing_peers()` since unattested peers
+    /// are rejected at announce time.
+    pub fn get_attested_signing_peers(&self) -> Vec<&Peer> {
+        self.get_signing_peers()
+            .into_iter()
+            .filter(|p| p.is_attested())
             .collect()
     }
 
