@@ -6,8 +6,13 @@ rust-version = "1.81"
 description = "FROST coordination protocol over nostr for Keep"
 license = "AGPL-3.0-or-later"
 
+[features]
+default = ["nitro-attestation"]
+nitro-attestation = ["dep:keep-enclave-host"]
+
 [dependencies]
 keep-core = { path = "../keep-core" }
+keep-enclave-host = { path = "../keep-enclave/host", optional = true }
 
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 frost-secp256k1-tr = "2.2"
@@ -20,6 +25,7 @@ parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
+base64 = "0.22"
 chrono = "0.4"
 
 thiserror = "1.0"

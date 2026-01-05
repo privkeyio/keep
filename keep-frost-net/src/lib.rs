@@ -67,8 +67,8 @@ pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{
-    verify_peer_attestation, ExpectedPcrs, KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy,
-    SessionInfo, SigningHooks,
+    derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs, KfpNode, KfpNodeEvent,
+    NoOpHooks, PeerPolicy, SessionInfo, SigningHooks,
 };
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};

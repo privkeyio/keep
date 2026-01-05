@@ -145,6 +145,8 @@ pub struct AnnouncePayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EnclaveAttestation {
+    #[serde(with = "base64_vec")]
+    pub document: Vec<u8>,
     #[serde(with = "hex_vec")]
     pub pcr0: Vec<u8>,
     #[serde(with = "hex_vec")]
@@ -158,6 +160,7 @@ pub struct EnclaveAttestation {
 
 impl EnclaveAttestation {
     pub fn new(
+        document: Vec<u8>,
         pcr0: Vec<u8>,
         pcr1: Vec<u8>,
         pcr2: Vec<u8>,
@@ -165,6 +168,7 @@ impl EnclaveAttestation {
         timestamp: u64,
     ) -> Self {
         Self {
+            document,
             pcr0,
             pcr1,
             pcr2,
@@ -502,6 +506,29 @@ mod hex_vec {
     }
 }
 
+mod base64_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use base64::Engine;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use base64::Engine;
+        let s = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +723,7 @@ mod tests {
     #[test]
     fn test_announce_with_attestation_serialization() {
         let attestation = EnclaveAttestation::new(
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
             vec![0u8; 48],
             vec![1u8; 48],
             vec![2u8; 48],
@@ -715,6 +743,7 @@ mod tests {
                 assert_eq!(p.share_index, 1);
                 assert_eq!(p.name, Some("test-enclave".into()));
                 let att = p.attestation.expect("attestation should be present");
+                assert_eq!(att.document, vec![0xDE, 0xAD, 0xBE, 0xEF]);
                 assert_eq!(att.pcr0.len(), 48);
                 assert_eq!(att.pcr1.len(), 48);
                 assert_eq!(att.pcr2.len(), 48);

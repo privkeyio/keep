@@ -1986,12 +1986,14 @@ dependencies = [
 name = "keep-frost-net"
 version = "0.1.2"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "frost-secp256k1-tr",
  "hex",
  "hmac",
  "k256",
  "keep-core",
+ "keep-enclave-host",
  "nostr-relay-builder",
  "nostr-sdk",
  "parking_lot",
