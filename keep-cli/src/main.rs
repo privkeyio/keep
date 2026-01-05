@@ -3,6 +3,8 @@ mod output;
 mod server;
 mod signer;
 mod tui;
+#[cfg(feature = "warden")]
+mod warden;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -171,6 +173,11 @@ enum FrostCommands {
         group: String,
         #[arg(long)]
         interactive: bool,
+        #[arg(
+            long,
+            help = "Warden URL for policy check (e.g., http://localhost:3000)"
+        )]
+        warden_url: Option<String>,
     },
     Network {
         #[command(subcommand)]
@@ -228,6 +235,11 @@ enum FrostNetworkCommands {
         share: Option<u16>,
         #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
         hardware: Option<String>,
+        #[arg(
+            long,
+            help = "Warden URL for policy check (e.g., http://localhost:3000)"
+        )]
+        warden_url: Option<String>,
     },
     SignEvent {
         #[arg(short, long)]
@@ -538,7 +550,15 @@ fn cmd_frost(out: &Output, path: &Path, command: FrostCommands) -> Result<()> {
             message,
             group,
             interactive,
-        } => cmd_frost_sign(out, path, &message, &group, interactive),
+            warden_url,
+        } => cmd_frost_sign(
+            out,
+            path,
+            &message,
+            &group,
+            interactive,
+            warden_url.as_deref(),
+        ),
         FrostCommands::Network { command } => cmd_frost_network(out, path, command),
         FrostCommands::Hardware { command } => cmd_frost_hardware(out, path, command),
     }
@@ -576,6 +596,7 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             relay,
             share,
             hardware,
+            warden_url,
         } => cmd_frost_network_sign(
             out,
             path,
@@ -584,6 +605,7 @@ fn cmd_frost_network(out: &Output, path: &Path, command: FrostNetworkCommands) -
             &relay,
             share,
             hardware.as_deref(),
+            warden_url.as_deref(),
         ),
         FrostNetworkCommands::SignEvent {
             group,
@@ -1023,6 +1045,7 @@ fn cmd_frost_network_peers(out: &Output, path: &Path, group_npub: &str, relay: &
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_frost_network_sign(
     out: &Output,
     path: &Path,
@@ -1031,9 +1054,25 @@ fn cmd_frost_network_sign(
     relay: &str,
     share_index: Option<u16>,
     hardware: Option<&str>,
+    warden_url: Option<&str>,
 ) -> Result<()> {
     if let Some(device) = hardware {
         return cmd_frost_network_sign_hardware(out, group_npub, message, relay, device);
+    }
+
+    // Check warden policy FIRST before touching vault
+    #[cfg(feature = "warden")]
+    if let Some(url) = warden_url {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+        rt.block_on(check_warden_policy(out, url, group_npub, message))?;
+    }
+
+    #[cfg(not(feature = "warden"))]
+    if warden_url.is_some() {
+        return Err(KeepError::Other(
+            "Warden support not compiled. Rebuild with --features warden".into(),
+        ));
     }
 
     let mut keep = Keep::open(path)?;
@@ -1866,12 +1905,95 @@ fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "warden")]
+async fn check_warden_policy(
+    out: &Output,
+    warden_url: &str,
+    group_npub: &str,
+    message_hex: &str,
+) -> Result<()> {
+    use crate::warden::{check_policy, get_warden_token, wait_for_approval, PolicyCheckResult};
+
+    let token = get_warden_token();
+
+    out.info("Checking Warden policy...");
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("operation".to_string(), serde_json::json!("frost_sign"));
+    metadata.insert("message_hash".to_string(), serde_json::json!(message_hex));
+
+    let result = check_policy(warden_url, token.clone(), group_npub, "", 0, Some(metadata)).await?;
+
+    match result {
+        PolicyCheckResult::Allowed => {
+            out.success("Policy check passed");
+            out.newline();
+            Ok(())
+        }
+        PolicyCheckResult::Denied { rule_id, reason } => {
+            out.error(&format!(
+                "Policy denied signing: {} (rule: {})",
+                reason, rule_id
+            ));
+            Err(KeepError::Other(format!(
+                "Warden policy denied: {} (rule: {})",
+                reason, rule_id
+            )))
+        }
+        PolicyCheckResult::RequiresApproval {
+            rule_id,
+            config,
+            transaction_id,
+        } => {
+            out.warn(&format!("Signing requires approval (rule: {})", rule_id));
+            out.field("Quorum required", &config.quorum.to_string());
+            out.field("Approver groups", &config.from_groups.join(", "));
+            out.field(
+                "Approval timeout",
+                &format!("{} hours", config.timeout_hours),
+            );
+            out.field("Transaction ID", &transaction_id.to_string());
+            out.newline();
+
+            // Cap CLI wait at 5 minutes - user can retry if approval takes longer
+            const MAX_WAIT_SECS: u64 = 300;
+            let confirm = get_confirm(&format!(
+                "Wait for approval? (will poll for up to {} seconds)",
+                MAX_WAIT_SECS
+            ))?;
+            if !confirm {
+                return Err(KeepError::Other("Approval cancelled by user".into()));
+            }
+
+            let spinner = out.spinner("Waiting for approval...");
+
+            match wait_for_approval(warden_url, token, transaction_id, MAX_WAIT_SECS).await {
+                Ok(true) => {
+                    spinner.finish();
+                    out.success("Approval granted");
+                    out.newline();
+                    Ok(())
+                }
+                Ok(false) => {
+                    spinner.finish();
+                    Err(KeepError::Other("Approval was denied".into()))
+                }
+                Err(e) => {
+                    spinner.finish();
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
 fn cmd_frost_sign(
     out: &Output,
     path: &Path,
     message_hex: &str,
     group_npub: &str,
     interactive: bool,
+    warden_url: Option<&str>,
 ) -> Result<()> {
     debug!(
         message = message_hex,
@@ -1882,6 +2004,21 @@ fn cmd_frost_sign(
 
     let message =
         hex::decode(message_hex).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+
+    // Check warden policy FIRST before touching vault
+    #[cfg(feature = "warden")]
+    if let Some(url) = warden_url {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+        rt.block_on(check_warden_policy(out, url, group_npub, message_hex))?;
+    }
+
+    #[cfg(not(feature = "warden"))]
+    if warden_url.is_some() {
+        return Err(KeepError::Other(
+            "Warden support not compiled. Rebuild with --features warden".into(),
+        ));
+    }
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
