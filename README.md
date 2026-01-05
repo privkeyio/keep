@@ -150,6 +150,27 @@ keep frost network sign --group npub1... --message "hello"
 keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"
 ```
 
+### Policy Enforcement (Warden)
+
+Integrate with [Warden](https://github.com/privkeyio/warden) for policy-based signing controls:
+
+```bash
+# Build with warden support
+cargo build --release --features warden
+
+# Sign with policy check
+export WARDEN_TOKEN="<jwt>"
+keep frost sign --warden-url http://localhost:3000 --group npub1... --message <hex>
+
+# Network sign with policy check
+keep frost network sign --warden-url http://localhost:3000 --group npub1... --message <hex>
+```
+
+Policy decisions:
+- **ALLOW**: Signing proceeds
+- **DENY**: Signing blocked with reason
+- **REQUIRE_APPROVAL**: CLI waits for approval workflow (polls up to 5 minutes)
+
 ### Hardware Signing
 
 Store FROST shares on an air-gapped hardware signer. See [keep-esp32](https://github.com/privkeyio/keep-esp32) for firmware.
@@ -357,6 +378,7 @@ KEEP_PASSWORD="hidden" keep --hidden list
 | `KEEP_PASSWORD` | Vault password (avoids interactive prompt) |
 | `KEEP_HIDDEN_PASSWORD` | Hidden volume password (with `--hidden` flag) |
 | `KEEP_PATH` | Custom vault path (default: `~/.keep`) |
+| `WARDEN_TOKEN` | JWT token for Warden API authentication (requires `--features warden`) |
 
 ---
 

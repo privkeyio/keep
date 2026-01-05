@@ -244,12 +244,8 @@ pub async fn wait_for_approval(
         match response.status.as_str() {
             "APPROVED" => return Ok(true),
             "REJECTED" => return Ok(false),
-            "TIMED_OUT" => {
-                return Err(KeepError::Other("Approval workflow timed out".to_string()))
-            }
-            "CANCELLED" => {
-                return Err(KeepError::Other("Approval workflow cancelled".to_string()))
-            }
+            "TIMED_OUT" => return Err(KeepError::Other("Approval workflow timed out".to_string())),
+            "CANCELLED" => return Err(KeepError::Other("Approval workflow cancelled".to_string())),
             "PENDING" => {}
             other => {
                 return Err(KeepError::Other(format!(
