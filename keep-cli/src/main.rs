@@ -1060,6 +1060,21 @@ fn cmd_frost_network_sign(
         return cmd_frost_network_sign_hardware(out, group_npub, message, relay, device);
     }
 
+    // Check warden policy FIRST before touching vault
+    #[cfg(feature = "warden")]
+    if let Some(url) = warden_url {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+        rt.block_on(check_warden_policy(out, url, group_npub, message))?;
+    }
+
+    #[cfg(not(feature = "warden"))]
+    if warden_url.is_some() {
+        return Err(KeepError::Other(
+            "Warden support not compiled. Rebuild with --features warden".into(),
+        ));
+    }
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
@@ -1094,18 +1109,6 @@ fn cmd_frost_network_sign(
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
     rt.block_on(async {
-        #[cfg(feature = "warden")]
-        if let Some(url) = warden_url {
-            check_warden_policy(out, url, group_npub, message).await?;
-        }
-
-        #[cfg(not(feature = "warden"))]
-        if warden_url.is_some() {
-            return Err(KeepError::Other(
-                "Warden support not compiled. Rebuild with --features warden".into(),
-            ));
-        }
-
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
@@ -2002,6 +2005,21 @@ fn cmd_frost_sign(
     let message =
         hex::decode(message_hex).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
 
+    // Check warden policy FIRST before touching vault
+    #[cfg(feature = "warden")]
+    if let Some(url) = warden_url {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+        rt.block_on(check_warden_policy(out, url, group_npub, message_hex))?;
+    }
+
+    #[cfg(not(feature = "warden"))]
+    if warden_url.is_some() {
+        return Err(KeepError::Other(
+            "Warden support not compiled. Rebuild with --features warden".into(),
+        ));
+    }
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
@@ -2026,20 +2044,6 @@ fn cmd_frost_sign(
 
     let threshold = our_shares[0].metadata.threshold;
     let total = our_shares[0].metadata.total_shares;
-
-    #[cfg(feature = "warden")]
-    if let Some(url) = warden_url {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
-        rt.block_on(check_warden_policy(out, url, group_npub, message_hex))?;
-    }
-
-    #[cfg(not(feature = "warden"))]
-    if warden_url.is_some() {
-        return Err(KeepError::Other(
-            "Warden support not compiled. Rebuild with --features warden".into(),
-        ));
-    }
 
     if interactive {
         return cmd_frost_sign_interactive(out, &keep, &group_pubkey, &message, threshold, total);
