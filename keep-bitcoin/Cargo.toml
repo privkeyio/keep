@@ -1,6 +1,6 @@
 [package]
 name = "keep-bitcoin"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.81"
 description = "Bitcoin PSBT and Taproot support for Keep"
