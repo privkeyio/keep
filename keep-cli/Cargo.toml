@@ -49,6 +49,9 @@ rand = "0.9"
 # Serial
 serialport = "4.8.1"
 
+# File locking
+fs2 = "0.4"
+
 # Misc
 bitflags = { version = "2.4", features = ["serde"] }
 ctrlc = { version = "3.4", features = ["termination"] }

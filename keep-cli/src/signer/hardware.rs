@@ -156,6 +156,38 @@ impl HardwareSigner {
         Ok((pubkey, index))
     }
 
+    pub fn get_share_info(&mut self, group: &str) -> Result<ShareInfo> {
+        let params = serde_json::json!({
+            "group": group,
+        });
+        let result = self.call("get_share_info", Some(params))?;
+        let pubkey = result["pubkey"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing pubkey in response"))?
+            .to_string();
+        let index = result["index"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing index in response"))?
+            .try_into()
+            .map_err(|_| anyhow!("index out of range"))?;
+        let threshold = result["threshold"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing threshold in response"))?
+            .try_into()
+            .map_err(|_| anyhow!("threshold out of range"))?;
+        let participants = result["participants"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing participants in response"))?
+            .try_into()
+            .map_err(|_| anyhow!("participants out of range"))?;
+        Ok(ShareInfo {
+            pubkey,
+            index,
+            threshold,
+            participants,
+        })
+    }
+
     pub fn frost_commit(
         &mut self,
         group: &str,
@@ -327,6 +359,15 @@ impl HardwareSigner {
             our_index,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ShareInfo {
+    pub pubkey: String,
+    pub index: u16,
+    pub threshold: u16,
+    pub participants: u16,
 }
 
 #[derive(Debug, Clone)]
