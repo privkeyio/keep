@@ -10,21 +10,11 @@ use frost_secp256k1_tr::{
     round2::SignatureShare,
     Identifier, Signature, SigningPackage,
 };
-use zeroize::Zeroize;
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
 use crate::protocol::KFP_VERSION;
-
-struct NonceWrapper(SigningNonces);
-
-impl Zeroize for NonceWrapper {
-    fn zeroize(&mut self) {
-        // SigningNonces doesn't implement Zeroize - limitation of upstream FROST library
-    }
-}
 
 pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -> [u8; 32] {
     let mut sorted_participants = participants.to_vec();
@@ -84,7 +74,7 @@ pub struct NetworkSession {
     timeout: Duration,
     commitments: BTreeMap<Identifier, SigningCommitments>,
     signature_shares: BTreeMap<Identifier, SignatureShare>,
-    our_nonces: Option<NonceWrapper>,
+    our_nonces: Option<SigningNonces>,
     our_commitment: Option<SigningCommitments>,
     signature: Option<Signature>,
     rehydrations_used: u16,
@@ -154,7 +144,7 @@ impl NetworkSession {
     }
 
     pub fn set_our_nonces(&mut self, nonces: SigningNonces) {
-        self.our_nonces = Some(NonceWrapper(nonces));
+        self.our_nonces = Some(nonces);
     }
 
     pub fn set_our_commitment(&mut self, commitment: SigningCommitments) {
@@ -315,7 +305,7 @@ impl NetworkSession {
     }
 
     pub fn take_our_nonces(&mut self) -> Option<SigningNonces> {
-        self.our_nonces.take().map(|w| w.0)
+        self.our_nonces.take()
     }
 
     pub fn rehydrations_used(&self) -> u16 {
@@ -352,7 +342,7 @@ impl NetworkSession {
             .our_nonces
             .as_ref()
             .map(|n| {
-                n.0.serialize()
+                n.serialize()
                     .map_err(|e| FrostNetError::Crypto(format!("Serialize nonces: {}", e)))
             })
             .transpose()?;
@@ -424,8 +414,7 @@ impl NetworkSession {
                 SigningNonces::deserialize(&bytes)
                     .map_err(|e| FrostNetError::Crypto(format!("Deserialize nonces: {}", e)))
             })
-            .transpose()?
-            .map(NonceWrapper);
+            .transpose()?;
 
         let our_commitment = cached
             .our_commitment

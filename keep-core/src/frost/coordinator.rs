@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(unused_assignments)]
 
 use std::collections::BTreeMap;
 
@@ -9,17 +10,26 @@ use frost::{
     Identifier, Signature, SigningPackage,
 };
 use frost_secp256k1_tr as frost;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KeepError, Result};
 use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Coordinator {
+    #[zeroize(skip)]
     session_id: [u8; 32],
+    #[zeroize(skip)]
     message: Vec<u8>,
+    #[zeroize(skip)]
     threshold: u16,
+    #[zeroize(skip)]
     commitments: BTreeMap<Identifier, SigningCommitments>,
+    #[zeroize(skip)]
     signature_shares: BTreeMap<Identifier, SignatureShare>,
-    our_nonces: Option<(Identifier, SigningNonces)>,
+    #[zeroize(skip)]
+    our_identifier: Option<Identifier>,
+    our_nonces: Option<SigningNonces>,
 }
 
 impl Coordinator {
@@ -30,6 +40,7 @@ impl Coordinator {
             threshold,
             commitments: BTreeMap::new(),
             signature_shares: BTreeMap::new(),
+            our_identifier: None,
             our_nonces: None,
         }
     }
@@ -44,7 +55,8 @@ impl Coordinator {
 
         let (nonces, commitment) = frost::round1::commit(kp.signing_share(), &mut OsRng);
 
-        self.our_nonces = Some((id, nonces));
+        self.our_identifier = Some(id);
+        self.our_nonces = Some(nonces);
         self.commitments.insert(id, commitment);
 
         let commit_bytes = commitment
@@ -92,7 +104,11 @@ impl Coordinator {
         }
 
         let kp = share.key_package()?;
-        let (our_id, nonces) = self
+        let our_id = self
+            .our_identifier
+            .take()
+            .ok_or_else(|| KeepError::Frost("No identifier available".into()))?;
+        let nonces = self
             .our_nonces
             .take()
             .ok_or_else(|| KeepError::Frost("No nonces available".into()))?;
