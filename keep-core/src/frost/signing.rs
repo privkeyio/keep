@@ -11,7 +11,7 @@ use frost::{
     Identifier, Signature, SigningPackage,
 };
 use frost_secp256k1_tr as frost;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 use crate::crypto;
 use crate::error::{KeepError, Result};
@@ -40,24 +40,10 @@ pub struct SigningSession {
     #[zeroize(skip)]
     signature_shares: BTreeMap<Identifier, SignatureShare>,
 
-    our_nonces: Option<NonceWrapper>,
+    our_nonces: Option<SigningNonces>,
 
     #[zeroize(skip)]
     signature: Option<Signature>,
-}
-
-// SECURITY NOTE: NonceWrapper provides no actual zeroization because SigningNonces
-// from frost-secp256k1-tr doesn't implement Zeroize. During normal operation, nonces
-// are consumed via take() ensuring single use. However, if a session is dropped early
-// (e.g., on error paths before signing completes), the nonce data may remain in memory
-// until the allocator reuses that memory. This is a limitation of the upstream FROST
-// library. For high-security applications, consider process isolation.
-struct NonceWrapper(SigningNonces);
-
-impl Zeroize for NonceWrapper {
-    fn zeroize(&mut self) {
-        // SigningNonces doesn't implement Zeroize - see security note above
-    }
 }
 
 impl SigningSession {
@@ -111,7 +97,7 @@ impl SigningSession {
 
         let (nonces, commitments) = frost::round1::commit(key_package.signing_share(), &mut OsRng);
 
-        self.our_nonces = Some(NonceWrapper(nonces));
+        self.our_nonces = Some(nonces);
         self.commitments
             .insert(*key_package.identifier(), commitments);
 
@@ -154,7 +140,7 @@ impl SigningSession {
 
         let signing_package = SigningPackage::new(self.commitments.clone(), &self.message);
 
-        let share = frost::round2::sign(&signing_package, &nonces.0, key_package)
+        let share = frost::round2::sign(&signing_package, &nonces, key_package)
             .map_err(|e| KeepError::Frost(format!("Signing failed: {}", e)))?;
 
         self.signature_shares
