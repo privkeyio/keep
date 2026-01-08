@@ -53,6 +53,7 @@
 
 #![forbid(unsafe_code)]
 
+mod attestation;
 mod audit;
 mod error;
 mod event;
@@ -63,13 +64,11 @@ pub mod proof;
 mod protocol;
 mod session;
 
+pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
-pub use node::{
-    derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs, KfpNode, KfpNodeEvent,
-    NoOpHooks, PeerPolicy, SessionInfo, SigningHooks,
-};
+pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{

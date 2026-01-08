@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{EnclaveError, Result};
-use crate::signer::MlockedBox;
+use crate::mlock::MlockedBox;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
