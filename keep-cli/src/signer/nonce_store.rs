@@ -137,6 +137,7 @@ impl NonceStore {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub fn mark_nonce_used(
         &mut self,
         group: &str,

@@ -1,5 +1,5 @@
 // SAFETY: We use `deny(unsafe_code)` instead of `forbid(unsafe_code)` to allow a single,
-// reviewed exception in the `mlock` module (signer.rs). That module uses unsafe code for:
+// reviewed exception in the `mlock` module. That module uses unsafe code for:
 // - Memory locking via mlock(2) to prevent secrets from being swapped to disk
 // - Secure zeroing of sensitive data via memsec::memzero before deallocation
 // The unsafe code is intentionally scoped to MlockedBox and MlockedVec types only.
@@ -13,6 +13,7 @@ mod error;
 mod kms;
 #[cfg(target_os = "linux")]
 mod kmstool;
+mod mlock;
 mod policy;
 mod rate_limit;
 mod signer;
