@@ -75,8 +75,10 @@ url = "2.5"
 # Storage
 redb = "~2.4"  # Pin to 2.4.x for MSRV 1.81 compatibility (2.5+ requires MSRV 1.85)
 
-# MSRV 1.81 compatibility pins (edition2024 crates)
+# MSRV 1.83 compatibility pins (edition2024 crates)
 base64ct = ">=1.0, <1.8"  # 1.8+ uses edition2024
+blake3 = ">=1.0, <1.8.3"  # 1.8.3+ uses edition2024
+constant_time_eq = ">=0.1, <0.4"  # 0.4+ uses edition2024
 
 # Misc
 bitflags = "2.4"

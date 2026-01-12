@@ -9,6 +9,8 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 argon2 = "0.5"
 base64ct.workspace = true  # Pin for MSRV compatibility
+blake3.workspace = true  # Pin for MSRV compatibility
+constant_time_eq.workspace = true  # Pin for MSRV compatibility
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
