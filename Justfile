@@ -1,6 +1,6 @@
 set shell := ["bash", "-uc"]
 
-msrv := "1.81"
+msrv := "1.83"
 
 default:
     @just --list
