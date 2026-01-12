@@ -16,43 +16,33 @@ keep-enclave-host = { path = "../keep-enclave/host" }
 keep-agent = { path = "../keep-agent", features = ["mcp"] }
 keep-frost-net = { path = "../keep-frost-net" }
 
-# CLI
 clap = { version = "4.5", features = ["derive"] }
 dialoguer = "0.11"
 indicatif = "0.17"
 console = "0.15"
 
-# TUI
 ratatui = "0.29"
 crossterm = "0.28"
 
-# Nostr
 nostr-sdk = { workspace = true }
 
-# Async
 tokio = { version = "1", features = ["full", "signal"] }
 
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
 
-# URL handling
 urlencoding = "2.1"
 url = "2.5"
 
-# FROST / Crypto
 frost-secp256k1-tr = "2.2.0"
 sha2 = "0.10.9"
 rand = "0.9"
 
-# Serial
 serialport = "4.8.1"
 
-# File locking
 fs2 = "0.4"
 
-# Misc
 bitflags = { version = "2.4", features = ["serde"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -60,15 +50,12 @@ dirs = "5.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 secrecy = "0.10"
 
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Error handling
 anyhow = "1.0"
 
-# Optional: Warden policy check
-reqwest = { version = "0.12", features = ["json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
 
 [features]
