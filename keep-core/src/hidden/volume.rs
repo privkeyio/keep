@@ -455,7 +455,9 @@ impl HiddenStorage {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(record)?;
+        let serialized = bincode::options()
+            .with_fixint_encoding()
+            .serialize(record)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
@@ -540,7 +542,9 @@ impl HiddenStorage {
         data_key: &SecretKey,
         hidden_header: &HiddenHeader,
     ) -> Result<()> {
-        let serialized = bincode::serialize(records)?;
+        let serialized = bincode::options()
+            .with_fixint_encoding()
+            .serialize(records)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
