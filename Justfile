@@ -1,0 +1,33 @@
+set shell := ["bash", "-uc"]
+
+msrv := "1.81"
+
+default:
+    @just --list
+
+build:
+    cargo build --release
+
+test:
+    cargo test
+
+lint:
+    cargo fmt -- --check
+    cargo clippy -- -D warnings
+
+fmt:
+    cargo fmt
+
+doc:
+    cargo doc --no-deps --document-private-items
+
+bench:
+    cargo bench
+
+fuzz target:
+    cargo +nightly fuzz run {{target}}
+
+ci: lint test build
+
+msrv-check:
+    cargo +{{msrv}} check --all-targets

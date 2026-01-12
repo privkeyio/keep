@@ -25,7 +25,7 @@ Self-custodial key management for Nostr and Bitcoin.
 cargo install --path keep-cli
 ```
 
-Requires Rust 1.70+.
+Requires Rust 1.81+ (MSRV).
 
 **From source:**
 
@@ -398,16 +398,32 @@ KEEP_PASSWORD="hidden" keep --hidden list
 
 ## Development
 
+Install [just](https://github.com/casey/just):
+
 ```bash
-# Build
-cargo build --release
+cargo install just
+```
 
-# Run tests
-cargo test
+Common tasks:
 
-# Debug logging
+```bash
+just build    # Build release binaries
+just test     # Run all tests
+just lint     # Run clippy and fmt check
+just fmt      # Format all code
+just doc      # Generate documentation
+just ci       # Run full CI checks locally
+```
+
+Debug logging:
+
+```bash
 RUST_LOG=debug cargo run --bin keep -- <command>
 ```
+
+### MSRV Policy
+
+Minimum Supported Rust Version is **1.81**. MSRV changes are considered breaking and will be noted in release notes.
 
 ---
 
