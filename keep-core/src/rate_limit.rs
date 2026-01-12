@@ -9,6 +9,7 @@ use blake2::digest::consts::U4;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 use fs2::FileExt;
+use subtle::ConstantTimeEq;
 
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_DELAY_SECS: u64 = 1;
@@ -86,7 +87,7 @@ impl RateLimitRecord {
             return None;
         }
         let tag = compute_hmac(&data[0..12], hmac_key);
-        if data[12..16] != tag {
+        if !bool::from(data[12..16].ct_eq(&tag)) {
             return None;
         }
         Some(Self {
