@@ -130,6 +130,7 @@ After 5 failed attempts:
 Attempt 6:  1 second delay
 Attempt 7:  2 seconds
 Attempt 8:  4 seconds
+Attempt 9:  8 seconds
 Attempt 10: 16 seconds
 Attempt 13: 128 seconds
 Attempt 14+: 300 seconds (capped)
