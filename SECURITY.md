@@ -140,7 +140,7 @@ Attempt 14+: 300 seconds (capped)
 Rate limit records include HMAC-Blake2b:
 ```
 HMAC_key = Blake2b(b"keep-rate-limit-hmac-key" || vault_salt)
-Record = failed_attempts || last_failure_timestamp || HMAC[0..4]
+Record = failed_attempts || last_failure_timestamp || HMAC[0..8]
 ```
 
 ## Hidden Volumes
@@ -217,7 +217,7 @@ Identical implementation and safety invariants.
 MAX_MESSAGE_SIZE: 64 KB
 MAX_COMMITMENT_SIZE: 128 bytes
 MAX_SIGNATURE_SHARE_SIZE: 64 bytes
-MAX_PARTICIPANTS: 256
+MAX_PARTICIPANTS: 255
 ```
 
 **Protected against:**
@@ -267,6 +267,8 @@ r8nwAA==
 ```
 
 **Fingerprint:** `5F0A E5D5 0B42 BE91 08F0 E4A6 E23B 2F15 7966 B64C`
+
+**Keyserver:** https://keys.openpgp.org/search?q=security%40privkey.io
 
 **Process:**
 1. Encrypt report with PGP key above
