@@ -30,7 +30,11 @@ struct Cli {
     #[arg(long, global = true)]
     hidden: bool,
 
-    #[arg(long, global = true, help = "Disable memory locking (accepts degraded security)")]
+    #[arg(
+        long,
+        global = true,
+        help = "Disable memory locking (accepts degraded security)"
+    )]
     no_mlock: bool,
 
     #[command(subcommand)]
