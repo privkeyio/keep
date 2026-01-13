@@ -1,0 +1,17 @@
+services:
+  keep:
+    build:
+      context: ..
+      dockerfile: contrib/Dockerfile
+    volumes:
+      - keep-data:/data
+    environment:
+      - KEEP_PATH=/data
+      - RUST_LOG=info
+    env_file:
+      - keep.env
+    restart: unless-stopped
+    command: ["serve", "--relay", "wss://nos.lol"]
+
+volumes:
+  keep-data:
