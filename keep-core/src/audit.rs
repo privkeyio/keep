@@ -249,14 +249,19 @@ impl AuditLog {
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
 
-        for line in reader.lines() {
+        for (line_num, line) in reader.lines().enumerate() {
             let line = line?;
             if line.is_empty() {
                 continue;
             }
-            if let Ok(entry) = Self::decrypt_line(&line, data_key) {
-                entries.push(entry);
-            }
+            let entry = Self::decrypt_line(&line, data_key).map_err(|e| {
+                KeepError::Other(format!(
+                    "Audit log corrupted or tampered at line {}: {}",
+                    line_num + 1,
+                    e
+                ))
+            })?;
+            entries.push(entry);
         }
 
         Ok(entries)
@@ -312,14 +317,19 @@ impl AuditLog {
         let reader = BufReader::new(file);
         let mut last_hash = [0u8; 32];
 
-        for line in reader.lines() {
+        for (line_num, line) in reader.lines().enumerate() {
             let line = line?;
             if line.is_empty() {
                 continue;
             }
-            if let Ok(entry) = Self::decrypt_line(&line, data_key) {
-                last_hash = entry.hash;
-            }
+            let entry = Self::decrypt_line(&line, data_key).map_err(|e| {
+                KeepError::Other(format!(
+                    "Audit log corrupted or tampered at line {}: {}",
+                    line_num + 1,
+                    e
+                ))
+            })?;
+            last_hash = entry.hash;
         }
 
         Ok(last_hash)
