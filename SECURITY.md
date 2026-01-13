@@ -269,8 +269,6 @@ r8nwAA==
 
 **Fingerprint:** `5F0A E5D5 0B42 BE91 08F0 E4A6 E23B 2F15 7966 B64C`
 
-**Keyserver:** https://keys.openpgp.org/search?q=security%40privkey.io
-
 **Process:**
 1. Encrypt report with PGP key above
 2. Send to security@privkey.io
