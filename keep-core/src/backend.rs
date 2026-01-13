@@ -7,8 +7,10 @@ use std::path::Path;
 use std::sync::{PoisonError, RwLock};
 
 use redb::{Database, ReadableTable, TableDefinition};
+use tracing::debug;
 
 use crate::error::{KeepError, Result};
+use crate::migration;
 
 fn lock_error<T>(_: PoisonError<T>) -> KeepError {
     KeepError::Other("lock poisoned".into())
@@ -47,6 +49,7 @@ impl RedbBackend {
     /// Create a new database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
+        migration::initialize_schema(&db)?;
         Ok(Self { db })
     }
 
@@ -59,7 +62,19 @@ impl RedbBackend {
         let mut last_err = None;
         for _ in 0..MAX_RETRIES {
             match Database::open(path) {
-                Ok(db) => return Ok(Self { db }),
+                Ok(db) => {
+                    migration::check_compatibility(&db)?;
+                    let result = migration::run_migrations(&db)?;
+                    if result.migrations_run > 0 {
+                        debug!(
+                            from = result.from_version,
+                            to = result.to_version,
+                            count = result.migrations_run,
+                            "migrations completed"
+                        );
+                    }
+                    return Ok(Self { db });
+                }
                 Err(e) => {
                     let is_retryable = matches!(
                         &e,
@@ -79,6 +94,14 @@ impl RedbBackend {
         Err(last_err
             .map(|e| e.into())
             .unwrap_or_else(|| KeepError::Other("database open failed after retries".into())))
+    }
+
+    pub fn schema_version(&self) -> Result<u32> {
+        Ok(migration::read_schema_version(&self.db)?.unwrap_or(1))
+    }
+
+    pub fn needs_migration(&self) -> Result<bool> {
+        migration::needs_migration(&self.db)
     }
 
     fn table_def(

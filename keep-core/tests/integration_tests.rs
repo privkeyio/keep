@@ -6,10 +6,12 @@ use tempfile::tempdir;
 
 use keep_core::crypto::Argon2Params;
 use keep_core::keys::NostrKeypair;
+use keep_core::migration::CURRENT_SCHEMA_VERSION;
+use keep_core::storage::Storage;
 use keep_core::Keep;
 
 fn create_test_keep(path: &Path) -> Keep {
-    keep_core::storage::Storage::create(path, "testpass123", Argon2Params::TESTING).unwrap();
+    Storage::create(path, "testpass123", Argon2Params::TESTING).unwrap();
     let mut keep = Keep::open(path).unwrap();
     keep.unlock("testpass123").unwrap();
     keep
@@ -133,4 +135,56 @@ fn test_keyring_signing() {
     let message = b"test message";
     let sig = keypair.sign(message).unwrap();
     assert_eq!(sig.len(), 64);
+}
+
+#[test]
+fn test_new_vault_has_schema_version() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test-keep");
+
+    Storage::create(&path, "testpass123", Argon2Params::TESTING).unwrap();
+
+    let mut storage = Storage::open(&path).unwrap();
+    storage.unlock("testpass123").unwrap();
+
+    assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn test_vault_migration_status() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test-keep");
+
+    Storage::create(&path, "testpass123", Argon2Params::TESTING).unwrap();
+
+    let mut storage = Storage::open(&path).unwrap();
+    storage.unlock("testpass123").unwrap();
+
+    assert!(!storage.needs_migration().unwrap());
+    assert_eq!(storage.run_migrations().unwrap().migrations_run, 0);
+}
+
+#[test]
+fn test_vault_preserves_data_after_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test-keep");
+
+    let pubkey;
+    {
+        let mut keep = create_test_keep(&path);
+        pubkey = keep.generate_key("persistent-key").unwrap();
+    }
+
+    {
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("testpass123").unwrap();
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    {
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass123").unwrap();
+        assert_eq!(keep.list_keys().unwrap().len(), 1);
+        assert_eq!(keep.list_keys().unwrap()[0].pubkey, pubkey);
+    }
 }

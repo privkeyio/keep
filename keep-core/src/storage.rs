@@ -372,7 +372,6 @@ impl Storage {
         &self.path
     }
 
-    /// Store a FROST share.
     pub fn store_share(&self, share: &StoredShare) -> Result<()> {
         debug!(name = %share.metadata.name, "storing FROST share");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;

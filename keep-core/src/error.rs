@@ -74,6 +74,10 @@ pub enum KeepError {
     #[error("Rotation failed: {0}")]
     RotationFailed(String),
 
+    /// Migration operation failed.
+    #[error("Migration error: {0}")]
+    Migration(String),
+
     /// Serialization or deserialization failed.
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
