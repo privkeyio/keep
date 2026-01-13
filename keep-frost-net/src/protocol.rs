@@ -368,6 +368,7 @@ impl PongPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ErrorPayload {
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(with = "hex_bytes_option")]
     pub session_id: Option<[u8; 32]>,
