@@ -413,14 +413,14 @@ impl Keep {
         let stored = StoredShare::encrypt(&share, &data_key)?;
         self.storage.store_share(&stored)?;
 
-        if let Ok(group_bytes) = hex::decode(&export.group_pubkey) {
-            if let Ok(group) = <[u8; 32]>::try_from(group_bytes.as_slice()) {
-                self.audit_event(AuditEventType::FrostShareImport, |e| {
-                    e.with_group(&group)
-                        .with_participants(vec![export.identifier])
-                });
-            }
-        }
+        let group = hex::decode(&export.group_pubkey)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .unwrap_or_else(|| crypto::blake2b_256(export.group_pubkey.as_bytes()));
+        self.audit_event(AuditEventType::FrostShareImport, |e| {
+            e.with_group(&group)
+                .with_participants(vec![export.identifier])
+        });
 
         Ok(())
     }
