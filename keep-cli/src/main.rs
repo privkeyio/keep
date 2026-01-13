@@ -4,6 +4,7 @@
 mod bunker;
 mod commands;
 mod output;
+mod panic;
 mod server;
 mod signer;
 mod tui;
@@ -11,12 +12,21 @@ mod tui;
 mod warden;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Parser, Subcommand};
 use tracing::debug;
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use keep_core::crypto::disable_mlock;
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_request_id() -> String {
+    let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("req-{:08x}", id)
+}
 use keep_core::default_keep_path;
 use keep_core::error::Result;
 
@@ -386,17 +396,30 @@ enum EnclaveCommands {
     },
 }
 
-fn setup_panic_hook() {
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        original_hook(panic_info);
-    }));
+fn init_logging() {
+    let use_json = std::env::var("KEEP_LOG_JSON").is_ok();
+    let filter = EnvFilter::from_default_env();
+
+    if use_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_span_events(FmtSpan::CLOSE)
+            .with_current_span(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .without_time()
+            .with_span_events(FmtSpan::CLOSE)
+            .init();
+    }
 }
 
 fn main() {
-    setup_panic_hook();
+    init_logging();
+    panic::install();
 
     ctrlc::set_handler(|| {
         let _ = crossterm::terminal::disable_raw_mode();
@@ -404,12 +427,6 @@ fn main() {
         std::process::exit(130);
     })
     .ok();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .without_time()
-        .init();
 
     let out = Output::new();
 
@@ -419,6 +436,7 @@ fn main() {
     }
 }
 
+#[tracing::instrument(skip(out), fields(request_id = %next_request_id()))]
 fn run(out: &Output) -> Result<()> {
     let cli = Cli::parse();
 

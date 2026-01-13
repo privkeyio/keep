@@ -15,6 +15,7 @@ use crate::output::Output;
 
 use super::{get_password, get_password_with_confirm};
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_generate(
     out: &Output,
     path: &Path,
@@ -71,6 +72,7 @@ pub fn cmd_frost_generate(
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_split(
     out: &Output,
     path: &Path,
@@ -122,6 +124,7 @@ pub fn cmd_frost_split(
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_list(out: &Output, path: &Path) -> Result<()> {
     debug!("listing FROST shares");
 
@@ -170,13 +173,14 @@ pub fn cmd_frost_list(out: &Output, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_export(
     out: &Output,
     path: &Path,
     identifier: u16,
     group_npub: &str,
 ) -> Result<()> {
-    debug!(identifier, group_npub, "exporting FROST share");
+    debug!(identifier, group = group_npub, "exporting FROST share");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -207,6 +211,7 @@ pub fn cmd_frost_export(
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     debug!("importing FROST share");
 
@@ -339,6 +344,7 @@ pub async fn check_warden_policy(
     }
 }
 
+#[tracing::instrument(skip(out, warden_url), fields(path = %path.display()))]
 pub fn cmd_frost_sign(
     out: &Output,
     path: &Path,
