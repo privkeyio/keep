@@ -400,7 +400,7 @@ KEEP_PASSWORD="hidden" keep --hidden list
 Keep uses `mlock(2)` to prevent secret key material from being paged to disk. If mlock fails (common on systems with low `RLIMIT_MEMLOCK`), Keep warns but continues with degraded security.
 
 **If you see the warning:**
-```
+```text
 Warning: Failed to lock memory. Secrets may be paged to disk.
 To fix: ulimit -l unlimited (or increase RLIMIT_MEMLOCK)
 ```
@@ -408,7 +408,7 @@ To fix: ulimit -l unlimited (or increase RLIMIT_MEMLOCK)
 **Solutions:**
 - Temporary: `ulimit -l unlimited` before running keep
 - Permanent: Add to `/etc/security/limits.conf`:
-  ```
+  ```conf
   * soft memlock unlimited
   * hard memlock unlimited
   ```
