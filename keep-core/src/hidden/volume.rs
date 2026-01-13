@@ -11,18 +11,20 @@
 //!
 //! ```text
 //! ┌─────────────────────┐  0
-//! │   Outer Header      │  256 bytes - salt, encrypted data key, argon2 params
-//! ├─────────────────────┤  256
-//! │   Hidden Header     │  256 bytes - encrypted with separate KDF salt (looks random)
-//! ├─────────────────────┤  512 (DATA_START_OFFSET)
+//! │   Outer Header      │  512 bytes - salt, encrypted data key, argon2 params
+//! ├─────────────────────┤  512
+//! │   Hidden Header     │  512 bytes - fully encrypted (looks random)
+//! ├─────────────────────┤  1024 (DATA_START_OFFSET)
 //! │   Outer Data Area   │  Variable size - redb database for outer volume
 //! ├─────────────────────┤
-//! │   Hidden Data Area  │  Variable size - serialized records for hidden volume
+//! │   Hidden Data Area  │  Variable size - encrypted length + encrypted records + random padding
 //! └─────────────────────┘
 //! ```
 //!
 //! # Security Properties
 //!
+//! - Hidden header KDF salt is derived from password (not stored)
+//! - Hidden data length is encrypted (no plaintext size prefix)
 //! - Hidden header is encrypted and indistinguishable from random bytes
 //! - Wrong password for hidden volume produces same error as "no hidden volume"
 //! - Both volumes use independent Argon2id key derivation
@@ -51,6 +53,25 @@ use super::header::{
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
+
+fn derive_hidden_salt(password: &str) -> [u8; 32] {
+    let mut input = Vec::with_capacity(19 + password.len());
+    input.extend_from_slice(b"keep-hidden-salt-v1");
+    input.extend_from_slice(password.as_bytes());
+    crypto::blake2b_256(&input)
+}
+
+fn write_random_padding(file: &mut File, size: u64) -> std::io::Result<()> {
+    let mut buffer = [0u8; 4096];
+    let mut written = 0u64;
+    while written < size {
+        let to_write = ((size - written) as usize).min(buffer.len());
+        rand::rng().fill_bytes(&mut buffer[..to_write]);
+        file.write_all(&buffer[..to_write])?;
+        written += to_write as u64;
+    }
+    Ok(())
+}
 
 /// Type of encrypted volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,31 +151,33 @@ impl HiddenStorage {
             .encrypted_data_key
             .copy_from_slice(&encrypted_outer.ciphertext);
 
-        let (hidden_header, hidden_data_key, hidden_kdf_salt) = if let Some(hp) = hidden_password {
-            let hidden_offset = DATA_START_OFFSET + outer_size;
-            let mut hh = HiddenHeader::new(hidden_offset, hidden_size);
+        let (hidden_header, hidden_data_key, encrypted_hidden_header) =
+            if let Some(hp) = hidden_password {
+                let hidden_offset = DATA_START_OFFSET + outer_size;
+                let mut hh = HiddenHeader::new(hidden_offset, hidden_size);
 
-            let hidden_data_key = SecretKey::generate()?;
+                let hidden_data_key = SecretKey::generate()?;
+                let kdf_salt = derive_hidden_salt(hp);
+                let hidden_master_key =
+                    crypto::derive_key(hp.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
 
-            let kdf_salt: [u8; 32] = crypto::random_bytes();
+                let hidden_header_key =
+                    crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
+                let hidden_key_bytes = hidden_data_key.decrypt()?;
+                let encrypted_hidden = crypto::encrypt(&*hidden_key_bytes, &hidden_header_key)?;
+                hh.nonce.copy_from_slice(&encrypted_hidden.nonce);
+                hh.encrypted_data_key
+                    .copy_from_slice(&encrypted_hidden.ciphertext);
+                hh.checksum = hh.compute_checksum();
 
-            let hidden_master_key =
-                crypto::derive_key(hp.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
-            let hidden_header_key =
-                crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
+                let hidden_header_enc_key =
+                    crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header-enc")?;
+                let encrypted_hh = crypto::encrypt(&hh.to_bytes_compact(), &hidden_header_enc_key)?;
 
-            let hidden_key_bytes = hidden_data_key.decrypt()?;
-            let encrypted_hidden = crypto::encrypt(&*hidden_key_bytes, &hidden_header_key)?;
-            hh.nonce.copy_from_slice(&encrypted_hidden.nonce);
-            hh.encrypted_data_key
-                .copy_from_slice(&encrypted_hidden.ciphertext);
-
-            hh.checksum = hh.compute_checksum();
-
-            (Some(hh), Some(hidden_data_key), Some(kdf_salt))
-        } else {
-            (None, None, None)
-        };
+                (Some(hh), Some(hidden_data_key), Some(encrypted_hh))
+            } else {
+                (None, None, None)
+            };
 
         fs::create_dir_all(path)?;
         let vault_path = path.join("keep.vault");
@@ -162,54 +185,24 @@ impl HiddenStorage {
 
         file.write_all(&outer_header.to_bytes())?;
 
-        if let Some(ref hh) = hidden_header {
-            let kdf_salt = hidden_kdf_salt.unwrap();
-
-            let hidden_master_key = crypto::derive_key(
-                hidden_password.unwrap().as_bytes(),
-                &kdf_salt,
-                Argon2Params::DEFAULT,
-            )?;
-            let hidden_header_enc_key =
-                crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header-enc")?;
-
-            let encrypted_hh = crypto::encrypt(&hh.to_bytes_compact(), &hidden_header_enc_key)?;
-
-            let mut hidden_area: [u8; HEADER_SIZE] = crypto::random_bytes();
-            hidden_area[..32].copy_from_slice(&kdf_salt);
-            hidden_area[32..56].copy_from_slice(&encrypted_hh.nonce);
-            hidden_area[56..56 + encrypted_hh.ciphertext.len()]
+        let mut hidden_area: [u8; HEADER_SIZE] = crypto::random_bytes();
+        if let Some(encrypted_hh) = encrypted_hidden_header {
+            hidden_area[..24].copy_from_slice(&encrypted_hh.nonce);
+            hidden_area[24..24 + encrypted_hh.ciphertext.len()]
                 .copy_from_slice(&encrypted_hh.ciphertext);
-            file.write_all(&hidden_area)?;
-        } else {
-            let random_bytes: [u8; HEADER_SIZE] = crypto::random_bytes();
-            file.write_all(&random_bytes)?;
         }
+        file.write_all(&hidden_area)?;
 
-        let remaining = total_size - DATA_START_OFFSET;
-        let mut written = 0u64;
-        let mut buffer = [0u8; 4096];
-
-        while written < remaining {
-            let to_write = ((remaining - written) as usize).min(buffer.len());
-            rand::rng().fill_bytes(&mut buffer[..to_write]);
-            file.write_all(&buffer[..to_write])?;
-            written += to_write as u64;
-        }
-
+        write_random_padding(&mut file, total_size - DATA_START_OFFSET)?;
         file.sync_all()?;
         drop(file);
 
         let db_path = path.join("keep.db");
         let db = Database::create(&db_path)?;
 
-        {
-            let wtxn = db.begin_write()?;
-            {
-                let _ = wtxn.open_table(KEYS_TABLE)?;
-            }
-            wtxn.commit()?;
-        }
+        let wtxn = db.begin_write()?;
+        let _ = wtxn.open_table(KEYS_TABLE)?;
+        wtxn.commit()?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -314,27 +307,18 @@ impl HiddenStorage {
         let mut hidden_area = [0u8; HEADER_SIZE];
         file.read_exact(&mut hidden_area)?;
 
-        let mut kdf_salt = [0u8; 32];
-        kdf_salt.copy_from_slice(&hidden_area[..32]);
-
+        let kdf_salt = derive_hidden_salt(password);
         let master_key = crypto::derive_key(password.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
-
         let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc")?;
 
-        let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&hidden_area[32..56]);
-
         const ENCRYPTED_HEADER_SIZE: usize = HiddenHeader::COMPACT_SIZE + crypto::TAG_SIZE;
-
         let encrypted = EncryptedData {
-            nonce,
-            ciphertext: hidden_area[56..56 + ENCRYPTED_HEADER_SIZE].to_vec(),
+            nonce: hidden_area[..24].try_into().expect("slice is 24 bytes"),
+            ciphertext: hidden_area[24..24 + ENCRYPTED_HEADER_SIZE].to_vec(),
         };
 
-        let decrypted = match crypto::decrypt(&encrypted, &header_enc_key) {
-            Ok(d) => d,
-            Err(_) => return Err(KeepError::InvalidPassword),
-        };
+        let decrypted = crypto::decrypt(&encrypted, &header_enc_key)
+            .map_err(|_| KeepError::InvalidPassword)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
         let hidden_header = HiddenHeader::from_bytes_compact(&decrypted_bytes)?;
@@ -344,12 +328,8 @@ impl HiddenStorage {
         }
 
         let data_key_enc = crypto::derive_subkey(&master_key, b"keep-hidden-header")?;
-
-        let mut data_nonce = [0u8; 24];
-        data_nonce.copy_from_slice(&hidden_header.nonce);
-
         let data_encrypted = EncryptedData {
-            nonce: data_nonce,
+            nonce: hidden_header.nonce,
             ciphertext: hidden_header.encrypted_data_key.to_vec(),
         };
 
@@ -509,49 +489,45 @@ impl HiddenStorage {
         let mut file = File::open(&vault_path)?;
         file.seek(SeekFrom::Start(hidden_header.hidden_data_offset))?;
 
-        let mut size_bytes = [0u8; 8];
-        if file.read_exact(&mut size_bytes).is_err() {
+        const ENCRYPTED_LENGTH_SIZE: usize = crypto::NONCE_SIZE + 8 + crypto::TAG_SIZE;
+        let mut length_blob = [0u8; ENCRYPTED_LENGTH_SIZE];
+        if file.read_exact(&mut length_blob).is_err() {
             return Ok(Vec::new());
         }
 
-        let data_size = u64::from_le_bytes(size_bytes);
-        if data_size == 0 || data_size > hidden_header.hidden_data_size {
+        let data_size = (|| -> Option<u64> {
+            let encrypted_length = EncryptedData::from_bytes(&length_blob).ok()?;
+            let decrypted_length = crypto::decrypt(&encrypted_length, data_key).ok()?;
+            let length_bytes = decrypted_length.as_slice().ok()?;
+            let arr: [u8; 8] = length_bytes.try_into().ok()?;
+            Some(u64::from_le_bytes(arr))
+        })();
+
+        let Some(data_size) = data_size else {
+            return Ok(Vec::new());
+        };
+
+        let max_data_size = hidden_header.hidden_data_size.saturating_sub(ENCRYPTED_LENGTH_SIZE as u64);
+        if data_size == 0 || data_size > max_data_size {
             return Ok(Vec::new());
         }
 
         let mut encrypted_data = vec![0u8; data_size as usize];
         file.read_exact(&mut encrypted_data)?;
 
-        let encrypted = match EncryptedData::from_bytes(&encrypted_data) {
-            Ok(e) => e,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let records = (|| -> Option<Vec<KeyRecord>> {
+            let encrypted = EncryptedData::from_bytes(&encrypted_data).ok()?;
+            let decrypted = crypto::decrypt(&encrypted, data_key).ok()?;
+            let decrypted_bytes = decrypted.as_slice().ok()?;
+            bincode::options()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_RECORD_SIZE)
+                .deserialize(&decrypted_bytes)
+                .ok()
+        })();
 
-        let decrypted = match crypto::decrypt(&encrypted, data_key) {
-            Ok(d) => d,
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let decrypted_bytes = match decrypted.as_slice() {
-            Ok(d) => d,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let records: Vec<KeyRecord> = match bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .with_limit(MAX_RECORD_SIZE)
-            .deserialize(&decrypted_bytes)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to deserialize hidden records (possible data corruption or wrong password)"
-                );
-                Vec::new()
-            }
-        };
-        Ok(records)
+        Ok(records.unwrap_or_default())
     }
 
     fn write_hidden_records(
@@ -563,11 +539,15 @@ impl HiddenStorage {
         let serialized = bincode::options()
             .with_fixint_encoding()
             .serialize(records)?;
-
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        if (encrypted_bytes.len() + 8) as u64 > hidden_header.hidden_data_size {
+        let length_bytes = (encrypted_bytes.len() as u64).to_le_bytes();
+        let encrypted_length = crypto::encrypt(&length_bytes, data_key)?;
+        let encrypted_length_bytes = encrypted_length.to_bytes();
+
+        let total_size = encrypted_length_bytes.len() + encrypted_bytes.len();
+        if total_size as u64 > hidden_header.hidden_data_size {
             return Err(KeepError::Other("Hidden volume full".into()));
         }
 
@@ -575,18 +555,11 @@ impl HiddenStorage {
         let mut file = OpenOptions::new().write(true).open(&vault_path)?;
         file.seek(SeekFrom::Start(hidden_header.hidden_data_offset))?;
 
-        file.write_all(&(encrypted_bytes.len() as u64).to_le_bytes())?;
+        file.write_all(&encrypted_length_bytes)?;
         file.write_all(&encrypted_bytes)?;
 
-        let remaining = hidden_header.hidden_data_size - encrypted_bytes.len() as u64 - 8;
-        let mut buffer = [0u8; 4096];
-        let mut written = 0u64;
-        while written < remaining {
-            let to_write = ((remaining - written) as usize).min(buffer.len());
-            rand::rng().fill_bytes(&mut buffer[..to_write]);
-            file.write_all(&buffer[..to_write])?;
-            written += to_write as u64;
-        }
+        let remaining = hidden_header.hidden_data_size - total_size as u64;
+        write_random_padding(&mut file, remaining)?;
 
         file.sync_all()?;
         Ok(())
