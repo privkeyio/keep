@@ -20,8 +20,42 @@ use zeroize::Zeroize;
 
 use crate::error::{KeepError, Result};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static MLOCK_DISABLED: AtomicBool = AtomicBool::new(false);
+static MLOCK_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn disable_mlock() {
+    MLOCK_DISABLED.store(true, Ordering::SeqCst);
+}
+
+fn warn_once() {
+    if !MLOCK_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "Warning: Failed to lock memory. Secrets may be paged to disk.\n\
+             To fix: ulimit -l unlimited (or increase RLIMIT_MEMLOCK)"
+        );
+    }
+}
+
+/// Attempt to mlock memory, returning true if locked.
+/// Returns false without attempting if mlock is globally disabled.
+/// Warns once on first failure.
+#[allow(unsafe_code)]
+fn try_mlock(ptr: *mut u8, len: usize) -> bool {
+    if MLOCK_DISABLED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let result = unsafe { memsec::mlock(ptr, len) };
+    if !result {
+        warn_once();
+    }
+    result
+}
+
 #[allow(unsafe_code)]
 mod mlock {
+    use super::try_mlock;
     use std::alloc::{alloc_zeroed, dealloc, Layout};
     use zeroize::Zeroize;
 
@@ -46,14 +80,10 @@ mod mlock {
                 std::alloc::handle_alloc_error(layout);
             }
 
-            // Copy data to mlocked memory
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, N) };
-
-            // Zero the source immediately
             data.zeroize();
 
-            let locked = unsafe { memsec::mlock(ptr as *mut u8, N) };
-
+            let locked = try_mlock(ptr as *mut u8, N);
             Self { ptr, locked }
         }
 
@@ -121,8 +151,7 @@ mod mlock {
             let ptr = data.as_mut_ptr();
             std::mem::forget(data);
 
-            let locked = unsafe { memsec::mlock(ptr, capacity) };
-
+            let locked = try_mlock(ptr, capacity);
             Self {
                 ptr,
                 len,
