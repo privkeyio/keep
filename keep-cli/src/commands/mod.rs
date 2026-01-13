@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub mod agent;
+pub mod audit;
 pub mod bitcoin;
 pub mod enclave;
 pub mod frost;

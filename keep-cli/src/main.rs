@@ -89,6 +89,10 @@ enum Commands {
         #[arg(long, default_value = "wss://nos.lol")]
         frost_relay: String,
     },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
     Frost {
         #[command(subcommand)]
         command: FrostCommands,
@@ -113,6 +117,28 @@ enum AgentCommands {
         #[arg(short, long)]
         key: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    List {
+        #[arg(short, long, help = "Number of entries to show")]
+        limit: Option<usize>,
+    },
+    Export {
+        #[arg(short, long, help = "Output file path")]
+        output: Option<String>,
+    },
+    Verify,
+    Retention {
+        #[arg(long, help = "Maximum entries to keep")]
+        max_entries: Option<usize>,
+        #[arg(long, help = "Maximum age in days")]
+        max_days: Option<u32>,
+        #[arg(long, help = "Apply retention policy now")]
+        apply: bool,
+    },
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -483,6 +509,7 @@ fn run(out: &Output) -> Result<()> {
             frost_group.as_deref(),
             &frost_relay,
         ),
+        Commands::Audit { command } => dispatch_audit(out, &path, command, hidden),
         Commands::Frost { command } => dispatch_frost(out, &path, command),
         Commands::Bitcoin { command } => dispatch_bitcoin(out, &path, command),
         Commands::Enclave { command } => dispatch_enclave(out, &path, command),
@@ -498,6 +525,27 @@ fn dispatch_agent(
 ) -> Result<()> {
     match command {
         AgentCommands::Mcp { key } => commands::agent::cmd_agent_mcp(out, path, &key, hidden),
+    }
+}
+
+fn dispatch_audit(
+    out: &Output,
+    path: &std::path::Path,
+    command: AuditCommands,
+    hidden: bool,
+) -> Result<()> {
+    match command {
+        AuditCommands::List { limit } => commands::audit::cmd_audit_list(out, path, limit, hidden),
+        AuditCommands::Export { output } => {
+            commands::audit::cmd_audit_export(out, path, output.as_deref(), hidden)
+        }
+        AuditCommands::Verify => commands::audit::cmd_audit_verify(out, path, hidden),
+        AuditCommands::Retention {
+            max_entries,
+            max_days,
+            apply,
+        } => commands::audit::cmd_audit_retention(out, path, max_entries, max_days, apply, hidden),
+        AuditCommands::Stats => commands::audit::cmd_audit_stats(out, path, hidden),
     }
 }
 
