@@ -171,48 +171,85 @@ fn valid_messages_pass_validation() {
         AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 12345)
             .with_name("Test")
             .with_capabilities(vec!["sign".into()])
-    ).validate().is_ok());
+    )
+    .validate()
+    .is_ok());
 
-    assert!(KfpMessage::SignRequest(
-        SignRequestPayload::new([1u8; 32], [2u8; 32], vec![1, 2, 3], "raw", vec![1, 2])
-    ).validate().is_ok());
+    assert!(KfpMessage::SignRequest(SignRequestPayload::new(
+        [1u8; 32],
+        [2u8; 32],
+        vec![1, 2, 3],
+        "raw",
+        vec![1, 2]
+    ))
+    .validate()
+    .is_ok());
 
-    assert!(KfpMessage::Commitment(
-        CommitmentPayload::new([1u8; 32], 1, vec![0u8; 64])
-    ).validate().is_ok());
+    assert!(
+        KfpMessage::Commitment(CommitmentPayload::new([1u8; 32], 1, vec![0u8; 64]))
+            .validate()
+            .is_ok()
+    );
 
-    assert!(KfpMessage::SignatureShare(
-        SignatureSharePayload::new([1u8; 32], 1, vec![0u8; 32])
-    ).validate().is_ok());
+    assert!(
+        KfpMessage::SignatureShare(SignatureSharePayload::new([1u8; 32], 1, vec![0u8; 32]))
+            .validate()
+            .is_ok()
+    );
 
-    assert!(KfpMessage::Error(
-        ErrorPayload::new("INVALID_SESSION", "Session not found")
-    ).validate().is_ok());
+    assert!(
+        KfpMessage::Error(ErrorPayload::new("INVALID_SESSION", "Session not found"))
+            .validate()
+            .is_ok()
+    );
 }
 
 #[test]
 fn message_type_accessor() {
     assert_eq!(
-        KfpMessage::Announce(AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 12345)).message_type(),
+        KfpMessage::Announce(AnnouncePayload::new(
+            [1u8; 32], 1, [2u8; 33], [3u8; 64], 12345
+        ))
+        .message_type(),
         "announce"
     );
     assert_eq!(
-        KfpMessage::SignRequest(SignRequestPayload::new([1u8; 32], [2u8; 32], vec![], "raw", vec![])).message_type(),
+        KfpMessage::SignRequest(SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![],
+            "raw",
+            vec![]
+        ))
+        .message_type(),
         "sign_request"
     );
 }
 
 #[test]
 fn boundary_sizes_valid() {
-    assert!(KfpMessage::SignRequest(
-        SignRequestPayload::new([1u8; 32], [2u8; 32], vec![0u8; MAX_MESSAGE_SIZE], "raw", vec![1])
-    ).validate().is_ok());
+    assert!(KfpMessage::SignRequest(SignRequestPayload::new(
+        [1u8; 32],
+        [2u8; 32],
+        vec![0u8; MAX_MESSAGE_SIZE],
+        "raw",
+        vec![1]
+    ))
+    .validate()
+    .is_ok());
 
     assert!(KfpMessage::Announce(
-        AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 12345).with_name(&"n".repeat(MAX_NAME_LENGTH))
-    ).validate().is_ok());
+        AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 12345)
+            .with_name(&"n".repeat(MAX_NAME_LENGTH))
+    )
+    .validate()
+    .is_ok());
 
-    assert!(KfpMessage::Commitment(
-        CommitmentPayload::new([1u8; 32], 1, vec![0u8; MAX_COMMITMENT_SIZE])
-    ).validate().is_ok());
+    assert!(KfpMessage::Commitment(CommitmentPayload::new(
+        [1u8; 32],
+        1,
+        vec![0u8; MAX_COMMITMENT_SIZE]
+    ))
+    .validate()
+    .is_ok());
 }
