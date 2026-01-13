@@ -175,18 +175,22 @@ valid = constant_time_eq(expected, stored_checksum)
 
 All modules use `#![forbid(unsafe_code)]` except memory protection.
 
-### MlockedBox (keep-core/src/crypto.rs:16-88)
+### MlockedBox (keep-core/src/crypto.rs, `mlock` module)
 
-| Line | Operation | Safety Invariant |
-|------|-----------|------------------|
-| 32 | `alloc_zeroed()` | Layout valid; null check at line 33 |
-| 38 | `copy_nonoverlapping()` | Source/dest valid; no overlap |
-| 43 | `mlock()` | Failure handled (sets locked=false) |
-| 58, 64 | Deref/DerefMut | Pointer valid until Drop |
-| 71, 82 | `memzero()` | Pointer valid; size matches allocation |
-| 73 | `munlock()` | Size matches original mlock |
-| 75 | `dealloc()` | Layout matches original allocation |
-| 86-87 | `Send`/`Sync` | Interior pointer never exposed |
+| Location | Operation | Safety Invariant |
+|----------|-----------|------------------|
+| `MlockedBox::new` | `alloc_zeroed()` | Layout valid for `[u8; N]`; null check before use |
+| `MlockedBox::new` | `copy_nonoverlapping()` | Source valid slice, dest from `alloc_zeroed`; no overlap |
+| `MlockedBox::new` | `mlock()` | Failure handled gracefully (sets `locked=false`) |
+| `impl Deref` | `&*self.ptr` | Pointer valid from allocation until `Drop` |
+| `impl DerefMut` | `&mut *self.ptr` | Pointer valid from allocation until `Drop` |
+| `impl Drop` | `memzero()` | Pointer valid; size `N` matches allocation |
+| `impl Drop` | `munlock()` | Size `N` matches original `mlock` call |
+| `impl Drop` | `dealloc()` | Layout matches original `alloc_zeroed` |
+| `impl Zeroize` | `memzero()` | Pointer valid; size `N` matches allocation |
+| `unsafe impl Send/Sync` | Marker traits | Interior pointer never exposed; no shared mutation |
+
+*Note: Verified against commit `760cd18`. Line numbers omitted for maintainability.*
 
 ### Enclave MlockedBox (keep-enclave/enclave/src/mlock.rs)
 
