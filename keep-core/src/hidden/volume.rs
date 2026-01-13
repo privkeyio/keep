@@ -317,8 +317,8 @@ impl HiddenStorage {
             ciphertext: hidden_area[24..24 + ENCRYPTED_HEADER_SIZE].to_vec(),
         };
 
-        let decrypted = crypto::decrypt(&encrypted, &header_enc_key)
-            .map_err(|_| KeepError::InvalidPassword)?;
+        let decrypted =
+            crypto::decrypt(&encrypted, &header_enc_key).map_err(|_| KeepError::InvalidPassword)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
         let hidden_header = HiddenHeader::from_bytes_compact(&decrypted_bytes)?;
@@ -507,7 +507,9 @@ impl HiddenStorage {
             return Ok(Vec::new());
         };
 
-        let max_data_size = hidden_header.hidden_data_size.saturating_sub(ENCRYPTED_LENGTH_SIZE as u64);
+        let max_data_size = hidden_header
+            .hidden_data_size
+            .saturating_sub(ENCRYPTED_LENGTH_SIZE as u64);
         if data_size == 0 || data_size > max_data_size {
             return Ok(Vec::new());
         }
