@@ -4,7 +4,7 @@
 
 ### Rust Toolchain
 
-Rust 1.70 or later required. Install via [rustup](https://rustup.rs):
+Rust 1.83 or later required. Install via [rustup](https://rustup.rs):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -155,7 +155,7 @@ Build the CLI in Docker:
 
 ```bash
 docker build -t keep-build -f - . <<'EOF'
-FROM rust:1.81-bookworm
+FROM rust:1.83-bookworm
 RUN apt-get update && apt-get install -y libudev-dev
 WORKDIR /app
 COPY . .

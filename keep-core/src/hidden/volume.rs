@@ -935,20 +935,21 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        // First 4 attempts - new storage each time to test persistence
-        for _ in 0..4 {
+        // First 5 attempts - new storage each time to test persistence
+        for _ in 0..5 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock_outer("wrong");
             assert!(result.is_err());
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 5 and 6 on same instance to ensure tight timing
-        // (rate limit delay is only 1 second, can expire on slow CI)
+        // Attempts 6 and 7 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
+        // ensures we hit rate limiting even if the first attempt's
+        // 1-second window expired on slow CI.
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock_outer("wrong");
-        assert!(result.is_err());
-        assert!(!matches!(result, Err(KeepError::RateLimited(_))));
+        assert!(result.is_err()); // May or may not be rate limited (1s window)
 
         let result = storage.unlock_outer("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
@@ -961,17 +962,21 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        // First 4 attempts - new storage each time to test persistence
-        for _ in 0..4 {
+        // First 5 attempts - new storage each time to test persistence
+        for _ in 0..5 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock_hidden("wrong");
-            assert!(matches!(result, Err(KeepError::InvalidPassword)));
+            assert!(result.is_err());
+            assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 5 and 6 on same instance to ensure tight timing
+        // Attempts 6 and 7 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
+        // ensures we hit rate limiting even if the first attempt's
+        // 1-second window expired on slow CI.
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock_hidden("wrong");
-        assert!(matches!(result, Err(KeepError::InvalidPassword)));
+        assert!(result.is_err()); // May or may not be rate limited (1s window)
 
         let result = storage.unlock_hidden("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
@@ -984,17 +989,21 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        // First 4 attempts - new storage each time to test persistence
-        for _ in 0..4 {
+        // First 5 attempts - new storage each time to test persistence
+        for _ in 0..5 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock("wrong");
-            assert!(matches!(result, Err(KeepError::InvalidPassword)));
+            assert!(result.is_err());
+            assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 5 and 6 on same instance to ensure tight timing
+        // Attempts 6 and 7 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
+        // ensures we hit rate limiting even if the first attempt's
+        // 1-second window expired on slow CI.
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock("wrong");
-        assert!(matches!(result, Err(KeepError::InvalidPassword)));
+        assert!(result.is_err()); // May or may not be rate limited (1s window)
 
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));

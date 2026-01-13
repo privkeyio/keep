@@ -2,12 +2,13 @@ _keep_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="init generate import list export delete serve bitcoin frost enclave mcp-server"
+    local commands="init generate import list export delete serve bitcoin frost enclave agent"
     local bitcoin_cmds="address descriptor analyze sign"
     local frost_cmds="generate split list export import sign network hardware"
-    local frost_network_cmds="serve peers sign sign-event dkg"
-    local frost_hardware_cmds="ping list import"
-    local enclave_cmds="status verify generate-key import-key sign sign-psbt"
+    local frost_network_cmds="serve peers sign sign-event dkg group-create nonce-precommit"
+    local frost_hardware_cmds="ping list import delete sign"
+    local enclave_cmds="status verify generate-key import-key sign"
+    local agent_cmds="mcp"
 
     case $prev in
         keep)
@@ -36,6 +37,10 @@ _keep_completions() {
             ;;
         enclave)
             COMPREPLY=($(compgen -W "$enclave_cmds" -- "$cur"))
+            return
+            ;;
+        agent)
+            COMPREPLY=($(compgen -W "$agent_cmds" -- "$cur"))
             return
             ;;
         --name|--key|--group|--share)

@@ -1,7 +1,7 @@
 #compdef keep
 
 _keep() {
-    local -a commands bitcoin_cmds frost_cmds frost_network_cmds frost_hardware_cmds enclave_cmds
+    local -a commands bitcoin_cmds frost_cmds frost_network_cmds frost_hardware_cmds enclave_cmds agent_cmds
 
     commands=(
         'init:Create encrypted vault'
@@ -14,7 +14,7 @@ _keep() {
         'bitcoin:Bitcoin operations'
         'frost:FROST threshold signatures'
         'enclave:AWS Nitro Enclave operations'
-        'mcp-server:Start MCP server'
+        'agent:Agent operations'
     )
 
     bitcoin_cmds=(
@@ -41,12 +41,16 @@ _keep() {
         'sign:Request signature'
         'sign-event:Sign nostr event'
         'dkg:Distributed key generation'
+        'group-create:Create signing group'
+        'nonce-precommit:Precommit nonces'
     )
 
     frost_hardware_cmds=(
         'ping:Test connection'
         'list:List shares on device'
         'import:Import share to hardware'
+        'delete:Delete share from device'
+        'sign:Sign with hardware'
     )
 
     enclave_cmds=(
@@ -55,7 +59,10 @@ _keep() {
         'generate-key:Generate key in enclave'
         'import-key:Import key to enclave'
         'sign:Sign message'
-        'sign-psbt:Sign PSBT'
+    )
+
+    agent_cmds=(
+        'mcp:Start MCP server'
     )
 
     _arguments -C \
@@ -70,14 +77,14 @@ _keep() {
             _describe 'command' commands
             ;;
         args)
-            case $words[1] in
+            case $words[2] in
                 bitcoin)
                     _describe 'bitcoin command' bitcoin_cmds
                     ;;
                 frost)
-                    if [[ $words[2] == "network" ]]; then
+                    if [[ $words[3] == "network" ]]; then
                         _describe 'network command' frost_network_cmds
-                    elif [[ $words[2] == "hardware" ]]; then
+                    elif [[ $words[3] == "hardware" ]]; then
                         _describe 'hardware command' frost_hardware_cmds
                     else
                         _describe 'frost command' frost_cmds
@@ -85,6 +92,9 @@ _keep() {
                     ;;
                 enclave)
                     _describe 'enclave command' enclave_cmds
+                    ;;
+                agent)
+                    _describe 'agent command' agent_cmds
                     ;;
             esac
             ;;
