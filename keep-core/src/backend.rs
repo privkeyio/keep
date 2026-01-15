@@ -44,12 +44,18 @@ impl RedbBackend {
         })
     }
 
-    fn table_def(&self, name: &str) -> Result<TableDefinition<'static, &'static [u8], &'static [u8]>> {
+    fn table_def(
+        &self,
+        name: &str,
+    ) -> Result<TableDefinition<'static, &'static [u8], &'static [u8]>> {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
             _ => {
-                let mut cache = self.table_names.write().map_err(|e| KeepError::Other(e.to_string()))?;
+                let mut cache = self
+                    .table_names
+                    .write()
+                    .map_err(|e| KeepError::Other(e.to_string()))?;
                 let static_name: &'static str = cache
                     .entry(name.to_string())
                     .or_insert_with(|| Box::leak(name.to_string().into_boxed_str()));
@@ -68,14 +74,18 @@ impl StorageBackend for RedbBackend {
 
     fn put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let wtxn = self.db.begin_write()?;
-        wtxn.open_table(self.table_def(table)?)?.insert(key, value)?;
+        wtxn.open_table(self.table_def(table)?)?
+            .insert(key, value)?;
         wtxn.commit()?;
         Ok(())
     }
 
     fn delete(&self, table: &str, key: &[u8]) -> Result<bool> {
         let wtxn = self.db.begin_write()?;
-        let existed = wtxn.open_table(self.table_def(table)?)?.remove(key)?.is_some();
+        let existed = wtxn
+            .open_table(self.table_def(table)?)?
+            .remove(key)?
+            .is_some();
         wtxn.commit()?;
         Ok(existed)
     }
@@ -121,12 +131,18 @@ impl Default for MemoryBackend {
 
 impl StorageBackend for MemoryBackend {
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let tables = self.tables.read().map_err(|e| KeepError::Other(e.to_string()))?;
+        let tables = self
+            .tables
+            .read()
+            .map_err(|e| KeepError::Other(e.to_string()))?;
         Ok(tables.get(table).and_then(|t| t.get(key).cloned()))
     }
 
     fn put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut tables = self.tables.write().map_err(|e| KeepError::Other(e.to_string()))?;
+        let mut tables = self
+            .tables
+            .write()
+            .map_err(|e| KeepError::Other(e.to_string()))?;
         tables
             .entry(table.to_string())
             .or_default()
@@ -135,7 +151,10 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn delete(&self, table: &str, key: &[u8]) -> Result<bool> {
-        let mut tables = self.tables.write().map_err(|e| KeepError::Other(e.to_string()))?;
+        let mut tables = self
+            .tables
+            .write()
+            .map_err(|e| KeepError::Other(e.to_string()))?;
         Ok(tables
             .get_mut(table)
             .map(|t| t.remove(key).is_some())
@@ -143,7 +162,10 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let tables = self.tables.read().map_err(|e| KeepError::Other(e.to_string()))?;
+        let tables = self
+            .tables
+            .read()
+            .map_err(|e| KeepError::Other(e.to_string()))?;
         Ok(tables
             .get(table)
             .map(|t| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -151,7 +173,10 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn create_table(&self, table: &str) -> Result<()> {
-        let mut tables = self.tables.write().map_err(|e| KeepError::Other(e.to_string()))?;
+        let mut tables = self
+            .tables
+            .write()
+            .map_err(|e| KeepError::Other(e.to_string()))?;
         tables.entry(table.to_string()).or_default();
         Ok(())
     }
@@ -168,7 +193,10 @@ mod tests {
         assert!(backend.get("test", b"key1").unwrap().is_none());
 
         backend.put("test", b"key1", b"value1").unwrap();
-        assert_eq!(backend.get("test", b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(
+            backend.get("test", b"key1").unwrap(),
+            Some(b"value1".to_vec())
+        );
 
         backend.put("test", b"key2", b"value2").unwrap();
         let entries = backend.list("test").unwrap();

@@ -163,7 +163,9 @@ impl Storage {
         let data_key_bytes = data_key.decrypt()?;
         let encrypted = crypto::encrypt(&*data_key_bytes, &header_key)?;
         header.nonce.copy_from_slice(&encrypted.nonce);
-        header.encrypted_data_key.copy_from_slice(&encrypted.ciphertext);
+        header
+            .encrypted_data_key
+            .copy_from_slice(&encrypted.ciphertext);
 
         fs::write(path.join("keep.hdr"), header.to_bytes())?;
 
