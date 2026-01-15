@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full", "signal"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 hex = "0.4"
 
 urlencoding = "2.1"
@@ -42,6 +43,8 @@ rand = "0.9"
 serialport = "4.8.1"
 
 fs2 = "0.4"
+
+shellexpand = "3.1"
 
 bitflags = { version = "2.4", features = ["serde"] }
 ctrlc = { version = "3.4", features = ["termination"] }

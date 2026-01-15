@@ -1,0 +1,21 @@
+# Keep configuration file
+# Location: ~/.config/keep/config.toml
+#
+# Precedence: CLI flags > environment variables > config file > defaults
+
+# Default vault location
+# vault_path = "~/.keep"
+
+# KDF strength for password hashing
+# Options: testing, default, high
+# argon2_profile = "default"
+
+# Default logging verbosity
+# Options: error, warn, info, debug, trace
+# log_level = "info"
+
+# Default Nostr relays for FROST operations
+# relays = ["wss://nos.lol"]
+
+# Network operation timeout in seconds
+# timeout = 30
