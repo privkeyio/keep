@@ -88,7 +88,12 @@ impl Keep {
     ///
     /// Returns [`KeepError::AlreadyExists`] if a Keep already exists at the path.
     pub fn create(path: &Path, password: &str) -> Result<Self> {
-        let storage = Storage::create(path, password, Argon2Params::DEFAULT)?;
+        Self::create_with_params(path, password, Argon2Params::DEFAULT)
+    }
+
+    /// Create a new Keep with custom Argon2 parameters.
+    pub fn create_with_params(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
+        let storage = Storage::create(path, password, params)?;
         Ok(Self {
             storage,
             keyring: Keyring::new(),

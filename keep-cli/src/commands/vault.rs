@@ -8,6 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
+use keep_core::crypto::Argon2Params;
 use keep_core::error::{KeepError, Result};
 use keep_core::keys::bytes_to_npub;
 use keep_core::Keep;
@@ -75,6 +76,13 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
 
     info!(size_mb, hidden, "creating keep");
 
+    let params = if std::env::var("KEEP_TESTING_MODE").is_ok() {
+        debug!("using lightweight Argon2 params (KEEP_TESTING_MODE set)");
+        Argon2Params::TESTING
+    } else {
+        Argon2Params::DEFAULT
+    };
+
     if hidden {
         keep_core::hidden::HiddenStorage::create(
             path,
@@ -82,9 +90,10 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
             hidden_password.as_ref().map(|s| s.expose_secret()),
             total_size,
             0.2,
+            params,
         )?;
     } else {
-        Keep::create(path, outer_password.expose_secret())?;
+        Keep::create_with_params(path, outer_password.expose_secret(), params)?;
     }
 
     spinner.finish();
