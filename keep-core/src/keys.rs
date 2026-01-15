@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use bech32::{Bech32m, Hrp};
+use bech32::{Bech32, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
 
@@ -71,13 +71,13 @@ impl NostrKeypair {
     /// Export as a bech32 nsec string.
     pub fn to_nsec(&self) -> String {
         let hrp = Hrp::parse("nsec").unwrap();
-        bech32::encode::<Bech32m>(hrp, &*self.secret_key).unwrap()
+        bech32::encode::<Bech32>(hrp, &*self.secret_key).unwrap()
     }
 
     /// Export as a bech32 npub string.
     pub fn to_npub(&self) -> String {
         let hrp = Hrp::parse("npub").unwrap();
-        bech32::encode::<Bech32m>(hrp, &self.public_key).unwrap()
+        bech32::encode::<Bech32>(hrp, &self.public_key).unwrap()
     }
 
     /// The secret key bytes.
@@ -165,7 +165,7 @@ impl KeyRecord {
     pub fn npub(&self) -> Option<String> {
         if self.key_type == KeyType::Nostr {
             let hrp = Hrp::parse("npub").unwrap();
-            Some(bech32::encode::<Bech32m>(hrp, &self.pubkey).unwrap())
+            Some(bech32::encode::<Bech32>(hrp, &self.pubkey).unwrap())
         } else {
             None
         }
@@ -192,7 +192,7 @@ pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
 /// Encode raw bytes as an npub.
 pub fn bytes_to_npub(pubkey: &[u8; 32]) -> String {
     let hrp = Hrp::parse("npub").unwrap();
-    bech32::encode::<Bech32m>(hrp, pubkey).unwrap()
+    bech32::encode::<Bech32>(hrp, pubkey).unwrap()
 }
 
 #[cfg(test)]

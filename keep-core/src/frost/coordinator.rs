@@ -1,7 +1,6 @@
 //! FROST signing coordinator for multi-party signing sessions.
 
 #![forbid(unsafe_code)]
-#![allow(unused_assignments)]
 
 use std::collections::BTreeMap;
 
