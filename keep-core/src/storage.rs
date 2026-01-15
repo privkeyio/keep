@@ -1,3 +1,5 @@
+//! Persistent encrypted storage backend.
+
 #![forbid(unsafe_code)]
 
 use std::fs;
@@ -23,9 +25,10 @@ const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 256;
 
+/// Storage file header containing encryption metadata.
 #[repr(C)]
 #[derive(Clone)]
-pub struct Header {
+struct Header {
     magic: [u8; 8],
     version: u16,
     flags: u16,
@@ -115,6 +118,7 @@ impl Header {
     }
 }
 
+/// Encrypted persistent storage for keys and FROST shares.
 pub struct Storage {
     path: PathBuf,
     header: Header,
@@ -123,6 +127,7 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
         if path.exists() {
             return Err(KeepError::AlreadyExists(path.display().to_string()));
@@ -168,6 +173,7 @@ impl Storage {
         })
     }
 
+    /// Open existing storage.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(KeepError::NotFound(path.display().to_string()));
@@ -192,6 +198,7 @@ impl Storage {
         })
     }
 
+    /// Unlock with the given password.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         if self.data_key.is_some() {
             return Ok(());
@@ -240,19 +247,23 @@ impl Storage {
         Ok(())
     }
 
+    /// Lock and clear keys from memory.
     pub fn lock(&mut self) {
         self.data_key = None;
         self.db = None;
     }
 
+    /// Returns true if unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.data_key.is_some()
     }
 
+    /// The data encryption key, if unlocked.
     pub fn data_key(&self) -> Option<&SecretKey> {
         self.data_key.as_ref()
     }
 
+    /// Store a key record.
     pub fn store_key(&self, record: &KeyRecord) -> Result<()> {
         debug!(name = %record.name, "storing key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -273,6 +284,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Load a key record.
     pub fn load_key(&self, id: &[u8; 32]) -> Result<KeyRecord> {
         trace!(id = %hex::encode(id), "loading key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -296,6 +308,7 @@ impl Storage {
             .deserialize(&decrypted_bytes)?)
     }
 
+    /// List all stored key records.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         trace!("listing keys");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -324,6 +337,7 @@ impl Storage {
         Ok(records)
     }
 
+    /// Delete a key record.
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting key");
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;
@@ -343,10 +357,12 @@ impl Storage {
         Ok(())
     }
 
+    /// The storage directory path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Store a FROST share.
     pub fn store_share(&self, share: &StoredShare) -> Result<()> {
         debug!(name = %share.metadata.name, "storing FROST share");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -369,6 +385,7 @@ impl Storage {
         Ok(())
     }
 
+    /// List all stored FROST shares.
     pub fn list_shares(&self) -> Result<Vec<StoredShare>> {
         trace!("listing FROST shares");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -397,6 +414,7 @@ impl Storage {
         Ok(shares)
     }
 
+    /// Delete a FROST share.
     pub fn delete_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         debug!(id = identifier, "deleting FROST share");
         let db = self.db.as_ref().ok_or(KeepError::Locked)?;

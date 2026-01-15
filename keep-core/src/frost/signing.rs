@@ -1,3 +1,5 @@
+//! FROST signing session management.
+
 #![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
@@ -16,14 +18,22 @@ use zeroize::ZeroizeOnDrop;
 use crate::crypto;
 use crate::error::{KeepError, Result};
 
+/// State of a signing session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
+    /// Collecting round 1 commitments from participants.
     CollectingCommitments,
+    /// Collecting round 2 signature shares.
     CollectingShares,
+    /// Signing completed successfully.
     Complete,
+    /// Signing failed.
     Failed,
 }
 
+/// A FROST signing session.
+///
+/// Manages the two-round signing protocol state and collected data.
 #[derive(ZeroizeOnDrop)]
 pub struct SigningSession {
     #[zeroize(skip)]
@@ -47,6 +57,7 @@ pub struct SigningSession {
 }
 
 impl SigningSession {
+    /// Create a new signing session.
     pub fn new(message: Vec<u8>, threshold: u16) -> Self {
         let session_id = Self::compute_session_id(&message);
 
@@ -74,14 +85,17 @@ impl SigningSession {
         crypto::blake2b_256(&preimage)
     }
 
+    /// The session ID.
     pub fn session_id(&self) -> &[u8; 32] {
         &self.session_id
     }
 
+    /// The current session state.
     pub fn state(&self) -> SessionState {
         self.state
     }
 
+    /// Generate our commitment (round 1). Must not have been called before.
     pub fn generate_commitment(&mut self, key_package: &KeyPackage) -> Result<SigningCommitments> {
         if self.state != SessionState::CollectingCommitments {
             return Err(KeepError::Frost(
@@ -104,6 +118,7 @@ impl SigningSession {
         Ok(commitments)
     }
 
+    /// Add another participant's commitment.
     pub fn add_commitment(&mut self, id: Identifier, commitment: SigningCommitments) -> Result<()> {
         if self.state != SessionState::CollectingCommitments {
             return Err(KeepError::Frost("Not collecting commitments".into()));
@@ -122,10 +137,12 @@ impl SigningSession {
         Ok(())
     }
 
+    /// Commitments still needed to reach threshold.
     pub fn commitments_needed(&self) -> usize {
         self.threshold as usize - self.commitments.len()
     }
 
+    /// Generate our signature share (round 2).
     pub fn generate_signature_share(&mut self, key_package: &KeyPackage) -> Result<SignatureShare> {
         if self.state != SessionState::CollectingShares {
             return Err(KeepError::Frost(
@@ -149,6 +166,8 @@ impl SigningSession {
         Ok(share)
     }
 
+    /// Add another participant's signature share.
+    /// Returns the aggregated signature when threshold is met.
     pub fn add_signature_share(
         &mut self,
         id: Identifier,
@@ -184,10 +203,12 @@ impl SigningSession {
         Ok(None)
     }
 
+    /// Signature shares still needed to reach threshold.
     pub fn shares_needed(&self) -> usize {
         self.threshold as usize - self.signature_shares.len()
     }
 
+    /// The signature bytes, if signing is complete.
     pub fn signature_bytes(&self) -> Result<Option<[u8; 64]>> {
         match &self.signature {
             Some(s) => {
@@ -206,11 +227,13 @@ impl SigningSession {
         }
     }
 
+    /// Returns true if signing completed successfully.
     pub fn is_complete(&self) -> bool {
         self.state == SessionState::Complete
     }
 }
 
+/// Sign using local shares only (no network). Requires threshold shares.
 pub fn sign_with_local_shares(shares: &[super::SharePackage], message: &[u8]) -> Result<[u8; 64]> {
     use frost::{keys::PublicKeyPackage, round1, round2};
 
