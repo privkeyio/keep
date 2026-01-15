@@ -15,7 +15,10 @@ use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::{get_confirm, get_hidden_password, get_nsec, get_password, get_password_with_confirm, is_hidden_vault};
+use super::{
+    get_confirm, get_hidden_password, get_nsec, get_password, get_password_with_confirm,
+    is_hidden_vault,
+};
 
 pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
     if hidden {
