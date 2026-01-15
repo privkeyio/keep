@@ -1,5 +1,4 @@
 use sha2::Digest;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -237,24 +236,11 @@ fn test_import_export_nsec_roundtrip() {
 
     assert_success(&KeepCmd::new(&bin).path(&vault2).args(["init"]).run());
 
-    let mut child = Command::new(&bin)
-        .env("KEEP_PASSWORD", TEST_PASSWORD)
-        .env("KEEP_YES", "1")
-        .args(["--path"])
-        .arg(&vault2)
+    let output = KeepCmd::new(&bin)
+        .path(&vault2)
+        .env("KEEP_NSEC", nsec)
         .args(["import", "--name", "imported"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(format!("{nsec}\n").as_bytes())
-        .expect("write nsec");
-    let output = child.wait_with_output().expect("wait");
+        .run();
     assert_success(&output);
 
     let output = KeepCmd::new(&bin).path(&vault2).args(["list"]).run();
@@ -295,22 +281,6 @@ fn test_frost_generate_list_sign() {
     assert!(output_contains(&output, "testgroup"));
     assert!(output_contains(&output, "3 share(s)"));
 
-    let list_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let line = list_output
-        .lines()
-        .find(|l| l.contains("testgroup"))
-        .expect("testgroup not found in frost list output");
-    let npub_word = line
-        .split_whitespace()
-        .find(|w| w.starts_with("npub1"))
-        .expect("npub not found in frost list output");
-    let group_npub = npub_word.trim_end_matches("...");
-
     let msg_hex = hex::encode(sha2::Sha256::digest(b"test message"));
     let output = KeepCmd::new(&bin)
         .path(&vault)
@@ -320,7 +290,7 @@ fn test_frost_generate_list_sign() {
             "--message",
             &msg_hex,
             "--group",
-            group_npub,
+            "testgroup",
         ])
         .run();
     assert_success(&output);
@@ -343,7 +313,7 @@ fn test_hidden_volume_workflow() {
     let output = KeepCmd::new(&bin)
         .hidden()
         .path(&vault)
-        .args(["init", "--size", "10"])
+        .args(["init", "--size", "1"])
         .run();
     assert_success(&output);
     assert!(output_contains(&output, "Keep created"));

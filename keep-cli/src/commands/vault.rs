@@ -14,7 +14,7 @@ use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::{get_confirm, get_password, get_password_with_confirm, is_hidden_vault};
+use super::{get_confirm, get_nsec, get_password, get_password_with_confirm, is_hidden_vault};
 
 pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
     if hidden {
@@ -227,7 +227,7 @@ pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let pubkey = keep.import_nsec(nsec.expose_secret(), name)?;
@@ -258,7 +258,7 @@ fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
@@ -299,7 +299,7 @@ fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
