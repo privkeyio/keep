@@ -11,8 +11,8 @@ use frost_secp256k1_tr::round1::SigningCommitments;
 use parking_lot::RwLock;
 
 use keep_frost_net::{
-    CommitmentPayload, FrostNetError, MemoryNonceStore, NetworkSession, NonceStore,
-    SessionManager, SessionState, SignRequestPayload, SignatureSharePayload, derive_session_id,
+    derive_session_id, CommitmentPayload, FrostNetError, MemoryNonceStore, NetworkSession,
+    NonceStore, SessionManager, SessionState, SignRequestPayload, SignatureSharePayload,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,8 +187,7 @@ fn test_message_reordering_shares_before_commitments_complete() {
     let commit1 = generate_test_commitment(1);
     session.add_commitment(1, commit1).unwrap();
 
-    let fake_share =
-        frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
+    let fake_share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
 
     let result = session.add_signature_share(2, fake_share);
     assert!(result.is_err());
@@ -201,8 +200,8 @@ fn test_participant_dropout_before_commitment() {
     let participants = vec![1, 2, 3];
     let threshold = 2;
     let session_id = derive_session_id(&message, &participants, threshold);
-    let mut session =
-        NetworkSession::new(session_id, message, threshold, participants).with_timeout(Duration::from_millis(100));
+    let mut session = NetworkSession::new(session_id, message, threshold, participants)
+        .with_timeout(Duration::from_millis(100));
 
     let commit1 = generate_test_commitment(1);
     session.add_commitment(1, commit1).unwrap();
@@ -263,8 +262,7 @@ fn test_duplicate_signature_share_rejected() {
     let share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     session.add_signature_share(1, share).unwrap();
 
-    let share_dup =
-        frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
+    let share_dup = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     let result = session.add_signature_share(1, share_dup);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Duplicate"));
@@ -312,8 +310,8 @@ fn test_timeout_expires_session() {
     let participants = vec![1, 2];
     let threshold = 2;
     let session_id = derive_session_id(&message, &participants, threshold);
-    let session =
-        NetworkSession::new(session_id, message, threshold, participants).with_timeout(Duration::from_millis(50));
+    let session = NetworkSession::new(session_id, message, threshold, participants)
+        .with_timeout(Duration::from_millis(50));
 
     assert_eq!(session.state(), SessionState::AwaitingCommitments);
     std::thread::sleep(Duration::from_millis(100));
@@ -349,7 +347,10 @@ fn test_malicious_commitment_from_non_participant() {
     let malicious_commit = generate_test_commitment(99);
     let result = session.add_commitment(99, malicious_commit);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("not a participant"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("not a participant"));
 }
 
 #[test]
@@ -369,7 +370,10 @@ fn test_malicious_share_from_non_participant() {
         frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     let result = session.add_signature_share(99, malicious_share);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("not a participant"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("not a participant"));
 }
 
 #[test]
@@ -427,7 +431,10 @@ fn test_session_cleanup_removes_nonces() {
     assert!(result.is_err());
     let err = result.err().unwrap();
     assert!(
-        matches!(err, FrostNetError::ReplayDetected(_) | FrostNetError::NonceConsumed(_)),
+        matches!(
+            err,
+            FrostNetError::ReplayDetected(_) | FrostNetError::NonceConsumed(_)
+        ),
         "Expected ReplayDetected or NonceConsumed, got: {}",
         err
     );
@@ -656,8 +663,8 @@ fn test_session_expiry_during_signing() {
     let participants = vec![1, 2];
     let threshold = 2;
     let session_id = derive_session_id(&message, &participants, threshold);
-    let mut session =
-        NetworkSession::new(session_id, message, threshold, participants).with_timeout(Duration::from_millis(50));
+    let mut session = NetworkSession::new(session_id, message, threshold, participants)
+        .with_timeout(Duration::from_millis(50));
 
     let commit1 = generate_test_commitment(1);
     let commit2 = generate_test_commitment(2);
