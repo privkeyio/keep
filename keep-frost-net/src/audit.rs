@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tracing::info;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -75,7 +76,7 @@ impl SigningAuditEntry {
             self.our_index,
             &self.operation,
         );
-        constant_time_eq(&self.hmac, &expected)
+        bool::from(self.hmac.ct_eq(&expected))
     }
 }
 
@@ -89,14 +90,6 @@ impl SigningOperation {
             SigningOperation::SignatureReceived => 4,
         }
     }
-}
-
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
