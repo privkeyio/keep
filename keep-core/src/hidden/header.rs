@@ -9,7 +9,6 @@ use crate::error::{KeepError, Result};
 
 /// Size of each header block in bytes.
 pub const HEADER_SIZE: usize = 512;
-pub(crate) const OUTER_HEADER_OFFSET: u64 = 0;
 /// Offset of the hidden header in the vault file.
 pub const HIDDEN_HEADER_OFFSET: u64 = 512;
 /// Offset where data storage begins.
@@ -230,6 +229,7 @@ impl HiddenHeader {
     }
 
     /// Serialize to full size.
+    #[cfg(test)]
     pub(crate) fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         let compact = self.to_bytes_compact();
@@ -267,6 +267,7 @@ impl HiddenHeader {
     pub(crate) const COMPACT_SIZE: usize = 2 + 2 + SALT_SIZE + 24 + 48 + 4 + 8 + 8 + 32;
 
     /// Deserialize from full-size bytes.
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
         Self::from_bytes_compact(bytes)
     }
