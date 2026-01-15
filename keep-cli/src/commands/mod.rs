@@ -28,6 +28,18 @@ pub fn get_password(prompt: &str) -> Result<SecretString> {
     Ok(SecretString::from(pw))
 }
 
+pub fn get_hidden_password(prompt: &str) -> Result<SecretString> {
+    if let Ok(pw) = std::env::var("KEEP_HIDDEN_PASSWORD") {
+        debug!("using password from KEEP_HIDDEN_PASSWORD env var");
+        return Ok(SecretString::from(pw));
+    }
+    let pw = Password::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .interact()
+        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
+    Ok(SecretString::from(pw))
+}
+
 pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretString> {
     if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
         debug!("using password from KEEP_PASSWORD env var");
