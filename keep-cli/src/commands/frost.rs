@@ -388,7 +388,9 @@ pub fn cmd_frost_sign(
         let share = shares
             .iter()
             .find(|s| s.metadata.name == group_id)
-            .ok_or_else(|| KeepError::KeyNotFound(format!("No group found with name: {}", group_id)))?;
+            .ok_or_else(|| {
+                KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
+            })?;
         share.metadata.group_pubkey
     };
     let our_shares: Vec<_> = shares
