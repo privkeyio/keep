@@ -1,6 +1,9 @@
 //! FROST signing coordinator for multi-party signing sessions.
 
 #![forbid(unsafe_code)]
+// ZeroizeOnDrop derive generates assignments in Drop impl for #[zeroize(skip)] fields
+// that appear unused. Module-level allow is needed as struct-level doesn't affect generated code.
+#![allow(unused_assignments)]
 
 use std::collections::BTreeMap;
 
@@ -17,9 +20,6 @@ use crate::error::{KeepError, Result};
 use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
 
 /// Coordinates a FROST signing session between multiple participants.
-// False positive from zeroize_derive: fields with #[zeroize(skip)] trigger unused_assignments
-// in generated Drop impl. The allow must be ABOVE derive to apply to generated code.
-#[allow(unused_assignments)]
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Coordinator {
     #[zeroize(skip)]
