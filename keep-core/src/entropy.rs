@@ -17,25 +17,26 @@ fn gather_os_entropy(pool: &mut [u8]) {
 
 #[cfg(target_arch = "x86_64")]
 fn is_rdrand_available() -> bool {
-    #[cfg(target_feature = "rdrand")]
-    {
-        true
-    }
-    #[cfg(not(target_feature = "rdrand"))]
-    {
-        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *AVAILABLE.get_or_init(|| {
-            let result = unsafe { core::arch::x86_64::__cpuid(1) };
-            (result.ecx & (1 << 30)) != 0
-        })
-    }
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let result = unsafe { core::arch::x86_64::__cpuid(1) };
+        (result.ecx & (1 << 30)) != 0
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
 fn fill_rdrand(pool: &mut [u8; 16]) -> bool {
+    const MAX_RETRIES: u32 = 10;
     for chunk in pool.chunks_exact_mut(8) {
         let mut val: u64 = 0;
-        if unsafe { core::arch::x86_64::_rdrand64_step(&mut val) } != 1 {
+        let mut success = false;
+        for _ in 0..MAX_RETRIES {
+            if unsafe { core::arch::x86_64::_rdrand64_step(&mut val) } == 1 {
+                success = true;
+                break;
+            }
+        }
+        if !success {
             return false;
         }
         chunk.copy_from_slice(&val.to_le_bytes());
@@ -256,6 +257,6 @@ mod tests {
     fn test_random_bytes_large_buffer() {
         let bytes: [u8; 128] = random_bytes();
         assert!(!bytes.iter().all(|&b| b == 0));
-        assert!(!bytes[..32].iter().all(|&b| b == bytes[32]));
+        assert_ne!(&bytes[..32], &bytes[32..64]);
     }
 }
