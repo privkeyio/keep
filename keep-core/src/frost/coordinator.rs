@@ -17,8 +17,10 @@ use crate::error::{KeepError, Result};
 use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
 
 /// Coordinates a FROST signing session between multiple participants.
+// False positive from zeroize_derive: fields with #[zeroize(skip)] trigger unused_assignments
+// in generated Drop impl. The allow must be ABOVE derive to apply to generated code.
+#[allow(unused_assignments)]
 #[derive(Zeroize, ZeroizeOnDrop)]
-#[allow(unused_assignments)] // False positive from zeroize_derive with #[zeroize(skip)]
 pub struct Coordinator {
     #[zeroize(skip)]
     session_id: [u8; 32],
