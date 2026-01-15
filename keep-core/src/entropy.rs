@@ -161,7 +161,10 @@ pub struct EntropyHealthError;
 
 impl std::fmt::Display for EntropyHealthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RNG health check failed: constant or zero output detected")
+        write!(
+            f,
+            "RNG health check failed: constant or zero output detected"
+        )
     }
 }
 
@@ -173,10 +176,15 @@ impl std::error::Error for EntropyHealthError {}
 /// - Output is not all zeros
 /// - Different calls produce different output
 pub fn check_entropy_health() -> Result<(), EntropyHealthError> {
-    let samples = [random_bytes_mixed(), random_bytes_mixed(), random_bytes_mixed()];
+    let samples = [
+        random_bytes_mixed(),
+        random_bytes_mixed(),
+        random_bytes_mixed(),
+    ];
 
     let all_nonzero = samples.iter().all(|s| s.iter().any(|&b| b != 0));
-    let all_unique = samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
+    let all_unique =
+        samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
 
     if all_nonzero && all_unique {
         Ok(())
