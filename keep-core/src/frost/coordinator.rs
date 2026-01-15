@@ -18,6 +18,7 @@ use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
 
 /// Coordinates a FROST signing session between multiple participants.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[allow(unused_assignments)] // False positive from zeroize_derive with #[zeroize(skip)]
 pub struct Coordinator {
     #[zeroize(skip)]
     session_id: [u8; 32],
