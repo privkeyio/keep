@@ -5,9 +5,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, trace};
 
+use crate::backend::{RedbBackend, StorageBackend, KEYS_TABLE, SHARES_TABLE};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
@@ -15,9 +15,6 @@ use crate::keys::KeyRecord;
 use crate::rate_limit;
 
 use bincode::Options;
-
-const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
-const SHARES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
@@ -123,7 +120,7 @@ pub struct Storage {
     path: PathBuf,
     header: Header,
     data_key: Option<SecretKey>,
-    db: Option<Database>,
+    backend: Option<Box<dyn StorageBackend>>,
 }
 
 impl Storage {
@@ -132,44 +129,52 @@ impl Storage {
         if path.exists() {
             return Err(KeepError::AlreadyExists(path.display().to_string()));
         }
-
         fs::create_dir_all(path)?;
 
+        let backend = RedbBackend::create(&path.join("keep.db"))?;
+        Self::create_inner(path, password, params, Box::new(backend))
+    }
+
+    pub fn create_with_backend(
+        path: &Path,
+        password: &str,
+        params: Argon2Params,
+        backend: Box<dyn StorageBackend>,
+    ) -> Result<Self> {
+        if path.exists() {
+            return Err(KeepError::AlreadyExists(path.display().to_string()));
+        }
+        fs::create_dir_all(path)?;
+
+        Self::create_inner(path, password, params, backend)
+    }
+
+    fn create_inner(
+        path: &Path,
+        password: &str,
+        params: Argon2Params,
+        backend: Box<dyn StorageBackend>,
+    ) -> Result<Self> {
         let mut header = Header::new(params);
-
         let data_key = SecretKey::generate()?;
-
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
-
         let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
 
         let data_key_bytes = data_key.decrypt()?;
         let encrypted = crypto::encrypt(&*data_key_bytes, &header_key)?;
         header.nonce.copy_from_slice(&encrypted.nonce);
-        header
-            .encrypted_data_key
-            .copy_from_slice(&encrypted.ciphertext);
+        header.encrypted_data_key.copy_from_slice(&encrypted.ciphertext);
 
-        let header_path = path.join("keep.hdr");
-        fs::write(&header_path, header.to_bytes())?;
+        fs::write(path.join("keep.hdr"), header.to_bytes())?;
 
-        let db_path = path.join("keep.db");
-        let db = Database::create(&db_path)?;
-
-        {
-            let wtxn = db.begin_write()?;
-            {
-                let _ = wtxn.open_table(KEYS_TABLE)?;
-                let _ = wtxn.open_table(SHARES_TABLE)?;
-            }
-            wtxn.commit()?;
-        }
+        backend.create_table(KEYS_TABLE)?;
+        backend.create_table(SHARES_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             header,
             data_key: Some(data_key),
-            db: Some(db),
+            backend: Some(backend),
         })
     }
 
@@ -194,7 +199,7 @@ impl Storage {
             path: path.to_path_buf(),
             header,
             data_key: None,
-            db: None,
+            backend: None,
         })
     }
 
@@ -204,6 +209,28 @@ impl Storage {
             return Ok(());
         }
 
+        self.unlock_inner(password)?;
+
+        let backend = RedbBackend::open(&self.path.join("keep.db"))?;
+        self.backend = Some(Box::new(backend));
+        Ok(())
+    }
+
+    pub fn unlock_with_backend(
+        &mut self,
+        password: &str,
+        backend: Box<dyn StorageBackend>,
+    ) -> Result<()> {
+        if self.data_key.is_some() {
+            return Ok(());
+        }
+
+        self.unlock_inner(password)?;
+        self.backend = Some(backend);
+        Ok(())
+    }
+
+    fn unlock_inner(&mut self, password: &str) -> Result<()> {
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
@@ -236,21 +263,15 @@ impl Storage {
         let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
-        debug!(path = ?self.path, "opening database");
-        let db_path = self.path.join("keep.db");
-        let db = Database::open(&db_path)?;
-
-        self.db = Some(db);
         rate_limit::record_success(&self.path);
         debug!("storage unlocked");
-
         Ok(())
     }
 
     /// Lock and clear keys from memory.
     pub fn lock(&mut self) {
         self.data_key = None;
-        self.db = None;
+        self.backend = None;
     }
 
     /// Returns true if unlocked.
@@ -267,20 +288,13 @@ impl Storage {
     pub fn store_key(&self, record: &KeyRecord) -> Result<()> {
         debug!(name = %record.name, "storing key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
         let serialized = bincode::serialize(record)?;
-
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        let wtxn = db.begin_write()?;
-        {
-            let mut table = wtxn.open_table(KEYS_TABLE)?;
-            table.insert(record.id.as_slice(), encrypted_bytes.as_slice())?;
-        }
-        wtxn.commit()?;
-
+        backend.put(KEYS_TABLE, &record.id, &encrypted_bytes)?;
         Ok(())
     }
 
@@ -288,16 +302,13 @@ impl Storage {
     pub fn load_key(&self, id: &[u8; 32]) -> Result<KeyRecord> {
         trace!(id = %hex::encode(id), "loading key");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()?;
-        let table = rtxn.open_table(KEYS_TABLE)?;
-
-        let encrypted_bytes = table
-            .get(id.as_slice())?
+        let encrypted_bytes = backend
+            .get(KEYS_TABLE, id)?
             .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))?;
 
-        let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
@@ -312,16 +323,13 @@ impl Storage {
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         trace!("listing keys");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()?;
-        let table = rtxn.open_table(KEYS_TABLE)?;
-
+        let entries = backend.list(KEYS_TABLE)?;
         let mut records = Vec::new();
 
-        for result in table.iter()? {
-            let (_, encrypted_bytes) = result?;
-            let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
+        for (_, encrypted_bytes) in entries {
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
@@ -340,21 +348,11 @@ impl Storage {
     /// Delete a key record.
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting key");
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
-
-        let wtxn = db.begin_write()?;
-        let existed;
-        {
-            let mut table = wtxn.open_table(KEYS_TABLE)?;
-            existed = table.remove(id.as_slice())?.is_some();
-        }
-        wtxn.commit()?;
-
-        if !existed {
-            return Err(KeepError::KeyNotFound(hex::encode(id)));
-        }
-
-        Ok(())
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend
+            .delete(KEYS_TABLE, id)?
+            .then_some(())
+            .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))
     }
 
     /// The storage directory path.
@@ -366,21 +364,14 @@ impl Storage {
     pub fn store_share(&self, share: &StoredShare) -> Result<()> {
         debug!(name = %share.metadata.name, "storing FROST share");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
         let serialized = bincode::serialize(share)?;
-
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
         let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
-
-        let wtxn = db.begin_write()?;
-        {
-            let mut table = wtxn.open_table(SHARES_TABLE)?;
-            table.insert(id.as_slice(), encrypted_bytes.as_slice())?;
-        }
-        wtxn.commit()?;
+        backend.put(SHARES_TABLE, &id, &encrypted_bytes)?;
 
         Ok(())
     }
@@ -389,16 +380,13 @@ impl Storage {
     pub fn list_shares(&self) -> Result<Vec<StoredShare>> {
         trace!("listing FROST shares");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let rtxn = db.begin_read()?;
-        let table = rtxn.open_table(SHARES_TABLE)?;
-
+        let entries = backend.list(SHARES_TABLE)?;
         let mut shares = Vec::new();
 
-        for result in table.iter()? {
-            let (_, encrypted_bytes) = result?;
-            let encrypted = EncryptedData::from_bytes(encrypted_bytes.value())?;
+        for (_, encrypted_bytes) in entries {
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
@@ -417,26 +405,12 @@ impl Storage {
     /// Delete a FROST share.
     pub fn delete_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         debug!(id = identifier, "deleting FROST share");
-        let db = self.db.as_ref().ok_or(KeepError::Locked)?;
-
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let id = share_id(group_pubkey, identifier);
-
-        let wtxn = db.begin_write()?;
-        let existed;
-        {
-            let mut table = wtxn.open_table(SHARES_TABLE)?;
-            existed = table.remove(id.as_slice())?.is_some();
-        }
-        wtxn.commit()?;
-
-        if !existed {
-            return Err(KeepError::KeyNotFound(format!(
-                "share {} not found",
-                identifier
-            )));
-        }
-
-        Ok(())
+        backend
+            .delete(SHARES_TABLE, &id)?
+            .then_some(())
+            .ok_or_else(|| KeepError::KeyNotFound(format!("share {} not found", identifier)))
     }
 }
 
@@ -557,5 +531,33 @@ mod tests {
             let result = storage.unlock("wrong");
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
+    }
+
+    #[test]
+    fn test_storage_with_memory_backend() {
+        use crate::backend::MemoryBackend;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-mem-backend");
+
+        let backend = Box::new(MemoryBackend::new());
+        let storage =
+            Storage::create_with_backend(&path, "password", Argon2Params::TESTING, backend)
+                .unwrap();
+        assert!(storage.is_unlocked());
+
+        let record = KeyRecord::new(
+            crypto::random_bytes(),
+            crate::keys::KeyType::Nostr,
+            "mem test key".into(),
+            vec![1, 2, 3, 4],
+        );
+
+        storage.store_key(&record).unwrap();
+        let loaded = storage.load_key(&record.id).unwrap();
+        assert_eq!(loaded.name, record.name);
+
+        let keys = storage.list_keys().unwrap();
+        assert_eq!(keys.len(), 1);
     }
 }
