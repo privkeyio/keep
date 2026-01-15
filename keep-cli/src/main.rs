@@ -79,6 +79,8 @@ enum Commands {
         #[arg(short, long)]
         name: String,
     },
+    RotatePassword,
+    RotateDataKey,
     Serve {
         #[arg(short, long, default_value = "wss://nos.lol")]
         relay: String,
@@ -469,6 +471,8 @@ fn run(out: &Output) -> Result<()> {
         Commands::List => commands::vault::cmd_list(out, &path, hidden),
         Commands::Export { name } => commands::vault::cmd_export(out, &path, &name, hidden),
         Commands::Delete { name } => commands::vault::cmd_delete(out, &path, &name, hidden),
+        Commands::RotatePassword => commands::vault::cmd_rotate_password(out, &path),
+        Commands::RotateDataKey => commands::vault::cmd_rotate_data_key(out, &path),
         Commands::Serve {
             relay,
             headless,

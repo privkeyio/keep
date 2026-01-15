@@ -417,6 +417,188 @@ fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
     crypto::blake2b_256(&data)
 }
 
+impl Storage {
+    pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
+        if !self.is_unlocked() {
+            self.unlock(old_password)?;
+        }
+
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let old_header = self.header.clone();
+        let header_path = self.path.join("keep.hdr");
+        let backup_path = self.path.join("keep.hdr.backup");
+        fs::copy(&header_path, &backup_path)?;
+
+        let new_header = self.create_header_with_key(new_password, data_key)?;
+
+        let tmp_path = self.path.join("keep.hdr.tmp");
+        fs::write(&tmp_path, new_header.to_bytes())?;
+        fs::rename(&tmp_path, &header_path)?;
+        self.header = new_header;
+
+        self.lock();
+        if let Err(e) = self.unlock(new_password) {
+            self.header = old_header;
+            fs::copy(&backup_path, &header_path)?;
+            self.unlock(old_password)?;
+            let _ = fs::remove_file(&backup_path);
+            return Err(KeepError::RotationFailed(format!(
+                "verification failed: {}",
+                e
+            )));
+        }
+
+        let _ = fs::remove_file(&backup_path);
+        Ok(())
+    }
+
+    fn create_header_with_key(&self, password: &str, data_key: &SecretKey) -> Result<Header> {
+        let mut header = Header::new(self.header.argon2_params());
+        let master_key =
+            crypto::derive_key(password.as_bytes(), &header.salt, header.argon2_params())?;
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
+        let data_key_bytes = data_key.decrypt()?;
+        let encrypted = crypto::encrypt(&*data_key_bytes, &header_key)?;
+        header.nonce.copy_from_slice(&encrypted.nonce);
+        header
+            .encrypted_data_key
+            .copy_from_slice(&encrypted.ciphertext);
+        Ok(header)
+    }
+
+    pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        if !self.is_unlocked() {
+            self.unlock(password)?;
+        }
+
+        let old_data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?.clone();
+        let old_header = self.header.clone();
+        let header_path = self.path.join("keep.hdr");
+        let backup_path = self.path.join("keep.hdr.backup");
+        let db_path = self.path.join("keep.db");
+        let db_backup_path = self.path.join("keep.db.backup");
+        fs::copy(&header_path, &backup_path)?;
+        fs::copy(&db_path, &db_backup_path)?;
+
+        let keys = self.list_keys()?;
+        let shares = self.list_shares()?;
+        let key_count = keys.len();
+        let share_count = shares.len();
+
+        let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
+        let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
+
+        let new_data_key = SecretKey::generate()?;
+        self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
+
+        let new_header = self.encrypt_data_key_in_header(password, &new_data_key)?;
+        let tmp_path = self.path.join("keep.hdr.tmp");
+        fs::write(&tmp_path, new_header.to_bytes())?;
+        fs::rename(&tmp_path, &header_path)?;
+
+        self.header = new_header;
+        self.data_key = Some(new_data_key);
+
+        let verified_keys = self.list_keys()?.len();
+        let verified_shares = self.list_shares()?.len();
+        if verified_keys != key_count || verified_shares != share_count {
+            self.header = old_header;
+            self.data_key = Some(old_data_key);
+            self.lock();
+            fs::copy(&backup_path, &header_path)?;
+            fs::copy(&db_backup_path, &db_path)?;
+            self.unlock(password)?;
+            let _ = fs::remove_file(&backup_path);
+            let _ = fs::remove_file(&db_backup_path);
+            return Err(KeepError::RotationFailed("integrity check failed".into()));
+        }
+
+        let _ = fs::remove_file(&backup_path);
+        let _ = fs::remove_file(&db_backup_path);
+        Ok(())
+    }
+
+    fn decrypt_all_keys(
+        &self,
+        keys: &[KeyRecord],
+        data_key: &SecretKey,
+    ) -> Result<Vec<(KeyRecord, Vec<u8>)>> {
+        keys.iter()
+            .map(|record| {
+                let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
+                let secret = crypto::decrypt(&encrypted, data_key)?;
+                Ok((record.clone(), secret.as_slice()?.to_vec()))
+            })
+            .collect()
+    }
+
+    fn decrypt_all_shares(
+        &self,
+        shares: &[StoredShare],
+        data_key: &SecretKey,
+    ) -> Result<Vec<(StoredShare, Vec<u8>)>> {
+        shares
+            .iter()
+            .map(|stored| {
+                let encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
+                let key_package_bytes = crypto::decrypt(&encrypted, data_key)?;
+                Ok((stored.clone(), key_package_bytes.as_slice()?.to_vec()))
+            })
+            .collect()
+    }
+
+    fn reencrypt_database(
+        &self,
+        keys: &[(KeyRecord, Vec<u8>)],
+        shares: &[(StoredShare, Vec<u8>)],
+        new_data_key: &SecretKey,
+    ) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        for (record, secret_bytes) in keys {
+            let new_encrypted = crypto::encrypt(secret_bytes, new_data_key)?;
+            let mut new_record = record.clone();
+            new_record.encrypted_secret = new_encrypted.to_bytes();
+            let serialized = bincode::serialize(&new_record)?;
+            let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
+            backend.put(KEYS_TABLE, &new_record.id, &record_encrypted.to_bytes())?;
+        }
+
+        for (stored, key_package_bytes) in shares {
+            let new_encrypted = crypto::encrypt(key_package_bytes, new_data_key)?;
+            let new_stored = StoredShare {
+                metadata: stored.metadata.clone(),
+                encrypted_key_package: new_encrypted.to_bytes(),
+                pubkey_package: stored.pubkey_package.clone(),
+            };
+            let serialized = bincode::serialize(&new_stored)?;
+            let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
+            let id = share_id(&stored.metadata.group_pubkey, stored.metadata.identifier);
+            backend.put(SHARES_TABLE, &id, &record_encrypted.to_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    fn encrypt_data_key_in_header(&self, password: &str, data_key: &SecretKey) -> Result<Header> {
+        let master_key = crypto::derive_key(
+            password.as_bytes(),
+            &self.header.salt,
+            self.header.argon2_params(),
+        )?;
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
+        let data_key_bytes = data_key.decrypt()?;
+        let encrypted = crypto::encrypt(&*data_key_bytes, &header_key)?;
+
+        let mut new_header = self.header.clone();
+        new_header.nonce.copy_from_slice(&encrypted.nonce);
+        new_header
+            .encrypted_data_key
+            .copy_from_slice(&encrypted.ciphertext);
+        Ok(new_header)
+    }
+}
+
 impl Drop for Storage {
     fn drop(&mut self) {
         self.lock();
@@ -555,5 +737,71 @@ mod tests {
 
         let keys = storage.list_keys().unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn test_rotate_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rotate-pw");
+
+        {
+            let storage = Storage::create(&path, "oldpass", Argon2Params::TESTING).unwrap();
+            let pubkey: [u8; 32] = crypto::random_bytes();
+            let secret: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "test".into(),
+                encrypted.to_bytes(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_password("oldpass", "newpass").unwrap();
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            assert!(storage.unlock("oldpass").is_err());
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.unlock("newpass").unwrap();
+            let keys = storage.list_keys().unwrap();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].name, "test");
+        }
+    }
+
+    #[test]
+    fn test_rotate_data_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rotate-dek");
+
+        {
+            let storage = Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+            let pubkey: [u8; 32] = crypto::random_bytes();
+            let secret: Vec<u8> = vec![9, 10, 11, 12];
+            let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "dek-test".into(),
+                encrypted.to_bytes(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key("password").unwrap();
+            let keys = storage.list_keys().unwrap();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].name, "dek-test");
+        }
     }
 }

@@ -595,6 +595,58 @@ fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
+    debug!("rotating password");
+
+    let mut keep = Keep::open(path)?;
+    let old_password = get_password("Enter current password")?;
+    let new_password = get_password_with_confirm("Enter new password", "Confirm new password")?;
+
+    if new_password.expose_secret().len() < 8 {
+        return Err(KeepError::Other(
+            "Password must be at least 8 characters".into(),
+        ));
+    }
+
+    if !get_confirm("Rotate vault password? This will re-encrypt the data encryption key.")? {
+        out.info("Cancelled.");
+        return Ok(());
+    }
+
+    let spinner = out.spinner("Rotating password...");
+    keep.rotate_password(old_password.expose_secret(), new_password.expose_secret())?;
+    spinner.finish();
+
+    info!("password rotated");
+    out.newline();
+    out.success("Password rotated successfully!");
+
+    Ok(())
+}
+
+pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
+    debug!("rotating data key");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    if !get_confirm("Rotate data encryption key? This will re-encrypt all stored keys and shares.")?
+    {
+        out.info("Cancelled.");
+        return Ok(());
+    }
+
+    let spinner = out.spinner("Rotating data key and re-encrypting all secrets...");
+    keep.rotate_data_key(password.expose_secret())?;
+    spinner.finish();
+
+    info!("data key rotated");
+    out.newline();
+    out.success("Data key rotated successfully!");
+
+    Ok(())
+}
+
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_delete(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {

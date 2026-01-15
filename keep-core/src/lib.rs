@@ -469,7 +469,33 @@ impl Keep {
         self.storage.data_key().cloned().ok_or(KeepError::Locked)
     }
 
-    /// The data encryption key. Exposed for FROST integration.
+    /// Rotate the vault password.
+    ///
+    /// Re-encrypts the data encryption key with a new password-derived key.
+    /// The data encryption key itself is unchanged, so stored secrets remain intact.
+    pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
+        self.storage.rotate_password(old_password, new_password)?;
+        self.keyring.clear();
+        self.load_keys_to_keyring()?;
+        Ok(())
+    }
+
+    /// Rotate the data encryption key.
+    ///
+    /// Generates a new data encryption key and re-encrypts all stored keys and shares.
+    pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        self.storage.rotate_data_key(password)?;
+        self.keyring.clear();
+        self.load_keys_to_keyring()?;
+        Ok(())
+    }
+
+    /// Returns the data encryption key used to encrypt stored secrets.
+    ///
+    /// # Errors
+    /// Returns [`KeepError::Locked`] if [`unlock()`](Self::unlock) has not been called.
+    ///
+    /// Exposed for FROST/FrostSigner integration to decrypt stored shares.
     pub fn data_key(&self) -> Result<SecretKey> {
         self.get_data_key()
     }
@@ -609,5 +635,59 @@ mod tests {
 
         assert_eq!(session.commitments_needed(), 1);
         assert!(!session.is_complete());
+    }
+
+    #[test]
+    fn test_keep_rotate_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+
+        {
+            let mut keep = test_keep(&path);
+            keep.generate_key("rotatetest").unwrap();
+        }
+
+        {
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            keep.rotate_password("testpass", "newpass").unwrap();
+        }
+
+        {
+            let mut keep = Keep::open(&path).unwrap();
+            assert!(keep.unlock("testpass").is_err());
+        }
+
+        {
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("newpass").unwrap();
+            assert!(keep.keyring().get_by_name("rotatetest").is_some());
+        }
+    }
+
+    #[test]
+    fn test_keep_rotate_data_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+
+        let pubkey;
+        {
+            let mut keep = test_keep(&path);
+            pubkey = keep.generate_key("dektest").unwrap();
+        }
+
+        {
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            keep.rotate_data_key("testpass").unwrap();
+            assert!(keep.keyring().get(&pubkey).is_some());
+        }
+
+        {
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            let slot = keep.keyring().get(&pubkey).unwrap();
+            assert_eq!(slot.name, "dektest");
+        }
     }
 }
