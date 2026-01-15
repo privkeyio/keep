@@ -64,3 +64,5 @@ warden = ["dep:reqwest", "dep:uuid"]
 
 [dev-dependencies]
 tempfile = "3.10"
+sha2 = "0.10"
+hex = "0.4"
