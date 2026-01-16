@@ -9,7 +9,7 @@ cargo build
 cargo test
 ```
 
-Requires Rust 1.70+.
+Requires Rust 1.83+.
 
 ## Code Style
 
@@ -28,7 +28,7 @@ Requires Rust 1.70+.
 
 Write atomic commits with clear reasoning:
 
-```
+```text
 <type>: <short summary>
 
 <why this change is needed>
@@ -38,7 +38,7 @@ Write atomic commits with clear reasoning:
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`
 
 Example:
-```
+```text
 fix: prevent memory exhaustion on malformed vault data
 
 Unbounded deserialization could exhaust memory with crafted input.
