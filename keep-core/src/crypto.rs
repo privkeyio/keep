@@ -25,6 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static MLOCK_DISABLED: AtomicBool = AtomicBool::new(false);
 static MLOCK_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
+/// Globally disable memory locking for the process.
+///
+/// When disabled, secret keys will not be locked in memory (mlock),
+/// which means they may be paged to disk. This is useful in container
+/// environments where mlock may not be available.
 pub fn disable_mlock() {
     MLOCK_DISABLED.store(true, Ordering::SeqCst);
 }
