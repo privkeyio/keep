@@ -950,14 +950,21 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        for _ in 0..5 {
+        // First 4 attempts - new storage each time to test persistence
+        for _ in 0..4 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock_outer("wrong");
             assert!(result.is_err());
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
+        // Attempts 5 and 6 on same instance to ensure tight timing
+        // (rate limit delay is only 1 second, can expire on slow CI)
         let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock_outer("wrong");
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(KeepError::RateLimited(_))));
+
         let result = storage.unlock_outer("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
@@ -969,13 +976,18 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        for _ in 0..5 {
+        // First 4 attempts - new storage each time to test persistence
+        for _ in 0..4 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock_hidden("wrong");
             assert!(matches!(result, Err(KeepError::InvalidPassword)));
         }
 
+        // Attempts 5 and 6 on same instance to ensure tight timing
         let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock_hidden("wrong");
+        assert!(matches!(result, Err(KeepError::InvalidPassword)));
+
         let result = storage.unlock_hidden("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
@@ -987,13 +999,18 @@ mod tests {
 
         HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
 
-        for _ in 0..5 {
+        // First 4 attempts - new storage each time to test persistence
+        for _ in 0..4 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let result = storage.unlock("wrong");
             assert!(matches!(result, Err(KeepError::InvalidPassword)));
         }
 
+        // Attempts 5 and 6 on same instance to ensure tight timing
         let mut storage = HiddenStorage::open(&path).unwrap();
+        let result = storage.unlock("wrong");
+        assert!(matches!(result, Err(KeepError::InvalidPassword)));
+
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }

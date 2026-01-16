@@ -30,7 +30,7 @@ pub struct MockEnclaveClient {
 
 impl MockEnclaveClient {
     pub fn new() -> Self {
-        Self::with_path(Path::new("/tmp/keep-mock-enclave.redb"))
+        Self::with_path(&std::env::temp_dir().join("keep-mock-enclave.redb"))
     }
 
     pub fn with_path(path: &Path) -> Self {
