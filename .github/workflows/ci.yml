@@ -46,3 +46,22 @@ jobs:
           key: ${{ matrix.os }}
       - run: cargo build --release
       - run: cargo test
+
+  reproducible:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build twice and compare
+        run: |
+          docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
+          docker build --no-cache -f Dockerfile.reproducible -o type=local,dest=./dist2 .
+          HASH1=$(sha256sum dist1/keep | cut -d' ' -f1)
+          HASH2=$(sha256sum dist2/keep | cut -d' ' -f1)
+          echo "Build 1: $HASH1"
+          echo "Build 2: $HASH2"
+          if [ "$HASH1" != "$HASH2" ]; then
+            echo "Reproducibility check failed"
+            exit 1
+          fi
+          echo "Reproducible build verified"
