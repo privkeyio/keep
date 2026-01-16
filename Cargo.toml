@@ -73,7 +73,7 @@ urlencoding = "2.1"
 url = "2.5"
 
 # Storage
-redb = "~2.4"  # Pin to 2.4.x for MSRV 1.81 compatibility (2.5+ requires MSRV 1.85)
+redb = "~2.4"  # Pin to 2.4.x for MSRV 1.83 compatibility (2.5+ requires MSRV 1.85)
 
 # MSRV 1.83 compatibility pins (edition2024 crates)
 base64ct = ">=1.0, <1.8"  # 1.8+ uses edition2024
