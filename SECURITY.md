@@ -270,7 +270,7 @@ kyew0MAIis6DCtVkNduBlBYA
 -----END PGP PUBLIC KEY BLOCK-----
 ```
 
-**Fingerprint:** `5F0A E5D5 0B42 BE91 08F0 E4A6 E23B 2F15 7966 B64C`
+**Fingerprint:** `E749 1A98 55C1 B9D7 99B6 B491 B835 2708 95A8 0B0B`
 
 **Process:**
 1. Encrypt report with PGP key above
