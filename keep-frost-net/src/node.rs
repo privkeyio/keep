@@ -815,30 +815,22 @@ impl KfpNode {
         Ok(())
     }
 
-    async fn handle_commitment(&self, from: PublicKey, payload: CommitmentPayload) -> Result<()> {
-        {
-            let peers = self.peers.read();
-            if let Some(peer) = peers.get_peer(payload.share_index) {
-                if peer.pubkey != from {
-                    return Err(FrostNetError::UntrustedPeer(format!(
-                        "Sender {} doesn't match share index {}",
-                        from, payload.share_index
-                    )));
-                }
-            } else {
-                let sessions = self.sessions.read();
-                let is_session_participant = sessions
-                    .get_session(&payload.session_id)
-                    .map(|s| s.is_participant(payload.share_index))
-                    .unwrap_or(false);
-                if !is_session_participant {
-                    return Err(FrostNetError::UntrustedPeer(format!(
-                        "Unknown share index {} not a session participant",
-                        payload.share_index
-                    )));
-                }
-            }
+    fn verify_peer_share_index(&self, from: PublicKey, share_index: u16) -> Result<()> {
+        let peers = self.peers.read();
+        let peer = peers.get_peer(share_index).ok_or_else(|| {
+            FrostNetError::UntrustedPeer(format!("Share index {} not announced", share_index))
+        })?;
+        if peer.pubkey != from {
+            return Err(FrostNetError::UntrustedPeer(format!(
+                "Sender {} doesn't match share index {}",
+                from, share_index
+            )));
         }
+        Ok(())
+    }
+
+    async fn handle_commitment(&self, from: PublicKey, payload: CommitmentPayload) -> Result<()> {
+        self.verify_peer_share_index(from, payload.share_index)?;
 
         let commitment =
             frost_secp256k1_tr::round1::SigningCommitments::deserialize(&payload.commitment)
@@ -949,29 +941,7 @@ impl KfpNode {
         from: PublicKey,
         payload: SignatureSharePayload,
     ) -> Result<()> {
-        {
-            let peers = self.peers.read();
-            if let Some(peer) = peers.get_peer(payload.share_index) {
-                if peer.pubkey != from {
-                    return Err(FrostNetError::UntrustedPeer(format!(
-                        "Sender {} doesn't match share index {}",
-                        from, payload.share_index
-                    )));
-                }
-            } else {
-                let sessions = self.sessions.read();
-                let is_session_participant = sessions
-                    .get_session(&payload.session_id)
-                    .map(|s| s.is_participant(payload.share_index))
-                    .unwrap_or(false);
-                if !is_session_participant {
-                    return Err(FrostNetError::UntrustedPeer(format!(
-                        "Unknown share index {} not a session participant",
-                        payload.share_index
-                    )));
-                }
-            }
-        }
+        self.verify_peer_share_index(from, payload.share_index)?;
 
         let sig_share =
             frost_secp256k1_tr::round2::SignatureShare::deserialize(&payload.signature_share)
