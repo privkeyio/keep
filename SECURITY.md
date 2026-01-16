@@ -272,6 +272,10 @@ kyew0MAIis6DCtVkNduBlBYA
 
 **Fingerprint:** `E749 1A98 55C1 B9D7 99B6 B491 B835 2708 95A8 0B0B`
 
+**Key Servers:**
+- [keys.openpgp.org](https://keys.openpgp.org/search?q=E7491A9855C1B9D799B6B491B835270895A80B0B)
+- [keyserver.ubuntu.com](https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xE7491A9855C1B9D799B6B491B835270895A80B0B)
+
 **Process:**
 1. Encrypt report with PGP key above
 2. Send to security@privkey.io
