@@ -54,9 +54,12 @@ const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
-fn derive_hidden_salt(password: &str) -> [u8; 32] {
-    let mut input = Vec::with_capacity(19 + password.len());
+const MIN_HIDDEN_SIZE: u64 = (crypto::NONCE_SIZE + 8 + crypto::TAG_SIZE) as u64;
+
+fn derive_hidden_salt(outer_salt: &[u8; 32], password: &str) -> [u8; 32] {
+    let mut input = Vec::with_capacity(19 + 32 + password.len());
     input.extend_from_slice(b"keep-hidden-salt-v1");
+    input.extend_from_slice(outer_salt);
     input.extend_from_slice(password.as_bytes());
     crypto::blake2b_256(&input)
 }
@@ -121,6 +124,13 @@ impl HiddenStorage {
             0
         };
 
+        if hidden_password.is_some() && hidden_size < MIN_HIDDEN_SIZE {
+            return Err(KeepError::Other(format!(
+                "Hidden volume size {} too small, need at least {} bytes",
+                hidden_size, MIN_HIDDEN_SIZE
+            )));
+        }
+
         let required_min = DATA_START_OFFSET
             .checked_add(hidden_size)
             .ok_or_else(|| KeepError::Other("Volume size overflow".into()))?;
@@ -157,7 +167,7 @@ impl HiddenStorage {
                 let mut hh = HiddenHeader::new(hidden_offset, hidden_size);
 
                 let hidden_data_key = SecretKey::generate()?;
-                let kdf_salt = derive_hidden_salt(hp);
+                let kdf_salt = derive_hidden_salt(&outer_header.salt, hp);
                 let hidden_master_key =
                     crypto::derive_key(hp.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
 
@@ -307,7 +317,7 @@ impl HiddenStorage {
         let mut hidden_area = [0u8; HEADER_SIZE];
         file.read_exact(&mut hidden_area)?;
 
-        let kdf_salt = derive_hidden_salt(password);
+        let kdf_salt = derive_hidden_salt(&self.outer_header.salt, password);
         let master_key = crypto::derive_key(password.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
         let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc")?;
 
