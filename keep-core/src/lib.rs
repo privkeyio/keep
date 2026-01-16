@@ -1,19 +1,48 @@
-//! Keep Core - Sovereign key management for Nostr and Bitcoin
+//! Sovereign key management for Nostr and Bitcoin.
 //!
-//! This crate provides the core library functionality for Keep:
-//! - Encrypted storage using Redb with XChaCha20-Poly1305
-//! - Key derivation using Argon2id
-//! - Nostr keypair management
-//! - Hidden volumes for plausible deniability
+//! This crate provides encrypted key storage with the following features:
+//!
+//! - **Encrypted storage** using Redb with XChaCha20-Poly1305
+//! - **Key derivation** using Argon2id with configurable parameters
+//! - **Nostr keypair management** with nsec/npub support
+//! - **FROST threshold signatures** for distributed key management
+//! - **Hidden volumes** for plausible deniability
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::path::Path;
+//! use keep_core::Keep;
+//!
+//! // Create a new Keep
+//! let mut keep = Keep::create(Path::new("/tmp/my-keep"), "password")?;
+//!
+//! // Generate a new key
+//! let pubkey = keep.generate_key("my-key")?;
+//!
+//! // Lock when done
+//! keep.lock();
+//! # Ok::<(), keep_core::error::KeepError>(())
+//! ```
 
+#![deny(missing_docs)]
+
+/// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
+/// Error types and result aliases.
 pub mod error;
+/// FROST threshold signature implementation.
 pub mod frost;
+/// Hidden volume storage for plausible deniability.
 pub mod hidden;
+/// In-memory keyring for unlocked keys.
 pub mod keyring;
+/// Key types and Nostr keypair operations.
 pub mod keys;
 pub(crate) mod rate_limit;
+/// Persistent encrypted storage backend.
 pub mod storage;
+/// Ephemeral time-limited secret vault.
 pub mod vault;
 
 use std::path::{Path, PathBuf};
@@ -35,7 +64,22 @@ pub struct Keep {
 }
 
 impl Keep {
-    /// Create a new Keep at the given path with the provided password.
+    /// Create a new Keep with the given password.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use keep_core::Keep;
+    ///
+    /// let keep = Keep::create(Path::new("/tmp/my-keep"), "password")?;
+    /// assert!(keep.is_unlocked());
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::AlreadyExists`] if a Keep already exists at the path.
     pub fn create(path: &Path, password: &str) -> Result<Self> {
         let storage = Storage::create(path, password, Argon2Params::DEFAULT)?;
 
@@ -45,7 +89,22 @@ impl Keep {
         })
     }
 
-    /// Open an existing Keep at the given path.
+    /// Open an existing Keep.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use keep_core::Keep;
+    ///
+    /// let mut keep = Keep::open(Path::new("~/.keep"))?;
+    /// keep.unlock("password")?;
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::NotFound`] if no Keep exists at the path.
     pub fn open(path: &Path) -> Result<Self> {
         let storage = Storage::open(path)?;
 
@@ -55,7 +114,12 @@ impl Keep {
         })
     }
 
-    /// Unlock the Keep with the given password.
+    /// Unlock with the given password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::InvalidPassword`] if the password is incorrect.
+    /// Returns [`KeepError::RateLimited`] after too many failed attempts.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
         debug!("loading keys to keyring");
@@ -63,18 +127,33 @@ impl Keep {
         Ok(())
     }
 
-    /// Lock the Keep, clearing all keys from memory.
+    /// Lock and clear all keys from memory.
     pub fn lock(&mut self) {
         self.keyring.clear();
         self.storage.lock();
     }
 
-    /// Check if the Keep is currently unlocked.
+    /// Returns true if unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.storage.is_unlocked()
     }
 
-    /// Generate a new Nostr keypair and store it with the given name.
+    /// Generate a new Nostr keypair and store it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use keep_core::Keep;
+    /// # let mut keep = Keep::create(Path::new("/tmp/k"), "pw")?;
+    /// let pubkey = keep.generate_key("my-nostr-key")?;
+    /// println!("Created key: {}", hex::encode(pubkey));
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::Locked`] if the Keep is not unlocked.
     pub fn generate_key(&mut self, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -105,7 +184,24 @@ impl Keep {
         Ok(pubkey)
     }
 
-    /// Import an nsec (Nostr secret key) and store it with the given name.
+    /// Import an nsec and store it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use keep_core::Keep;
+    /// # let mut keep = Keep::create(Path::new("/tmp/k"), "pw")?;
+    /// let nsec = "nsec1...";
+    /// let pubkey = keep.import_nsec(nsec, "imported-key")?;
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::Locked`] if the Keep is not unlocked.
+    /// Returns [`KeepError::InvalidNsec`] if the nsec format is invalid.
+    /// Returns [`KeepError::KeyAlreadyExists`] if the key is already stored.
     pub fn import_nsec(&mut self, nsec: &str, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -140,7 +236,7 @@ impl Keep {
         Ok(pubkey)
     }
 
-    /// Get the primary key slot from the keyring.
+    /// The primary key slot, if set.
     pub fn get_primary_key(&self) -> Option<&keyring::KeySlot> {
         self.keyring.get_primary()
     }
@@ -150,7 +246,7 @@ impl Keep {
         self.storage.list_keys()
     }
 
-    /// Delete a key by its public key.
+    /// Delete a key.
     pub fn delete_key(&mut self, pubkey: &[u8; 32]) -> Result<()> {
         let id = crypto::blake2b_256(pubkey);
         self.storage.delete_key(&id)?;
@@ -158,16 +254,17 @@ impl Keep {
         Ok(())
     }
 
-    /// Get a reference to the keyring.
+    /// The keyring.
     pub fn keyring(&self) -> &Keyring {
         &self.keyring
     }
 
-    /// Get a mutable reference to the keyring.
+    /// Mutable access to the keyring.
     pub fn keyring_mut(&mut self) -> &mut Keyring {
         &mut self.keyring
     }
 
+    /// Generate a new FROST key with the given threshold and total shares.
     pub fn frost_generate(
         &mut self,
         threshold: u16,
@@ -191,6 +288,7 @@ impl Keep {
         Ok(shares)
     }
 
+    /// Split an existing key into FROST shares.
     pub fn frost_split(
         &mut self,
         key_name: &str,
@@ -221,6 +319,7 @@ impl Keep {
         Ok(shares)
     }
 
+    /// List all stored FROST shares.
     pub fn frost_list_shares(&self) -> Result<Vec<StoredShare>> {
         self.storage.list_shares()
     }
@@ -235,6 +334,7 @@ impl Keep {
             .ok_or_else(|| KeepError::KeyNotFound(format!("No share {} for group", identifier)))
     }
 
+    /// Export a FROST share encrypted with a passphrase.
     pub fn frost_export_share(
         &self,
         group_pubkey: &[u8; 32],
@@ -252,6 +352,7 @@ impl Keep {
         ShareExport::from_share(&share, passphrase)
     }
 
+    /// Import a FROST share from an encrypted export.
     pub fn frost_import_share(&mut self, export: &ShareExport, passphrase: &str) -> Result<()> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -265,10 +366,12 @@ impl Keep {
         Ok(())
     }
 
+    /// Delete a FROST share.
     pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         self.storage.delete_share(group_pubkey, identifier)
     }
 
+    /// Get a FROST share by group public key.
     pub fn frost_get_share(&self, group_pubkey: &[u8; 32]) -> Result<frost::SharePackage> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -284,6 +387,7 @@ impl Keep {
         stored.decrypt(&data_key)
     }
 
+    /// Get a FROST share by group public key and identifier index.
     pub fn frost_get_share_by_index(
         &self,
         group_pubkey: &[u8; 32],
@@ -298,6 +402,7 @@ impl Keep {
         stored.decrypt(&data_key)
     }
 
+    /// Sign using local FROST shares. Requires threshold shares locally.
     pub fn frost_sign(&self, group_pubkey: &[u8; 32], message: &[u8]) -> Result<[u8; 64]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -357,12 +462,7 @@ impl Keep {
         self.storage.data_key().cloned().ok_or(KeepError::Locked)
     }
 
-    /// Returns the data encryption key used to encrypt stored secrets.
-    ///
-    /// # Errors
-    /// Returns [`KeepError::Locked`] if [`unlock()`](Self::unlock) has not been called.
-    ///
-    /// Exposed for FROST/FrostSigner integration to decrypt stored shares.
+    /// The data encryption key. Exposed for FROST integration.
     pub fn data_key(&self) -> Result<SecretKey> {
         self.get_data_key()
     }

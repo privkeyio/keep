@@ -1,3 +1,5 @@
+//! Trusted dealer key generation for FROST.
+
 #![forbid(unsafe_code)]
 
 use frost::keys::{IdentifierList, KeyPackage, PublicKeyPackage};
@@ -8,13 +10,19 @@ use crate::error::{KeepError, Result};
 
 use super::share::{ShareMetadata, SharePackage};
 
+/// Configuration for a threshold signature scheme.
 #[derive(Clone, Copy)]
 pub struct ThresholdConfig {
+    /// Minimum number of shares required to sign.
     pub threshold: u16,
+    /// Total number of shares to generate.
     pub total_shares: u16,
 }
 
 impl ThresholdConfig {
+    /// Create a new threshold configuration.
+    ///
+    /// Requires: threshold >= 2, total_shares >= threshold, total_shares <= 255.
     pub fn new(threshold: u16, total_shares: u16) -> Result<Self> {
         if threshold < 2 {
             return Err(KeepError::Frost("Threshold must be at least 2".into()));
@@ -32,6 +40,7 @@ impl ThresholdConfig {
         })
     }
 
+    /// Create a 2-of-3 threshold configuration.
     pub fn two_of_three() -> Self {
         Self {
             threshold: 2,
@@ -39,6 +48,7 @@ impl ThresholdConfig {
         }
     }
 
+    /// Create a 3-of-5 threshold configuration.
     pub fn three_of_five() -> Self {
         Self {
             threshold: 3,
@@ -61,10 +71,14 @@ pub struct TrustedDealer {
 }
 
 impl TrustedDealer {
+    /// Create a new trusted dealer.
     pub fn new(config: ThresholdConfig) -> Self {
         Self { config }
     }
 
+    /// Generate a new threshold key and split into shares.
+    ///
+    /// Returns (share packages, public key package).
     pub fn generate(&self, name: &str) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
         let (shares, pubkey_pkg) = frost::keys::generate_with_dealer(
             self.config.total_shares,
@@ -101,6 +115,7 @@ impl TrustedDealer {
         Ok((packages?, pubkey_pkg))
     }
 
+    /// Split an existing secret key into threshold shares.
     pub fn split_existing(
         &self,
         secret: &[u8; 32],

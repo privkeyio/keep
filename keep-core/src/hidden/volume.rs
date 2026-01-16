@@ -52,12 +52,16 @@ const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
+/// Type of encrypted volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeType {
+    /// The primary outer volume.
     Outer,
+    /// The hidden plausible-deniability volume.
     Hidden,
 }
 
+/// Encrypted storage with optional hidden volume.
 pub struct HiddenStorage {
     path: PathBuf,
     outer_header: OuterHeader,
@@ -69,6 +73,9 @@ pub struct HiddenStorage {
 }
 
 impl HiddenStorage {
+    /// Create a new hidden storage vault.
+    ///
+    /// `hidden_ratio` is the fraction of space for the hidden volume (0.0-1.0).
     pub fn create(
         path: &Path,
         outer_password: &str,
@@ -215,6 +222,7 @@ impl HiddenStorage {
         })
     }
 
+    /// Open an existing hidden storage vault.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(KeepError::NotFound(path.display().to_string()));
@@ -269,6 +277,7 @@ impl HiddenStorage {
         Ok(())
     }
 
+    /// Unlock the outer volume.
     pub fn unlock_outer(&mut self, password: &str) -> Result<()> {
         if self.outer_key.is_some() {
             return Ok(());
@@ -353,6 +362,7 @@ impl HiddenStorage {
         Ok(())
     }
 
+    /// Unlock the hidden volume.
     pub fn unlock_hidden(&mut self, password: &str) -> Result<()> {
         if self.hidden_key.is_some() {
             return Ok(());
@@ -377,6 +387,8 @@ impl HiddenStorage {
         }
     }
 
+    /// Unlock whichever volume the password matches.
+    /// Returns the type that was unlocked.
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
@@ -415,6 +427,7 @@ impl HiddenStorage {
         }
     }
 
+    /// Lock and zeroize all keys.
     pub fn lock(&mut self) {
         self.outer_key = None;
         self.hidden_key = None;
@@ -423,10 +436,12 @@ impl HiddenStorage {
         self.outer_db = None;
     }
 
+    /// Returns true if any volume is unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.active_volume.is_some()
     }
 
+    /// The data encryption key for the active volume.
     pub fn data_key(&self) -> Option<&SecretKey> {
         match self.active_volume {
             Some(VolumeType::Hidden) => self.hidden_key.as_ref(),
@@ -435,14 +450,17 @@ impl HiddenStorage {
         }
     }
 
+    /// The active volume type, if unlocked.
     pub fn active_volume(&self) -> Option<VolumeType> {
         self.active_volume
     }
 
+    /// Returns true if the hidden volume is unlocked.
     pub fn is_hidden_unlocked(&self) -> bool {
         self.hidden_key.is_some()
     }
 
+    /// Store a key record in the active volume.
     pub fn store_key(&self, record: &KeyRecord) -> Result<()> {
         match self.active_volume {
             Some(VolumeType::Outer) => self.store_key_outer(record),
@@ -574,6 +592,7 @@ impl HiddenStorage {
         Ok(())
     }
 
+    /// List all keys in the active volume.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         match self.active_volume {
             Some(VolumeType::Outer) => self.list_keys_outer(),
@@ -609,6 +628,7 @@ impl HiddenStorage {
         Ok(records)
     }
 
+    /// Delete a key from the active volume.
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         match self.active_volume {
             Some(VolumeType::Outer) => self.delete_key_outer(id),
@@ -650,6 +670,7 @@ impl HiddenStorage {
         self.write_hidden_records(&records, data_key, hidden_header)
     }
 
+    /// The vault directory path.
     pub fn path(&self) -> &Path {
         &self.path
     }

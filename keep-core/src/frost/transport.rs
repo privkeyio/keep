@@ -1,3 +1,5 @@
+//! Transport formats for FROST shares and messages.
+
 #![forbid(unsafe_code)]
 
 use bech32::{Bech32m, Hrp};
@@ -12,19 +14,29 @@ const SHARE_HRP: &str = "kshare";
 const MAX_FRAME_COUNT: usize = 100;
 const MAX_ASSEMBLED_SIZE: usize = 64 * 1024;
 
+/// An encrypted share export for backup and transfer.
 #[derive(Serialize, Deserialize)]
 pub struct ShareExport {
+    /// Format version.
     pub version: u8,
+    /// Threshold required to sign.
     pub threshold: u16,
+    /// Total number of shares.
     pub total: u16,
+    /// Share identifier.
     pub identifier: u16,
+    /// Group public key (hex).
     pub group_pubkey: String,
+    /// Encrypted share data (hex).
     pub encrypted_share: String,
+    /// Encryption nonce (hex).
     pub nonce: String,
+    /// Key derivation salt (hex).
     pub salt: String,
 }
 
 impl ShareExport {
+    /// Create an encrypted export from a share package.
     pub fn from_share(share: &SharePackage, passphrase: &str) -> Result<Self> {
         let salt: [u8; 32] = crypto::random_bytes();
         let key = crypto::derive_key(passphrase.as_bytes(), &salt, crypto::Argon2Params::DEFAULT)?;
@@ -48,6 +60,7 @@ impl ShareExport {
         })
     }
 
+    /// Decrypt and restore the share package.
     pub fn to_share(&self, passphrase: &str, name: &str) -> Result<SharePackage> {
         const INVALID_SHARE: &str = "Invalid or corrupted share data";
 
@@ -107,16 +120,23 @@ impl ShareExport {
         SharePackage::new(metadata, &key_package, &pubkey_package)
     }
 
+    /// Serialize to JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| KeepError::Frost(format!("JSON serialization failed: {}", e)))
     }
 
+    /// Deserialize from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json)
             .map_err(|e| KeepError::Frost(format!("JSON deserialization failed: {}", e)))
     }
 
+    /// Encode as a bech32 string with `kshare` prefix.
     pub fn to_bech32(&self) -> Result<String> {
         let json = self.to_json()?;
         let hrp =
@@ -125,6 +145,7 @@ impl ShareExport {
             .map_err(|e| KeepError::Frost(format!("Bech32 encoding failed: {}", e)))
     }
 
+    /// Decode from a bech32 string.
     pub fn from_bech32(encoded: &str) -> Result<Self> {
         let (hrp, data) = bech32::decode(encoded)
             .map_err(|e| KeepError::Frost(format!("Bech32 decoding failed: {}", e)))?;
@@ -159,23 +180,32 @@ fn derive_pubkey_package(
     Ok(PublicKeyPackage::new(verifying_shares, *verifying_key))
 }
 
+/// A FROST protocol message for network transport.
 #[derive(Serialize, Deserialize)]
 pub struct FrostMessage {
+    /// Message type (commitment or share).
     #[serde(rename = "type")]
     pub msg_type: FrostMessageType,
+    /// Session identifier (hex).
     pub session_id: String,
+    /// Participant identifier.
     pub identifier: u16,
+    /// Message payload (hex).
     pub payload: String,
 }
 
+/// Type of FROST protocol message.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FrostMessageType {
+    /// Round 1 commitment.
     Round1Commitment,
+    /// Round 2 signature share.
     Round2Share,
 }
 
 impl FrostMessage {
+    /// Create a round 1 commitment message.
     pub fn commitment(session_id: &[u8; 32], identifier: u16, commitment_bytes: &[u8]) -> Self {
         Self {
             msg_type: FrostMessageType::Round1Commitment,
@@ -185,6 +215,7 @@ impl FrostMessage {
         }
     }
 
+    /// Create a round 2 signature share message.
     pub fn signature_share(session_id: &[u8; 32], identifier: u16, share_bytes: &[u8]) -> Self {
         Self {
             msg_type: FrostMessageType::Round2Share,
@@ -194,20 +225,24 @@ impl FrostMessage {
         }
     }
 
+    /// Serialize to JSON.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| KeepError::Frost(format!("JSON encode failed: {}", e)))
     }
 
+    /// Deserialize from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json)
             .map_err(|e| KeepError::Frost(format!("JSON decode failed: {}", e)))
     }
 
+    /// Decode the payload from hex.
     pub fn payload_bytes(&self) -> Result<Vec<u8>> {
         hex::decode(&self.payload).map_err(|_| KeepError::Frost("Invalid payload hex".into()))
     }
 
+    /// Decode the session ID from hex.
     pub fn session_id_bytes(&self) -> Result<[u8; 32]> {
         let bytes = hex::decode(&self.session_id)
             .map_err(|_| KeepError::Frost("Invalid session_id hex".into()))?;
@@ -221,6 +256,7 @@ impl FrostMessage {
 }
 
 impl ShareExport {
+    /// Split into animated QR code frames.
     pub fn to_animated_frames(&self, max_bytes: usize) -> Result<Vec<String>> {
         let full = self.to_json()?;
 
@@ -245,6 +281,7 @@ impl ShareExport {
         Ok(frames)
     }
 
+    /// Reassemble from animated QR code frames.
     pub fn from_animated_frames(frames: &[String]) -> Result<Self> {
         if frames.is_empty() {
             return Err(KeepError::Frost("No frames provided".into()));

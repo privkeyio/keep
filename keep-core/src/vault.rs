@@ -21,6 +21,7 @@ pub struct EphemeralVault<T: Zeroize> {
 }
 
 impl<T: Zeroize> EphemeralVault<T> {
+    /// Create a new vault with the given TTL and maximum read count.
     pub fn new(inner: T, ttl: Duration, max_reads: usize) -> Self {
         Self {
             inner: Some(inner),
@@ -29,10 +30,8 @@ impl<T: Zeroize> EphemeralVault<T> {
         }
     }
 
-    /// Access the secret if still valid.
-    ///
-    /// Returns `None` if the vault has expired, reads are exhausted, or [`revoke`](Self::revoke)
-    /// was called. Each successful call decrements the remaining read count.
+    /// Access the secret if still valid (not expired, not exhausted, not revoked).
+    /// Each successful call decrements the remaining read count.
     #[must_use]
     pub fn get(&self) -> Option<&T> {
         if Instant::now() >= self.expires_at {
@@ -48,10 +47,12 @@ impl<T: Zeroize> EphemeralVault<T> {
         self.inner.as_ref()
     }
 
+    /// Remaining reads before exhaustion.
     pub fn remaining_reads(&self) -> usize {
         self.remaining_reads.get()
     }
 
+    /// Returns true if TTL has elapsed.
     pub fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
     }
@@ -61,13 +62,12 @@ impl<T: Zeroize> EphemeralVault<T> {
         self.inner.is_none()
     }
 
+    /// Time remaining until expiration.
     pub fn time_remaining(&self) -> Duration {
         self.expires_at.saturating_duration_since(Instant::now())
     }
 
-    /// Explicitly zeroize and remove the secret before the vault is dropped.
-    ///
-    /// After calling this, [`get`](Self::get) will return `None`.
+    /// Zeroize and remove the secret early. After this, `get` returns `None`.
     pub fn revoke(&mut self) {
         if let Some(ref mut inner) = self.inner {
             inner.zeroize();

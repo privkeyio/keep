@@ -1,4 +1,8 @@
+//! FROST signing coordinator for multi-party signing sessions.
+
 #![forbid(unsafe_code)]
+// ZeroizeOnDrop derive generates assignments in Drop impl for #[zeroize(skip)] fields
+// that appear unused. Module-level allow is needed as struct-level doesn't affect generated code.
 #![allow(unused_assignments)]
 
 use std::collections::BTreeMap;
@@ -15,6 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::{KeepError, Result};
 use crate::frost::{FrostMessage, FrostMessageType, SharePackage};
 
+/// Coordinates a FROST signing session between multiple participants.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Coordinator {
     #[zeroize(skip)]
@@ -33,6 +38,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    /// Create a new signing coordinator.
     pub fn new(message: Vec<u8>, threshold: u16) -> Self {
         Self {
             session_id: crate::crypto::random_bytes(),
@@ -45,10 +51,12 @@ impl Coordinator {
         }
     }
 
+    /// The session ID.
     pub fn session_id(&self) -> &[u8; 32] {
         &self.session_id
     }
 
+    /// Add a local share and generate its commitment.
     pub fn add_local_share(&mut self, share: &SharePackage) -> Result<FrostMessage> {
         let kp = share.key_package()?;
         let id = *kp.identifier();
@@ -70,6 +78,7 @@ impl Coordinator {
         ))
     }
 
+    /// Add a remote participant's commitment.
     pub fn add_remote_commitment(&mut self, msg: &FrostMessage) -> Result<()> {
         if msg.msg_type != FrostMessageType::Round1Commitment {
             return Err(KeepError::Frost("Expected commitment message".into()));
@@ -90,10 +99,12 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Returns true if threshold commitments collected.
     pub fn has_enough_commitments(&self) -> bool {
         self.commitments.len() >= self.threshold as usize
     }
 
+    /// Generate our signature share (round 2).
     pub fn generate_signature_share(&mut self, share: &SharePackage) -> Result<FrostMessage> {
         if !self.has_enough_commitments() {
             return Err(KeepError::Frost(format!(
@@ -129,6 +140,7 @@ impl Coordinator {
         ))
     }
 
+    /// Add a remote participant's signature share.
     pub fn add_remote_signature_share(&mut self, msg: &FrostMessage) -> Result<()> {
         if msg.msg_type != FrostMessageType::Round2Share {
             return Err(KeepError::Frost("Expected signature share message".into()));
@@ -149,10 +161,12 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Returns true if threshold shares collected.
     pub fn has_enough_shares(&self) -> bool {
         self.signature_shares.len() >= self.threshold as usize
     }
 
+    /// Aggregate shares into a complete Schnorr signature.
     pub fn aggregate(&self, share: &SharePackage) -> Result<Signature> {
         if !self.has_enough_shares() {
             return Err(KeepError::Frost(format!(
@@ -169,6 +183,7 @@ impl Coordinator {
             .map_err(|e| KeepError::Frost(format!("Aggregation failed: {}", e)))
     }
 
+    /// Aggregate shares and return the 64-byte signature.
     pub fn aggregate_to_bytes(&self, share: &SharePackage) -> Result<[u8; 64]> {
         let signature = self.aggregate(share)?;
         let serialized = signature

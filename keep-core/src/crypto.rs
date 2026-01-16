@@ -1,3 +1,11 @@
+//! Cryptographic primitives for key derivation, encryption, and hashing.
+//!
+//! This module provides:
+//! - Argon2id key derivation with configurable parameters
+//! - XChaCha20-Poly1305 authenticated encryption
+//! - Blake2b-256 hashing
+//! - Memory-locked types for sensitive data
+
 #![deny(unsafe_code)]
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -17,6 +25,10 @@ mod mlock {
     use std::alloc::{alloc_zeroed, dealloc, Layout};
     use zeroize::Zeroize;
 
+    /// Fixed-size memory-locked byte array.
+    ///
+    /// The contents are locked in memory to prevent swapping and
+    /// automatically zeroized when dropped.
     pub struct MlockedBox<const N: usize> {
         ptr: *mut [u8; N],
         locked: bool,
@@ -45,6 +57,7 @@ mod mlock {
             Self { ptr, locked }
         }
 
+        /// Returns true if the memory is successfully locked.
         #[allow(dead_code)]
         pub fn is_locked(&self) -> bool {
             self.locked
@@ -86,6 +99,10 @@ mod mlock {
     unsafe impl<const N: usize> Send for MlockedBox<N> {}
     unsafe impl<const N: usize> Sync for MlockedBox<N> {}
 
+    /// Variable-size memory-locked byte vector.
+    ///
+    /// The contents are locked in memory to prevent swapping and
+    /// automatically zeroized when dropped.
     pub struct MlockedVec {
         ptr: *mut u8,
         len: usize,
@@ -114,11 +131,13 @@ mod mlock {
             }
         }
 
+        /// Returns true if the memory is successfully locked.
         #[allow(dead_code)]
         pub fn is_locked(&self) -> bool {
             self.locked
         }
 
+        /// Returns a slice view of the locked data.
         pub fn as_slice(&self) -> &[u8] {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
@@ -149,13 +168,16 @@ mod mlock {
 
 pub use mlock::{MlockedBox, MlockedVec};
 
+/// Salt size for key derivation.
 pub const SALT_SIZE: usize = 32;
 
+/// Variable-length secret stored encrypted in RAM.
 pub struct SecretVec {
     encrypted: EncryptedMem,
 }
 
 impl SecretVec {
+    /// Encrypt data into a new SecretVec.
     pub fn new(mut data: Vec<u8>) -> Result<Self> {
         let mut encrypted = EncryptedMem::new();
         encrypted
@@ -165,6 +187,7 @@ impl SecretVec {
         Ok(Self { encrypted })
     }
 
+    /// Decrypt and return the data.
     pub fn as_slice(&self) -> Result<Vec<u8>> {
         self.encrypted
             .decrypt()
@@ -173,30 +196,40 @@ impl SecretVec {
     }
 }
 
+/// XChaCha20-Poly1305 nonce size.
 pub const NONCE_SIZE: usize = 24;
+/// Encryption key size.
 pub const KEY_SIZE: usize = 32;
+/// Authentication tag size.
 pub const TAG_SIZE: usize = 16;
 
+/// Parameters for Argon2id key derivation.
 #[derive(Clone, Copy)]
 pub struct Argon2Params {
+    /// Memory cost in KiB.
     pub memory_kib: u32,
+    /// Number of iterations.
     pub iterations: u32,
+    /// Degree of parallelism.
     pub parallelism: u32,
 }
 
 impl Argon2Params {
+    /// Fast parameters for testing only.
     pub const TESTING: Self = Self {
         memory_kib: 1024,
         iterations: 1,
         parallelism: 1,
     };
 
+    /// Default parameters (256 MiB memory, 4 iterations).
     pub const DEFAULT: Self = Self {
         memory_kib: 256 * 1024,
         iterations: 4,
         parallelism: 4,
     };
 
+    /// High security parameters (512 MiB memory, 6 iterations).
     pub const HIGH: Self = Self {
         memory_kib: 512 * 1024,
         iterations: 6,
@@ -210,11 +243,13 @@ impl Default for Argon2Params {
     }
 }
 
+/// A 32-byte encryption key stored encrypted in RAM.
 pub struct SecretKey {
     encrypted: EncryptedMem,
 }
 
 impl SecretKey {
+    /// Encrypt raw bytes into a new SecretKey.
     pub fn new(mut bytes: [u8; KEY_SIZE]) -> Result<Self> {
         let mut encrypted = EncryptedMem::new();
         encrypted
@@ -224,12 +259,14 @@ impl SecretKey {
         Ok(Self { encrypted })
     }
 
+    /// Generate a new random encryption key.
     pub fn generate() -> Result<Self> {
         let mut bytes = [0u8; KEY_SIZE];
         rand::rng().fill_bytes(&mut bytes);
         Self::new(bytes)
     }
 
+    /// Decrypt into memory-locked storage.
     pub fn decrypt(&self) -> Result<MlockedBox<KEY_SIZE>> {
         let decrypted = self
             .encrypted
@@ -239,6 +276,7 @@ impl SecretKey {
         Ok(MlockedBox::new(&mut bytes))
     }
 
+    /// Create a SecretKey from a byte slice.
     pub fn from_slice(slice: &[u8]) -> Result<Self> {
         if slice.len() != KEY_SIZE {
             return Err(KeepError::Other("Invalid key length".into()));
@@ -248,6 +286,7 @@ impl SecretKey {
         Self::new(bytes)
     }
 
+    /// Clone the key. Returns an error if RAM encryption fails.
     pub fn try_clone(&self) -> Result<Self> {
         let decrypted = self.decrypt()?;
         Self::new(*decrypted)
@@ -261,6 +300,7 @@ impl Clone for SecretKey {
     }
 }
 
+/// Derive an encryption key from a password using Argon2id.
 pub fn derive_key(
     password: &[u8],
     salt: &[u8; SALT_SIZE],
@@ -284,6 +324,7 @@ pub fn derive_key(
     SecretKey::new(output)
 }
 
+/// Derive a subkey from a master key using domain separation.
 pub fn derive_subkey(master_key: &SecretKey, context: &[u8]) -> Result<SecretKey> {
     let decrypted = master_key.decrypt()?;
     let mut hasher = Blake2b512::new();
@@ -296,13 +337,17 @@ pub fn derive_subkey(master_key: &SecretKey, context: &[u8]) -> Result<SecretKey
     SecretKey::new(output)
 }
 
+/// Encrypted data with nonce for authenticated decryption.
 #[derive(Clone)]
 pub struct EncryptedData {
+    /// The encrypted ciphertext with authentication tag.
     pub ciphertext: Vec<u8>,
+    /// The nonce used for encryption.
     pub nonce: [u8; NONCE_SIZE],
 }
 
 impl EncryptedData {
+    /// Serialize to bytes: nonce || ciphertext.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(NONCE_SIZE + self.ciphertext.len());
         result.extend_from_slice(&self.nonce);
@@ -310,6 +355,7 @@ impl EncryptedData {
         result
     }
 
+    /// Deserialize from bytes: nonce || ciphertext.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < NONCE_SIZE + TAG_SIZE {
             return Err(KeepError::Other("Encrypted data too short".into()));
@@ -325,6 +371,7 @@ impl EncryptedData {
     }
 }
 
+/// Encrypt plaintext using XChaCha20-Poly1305.
 pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     let decrypted = key.decrypt()?;
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted));
@@ -340,6 +387,7 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     Ok(EncryptedData { ciphertext, nonce })
 }
 
+/// Decrypt ciphertext using XChaCha20-Poly1305.
 pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
     let decrypted_key = key.decrypt()?;
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted_key));
@@ -352,6 +400,7 @@ pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> 
     SecretVec::new(plaintext)
 }
 
+/// Compute Blake2b-256 hash of data.
 pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b512::new();
     hasher.update(data);
@@ -362,6 +411,7 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     output
 }
 
+/// Generate cryptographically secure random bytes.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     rand::rng().fill_bytes(&mut bytes);

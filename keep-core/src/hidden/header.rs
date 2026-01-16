@@ -1,3 +1,5 @@
+//! Header structures for hidden volume storage.
+
 #![forbid(unsafe_code)]
 
 use subtle::ConstantTimeEq;
@@ -5,34 +7,38 @@ use subtle::ConstantTimeEq;
 use crate::crypto::{self, Argon2Params, SALT_SIZE};
 use crate::error::{KeepError, Result};
 
+/// Size of each header block in bytes.
 pub const HEADER_SIZE: usize = 512;
-pub const OUTER_HEADER_OFFSET: u64 = 0;
+/// Offset of the hidden header in the vault file.
 pub const HIDDEN_HEADER_OFFSET: u64 = 512;
+/// Offset where data storage begins.
 pub const DATA_START_OFFSET: u64 = 1024;
 
-pub const OUTER_MAGIC: &[u8; 8] = b"KEEPVALT";
+pub(crate) const OUTER_MAGIC: &[u8; 8] = b"KEEPVALT";
 
+/// Header for the outer (primary) encrypted volume.
 #[derive(Clone)]
 #[repr(C)]
-pub struct OuterHeader {
-    pub magic: [u8; 8],
-    pub version: u16,
-    pub flags: u16,
-    pub reserved: u32,
-    pub salt: [u8; SALT_SIZE],
-    pub nonce: [u8; 24],
-    pub encrypted_data_key: [u8; 48],
-    pub argon2_memory_kib: u32,
-    pub argon2_iterations: u32,
-    pub argon2_parallelism: u32,
-    pub _align_pad: u32,
-    pub outer_data_size: u64,
-    pub total_size: u64,
-    pub padding: [u8; 360],
+pub(crate) struct OuterHeader {
+    pub(crate) magic: [u8; 8],
+    pub(crate) version: u16,
+    pub(crate) flags: u16,
+    pub(crate) reserved: u32,
+    pub(crate) salt: [u8; SALT_SIZE],
+    pub(crate) nonce: [u8; 24],
+    pub(crate) encrypted_data_key: [u8; 48],
+    pub(crate) argon2_memory_kib: u32,
+    pub(crate) argon2_iterations: u32,
+    pub(crate) argon2_parallelism: u32,
+    pub(crate) _align_pad: u32,
+    pub(crate) outer_data_size: u64,
+    pub(crate) total_size: u64,
+    pub(crate) padding: [u8; 360],
 }
 
 impl OuterHeader {
-    pub fn new(params: Argon2Params, outer_size: u64, total_size: u64) -> Self {
+    /// Create a new outer header.
+    pub(crate) fn new(params: Argon2Params, outer_size: u64, total_size: u64) -> Self {
         Self {
             magic: *OUTER_MAGIC,
             version: 1,
@@ -51,7 +57,8 @@ impl OuterHeader {
         }
     }
 
-    pub fn argon2_params(&self) -> Argon2Params {
+    /// The Argon2 parameters.
+    pub(crate) fn argon2_params(&self) -> Argon2Params {
         Argon2Params {
             memory_kib: self.argon2_memory_kib,
             iterations: self.argon2_iterations,
@@ -59,7 +66,8 @@ impl OuterHeader {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+    /// Serialize to bytes.
+    pub(crate) fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         let mut offset = 0;
 
@@ -96,7 +104,8 @@ impl OuterHeader {
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
+    /// Deserialize from bytes.
+    pub(crate) fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&bytes[0..8]);
 
@@ -163,23 +172,25 @@ impl OuterHeader {
     }
 }
 
+/// Header for the hidden (secondary) encrypted volume.
 #[derive(Clone)]
 #[repr(C)]
-pub struct HiddenHeader {
-    pub version: u16,
-    pub reserved: u16,
-    pub salt: [u8; SALT_SIZE],
-    pub nonce: [u8; 24],
-    pub encrypted_data_key: [u8; 48],
-    pub _align_pad: u32,
-    pub hidden_data_offset: u64,
-    pub hidden_data_size: u64,
-    pub checksum: [u8; 32],
-    pub padding: [u8; 352],
+pub(crate) struct HiddenHeader {
+    pub(crate) version: u16,
+    pub(crate) reserved: u16,
+    pub(crate) salt: [u8; SALT_SIZE],
+    pub(crate) nonce: [u8; 24],
+    pub(crate) encrypted_data_key: [u8; 48],
+    pub(crate) _align_pad: u32,
+    pub(crate) hidden_data_offset: u64,
+    pub(crate) hidden_data_size: u64,
+    pub(crate) checksum: [u8; 32],
+    pub(crate) padding: [u8; 352],
 }
 
 impl HiddenHeader {
-    pub fn new(hidden_offset: u64, hidden_size: u64) -> Self {
+    /// Create a new hidden header.
+    pub(crate) fn new(hidden_offset: u64, hidden_size: u64) -> Self {
         let mut header = Self {
             version: 1,
             reserved: 0,
@@ -197,7 +208,8 @@ impl HiddenHeader {
         header
     }
 
-    pub fn compute_checksum(&self) -> [u8; 32] {
+    /// Compute checksum.
+    pub(crate) fn compute_checksum(&self) -> [u8; 32] {
         let mut data = Vec::with_capacity(128);
         data.extend_from_slice(&self.version.to_le_bytes());
         data.extend_from_slice(&self.reserved.to_le_bytes());
@@ -210,19 +222,23 @@ impl HiddenHeader {
         crypto::blake2b_256(&data)
     }
 
-    pub fn verify_checksum(&self) -> bool {
+    /// Verify checksum.
+    pub(crate) fn verify_checksum(&self) -> bool {
         let expected = self.compute_checksum();
         expected.ct_eq(&self.checksum).into()
     }
 
-    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+    /// Serialize to full size.
+    #[cfg(test)]
+    pub(crate) fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         let compact = self.to_bytes_compact();
         bytes[..compact.len()].copy_from_slice(&compact);
         bytes
     }
 
-    pub fn to_bytes_compact(&self) -> [u8; Self::COMPACT_SIZE] {
+    /// Serialize to compact size.
+    pub(crate) fn to_bytes_compact(&self) -> [u8; Self::COMPACT_SIZE] {
         let mut bytes = [0u8; Self::COMPACT_SIZE];
         let mut offset = 0;
 
@@ -247,13 +263,17 @@ impl HiddenHeader {
         bytes
     }
 
-    pub const COMPACT_SIZE: usize = 2 + 2 + SALT_SIZE + 24 + 48 + 4 + 8 + 8 + 32;
+    /// Compact serialized size.
+    pub(crate) const COMPACT_SIZE: usize = 2 + 2 + SALT_SIZE + 24 + 48 + 4 + 8 + 8 + 32;
 
-    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
+    /// Deserialize from full-size bytes.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> Result<Self> {
         Self::from_bytes_compact(bytes)
     }
 
-    pub fn from_bytes_compact(bytes: &[u8]) -> Result<Self> {
+    /// Deserialize from compact-size bytes.
+    pub(crate) fn from_bytes_compact(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < Self::COMPACT_SIZE {
             return Err(KeepError::Other(format!(
                 "Hidden header too short: {} bytes, expected at least {}",
