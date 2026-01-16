@@ -1,0 +1,27 @@
+FROM rust:1.85.0-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libudev-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+ARG SOURCE_DATE_EPOCH
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
+ENV RUSTFLAGS="-C strip=symbols -C codegen-units=1"
+
+COPY Cargo.toml Cargo.lock ./
+COPY keep-core ./keep-core
+COPY keep-cli ./keep-cli
+COPY keep-bitcoin ./keep-bitcoin
+COPY keep-agent ./keep-agent
+COPY keep-frost-net ./keep-frost-net
+COPY keep-enclave ./keep-enclave
+
+RUN cargo build --release --locked \
+    && mkdir -p /out \
+    && cp target/release/keep /out/
+
+FROM scratch AS export
+COPY --from=builder /out/* /

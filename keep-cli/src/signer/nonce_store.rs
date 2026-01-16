@@ -83,8 +83,7 @@ impl NonceStore {
 
         self.data = data;
 
-        file.unlock()
-            .context("Failed to release nonce store lock")?;
+        FileExt::unlock(&file).context("Failed to release nonce store lock")?;
 
         Ok(result)
     }
