@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Hidden volume support for plausible deniability.
 //!
 //! This module provides encrypted storage with an optional hidden volume

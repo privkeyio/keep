@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! FROST signing coordinator for multi-party signing sessions.
 
 #![forbid(unsafe_code)]
