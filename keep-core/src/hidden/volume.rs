@@ -42,11 +42,15 @@ use crate::error::{KeepError, Result};
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 
+use bincode::Options;
+
 use super::header::{
     HiddenHeader, OuterHeader, DATA_START_OFFSET, HEADER_SIZE, HIDDEN_HEADER_OFFSET,
 };
 
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
+
+const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeType {
@@ -451,7 +455,9 @@ impl HiddenStorage {
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(record)?;
+        let serialized = bincode::options()
+            .with_fixint_encoding()
+            .serialize(record)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
@@ -512,7 +518,12 @@ impl HiddenStorage {
             Ok(d) => d,
             Err(_) => return Ok(Vec::new()),
         };
-        let records: Vec<KeyRecord> = match bincode::deserialize(&decrypted_bytes) {
+        let records: Vec<KeyRecord> = match bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_RECORD_SIZE)
+            .deserialize(&decrypted_bytes)
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -531,7 +542,9 @@ impl HiddenStorage {
         data_key: &SecretKey,
         hidden_header: &HiddenHeader,
     ) -> Result<()> {
-        let serialized = bincode::serialize(records)?;
+        let serialized = bincode::options()
+            .with_fixint_encoding()
+            .serialize(records)?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
@@ -584,7 +597,11 @@ impl HiddenStorage {
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)?;
+            let record: KeyRecord = bincode::options()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_RECORD_SIZE)
+                .deserialize(&decrypted_bytes)?;
 
             records.push(record);
         }

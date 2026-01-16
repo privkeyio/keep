@@ -14,6 +14,8 @@ use crate::bunker::generate_bunker_url;
 use crate::signer::{AuditLog, FrostSigner, NetworkFrostSigner, PermissionManager, SignerHandler};
 use crate::tui::{LogEntry, TuiEvent};
 
+const MAX_EVENT_JSON_SIZE: usize = 64 * 1024;
+
 pub struct Server {
     keys: Keys,
     relay_url: String,
@@ -288,6 +290,10 @@ impl Server {
                     None => return Nip46Response::error(id, "Missing event parameter"),
                 };
 
+                if event_json.len() > MAX_EVENT_JSON_SIZE {
+                    return Nip46Response::error(id, "Event JSON too large");
+                }
+
                 let partial: PartialEvent = match serde_json::from_str(event_json) {
                     Ok(p) => p,
                     Err(e) => return Nip46Response::error(id, &format!("Invalid event: {}", e)),
@@ -308,10 +314,10 @@ impl Server {
                 );
 
                 match handler.handle_sign_event(app_pubkey, unsigned).await {
-                    Ok(event) => {
-                        let json = serde_json::to_string(&event).unwrap();
-                        Nip46Response::ok(id, &json)
-                    }
+                    Ok(event) => match serde_json::to_string(&event) {
+                        Ok(json) => Nip46Response::ok(id, &json),
+                        Err(e) => Nip46Response::error(id, &format!("Serialization failed: {}", e)),
+                    },
                     Err(e) => Nip46Response::error(id, &e.to_string()),
                 }
             }

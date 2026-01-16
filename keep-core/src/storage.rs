@@ -12,8 +12,12 @@ use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 
+use bincode::Options;
+
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 const SHARES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
+
+const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
 const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
@@ -285,7 +289,11 @@ impl Storage {
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
-        Ok(bincode::deserialize(&decrypted_bytes)?)
+        Ok(bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_RECORD_SIZE)
+            .deserialize(&decrypted_bytes)?)
     }
 
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
@@ -304,7 +312,11 @@ impl Storage {
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let record: KeyRecord = bincode::deserialize(&decrypted_bytes)?;
+            let record: KeyRecord = bincode::options()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_RECORD_SIZE)
+                .deserialize(&decrypted_bytes)?;
 
             records.push(record);
         }
@@ -373,7 +385,11 @@ impl Storage {
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
             let decrypted_bytes = decrypted.as_slice()?;
-            let share: StoredShare = bincode::deserialize(&decrypted_bytes)?;
+            let share: StoredShare = bincode::options()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_RECORD_SIZE)
+                .deserialize(&decrypted_bytes)?;
 
             shares.push(share);
         }

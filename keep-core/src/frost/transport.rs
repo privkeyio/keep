@@ -9,6 +9,8 @@ use crate::error::{KeepError, Result};
 use super::share::SharePackage;
 
 const SHARE_HRP: &str = "kshare";
+const MAX_FRAME_COUNT: usize = 100;
+const MAX_ASSEMBLED_SIZE: usize = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
 pub struct ShareExport {
@@ -248,6 +250,10 @@ impl ShareExport {
             return Err(KeepError::Frost("No frames provided".into()));
         }
 
+        if frames.len() > MAX_FRAME_COUNT {
+            return Err(KeepError::Frost("Too many frames".into()));
+        }
+
         if frames.len() == 1 {
             if let Ok(export) = Self::from_json(&frames[0]) {
                 return Ok(export);
@@ -255,6 +261,8 @@ impl ShareExport {
         }
 
         let mut sorted: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut total_size = 0usize;
+        let mut seen_indices = std::collections::HashSet::new();
 
         for frame in frames {
             let parsed: serde_json::Value = serde_json::from_str(frame)
@@ -264,11 +272,28 @@ impl ShareExport {
                 .as_u64()
                 .ok_or_else(|| KeepError::Frost("Missing frame index".into()))?
                 as usize;
+
+            if idx >= MAX_FRAME_COUNT {
+                return Err(KeepError::Frost("Frame index out of range".into()));
+            }
+
+            if !seen_indices.insert(idx) {
+                return Err(KeepError::Frost("Duplicate frame index".into()));
+            }
+
             let data_hex = parsed["d"]
                 .as_str()
                 .ok_or_else(|| KeepError::Frost("Missing frame data".into()))?;
             let data = hex::decode(data_hex)
                 .map_err(|_| KeepError::Frost("Invalid frame data hex".into()))?;
+
+            total_size = total_size
+                .checked_add(data.len())
+                .ok_or_else(|| KeepError::Frost("Total size overflow".into()))?;
+
+            if total_size > MAX_ASSEMBLED_SIZE {
+                return Err(KeepError::Frost("Assembled data too large".into()));
+            }
 
             sorted.push((idx, data));
         }
