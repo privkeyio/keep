@@ -139,7 +139,7 @@ impl SigningSession {
 
     /// Commitments still needed to reach threshold.
     pub fn commitments_needed(&self) -> usize {
-        self.threshold as usize - self.commitments.len()
+        (self.threshold as usize).saturating_sub(self.commitments.len())
     }
 
     /// Generate our signature share (round 2).
@@ -205,7 +205,7 @@ impl SigningSession {
 
     /// Signature shares still needed to reach threshold.
     pub fn shares_needed(&self) -> usize {
-        self.threshold as usize - self.signature_shares.len()
+        (self.threshold as usize).saturating_sub(self.signature_shares.len())
     }
 
     /// The signature bytes, if signing is complete.
