@@ -21,6 +21,19 @@ pub enum KeyType {
 }
 
 /// A Nostr keypair with memory-locked secret key.
+///
+/// # Example
+///
+/// ```
+/// use keep_core::keys::NostrKeypair;
+///
+/// let keypair = NostrKeypair::generate();
+/// println!("npub: {}", keypair.to_npub());
+/// println!("nsec: {}", keypair.to_nsec());
+///
+/// let signature = keypair.sign(b"hello nostr")?;
+/// # Ok::<(), keep_core::error::KeepError>(())
+/// ```
 pub struct NostrKeypair {
     secret_key: MlockedBox<32>,
     public_key: [u8; 32],
@@ -52,6 +65,23 @@ impl NostrKeypair {
     }
 
     /// Create a keypair from a bech32 nsec string.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use keep_core::keys::NostrKeypair;
+    ///
+    /// let keypair = NostrKeypair::generate();
+    /// let nsec = keypair.to_nsec();
+    ///
+    /// let restored = NostrKeypair::from_nsec(&nsec)?;
+    /// assert_eq!(keypair.public_bytes(), restored.public_bytes());
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::InvalidNsec`] if the string is not a valid nsec.
     pub fn from_nsec(nsec: &str) -> Result<Self> {
         let (hrp, data) = bech32::decode(nsec).map_err(|_| KeepError::InvalidNsec)?;
 
@@ -96,6 +126,17 @@ impl NostrKeypair {
     }
 
     /// Sign a message, returning a 64-byte Schnorr signature.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use keep_core::keys::NostrKeypair;
+    ///
+    /// let keypair = NostrKeypair::generate();
+    /// let signature = keypair.sign(b"hello nostr")?;
+    /// assert_eq!(signature.len(), 64);
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
     pub fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         use k256::schnorr::signature::Signer;
 
@@ -173,6 +214,22 @@ impl KeyRecord {
 }
 
 /// Decode an npub to raw bytes.
+///
+/// # Example
+///
+/// ```
+/// use keep_core::keys::{NostrKeypair, npub_to_bytes};
+///
+/// let keypair = NostrKeypair::generate();
+/// let npub = keypair.to_npub();
+/// let bytes = npub_to_bytes(&npub)?;
+/// assert_eq!(&bytes, keypair.public_bytes());
+/// # Ok::<(), keep_core::error::KeepError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`KeepError::InvalidNpub`] if the string is not a valid npub.
 pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
     let (hrp, data) = bech32::decode(npub).map_err(|_| KeepError::InvalidNpub)?;
 
@@ -190,6 +247,16 @@ pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
 }
 
 /// Encode raw bytes as an npub.
+///
+/// # Example
+///
+/// ```
+/// use keep_core::keys::{NostrKeypair, bytes_to_npub};
+///
+/// let keypair = NostrKeypair::generate();
+/// let npub = bytes_to_npub(keypair.public_bytes());
+/// assert!(npub.starts_with("npub1"));
+/// ```
 pub fn bytes_to_npub(pubkey: &[u8; 32]) -> String {
     let hrp = Hrp::parse("npub").unwrap();
     bech32::encode::<Bech32>(hrp, pubkey).unwrap()

@@ -65,6 +65,21 @@ pub struct Keep {
 
 impl Keep {
     /// Create a new Keep with the given password.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use keep_core::Keep;
+    ///
+    /// let keep = Keep::create(Path::new("/tmp/my-keep"), "password")?;
+    /// assert!(keep.is_unlocked());
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::AlreadyExists`] if a Keep already exists at the path.
     pub fn create(path: &Path, password: &str) -> Result<Self> {
         let storage = Storage::create(path, password, Argon2Params::DEFAULT)?;
 
@@ -75,6 +90,21 @@ impl Keep {
     }
 
     /// Open an existing Keep.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use keep_core::Keep;
+    ///
+    /// let mut keep = Keep::open(Path::new("~/.keep"))?;
+    /// keep.unlock("password")?;
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::NotFound`] if no Keep exists at the path.
     pub fn open(path: &Path) -> Result<Self> {
         let storage = Storage::open(path)?;
 
@@ -85,6 +115,11 @@ impl Keep {
     }
 
     /// Unlock with the given password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::InvalidPassword`] if the password is incorrect.
+    /// Returns [`KeepError::RateLimited`] after too many failed attempts.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
         debug!("loading keys to keyring");
@@ -104,6 +139,21 @@ impl Keep {
     }
 
     /// Generate a new Nostr keypair and store it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use keep_core::Keep;
+    /// # let mut keep = Keep::create(Path::new("/tmp/k"), "pw")?;
+    /// let pubkey = keep.generate_key("my-nostr-key")?;
+    /// println!("Created key: {}", hex::encode(pubkey));
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::Locked`] if the Keep is not unlocked.
     pub fn generate_key(&mut self, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -135,6 +185,23 @@ impl Keep {
     }
 
     /// Import an nsec and store it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::path::Path;
+    /// # use keep_core::Keep;
+    /// # let mut keep = Keep::create(Path::new("/tmp/k"), "pw")?;
+    /// let nsec = "nsec1...";
+    /// let pubkey = keep.import_nsec(nsec, "imported-key")?;
+    /// # Ok::<(), keep_core::error::KeepError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeepError::Locked`] if the Keep is not unlocked.
+    /// Returns [`KeepError::InvalidNsec`] if the nsec format is invalid.
+    /// Returns [`KeepError::KeyAlreadyExists`] if the key is already stored.
     pub fn import_nsec(&mut self, nsec: &str, name: &str) -> Result<[u8; 32]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
