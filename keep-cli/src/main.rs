@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 
+use keep_core::crypto::disable_mlock;
 use keep_core::default_keep_path;
 use keep_core::error::Result;
 
@@ -28,6 +29,13 @@ struct Cli {
 
     #[arg(long, global = true)]
     hidden: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable memory locking (accepts degraded security)"
+    )]
+    no_mlock: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -410,6 +418,11 @@ fn main() {
 
 fn run(out: &Output) -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.no_mlock {
+        disable_mlock();
+    }
+
     let path = match cli.path {
         Some(p) => p,
         None => default_keep_path()?,
