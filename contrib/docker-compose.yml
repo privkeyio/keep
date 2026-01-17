@@ -1,0 +1,19 @@
+services:
+  keep:
+    build:
+      context: ..
+      dockerfile: contrib/Dockerfile
+    volumes:
+      - keep-data:/data
+    environment:
+      - KEEP_PATH=/data
+      - RUST_LOG=info
+    env_file:
+      # Copy keep.env.example to keep.env before starting
+      - path: keep.env
+        required: false
+    restart: unless-stopped
+    command: ["serve", "--relay", "wss://nos.lol"]
+
+volumes:
+  keep-data:

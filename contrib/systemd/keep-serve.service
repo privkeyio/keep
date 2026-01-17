@@ -1,0 +1,31 @@
+[Unit]
+Description=Keep NIP-46 Remote Signer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keep
+Group=keep
+ExecStart=/usr/local/bin/keep serve --relay wss://nos.lol
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=-/etc/keep/keep.env
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/keep
+
+[Install]
+WantedBy=multi-user.target
