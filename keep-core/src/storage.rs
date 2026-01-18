@@ -135,6 +135,7 @@ impl Storage {
         Self::create_inner(path, password, params, Box::new(backend))
     }
 
+    /// Create new storage with a custom backend.
     pub fn create_with_backend(
         path: &Path,
         password: &str,
@@ -218,6 +219,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Unlock with the given password using a custom backend.
     pub fn unlock_with_backend(
         &mut self,
         password: &str,

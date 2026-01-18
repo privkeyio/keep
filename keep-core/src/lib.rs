@@ -59,6 +59,7 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 use crate::storage::Storage;
 
+/// The main Keep type for encrypted key management.
 pub struct Keep {
     storage: Storage,
     keyring: Keyring,
@@ -239,6 +240,7 @@ impl Keep {
         self.keyring.get_primary()
     }
 
+    /// List all stored key records.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         self.storage.list_keys()
     }
@@ -463,6 +465,7 @@ impl Keep {
     }
 }
 
+/// Returns the default path to the Keep directory (~/.keep).
 pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".keep"))

@@ -1,3 +1,5 @@
+//! Pluggable storage backends for encrypted key storage.
+
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -8,26 +10,38 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::{KeepError, Result};
 
+/// Table name for key records.
 pub const KEYS_TABLE: &str = "keys";
+/// Table name for FROST shares.
 pub const SHARES_TABLE: &str = "shares";
 
+/// Trait for pluggable storage backends.
+///
+/// Implementations must be thread-safe (`Send + Sync`).
 pub trait StorageBackend: Send + Sync {
+    /// Get a value by key from the specified table.
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// Store a key-value pair in the specified table.
     fn put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()>;
+    /// Delete a key from the specified table. Returns true if the key existed.
     fn delete(&self, table: &str, key: &[u8]) -> Result<bool>;
+    /// List all key-value pairs in the specified table.
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
 }
 
 const KEYS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 const SHARES_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
 
+/// Redb-based storage backend (default).
 pub struct RedbBackend {
     db: Database,
     table_names: RwLock<BTreeMap<String, &'static str>>,
 }
 
 impl RedbBackend {
+    /// Create a new database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
         Ok(Self {
@@ -36,6 +50,7 @@ impl RedbBackend {
         })
     }
 
+    /// Open an existing database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::open(path)?;
         Ok(Self {
@@ -111,11 +126,13 @@ impl StorageBackend for RedbBackend {
 
 type TableData = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// In-memory storage backend for testing.
 pub struct MemoryBackend {
     tables: RwLock<BTreeMap<String, TableData>>,
 }
 
 impl MemoryBackend {
+    /// Create a new in-memory backend.
     pub fn new() -> Self {
         Self {
             tables: RwLock::new(BTreeMap::new()),
