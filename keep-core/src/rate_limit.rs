@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use blake2::digest::consts::U4;
+use blake2::digest::consts::U8;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 use fs2::FileExt;
@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_DELAY_SECS: u64 = 1;
 const MAX_DELAY_SECS: u64 = 300;
-const RECORD_SIZE: usize = 16;
+const RECORD_SIZE: usize = 20;
 
 fn rate_limit_path(storage_path: &Path) -> PathBuf {
     if storage_path.is_dir() {
@@ -42,13 +42,13 @@ pub(crate) fn derive_hmac_key(salt: &[u8; 32]) -> [u8; 32] {
     key
 }
 
-type Blake2bMac32 = Blake2bMac<U4>;
+type Blake2bMac64 = Blake2bMac<U8>;
 
-fn compute_hmac(data: &[u8], key: &[u8; 32]) -> [u8; 4] {
-    let mut mac = <Blake2bMac32 as KeyInit>::new_from_slice(key).expect("valid key length");
+fn compute_hmac(data: &[u8], key: &[u8; 32]) -> [u8; 8] {
+    let mut mac = <Blake2bMac64 as KeyInit>::new_from_slice(key).expect("valid key length");
     mac.update(data);
     let result = mac.finalize();
-    let mut tag = [0u8; 4];
+    let mut tag = [0u8; 8];
     tag.copy_from_slice(&result.into_bytes());
     tag
 }
@@ -78,7 +78,7 @@ impl RateLimitRecord {
         data[0..4].copy_from_slice(&self.failed_attempts.to_le_bytes());
         data[4..12].copy_from_slice(&self.last_failure.to_le_bytes());
         let tag = compute_hmac(&data[0..12], hmac_key);
-        data[12..16].copy_from_slice(&tag);
+        data[12..20].copy_from_slice(&tag);
         data
     }
 
@@ -87,7 +87,7 @@ impl RateLimitRecord {
             return None;
         }
         let tag = compute_hmac(&data[0..12], hmac_key);
-        if !bool::from(data[12..16].ct_eq(&tag)) {
+        if !bool::from(data[12..20].ct_eq(&tag)) {
             return None;
         }
         Some(Self {

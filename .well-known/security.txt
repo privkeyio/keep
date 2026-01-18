@@ -1,0 +1,10 @@
+# Security contact for keep
+# https://securitytxt.org/
+# RFC 9116: https://www.rfc-editor.org/rfc/rfc9116
+
+Contact: mailto:security@privkey.io
+Expires: 2027-01-16T00:00:00.000Z
+Encryption: https://keys.openpgp.org/search?q=E7491A9855C1B9D799B6B491B835270895A80B0B
+Preferred-Languages: en
+
+# PGP Fingerprint: E749 1A98 55C1 B9D7 99B6 B491 B835 2708 95A8 0B0B
