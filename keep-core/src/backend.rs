@@ -4,11 +4,15 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::error::{KeepError, Result};
+
+fn lock_error<T>(_: PoisonError<T>) -> KeepError {
+    KeepError::Other("lock poisoned".into())
+}
 
 /// Table name for key records.
 pub const KEYS_TABLE: &str = "keys";
@@ -37,26 +41,19 @@ const SHARES_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sh
 /// Redb-based storage backend (default).
 pub struct RedbBackend {
     db: Database,
-    table_names: RwLock<BTreeMap<String, &'static str>>,
 }
 
 impl RedbBackend {
     /// Create a new database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
-        Ok(Self {
-            db,
-            table_names: RwLock::new(BTreeMap::new()),
-        })
+        Ok(Self { db })
     }
 
     /// Open an existing database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::open(path)?;
-        Ok(Self {
-            db,
-            table_names: RwLock::new(BTreeMap::new()),
-        })
+        Ok(Self { db })
     }
 
     fn table_def(
@@ -66,16 +63,7 @@ impl RedbBackend {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
-            _ => {
-                let mut cache = self
-                    .table_names
-                    .write()
-                    .map_err(|e| KeepError::Other(e.to_string()))?;
-                let static_name: &'static str = cache
-                    .entry(name.to_string())
-                    .or_insert_with(|| Box::leak(name.to_string().into_boxed_str()));
-                Ok(TableDefinition::new(static_name))
-            }
+            _ => Err(KeepError::Other(format!("unknown table: {}", name))),
         }
     }
 }
@@ -148,19 +136,14 @@ impl Default for MemoryBackend {
 
 impl StorageBackend for MemoryBackend {
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let tables = self
-            .tables
-            .read()
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let tables = self.tables.read().map_err(lock_error)?;
         Ok(tables.get(table).and_then(|t| t.get(key).cloned()))
     }
 
     fn put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut tables = self
-            .tables
+        self.tables
             .write()
-            .map_err(|e| KeepError::Other(e.to_string()))?;
-        tables
+            .map_err(lock_error)?
             .entry(table.to_string())
             .or_default()
             .insert(key.to_vec(), value.to_vec());
@@ -168,10 +151,7 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn delete(&self, table: &str, key: &[u8]) -> Result<bool> {
-        let mut tables = self
-            .tables
-            .write()
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let mut tables = self.tables.write().map_err(lock_error)?;
         Ok(tables
             .get_mut(table)
             .map(|t| t.remove(key).is_some())
@@ -179,10 +159,7 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let tables = self
-            .tables
-            .read()
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let tables = self.tables.read().map_err(lock_error)?;
         Ok(tables
             .get(table)
             .map(|t| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -190,11 +167,11 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn create_table(&self, table: &str) -> Result<()> {
-        let mut tables = self
-            .tables
+        self.tables
             .write()
-            .map_err(|e| KeepError::Other(e.to_string()))?;
-        tables.entry(table.to_string()).or_default();
+            .map_err(lock_error)?
+            .entry(table.to_string())
+            .or_default();
         Ok(())
     }
 }
@@ -205,23 +182,23 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_backend_operations(backend: &dyn StorageBackend) {
-        backend.create_table("test").unwrap();
+        backend.create_table(KEYS_TABLE).unwrap();
 
-        assert!(backend.get("test", b"key1").unwrap().is_none());
+        assert!(backend.get(KEYS_TABLE, b"key1").unwrap().is_none());
 
-        backend.put("test", b"key1", b"value1").unwrap();
+        backend.put(KEYS_TABLE, b"key1", b"value1").unwrap();
         assert_eq!(
-            backend.get("test", b"key1").unwrap(),
+            backend.get(KEYS_TABLE, b"key1").unwrap(),
             Some(b"value1".to_vec())
         );
 
-        backend.put("test", b"key2", b"value2").unwrap();
-        let entries = backend.list("test").unwrap();
+        backend.put(KEYS_TABLE, b"key2", b"value2").unwrap();
+        let entries = backend.list(KEYS_TABLE).unwrap();
         assert_eq!(entries.len(), 2);
 
-        assert!(backend.delete("test", b"key1").unwrap());
-        assert!(backend.get("test", b"key1").unwrap().is_none());
-        assert!(!backend.delete("test", b"key1").unwrap());
+        assert!(backend.delete(KEYS_TABLE, b"key1").unwrap());
+        assert!(backend.get(KEYS_TABLE, b"key1").unwrap().is_none());
+        assert!(!backend.delete(KEYS_TABLE, b"key1").unwrap());
     }
 
     #[test]
@@ -235,5 +212,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = RedbBackend::create(&dir.path().join("test.db")).unwrap();
         test_backend_operations(&backend);
+    }
+
+    #[test]
+    fn test_unknown_table_rejected() {
+        let dir = tempdir().unwrap();
+        let backend = RedbBackend::create(&dir.path().join("test.db")).unwrap();
+        assert!(backend.create_table("unknown").is_err());
     }
 }

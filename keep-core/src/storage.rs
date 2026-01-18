@@ -18,6 +18,13 @@ use bincode::Options;
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
+fn bincode_options() -> impl Options {
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_RECORD_SIZE)
+}
+
 const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 256;
@@ -316,11 +323,7 @@ impl Storage {
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         let decrypted_bytes = decrypted.as_slice()?;
-        Ok(bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .with_limit(MAX_RECORD_SIZE)
-            .deserialize(&decrypted_bytes)?)
+        Ok(bincode_options().deserialize(&decrypted_bytes)?)
     }
 
     /// List all stored key records.
@@ -335,15 +338,8 @@ impl Storage {
         for (_, encrypted_bytes) in entries {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
-
             let decrypted_bytes = decrypted.as_slice()?;
-            let record: KeyRecord = bincode::options()
-                .with_fixint_encoding()
-                .allow_trailing_bytes()
-                .with_limit(MAX_RECORD_SIZE)
-                .deserialize(&decrypted_bytes)?;
-
-            records.push(record);
+            records.push(bincode_options().deserialize(&decrypted_bytes)?);
         }
 
         Ok(records)
@@ -392,15 +388,8 @@ impl Storage {
         for (_, encrypted_bytes) in entries {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
-
             let decrypted_bytes = decrypted.as_slice()?;
-            let share: StoredShare = bincode::options()
-                .with_fixint_encoding()
-                .allow_trailing_bytes()
-                .with_limit(MAX_RECORD_SIZE)
-                .deserialize(&decrypted_bytes)?;
-
-            shares.push(share);
+            shares.push(bincode_options().deserialize(&decrypted_bytes)?);
         }
 
         Ok(shares)
