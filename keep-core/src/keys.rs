@@ -42,13 +42,15 @@ pub struct NostrKeypair {
 impl NostrKeypair {
     /// Generate a new random keypair.
     pub fn generate() -> Self {
-        let mut secret_bytes: [u8; 32] = crypto::random_bytes();
-        let signing_key = SigningKey::from_bytes(&secret_bytes).expect("valid key");
-        let verifying_key = signing_key.verifying_key();
-
-        Self {
-            secret_key: MlockedBox::new(&mut secret_bytes),
-            public_key: verifying_key.to_bytes().into(),
+        loop {
+            let mut secret_bytes: [u8; 32] = crypto::random_bytes();
+            if let Ok(signing_key) = SigningKey::from_bytes(&secret_bytes) {
+                let verifying_key = signing_key.verifying_key();
+                return Self {
+                    secret_key: MlockedBox::new(&mut secret_bytes),
+                    public_key: verifying_key.to_bytes().into(),
+                };
+            }
         }
     }
 

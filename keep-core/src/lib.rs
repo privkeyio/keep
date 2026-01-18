@@ -27,6 +27,8 @@
 
 #![deny(missing_docs)]
 
+/// Pluggable storage backends.
+pub mod backend;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
 /// Error types and result aliases.
@@ -57,7 +59,7 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 use crate::storage::Storage;
 
-/// Main Keep instance for managing encrypted key storage.
+/// The main Keep type for encrypted key management.
 pub struct Keep {
     storage: Storage,
     keyring: Keyring,
@@ -82,7 +84,6 @@ impl Keep {
     /// Returns [`KeepError::AlreadyExists`] if a Keep already exists at the path.
     pub fn create(path: &Path, password: &str) -> Result<Self> {
         let storage = Storage::create(path, password, Argon2Params::DEFAULT)?;
-
         Ok(Self {
             storage,
             keyring: Keyring::new(),
@@ -107,7 +108,6 @@ impl Keep {
     /// Returns [`KeepError::NotFound`] if no Keep exists at the path.
     pub fn open(path: &Path) -> Result<Self> {
         let storage = Storage::open(path)?;
-
         Ok(Self {
             storage,
             keyring: Keyring::new(),
@@ -123,8 +123,7 @@ impl Keep {
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
         debug!("loading keys to keyring");
-        self.load_keys_to_keyring()?;
-        Ok(())
+        self.load_keys_to_keyring()
     }
 
     /// Lock and clear all keys from memory.
@@ -361,9 +360,7 @@ impl Keep {
         let share = export.to_share(passphrase, &format!("imported-{}", export.identifier))?;
         let data_key = self.get_data_key()?;
         let stored = StoredShare::encrypt(&share, &data_key)?;
-        self.storage.store_share(&stored)?;
-
-        Ok(())
+        self.storage.store_share(&stored)
     }
 
     /// Delete a FROST share.
@@ -468,7 +465,7 @@ impl Keep {
     }
 }
 
-/// Get the default path for Keep storage (~/.keep).
+/// Returns the default path to the Keep directory (~/.keep).
 pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".keep"))
