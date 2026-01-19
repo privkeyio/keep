@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Cryptographic primitives for key derivation, encryption, and hashing.
 //!
 //! This module provides:
@@ -43,25 +46,23 @@ fn warn_once() {
     }
 }
 
-/// Attempt to mlock memory, returning true if locked.
-/// Returns false without attempting if mlock is globally disabled.
-/// Warns once on first failure.
 #[allow(unsafe_code)]
 fn try_mlock(ptr: *mut u8, len: usize) -> bool {
     if MLOCK_DISABLED.load(Ordering::SeqCst) {
         return false;
     }
-    let result = unsafe { memsec::mlock(ptr, len) };
-    if !result {
+    let locked = unsafe { memsec::mlock(ptr, len) };
+    if !locked {
         warn_once();
     }
-    result
+    locked
 }
 
 #[allow(unsafe_code)]
 mod mlock {
     use super::try_mlock;
     use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::ptr::NonNull;
     use zeroize::Zeroize;
 
     /// Fixed-size memory-locked byte array.
@@ -69,7 +70,7 @@ mod mlock {
     /// The contents are locked in memory to prevent swapping and
     /// automatically zeroized when dropped.
     pub struct MlockedBox<const N: usize> {
-        ptr: *mut [u8; N],
+        ptr: NonNull<[u8; N]>,
         locked: bool,
     }
 
@@ -80,15 +81,14 @@ mod mlock {
         /// zeroed to prevent secrets from remaining on the stack.
         pub fn new(data: &mut [u8; N]) -> Self {
             let layout = Layout::new::<[u8; N]>();
-            let ptr = unsafe { alloc_zeroed(layout) as *mut [u8; N] };
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
+            let raw_ptr = unsafe { alloc_zeroed(layout) as *mut [u8; N] };
+            let ptr =
+                NonNull::new(raw_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
 
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, N) };
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr() as *mut u8, N) };
             data.zeroize();
 
-            let locked = try_mlock(ptr as *mut u8, N);
+            let locked = try_mlock(ptr.as_ptr() as *mut u8, N);
             Self { ptr, locked }
         }
 
@@ -103,34 +103,43 @@ mod mlock {
         type Target = [u8; N];
 
         fn deref(&self) -> &Self::Target {
-            unsafe { &*self.ptr }
+            // SAFETY: ptr is guaranteed non-null by NonNull and valid by construction
+            unsafe { self.ptr.as_ref() }
         }
     }
 
     impl<const N: usize> std::ops::DerefMut for MlockedBox<N> {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe { &mut *self.ptr }
+            // SAFETY: ptr is guaranteed non-null by NonNull and valid by construction,
+            // and we have exclusive access via &mut self
+            unsafe { self.ptr.as_mut() }
         }
     }
 
     impl<const N: usize> Drop for MlockedBox<N> {
         fn drop(&mut self) {
+            // SAFETY: ptr is guaranteed valid by construction, and we own the allocation
             unsafe {
-                memsec::memzero(self.ptr as *mut u8, N);
+                memsec::memzero(self.ptr.as_ptr() as *mut u8, N);
                 if self.locked {
-                    memsec::munlock(self.ptr as *mut u8, N);
+                    memsec::munlock(self.ptr.as_ptr() as *mut u8, N);
                 }
-                dealloc(self.ptr as *mut u8, Layout::new::<[u8; N]>());
+                dealloc(self.ptr.as_ptr() as *mut u8, Layout::new::<[u8; N]>());
             }
         }
     }
 
     impl<const N: usize> Zeroize for MlockedBox<N> {
         fn zeroize(&mut self) {
-            unsafe { memsec::memzero(self.ptr as *mut u8, N) };
+            // SAFETY: ptr is guaranteed valid by construction
+            unsafe { memsec::memzero(self.ptr.as_ptr() as *mut u8, N) };
         }
     }
 
+    // SAFETY: MlockedBox owns its data exclusively (like Box<T>).
+    // NonNull<T> is covariant over T and the data is heap-allocated.
+    // The type is safe to send/share because it doesn't contain any thread-local
+    // state, and all operations on the inner data require &mut self for mutation.
     unsafe impl<const N: usize> Send for MlockedBox<N> {}
     unsafe impl<const N: usize> Sync for MlockedBox<N> {}
 
@@ -139,7 +148,7 @@ mod mlock {
     /// The contents are locked in memory to prevent swapping and
     /// automatically zeroized when dropped.
     pub struct MlockedVec {
-        ptr: *mut u8,
+        ptr: NonNull<u8>,
         len: usize,
         capacity: usize,
         locked: bool,
@@ -153,10 +162,18 @@ mod mlock {
         pub fn new(mut data: Vec<u8>) -> Self {
             let len = data.len();
             let capacity = data.capacity();
-            let ptr = data.as_mut_ptr();
+            let raw_ptr = data.as_mut_ptr();
             std::mem::forget(data);
 
-            let locked = try_mlock(ptr, capacity);
+            // SAFETY: Vec guarantees a valid, non-null pointer for non-zero capacity.
+            // For zero-capacity Vec, we use NonNull::dangling() which is valid for zero-sized access.
+            let ptr = NonNull::new(raw_ptr).unwrap_or(NonNull::dangling());
+            let locked = if capacity > 0 {
+                try_mlock(ptr.as_ptr(), capacity)
+            } else {
+                false
+            };
+
             Self {
                 ptr,
                 len,
@@ -173,29 +190,40 @@ mod mlock {
 
         /// Returns a slice view of the locked data.
         pub fn as_slice(&self) -> &[u8] {
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            // SAFETY: ptr and len are valid from Vec construction
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
         }
     }
 
     impl Drop for MlockedVec {
         fn drop(&mut self) {
+            if self.capacity == 0 {
+                return;
+            }
+            // SAFETY: ptr is valid and we own the allocation from the original Vec
             unsafe {
-                // Zero the full capacity, not just len, to catch any leftover data
-                memsec::memzero(self.ptr, self.capacity);
+                memsec::memzero(self.ptr.as_ptr(), self.capacity);
                 if self.locked {
-                    memsec::munlock(self.ptr, self.capacity);
+                    memsec::munlock(self.ptr.as_ptr(), self.capacity);
                 }
-                let _ = Vec::from_raw_parts(self.ptr, self.len, self.capacity);
+                let _ = Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.capacity);
             }
         }
     }
 
     impl Zeroize for MlockedVec {
         fn zeroize(&mut self) {
-            unsafe { memsec::memzero(self.ptr, self.capacity) };
+            if self.capacity > 0 {
+                // SAFETY: ptr is valid for capacity bytes
+                unsafe { memsec::memzero(self.ptr.as_ptr(), self.capacity) };
+            }
         }
     }
 
+    // SAFETY: MlockedVec owns its data exclusively (like Vec<T>).
+    // NonNull<u8> is used for the heap allocation which we own.
+    // The type is safe to send/share because it doesn't contain any thread-local
+    // state, and the inner data is only accessed via &self methods.
     unsafe impl Send for MlockedVec {}
     unsafe impl Sync for MlockedVec {}
 }

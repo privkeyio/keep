@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #![forbid(unsafe_code)]
 
 use crate::rate_limit::RateLimiter;
@@ -55,6 +58,7 @@ pub enum PolicyDenyReason {
     TimeRestriction,
     EventKindNotAllowed,
     ExplicitDeny,
+    PolicyDepthExceeded,
 }
 
 impl std::fmt::Display for PolicyDenyReason {
@@ -67,6 +71,7 @@ impl std::fmt::Display for PolicyDenyReason {
             Self::TimeRestriction => write!(f, "time restriction"),
             Self::EventKindNotAllowed => write!(f, "event kind not allowed"),
             Self::ExplicitDeny => write!(f, "policy denies request"),
+            Self::PolicyDepthExceeded => write!(f, "policy nesting depth exceeded"),
         }
     }
 }
@@ -109,23 +114,32 @@ impl PolicyEngine {
 
     fn check_policy(&mut self, policy: &Policy, ctx: &SigningContext<'_>) -> PolicyDecision {
         for rule in &policy.rules {
-            if !self.check_rule(rule, ctx, MAX_POLICY_DEPTH) {
-                return match policy.action {
-                    PolicyAction::Deny => PolicyDecision::Deny(PolicyDenyReason::ExplicitDeny),
-                    PolicyAction::RequireApproval => PolicyDecision::RequireApproval,
-                    PolicyAction::Allow => PolicyDecision::Allow,
-                };
+            match self.check_rule(rule, ctx, MAX_POLICY_DEPTH) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    return match policy.action {
+                        PolicyAction::Deny => PolicyDecision::Deny(PolicyDenyReason::ExplicitDeny),
+                        PolicyAction::RequireApproval => PolicyDecision::RequireApproval,
+                        PolicyAction::Allow => PolicyDecision::Allow,
+                    };
+                }
+                Err(reason) => return PolicyDecision::Deny(reason),
             }
         }
         PolicyDecision::Allow
     }
 
-    fn check_rule(&mut self, rule: &PolicyRule, ctx: &SigningContext<'_>, depth: usize) -> bool {
+    fn check_rule(
+        &mut self,
+        rule: &PolicyRule,
+        ctx: &SigningContext<'_>,
+        depth: usize,
+    ) -> Result<bool, PolicyDenyReason> {
         if depth == 0 {
-            return false;
+            return Err(PolicyDenyReason::PolicyDepthExceeded);
         }
 
-        match rule {
+        let result = match rule {
             PolicyRule::MaxAmountSats(max) => {
                 ctx.amount_sats.map(|a| a <= *max).unwrap_or(true)
             }
@@ -156,7 +170,7 @@ impl PolicyEngine {
 
             PolicyRule::AllowedHours { start, end } => {
                 if *start > 23 || *end > 23 {
-                    return false;
+                    return Ok(false);
                 }
                 let hour = ((ctx.timestamp / 3600) % 24) as u8;
                 if start <= end {
@@ -178,13 +192,24 @@ impl PolicyEngine {
             }
 
             PolicyRule::And(rules) => {
-                rules.iter().all(|r| self.check_rule(r, ctx, depth - 1))
+                for r in rules {
+                    if !self.check_rule(r, ctx, depth - 1)? {
+                        return Ok(false);
+                    }
+                }
+                true
             }
 
             PolicyRule::Or(rules) => {
-                rules.iter().any(|r| self.check_rule(r, ctx, depth - 1))
+                for r in rules {
+                    if self.check_rule(r, ctx, depth - 1)? {
+                        return Ok(true);
+                    }
+                }
+                false
             }
-        }
+        };
+        Ok(result)
     }
 
     pub fn record_operation(&mut self, key_id: &str) {

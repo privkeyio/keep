@@ -1,0 +1,94 @@
+version = 1
+SPDX-PackageName = "keep"
+SPDX-PackageSupplier = "PrivKey LLC"
+SPDX-PackageDownloadLocation = "https://github.com/privkeyio/keep"
+
+[[annotations]]
+path = "**.md"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "**.toml"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "Cargo.lock"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ".gitignore"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ".env.example"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "deploy/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-agent-py/**.py"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-agent-ts/**.ts"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-agent-ts/**.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ".github/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "**/Cargo.lock"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-agent-ts/**.js"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-agent-ts/lib/**.js"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-enclave/build/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "keep-enclave/enclaver.yaml"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"

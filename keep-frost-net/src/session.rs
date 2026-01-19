@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -371,7 +374,44 @@ impl NetworkSession {
         })
     }
 
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+    const MAX_PARTICIPANTS: usize = 256;
+    const MAX_COMMITMENTS: usize = 256;
+    const MAX_SIGNATURE_SHARES: usize = 256;
+
     pub fn from_cached_state(cached: CachedSessionState) -> Result<Self> {
+        if cached.message.len() > Self::MAX_MESSAGE_SIZE {
+            return Err(FrostNetError::Session(format!(
+                "Message too large: {} bytes (max {})",
+                cached.message.len(),
+                Self::MAX_MESSAGE_SIZE
+            )));
+        }
+
+        if cached.participants.len() > Self::MAX_PARTICIPANTS {
+            return Err(FrostNetError::Session(format!(
+                "Too many participants: {} (max {})",
+                cached.participants.len(),
+                Self::MAX_PARTICIPANTS
+            )));
+        }
+
+        if cached.commitments.len() > Self::MAX_COMMITMENTS {
+            return Err(FrostNetError::Session(format!(
+                "Too many commitments: {} (max {})",
+                cached.commitments.len(),
+                Self::MAX_COMMITMENTS
+            )));
+        }
+
+        if cached.signature_shares.len() > Self::MAX_SIGNATURE_SHARES {
+            return Err(FrostNetError::Session(format!(
+                "Too many signature shares: {} (max {})",
+                cached.signature_shares.len(),
+                Self::MAX_SIGNATURE_SHARES
+            )));
+        }
+
         let expected_id =
             derive_session_id(&cached.message, &cached.participants, cached.threshold);
         if cached.session_id != expected_id {

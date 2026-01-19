@@ -8,7 +8,6 @@ use std::sync::OnceLock;
 const POOL_SIZE: usize = 128;
 
 static PROCESS_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static ENTROPY_HEALTH_CHECKED: OnceLock<()> = OnceLock::new();
 
 fn hash_to_32(hasher: Blake2b512) -> [u8; 32] {
     let mut output = [0u8; 32];
@@ -24,6 +23,8 @@ fn gather_os_entropy(pool: &mut [u8]) {
 fn is_rdrand_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
+        // SAFETY: __cpuid with leaf 1 is safe on all x86_64 processors.
+        // This instruction queries CPU feature flags and does not modify state.
         let result = unsafe { core::arch::x86_64::__cpuid(1) };
         (result.ecx & (1 << 30)) != 0
     })
@@ -55,6 +56,9 @@ fn rdrand64_with_retry() -> Option<u64> {
     const MAX_RETRIES: u32 = 10;
     let mut val: u64 = 0;
     for _ in 0..MAX_RETRIES {
+        // SAFETY: _rdrand64_step is safe to call when RDRAND is available (checked by caller).
+        // It writes a random value to `val` and returns 1 on success, 0 on underflow.
+        // The instruction does not have side effects beyond writing to the output parameter.
         if unsafe { core::arch::x86_64::_rdrand64_step(&mut val) } == 1 {
             return Some(val);
         }
@@ -140,12 +144,9 @@ fn mix_entropy(sources: &[&[u8]]) -> [u8; 32] {
     hash_to_32(hasher)
 }
 
-fn ensure_entropy_health() {
-    ENTROPY_HEALTH_CHECKED.get_or_init(|| {
-        if check_entropy_health_internal().is_err() {
-            panic!("RNG health check failed: constant or zero output detected");
-        }
-    });
+fn ensure_entropy_health() -> Result<(), EntropyHealthError> {
+    static HEALTH_RESULT: OnceLock<Result<(), EntropyHealthError>> = OnceLock::new();
+    *HEALTH_RESULT.get_or_init(check_entropy_health_internal)
 }
 
 /// Generates 32 bytes of mixed entropy from multiple sources.
@@ -158,11 +159,10 @@ fn ensure_entropy_health() {
 ///
 /// All sources are mixed through BLAKE2b-512, truncated to 32 bytes.
 ///
-/// # Panics
-/// Panics on first use if RNG health check fails.
-pub fn random_bytes_mixed() -> [u8; 32] {
-    ensure_entropy_health();
-    random_bytes_mixed_internal()
+/// Returns an error if the RNG health check fails.
+pub fn random_bytes_mixed() -> Result<[u8; 32], EntropyHealthError> {
+    ensure_entropy_health()?;
+    Ok(random_bytes_mixed_internal())
 }
 
 fn random_bytes_mixed_internal() -> [u8; 32] {
@@ -187,16 +187,15 @@ fn random_bytes_mixed_internal() -> [u8; 32] {
 /// For requests <= 32 bytes, returns a truncated output from `random_bytes_mixed()`.
 /// For larger requests, generates multiple 32-byte blocks with unique counters.
 ///
-/// # Panics
-/// Panics on first use if RNG health check fails.
-pub fn random_bytes<const N: usize>() -> [u8; N] {
-    ensure_entropy_health();
+/// Returns an error if the RNG health check fails.
+pub fn try_random_bytes<const N: usize>() -> Result<[u8; N], EntropyHealthError> {
+    ensure_entropy_health()?;
 
     let mut output = [0u8; N];
 
     if N <= 32 {
         output.copy_from_slice(&random_bytes_mixed_internal()[..N]);
-        return output;
+        return Ok(output);
     }
 
     for (counter, chunk) in output.chunks_mut(32).enumerate() {
@@ -207,11 +206,22 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
         chunk.copy_from_slice(&hasher.finalize()[..chunk.len()]);
     }
 
-    output
+    Ok(output)
+}
+
+/// Generates N bytes of mixed entropy.
+///
+/// For requests <= 32 bytes, returns a truncated output from `random_bytes_mixed()`.
+/// For larger requests, generates multiple 32-byte blocks with unique counters.
+///
+/// # Panics
+/// Panics if the RNG health check fails (use `try_random_bytes` to handle errors).
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    try_random_bytes().expect("RNG health check failed: constant or zero output detected")
 }
 
 /// Error returned when RNG health check fails.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EntropyHealthError;
 
 impl std::fmt::Display for EntropyHealthError {
@@ -289,15 +299,15 @@ mod tests {
 
     #[test]
     fn test_random_bytes_mixed_produces_output() {
-        let bytes = random_bytes_mixed();
+        let bytes = random_bytes_mixed().unwrap();
         assert!(!bytes.iter().all(|&b| b == 0));
     }
 
     #[test]
     fn test_random_bytes_mixed_different_each_call() {
-        let b1 = random_bytes_mixed();
-        let b2 = random_bytes_mixed();
-        let b3 = random_bytes_mixed();
+        let b1 = random_bytes_mixed().unwrap();
+        let b2 = random_bytes_mixed().unwrap();
+        let b3 = random_bytes_mixed().unwrap();
         assert_ne!(b1, b2);
         assert_ne!(b2, b3);
         assert_ne!(b1, b3);
