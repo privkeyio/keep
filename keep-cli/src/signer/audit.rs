@@ -11,6 +11,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AuditAction {
@@ -130,8 +131,15 @@ impl AuditLog {
 
     pub fn log(&mut self, entry: AuditEntry) {
         if let Some(ref mut file) = self.file {
-            if let Ok(json) = serde_json::to_string(&entry) {
-                let _ = writeln!(file, "{}", json);
+            let result = serde_json::to_string(&entry)
+                .map_err(|e| ("Failed to serialize audit log entry", e.to_string()))
+                .and_then(|json| {
+                    writeln!(file, "{}", json)
+                        .map_err(|e| ("Failed to write audit log entry to file", e.to_string()))
+                });
+
+            if let Err((msg, e)) = result {
+                warn!(error = %e, action = %entry.action, "{}", msg);
             }
         }
 

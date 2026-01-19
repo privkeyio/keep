@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ pub trait NonceStore: Send + Sync {
     fn record(&self, session_id: &[u8; 32]) -> Result<()>;
     fn is_consumed(&self, session_id: &[u8; 32]) -> bool;
     fn count(&self) -> usize;
+    fn prune_if_needed(&self) {}
 }
 
 pub struct FileNonceStore {
@@ -127,14 +128,24 @@ impl NonceStore for FileNonceStore {
     }
 }
 
+const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
 pub struct MemoryNonceStore {
     consumed: Arc<RwLock<HashSet<[u8; 32]>>>,
+    insertion_order: Arc<RwLock<VecDeque<[u8; 32]>>>,
+    max_entries: usize,
 }
 
 impl MemoryNonceStore {
     pub fn new() -> Self {
+        Self::with_max_entries(DEFAULT_MAX_ENTRIES)
+    }
+
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             consumed: Arc::new(RwLock::new(HashSet::new())),
+            insertion_order: Arc::new(RwLock::new(VecDeque::new())),
+            max_entries,
         }
     }
 }
@@ -147,7 +158,13 @@ impl Default for MemoryNonceStore {
 
 impl NonceStore for MemoryNonceStore {
     fn record(&self, session_id: &[u8; 32]) -> Result<()> {
-        self.consumed.write().insert(*session_id);
+        {
+            let mut consumed = self.consumed.write();
+            if consumed.insert(*session_id) {
+                self.insertion_order.write().push_back(*session_id);
+            }
+        }
+        self.prune_if_needed();
         Ok(())
     }
 
@@ -157,6 +174,19 @@ impl NonceStore for MemoryNonceStore {
 
     fn count(&self) -> usize {
         self.consumed.read().len()
+    }
+
+    fn prune_if_needed(&self) {
+        let mut consumed = self.consumed.write();
+        let mut order = self.insertion_order.write();
+
+        while consumed.len() > self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                consumed.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 }
 
