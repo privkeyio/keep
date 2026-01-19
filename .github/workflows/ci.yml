@@ -46,7 +46,10 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - run: cargo build --release
-      - run: cargo test
+      - run: cargo test --workspace --lib --bins
+      - run: cargo test -p keep-core --test integration_tests
+      - run: cargo test -p keep-frost-net --test multinode_test
+      - run: cargo test -p keep-enclave-host --test integration_tests
 
   msrv:
     runs-on: ubuntu-latest
