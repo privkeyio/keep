@@ -25,7 +25,7 @@ Self-custodial key management for Nostr and Bitcoin.
 cargo install --path keep-cli
 ```
 
-Requires Rust 1.83+ (MSRV).
+Requires Rust 1.85+ (MSRV).
 
 **From source:**
 
@@ -443,7 +443,7 @@ RUST_LOG=debug cargo run --bin keep -- <command>
 
 ### MSRV Policy
 
-Minimum Supported Rust Version is **1.83**. MSRV changes are considered breaking and will be noted in release notes.
+Minimum Supported Rust Version is **1.85**. MSRV changes are considered breaking and will be noted in release notes.
 
 ---
 

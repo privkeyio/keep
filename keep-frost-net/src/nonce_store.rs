@@ -174,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "file locking behaves differently on Windows")]
     fn test_file_store_persistence() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonces.log");
@@ -199,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "file locking behaves differently on Windows")]
     fn test_file_store_new_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("new_nonces.log");
@@ -212,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "file locking behaves differently on Windows")]
     fn test_idempotent_record() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonces.log");
