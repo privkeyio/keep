@@ -15,9 +15,9 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
 };
 use memsecurity::EncryptedMem;
-use rand::RngCore;
 use zeroize::Zeroize;
 
+use crate::entropy;
 use crate::error::{KeepError, Result};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -295,8 +295,7 @@ impl SecretKey {
 
     /// Generate a new random encryption key.
     pub fn generate() -> Result<Self> {
-        let mut bytes = [0u8; KEY_SIZE];
-        rand::rng().fill_bytes(&mut bytes);
+        let bytes: [u8; KEY_SIZE] = entropy::random_bytes();
         Self::new(bytes)
     }
 
@@ -410,8 +409,7 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     let decrypted = key.decrypt()?;
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted));
 
-    let mut nonce = [0u8; NONCE_SIZE];
-    rand::rng().fill_bytes(&mut nonce);
+    let nonce: [u8; NONCE_SIZE] = entropy::random_bytes();
     let nonce_ga = GenericArray::from_slice(&nonce);
 
     let ciphertext = cipher
@@ -447,9 +445,7 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 
 /// Generate cryptographically secure random bytes.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes
+    entropy::random_bytes()
 }
 
 #[cfg(test)]

@@ -31,6 +31,8 @@
 pub mod backend;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
+/// Multi-source entropy mixing for defense-in-depth randomness.
+pub mod entropy;
 /// Error types and result aliases.
 pub mod error;
 /// FROST threshold signature implementation.
