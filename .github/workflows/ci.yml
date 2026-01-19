@@ -5,19 +5,79 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 0 * * 0"
 
 jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  lint:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true && github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy -- -D warnings
+
   build:
+    runs-on: ${{ matrix.os }}
+    if: github.event.pull_request.draft != true && github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+      - name: Install Xcode tools (macOS)
+        if: matrix.os == 'macos-latest'
+        run: xcode-select --install || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo build --release
+      - run: cargo test
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets
+
+  reproducible:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft != true
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-      - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo build --release
-      - run: cargo test
+      - name: Build twice and compare
+        run: |
+          docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
+          docker build --no-cache -f Dockerfile.reproducible -o type=local,dest=./dist2 .
+          HASH1=$(sha256sum dist1/keep | cut -d' ' -f1)
+          HASH2=$(sha256sum dist2/keep | cut -d' ' -f1)
+          echo "Build 1: $HASH1"
+          echo "Build 2: $HASH2"
+          if [ "$HASH1" != "$HASH2" ]; then
+            echo "Reproducibility check failed"
+            exit 1
+          fi
+          echo "Reproducible build verified"
