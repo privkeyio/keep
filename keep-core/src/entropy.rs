@@ -157,6 +157,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     output
 }
 
+/// Error returned when RNG health check fails.
 #[derive(Debug)]
 pub struct EntropyHealthError;
 
