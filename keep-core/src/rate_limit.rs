@@ -34,7 +34,7 @@ pub(crate) fn derive_hmac_key(salt: &[u8; 32]) -> [u8; 32] {
     use blake2::{Blake2b, Digest};
     type Blake2b256 = Blake2b<U32>;
     let mut hasher = Blake2b256::new();
-    hasher.update(b"keep-rate-limit-hmac-key");
+    hasher.update(b"keep.privkey.io/v1/rate-limit/hmac-key-derivation");
     hasher.update(salt);
     let result = hasher.finalize();
     let mut key = [0u8; 32];

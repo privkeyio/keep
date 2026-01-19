@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fs2::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -30,7 +31,12 @@ impl FileNonceStore {
             let file = File::open(path).map_err(|e| {
                 FrostNetError::Session(format!("Failed to open nonce store: {}", e))
             })?;
-            let reader = BufReader::new(file);
+
+            file.lock_exclusive().map_err(|e| {
+                FrostNetError::Session(format!("Failed to lock nonce store: {}", e))
+            })?;
+
+            let reader = BufReader::new(&file);
 
             let mut guard = consumed.write();
             for line in reader.lines() {
@@ -56,6 +62,10 @@ impl FileNonceStore {
                 guard.insert(session_id);
             }
             debug!(count = guard.len(), path = ?path, "Loaded consumed session IDs");
+
+            FileExt::unlock(&file).map_err(|e| {
+                FrostNetError::Session(format!("Failed to unlock nonce store: {}", e))
+            })?;
         }
 
         Ok(Self {
@@ -67,7 +77,6 @@ impl FileNonceStore {
 
 impl NonceStore for FileNonceStore {
     fn record(&self, session_id: &[u8; 32]) -> Result<()> {
-        // Use write lock for entire operation to prevent TOCTOU race
         let mut guard = self.consumed.write();
         if guard.contains(session_id) {
             return Ok(());
@@ -79,12 +88,25 @@ impl NonceStore for FileNonceStore {
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {}", e)))?;
 
+        file.lock_exclusive()
+            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {}", e)))?;
+
         let hex_id = hex::encode(session_id);
-        writeln!(file, "{}", hex_id).map_err(|e| {
+        let write_result = writeln!(file, "{}", hex_id);
+        let sync_result = if write_result.is_ok() {
+            file.sync_all()
+        } else {
+            Ok(())
+        };
+
+        FileExt::unlock(&file)
+            .map_err(|e| FrostNetError::Session(format!("Failed to unlock nonce store: {}", e)))?;
+
+        write_result.map_err(|e| {
             FrostNetError::Session(format!("Failed to write to nonce store: {}", e))
         })?;
 
-        file.sync_all()
+        sync_result
             .map_err(|e| FrostNetError::Session(format!("Failed to sync nonce store: {}", e)))?;
 
         guard.insert(*session_id);

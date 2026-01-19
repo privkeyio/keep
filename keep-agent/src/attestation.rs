@@ -3,6 +3,7 @@
 use crate::error::{AgentError, Result};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 #[derive(Clone, Debug)]
 pub struct ExpectedPcrs {
@@ -214,7 +215,7 @@ fn verify_pcr(pcrs: &HashMap<u32, Vec<u8>>, index: u32, expected: &[u8; 48]) -> 
         });
     }
 
-    if actual.as_slice() != expected {
+    if !bool::from(actual.as_slice().ct_eq(expected)) {
         return Err(AgentError::PcrMismatch {
             pcr: index,
             expected: hex::encode(expected),
