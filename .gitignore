@@ -1,4 +1,5 @@
 /target
+fuzz/target/
 keep-enclave/enclave/target/
 keep-agent-py/target/
 keep-agent-ts/target/

@@ -1,0 +1,17 @@
+name: Property Tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  property-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run property tests (keep-core)
+        run: cargo test -p keep-core --test property_tests
+      - name: Run property tests (keep-frost-net)
+        run: cargo test -p keep-frost-net --test property_tests

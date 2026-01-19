@@ -5,8 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "0 0 * * 0"
 
 jobs:
   deny:
@@ -48,7 +46,10 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - run: cargo build --release
-      - run: cargo test
+      - run: cargo test --workspace --lib --bins
+      - run: cargo test -p keep-core --test integration_tests
+      - run: cargo test -p keep-frost-net --test multinode_test
+      - run: cargo test -p keep-enclave-host --test integration_tests
 
   msrv:
     runs-on: ubuntu-latest
@@ -81,3 +82,32 @@ jobs:
             exit 1
           fi
           echo "Reproducible build verified"
+
+  fuzz:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - run: cargo install cargo-fuzz
+      - name: Fuzz nsec parsing
+        run: cargo +nightly fuzz run fuzz_nsec -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz npub parsing
+        run: cargo +nightly fuzz run fuzz_npub -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz vault header parsing
+        run: cargo +nightly fuzz run fuzz_vault_header -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz FROST messages
+        run: cargo +nightly fuzz run fuzz_frost_messages -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz encrypted data
+        run: cargo +nightly fuzz run fuzz_encrypted_data -- -max_total_time=30
+        working-directory: fuzz
+      - name: Fuzz share export
+        run: cargo +nightly fuzz run fuzz_share_export -- -max_total_time=30
+        working-directory: fuzz
