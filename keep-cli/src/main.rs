@@ -847,10 +847,11 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             out.field("Config file", &path.display().to_string());
             out.field("Exists", &path.exists().to_string());
             out.newline();
-            out.field(
-                "vault_path",
-                &cfg.vault_path().unwrap_or_default().display().to_string(),
-            );
+            let vault_path_str = match cfg.vault_path() {
+                Ok(p) => p.display().to_string(),
+                Err(e) => format!("(error: {})", e),
+            };
+            out.field("vault_path", &vault_path_str);
             out.field("argon2_profile", &cfg.argon2_profile.to_string());
             out.field("log_level", &cfg.log_level.to_string());
             let relays = if cfg.relays.is_empty() {
