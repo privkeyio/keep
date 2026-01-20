@@ -423,9 +423,15 @@ fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
 fn secure_delete(path: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {
         if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
-            let zeros = vec![0u8; metadata.len() as usize];
+            const CHUNK: usize = 8 * 1024;
+            let zeros = [0u8; CHUNK];
+            let mut remaining = metadata.len();
             file.seek(SeekFrom::Start(0))?;
-            file.write_all(&zeros)?;
+            while remaining > 0 {
+                let to_write = std::cmp::min(CHUNK as u64, remaining) as usize;
+                file.write_all(&zeros[..to_write])?;
+                remaining -= to_write as u64;
+            }
             file.sync_all()?;
         }
     }
@@ -481,7 +487,7 @@ impl Storage {
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
 
-        let _lock = acquire_rotation_lock(&self.path)?;
+        let lock = acquire_rotation_lock(&self.path)?;
 
         fs::copy(&header_path, &backup_path)?;
 
@@ -490,10 +496,13 @@ impl Storage {
         self.header = new_header;
 
         self.lock();
+
+        drop(lock);
+
         if let Err(e) = self.unlock(new_password) {
             self.header = old_header;
-            fs::copy(&backup_path, &header_path)?;
-            self.unlock(old_password)?;
+            let _ = fs::copy(&backup_path, &header_path);
+            let _ = self.unlock(old_password);
             let _ = secure_delete(&backup_path);
             return Err(KeepError::RotationFailed(format!(
                 "verification failed: {}",
@@ -535,40 +544,50 @@ impl Storage {
         let db_path = self.path.join("keep.db");
         let db_backup_path = self.path.join("keep.db.backup");
 
-        let _lock = acquire_rotation_lock(&self.path)?;
+        let lock = acquire_rotation_lock(&self.path)?;
 
         fs::copy(&header_path, &backup_path)?;
         fs::copy(&db_path, &db_backup_path)?;
 
-        let keys = self.list_keys()?;
-        let shares = self.list_shares()?;
-        let key_count = keys.len();
-        let share_count = shares.len();
+        let result = (|| -> Result<()> {
+            let keys = self.list_keys()?;
+            let shares = self.list_shares()?;
+            let key_count = keys.len();
+            let share_count = shares.len();
 
-        let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
-        let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
+            let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
+            let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
 
-        let new_data_key = SecretKey::generate()?;
-        self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
+            let new_data_key = SecretKey::generate()?;
+            self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
 
-        let new_header = self.encrypt_data_key_in_header(password, &new_data_key)?;
-        write_header_atomically(&self.path, &new_header)?;
+            let new_header = self.encrypt_data_key_in_header(password, &new_data_key)?;
+            write_header_atomically(&self.path, &new_header)?;
 
-        self.header = new_header;
-        self.data_key = Some(new_data_key);
+            self.header = new_header;
+            self.data_key = Some(new_data_key);
 
-        let verified_keys = self.list_keys()?.len();
-        let verified_shares = self.list_shares()?.len();
-        if verified_keys != key_count || verified_shares != share_count {
+            let verified_keys = self.list_keys()?.len();
+            let verified_shares = self.list_shares()?.len();
+            if verified_keys != key_count || verified_shares != share_count {
+                return Err(KeepError::RotationFailed("integrity check failed".into()));
+            }
+
+            Ok(())
+        })();
+
+        drop(lock);
+
+        if let Err(e) = result {
             self.header = old_header;
             self.data_key = Some(old_data_key);
             self.lock();
-            fs::copy(&backup_path, &header_path)?;
-            fs::copy(&db_backup_path, &db_path)?;
-            self.unlock(password)?;
+            let _ = fs::copy(&backup_path, &header_path);
+            let _ = fs::copy(&db_backup_path, &db_path);
+            let _ = self.unlock(password);
             let _ = secure_delete(&backup_path);
             let _ = secure_delete(&db_backup_path);
-            return Err(KeepError::RotationFailed("integrity check failed".into()));
+            return Err(e);
         }
 
         let _ = secure_delete(&backup_path);

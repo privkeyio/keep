@@ -598,6 +598,13 @@ fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
 pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
     debug!("rotating password");
 
+    if is_hidden_vault(path) {
+        return Err(KeepError::Other(
+            "Password rotation is not supported for hidden vaults. Use the outer vault instead."
+                .into(),
+        ));
+    }
+
     let mut keep = Keep::open(path)?;
     let old_password = get_password("Enter current password")?;
     let new_password = get_password_with_confirm("Enter new password", "Confirm new password")?;
@@ -626,6 +633,13 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
 
 pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
     debug!("rotating data key");
+
+    if is_hidden_vault(path) {
+        return Err(KeepError::Other(
+            "Data key rotation is not supported for hidden vaults. Use the outer vault instead."
+                .into(),
+        ));
+    }
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
