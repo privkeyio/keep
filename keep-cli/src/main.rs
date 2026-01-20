@@ -196,7 +196,7 @@ enum FrostNetworkCommands {
         index: u8,
         #[arg(short, long, default_value = "wss://nos.lol")]
         relay: String,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: String,
     },
     Sign {
@@ -208,7 +208,7 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: Option<String>,
         #[arg(
             long,
@@ -239,7 +239,7 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: Option<String>,
     },
     GroupCreate {
@@ -309,6 +309,14 @@ enum FrostHardwareCommands {
         session_id: String,
         #[arg(long)]
         commitments: String,
+    },
+    Export {
+        #[arg(short, long)]
+        device: String,
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -652,6 +660,16 @@ fn dispatch_frost_hardware(
             &group,
             &session_id,
             &commitments,
+        ),
+        FrostHardwareCommands::Export {
+            device,
+            group,
+            output,
+        } => commands::frost_hardware::cmd_frost_hardware_export(
+            out,
+            &device,
+            &group,
+            output.as_deref(),
         ),
     }
 }

@@ -12,7 +12,7 @@ use keep_core::Keep;
 use crate::output::Output;
 use crate::signer::HardwareSigner;
 
-use super::{get_confirm, get_password};
+use super::{get_confirm, get_password, get_password_with_confirm};
 
 pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     out.newline();
@@ -227,5 +227,88 @@ pub fn cmd_frost_hardware_sign(
     out.field("Share index", &index.to_string());
     out.field("Signature share", &hex::encode(&sig_share));
     out.success("Round 2 complete");
+    Ok(())
+}
+
+pub fn cmd_frost_hardware_export(
+    out: &Output,
+    device: &str,
+    group_npub: &str,
+    output_file: Option<&str>,
+) -> Result<()> {
+    use std::io::Write;
+
+    out.newline();
+    out.header("Hardware Share Export");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.newline();
+
+    out.warn("This exports your encrypted share for backup purposes.");
+    out.warn("The passphrase you enter will be used to encrypt the export.");
+    out.newline();
+
+    if !get_confirm("Export share from hardware?")? {
+        out.info("Cancelled");
+        return Ok(());
+    }
+
+    let passphrase = get_password_with_confirm(
+        "Enter export passphrase (min 8 chars)",
+        "Confirm passphrase",
+    )?;
+    if passphrase.expose_secret().len() < 8 {
+        return Err(KeepError::Other(
+            "Passphrase must be at least 8 characters".into(),
+        ));
+    }
+
+    let spinner = out.spinner("Connecting...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Exporting share...");
+    let exported = signer
+        .export_share(group_npub, passphrase.expose_secret())
+        .map_err(|e| KeepError::Other(format!("Export failed: {}", e)))?;
+    spinner.finish();
+
+    let json_str = serde_json::to_string_pretty(&exported)
+        .map_err(|e| KeepError::Other(format!("Failed to serialize JSON: {}", e)))?;
+
+    if let Some(path) = output_file {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
+            file.write_all(json_str.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::File::create(path)
+                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
+            file.write_all(json_str.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        }
+        out.newline();
+        out.field("Share index", &exported.share_index.to_string());
+        out.field(
+            "Threshold",
+            &format!("{}-of-{}", exported.threshold, exported.participants),
+        );
+        out.success(&format!("Share exported to {}", path));
+    } else {
+        println!("{}", json_str);
+    }
+
     Ok(())
 }
