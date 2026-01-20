@@ -30,6 +30,7 @@
 
 #![deny(missing_docs)]
 
+/// Tamper-evident audit logging with hash chain integrity.
 pub mod audit;
 /// Pluggable storage backends.
 pub mod backend;

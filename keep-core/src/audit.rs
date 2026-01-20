@@ -1,3 +1,8 @@
+//! Tamper-evident audit logging with hash chain integrity.
+//!
+//! This module provides encrypted audit logging with cryptographic integrity guarantees.
+//! Each entry links to the previous via a hash chain, making tampering detectable.
+
 #![forbid(unsafe_code)]
 
 use std::fs::{File, OpenOptions};
@@ -10,26 +15,46 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{self, SecretKey};
 use crate::error::{KeepError, Result};
 
+/// Type of audit event being logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditEventType {
+    /// A new key was generated.
     KeyGenerate,
+    /// A key was imported.
     KeyImport,
+    /// A key was exported.
     KeyExport,
+    /// A key was deleted.
     KeyDelete,
+    /// A signing operation succeeded.
     Sign,
+    /// A signing operation failed.
     SignFailed,
+    /// A new FROST key was generated.
     FrostGenerate,
+    /// An existing key was split into FROST shares.
     FrostSplit,
+    /// A FROST signing operation succeeded.
     FrostSign,
+    /// A FROST signing operation failed.
     FrostSignFailed,
+    /// A FROST signing session was started.
     FrostSessionStart,
+    /// A FROST signing session completed successfully.
     FrostSessionComplete,
+    /// A FROST signing session failed.
     FrostSessionFailed,
+    /// A FROST share was imported.
     FrostShareImport,
+    /// A FROST share was exported.
     FrostShareExport,
+    /// A FROST share was deleted.
     FrostShareDelete,
+    /// Authentication failed.
     AuthFailed,
+    /// The vault was unlocked.
     VaultUnlock,
+    /// The vault was locked.
     VaultLock,
 }
 
@@ -59,23 +84,37 @@ impl std::fmt::Display for AuditEventType {
     }
 }
 
+/// A single audit log entry with hash chain linkage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
+    /// Unix timestamp when the event occurred.
     pub timestamp: i64,
+    /// Type of event.
     pub event_type: AuditEventType,
+    /// Public key involved, if applicable.
     pub pubkey: Option<String>,
+    /// Key type (e.g., "nostr"), if applicable.
     pub key_type: Option<String>,
+    /// Hash of the message being signed, if applicable.
     pub message_hash: Option<String>,
+    /// FROST group public key, if applicable.
     pub group_pubkey: Option<String>,
+    /// FROST participant identifiers, if applicable.
     pub participants: Option<Vec<u16>>,
+    /// FROST threshold, if applicable.
     pub threshold: Option<u16>,
+    /// Whether the operation succeeded.
     pub success: bool,
+    /// Reason for failure, if applicable.
     pub reason: Option<String>,
+    /// Hash of the previous entry in the chain.
     pub prev_hash: [u8; 32],
+    /// Hash of this entry.
     pub hash: [u8; 32],
 }
 
 impl AuditEntry {
+    /// Create a new audit entry with the given event type and previous hash.
     pub fn new(event_type: AuditEventType, prev_hash: [u8; 32]) -> Self {
         Self {
             timestamp: chrono::Utc::now().timestamp(),
@@ -93,46 +132,55 @@ impl AuditEntry {
         }
     }
 
+    /// Set the public key for this entry.
     pub fn with_pubkey(mut self, pubkey: &[u8; 32]) -> Self {
         self.pubkey = Some(hex::encode(pubkey));
         self
     }
 
+    /// Set the key type for this entry.
     pub fn with_key_type(mut self, key_type: &str) -> Self {
         self.key_type = Some(key_type.to_string());
         self
     }
 
+    /// Set the message hash for this entry.
     pub fn with_message_hash(mut self, message: &[u8]) -> Self {
         self.message_hash = Some(hex::encode(crypto::blake2b_256(message)));
         self
     }
 
+    /// Set the FROST group public key for this entry.
     pub fn with_group(mut self, group_pubkey: &[u8; 32]) -> Self {
         self.group_pubkey = Some(hex::encode(group_pubkey));
         self
     }
 
+    /// Set the FROST participant identifiers for this entry.
     pub fn with_participants(mut self, participants: Vec<u16>) -> Self {
         self.participants = Some(participants);
         self
     }
 
+    /// Set the FROST threshold for this entry.
     pub fn with_threshold(mut self, threshold: u16) -> Self {
         self.threshold = Some(threshold);
         self
     }
 
+    /// Set whether the operation succeeded.
     pub fn with_success(mut self, success: bool) -> Self {
         self.success = success;
         self
     }
 
+    /// Set the failure reason for this entry.
     pub fn with_reason(mut self, reason: &str) -> Self {
         self.reason = Some(reason.to_string());
         self
     }
 
+    /// Compute and set the hash for this entry.
     pub fn finalize(mut self) -> Self {
         self.hash = self.compute_hash();
         self
@@ -170,6 +218,7 @@ impl AuditEntry {
         crypto::blake2b_256(&data)
     }
 
+    /// Verify this entry's hash chain linkage.
     pub fn verify(&self, prev_hash: &[u8; 32]) -> bool {
         if self.prev_hash != *prev_hash {
             return false;
@@ -178,9 +227,12 @@ impl AuditEntry {
     }
 }
 
+/// Policy for automatic audit log retention.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RetentionPolicy {
+    /// Maximum number of entries to keep.
     pub max_entries: Option<usize>,
+    /// Maximum age of entries in days.
     pub max_age_days: Option<u32>,
 }
 
@@ -193,6 +245,7 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Encrypted audit log with hash chain integrity.
 pub struct AuditLog {
     path: PathBuf,
     last_hash: [u8; 32],
@@ -200,6 +253,7 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    /// Open or create an audit log at the given path.
     pub fn open(path: &Path, data_key: &SecretKey) -> Result<Self> {
         let audit_path = path.join("audit.log");
         let last_hash = if audit_path.exists() {
@@ -215,10 +269,12 @@ impl AuditLog {
         })
     }
 
+    /// Set the retention policy for this log.
     pub fn set_retention(&mut self, policy: RetentionPolicy) {
         self.retention = policy;
     }
 
+    /// Log an audit entry.
     pub fn log(&mut self, entry: AuditEntry, data_key: &SecretKey) -> Result<()> {
         let mut entry = entry;
         entry.prev_hash = self.last_hash;
@@ -240,6 +296,7 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Read all entries from the log.
     pub fn read_all(&self, data_key: &SecretKey) -> Result<Vec<AuditEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -267,6 +324,7 @@ impl AuditLog {
         Ok(entries)
     }
 
+    /// Verify the integrity of the hash chain.
     pub fn verify_chain(&self, data_key: &SecretKey) -> Result<bool> {
         let entries = self.read_all(data_key)?;
         let mut prev_hash = [0u8; 32];
@@ -281,6 +339,7 @@ impl AuditLog {
         Ok(true)
     }
 
+    /// Apply the retention policy and return the number of entries removed.
     pub fn apply_retention(&mut self, data_key: &SecretKey) -> Result<usize> {
         let entries = self.read_all(data_key)?;
         let original_count = entries.len();
@@ -306,6 +365,7 @@ impl AuditLog {
         Ok(removed)
     }
 
+    /// Export the log as JSON.
     pub fn export(&self, data_key: &SecretKey) -> Result<String> {
         let entries = self.read_all(data_key)?;
         serde_json::to_string_pretty(&entries)
@@ -372,6 +432,7 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Get the hash of the last entry in the chain.
     pub fn last_hash(&self) -> [u8; 32] {
         self.last_hash
     }
