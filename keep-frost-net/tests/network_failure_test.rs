@@ -44,13 +44,10 @@ impl DropAfterNInjector {
 
 impl FaultInjector for DropAfterNInjector {
     fn should_inject(&self, msg_type: &str, _from: u16, _to: u16) -> Option<FaultType> {
-        if msg_type == self.target_msg_type {
-            let current = self.count.fetch_add(1, Ordering::SeqCst);
-            if current >= self.threshold {
-                return Some(FaultType::Drop);
-            }
+        if msg_type != self.target_msg_type {
+            return None;
         }
-        None
+        (self.count.fetch_add(1, Ordering::SeqCst) >= self.threshold).then_some(FaultType::Drop)
     }
 
     fn reset(&self) {
@@ -58,18 +55,10 @@ impl FaultInjector for DropAfterNInjector {
     }
 }
 
+#[derive(Default)]
 struct PartitionInjector {
     partitioned_nodes: RwLock<Vec<u16>>,
     active: AtomicBool,
-}
-
-impl Default for PartitionInjector {
-    fn default() -> Self {
-        Self {
-            partitioned_nodes: RwLock::new(Vec::new()),
-            active: AtomicBool::new(false),
-        }
-    }
 }
 
 impl PartitionInjector {
@@ -94,13 +83,7 @@ impl FaultInjector for PartitionInjector {
             return None;
         }
         let partitioned = self.partitioned_nodes.read();
-        let from_partitioned = partitioned.contains(&from);
-        let to_partitioned = partitioned.contains(&to);
-        if from_partitioned != to_partitioned {
-            Some(FaultType::Drop)
-        } else {
-            None
-        }
+        (partitioned.contains(&from) != partitioned.contains(&to)).then_some(FaultType::Drop)
     }
 
     fn reset(&self) {
@@ -132,21 +115,13 @@ impl ReorderInjector {
     }
 
     fn flush(&self) -> Vec<(String, u16, u16)> {
-        let mut buffer = self.buffer.write();
-        let mut result: Vec<_> = buffer.drain(..).collect();
-        result.reverse();
-        result
+        self.buffer.write().drain(..).rev().collect()
     }
 }
 
 impl FaultInjector for ReorderInjector {
     fn should_inject(&self, _msg_type: &str, _from: u16, _to: u16) -> Option<FaultType> {
-        let buffer = self.buffer.read();
-        if buffer.len() >= self.buffer_size {
-            Some(FaultType::Reorder)
-        } else {
-            None
-        }
+        (self.buffer.read().len() >= self.buffer_size).then_some(FaultType::Reorder)
     }
 
     fn reset(&self) {
@@ -154,6 +129,7 @@ impl FaultInjector for ReorderInjector {
     }
 }
 
+// TEST ONLY: Real keys must never be generated from predictable byte patterns
 fn generate_test_commitment(index: u16) -> SigningCommitments {
     let secret = frost_secp256k1_tr::keys::SigningShare::deserialize(&[index as u8; 32]).unwrap();
     frost_secp256k1_tr::round1::commit(&secret, &mut OsRng).1
@@ -187,11 +163,11 @@ fn test_message_reordering_shares_before_commitments_complete() {
     let commit1 = generate_test_commitment(1);
     session.add_commitment(1, commit1).unwrap();
 
+    // Deserialization accepts any bytes; validation occurs at aggregation time
     let fake_share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
 
-    let result = session.add_signature_share(2, fake_share);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Not accepting"));
+    let err = session.add_signature_share(2, fake_share).unwrap_err();
+    assert!(err.to_string().contains("Not accepting"));
 }
 
 #[test]
@@ -241,9 +217,8 @@ fn test_duplicate_commitment_rejected() {
     session.add_commitment(1, commit1).unwrap();
 
     let commit1_dup = generate_test_commitment(1);
-    let result = session.add_commitment(1, commit1_dup);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Duplicate"));
+    let err = session.add_commitment(1, commit1_dup).unwrap_err();
+    assert!(err.to_string().contains("Duplicate"));
 }
 
 #[test]
@@ -259,13 +234,13 @@ fn test_duplicate_signature_share_rejected() {
     session.add_commitment(1, commit1).unwrap();
     session.add_commitment(2, commit2).unwrap();
 
+    // Deserialization accepts any bytes; validation occurs at aggregation time
     let share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     session.add_signature_share(1, share).unwrap();
 
     let share_dup = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
-    let result = session.add_signature_share(1, share_dup);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Duplicate"));
+    let err = session.add_signature_share(1, share_dup).unwrap_err();
+    assert!(err.to_string().contains("Duplicate"));
 }
 
 #[test]
@@ -345,12 +320,8 @@ fn test_malicious_commitment_from_non_participant() {
     let mut session = NetworkSession::new(session_id, message, threshold, participants);
 
     let malicious_commit = generate_test_commitment(99);
-    let result = session.add_commitment(99, malicious_commit);
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("not a participant"));
+    let err = session.add_commitment(99, malicious_commit).unwrap_err();
+    assert!(err.to_string().contains("not a participant"));
 }
 
 #[test]
@@ -366,14 +337,11 @@ fn test_malicious_share_from_non_participant() {
     session.add_commitment(1, commit1).unwrap();
     session.add_commitment(2, commit2).unwrap();
 
+    // Deserialization accepts any bytes; validation occurs at aggregation time
     let malicious_share =
         frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
-    let result = session.add_signature_share(99, malicious_share);
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("not a participant"));
+    let err = session.add_signature_share(99, malicious_share).unwrap_err();
+    assert!(err.to_string().contains("not a participant"));
 }
 
 #[test]
@@ -385,9 +353,8 @@ fn test_invalid_share_index_zero() {
     let mut session = NetworkSession::new(session_id, message, threshold, participants);
 
     let commit = generate_test_commitment(1);
-    let result = session.add_commitment(0, commit);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("non-zero"));
+    let err = session.add_commitment(0, commit).unwrap_err();
+    assert!(err.to_string().contains("non-zero"));
 }
 
 #[test]
@@ -591,6 +558,7 @@ fn test_session_state_machine_integrity() {
 
     assert_eq!(session.state(), SessionState::AwaitingCommitments);
 
+    // Deserialization accepts any bytes; validation occurs at aggregation time
     let share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     assert!(session.add_signature_share(1, share).is_err());
 
