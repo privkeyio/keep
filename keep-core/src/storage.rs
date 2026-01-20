@@ -496,9 +496,10 @@ fn acquire_rotation_lock(path: &Path) -> Result<File> {
     Ok(lock_file)
 }
 
-fn cleanup_rotation_lock(path: &Path) {
-    let lock_path = path.join(".rotation.lock");
-    let _ = fs::remove_file(lock_path);
+fn cleanup_rotation_lock(_path: &Path) {
+    // No-op: we intentionally leave the lock file in place to avoid a race
+    // condition between drop(lock) and remove_file that could allow concurrent
+    // rotations. The file lock held by the lock object is sufficient.
 }
 
 fn write_header_atomically(path: &Path, header: &Header) -> Result<()> {
