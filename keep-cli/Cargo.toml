@@ -55,6 +55,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 anyhow = "1.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
+
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
 
