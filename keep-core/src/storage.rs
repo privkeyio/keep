@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
-use tracing::{debug, trace};
+use subtle::ConstantTimeEq;
+use tracing::{debug, trace, warn};
 
 use crate::backend::{RedbBackend, StorageBackend, KEYS_TABLE, SHARES_TABLE};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
@@ -557,7 +558,7 @@ impl Storage {
         };
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
-        if decrypted_bytes != expected_data_key {
+        if !bool::from(decrypted_bytes.ct_eq(expected_data_key)) {
             return Err(KeepError::DecryptionFailed);
         }
         Ok(())
@@ -638,8 +639,12 @@ impl Storage {
             self.backend = RedbBackend::open(&db_path)
                 .ok()
                 .map(|b| Box::new(b) as Box<dyn StorageBackend>);
-            let _ = secure_delete(&backup_path);
-            let _ = secure_delete(&db_backup_path);
+            if let Err(e) = secure_delete(&backup_path) {
+                warn!(path = %backup_path.display(), error = %e, "failed to securely delete backup file after rotation failure");
+            }
+            if let Err(e) = secure_delete(&db_backup_path) {
+                warn!(path = %db_backup_path.display(), error = %e, "failed to securely delete database backup after rotation failure");
+            }
             drop(lock);
             return Err(e);
         }
