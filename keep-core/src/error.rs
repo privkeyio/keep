@@ -70,6 +70,10 @@ pub enum KeepError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// Key rotation operation failed.
+    #[error("Rotation failed: {0}")]
+    RotationFailed(String),
+
     /// Serialization or deserialization failed.
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
