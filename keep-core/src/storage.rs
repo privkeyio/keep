@@ -483,6 +483,7 @@ impl Storage {
         }
 
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let data_key_bytes = data_key.decrypt()?;
         let old_header = self.header.clone();
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
@@ -491,14 +492,11 @@ impl Storage {
 
         let new_header = self.create_header_with_key(new_password, data_key)?;
         write_header_atomically(&self.path, &new_header)?;
-        self.header = new_header;
+        self.header = new_header.clone();
 
-        self.lock();
-
-        if let Err(e) = self.unlock(new_password) {
+        if let Err(e) = self.verify_header_decryption(&new_header, new_password, &*data_key_bytes) {
             self.header = old_header;
             let _ = fs::copy(&backup_path, &header_path);
-            let _ = self.unlock(old_password);
             let _ = secure_delete(&backup_path);
             drop(lock);
             return Err(KeepError::RotationFailed(format!(
@@ -509,6 +507,27 @@ impl Storage {
 
         let _ = secure_delete(&backup_path);
         drop(lock);
+        Ok(())
+    }
+
+    fn verify_header_decryption(
+        &self,
+        header: &Header,
+        password: &str,
+        expected_data_key: &[u8],
+    ) -> Result<()> {
+        let master_key =
+            crypto::derive_key(password.as_bytes(), &header.salt, header.argon2_params())?;
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
+        let encrypted = EncryptedData {
+            nonce: header.nonce,
+            ciphertext: header.encrypted_data_key.to_vec(),
+        };
+        let decrypted = crypto::decrypt(&encrypted, &header_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        if decrypted_bytes != expected_data_key {
+            return Err(KeepError::DecryptionFailed);
+        }
         Ok(())
     }
 
@@ -544,18 +563,22 @@ impl Storage {
         let db_path = self.path.join("keep.db");
         let db_backup_path = self.path.join("keep.db.backup");
 
+        let keys = self.list_keys()?;
+        let shares = self.list_shares()?;
+        let key_count = keys.len();
+        let share_count = shares.len();
+
+        let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
+        let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
+
+        self.backend = None;
+
         fs::copy(&header_path, &backup_path)?;
         fs::copy(&db_path, &db_backup_path)?;
 
+        self.backend = Some(Box::new(RedbBackend::open(&db_path)?));
+
         let result = (|| -> Result<()> {
-            let keys = self.list_keys()?;
-            let shares = self.list_shares()?;
-            let key_count = keys.len();
-            let share_count = shares.len();
-
-            let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
-            let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
-
             let new_data_key = SecretKey::generate()?;
             self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
 
@@ -575,12 +598,14 @@ impl Storage {
         })();
 
         if let Err(e) = result {
+            self.backend = None;
             self.header = old_header;
             self.data_key = Some(old_data_key);
-            self.lock();
             let _ = fs::copy(&backup_path, &header_path);
             let _ = fs::copy(&db_backup_path, &db_path);
-            let _ = self.unlock(password);
+            self.backend = RedbBackend::open(&db_path)
+                .ok()
+                .map(|b| Box::new(b) as Box<dyn StorageBackend>);
             let _ = secure_delete(&backup_path);
             let _ = secure_delete(&db_backup_path);
             drop(lock);
