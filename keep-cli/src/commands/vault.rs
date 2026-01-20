@@ -8,13 +8,17 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
+use keep_core::crypto::Argon2Params;
 use keep_core::error::{KeepError, Result};
 use keep_core::keys::bytes_to_npub;
 use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::{get_confirm, get_password, get_password_with_confirm, is_hidden_vault};
+use super::{
+    get_confirm, get_hidden_password, get_nsec, get_password, get_password_with_confirm,
+    is_hidden_vault,
+};
 
 pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
     if hidden {
@@ -75,6 +79,11 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
 
     info!(size_mb, hidden, "creating keep");
 
+    #[cfg(feature = "testing")]
+    let params = Argon2Params::TESTING;
+    #[cfg(not(feature = "testing"))]
+    let params = Argon2Params::DEFAULT;
+
     if hidden {
         keep_core::hidden::HiddenStorage::create(
             path,
@@ -82,9 +91,10 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
             hidden_password.as_ref().map(|s| s.expose_secret()),
             total_size,
             0.2,
+            params,
         )?;
     } else {
-        Keep::create(path, outer_password.expose_secret())?;
+        Keep::create_with_params(path, outer_password.expose_secret(), params)?;
     }
 
     spinner.finish();
@@ -179,7 +189,7 @@ fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     debug!(name, "generating key in hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password")?;
+    let password = get_hidden_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -227,7 +237,7 @@ pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let pubkey = keep.import_nsec(nsec.expose_secret(), name)?;
@@ -258,7 +268,7 @@ fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
@@ -293,13 +303,13 @@ fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     debug!(name, "importing key to hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password")?;
+    let password = get_hidden_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
 
-    let nsec = get_password("Enter nsec")?;
+    let nsec = get_nsec("Enter nsec")?;
 
     let spinner = out.spinner("Importing key...");
     let keypair = NostrKeypair::from_nsec(nsec.expose_secret())?;
@@ -421,7 +431,7 @@ fn cmd_list_hidden(out: &Output, path: &Path) -> Result<()> {
     debug!("listing keys in hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password")?;
+    let password = get_hidden_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -545,7 +555,7 @@ fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     debug!(name, "exporting key from hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password")?;
+    let password = get_hidden_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
@@ -660,7 +670,7 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     debug!(name, "deleting key from hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter HIDDEN password")?;
+    let password = get_hidden_password("Enter HIDDEN password")?;
 
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;

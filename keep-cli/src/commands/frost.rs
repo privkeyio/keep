@@ -343,13 +343,13 @@ pub fn cmd_frost_sign(
     out: &Output,
     path: &Path,
     message_hex: &str,
-    group_npub: &str,
+    group_id: &str,
     interactive: bool,
     warden_url: Option<&str>,
 ) -> Result<()> {
     debug!(
         message = message_hex,
-        group = group_npub,
+        group = group_id,
         interactive,
         "FROST signing"
     );
@@ -361,7 +361,7 @@ pub fn cmd_frost_sign(
     if let Some(url) = warden_url {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
-        rt.block_on(check_warden_policy(out, url, group_npub, message_hex))?;
+        rt.block_on(check_warden_policy(out, url, group_id, message_hex))?;
     }
 
     #[cfg(not(feature = "warden"))]
@@ -378,9 +378,21 @@ pub fn cmd_frost_sign(
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
-
     let shares = keep.frost_list_shares()?;
+
+    // Try to parse as npub first, otherwise look up by group name
+    let group_pubkey = if group_id.starts_with("npub1") {
+        keep_core::keys::npub_to_bytes(group_id)?
+    } else {
+        // Look up by group name
+        let share = shares
+            .iter()
+            .find(|s| s.metadata.name == group_id)
+            .ok_or_else(|| {
+                KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
+            })?;
+        share.metadata.group_pubkey
+    };
     let our_shares: Vec<_> = shares
         .iter()
         .filter(|s| s.metadata.group_pubkey == group_pubkey)
@@ -389,7 +401,7 @@ pub fn cmd_frost_sign(
     if our_shares.is_empty() {
         return Err(KeepError::KeyNotFound(format!(
             "No shares found for group {}",
-            group_npub
+            group_id
         )));
     }
 

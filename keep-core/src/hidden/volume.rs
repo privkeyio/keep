@@ -109,6 +109,7 @@ impl HiddenStorage {
         hidden_password: Option<&str>,
         total_size: u64,
         hidden_ratio: f32,
+        params: Argon2Params,
     ) -> Result<Self> {
         if path.exists() {
             return Err(KeepError::AlreadyExists(path.display().to_string()));
@@ -147,14 +148,11 @@ impl HiddenStorage {
 
         let outer_size = total_size - DATA_START_OFFSET - hidden_size;
 
-        let mut outer_header = OuterHeader::new(Argon2Params::DEFAULT, outer_size, total_size);
+        let mut outer_header = OuterHeader::new(params, outer_size, total_size);
 
         let outer_data_key = SecretKey::generate()?;
-        let outer_master_key = crypto::derive_key(
-            outer_password.as_bytes(),
-            &outer_header.salt,
-            Argon2Params::DEFAULT,
-        )?;
+        let outer_master_key =
+            crypto::derive_key(outer_password.as_bytes(), &outer_header.salt, params)?;
         let outer_header_key = crypto::derive_subkey(&outer_master_key, b"keep-outer-header")?;
 
         let outer_key_bytes = outer_data_key.decrypt()?;
@@ -171,8 +169,7 @@ impl HiddenStorage {
 
                 let hidden_data_key = SecretKey::generate()?;
                 let kdf_salt = derive_hidden_salt(&outer_header.salt, hp);
-                let hidden_master_key =
-                    crypto::derive_key(hp.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
+                let hidden_master_key = crypto::derive_key(hp.as_bytes(), &kdf_salt, params)?;
 
                 let hidden_header_key =
                     crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
@@ -321,7 +318,11 @@ impl HiddenStorage {
         file.read_exact(&mut hidden_area)?;
 
         let kdf_salt = derive_hidden_salt(&self.outer_header.salt, password);
-        let master_key = crypto::derive_key(password.as_bytes(), &kdf_salt, Argon2Params::DEFAULT)?;
+        let master_key = crypto::derive_key(
+            password.as_bytes(),
+            &kdf_salt,
+            self.outer_header.argon2_params(),
+        )?;
         let header_enc_key = crypto::derive_subkey(&master_key, b"keep-hidden-header-enc")?;
 
         const ENCRYPTED_HEADER_SIZE: usize = HiddenHeader::COMPACT_SIZE + crypto::TAG_SIZE;
@@ -688,6 +689,7 @@ mod tests {
                 Some("hidden_password"),
                 10 * 1024 * 1024,
                 0.2,
+                Argon2Params::TESTING,
             )
             .unwrap();
 
@@ -708,7 +710,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden2");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         let mut storage = HiddenStorage::open(&path).unwrap();
 
@@ -722,7 +732,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden3");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         {
             let mut storage = HiddenStorage::open(&path).unwrap();
@@ -742,7 +760,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden4");
 
-        HiddenStorage::create(&path, "correct", None, 10 * 1024 * 1024, 0.0).unwrap();
+        HiddenStorage::create(
+            &path,
+            "correct",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         let mut storage = HiddenStorage::open(&path).unwrap();
         let result = storage.unlock("wrong");
@@ -754,8 +780,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden5");
 
-        let storage =
-            HiddenStorage::create(&path, "password", None, 10 * 1024 * 1024, 0.0).unwrap();
+        let storage = HiddenStorage::create(
+            &path,
+            "password",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         let record = KeyRecord::new(
             crypto::random_bytes(),
@@ -780,7 +813,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden6");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         let mut storage = HiddenStorage::open(&path).unwrap();
         storage.unlock_hidden("hidden").unwrap();
@@ -809,9 +850,15 @@ mod tests {
         let path = dir.path().join("test-hidden7");
 
         {
-            let storage =
-                HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2)
-                    .unwrap();
+            let storage = HiddenStorage::create(
+                &path,
+                "outer",
+                Some("hidden"),
+                10 * 1024 * 1024,
+                0.2,
+                Argon2Params::TESTING,
+            )
+            .unwrap();
 
             let outer_key = KeyRecord::new(
                 crypto::random_bytes(),
@@ -854,8 +901,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-sequential");
 
-        let storage =
-            HiddenStorage::create(&path, "password", None, 10 * 1024 * 1024, 0.0).unwrap();
+        let storage = HiddenStorage::create(
+            &path,
+            "password",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         for i in 0..4 {
             let record = KeyRecord::new(
@@ -884,9 +938,15 @@ mod tests {
         let path = dir.path().join("test-isolation-sequential");
 
         {
-            let storage =
-                HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2)
-                    .unwrap();
+            let storage = HiddenStorage::create(
+                &path,
+                "outer",
+                Some("hidden"),
+                10 * 1024 * 1024,
+                0.2,
+                Argon2Params::TESTING,
+            )
+            .unwrap();
 
             for i in 0..3 {
                 let record = KeyRecord::new(
@@ -936,7 +996,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-outer");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         // First 5 attempts - new storage each time to test persistence
         for _ in 0..5 {
@@ -963,7 +1031,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-hidden");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         // First 5 attempts - new storage each time to test persistence
         for _ in 0..5 {
@@ -990,7 +1066,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-combined");
 
-        HiddenStorage::create(&path, "outer", Some("hidden"), 10 * 1024 * 1024, 0.2).unwrap();
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
 
         // First 5 attempts - new storage each time to test persistence
         for _ in 0..5 {
