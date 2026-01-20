@@ -1,4 +1,7 @@
+use std::fs::File;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
 
@@ -10,9 +13,7 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-};
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapFree};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -125,21 +126,6 @@ unsafe fn write_file_owner_only_impl(path: &Path, content: &str) -> std::io::Res
         return Err(std::io::Error::last_os_error());
     }
 
-    let bytes = content.as_bytes();
-    let mut written: u32 = 0;
-    let write_result = WriteFile(
-        file_handle,
-        bytes.as_ptr(),
-        bytes.len() as u32,
-        &mut written,
-        ptr::null_mut(),
-    );
-
-    CloseHandle(file_handle);
-
-    if write_result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
+    let mut file = File::from_raw_handle(file_handle as *mut _);
+    file.write_all(content.as_bytes())
 }
