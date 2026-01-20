@@ -6,7 +6,7 @@
 //! This module provides encrypted storage with an optional hidden volume
 //! that is cryptographically indistinguishable from random data.
 
-mod header;
+pub mod header;
 pub mod volume;
 
 pub use volume::{HiddenStorage, VolumeType};
