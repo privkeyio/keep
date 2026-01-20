@@ -103,7 +103,8 @@ impl SignerHandler {
         let mut audit = self.audit.lock().await;
         audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
-        info!("App connected: {}", &app_pubkey.to_hex()[..8]);
+        let app_id = &app_pubkey.to_hex()[..8];
+        info!(app_id, "app connected");
         Ok(secret)
     }
 
@@ -280,11 +281,9 @@ impl SignerHandler {
             );
         }
 
-        debug!(
-            "Signed event kind:{} id:{}",
-            kind.as_u16(),
-            &signed_event.id.to_hex()[..8]
-        );
+        let event_kind = kind.as_u16();
+        let event_id = &signed_event.id.to_hex()[..8];
+        debug!(event_kind, event_id, "signed event");
         Ok(signed_event)
     }
 
@@ -450,7 +449,7 @@ impl SignerHandler {
                     .unwrap_or(false);
             }
         }
-        info!("Auto-approving {} (headless mode)", method);
+        info!(method, "auto-approving in headless mode");
         true
     }
 }

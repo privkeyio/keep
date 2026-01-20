@@ -142,8 +142,9 @@ impl Server {
         self.keys.public_key()
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
-        info!("Connecting to relay: {}", self.relay_url);
+        info!(relay = %self.relay_url, "connecting to relay");
 
         self.client.connect().await;
 
@@ -158,8 +159,8 @@ impl Server {
 
         self.running = true;
 
-        info!("Listening for NIP-46 requests");
-        info!("Bunker URL: {}", self.bunker_url());
+        let bunker_url = self.bunker_url();
+        info!(bunker_url, "listening for NIP-46 requests");
 
         Ok(())
     }
@@ -191,7 +192,7 @@ impl Server {
                             )
                             .await
                             {
-                                warn!("Error handling NIP-46 event: {}", e);
+                                warn!(error = %e, "error handling NIP-46 event");
                             }
                         }
                     }
@@ -220,7 +221,7 @@ impl Server {
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| KeepError::Other(format!("Parse failed: {}", e)))?;
 
-        debug!("NIP-46 request: {} from {}", request.method, app_id);
+        debug!(method = %request.method, app_id, "NIP-46 request");
 
         let method = request.method.clone();
         let response =
@@ -251,7 +252,7 @@ impl Server {
             .map_err(|e| KeepError::Other(format!("Sign response failed: {}", e)))?;
 
         if let Err(e) = client.send_event(&response_event).await {
-            error!("Failed to send response: {}", e);
+            error!(error = %e, "failed to send response");
         }
 
         Ok(())

@@ -20,6 +20,7 @@ use super::{
     is_hidden_vault,
 };
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result<()> {
     if hidden {
         out.hidden_banner();
@@ -110,6 +111,7 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_generate(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_generate_hidden(out, path, name);
@@ -220,6 +222,7 @@ fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_import_hidden(out, path, name);
@@ -336,6 +339,7 @@ fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_list(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_list_hidden(out, path);
@@ -468,6 +472,7 @@ fn cmd_list_hidden(out: &Output, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_export(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_export_hidden(out, path, name);
@@ -590,6 +595,7 @@ fn cmd_export_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_delete(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
     if hidden {
         return cmd_delete_hidden(out, path, name);

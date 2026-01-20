@@ -15,6 +15,7 @@ use crate::signer::{HardwareSigner, NonceStore};
 
 use super::get_password;
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_network_serve(
     out: &Output,
     path: &Path,
@@ -70,24 +71,19 @@ pub fn cmd_frost_network_serve(
                 match event_rx.recv().await {
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
-                        eprintln!("Peer discovered: Share {} ({})", share_index, name_str);
+                        tracing::info!(share_index, name = name_str, "peer discovered");
                     }
                     Ok(keep_frost_net::KfpNodeEvent::SignatureComplete {
                         session_id,
                         signature,
                     }) => {
-                        eprintln!(
-                            "Signature complete for session {}: {}",
-                            hex::encode(&session_id[..8]),
-                            hex::encode(signature)
-                        );
+                        let session = hex::encode(&session_id[..8]);
+                        let sig = hex::encode(signature);
+                        tracing::info!(session, signature = sig, "signature complete");
                     }
                     Ok(keep_frost_net::KfpNodeEvent::SigningFailed { session_id, error }) => {
-                        eprintln!(
-                            "Signing failed for session {}: {}",
-                            hex::encode(&session_id[..8]),
-                            error
-                        );
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::error!(session, error, "signing failed");
                     }
                     Err(_) => break,
                     _ => {}
@@ -106,6 +102,7 @@ pub fn cmd_frost_network_serve(
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_network_peers(
     out: &Output,
     path: &Path,
@@ -151,7 +148,7 @@ pub fn cmd_frost_network_peers(
             let node = node.clone();
             async move {
                 if let Err(e) = node.run().await {
-                    tracing::error!("FROST node error: {}", e);
+                    tracing::error!(error = %e, "FROST node error");
                 }
             }
         });
@@ -192,6 +189,7 @@ pub fn cmd_frost_network_peers(
     Ok(())
 }
 
+#[tracing::instrument(skip(out, warden_url, message), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_sign(
     out: &Output,
@@ -655,6 +653,7 @@ fn cmd_frost_network_sign_hardware(
     Ok(())
 }
 
+#[tracing::instrument(skip(out))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_sign_event(
     out: &Output,
@@ -672,6 +671,7 @@ pub fn cmd_frost_network_sign_event(
     Err(KeepError::Other("Not implemented".into()))
 }
 
+#[tracing::instrument(skip(out))]
 pub fn cmd_frost_network_dkg(
     out: &Output,
     group: &str,
@@ -1000,6 +1000,7 @@ pub fn cmd_frost_network_dkg(
     Ok(())
 }
 
+#[tracing::instrument(skip(out))]
 pub fn cmd_frost_network_group_create(
     out: &Output,
     name: &str,
@@ -1122,6 +1123,7 @@ pub fn cmd_frost_network_group_create(
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_network_nonce_precommit(
     out: &Output,
     path: &Path,
