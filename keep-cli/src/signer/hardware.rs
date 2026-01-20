@@ -537,7 +537,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_ping_hardware() {
-        let mut signer = HardwareSigner::new("/dev/ttyUSB0").unwrap();
+        let mut signer = HardwareSigner::new("/dev/ttyACM0").unwrap();
         let version = signer.ping().unwrap();
         assert!(!version.is_empty());
     }

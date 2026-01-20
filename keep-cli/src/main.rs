@@ -196,7 +196,7 @@ enum FrostNetworkCommands {
         index: u8,
         #[arg(short, long, default_value = "wss://nos.lol")]
         relay: String,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: String,
     },
     Sign {
@@ -208,7 +208,7 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: Option<String>,
         #[arg(
             long,
@@ -239,7 +239,7 @@ enum FrostNetworkCommands {
         relay: String,
         #[arg(short, long)]
         share: Option<u16>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyUSB0)")]
+        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: Option<String>,
     },
     GroupCreate {

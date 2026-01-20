@@ -177,19 +177,19 @@ Store FROST shares on an air-gapped hardware signer. See [keep-esp32](https://gi
 
 ```bash
 # Test connection
-keep frost hardware ping --device /dev/ttyUSB0
+keep frost hardware ping --device /dev/ttyACM0
 
 # List shares on device
-keep frost hardware list --device /dev/ttyUSB0
+keep frost hardware list --device /dev/ttyACM0
 
 # Import share to hardware
-keep frost hardware import --device /dev/ttyUSB0 --group npub1... --share 1
+keep frost hardware import --device /dev/ttyACM0 --group npub1... --share 1
 
 # Export share from hardware (encrypted backup)
-keep frost hardware export --device /dev/ttyUSB0 --group npub1... --output backup.json
+keep frost hardware export --device /dev/ttyACM0 --group npub1... --output backup.json
 
 # Network sign using hardware
-keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyUSB0
+keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyACM0
 ```
 
 ### Distributed Key Generation (DKG)
@@ -215,7 +215,7 @@ keep frost network dkg \
   --participants 3 \
   --index 1 \
   --relay wss://nos.lol \
-  --hardware /dev/ttyUSB0
+  --hardware /dev/ttyACM0
 
 # Participant 2 (on second device, run simultaneously)
 keep frost network dkg \
@@ -224,7 +224,7 @@ keep frost network dkg \
   --participants 3 \
   --index 2 \
   --relay wss://nos.lol \
-  --hardware /dev/ttyUSB0
+  --hardware /dev/ttyACM0
 
 # Participant 3 (on third device, run simultaneously)
 keep frost network dkg \
@@ -233,7 +233,7 @@ keep frost network dkg \
   --participants 3 \
   --index 3 \
   --relay wss://nos.lol \
-  --hardware /dev/ttyUSB0
+  --hardware /dev/ttyACM0
 ```
 
 All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
