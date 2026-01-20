@@ -51,7 +51,14 @@ clean:
     rm -rf dist dist-verify target
 
 test:
-    cargo test
+    cargo test --workspace --lib --bins
+    cargo test -p keep-core --test integration_tests
+    cargo test -p keep-frost-net --test multinode_test
+    cargo test -p keep-enclave-host --test integration_tests
+
+test-property:
+    cargo test -p keep-core --test property_tests
+    cargo test -p keep-frost-net --test property_tests
 
 fmt:
     cargo fmt

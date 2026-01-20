@@ -236,7 +236,6 @@ pub fn cmd_frost_hardware_export(
     group_npub: &str,
     output_file: Option<&str>,
 ) -> Result<()> {
-    use secrecy::ExposeSecret;
     use std::io::Write;
 
     out.newline();
@@ -275,27 +274,31 @@ pub fn cmd_frost_hardware_export(
         .map_err(|e| KeepError::Other(format!("Export failed: {}", e)))?;
     spinner.finish();
 
-    let export_json = serde_json::json!({
-        "version": exported.version,
-        "group": exported.group,
-        "share_index": exported.share_index,
-        "threshold": exported.threshold,
-        "participants": exported.participants,
-        "group_pubkey": exported.group_pubkey,
-        "encrypted_share": exported.encrypted_share,
-        "nonce": exported.nonce,
-        "salt": exported.salt,
-        "checksum": exported.checksum,
-    });
-
-    let json_str = serde_json::to_string_pretty(&export_json)
+    let json_str = serde_json::to_string_pretty(&exported)
         .map_err(|e| KeepError::Other(format!("Failed to serialize JSON: {}", e)))?;
 
     if let Some(path) = output_file {
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
-        file.write_all(json_str.as_bytes())
-            .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
+            file.write_all(json_str.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::File::create(path)
+                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
+            file.write_all(json_str.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        }
         out.success(&format!("Share exported to {}", path));
     } else {
         out.newline();

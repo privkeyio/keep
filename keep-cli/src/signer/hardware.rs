@@ -471,7 +471,7 @@ pub struct DkgFinalizeResult {
     pub our_index: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExportedShare {
     pub version: u8,
     pub group: String,
