@@ -169,8 +169,7 @@ impl HiddenStorage {
 
                 let hidden_data_key = SecretKey::generate()?;
                 let kdf_salt = derive_hidden_salt(&outer_header.salt, hp);
-                let hidden_master_key =
-                    crypto::derive_key(hp.as_bytes(), &kdf_salt, params)?;
+                let hidden_master_key = crypto::derive_key(hp.as_bytes(), &kdf_salt, params)?;
 
                 let hidden_header_key =
                     crypto::derive_subkey(&hidden_master_key, b"keep-hidden-header")?;
