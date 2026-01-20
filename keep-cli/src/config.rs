@@ -15,11 +15,12 @@ pub enum Argon2Profile {
 
 impl std::fmt::Display for Argon2Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Testing => write!(f, "testing"),
-            Self::Default => write!(f, "default"),
-            Self::High => write!(f, "high"),
-        }
+        let s = match self {
+            Self::Testing => "testing",
+            Self::Default => "default",
+            Self::High => "high",
+        };
+        f.write_str(s)
     }
 }
 
@@ -36,13 +37,14 @@ pub enum LogLevel {
 
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Error => write!(f, "error"),
-            Self::Warn => write!(f, "warn"),
-            Self::Info => write!(f, "info"),
-            Self::Debug => write!(f, "debug"),
-            Self::Trace => write!(f, "trace"),
-        }
+        let s = match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        };
+        f.write_str(s)
     }
 }
 
@@ -81,7 +83,7 @@ where
     Ok(opt)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default, deserialize_with = "deserialize_path")]
@@ -96,18 +98,6 @@ pub struct Config {
     pub timeout: Option<u64>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            vault_path: None,
-            argon2_profile: Argon2Profile::Default,
-            log_level: LogLevel::Info,
-            relays: vec![],
-            timeout: None,
-        }
-    }
-}
-
 impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::default_path()?;
@@ -119,6 +109,17 @@ impl Config {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
+        const MAX_CONFIG_SIZE: u64 = 1024 * 1024; // 1 MB
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            KeepError::Other(format!(
+                "Failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        if metadata.len() > MAX_CONFIG_SIZE {
+            return Err(KeepError::Other("Config file too large".into()));
+        }
         let content = std::fs::read_to_string(path).map_err(|e| {
             KeepError::Other(format!(
                 "Failed to read config file {}: {}",
