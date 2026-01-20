@@ -35,6 +35,22 @@ pub trait StorageBackend: Send + Sync {
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
+    /// Get the current schema version.
+    fn schema_version(&self) -> Result<u32> {
+        Ok(migration::CURRENT_SCHEMA_VERSION)
+    }
+    /// Check if migrations are needed.
+    fn needs_migration(&self) -> Result<bool> {
+        Ok(false)
+    }
+    /// Run pending migrations.
+    fn run_migrations(&self) -> Result<migration::MigrationResult> {
+        Ok(migration::MigrationResult {
+            from_version: migration::CURRENT_SCHEMA_VERSION,
+            to_version: migration::CURRENT_SCHEMA_VERSION,
+            migrations_run: 0,
+        })
+    }
 }
 
 const KEYS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
@@ -96,14 +112,6 @@ impl RedbBackend {
             .unwrap_or_else(|| KeepError::Other("database open failed after retries".into())))
     }
 
-    pub fn schema_version(&self) -> Result<u32> {
-        Ok(migration::read_schema_version(&self.db)?.unwrap_or(1))
-    }
-
-    pub fn needs_migration(&self) -> Result<bool> {
-        migration::needs_migration(&self.db)
-    }
-
     fn table_def(
         &self,
         name: &str,
@@ -157,6 +165,18 @@ impl StorageBackend for RedbBackend {
         wtxn.open_table(self.table_def(table)?)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    fn schema_version(&self) -> Result<u32> {
+        Ok(migration::read_schema_version(&self.db)?.unwrap_or(1))
+    }
+
+    fn needs_migration(&self) -> Result<bool> {
+        migration::needs_migration(&self.db)
+    }
+
+    fn run_migrations(&self) -> Result<migration::MigrationResult> {
+        migration::run_migrations(&self.db)
     }
 }
 

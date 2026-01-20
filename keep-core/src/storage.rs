@@ -372,6 +372,25 @@ impl Storage {
         &self.path
     }
 
+    /// Get the current schema version.
+    pub fn schema_version(&self) -> Result<u32> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.schema_version()
+    }
+
+    /// Check if migrations are needed.
+    pub fn needs_migration(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.needs_migration()
+    }
+
+    /// Run pending migrations.
+    pub fn run_migrations(&self) -> Result<crate::migration::MigrationResult> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.run_migrations()
+    }
+
+    /// Store a FROST share.
     pub fn store_share(&self, share: &StoredShare) -> Result<()> {
         debug!(name = %share.metadata.name, "storing FROST share");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;

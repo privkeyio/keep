@@ -74,7 +74,7 @@ pub enum KeepError {
     #[error("Rotation failed: {0}")]
     RotationFailed(String),
 
-    /// Migration operation failed.
+    /// Schema migration operation failed.
     #[error("Migration error: {0}")]
     Migration(String),
 

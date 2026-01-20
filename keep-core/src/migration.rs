@@ -1,3 +1,5 @@
+//! Database schema versioning and migrations.
+
 #![forbid(unsafe_code)]
 
 use redb::{Database, ReadableTable, TableDefinition};
@@ -9,13 +11,19 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
+/// The current schema version supported by this build.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
+/// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
 
+/// A single migration step.
 pub struct Migration {
+    /// The version this migration upgrades from.
     pub from_version: u32,
+    /// The version this migration upgrades to.
     pub to_version: u32,
+    /// The function that performs the migration.
     pub migrate: MigrationFn,
 }
 
@@ -23,6 +31,7 @@ fn get_migrations() -> Vec<Migration> {
     vec![]
 }
 
+/// Read the schema version from the database.
 pub fn read_schema_version(db: &Database) -> Result<Option<u32>> {
     let rtxn = db.begin_read()?;
 
@@ -44,6 +53,7 @@ pub fn read_schema_version(db: &Database) -> Result<Option<u32>> {
     Ok(Some(u32::from_le_bytes(bytes)))
 }
 
+/// Write the schema version to the database.
 pub fn write_schema_version(db: &Database, version: u32) -> Result<()> {
     let wtxn = db.begin_write()?;
     {
@@ -54,6 +64,7 @@ pub fn write_schema_version(db: &Database, version: u32) -> Result<()> {
     Ok(())
 }
 
+/// Initialize the schema version for a new database.
 pub fn initialize_schema(db: &Database) -> Result<()> {
     let wtxn = db.begin_write()?;
     {
@@ -73,13 +84,18 @@ pub fn initialize_schema(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Result of running migrations.
 #[derive(Debug)]
 pub struct MigrationResult {
+    /// The version before migrations ran.
     pub from_version: u32,
+    /// The version after migrations completed.
     pub to_version: u32,
+    /// The number of migrations that were executed.
     pub migrations_run: u32,
 }
 
+/// Run all pending migrations.
 pub fn run_migrations(db: &Database) -> Result<MigrationResult> {
     let current_version = read_schema_version(db)?.unwrap_or(1);
     let target_version = CURRENT_SCHEMA_VERSION;
@@ -134,6 +150,7 @@ pub fn run_migrations(db: &Database) -> Result<MigrationResult> {
     })
 }
 
+/// Check if the database is compatible with this version of keep.
 pub fn check_compatibility(db: &Database) -> Result<()> {
     let version = read_schema_version(db)?.unwrap_or(1);
 
@@ -147,6 +164,7 @@ pub fn check_compatibility(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Check if migrations are needed.
 pub fn needs_migration(db: &Database) -> Result<bool> {
     let version = read_schema_version(db)?.unwrap_or(1);
     Ok(version < CURRENT_SCHEMA_VERSION)
