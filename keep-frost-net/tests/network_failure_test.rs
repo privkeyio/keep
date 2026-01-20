@@ -340,7 +340,9 @@ fn test_malicious_share_from_non_participant() {
     // Deserialization accepts any bytes; validation occurs at aggregation time
     let malicious_share =
         frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
-    let err = session.add_signature_share(99, malicious_share).unwrap_err();
+    let err = session
+        .add_signature_share(99, malicious_share)
+        .unwrap_err();
     assert!(err.to_string().contains("not a participant"));
 }
 
