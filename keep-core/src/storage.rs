@@ -418,6 +418,10 @@ fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
 }
 
 impl Storage {
+    /// Rotate the vault password.
+    ///
+    /// Re-encrypts the data encryption key with a new password-derived key.
+    /// Creates a backup of the header before rotation and restores it on failure.
     pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
         if !self.is_unlocked() {
             self.unlock(old_password)?;
@@ -466,6 +470,10 @@ impl Storage {
         Ok(header)
     }
 
+    /// Rotate the data encryption key.
+    ///
+    /// Generates a new data encryption key and re-encrypts all stored keys and shares.
+    /// Creates backups of the header and database before rotation and restores them on failure.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
         if !self.is_unlocked() {
             self.unlock(password)?;
