@@ -10,10 +10,11 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
-use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+};
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapFree};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows_sys::Win32::System::IO::WriteFile;
 
 const GENERIC_ALL: u32 = 0x10000000;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
