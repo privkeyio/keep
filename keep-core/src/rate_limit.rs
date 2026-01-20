@@ -148,16 +148,21 @@ pub(crate) fn check_rate_limit(path: &Path, hmac_key: &[u8; 32]) -> Result<(), D
     }
 }
 
+fn open_rate_limit_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 pub(crate) fn record_failure(path: &Path, hmac_key: &[u8; 32]) {
     let rl_path = rate_limit_path(path);
 
-    let Ok(mut file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&rl_path)
-    else {
+    let Ok(mut file) = open_rate_limit_file(&rl_path) else {
         return;
     };
 

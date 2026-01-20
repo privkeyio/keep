@@ -137,14 +137,23 @@ pub struct Storage {
     backend: Option<Box<dyn StorageBackend>>,
 }
 
+fn create_storage_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(KeepError::AlreadyExists(path.display().to_string()));
+    }
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl Storage {
     /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
-        if path.exists() {
-            return Err(KeepError::AlreadyExists(path.display().to_string()));
-        }
-        fs::create_dir_all(path)?;
-
+        create_storage_dir(path)?;
         let backend = RedbBackend::create(&path.join("keep.db"))?;
         Self::create_inner(path, password, params, Box::new(backend))
     }
@@ -156,11 +165,7 @@ impl Storage {
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
     ) -> Result<Self> {
-        if path.exists() {
-            return Err(KeepError::AlreadyExists(path.display().to_string()));
-        }
-        fs::create_dir_all(path)?;
-
+        create_storage_dir(path)?;
         Self::create_inner(path, password, params, backend)
     }
 
@@ -491,6 +496,11 @@ fn acquire_rotation_lock(path: &Path) -> Result<File> {
     Ok(lock_file)
 }
 
+fn cleanup_rotation_lock(path: &Path) {
+    let lock_path = path.join(".rotation.lock");
+    let _ = fs::remove_file(lock_path);
+}
+
 fn write_header_atomically(path: &Path, header: &Header) -> Result<()> {
     let header_path = path.join("keep.hdr");
     let tmp_path = path.join("keep.hdr.tmp");
@@ -529,7 +539,15 @@ impl Storage {
 
         if let Err(e) = self.verify_header_decryption(&new_header, new_password, &*data_key_bytes) {
             self.header = old_header;
-            let _ = copy_with_retry(&backup_path, &header_path);
+            if let Err(restore_err) = copy_with_retry(&backup_path, &header_path) {
+                warn!(error = %restore_err, "failed to restore backup during rollback - vault may be corrupted");
+                let _ = secure_delete(&backup_path);
+                drop(lock);
+                return Err(KeepError::RotationFailed(format!(
+                    "verification failed and backup restoration failed: {} (restore error: {})",
+                    e, restore_err
+                )));
+            }
             let _ = secure_delete(&backup_path);
             drop(lock);
             return Err(KeepError::RotationFailed(format!(
@@ -540,6 +558,7 @@ impl Storage {
 
         let _ = secure_delete(&backup_path);
         drop(lock);
+        cleanup_rotation_lock(&self.path);
         Ok(())
     }
 
@@ -598,18 +617,34 @@ impl Storage {
 
         let keys = self.list_keys()?;
         let shares = self.list_shares()?;
-        let key_count = keys.len();
-        let share_count = shares.len();
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
         let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
 
         self.backend = None;
 
-        copy_with_retry(&header_path, &backup_path)?;
-        copy_with_retry(&db_path, &db_backup_path)?;
+        if let Err(e) = copy_with_retry(&header_path, &backup_path) {
+            self.backend = RedbBackend::open(&db_path)
+                .ok()
+                .map(|b| Box::new(b) as Box<dyn StorageBackend>);
+            return Err(KeepError::Io(e));
+        }
+        if let Err(e) = copy_with_retry(&db_path, &db_backup_path) {
+            self.backend = RedbBackend::open(&db_path)
+                .ok()
+                .map(|b| Box::new(b) as Box<dyn StorageBackend>);
+            return Err(KeepError::Io(e));
+        }
 
-        self.backend = Some(Box::new(RedbBackend::open(&db_path)?));
+        self.backend = Some(Box::new(match RedbBackend::open(&db_path) {
+            Ok(backend) => backend,
+            Err(e) => {
+                self.backend = RedbBackend::open(&db_path)
+                    .ok()
+                    .map(|b| Box::new(b) as Box<dyn StorageBackend>);
+                return Err(e);
+            }
+        }));
 
         let result = (|| -> Result<()> {
             let new_data_key = SecretKey::generate()?;
@@ -621,11 +656,7 @@ impl Storage {
             self.header = new_header;
             self.data_key = Some(new_data_key);
 
-            let verified_keys = self.list_keys()?.len();
-            let verified_shares = self.list_shares()?.len();
-            if verified_keys != key_count || verified_shares != share_count {
-                return Err(KeepError::RotationFailed("integrity check failed".into()));
-            }
+            self.verify_rotation_integrity(&decrypted_keys, &decrypted_shares)?;
 
             Ok(())
         })();
@@ -633,25 +664,38 @@ impl Storage {
         if let Err(e) = result {
             self.backend = None;
             self.header = old_header;
-            self.data_key = Some(old_data_key);
-            let _ = copy_with_retry(&backup_path, &header_path);
-            let _ = copy_with_retry(&db_backup_path, &db_path);
+            self.data_key = Some(old_data_key.clone());
+            let header_err = copy_with_retry(&backup_path, &header_path).err();
+            let db_err = copy_with_retry(&db_backup_path, &db_path).err();
             self.backend = RedbBackend::open(&db_path)
                 .ok()
                 .map(|b| Box::new(b) as Box<dyn StorageBackend>);
-            if let Err(e) = secure_delete(&backup_path) {
-                warn!(path = %backup_path.display(), error = %e, "failed to securely delete backup file after rotation failure");
+            if let Some(ref err) = header_err {
+                warn!(error = %err, "failed to restore header backup during rollback - vault may be corrupted");
             }
-            if let Err(e) = secure_delete(&db_backup_path) {
-                warn!(path = %db_backup_path.display(), error = %e, "failed to securely delete database backup after rotation failure");
+            if let Some(ref err) = db_err {
+                warn!(error = %err, "failed to restore database backup during rollback - vault may be corrupted");
+            }
+            if let Err(err) = secure_delete(&backup_path) {
+                warn!(path = %backup_path.display(), error = %err, "failed to securely delete backup file after rotation failure");
+            }
+            if let Err(err) = secure_delete(&db_backup_path) {
+                warn!(path = %db_backup_path.display(), error = %err, "failed to securely delete database backup after rotation failure");
             }
             drop(lock);
+            if header_err.is_some() || db_err.is_some() {
+                return Err(KeepError::RotationFailed(format!(
+                    "rotation failed and backup restoration failed: {} (header: {:?}, db: {:?})",
+                    e, header_err, db_err
+                )));
+            }
             return Err(e);
         }
 
         let _ = secure_delete(&backup_path);
         let _ = secure_delete(&db_backup_path);
         drop(lock);
+        cleanup_rotation_lock(&self.path);
         Ok(())
     }
 
@@ -712,6 +756,86 @@ impl Storage {
             let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
             let id = share_id(&stored.metadata.group_pubkey, stored.metadata.identifier);
             backend.put(SHARES_TABLE, &id, &record_encrypted.to_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_rotation_integrity(
+        &self,
+        original_keys: &[(KeyRecord, Vec<u8>)],
+        original_shares: &[(StoredShare, Vec<u8>)],
+    ) -> Result<()> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let stored_keys = backend.list(KEYS_TABLE)?;
+        if stored_keys.len() != original_keys.len() {
+            return Err(KeepError::RotationFailed(format!(
+                "key count mismatch: expected {}, found {}",
+                original_keys.len(),
+                stored_keys.len()
+            )));
+        }
+
+        for (original_record, original_secret) in original_keys {
+            let encrypted_bytes =
+                backend
+                    .get(KEYS_TABLE, &original_record.id)?
+                    .ok_or_else(|| {
+                        KeepError::RotationFailed(format!(
+                            "key {} missing after rotation",
+                            hex::encode(original_record.id)
+                        ))
+                    })?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let record: KeyRecord = bincode_options().deserialize(&decrypted_bytes)?;
+            let inner_encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
+            let inner_decrypted = crypto::decrypt(&inner_encrypted, data_key)?;
+            let inner_bytes = inner_decrypted.as_slice()?;
+            if !bool::from(inner_bytes.ct_eq(original_secret.as_slice())) {
+                return Err(KeepError::RotationFailed(format!(
+                    "key {} content mismatch after rotation",
+                    hex::encode(original_record.id)
+                )));
+            }
+        }
+
+        let stored_shares = backend.list(SHARES_TABLE)?;
+        if stored_shares.len() != original_shares.len() {
+            return Err(KeepError::RotationFailed(format!(
+                "share count mismatch: expected {}, found {}",
+                original_shares.len(),
+                stored_shares.len()
+            )));
+        }
+
+        for (original_stored, original_key_package) in original_shares {
+            let id = share_id(
+                &original_stored.metadata.group_pubkey,
+                original_stored.metadata.identifier,
+            );
+            let encrypted_bytes = backend.get(SHARES_TABLE, &id)?.ok_or_else(|| {
+                KeepError::RotationFailed(format!(
+                    "share {} missing after rotation",
+                    original_stored.metadata.identifier
+                ))
+            })?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let stored: StoredShare = bincode_options().deserialize(&decrypted_bytes)?;
+            let inner_encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
+            let inner_decrypted = crypto::decrypt(&inner_encrypted, data_key)?;
+            let inner_bytes = inner_decrypted.as_slice()?;
+            if !bool::from(inner_bytes.ct_eq(original_key_package.as_slice())) {
+                return Err(KeepError::RotationFailed(format!(
+                    "share {} content mismatch after rotation",
+                    original_stored.metadata.identifier
+                )));
+            }
         }
 
         Ok(())
