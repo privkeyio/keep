@@ -591,29 +591,34 @@ impl Keep {
         };
         if let Some(ref mut audit) = self.audit {
             let entry = builder(AuditEntry::new(event_type, audit.last_hash()));
-            let _ = audit.log(entry, &data_key);
+            if let Err(e) = audit.log(entry, &data_key) {
+                tracing::warn!("Failed to write audit log entry for {}: {}", event_type, e);
+            }
         }
     }
 
     /// Read all audit log entries.
     pub fn audit_read_all(&self) -> Result<Vec<AuditEntry>> {
-        let audit = self.audit.as_ref().ok_or(KeepError::Locked)?;
-        let data_key = self.get_data_key()?;
+        let (audit, data_key) = self.audit_with_key()?;
         audit.read_all(&data_key)
     }
 
     /// Verify the integrity of the audit log chain.
     pub fn audit_verify_chain(&self) -> Result<bool> {
-        let audit = self.audit.as_ref().ok_or(KeepError::Locked)?;
-        let data_key = self.get_data_key()?;
+        let (audit, data_key) = self.audit_with_key()?;
         audit.verify_chain(&data_key)
     }
 
     /// Export the audit log as JSON.
     pub fn audit_export(&self) -> Result<String> {
+        let (audit, data_key) = self.audit_with_key()?;
+        audit.export(&data_key)
+    }
+
+    fn audit_with_key(&self) -> Result<(&AuditLog, SecretKey)> {
         let audit = self.audit.as_ref().ok_or(KeepError::Locked)?;
         let data_key = self.get_data_key()?;
-        audit.export(&data_key)
+        Ok((audit, data_key))
     }
 
     /// Set the retention policy for the audit log.

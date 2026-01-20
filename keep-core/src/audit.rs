@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, SecretKey};
 use crate::error::{KeepError, Result};
@@ -220,10 +221,9 @@ impl AuditEntry {
 
     /// Verify this entry's hash chain linkage.
     pub fn verify(&self, prev_hash: &[u8; 32]) -> bool {
-        if self.prev_hash != *prev_hash {
-            return false;
-        }
-        self.hash == self.compute_hash()
+        let prev_hash_match = self.prev_hash.ct_eq(prev_hash);
+        let hash_match = self.hash.ct_eq(&self.compute_hash());
+        (prev_hash_match & hash_match).into()
     }
 }
 
@@ -291,6 +291,7 @@ impl AuditLog {
             .append(true)
             .open(&self.path)?;
         file.write_all(line.as_bytes())?;
+        file.sync_all()?;
 
         self.last_hash = entry.hash;
         Ok(())
@@ -301,27 +302,7 @@ impl AuditLog {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-
-        let file = File::open(&self.path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-
-        for (line_num, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let entry = Self::decrypt_line(&line, data_key).map_err(|e| {
-                KeepError::Other(format!(
-                    "Audit log corrupted or tampered at line {}: {}",
-                    line_num + 1,
-                    e
-                ))
-            })?;
-            entries.push(entry);
-        }
-
-        Ok(entries)
+        Self::read_entries(&self.path, data_key)
     }
 
     /// Verify the integrity of the hash chain.
@@ -373,9 +354,14 @@ impl AuditLog {
     }
 
     fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
+        let entries = Self::read_entries(path, data_key)?;
+        Ok(entries.last().map_or([0u8; 32], |e| e.hash))
+    }
+
+    fn read_entries(path: &Path, data_key: &SecretKey) -> Result<Vec<AuditEntry>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut last_hash = [0u8; 32];
+        let mut entries = Vec::new();
 
         for (line_num, line) in reader.lines().enumerate() {
             let line = line?;
@@ -389,10 +375,10 @@ impl AuditLog {
                     e
                 ))
             })?;
-            last_hash = entry.hash;
+            entries.push(entry);
         }
 
-        Ok(last_hash)
+        Ok(entries)
     }
 
     fn decrypt_line(line: &str, data_key: &SecretKey) -> Result<AuditEntry> {
@@ -402,9 +388,8 @@ impl AuditLog {
 
         let encrypted = crypto::EncryptedData::from_bytes(&bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
-        let decrypted_bytes = decrypted.as_slice()?;
 
-        serde_json::from_slice(&decrypted_bytes)
+        serde_json::from_slice(&decrypted.as_slice()?)
             .map_err(|e| KeepError::Other(format!("Failed to parse audit entry: {e}")))
     }
 
@@ -427,6 +412,7 @@ impl AuditLog {
             prev_hash = entry.hash;
         }
 
+        file.sync_all()?;
         std::fs::rename(&temp_path, &self.path)?;
         self.last_hash = prev_hash;
         Ok(())
