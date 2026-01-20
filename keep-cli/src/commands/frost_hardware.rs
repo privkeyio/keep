@@ -299,18 +299,16 @@ pub fn cmd_frost_hardware_export(
             file.write_all(json_str.as_bytes())
                 .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
         }
+        out.newline();
+        out.field("Share index", &exported.share_index.to_string());
+        out.field(
+            "Threshold",
+            &format!("{}-of-{}", exported.threshold, exported.participants),
+        );
         out.success(&format!("Share exported to {}", path));
     } else {
-        out.newline();
         println!("{}", json_str);
     }
 
-    out.newline();
-    out.field("Share index", &exported.share_index.to_string());
-    out.field(
-        "Threshold",
-        &format!("{}-of-{}", exported.threshold, exported.participants),
-    );
-    out.success("Export complete");
     Ok(())
 }
