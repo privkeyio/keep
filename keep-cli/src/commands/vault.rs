@@ -79,12 +79,10 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
 
     info!(size_mb, hidden, "creating keep");
 
-    let params = if std::env::var("KEEP_TESTING_MODE").is_ok() {
-        debug!("using lightweight Argon2 params (KEEP_TESTING_MODE set)");
-        Argon2Params::TESTING
-    } else {
-        Argon2Params::DEFAULT
-    };
+    #[cfg(feature = "testing")]
+    let params = Argon2Params::TESTING;
+    #[cfg(not(feature = "testing"))]
+    let params = Argon2Params::DEFAULT;
 
     if hidden {
         keep_core::hidden::HiddenStorage::create(

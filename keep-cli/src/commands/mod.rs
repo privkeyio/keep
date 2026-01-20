@@ -64,7 +64,6 @@ pub fn get_confirm(prompt: &str) -> Result<bool> {
         .map_err(|e| KeepError::Other(format!("Failed to read confirmation: {}", e)))
 }
 
-/// Read nsec from KEEP_NSEC env var or interactively
 pub fn get_nsec(prompt: &str) -> Result<SecretString> {
     if let Ok(nsec) = std::env::var("KEEP_NSEC") {
         debug!("using nsec from KEEP_NSEC env var");

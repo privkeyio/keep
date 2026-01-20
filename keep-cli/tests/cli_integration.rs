@@ -36,7 +36,7 @@ macro_rules! require_binary {
         match keep_binary() {
             Some(p) => p,
             None => {
-                eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
+                eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli --features testing)");
                 return;
             }
         }
@@ -52,7 +52,6 @@ impl KeepCmd {
         let mut cmd = Command::new(binary);
         cmd.env("KEEP_PASSWORD", TEST_PASSWORD);
         cmd.env("KEEP_YES", "1");
-        cmd.env("KEEP_TESTING_MODE", "1");
         Self { cmd }
     }
 

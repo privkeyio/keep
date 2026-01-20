@@ -60,6 +60,7 @@ uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
 
 [features]
 default = []
+testing = []
 warden = ["dep:reqwest", "dep:uuid"]
 
 [dev-dependencies]
