@@ -5,6 +5,8 @@ mod bunker;
 mod commands;
 mod output;
 mod panic;
+#[cfg(windows)]
+mod panic_windows;
 mod server;
 mod signer;
 mod tui;
