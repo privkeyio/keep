@@ -229,3 +229,77 @@ pub fn cmd_frost_hardware_sign(
     out.success("Round 2 complete");
     Ok(())
 }
+
+pub fn cmd_frost_hardware_export(
+    out: &Output,
+    device: &str,
+    group_npub: &str,
+    output_file: Option<&str>,
+) -> Result<()> {
+    use secrecy::ExposeSecret;
+    use std::io::Write;
+
+    out.newline();
+    out.header("Hardware Share Export");
+    out.field("Device", device);
+    out.field("Group", group_npub);
+    out.newline();
+
+    out.warn("This exports your encrypted share for backup purposes.");
+    out.warn("The passphrase you enter will be used to encrypt the export.");
+    out.newline();
+
+    if !get_confirm("Export share from hardware?")? {
+        out.info("Cancelled");
+        return Ok(());
+    }
+
+    let passphrase = get_password("Enter export passphrase (min 8 chars)")?;
+    if passphrase.expose_secret().len() < 8 {
+        return Err(KeepError::Other("Passphrase must be at least 8 characters".into()));
+    }
+
+    let spinner = out.spinner("Connecting...");
+    let mut signer = HardwareSigner::new(device)
+        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    spinner.finish();
+
+    let spinner = out.spinner("Exporting share...");
+    let exported = signer
+        .export_share(group_npub, passphrase.expose_secret())
+        .map_err(|e| KeepError::Other(format!("Export failed: {}", e)))?;
+    spinner.finish();
+
+    let export_json = serde_json::json!({
+        "version": exported.version,
+        "group": exported.group,
+        "share_index": exported.share_index,
+        "threshold": exported.threshold,
+        "participants": exported.participants,
+        "group_pubkey": exported.group_pubkey,
+        "encrypted_share": exported.encrypted_share,
+        "nonce": exported.nonce,
+        "salt": exported.salt,
+        "checksum": exported.checksum,
+    });
+
+    if let Some(path) = output_file {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
+        file.write_all(serde_json::to_string_pretty(&export_json).unwrap().as_bytes())
+            .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+        out.success(&format!("Share exported to {}", path));
+    } else {
+        out.newline();
+        println!("{}", serde_json::to_string_pretty(&export_json).unwrap());
+    }
+
+    out.newline();
+    out.field("Share index", &exported.share_index.to_string());
+    out.field(
+        "Threshold",
+        &format!("{}-of-{}", exported.threshold, exported.participants),
+    );
+    out.success("Export complete");
+    Ok(())
+}

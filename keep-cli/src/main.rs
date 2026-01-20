@@ -310,6 +310,14 @@ enum FrostHardwareCommands {
         #[arg(long)]
         commitments: String,
     },
+    Export {
+        #[arg(short, long)]
+        device: String,
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -652,6 +660,16 @@ fn dispatch_frost_hardware(
             &group,
             &session_id,
             &commitments,
+        ),
+        FrostHardwareCommands::Export {
+            device,
+            group,
+            output,
+        } => commands::frost_hardware::cmd_frost_hardware_export(
+            out,
+            &device,
+            &group,
+            output.as_deref(),
         ),
     }
 }

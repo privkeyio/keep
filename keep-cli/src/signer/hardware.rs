@@ -191,6 +191,70 @@ impl HardwareSigner {
         })
     }
 
+    pub fn export_share(&mut self, group: &str, passphrase: &str) -> Result<ExportedShare> {
+        let params = serde_json::json!({
+            "group": group,
+            "passphrase": passphrase,
+        });
+        let result = self.call("export_share", Some(params))?;
+        let version: u8 = result["version"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing version"))?
+            .try_into()
+            .map_err(|_| anyhow!("version out of range"))?;
+        let group_name = result["group"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing group"))?
+            .to_string();
+        let share_index: u16 = result["share_index"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing share_index"))?
+            .try_into()
+            .map_err(|_| anyhow!("share_index out of range"))?;
+        let threshold: u16 = result["threshold"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing threshold"))?
+            .try_into()
+            .map_err(|_| anyhow!("threshold out of range"))?;
+        let participants: u16 = result["participants"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing participants"))?
+            .try_into()
+            .map_err(|_| anyhow!("participants out of range"))?;
+        let group_pubkey = result["group_pubkey"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing group_pubkey"))?
+            .to_string();
+        let encrypted_share = result["encrypted_share"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing encrypted_share"))?
+            .to_string();
+        let nonce = result["nonce"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing nonce"))?
+            .to_string();
+        let salt = result["salt"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing salt"))?
+            .to_string();
+        let checksum = result["checksum"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing checksum"))?
+            .to_string();
+        Ok(ExportedShare {
+            version,
+            group: group_name,
+            share_index,
+            threshold,
+            participants,
+            group_pubkey,
+            encrypted_share,
+            nonce,
+            salt,
+            checksum,
+        })
+    }
+
     pub fn frost_commit(
         &mut self,
         group: &str,
@@ -405,6 +469,20 @@ pub struct DkgShare {
 pub struct DkgFinalizeResult {
     pub group_pubkey: String,
     pub our_index: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedShare {
+    pub version: u8,
+    pub group: String,
+    pub share_index: u16,
+    pub threshold: u16,
+    pub participants: u16,
+    pub group_pubkey: String,
+    pub encrypted_share: String,
+    pub nonce: String,
+    pub salt: String,
+    pub checksum: String,
 }
 
 pub fn serialize_share_for_hardware(
