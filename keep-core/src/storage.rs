@@ -439,12 +439,10 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
 }
 
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let Ok(dir) = File::open(parent) else {
-        return Ok(());
-    };
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "path has no parent directory")
+    })?;
+    let dir = File::open(parent)?;
     dir.sync_all()
 }
 
@@ -497,13 +495,12 @@ impl Storage {
 
         self.lock();
 
-        drop(lock);
-
         if let Err(e) = self.unlock(new_password) {
             self.header = old_header;
             let _ = fs::copy(&backup_path, &header_path);
             let _ = self.unlock(old_password);
             let _ = secure_delete(&backup_path);
+            drop(lock);
             return Err(KeepError::RotationFailed(format!(
                 "verification failed: {}",
                 e
@@ -511,6 +508,7 @@ impl Storage {
         }
 
         let _ = secure_delete(&backup_path);
+        drop(lock);
         Ok(())
     }
 
@@ -576,8 +574,6 @@ impl Storage {
             Ok(())
         })();
 
-        drop(lock);
-
         if let Err(e) = result {
             self.header = old_header;
             self.data_key = Some(old_data_key);
@@ -587,11 +583,13 @@ impl Storage {
             let _ = self.unlock(password);
             let _ = secure_delete(&backup_path);
             let _ = secure_delete(&db_backup_path);
+            drop(lock);
             return Err(e);
         }
 
         let _ = secure_delete(&backup_path);
         let _ = secure_delete(&db_backup_path);
+        drop(lock);
         Ok(())
     }
 
