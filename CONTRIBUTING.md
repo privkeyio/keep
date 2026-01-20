@@ -9,7 +9,7 @@ cargo build
 cargo test
 ```
 
-Requires Rust 1.83+.
+Requires Rust 1.85+.
 
 ## Code Style
 
