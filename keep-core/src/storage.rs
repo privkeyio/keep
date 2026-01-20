@@ -476,6 +476,8 @@ impl Storage {
     /// Re-encrypts the data encryption key with a new password-derived key.
     /// Creates a backup of the header before rotation and restores it on failure.
     pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
+        let lock = acquire_rotation_lock(&self.path)?;
+
         if !self.is_unlocked() {
             self.unlock(old_password)?;
         }
@@ -484,8 +486,6 @@ impl Storage {
         let old_header = self.header.clone();
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
-
-        let lock = acquire_rotation_lock(&self.path)?;
 
         fs::copy(&header_path, &backup_path)?;
 
@@ -531,6 +531,8 @@ impl Storage {
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     /// Creates backups of the header and database before rotation and restores them on failure.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        let lock = acquire_rotation_lock(&self.path)?;
+
         if !self.is_unlocked() {
             self.unlock(password)?;
         }
@@ -541,8 +543,6 @@ impl Storage {
         let backup_path = self.path.join("keep.hdr.backup");
         let db_path = self.path.join("keep.db");
         let db_backup_path = self.path.join("keep.db.backup");
-
-        let lock = acquire_rotation_lock(&self.path)?;
 
         fs::copy(&header_path, &backup_path)?;
         fs::copy(&db_path, &db_backup_path)?;
