@@ -51,9 +51,34 @@ impl RedbBackend {
     }
 
     /// Open an existing database at the given path.
+    /// Retries on Windows to handle delayed file handle release.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::open(path)?;
-        Ok(Self { db })
+        const MAX_RETRIES: u32 = 10;
+        const RETRY_DELAY_MS: u64 = 50;
+
+        let mut last_err = None;
+        for _ in 0..MAX_RETRIES {
+            match Database::open(path) {
+                Ok(db) => return Ok(Self { db }),
+                Err(e) => {
+                    let is_retryable = matches!(
+                        &e,
+                        redb::DatabaseError::Storage(redb::StorageError::Io(io_err))
+                            if io_err.kind() == std::io::ErrorKind::PermissionDenied
+                    ) || matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen);
+
+                    if is_retryable {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(last_err
+            .map(|e| e.into())
+            .unwrap_or_else(|| KeepError::Other("database open failed after retries".into())))
     }
 
     fn table_def(

@@ -446,6 +446,32 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
     dir.sync_all()
 }
 
+fn copy_with_retry(from: &Path, to: &Path) -> std::io::Result<u64> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY_MS: u64 = 50;
+
+    let mut last_err = None;
+    for _ in 0..MAX_RETRIES {
+        match fs::copy(from, to) {
+            Ok(n) => return Ok(n),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "file copy failed after retries",
+        )
+    }))
+}
+
 fn acquire_rotation_lock(path: &Path) -> Result<File> {
     let lock_path = path.join(".rotation.lock");
     let lock_file = OpenOptions::new()
@@ -488,7 +514,7 @@ impl Storage {
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
 
-        fs::copy(&header_path, &backup_path)?;
+        copy_with_retry(&header_path, &backup_path)?;
 
         let new_header = self.create_header_with_key(new_password, data_key)?;
         write_header_atomically(&self.path, &new_header)?;
@@ -496,7 +522,7 @@ impl Storage {
 
         if let Err(e) = self.verify_header_decryption(&new_header, new_password, &*data_key_bytes) {
             self.header = old_header;
-            let _ = fs::copy(&backup_path, &header_path);
+            let _ = copy_with_retry(&backup_path, &header_path);
             let _ = secure_delete(&backup_path);
             drop(lock);
             return Err(KeepError::RotationFailed(format!(
@@ -573,8 +599,8 @@ impl Storage {
 
         self.backend = None;
 
-        fs::copy(&header_path, &backup_path)?;
-        fs::copy(&db_path, &db_backup_path)?;
+        copy_with_retry(&header_path, &backup_path)?;
+        copy_with_retry(&db_path, &db_backup_path)?;
 
         self.backend = Some(Box::new(RedbBackend::open(&db_path)?));
 
@@ -601,8 +627,8 @@ impl Storage {
             self.backend = None;
             self.header = old_header;
             self.data_key = Some(old_data_key);
-            let _ = fs::copy(&backup_path, &header_path);
-            let _ = fs::copy(&db_backup_path, &db_path);
+            let _ = copy_with_retry(&backup_path, &header_path);
+            let _ = copy_with_retry(&db_backup_path, &db_path);
             self.backend = RedbBackend::open(&db_path)
                 .ok()
                 .map(|b| Box::new(b) as Box<dyn StorageBackend>);
