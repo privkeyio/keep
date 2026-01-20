@@ -12,7 +12,7 @@ use keep_core::Keep;
 use crate::output::Output;
 use crate::signer::HardwareSigner;
 
-use super::{get_confirm, get_password};
+use super::{get_confirm, get_password, get_password_with_confirm};
 
 pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     out.newline();
@@ -254,9 +254,14 @@ pub fn cmd_frost_hardware_export(
         return Ok(());
     }
 
-    let passphrase = get_password("Enter export passphrase (min 8 chars)")?;
+    let passphrase = get_password_with_confirm(
+        "Enter export passphrase (min 8 chars)",
+        "Confirm passphrase",
+    )?;
     if passphrase.expose_secret().len() < 8 {
-        return Err(KeepError::Other("Passphrase must be at least 8 characters".into()));
+        return Err(KeepError::Other(
+            "Passphrase must be at least 8 characters".into(),
+        ));
     }
 
     let spinner = out.spinner("Connecting...");
@@ -283,15 +288,18 @@ pub fn cmd_frost_hardware_export(
         "checksum": exported.checksum,
     });
 
+    let json_str = serde_json::to_string_pretty(&export_json)
+        .map_err(|e| KeepError::Other(format!("Failed to serialize JSON: {}", e)))?;
+
     if let Some(path) = output_file {
         let mut file = std::fs::File::create(path)
             .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
-        file.write_all(serde_json::to_string_pretty(&export_json).unwrap().as_bytes())
+        file.write_all(json_str.as_bytes())
             .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
         out.success(&format!("Share exported to {}", path));
     } else {
         out.newline();
-        println!("{}", serde_json::to_string_pretty(&export_json).unwrap());
+        println!("{}", json_str);
     }
 
     out.newline();
