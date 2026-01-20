@@ -41,7 +41,10 @@ struct Argon2Bounds {
     max: u32,
 }
 
-const ARGON2_MEMORY_KIB: Argon2Bounds = Argon2Bounds { min: 1024, max: 4_194_304 };
+const ARGON2_MEMORY_KIB: Argon2Bounds = Argon2Bounds {
+    min: 1024,
+    max: 4_194_304,
+};
 const ARGON2_ITERATIONS: Argon2Bounds = Argon2Bounds { min: 1, max: 20 };
 const ARGON2_PARALLELISM: Argon2Bounds = Argon2Bounds { min: 1, max: 64 };
 
@@ -462,7 +465,10 @@ impl Storage {
         if backend.delete(SHARES_TABLE, &id)? {
             Ok(())
         } else {
-            Err(KeepError::KeyNotFound(format!("share {} not found", identifier)))
+            Err(KeepError::KeyNotFound(format!(
+                "share {} not found",
+                identifier
+            )))
         }
     }
 }
