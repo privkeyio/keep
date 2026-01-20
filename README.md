@@ -185,6 +185,9 @@ keep frost hardware list --device /dev/ttyUSB0
 # Import share to hardware
 keep frost hardware import --device /dev/ttyUSB0 --group npub1... --share 1
 
+# Export share from hardware (encrypted backup)
+keep frost hardware export --device /dev/ttyUSB0 --group npub1... --output backup.json
+
 # Network sign using hardware
 keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyUSB0
 ```
