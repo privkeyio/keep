@@ -37,10 +37,10 @@ fn log_panic(info: &PanicHookInfo<'_>) {
         }
     }
 
-    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        if std::env::var("KEEP_NO_BACKTRACE").is_err() {
-            eprintln!("\nBacktrace (may reveal function call patterns - set KEEP_NO_BACKTRACE=1 to disable):\n{}", backtrace);
-        }
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured
+        && std::env::var("KEEP_NO_BACKTRACE").is_err()
+    {
+        eprintln!("\nBacktrace (may reveal function call patterns - set KEEP_NO_BACKTRACE=1 to disable):\n{}", backtrace);
     }
 }
 
@@ -48,7 +48,7 @@ fn extract_panic_message(info: &PanicHookInfo<'_>) -> String {
     let payload = info.payload();
     let msg = payload
         .downcast_ref::<&str>()
-        .map(|s| *s)
+        .copied()
         .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()));
 
     match msg {
