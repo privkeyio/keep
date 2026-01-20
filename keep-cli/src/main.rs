@@ -20,6 +20,10 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use keep_core::crypto::disable_mlock;
+use keep_core::default_keep_path;
+use keep_core::error::Result;
+
+use crate::output::Output;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -27,11 +31,6 @@ fn next_request_id() -> String {
     let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("req-{:08x}", id)
 }
-
-use keep_core::default_keep_path;
-use keep_core::error::Result;
-
-use crate::output::Output;
 
 #[derive(Parser)]
 #[command(name = "keep")]

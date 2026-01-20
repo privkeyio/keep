@@ -189,7 +189,7 @@ pub fn cmd_frost_network_peers(
     Ok(())
 }
 
-#[tracing::instrument(skip(out, warden_url), fields(path = %path.display()))]
+#[tracing::instrument(skip(out, warden_url, message), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_sign(
     out: &Output,

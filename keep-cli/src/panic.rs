@@ -38,17 +38,22 @@ fn log_panic(info: &PanicHookInfo<'_>) {
     }
 
     if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        eprintln!("\nBacktrace:\n{}", backtrace);
+        if std::env::var("KEEP_NO_BACKTRACE").is_err() {
+            eprintln!("\nBacktrace (may reveal function call patterns - set KEEP_NO_BACKTRACE=1 to disable):\n{}", backtrace);
+        }
     }
 }
 
 fn extract_panic_message(info: &PanicHookInfo<'_>) -> String {
-    if let Some(s) = info.payload().downcast_ref::<&str>() {
-        sanitize_message(s)
-    } else if let Some(s) = info.payload().downcast_ref::<String>() {
-        sanitize_message(s)
-    } else {
-        "unknown panic".to_string()
+    let payload = info.payload();
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| *s)
+        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()));
+
+    match msg {
+        Some(s) => sanitize_message(s),
+        None => "unknown panic".to_string(),
     }
 }
 
@@ -62,6 +67,12 @@ fn sanitize_message(msg: &str) -> String {
         "credential",
         "token",
         "auth",
+        "mnemonic",
+        "seed",
+        "xprv",
+        "share",
+        "nonce",
+        "commitment",
     ];
 
     let lower = msg.to_lowercase();
@@ -95,7 +106,23 @@ fn write_crash_dump(
         backtrace
     );
 
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(content.as_bytes())?;
+    }
+
+    #[cfg(not(unix))]
     std::fs::write(&path, content)?;
+
     eprintln!("Crash dump written to: {}", path.display());
     Ok(path)
 }
