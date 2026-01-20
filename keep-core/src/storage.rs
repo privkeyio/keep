@@ -5,8 +5,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
 
 use tracing::{debug, trace};
 
@@ -417,6 +420,52 @@ fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
     crypto::blake2b_256(&data)
 }
 
+fn secure_delete(path: &Path) -> std::io::Result<()> {
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
+            let zeros = vec![0u8; metadata.len() as usize];
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&zeros)?;
+            file.sync_all()?;
+        }
+    }
+    fs::remove_file(path)
+}
+
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Ok(dir) = File::open(parent) else {
+        return Ok(());
+    };
+    dir.sync_all()
+}
+
+fn acquire_rotation_lock(path: &Path) -> Result<File> {
+    let lock_path = path.join(".rotation.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+    Ok(lock_file)
+}
+
+fn write_header_atomically(path: &Path, header: &Header) -> Result<()> {
+    let header_path = path.join("keep.hdr");
+    let tmp_path = path.join("keep.hdr.tmp");
+    let mut tmp_file = File::create(&tmp_path)?;
+    tmp_file.write_all(&header.to_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    fs::rename(&tmp_path, &header_path)?;
+    fsync_dir(&header_path)?;
+    Ok(())
+}
+
 impl Storage {
     /// Rotate the vault password.
     ///
@@ -431,13 +480,13 @@ impl Storage {
         let old_header = self.header.clone();
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
+
+        let _lock = acquire_rotation_lock(&self.path)?;
+
         fs::copy(&header_path, &backup_path)?;
 
         let new_header = self.create_header_with_key(new_password, data_key)?;
-
-        let tmp_path = self.path.join("keep.hdr.tmp");
-        fs::write(&tmp_path, new_header.to_bytes())?;
-        fs::rename(&tmp_path, &header_path)?;
+        write_header_atomically(&self.path, &new_header)?;
         self.header = new_header;
 
         self.lock();
@@ -445,14 +494,14 @@ impl Storage {
             self.header = old_header;
             fs::copy(&backup_path, &header_path)?;
             self.unlock(old_password)?;
-            let _ = fs::remove_file(&backup_path);
+            let _ = secure_delete(&backup_path);
             return Err(KeepError::RotationFailed(format!(
                 "verification failed: {}",
                 e
             )));
         }
 
-        let _ = fs::remove_file(&backup_path);
+        let _ = secure_delete(&backup_path);
         Ok(())
     }
 
@@ -485,6 +534,9 @@ impl Storage {
         let backup_path = self.path.join("keep.hdr.backup");
         let db_path = self.path.join("keep.db");
         let db_backup_path = self.path.join("keep.db.backup");
+
+        let _lock = acquire_rotation_lock(&self.path)?;
+
         fs::copy(&header_path, &backup_path)?;
         fs::copy(&db_path, &db_backup_path)?;
 
@@ -500,9 +552,7 @@ impl Storage {
         self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
 
         let new_header = self.encrypt_data_key_in_header(password, &new_data_key)?;
-        let tmp_path = self.path.join("keep.hdr.tmp");
-        fs::write(&tmp_path, new_header.to_bytes())?;
-        fs::rename(&tmp_path, &header_path)?;
+        write_header_atomically(&self.path, &new_header)?;
 
         self.header = new_header;
         self.data_key = Some(new_data_key);
@@ -516,13 +566,13 @@ impl Storage {
             fs::copy(&backup_path, &header_path)?;
             fs::copy(&db_backup_path, &db_path)?;
             self.unlock(password)?;
-            let _ = fs::remove_file(&backup_path);
-            let _ = fs::remove_file(&db_backup_path);
+            let _ = secure_delete(&backup_path);
+            let _ = secure_delete(&db_backup_path);
             return Err(KeepError::RotationFailed("integrity check failed".into()));
         }
 
-        let _ = fs::remove_file(&backup_path);
-        let _ = fs::remove_file(&db_backup_path);
+        let _ = secure_delete(&backup_path);
+        let _ = secure_delete(&db_backup_path);
         Ok(())
     }
 
