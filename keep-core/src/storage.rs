@@ -438,12 +438,18 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
+#[cfg(not(windows))]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "path has no parent directory")
     })?;
     let dir = File::open(parent)?;
     dir.sync_all()
+}
+
+#[cfg(windows)]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn copy_with_retry(from: &Path, to: &Path) -> std::io::Result<u64> {
