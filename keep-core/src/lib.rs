@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-FileCopyrightText: (C) 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Sovereign key management for Nostr and Bitcoin.
@@ -30,6 +30,8 @@
 
 #![deny(missing_docs)]
 
+/// Tamper-evident audit logging with hash chain integrity.
+pub mod audit;
 /// Pluggable storage backends.
 pub mod backend;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
@@ -57,6 +59,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 use zeroize::Zeroize;
 
+use crate::audit::{AuditEntry, AuditEventType, AuditLog, RetentionPolicy};
 use crate::crypto::{Argon2Params, SecretKey};
 use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
@@ -68,6 +71,7 @@ use crate::storage::Storage;
 pub struct Keep {
     storage: Storage,
     keyring: Keyring,
+    audit: Option<AuditLog>,
 }
 
 impl Keep {
@@ -97,6 +101,7 @@ impl Keep {
         Ok(Self {
             storage,
             keyring: Keyring::new(),
+            audit: None,
         })
     }
 
@@ -121,6 +126,7 @@ impl Keep {
         Ok(Self {
             storage,
             keyring: Keyring::new(),
+            audit: None,
         })
     }
 
@@ -132,13 +138,19 @@ impl Keep {
     /// Returns [`KeepError::RateLimited`] after too many failed attempts.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
+
+        let data_key = self.get_data_key()?;
+        self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
+        self.audit_event(AuditEventType::VaultUnlock, |e| e);
         debug!("loading keys to keyring");
         self.load_keys_to_keyring()
     }
 
     /// Lock and clear all keys from memory.
     pub fn lock(&mut self) {
+        self.audit_event(AuditEventType::VaultLock, |e| e);
         self.keyring.clear();
+        self.audit = None;
         self.storage.lock();
     }
 
@@ -189,6 +201,10 @@ impl Keep {
             KeyType::Nostr,
             name.to_string(),
         )?;
+
+        self.audit_event(AuditEventType::KeyGenerate, |e| {
+            e.with_pubkey(&pubkey).with_key_type("nostr")
+        });
 
         Ok(pubkey)
     }
@@ -242,6 +258,10 @@ impl Keep {
             name.to_string(),
         )?;
 
+        self.audit_event(AuditEventType::KeyImport, |e| {
+            e.with_pubkey(&pubkey).with_key_type("nostr")
+        });
+
         Ok(pubkey)
     }
 
@@ -260,6 +280,7 @@ impl Keep {
         let id = crypto::blake2b_256(pubkey);
         self.storage.delete_key(&id)?;
         self.keyring.remove(pubkey)?;
+        self.audit_event(AuditEventType::KeyDelete, |e| e.with_pubkey(pubkey));
         Ok(())
     }
 
@@ -294,6 +315,14 @@ impl Keep {
             self.storage.store_share(&stored)?;
         }
 
+        let group_pubkey = *shares[0].group_pubkey();
+        let participants: Vec<u16> = (1..=total_shares).collect();
+        self.audit_event(AuditEventType::FrostGenerate, |e| {
+            e.with_group(&group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
         Ok(shares)
     }
 
@@ -325,6 +354,14 @@ impl Keep {
             self.storage.store_share(&stored)?;
         }
 
+        let group_pubkey = *shares[0].group_pubkey();
+        let participants: Vec<u16> = (1..=total_shares).collect();
+        self.audit_event(AuditEventType::FrostSplit, |e| {
+            e.with_group(&group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
         Ok(shares)
     }
 
@@ -345,7 +382,7 @@ impl Keep {
 
     /// Export a FROST share encrypted with a passphrase.
     pub fn frost_export_share(
-        &self,
+        &mut self,
         group_pubkey: &[u8; 32],
         identifier: u16,
         passphrase: &str,
@@ -357,6 +394,11 @@ impl Keep {
         let stored = self.find_stored_share(group_pubkey, identifier)?;
         let data_key = self.get_data_key()?;
         let share = stored.decrypt(&data_key)?;
+
+        self.audit_event(AuditEventType::FrostShareExport, |e| {
+            e.with_group(group_pubkey)
+                .with_participants(vec![identifier])
+        });
 
         ShareExport::from_share(&share, passphrase)
     }
@@ -370,12 +412,28 @@ impl Keep {
         let share = export.to_share(passphrase, &format!("imported-{}", export.identifier))?;
         let data_key = self.get_data_key()?;
         let stored = StoredShare::encrypt(&share, &data_key)?;
-        self.storage.store_share(&stored)
+        self.storage.store_share(&stored)?;
+
+        let group = hex::decode(&export.group_pubkey)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .unwrap_or_else(|| crypto::blake2b_256(export.group_pubkey.as_bytes()));
+        self.audit_event(AuditEventType::FrostShareImport, |e| {
+            e.with_group(&group)
+                .with_participants(vec![export.identifier])
+        });
+
+        Ok(())
     }
 
     /// Delete a FROST share.
     pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
-        self.storage.delete_share(group_pubkey, identifier)
+        self.storage.delete_share(group_pubkey, identifier)?;
+        self.audit_event(AuditEventType::FrostShareDelete, |e| {
+            e.with_group(group_pubkey)
+                .with_participants(vec![identifier])
+        });
+        Ok(())
     }
 
     /// Get a FROST share by group public key.
@@ -410,7 +468,7 @@ impl Keep {
     }
 
     /// Sign using local FROST shares. Requires threshold shares locally.
-    pub fn frost_sign(&self, group_pubkey: &[u8; 32], message: &[u8]) -> Result<[u8; 64]> {
+    pub fn frost_sign(&mut self, group_pubkey: &[u8; 32], message: &[u8]) -> Result<[u8; 64]> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
@@ -429,6 +487,12 @@ impl Keep {
         let threshold = our_shares[0].metadata.threshold;
 
         if our_shares.len() < threshold as usize {
+            self.audit_event(AuditEventType::FrostSignFailed, |e| {
+                e.with_group(group_pubkey)
+                    .with_message_hash(message)
+                    .with_success(false)
+                    .with_reason("Insufficient shares")
+            });
             return Err(KeepError::Frost(format!(
                 "Need {} shares to sign, only {} available",
                 threshold,
@@ -441,7 +505,24 @@ impl Keep {
             decrypted_shares.push(stored.decrypt(&data_key)?);
         }
 
-        frost::sign_with_local_shares(&decrypted_shares, message)
+        match frost::sign_with_local_shares(&decrypted_shares, message) {
+            Ok(sig) => {
+                self.audit_event(AuditEventType::FrostSign, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_threshold(threshold)
+                });
+                Ok(sig)
+            }
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                });
+                Err(e)
+            }
+        }
     }
 
     fn load_keys_to_keyring(&mut self) -> Result<()> {
@@ -484,7 +565,14 @@ impl Keep {
     ///
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        let old_data_key = self.get_data_key()?;
         self.storage.rotate_data_key(password)?;
+        let new_data_key = self.get_data_key()?;
+
+        if let Some(ref mut audit) = self.audit {
+            audit.reencrypt(&old_data_key, &new_data_key)?;
+        }
+
         self.keyring.clear();
         self.load_keys_to_keyring()?;
         Ok(())
@@ -498,6 +586,60 @@ impl Keep {
     /// Exposed for FROST/FrostSigner integration to decrypt stored shares.
     pub fn data_key(&self) -> Result<SecretKey> {
         self.get_data_key()
+    }
+
+    fn audit_event<F>(&mut self, event_type: AuditEventType, builder: F)
+    where
+        F: FnOnce(AuditEntry) -> AuditEntry,
+    {
+        let data_key = match self.get_data_key() {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        if let Some(ref mut audit) = self.audit {
+            let entry = builder(AuditEntry::new(event_type, audit.last_hash()));
+            if let Err(e) = audit.log(entry, &data_key) {
+                tracing::warn!("Failed to write audit log entry for {}: {}", event_type, e);
+            }
+        }
+    }
+
+    /// Read all audit log entries.
+    pub fn audit_read_all(&self) -> Result<Vec<AuditEntry>> {
+        let (audit, data_key) = self.audit_with_key()?;
+        audit.read_all(&data_key)
+    }
+
+    /// Verify the integrity of the audit log chain.
+    pub fn audit_verify_chain(&self) -> Result<bool> {
+        let (audit, data_key) = self.audit_with_key()?;
+        audit.verify_chain(&data_key)
+    }
+
+    /// Export the audit log as JSON.
+    pub fn audit_export(&self) -> Result<String> {
+        let (audit, data_key) = self.audit_with_key()?;
+        audit.export(&data_key)
+    }
+
+    fn audit_with_key(&self) -> Result<(&AuditLog, SecretKey)> {
+        let audit = self.audit.as_ref().ok_or(KeepError::Locked)?;
+        let data_key = self.get_data_key()?;
+        Ok((audit, data_key))
+    }
+
+    /// Set the retention policy for the audit log.
+    pub fn audit_set_retention(&mut self, policy: RetentionPolicy) {
+        if let Some(ref mut audit) = self.audit {
+            audit.set_retention(policy);
+        }
+    }
+
+    /// Apply the retention policy and return the number of entries removed.
+    pub fn audit_apply_retention(&mut self) -> Result<usize> {
+        let data_key = self.get_data_key()?;
+        let audit = self.audit.as_mut().ok_or(KeepError::Locked)?;
+        audit.apply_retention(&data_key)
     }
 }
 
