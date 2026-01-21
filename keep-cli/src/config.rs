@@ -113,7 +113,11 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = Self::default_path()?;
+        let path = match Self::default_path() {
+            Ok(p) => p,
+            Err(KeepError::HomeNotFound) => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
         if path.exists() {
             Self::from_file(&path)
         } else {
