@@ -48,6 +48,7 @@ pub mod hidden;
 pub mod keyring;
 /// Key types and Nostr keypair operations.
 pub mod keys;
+pub mod migration;
 pub(crate) mod rate_limit;
 /// Persistent encrypted storage backend.
 pub mod storage;

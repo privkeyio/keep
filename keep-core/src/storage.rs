@@ -36,6 +36,28 @@ const HEADER_MAGIC: &[u8; 8] = b"KEEPVALT";
 const HEADER_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 256;
 
+struct Argon2Bounds {
+    min: u32,
+    max: u32,
+}
+
+const ARGON2_MEMORY_KIB: Argon2Bounds = Argon2Bounds {
+    min: 1024,
+    max: 4_194_304,
+};
+const ARGON2_ITERATIONS: Argon2Bounds = Argon2Bounds { min: 1, max: 20 };
+const ARGON2_PARALLELISM: Argon2Bounds = Argon2Bounds { min: 1, max: 64 };
+
+fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Result<()> {
+    if value < bounds.min || value > bounds.max {
+        return Err(KeepError::Other(format!(
+            "Invalid Argon2 {} parameter: {} (must be {}-{})",
+            name, value, bounds.min, bounds.max
+        )));
+    }
+    Ok(())
+}
+
 /// Storage file header containing encryption metadata.
 #[repr(C)]
 #[derive(Clone)]
@@ -112,6 +134,17 @@ impl Header {
         let mut encrypted_data_key = [0u8; 48];
         encrypted_data_key.copy_from_slice(&bytes[68..116]);
 
+        let argon2_memory_kib =
+            u32::from_le_bytes([bytes[116], bytes[117], bytes[118], bytes[119]]);
+        let argon2_iterations =
+            u32::from_le_bytes([bytes[120], bytes[121], bytes[122], bytes[123]]);
+        let argon2_parallelism =
+            u32::from_le_bytes([bytes[124], bytes[125], bytes[126], bytes[127]]);
+
+        validate_argon2_param(argon2_memory_kib, &ARGON2_MEMORY_KIB, "memory")?;
+        validate_argon2_param(argon2_iterations, &ARGON2_ITERATIONS, "iterations")?;
+        validate_argon2_param(argon2_parallelism, &ARGON2_PARALLELISM, "parallelism")?;
+
         Ok(Self {
             magic,
             version,
@@ -119,11 +152,9 @@ impl Header {
             salt,
             nonce,
             encrypted_data_key,
-            argon2_memory_kib: u32::from_le_bytes([bytes[116], bytes[117], bytes[118], bytes[119]]),
-            argon2_iterations: u32::from_le_bytes([bytes[120], bytes[121], bytes[122], bytes[123]]),
-            argon2_parallelism: u32::from_le_bytes([
-                bytes[124], bytes[125], bytes[126], bytes[127],
-            ]),
+            argon2_memory_kib,
+            argon2_iterations,
+            argon2_parallelism,
             _padding: [0; 140],
         })
     }
@@ -361,15 +392,34 @@ impl Storage {
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting key");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        backend
-            .delete(KEYS_TABLE, id)?
-            .then_some(())
-            .ok_or_else(|| KeepError::KeyNotFound(hex::encode(id)))
+        if backend.delete(KEYS_TABLE, id)? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(hex::encode(id)))
+        }
     }
 
     /// The storage directory path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Get the current schema version.
+    pub fn schema_version(&self) -> Result<u32> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.schema_version()
+    }
+
+    /// Check if migrations are needed.
+    pub fn needs_migration(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.needs_migration()
+    }
+
+    /// Run pending migrations.
+    pub fn run_migrations(&self) -> Result<crate::migration::MigrationResult> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.run_migrations()
     }
 
     /// Store a FROST share.
@@ -412,10 +462,14 @@ impl Storage {
         debug!(id = identifier, "deleting FROST share");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let id = share_id(group_pubkey, identifier);
-        backend
-            .delete(SHARES_TABLE, &id)?
-            .then_some(())
-            .ok_or_else(|| KeepError::KeyNotFound(format!("share {} not found", identifier)))
+        if backend.delete(SHARES_TABLE, &id)? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(format!(
+                "share {} not found",
+                identifier
+            )))
+        }
     }
 }
 
@@ -1065,5 +1119,46 @@ mod tests {
             assert_eq!(keys.len(), 1);
             assert_eq!(keys[0].name, "dek-test");
         }
+    }
+
+    #[test]
+    fn test_header_rejects_malicious_argon2_params() {
+        let valid_header = Header::new(Argon2Params::TESTING);
+        let valid_bytes = valid_header.to_bytes();
+
+        Header::from_bytes(&valid_bytes).expect("valid header should parse");
+
+        let mut bad_memory_high = valid_bytes;
+        bad_memory_high[116..120].copy_from_slice(&u32::MAX.to_le_bytes());
+        match Header::from_bytes(&bad_memory_high) {
+            Err(e) => assert!(e.to_string().contains("memory")),
+            Ok(_) => panic!("expected error for extreme memory"),
+        }
+
+        let mut bad_memory_low = valid_bytes;
+        bad_memory_low[116..120].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Header::from_bytes(&bad_memory_low).is_err());
+
+        let mut bad_iterations_high = valid_bytes;
+        bad_iterations_high[120..124].copy_from_slice(&u32::MAX.to_le_bytes());
+        match Header::from_bytes(&bad_iterations_high) {
+            Err(e) => assert!(e.to_string().contains("iterations")),
+            Ok(_) => panic!("expected error for extreme iterations"),
+        }
+
+        let mut bad_iterations_low = valid_bytes;
+        bad_iterations_low[120..124].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Header::from_bytes(&bad_iterations_low).is_err());
+
+        let mut bad_parallelism_high = valid_bytes;
+        bad_parallelism_high[124..128].copy_from_slice(&u32::MAX.to_le_bytes());
+        match Header::from_bytes(&bad_parallelism_high) {
+            Err(e) => assert!(e.to_string().contains("parallelism")),
+            Ok(_) => panic!("expected error for extreme parallelism"),
+        }
+
+        let mut bad_parallelism_low = valid_bytes;
+        bad_parallelism_low[124..128].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Header::from_bytes(&bad_parallelism_low).is_err());
     }
 }

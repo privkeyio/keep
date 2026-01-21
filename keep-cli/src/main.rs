@@ -116,6 +116,15 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    Migrate {
+        #[command(subcommand)]
+        command: Option<MigrateCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateCommands {
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -531,6 +540,19 @@ fn run(out: &Output) -> Result<()> {
         Commands::Enclave { command } => dispatch_enclave(out, &path, command),
         Commands::Agent { command } => dispatch_agent(out, &path, command, hidden),
         Commands::Config { command } => dispatch_config(out, &cfg, command),
+        Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
+    }
+}
+
+fn dispatch_migrate(
+    out: &Output,
+    path: &std::path::Path,
+    command: Option<MigrateCommands>,
+    hidden: bool,
+) -> Result<()> {
+    match command {
+        None => commands::migrate::cmd_migrate(out, path, hidden),
+        Some(MigrateCommands::Status) => commands::migrate::cmd_migrate_status(out, path, hidden),
     }
 }
 

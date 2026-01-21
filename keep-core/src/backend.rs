@@ -7,8 +7,10 @@ use std::path::Path;
 use std::sync::{PoisonError, RwLock};
 
 use redb::{Database, ReadableTable, TableDefinition};
+use tracing::info;
 
 use crate::error::{KeepError, Result};
+use crate::migration;
 
 fn lock_error<T>(_: PoisonError<T>) -> KeepError {
     KeepError::Other("lock poisoned".into())
@@ -33,6 +35,34 @@ pub trait StorageBackend: Send + Sync {
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
+
+    /// Get the current schema version.
+    ///
+    /// Default implementation returns `CURRENT_SCHEMA_VERSION`, suitable for
+    /// in-memory backends that don't persist schema versions.
+    fn schema_version(&self) -> Result<u32> {
+        Ok(migration::CURRENT_SCHEMA_VERSION)
+    }
+
+    /// Check if migrations are needed.
+    ///
+    /// Default implementation returns `false`, suitable for in-memory backends
+    /// that always start fresh without persisted data to migrate.
+    fn needs_migration(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Run pending migrations.
+    ///
+    /// Default implementation is a no-op that reports zero migrations run,
+    /// suitable for in-memory backends that don't persist data between sessions.
+    fn run_migrations(&self) -> Result<migration::MigrationResult> {
+        Ok(migration::MigrationResult {
+            from_version: migration::CURRENT_SCHEMA_VERSION,
+            to_version: migration::CURRENT_SCHEMA_VERSION,
+            migrations_run: 0,
+        })
+    }
 }
 
 const KEYS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
@@ -47,6 +77,7 @@ impl RedbBackend {
     /// Create a new database at the given path.
     pub fn create(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
+        migration::initialize_schema(&db)?;
         Ok(Self { db })
     }
 
@@ -59,7 +90,17 @@ impl RedbBackend {
         let mut last_err = None;
         for _ in 0..MAX_RETRIES {
             match Database::open(path) {
-                Ok(db) => return Ok(Self { db }),
+                Ok(db) => {
+                    migration::check_compatibility(&db)?;
+                    let result = migration::run_migrations(&db)?;
+                    if result.migrations_run > 0 {
+                        info!(
+                            count = result.migrations_run,
+                            "vault schema migration completed"
+                        );
+                    }
+                    return Ok(Self { db });
+                }
                 Err(e) => {
                     let is_retryable = matches!(
                         &e,
@@ -134,6 +175,18 @@ impl StorageBackend for RedbBackend {
         wtxn.open_table(self.table_def(table)?)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    fn schema_version(&self) -> Result<u32> {
+        Ok(migration::read_schema_version(&self.db)?.unwrap_or(1))
+    }
+
+    fn needs_migration(&self) -> Result<bool> {
+        migration::needs_migration(&self.db)
+    }
+
+    fn run_migrations(&self) -> Result<migration::MigrationResult> {
+        migration::run_migrations(&self.db)
     }
 }
 

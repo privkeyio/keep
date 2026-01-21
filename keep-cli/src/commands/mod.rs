@@ -8,6 +8,7 @@ pub mod enclave;
 pub mod frost;
 pub mod frost_hardware;
 pub mod frost_network;
+pub mod migrate;
 pub mod serve;
 pub mod vault;
 
