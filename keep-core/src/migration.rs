@@ -101,10 +101,9 @@ pub fn run_migrations(db: &Database) -> Result<MigrationResult> {
     let target_version = CURRENT_SCHEMA_VERSION;
 
     if current_version > target_version {
-        return Err(KeepError::Migration(format!(
-            "vault schema version {} is newer than supported version {}",
-            current_version, target_version
-        )));
+        return Err(KeepError::Migration(
+            "vault was created with a newer version of keep".into(),
+        ));
     }
 
     if current_version == target_version {
@@ -125,7 +124,7 @@ pub fn run_migrations(db: &Database) -> Result<MigrationResult> {
             .iter()
             .find(|m| m.from_version == version)
             .ok_or_else(|| {
-                KeepError::Migration(format!("no migration path from version {}", version))
+                KeepError::Migration("unable to migrate vault to current version".into())
             })?;
 
         info!(
@@ -155,10 +154,9 @@ pub fn check_compatibility(db: &Database) -> Result<()> {
     let version = read_schema_version(db)?.unwrap_or(1);
 
     if version > CURRENT_SCHEMA_VERSION {
-        return Err(KeepError::Migration(format!(
-            "vault requires keep version that supports schema {}, current supports up to {}",
-            version, CURRENT_SCHEMA_VERSION
-        )));
+        return Err(KeepError::Migration(
+            "vault was created with a newer version of keep".into(),
+        ));
     }
 
     Ok(())
@@ -220,10 +218,7 @@ mod tests {
         write_schema_version(&db, CURRENT_SCHEMA_VERSION + 1).unwrap();
         let result = check_compatibility(&db);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("requires keep version"));
+        assert!(result.unwrap_err().to_string().contains("newer version"));
     }
 
     #[test]

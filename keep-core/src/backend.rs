@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{PoisonError, RwLock};
 
 use redb::{Database, ReadableTable, TableDefinition};
-use tracing::debug;
+use tracing::info;
 
 use crate::error::{KeepError, Result};
 use crate::migration;
@@ -35,15 +35,27 @@ pub trait StorageBackend: Send + Sync {
     fn list(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
+
     /// Get the current schema version.
+    ///
+    /// Default implementation returns `CURRENT_SCHEMA_VERSION`, suitable for
+    /// in-memory backends that don't persist schema versions.
     fn schema_version(&self) -> Result<u32> {
         Ok(migration::CURRENT_SCHEMA_VERSION)
     }
+
     /// Check if migrations are needed.
+    ///
+    /// Default implementation returns `false`, suitable for in-memory backends
+    /// that always start fresh without persisted data to migrate.
     fn needs_migration(&self) -> Result<bool> {
         Ok(false)
     }
+
     /// Run pending migrations.
+    ///
+    /// Default implementation is a no-op that reports zero migrations run,
+    /// suitable for in-memory backends that don't persist data between sessions.
     fn run_migrations(&self) -> Result<migration::MigrationResult> {
         Ok(migration::MigrationResult {
             from_version: migration::CURRENT_SCHEMA_VERSION,
@@ -82,11 +94,9 @@ impl RedbBackend {
                     migration::check_compatibility(&db)?;
                     let result = migration::run_migrations(&db)?;
                     if result.migrations_run > 0 {
-                        debug!(
-                            from = result.from_version,
-                            to = result.to_version,
+                        info!(
                             count = result.migrations_run,
-                            "migrations completed"
+                            "vault schema migration completed"
                         );
                     }
                     return Ok(Self { db });
