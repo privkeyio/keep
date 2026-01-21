@@ -422,6 +422,18 @@ impl AuditLog {
     pub fn last_hash(&self) -> [u8; 32] {
         self.last_hash
     }
+
+    /// Re-encrypt the entire audit log with a new data key.
+    pub fn reencrypt(&mut self, old_key: &SecretKey, new_key: &SecretKey) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let entries = Self::read_entries(&self.path, old_key)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.rewrite(&entries, new_key)
+    }
 }
 
 #[cfg(test)]

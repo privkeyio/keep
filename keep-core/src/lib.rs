@@ -565,7 +565,14 @@ impl Keep {
     ///
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        let old_data_key = self.get_data_key()?;
         self.storage.rotate_data_key(password)?;
+        let new_data_key = self.get_data_key()?;
+
+        if let Some(ref mut audit) = self.audit {
+            audit.reencrypt(&old_data_key, &new_data_key)?;
+        }
+
         self.keyring.clear();
         self.load_keys_to_keyring()?;
         Ok(())
