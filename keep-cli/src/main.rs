@@ -3,6 +3,7 @@
 
 mod bunker;
 mod commands;
+mod config;
 mod output;
 mod panic;
 #[cfg(windows)]
@@ -22,9 +23,9 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use keep_core::crypto::disable_mlock;
-use keep_core::default_keep_path;
 use keep_core::error::Result;
 
+use crate::config::Config;
 use crate::output::Output;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -82,14 +83,14 @@ enum Commands {
     RotatePassword,
     RotateDataKey,
     Serve {
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(long)]
         headless: bool,
         #[arg(long)]
         frost_group: Option<String>,
-        #[arg(long, default_value = "wss://nos.lol")]
-        frost_relay: String,
+        #[arg(long)]
+        frost_relay: Option<String>,
     },
     Audit {
         #[command(subcommand)]
@@ -110,6 +111,10 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
     },
 }
 
@@ -141,6 +146,13 @@ enum AuditCommands {
         apply: bool,
     },
     Stats,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    Show,
+    Path,
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -197,16 +209,16 @@ enum FrostNetworkCommands {
     Serve {
         #[arg(short, long)]
         group: String,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(short, long)]
         share: Option<u16>,
     },
     Peers {
         #[arg(short, long)]
         group: String,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
     },
     Dkg {
         #[arg(short, long, help = "Group name for the new keyset")]
@@ -222,8 +234,8 @@ enum FrostNetworkCommands {
         participants: u8,
         #[arg(short = 'i', long, help = "Our participant index (1-indexed)")]
         index: u8,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
         hardware: String,
     },
@@ -232,8 +244,8 @@ enum FrostNetworkCommands {
         group: String,
         #[arg(short, long)]
         message: String,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(short, long)]
         share: Option<u16>,
         #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
@@ -263,8 +275,8 @@ enum FrostNetworkCommands {
         kind: u16,
         #[arg(short, long)]
         content: String,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(short, long)]
         share: Option<u16>,
         #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
@@ -277,12 +289,7 @@ enum FrostNetworkCommands {
         threshold: u8,
         #[arg(short = 'n', long, help = "Total participants")]
         participants: u8,
-        #[arg(
-            short,
-            long,
-            default_value = "wss://nos.lol",
-            help = "Relay URLs (can specify multiple)"
-        )]
+        #[arg(short, long, help = "Relay URLs (can specify multiple)")]
         relay: Vec<String>,
         #[arg(long, help = "Participant npubs (can specify multiple)")]
         participant_npub: Vec<String>,
@@ -290,8 +297,8 @@ enum FrostNetworkCommands {
     NoncePrecommit {
         #[arg(short, long)]
         group: String,
-        #[arg(short, long, default_value = "wss://nos.lol")]
-        relay: String,
+        #[arg(short, long)]
+        relay: Option<String>,
         #[arg(long, help = "Hardware signer device path")]
         hardware: String,
         #[arg(
@@ -477,6 +484,7 @@ fn main() {
 #[tracing::instrument(skip(out), fields(request_id = %next_request_id()))]
 fn run(out: &Output) -> Result<()> {
     let cli = Cli::parse();
+    let cfg = Config::load()?;
 
     if cli.no_mlock {
         disable_mlock();
@@ -484,7 +492,7 @@ fn run(out: &Output) -> Result<()> {
 
     let path = match cli.path {
         Some(p) => p,
-        None => default_keep_path()?,
+        None => cfg.vault_path()?,
     };
     let hidden = cli.hidden;
 
@@ -504,20 +512,25 @@ fn run(out: &Output) -> Result<()> {
             headless,
             frost_group,
             frost_relay,
-        } => commands::serve::cmd_serve(
-            out,
-            &path,
-            &relay,
-            headless,
-            hidden,
-            frost_group.as_deref(),
-            &frost_relay,
-        ),
+        } => {
+            let relay = relay.unwrap_or_else(|| cfg.default_relay().to_string());
+            let frost_relay = frost_relay.unwrap_or_else(|| cfg.default_relay().to_string());
+            commands::serve::cmd_serve(
+                out,
+                &path,
+                &relay,
+                headless,
+                hidden,
+                frost_group.as_deref(),
+                &frost_relay,
+            )
+        }
         Commands::Audit { command } => dispatch_audit(out, &path, command, hidden),
-        Commands::Frost { command } => dispatch_frost(out, &path, command),
+        Commands::Frost { command } => dispatch_frost(out, &path, &cfg, command),
         Commands::Bitcoin { command } => dispatch_bitcoin(out, &path, command),
         Commands::Enclave { command } => dispatch_enclave(out, &path, command),
         Commands::Agent { command } => dispatch_agent(out, &path, command, hidden),
+        Commands::Config { command } => dispatch_config(out, &cfg, command),
     }
 }
 
@@ -553,7 +566,12 @@ fn dispatch_audit(
     }
 }
 
-fn dispatch_frost(out: &Output, path: &std::path::Path, command: FrostCommands) -> Result<()> {
+fn dispatch_frost(
+    out: &Output,
+    path: &std::path::Path,
+    cfg: &Config,
+    command: FrostCommands,
+) -> Result<()> {
     match command {
         FrostCommands::Generate {
             threshold,
@@ -583,7 +601,7 @@ fn dispatch_frost(out: &Output, path: &std::path::Path, command: FrostCommands) 
             interactive,
             warden_url.as_deref(),
         ),
-        FrostCommands::Network { command } => dispatch_frost_network(out, path, command),
+        FrostCommands::Network { command } => dispatch_frost_network(out, path, cfg, command),
         FrostCommands::Hardware { command } => dispatch_frost_hardware(out, path, command),
     }
 }
@@ -591,16 +609,22 @@ fn dispatch_frost(out: &Output, path: &std::path::Path, command: FrostCommands) 
 fn dispatch_frost_network(
     out: &Output,
     path: &std::path::Path,
+    cfg: &Config,
     command: FrostNetworkCommands,
 ) -> Result<()> {
+    let default_relay = cfg.default_relay();
     match command {
         FrostNetworkCommands::Serve {
             group,
             relay,
             share,
-        } => commands::frost_network::cmd_frost_network_serve(out, path, &group, &relay, share),
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_serve(out, path, &group, relay, share)
+        }
         FrostNetworkCommands::Peers { group, relay } => {
-            commands::frost_network::cmd_frost_network_peers(out, path, &group, &relay)
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_peers(out, path, &group, relay)
         }
         FrostNetworkCommands::Dkg {
             group,
@@ -609,15 +633,18 @@ fn dispatch_frost_network(
             index,
             relay,
             hardware,
-        } => commands::frost_network::cmd_frost_network_dkg(
-            out,
-            &group,
-            threshold,
-            participants,
-            index,
-            &relay,
-            &hardware,
-        ),
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_dkg(
+                out,
+                &group,
+                threshold,
+                participants,
+                index,
+                relay,
+                &hardware,
+            )
+        }
         FrostNetworkCommands::Sign {
             group,
             message,
@@ -627,18 +654,21 @@ fn dispatch_frost_network(
             warden_url,
             threshold,
             participants,
-        } => commands::frost_network::cmd_frost_network_sign(
-            out,
-            path,
-            &group,
-            &message,
-            &relay,
-            share,
-            hardware.as_deref(),
-            warden_url.as_deref(),
-            threshold,
-            participants,
-        ),
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_sign(
+                out,
+                path,
+                &group,
+                &message,
+                relay,
+                share,
+                hardware.as_deref(),
+                warden_url.as_deref(),
+                threshold,
+                participants,
+            )
+        }
         FrostNetworkCommands::SignEvent {
             group,
             kind,
@@ -646,38 +676,51 @@ fn dispatch_frost_network(
             relay,
             share,
             hardware,
-        } => commands::frost_network::cmd_frost_network_sign_event(
-            out,
-            path,
-            &group,
-            kind,
-            &content,
-            &relay,
-            share,
-            hardware.as_deref(),
-        ),
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_sign_event(
+                out,
+                path,
+                &group,
+                kind,
+                &content,
+                relay,
+                share,
+                hardware.as_deref(),
+            )
+        }
         FrostNetworkCommands::GroupCreate {
             name,
             threshold,
             participants,
             relay,
             participant_npub,
-        } => commands::frost_network::cmd_frost_network_group_create(
-            out,
-            &name,
-            threshold,
-            participants,
-            &relay,
-            &participant_npub,
-        ),
+        } => {
+            let relay = if relay.is_empty() {
+                vec![default_relay.to_string()]
+            } else {
+                relay
+            };
+            commands::frost_network::cmd_frost_network_group_create(
+                out,
+                &name,
+                threshold,
+                participants,
+                &relay,
+                &participant_npub,
+            )
+        }
         FrostNetworkCommands::NoncePrecommit {
             group,
             relay,
             hardware,
             count,
-        } => commands::frost_network::cmd_frost_network_nonce_precommit(
-            out, path, &group, &relay, &hardware, count,
-        ),
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_nonce_precommit(
+                out, path, &group, relay, &hardware, count,
+            )
+        }
     }
 }
 
@@ -793,5 +836,76 @@ fn dispatch_enclave(out: &Output, path: &std::path::Path, command: EnclaveComman
             cid,
             local,
         ),
+    }
+}
+
+fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Result<()> {
+    match command {
+        ConfigCommands::Show => {
+            let path = Config::default_path()?;
+            out.header("Configuration");
+            out.field("Config file", &path.display().to_string());
+            out.field("Exists", &path.exists().to_string());
+            out.newline();
+            let vault_path_str = match cfg.vault_path() {
+                Ok(p) => p.display().to_string(),
+                Err(e) => format!("(error: {})", e),
+            };
+            out.field("vault_path", &vault_path_str);
+            out.field("argon2_profile", &cfg.argon2_profile.to_string());
+            out.field("log_level", &cfg.log_level.to_string());
+            let relays = if cfg.relays.is_empty() {
+                "(default: wss://nos.lol)".to_string()
+            } else {
+                cfg.relays.join(", ")
+            };
+            out.field("relays", &relays);
+            out.field("timeout", &format!("{}s", cfg.timeout_secs()));
+            Ok(())
+        }
+        ConfigCommands::Path => {
+            let path = Config::default_path()?;
+            out.info(&path.display().to_string());
+            Ok(())
+        }
+        ConfigCommands::Init => {
+            use keep_core::error::KeepError;
+            use std::io::Write;
+
+            let path = Config::default_path()?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| KeepError::Other(format!("Failed to create directory: {}", e)))?;
+            }
+
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    out.warn(&format!("Config file already exists: {}", path.display()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(KeepError::Other(format!("Failed to create config: {}", e)));
+                }
+            };
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| KeepError::Other(format!("Failed to set permissions: {}", e)))?;
+            }
+
+            let example = include_str!("../contrib/config.toml.example");
+            file.write_all(example.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write config: {}", e)))?;
+
+            out.success(&format!("Created config file: {}", path.display()));
+            Ok(())
+        }
     }
 }

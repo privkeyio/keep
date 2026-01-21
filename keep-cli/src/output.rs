@@ -30,7 +30,6 @@ impl Output {
             .write_line(&format!("{} {}", style("✗").red().bold(), msg));
     }
 
-    #[allow(dead_code)]
     pub fn warn(&self, msg: &str) {
         let _ = self
             .term
