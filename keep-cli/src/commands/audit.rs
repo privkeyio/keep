@@ -83,6 +83,33 @@ pub fn cmd_audit_list(out: &Output, path: &Path, limit: Option<usize>, hidden: b
     Ok(())
 }
 
+fn resolve_output_path(out_path: &str) -> Result<PathBuf> {
+    use keep_core::error::KeepError;
+
+    let out_path = PathBuf::from(out_path);
+    let canonical = if out_path.exists() {
+        out_path.canonicalize()?
+    } else {
+        let parent = out_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .canonicalize()
+            .map_err(|_| KeepError::Other("Output directory does not exist".to_string()))?;
+        let file_name = out_path
+            .file_name()
+            .ok_or_else(|| KeepError::Other("Invalid output path".to_string()))?;
+        parent.join(file_name)
+    };
+
+    if canonical.to_string_lossy().contains("..") {
+        return Err(KeepError::Other(
+            "Path traversal detected in output path".to_string(),
+        ));
+    }
+
+    Ok(canonical)
+}
+
 pub fn cmd_audit_export(
     out: &Output,
     path: &Path,
@@ -95,11 +122,13 @@ pub fn cmd_audit_export(
 
     let json = keep.audit_export()?;
 
-    if let Some(out_path) = output_path {
-        std::fs::write(out_path, &json)?;
-        out.success(&format!("Audit log exported to {}", out_path));
-    } else {
-        println!("{}", json);
+    match output_path {
+        Some(out_path) => {
+            let canonical = resolve_output_path(out_path)?;
+            std::fs::write(&canonical, &json)?;
+            out.success(&format!("Audit log exported to {}", canonical.display()));
+        }
+        None => println!("{}", json),
     }
 
     Ok(())
@@ -155,6 +184,44 @@ pub fn cmd_audit_retention(
     Ok(())
 }
 
+#[derive(Default)]
+struct AuditStats {
+    key_gen: u32,
+    key_import: u32,
+    key_export: u32,
+    key_delete: u32,
+    sign_ok: u32,
+    sign_fail: u32,
+    frost_gen: u32,
+    frost_sign_ok: u32,
+    frost_sign_fail: u32,
+    auth_fail: u32,
+    unlock: u32,
+}
+
+impl AuditStats {
+    fn record(&mut self, event_type: AuditEventType) {
+        match event_type {
+            AuditEventType::KeyGenerate => self.key_gen += 1,
+            AuditEventType::KeyImport => self.key_import += 1,
+            AuditEventType::KeyExport => self.key_export += 1,
+            AuditEventType::KeyDelete => self.key_delete += 1,
+            AuditEventType::Sign => self.sign_ok += 1,
+            AuditEventType::SignFailed => self.sign_fail += 1,
+            AuditEventType::FrostGenerate | AuditEventType::FrostSplit => self.frost_gen += 1,
+            AuditEventType::FrostSign | AuditEventType::FrostSessionComplete => {
+                self.frost_sign_ok += 1
+            }
+            AuditEventType::FrostSignFailed | AuditEventType::FrostSessionFailed => {
+                self.frost_sign_fail += 1
+            }
+            AuditEventType::AuthFailed => self.auth_fail += 1,
+            AuditEventType::VaultUnlock => self.unlock += 1,
+            _ => {}
+        }
+    }
+}
+
 pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
@@ -167,35 +234,9 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         return Ok(());
     }
 
-    let mut key_gen = 0;
-    let mut key_import = 0;
-    let mut key_export = 0;
-    let mut key_delete = 0;
-    let mut sign_ok = 0;
-    let mut sign_fail = 0;
-    let mut frost_gen = 0;
-    let mut frost_sign_ok = 0;
-    let mut frost_sign_fail = 0;
-    let mut auth_fail = 0;
-    let mut unlock = 0;
-
+    let mut stats = AuditStats::default();
     for entry in &entries {
-        match entry.event_type {
-            AuditEventType::KeyGenerate => key_gen += 1,
-            AuditEventType::KeyImport => key_import += 1,
-            AuditEventType::KeyExport => key_export += 1,
-            AuditEventType::KeyDelete => key_delete += 1,
-            AuditEventType::Sign => sign_ok += 1,
-            AuditEventType::SignFailed => sign_fail += 1,
-            AuditEventType::FrostGenerate | AuditEventType::FrostSplit => frost_gen += 1,
-            AuditEventType::FrostSign | AuditEventType::FrostSessionComplete => frost_sign_ok += 1,
-            AuditEventType::FrostSignFailed | AuditEventType::FrostSessionFailed => {
-                frost_sign_fail += 1
-            }
-            AuditEventType::AuthFailed => auth_fail += 1,
-            AuditEventType::VaultUnlock => unlock += 1,
-            _ => {}
-        }
+        stats.record(entry.event_type);
     }
 
     let first_time = entries
@@ -213,23 +254,23 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     out.info(&format!("Last entry: {}", last_time));
     out.newline();
     out.info("Key Operations:");
-    out.info(&format!("  Generated: {}", key_gen));
-    out.info(&format!("  Imported: {}", key_import));
-    out.info(&format!("  Exported: {}", key_export));
-    out.info(&format!("  Deleted: {}", key_delete));
+    out.info(&format!("  Generated: {}", stats.key_gen));
+    out.info(&format!("  Imported: {}", stats.key_import));
+    out.info(&format!("  Exported: {}", stats.key_export));
+    out.info(&format!("  Deleted: {}", stats.key_delete));
     out.newline();
     out.info("Signing:");
-    out.info(&format!("  Successful: {}", sign_ok));
-    out.info(&format!("  Failed: {}", sign_fail));
+    out.info(&format!("  Successful: {}", stats.sign_ok));
+    out.info(&format!("  Failed: {}", stats.sign_fail));
     out.newline();
     out.info("FROST Operations:");
-    out.info(&format!("  Groups created: {}", frost_gen));
-    out.info(&format!("  Signatures (success): {}", frost_sign_ok));
-    out.info(&format!("  Signatures (failed): {}", frost_sign_fail));
+    out.info(&format!("  Groups created: {}", stats.frost_gen));
+    out.info(&format!("  Signatures (success): {}", stats.frost_sign_ok));
+    out.info(&format!("  Signatures (failed): {}", stats.frost_sign_fail));
     out.newline();
     out.info("Security:");
-    out.info(&format!("  Vault unlocks: {}", unlock));
-    out.info(&format!("  Auth failures: {}", auth_fail));
+    out.info(&format!("  Vault unlocks: {}", stats.unlock));
+    out.info(&format!("  Auth failures: {}", stats.auth_fail));
 
     Ok(())
 }

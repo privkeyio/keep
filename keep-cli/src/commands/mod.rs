@@ -17,34 +17,46 @@ use tracing::debug;
 
 use keep_core::error::{KeepError, Result};
 
-pub fn get_password(prompt: &str) -> Result<SecretString> {
-    if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
-        debug!("using password from KEEP_PASSWORD env var");
-        return Ok(SecretString::from(pw));
-    }
-    let pw = Password::with_theme(&ColorfulTheme::default())
+fn warn_env_password(var_name: &str) {
+    tracing::warn!(
+        "Using password from {} environment variable. \
+         Environment variables may be visible to other processes via /proc on Linux.",
+        var_name
+    );
+}
+
+fn password_from_env(var_name: &str) -> Option<SecretString> {
+    std::env::var(var_name).ok().map(|pw| {
+        debug!("using password from {} env var", var_name);
+        warn_env_password(var_name);
+        SecretString::from(pw)
+    })
+}
+
+fn read_password(prompt: &str) -> Result<String> {
+    Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
-    Ok(SecretString::from(pw))
+        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))
+}
+
+pub fn get_password(prompt: &str) -> Result<SecretString> {
+    if let Some(pw) = password_from_env("KEEP_PASSWORD") {
+        return Ok(pw);
+    }
+    read_password(prompt).map(SecretString::from)
 }
 
 pub fn get_hidden_password(prompt: &str) -> Result<SecretString> {
-    if let Ok(pw) = std::env::var("KEEP_HIDDEN_PASSWORD") {
-        debug!("using password from KEEP_HIDDEN_PASSWORD env var");
-        return Ok(SecretString::from(pw));
+    if let Some(pw) = password_from_env("KEEP_HIDDEN_PASSWORD") {
+        return Ok(pw);
     }
-    let pw = Password::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
-    Ok(SecretString::from(pw))
+    read_password(prompt).map(SecretString::from)
 }
 
 pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretString> {
-    if let Ok(pw) = std::env::var("KEEP_PASSWORD") {
-        debug!("using password from KEEP_PASSWORD env var");
-        return Ok(SecretString::from(pw));
+    if let Some(pw) = password_from_env("KEEP_PASSWORD") {
+        return Ok(pw);
     }
     let pw = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)

@@ -359,11 +359,19 @@ impl AuditLog {
     }
 
     fn read_entries(path: &Path, data_key: &SecretKey) -> Result<Vec<AuditEntry>> {
+        const MAX_ENTRIES: usize = 100_000;
+
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
 
         for (line_num, line) in reader.lines().enumerate() {
+            if entries.len() >= MAX_ENTRIES {
+                return Err(KeepError::Other(format!(
+                    "Audit log exceeds maximum of {} entries",
+                    MAX_ENTRIES
+                )));
+            }
             let line = line?;
             if line.is_empty() {
                 continue;
@@ -395,9 +403,57 @@ impl AuditLog {
 
     fn rewrite(&mut self, entries: &[AuditEntry], data_key: &SecretKey) -> Result<()> {
         let temp_path = self.path.with_extension("log.tmp");
-        let mut file = File::create(&temp_path)?;
-        let mut prev_hash = [0u8; 32];
+        let backup_path = self.path.with_extension("log.bak");
 
+        let final_hash = match self.write_entries_to_temp(&temp_path, entries, data_key) {
+            Ok(hash) => hash,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        };
+
+        if self.path.exists() {
+            if let Err(e) = std::fs::rename(&self.path, &backup_path) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(KeepError::Other(format!(
+                    "Failed to backup existing audit log: {}",
+                    e
+                )));
+            }
+        }
+
+        if let Err(e) = std::fs::rename(&temp_path, &self.path) {
+            if backup_path.exists() {
+                let _ = std::fs::rename(&backup_path, &self.path);
+            }
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(KeepError::Other(format!(
+                "Failed to replace audit log: {}",
+                e
+            )));
+        }
+
+        let _ = std::fs::remove_file(&backup_path);
+        self.last_hash = final_hash;
+        Ok(())
+    }
+
+    fn write_entries_to_temp(
+        &self,
+        temp_path: &Path,
+        entries: &[AuditEntry],
+        data_key: &SecretKey,
+    ) -> Result<[u8; 32]> {
+        let mut file = File::create(temp_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        let mut prev_hash = [0u8; 32];
         for entry in entries {
             let mut entry = entry.clone();
             entry.prev_hash = prev_hash;
@@ -413,9 +469,7 @@ impl AuditLog {
         }
 
         file.sync_all()?;
-        std::fs::rename(&temp_path, &self.path)?;
-        self.last_hash = prev_hash;
-        Ok(())
+        Ok(prev_hash)
     }
 
     /// Get the hash of the last entry in the chain.
