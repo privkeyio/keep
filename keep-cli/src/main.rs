@@ -869,23 +869,41 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             Ok(())
         }
         ConfigCommands::Init => {
+            use keep_core::error::KeepError;
+            use std::io::Write;
+
             let path = Config::default_path()?;
-            if path.exists() {
-                out.warn(&format!("Config file already exists: {}", path.display()));
-                return Ok(());
-            }
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    keep_core::error::KeepError::Other(format!(
-                        "Failed to create config directory: {}",
-                        e
-                    ))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| KeepError::Other(format!("Failed to create directory: {}", e)))?;
             }
+
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    out.warn(&format!("Config file already exists: {}", path.display()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(KeepError::Other(format!("Failed to create config: {}", e)));
+                }
+            };
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| KeepError::Other(format!("Failed to set permissions: {}", e)))?;
+            }
+
             let example = include_str!("../contrib/config.toml.example");
-            std::fs::write(&path, example).map_err(|e| {
-                keep_core::error::KeepError::Other(format!("Failed to write config file: {}", e))
-            })?;
+            file.write_all(example.as_bytes())
+                .map_err(|e| KeepError::Other(format!("Failed to write config: {}", e)))?;
+
             out.success(&format!("Created config file: {}", path.display()));
             Ok(())
         }

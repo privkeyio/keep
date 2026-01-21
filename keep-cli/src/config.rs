@@ -62,9 +62,12 @@ where
 {
     let relays: Vec<String> = Vec::deserialize(deserializer)?;
     for relay in &relays {
-        if !relay.starts_with("wss://") && !relay.starts_with("ws://") {
+        let parsed = url::Url::parse(relay).map_err(|e| {
+            serde::de::Error::custom(format!("Invalid relay URL '{}': {}", relay, e))
+        })?;
+        if parsed.scheme() != "wss" && parsed.scheme() != "ws" {
             return Err(serde::de::Error::custom(format!(
-                "Invalid relay URL: '{}'. Must start with wss:// or ws://",
+                "Invalid relay URL '{}': scheme must be wss:// or ws://",
                 relay
             )));
         }
@@ -76,9 +79,19 @@ fn deserialize_timeout<'de, D>(deserializer: D) -> std::result::Result<Option<u6
 where
     D: Deserializer<'de>,
 {
+    const MAX_TIMEOUT_SECS: u64 = 86400; // 24 hours
+
     let opt = Option::<u64>::deserialize(deserializer)?;
-    if opt == Some(0) {
-        return Err(serde::de::Error::custom("timeout must be greater than 0"));
+    if let Some(timeout) = opt {
+        if timeout == 0 {
+            return Err(serde::de::Error::custom("timeout must be greater than 0"));
+        }
+        if timeout > MAX_TIMEOUT_SECS {
+            return Err(serde::de::Error::custom(format!(
+                "timeout must not exceed {} seconds (24 hours)",
+                MAX_TIMEOUT_SECS
+            )));
+        }
     }
     Ok(opt)
 }
@@ -110,23 +123,17 @@ impl Config {
 
     pub fn from_file(path: &Path) -> Result<Self> {
         const MAX_CONFIG_SIZE: u64 = 1024 * 1024; // 1 MB
-        let metadata = std::fs::metadata(path).map_err(|e| {
-            KeepError::Other(format!(
-                "Failed to read config file {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
+
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| KeepError::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+
         if metadata.len() > MAX_CONFIG_SIZE {
             return Err(KeepError::Other("Config file too large".into()));
         }
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            KeepError::Other(format!(
-                "Failed to read config file {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
+
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| KeepError::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+
         Self::parse(&content)
     }
 
@@ -229,6 +236,26 @@ unknown_field = "value"
     fn test_zero_timeout_rejected() {
         let content = r#"
 timeout = 0
+"#;
+        let result = Config::parse(content);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_timeout_too_large_rejected() {
+        let content = r#"
+timeout = 86401
+"#;
+        let result = Config::parse(content);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("24 hours"));
+    }
+
+    #[test]
+    fn test_malformed_relay_url_rejected() {
+        let content = r#"
+relays = ["wss://not a valid url"]
 "#;
         let result = Config::parse(content);
         assert!(result.is_err());
