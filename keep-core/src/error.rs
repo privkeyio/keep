@@ -59,11 +59,11 @@ impl std::fmt::Display for ErrorCode {
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum StorageError {
-    #[error("[{code}] File not found: {path}")]
+    #[error("[{code}] File not found")]
     FileNotFound { code: ErrorCode, path: String },
-    #[error("[{code}] File already exists: {path}")]
+    #[error("[{code}] File already exists")]
     FileAlreadyExists { code: ErrorCode, path: String },
-    #[error("[{code}] Permission denied: {path}")]
+    #[error("[{code}] Permission denied")]
     PermissionDenied { code: ErrorCode, path: String },
     #[error("[{code}] Invalid file format: {reason}")]
     InvalidFormat { code: ErrorCode, reason: String },
@@ -167,6 +167,15 @@ impl StorageError {
             | Self::Migration { code, .. }
             | Self::Serialization { code, .. }
             | Self::HiddenVolumeFull { code } => *code,
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::FileNotFound { path, .. }
+            | Self::FileAlreadyExists { path, .. }
+            | Self::PermissionDenied { path, .. } => Some(path.as_str()),
+            _ => None,
         }
     }
 }

@@ -281,12 +281,18 @@ impl Server {
                 {
                     Ok(Some(s)) => Nip46Response::ok(id, &s),
                     Ok(None) => Nip46Response::ok(id, "ack"),
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "connect failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "get_public_key" => match handler.handle_get_public_key(app_pubkey).await {
                 Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
-                Err(e) => Nip46Response::error(id, &e.to_string()),
+                Err(e) => {
+                    warn!(error = %e, "get_public_key failed");
+                    Nip46Response::error(id, &sanitize_error_for_client(&e))
+                }
             },
             "sign_event" => {
                 let event_json = match request.params.first() {
@@ -320,9 +326,15 @@ impl Server {
                 match handler.handle_sign_event(app_pubkey, unsigned).await {
                     Ok(event) => match serde_json::to_string(&event) {
                         Ok(json) => Nip46Response::ok(id, &json),
-                        Err(e) => Nip46Response::error(id, &format!("Serialization failed: {}", e)),
+                        Err(e) => {
+                            warn!(error = %e, "sign_event serialization failed");
+                            Nip46Response::error(id, "Serialization failed")
+                        }
                     },
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "sign_event failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "nip44_encrypt" => {
@@ -331,14 +343,17 @@ impl Server {
                 }
                 let recipient = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
+                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
                 };
                 match handler
                     .handle_nip44_encrypt(app_pubkey, recipient, &request.params[1])
                     .await
                 {
                     Ok(ct) => Nip46Response::ok(id, &ct),
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "nip44_encrypt failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "nip44_decrypt" => {
@@ -347,14 +362,17 @@ impl Server {
                 }
                 let sender = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
+                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
                 };
                 match handler
                     .handle_nip44_decrypt(app_pubkey, sender, &request.params[1])
                     .await
                 {
                     Ok(pt) => Nip46Response::ok(id, &pt),
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "nip44_decrypt failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "nip04_encrypt" => {
@@ -363,14 +381,17 @@ impl Server {
                 }
                 let recipient = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
+                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
                 };
                 match handler
                     .handle_nip04_encrypt(app_pubkey, recipient, &request.params[1])
                     .await
                 {
                     Ok(ct) => Nip46Response::ok(id, &ct),
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "nip04_encrypt failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "nip04_decrypt" => {
@@ -379,14 +400,17 @@ impl Server {
                 }
                 let sender = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
-                    Err(e) => return Nip46Response::error(id, &format!("Invalid pubkey: {}", e)),
+                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
                 };
                 match handler
                     .handle_nip04_decrypt(app_pubkey, sender, &request.params[1])
                     .await
                 {
                     Ok(pt) => Nip46Response::ok(id, &pt),
-                    Err(e) => Nip46Response::error(id, &e.to_string()),
+                    Err(e) => {
+                        warn!(error = %e, "nip04_decrypt failed");
+                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    }
                 }
             }
             "ping" => Nip46Response::ok(id, "pong"),
@@ -440,5 +464,35 @@ impl Nip46Response {
             result: None,
             error: Some(error.to_string()),
         }
+    }
+}
+
+fn sanitize_error_for_client(e: &KeepError) -> &'static str {
+    match e {
+        KeepError::InvalidPassword => "Authentication failed",
+        KeepError::RateLimited(_) => "Rate limited",
+        KeepError::DecryptionFailed | KeepError::RotationFailed(_) => "Operation failed",
+        KeepError::KeyNotFound(_) => "Key not found",
+        KeepError::KeyAlreadyExists(_) => "Key already exists",
+        KeepError::InvalidNsec | KeepError::InvalidNpub => "Invalid key format",
+        KeepError::KeyringFull(_) => "Storage limit reached",
+        KeepError::Locked => "Signer locked",
+        KeepError::AlreadyExists(_) | KeepError::NotFound(_) => "Resource error",
+        KeepError::InvalidNetwork(_) => "Invalid network",
+        KeepError::Encryption(_) | KeepError::CryptoErr(_) => "Cryptographic operation failed",
+        KeepError::Database(_) | KeepError::Migration(_) | KeepError::StorageErr(_) => {
+            "Storage error"
+        }
+        KeepError::HomeNotFound | KeepError::Config(_) => "Configuration error",
+        KeepError::PermissionDenied(_) => "Permission denied",
+        KeepError::UserRejected => "User rejected",
+        KeepError::InvalidInput(_) => "Invalid input",
+        KeepError::NotImplemented(_) => "Not supported",
+        KeepError::Runtime(_) => "Internal error",
+        KeepError::Frost(_) | KeepError::FrostErr(_) => "Signing protocol error",
+        KeepError::NetworkErr(_) => "Network error",
+        KeepError::Serialization(_) => "Data format error",
+        KeepError::Io(_) => "IO error",
+        KeepError::Other(_) => "Unknown error",
     }
 }

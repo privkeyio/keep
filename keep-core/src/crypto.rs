@@ -39,8 +39,8 @@ pub fn disable_mlock() {
 
 fn warn_once() {
     if !MLOCK_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
-        eprintln!(
-            "Warning: Failed to lock memory. Secrets may be paged to disk.\n\
+        tracing::warn!(
+            "Failed to lock memory. Secrets may be paged to disk. \
              To fix: ulimit -l unlimited (or increase RLIMIT_MEMLOCK)"
         );
     }
