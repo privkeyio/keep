@@ -372,7 +372,9 @@ fn cmd_frost_network_sign_hardware(
     let mut message_arr = [0u8; 32];
     message_arr.copy_from_slice(&message_bytes);
 
-    let session_id: [u8; 32] = rand::random();
+    let mut session_id = [0u8; 32];
+    ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut session_id)
+        .expect("OS RNG failed");
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
@@ -432,20 +434,19 @@ fn cmd_frost_network_sign_hardware(
         ));
     }
 
-    if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
-        return Err(KeepError::FrostErr(keep_core::error::FrostError::session(
-            "nonce has already been used - aborting to prevent key compromise",
-        )));
-    }
-
-    nonce_store
-        .add_nonce(group_npub, &commitment_hex)
+    if !nonce_store
+        .check_and_add_nonce(group_npub, &commitment_hex)
         .map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::database(format!(
                 "nonce tracking: {}",
                 e
             )))
-        })?;
+        })?
+    {
+        return Err(KeepError::FrostErr(keep_core::error::FrostError::session(
+            "nonce has already been used - aborting to prevent key compromise",
+        )));
+    }
 
     out.field("Share index", &our_index.to_string());
     out.field("Commitment", &commitment_hex);
@@ -1280,8 +1281,12 @@ pub fn cmd_frost_network_nonce_precommit(
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
     for i in 0..count {
-        let dummy_session: [u8; 32] = rand::random();
-        let dummy_message: [u8; 32] = rand::random();
+        let mut dummy_session = [0u8; 32];
+        let mut dummy_message = [0u8; 32];
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session)
+            .expect("OS RNG failed");
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message)
+            .expect("OS RNG failed");
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
             .map_err(|e| {

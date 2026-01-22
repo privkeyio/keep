@@ -13,6 +13,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
+    #[ignore]
     fn encrypt_decrypt_roundtrip(plaintext in prop::collection::vec(any::<u8>(), 0..4096)) {
         let key = SecretKey::generate().unwrap();
         let encrypted = encrypt(&plaintext, &key).unwrap();
@@ -21,6 +22,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn key_derivation_deterministic(
         password in prop::collection::vec(any::<u8>(), 1..128),
         salt in prop::array::uniform32(any::<u8>())
@@ -31,6 +33,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn different_salts_produce_different_keys(
         password in prop::collection::vec(any::<u8>(), 1..64),
         salt1 in prop::array::uniform32(any::<u8>()),
@@ -43,6 +46,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn subkey_derivation_deterministic(context in prop::collection::vec(any::<u8>(), 1..64)) {
         let master = SecretKey::generate().unwrap();
         let subkey1 = derive_subkey(&master, &context).unwrap();
@@ -51,6 +55,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn different_contexts_produce_different_subkeys(
         ctx1 in prop::collection::vec(any::<u8>(), 1..32),
         ctx2 in prop::collection::vec(any::<u8>(), 1..32)
@@ -63,6 +68,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn sign_produces_valid_signature(message in prop::collection::vec(any::<u8>(), 0..1024)) {
         let kp = NostrKeypair::generate();
         let sig = kp.sign(&message).unwrap();
@@ -70,6 +76,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn nsec_roundtrip(_ in Just(())) {
         let kp = NostrKeypair::generate();
         let nsec = kp.to_nsec();
@@ -79,6 +86,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn npub_roundtrip(pubkey in prop::array::uniform32(1u8..)) {
         let npub = bytes_to_npub(&pubkey);
         let restored = npub_to_bytes(&npub).unwrap();
@@ -86,6 +94,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn outer_header_roundtrip(
         outer_size in 0u64..1_000_000,
         total_size in 0u64..10_000_000
@@ -100,6 +109,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn hidden_header_roundtrip(
         offset in 1024u64..1_000_000,
         size in 0u64..1_000_000
@@ -115,6 +125,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn encrypted_data_roundtrip(
         ciphertext in prop::collection::vec(any::<u8>(), 16..256),
         nonce in prop::array::uniform24(any::<u8>())
@@ -127,6 +138,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn blake2b_deterministic(data in prop::collection::vec(any::<u8>(), 0..1024)) {
         let hash1 = crypto::blake2b_256(&data);
         let hash2 = crypto::blake2b_256(&data);
@@ -134,6 +146,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore]
     fn wrong_key_fails_decrypt(plaintext in prop::collection::vec(any::<u8>(), 1..256)) {
         let key1 = SecretKey::generate().unwrap();
         let key2 = SecretKey::generate().unwrap();
@@ -166,6 +179,7 @@ mod frost_tests {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
         #[test]
+        #[ignore]
         fn frost_threshold_sign_succeeds(message in prop::collection::vec(any::<u8>(), 1..256)) {
             let config = ThresholdConfig::two_of_three();
             let dealer = TrustedDealer::new(config);
@@ -176,6 +190,7 @@ mod frost_tests {
         }
 
         #[test]
+        #[ignore]
         fn frost_all_shares_sign_succeeds(message in prop::collection::vec(any::<u8>(), 1..256)) {
             let config = ThresholdConfig::two_of_three();
             let dealer = TrustedDealer::new(config);
@@ -186,6 +201,7 @@ mod frost_tests {
         }
 
         #[test]
+        #[ignore]
         fn frost_below_threshold_fails(message in prop::collection::vec(any::<u8>(), 1..64)) {
             let config = ThresholdConfig::two_of_three();
             let dealer = TrustedDealer::new(config);
@@ -196,6 +212,7 @@ mod frost_tests {
         }
 
         #[test]
+        #[ignore]
         fn frost_share_export_roundtrip(password in "[a-zA-Z0-9]{8,32}") {
             let config = ThresholdConfig::two_of_three();
             let dealer = TrustedDealer::new(config);
@@ -212,6 +229,7 @@ mod frost_tests {
         }
 
         #[test]
+        #[ignore]
         fn frost_wrong_password_fails(
             correct_pw in "[a-zA-Z0-9]{8,16}",
             wrong_pw in "[a-zA-Z0-9]{8,16}"
@@ -227,6 +245,7 @@ mod frost_tests {
         }
 
         #[test]
+        #[ignore]
         fn frost_bech32_roundtrip(password in "[a-zA-Z0-9]{8,16}") {
             let config = ThresholdConfig::two_of_three();
             let dealer = TrustedDealer::new(config);

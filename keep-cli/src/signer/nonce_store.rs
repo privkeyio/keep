@@ -131,6 +131,36 @@ impl NonceStore {
         })
     }
 
+    pub fn check_and_add_nonce(&mut self, group: &str, commitment: &str) -> Result<bool> {
+        let group = group.to_string();
+        let commitment = commitment.to_string();
+
+        self.with_lock(|data| {
+            let entries = data.nonces.entry(group).or_default();
+            if entries.iter().any(|e| e.commitment == commitment && e.used) {
+                return Ok(false);
+            }
+            if entries.iter().any(|e| e.commitment == commitment) {
+                return Ok(true);
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            entries.push(NonceEntry {
+                commitment,
+                created_at: now,
+                used: false,
+                used_at: None,
+                session_id: None,
+            });
+            Ok(true)
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn is_nonce_used(&self, group: &str, commitment: &str) -> bool {
         self.data
             .nonces
