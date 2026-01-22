@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
-use keep_core::error::{KeepError, Result};
+use keep_core::error::{KeepError, NetworkError, Result, StorageError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionRequest {
@@ -93,7 +93,7 @@ impl WardenClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| KeepError::Other(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| NetworkError::connection(format!("http client: {}", e)))?;
 
         Ok(Self {
             base_url,
@@ -113,7 +113,7 @@ impl WardenClient {
         let response = req
             .send()
             .await
-            .map_err(|e| KeepError::Other(format!("Warden request failed: {}", e)))?;
+            .map_err(|e| NetworkError::request(format!("warden: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -121,16 +121,15 @@ impl WardenClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(KeepError::Other(format!(
-                "Warden returned {}: {}",
-                status, body
-            )));
+            return Err(
+                NetworkError::response(format!("warden returned {}: {}", status, body)).into(),
+            );
         }
 
         response
             .json()
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to parse Warden response: {}", e)))
+            .map_err(|e| StorageError::invalid_format(format!("warden response: {}", e)).into())
     }
 }
 
@@ -204,7 +203,7 @@ pub async fn wait_for_approval(
 
     loop {
         if start.elapsed() >= timeout {
-            return Err(KeepError::Other("Approval timeout exceeded".to_string()));
+            return Err(NetworkError::timeout("approval timeout exceeded").into());
         }
 
         let url = format!(
@@ -220,7 +219,7 @@ pub async fn wait_for_approval(
         let response = req
             .send()
             .await
-            .map_err(|e| KeepError::Other(format!("Workflow status check failed: {}", e)))?;
+            .map_err(|e| NetworkError::request(format!("workflow status: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -228,10 +227,11 @@ pub async fn wait_for_approval(
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            return Err(KeepError::Other(format!(
-                "Workflow status check failed: status={} body={}",
+            return Err(NetworkError::response(format!(
+                "workflow status check: status={} body={}",
                 status, body
-            )));
+            ))
+            .into());
         }
 
         #[derive(Deserialize)]
@@ -242,17 +242,17 @@ pub async fn wait_for_approval(
         let response: WorkflowStatusResponse = response
             .json()
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to parse status: {}", e)))?;
+            .map_err(|e| StorageError::invalid_format(format!("workflow status: {}", e)))?;
 
         match response.status.as_str() {
             "APPROVED" => return Ok(true),
             "REJECTED" => return Ok(false),
-            "TIMED_OUT" => return Err(KeepError::Other("Approval workflow timed out".to_string())),
-            "CANCELLED" => return Err(KeepError::Other("Approval workflow cancelled".to_string())),
+            "TIMED_OUT" => return Err(NetworkError::timeout("approval workflow timed out").into()),
+            "CANCELLED" => return Err(KeepError::UserRejected),
             "PENDING" => {}
             other => {
-                return Err(KeepError::Other(format!(
-                    "Unknown workflow status: {}",
+                return Err(KeepError::Runtime(format!(
+                    "unknown workflow status: {}",
                     other
                 )))
             }

@@ -21,7 +21,7 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     use std::io::{BufRead, Write};
 
     if hidden {
-        return Err(KeepError::Other(
+        return Err(KeepError::NotImplemented(
             "MCP server not supported for hidden volumes".into(),
         ));
     }
@@ -53,13 +53,13 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| KeepError::Other(format!("Failed to create runtime: {}", e)))?;
+        .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     let (token, session_id) = rt.block_on(async {
         let (token, session_id) = server
             .create_session(config)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to create session: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("create session: {}", e)))?;
         server.set_session(token.clone(), session_id.clone()).await;
         Ok::<_, KeepError>((token, session_id))
     })?;
@@ -73,17 +73,14 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     let mut stdout = std::io::stdout();
 
     for line in stdin.lock().lines() {
-        let line = line.map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
 
         let response = server.handle_request(&line);
-        writeln!(stdout, "{}", response)
-            .map_err(|e| KeepError::Other(format!("Write error: {}", e)))?;
-        stdout
-            .flush()
-            .map_err(|e| KeepError::Other(format!("Flush error: {}", e)))?;
+        writeln!(stdout, "{}", response)?;
+        stdout.flush()?;
     }
 
     Ok(())

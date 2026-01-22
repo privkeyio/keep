@@ -21,14 +21,21 @@ pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     out.newline();
 
     let spinner = out.spinner("Connecting to hardware signer...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Sending ping...");
-    let version = signer
-        .ping()
-        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    let version = signer.ping().map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware ping: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     out.success(&format!("Hardware signer v{} - OK", version));
@@ -42,14 +49,21 @@ pub fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
     out.newline();
 
     let spinner = out.spinner("Connecting...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Listing shares...");
-    let shares = signer
-        .list_shares()
-        .map_err(|e| KeepError::Other(format!("List failed: {}", e)))?;
+    let shares = signer.list_shares().map_err(|e| {
+        KeepError::FrostErr(keep_core::error::FrostError::session(format!(
+            "list shares: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     if shares.is_empty() {
@@ -141,21 +155,31 @@ pub fn cmd_frost_hardware_import(
     let share_hex: Zeroizing<String> = Zeroizing::new(hex::encode(&*hardware_share));
 
     let spinner = out.spinner("Connecting to hardware...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
-    let version = signer
-        .ping()
-        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    let version = signer.ping().map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware ping: {}",
+            e
+        )))
+    })?;
     spinner.finish();
     out.field("Hardware version", &version);
 
     let spinner = out.spinner("Importing share to hardware...");
-    signer
-        .import_share(group_npub, &share_hex)
-        .map_err(|e| KeepError::Other(format!("Import failed: {}", e)))?;
+    signer.import_share(group_npub, &share_hex).map_err(|e| {
+        KeepError::FrostErr(keep_core::error::FrostError::invalid_share(format!(
+            "import: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     out.success("Share imported successfully");
@@ -177,14 +201,21 @@ pub fn cmd_frost_hardware_delete(out: &Output, device: &str, group_npub: &str) -
     }
 
     let spinner = out.spinner("Connecting...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Deleting share...");
-    signer
-        .delete_share(group_npub)
-        .map_err(|e| KeepError::Other(format!("Delete failed: {}", e)))?;
+    signer.delete_share(group_npub).map_err(|e| {
+        KeepError::FrostErr(keep_core::error::FrostError::session(format!(
+            "delete: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     out.success("Share deleted from hardware");
@@ -199,9 +230,11 @@ pub fn cmd_frost_hardware_sign(
     commitments_hex: &str,
 ) -> Result<()> {
     let session_id_bytes = hex::decode(session_id_hex)
-        .map_err(|_| KeepError::Other("Invalid session_id hex".into()))?;
+        .map_err(|_| KeepError::InvalidInput("invalid session_id hex".into()))?;
     if session_id_bytes.len() != 32 {
-        return Err(KeepError::Other("session_id must be 32 bytes".into()));
+        return Err(KeepError::InvalidInput(
+            "session_id must be 32 bytes".into(),
+        ));
     }
     let mut session_id = [0u8; 32];
     session_id.copy_from_slice(&session_id_bytes);
@@ -214,14 +247,23 @@ pub fn cmd_frost_hardware_sign(
     out.newline();
 
     let spinner = out.spinner("Connecting...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Generating signature share...");
     let (sig_share, index) = signer
         .frost_sign(group_npub, &session_id, commitments_hex)
-        .map_err(|e| KeepError::Other(format!("Sign failed: {}", e)))?;
+        .map_err(|e| {
+            KeepError::FrostErr(keep_core::error::FrostError::session(format!(
+                "sign: {}",
+                e
+            )))
+        })?;
     spinner.finish();
 
     out.field("Share index", &index.to_string());
@@ -258,24 +300,34 @@ pub fn cmd_frost_hardware_export(
         "Confirm passphrase",
     )?;
     if passphrase.expose_secret().len() < 8 {
-        return Err(KeepError::Other(
-            "Passphrase must be at least 8 characters".into(),
+        return Err(KeepError::InvalidInput(
+            "passphrase must be at least 8 characters".into(),
         ));
     }
 
     let spinner = out.spinner("Connecting...");
-    let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+    let mut signer = HardwareSigner::new(device).map_err(|e| {
+        KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+            "hardware: {}",
+            e
+        )))
+    })?;
     spinner.finish();
 
     let spinner = out.spinner("Exporting share...");
     let exported = signer
         .export_share(group_npub, passphrase.expose_secret())
-        .map_err(|e| KeepError::Other(format!("Export failed: {}", e)))?;
+        .map_err(|e| {
+            KeepError::FrostErr(keep_core::error::FrostError::session(format!(
+                "export: {}",
+                e
+            )))
+        })?;
     spinner.finish();
 
-    let json_str = serde_json::to_string_pretty(&exported)
-        .map_err(|e| KeepError::Other(format!("Failed to serialize JSON: {}", e)))?;
+    let json_str = serde_json::to_string_pretty(&exported).map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::serialization(e.to_string()))
+    })?;
 
     if let Some(path) = output_file {
         #[cfg(unix)]
@@ -288,16 +340,33 @@ pub fn cmd_frost_hardware_export(
                 .truncate(true)
                 .mode(0o600)
                 .open(path)
-                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
-            file.write_all(json_str.as_bytes())
-                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+                .map_err(|e| {
+                    KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                        "create file: {}",
+                        e
+                    )))
+                })?;
+            file.write_all(json_str.as_bytes()).map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "write file: {}",
+                    e
+                )))
+            })?;
         }
         #[cfg(not(unix))]
         {
-            let mut file = std::fs::File::create(path)
-                .map_err(|e| KeepError::Other(format!("Failed to create file: {}", e)))?;
-            file.write_all(json_str.as_bytes())
-                .map_err(|e| KeepError::Other(format!("Failed to write file: {}", e)))?;
+            let mut file = std::fs::File::create(path).map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "create file: {}",
+                    e
+                )))
+            })?;
+            file.write_all(json_str.as_bytes()).map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "write file: {}",
+                    e
+                )))
+            })?;
         }
         out.newline();
         out.field("Share index", &exported.share_index.to_string());

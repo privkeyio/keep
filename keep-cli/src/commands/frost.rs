@@ -229,16 +229,19 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     let mut total_bytes = 0usize;
     loop {
         let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| KeepError::Other(format!("Failed to read input: {}", e)))?;
+        std::io::stdin().read_line(&mut line).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read input: {}",
+                e
+            )))
+        })?;
         if line.trim().is_empty() {
             break;
         }
         total_bytes = total_bytes.saturating_add(line.len());
         if total_bytes > MAX_JSON_BYTES {
-            return Err(KeepError::Other(format!(
-                "Input exceeds maximum size of {} bytes",
+            return Err(KeepError::InvalidInput(format!(
+                "input exceeds maximum size of {} bytes",
                 MAX_JSON_BYTES
             )));
         }
@@ -293,8 +296,8 @@ pub async fn check_warden_policy(
                 "Policy denied signing: {} (rule: {})",
                 reason, rule_id
             ));
-            Err(KeepError::Other(format!(
-                "Warden policy denied: {} (rule: {})",
+            Err(KeepError::PermissionDenied(format!(
+                "warden policy denied: {} (rule: {})",
                 reason, rule_id
             )))
         }
@@ -319,7 +322,7 @@ pub async fn check_warden_policy(
                 MAX_WAIT_SECS
             ))?;
             if !confirm {
-                return Err(KeepError::Other("Approval cancelled by user".into()));
+                return Err(KeepError::UserRejected);
             }
 
             let spinner = out.spinner("Waiting for approval...");
@@ -333,7 +336,7 @@ pub async fn check_warden_policy(
                 }
                 Ok(false) => {
                     spinner.finish();
-                    Err(KeepError::Other("Approval was denied".into()))
+                    Err(KeepError::PermissionDenied("approval was denied".into()))
                 }
                 Err(e) => {
                     spinner.finish();
@@ -360,19 +363,19 @@ pub fn cmd_frost_sign(
         "FROST signing"
     );
 
-    let message =
-        hex::decode(message_hex).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+    let message = hex::decode(message_hex)
+        .map_err(|_| KeepError::InvalidInput("invalid message hex".into()))?;
 
     #[cfg(feature = "warden")]
     if let Some(url) = warden_url {
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
         rt.block_on(check_warden_policy(out, url, group_id, message_hex))?;
     }
 
     #[cfg(not(feature = "warden"))]
     if warden_url.is_some() {
-        return Err(KeepError::Other(
+        return Err(KeepError::NotImplemented(
             "Warden support not compiled. Rebuild with --features warden".into(),
         ));
     }
@@ -419,11 +422,9 @@ pub fn cmd_frost_sign(
     }
 
     if our_shares.len() < threshold as usize {
-        return Err(KeepError::Other(format!(
-            "Need {} shares to sign, only {} local. Use --interactive for multi-device signing.",
-            threshold,
-            our_shares.len()
-        )));
+        return Err(KeepError::FrostErr(
+            keep_core::error::FrostError::threshold_not_met(threshold, our_shares.len() as u16),
+        ));
     }
 
     out.info(&format!(
@@ -500,10 +501,12 @@ fn cmd_frost_sign_interactive(
         std::io::stdout().flush().ok();
 
         let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        stdin.lock().read_line(&mut line).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read input: {}",
+                e
+            )))
+        })?;
 
         let msg = FrostMessage::from_json(line.trim())?;
         if msg.session_id != hex::encode(session_id) {
@@ -545,10 +548,12 @@ fn cmd_frost_sign_interactive(
         std::io::stdout().flush().ok();
 
         let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        stdin.lock().read_line(&mut line).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read input: {}",
+                e
+            )))
+        })?;
 
         let msg = FrostMessage::from_json(line.trim())?;
         if msg.session_id != hex::encode(session_id) {

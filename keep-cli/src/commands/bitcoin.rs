@@ -36,7 +36,7 @@ pub fn cmd_bitcoin_address(
     let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
-        .map_err(|e| KeepError::Other(e.to_string()));
+        .map_err(|e| KeepError::Runtime(e.to_string()));
     secret.zeroize();
     let signer = signer?;
 
@@ -49,7 +49,7 @@ pub fn cmd_bitcoin_address(
     for i in 0..count {
         let addr = signer
             .get_receive_address(i)
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+            .map_err(|e| KeepError::Runtime(e.to_string()))?;
         out.info(&format!("Index {}: {}", i, addr));
     }
 
@@ -79,13 +79,13 @@ pub fn cmd_bitcoin_descriptor(
     let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
-        .map_err(|e| KeepError::Other(e.to_string()));
+        .map_err(|e| KeepError::Runtime(e.to_string()));
     secret.zeroize();
     let signer = signer?;
 
     let export = signer
         .export_descriptor(account)
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     out.newline();
     out.header("Output Descriptor (BIP-86)");
@@ -100,7 +100,7 @@ pub fn cmd_bitcoin_descriptor(
     out.info("Internal descriptor (change):");
     let internal = export
         .internal_descriptor()
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
     println!("{}", internal);
 
     Ok(())
@@ -130,27 +130,35 @@ pub fn cmd_bitcoin_sign(
     let net = parse_network(network)?;
 
     let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, net)
-        .map_err(|e| KeepError::Other(e.to_string()));
+        .map_err(|e| KeepError::Runtime(e.to_string()));
     secret.zeroize();
     let signer = signer?;
 
-    let psbt_data = std::fs::read_to_string(psbt_path)
-        .map_err(|e| KeepError::Other(format!("Failed to read PSBT: {}", e)))?;
+    let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "read PSBT: {}",
+            e
+        )))
+    })?;
 
     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     let spinner = out.spinner("Signing PSBT...");
     let signed_count = signer
         .sign_psbt(&mut psbt)
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
     spinner.finish();
 
     let signed_base64 = keep_bitcoin::psbt::serialize_psbt_base64(&psbt);
 
     if let Some(output) = output_path {
-        std::fs::write(output, &signed_base64)
-            .map_err(|e| KeepError::Other(format!("Failed to write output: {}", e)))?;
+        std::fs::write(output, &signed_base64).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "write output: {}",
+                e
+            )))
+        })?;
         out.newline();
         out.success(&format!("Signed {} input(s)", signed_count));
         out.field("Output", output);
@@ -165,20 +173,24 @@ pub fn cmd_bitcoin_sign(
 }
 
 pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<()> {
-    let psbt_data = std::fs::read_to_string(psbt_path)
-        .map_err(|e| KeepError::Other(format!("Failed to read PSBT: {}", e)))?;
+    let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "read PSBT: {}",
+            e
+        )))
+    })?;
 
     let psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     let net = parse_network(network)?;
     let mut dummy_secret = [1u8; 32];
     let signer = keep_bitcoin::BitcoinSigner::new(&mut dummy_secret, net)
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     let analysis = signer
         .analyze_psbt(&psbt)
-        .map_err(|e| KeepError::Other(e.to_string()))?;
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     out.newline();
     out.header("PSBT Analysis");

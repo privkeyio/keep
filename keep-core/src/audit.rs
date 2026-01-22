@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, SecretKey};
-use crate::error::{KeepError, Result};
+use crate::error::{Result, StorageError};
 
 /// Type of audit event being logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +281,7 @@ impl AuditLog {
         entry.hash = entry.compute_hash();
 
         let serialized = serde_json::to_vec(&entry)
-            .map_err(|e| KeepError::Other(format!("Failed to serialize audit entry: {}", e)))?;
+            .map_err(|e| StorageError::serialization(format!("audit entry: {}", e)))?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let line = format!("{}\n", STANDARD.encode(encrypted.to_bytes()));
@@ -350,7 +350,7 @@ impl AuditLog {
     pub fn export(&self, data_key: &SecretKey) -> Result<String> {
         let entries = self.read_all(data_key)?;
         serde_json::to_string_pretty(&entries)
-            .map_err(|e| KeepError::Other(format!("Failed to export audit log: {}", e)))
+            .map_err(|e| StorageError::serialization(format!("export audit log: {}", e)).into())
     }
 
     fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
@@ -367,21 +367,18 @@ impl AuditLog {
 
         for (line_num, line) in reader.lines().enumerate() {
             if entries.len() >= MAX_ENTRIES {
-                return Err(KeepError::Other(format!(
-                    "Audit log exceeds maximum of {} entries",
+                return Err(StorageError::io(format!(
+                    "audit log exceeds maximum of {} entries",
                     MAX_ENTRIES
-                )));
+                ))
+                .into());
             }
             let line = line?;
             if line.is_empty() {
                 continue;
             }
             let entry = Self::decrypt_line(&line, data_key).map_err(|e| {
-                KeepError::Other(format!(
-                    "Audit log corrupted or tampered at line {}: {}",
-                    line_num + 1,
-                    e
-                ))
+                StorageError::corrupted(format!("audit log at line {}: {}", line_num + 1, e))
             })?;
             entries.push(entry);
         }
@@ -392,13 +389,13 @@ impl AuditLog {
     fn decrypt_line(line: &str, data_key: &SecretKey) -> Result<AuditEntry> {
         let bytes = STANDARD
             .decode(line)
-            .map_err(|e| KeepError::Other(format!("Failed to decode audit line: {}", e)))?;
+            .map_err(|e| StorageError::invalid_format(format!("audit line: {}", e)))?;
 
         let encrypted = crypto::EncryptedData::from_bytes(&bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         serde_json::from_slice(&decrypted.as_slice()?)
-            .map_err(|e| KeepError::Other(format!("Failed to parse audit entry: {e}")))
+            .map_err(|e| StorageError::invalid_format(format!("audit entry: {}", e)).into())
     }
 
     fn rewrite(&mut self, entries: &[AuditEntry], data_key: &SecretKey) -> Result<()> {
@@ -416,10 +413,7 @@ impl AuditLog {
         if self.path.exists() {
             if let Err(e) = std::fs::rename(&self.path, &backup_path) {
                 let _ = std::fs::remove_file(&temp_path);
-                return Err(KeepError::Other(format!(
-                    "Failed to backup existing audit log: {}",
-                    e
-                )));
+                return Err(StorageError::io(format!("backup existing audit log: {}", e)).into());
             }
         }
 
@@ -428,10 +422,7 @@ impl AuditLog {
                 let _ = std::fs::rename(&backup_path, &self.path);
             }
             let _ = std::fs::remove_file(&temp_path);
-            return Err(KeepError::Other(format!(
-                "Failed to replace audit log: {}",
-                e
-            )));
+            return Err(StorageError::io(format!("replace audit log: {}", e)).into());
         }
 
         let _ = std::fs::remove_file(&backup_path);
@@ -460,7 +451,7 @@ impl AuditLog {
             entry.hash = entry.compute_hash();
 
             let serialized = serde_json::to_vec(&entry)
-                .map_err(|e| KeepError::Other(format!("Failed to serialize: {}", e)))?;
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
 
             let encrypted = crypto::encrypt(&serialized, data_key)?;
             let line = format!("{}\n", STANDARD.encode(encrypted.to_bytes()));

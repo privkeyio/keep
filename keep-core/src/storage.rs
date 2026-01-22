@@ -16,7 +16,7 @@ use tracing::{debug, trace, warn};
 
 use crate::backend::{RedbBackend, StorageBackend, KEYS_TABLE, SHARES_TABLE};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
-use crate::error::{KeepError, Result};
+use crate::error::{KeepError, Result, StorageError};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
@@ -50,8 +50,8 @@ const ARGON2_PARALLELISM: Argon2Bounds = Argon2Bounds { min: 1, max: 64 };
 
 fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Result<()> {
     if value < bounds.min || value > bounds.max {
-        return Err(KeepError::Other(format!(
-            "Invalid Argon2 {} parameter: {} (must be {}-{})",
+        return Err(KeepError::InvalidInput(format!(
+            "argon2 {} parameter: {} (must be {}-{})",
             name, value, bounds.min, bounds.max
         )));
     }
@@ -117,12 +117,12 @@ impl Header {
         magic.copy_from_slice(&bytes[0..8]);
 
         if magic != *HEADER_MAGIC {
-            return Err(KeepError::Other("Invalid keep file".into()));
+            return Err(StorageError::invalid_format("invalid keep file magic").into());
         }
 
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
         if version > HEADER_VERSION {
-            return Err(KeepError::Other("Unsupported version".into()));
+            return Err(StorageError::invalid_format("unsupported version").into());
         }
 
         let mut salt = [0u8; SALT_SIZE];
@@ -241,7 +241,7 @@ impl Storage {
         let header_bytes = fs::read(&header_path)?;
 
         if header_bytes.len() != HEADER_SIZE {
-            return Err(KeepError::Other("Invalid header size".into()));
+            return Err(StorageError::invalid_format("invalid header size").into());
         }
 
         let mut bytes = [0u8; HEADER_SIZE];

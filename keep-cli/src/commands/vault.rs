@@ -39,8 +39,8 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
     let outer_password = get_password_with_confirm(outer_prompt, outer_confirm)?;
 
     if outer_password.expose_secret().len() < 8 {
-        return Err(KeepError::Other(
-            "Password must be at least 8 characters".into(),
+        return Err(KeepError::InvalidInput(
+            "password must be at least 8 characters".into(),
         ));
     }
 
@@ -54,19 +54,24 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
                 .with_prompt("Enter HIDDEN password (must be different!)")
                 .with_confirmation("Confirm HIDDEN password", "Passwords don't match")
                 .interact()
-                .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
+                .map_err(|e| {
+                    KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                        "read password: {}",
+                        e
+                    )))
+                })?;
             SecretString::from(pw)
         };
 
         if hp.expose_secret() == outer_password.expose_secret() {
-            return Err(KeepError::Other(
-                "HIDDEN password must be DIFFERENT from OUTER password!".into(),
+            return Err(KeepError::InvalidInput(
+                "HIDDEN password must be DIFFERENT from OUTER password".into(),
             ));
         }
 
         if hp.expose_secret().len() < 8 {
-            return Err(KeepError::Other(
-                "Password must be at least 8 characters".into(),
+            return Err(KeepError::InvalidInput(
+                "password must be at least 8 characters".into(),
             ));
         }
 
@@ -599,8 +604,8 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
     debug!("rotating password");
 
     if is_hidden_vault(path) {
-        return Err(KeepError::Other(
-            "Password rotation is not supported for hidden vaults. Use the outer vault instead."
+        return Err(KeepError::NotImplemented(
+            "password rotation not supported for hidden vaults - use the outer vault instead"
                 .into(),
         ));
     }
@@ -610,8 +615,8 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
     let new_password = get_password_with_confirm("Enter new password", "Confirm new password")?;
 
     if new_password.expose_secret().len() < 8 {
-        return Err(KeepError::Other(
-            "Password must be at least 8 characters".into(),
+        return Err(KeepError::InvalidInput(
+            "password must be at least 8 characters".into(),
         ));
     }
 
@@ -635,8 +640,8 @@ pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
     debug!("rotating data key");
 
     if is_hidden_vault(path) {
-        return Err(KeepError::Other(
-            "Data key rotation is not supported for hidden vaults. Use the outer vault instead."
+        return Err(KeepError::NotImplemented(
+            "data key rotation not supported for hidden vaults - use the outer vault instead"
                 .into(),
         ));
     }

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
-use keep_core::error::{KeepError, Result};
+use keep_core::error::{KeepError, Result, StorageError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,23 +126,24 @@ impl Config {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        const MAX_CONFIG_SIZE: u64 = 1024 * 1024; // 1 MB
+        const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
         let metadata = std::fs::metadata(path)
-            .map_err(|e| KeepError::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+            .map_err(|e| StorageError::io(format!("read {}: {}", path.display(), e)))?;
 
         if metadata.len() > MAX_CONFIG_SIZE {
-            return Err(KeepError::Other("Config file too large".into()));
+            return Err(KeepError::InvalidInput("config file too large".into()));
         }
 
         let content = std::fs::read_to_string(path)
-            .map_err(|e| KeepError::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+            .map_err(|e| StorageError::io(format!("read {}: {}", path.display(), e)))?;
 
         Self::parse(&content)
     }
 
     pub fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content).map_err(|e| KeepError::Other(format!("Invalid config: {}", e)))
+        toml::from_str(content)
+            .map_err(|e| StorageError::invalid_format(format!("config: {}", e)).into())
     }
 
     pub fn default_path() -> Result<PathBuf> {

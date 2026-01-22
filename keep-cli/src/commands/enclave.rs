@@ -107,15 +107,18 @@ pub fn cmd_enclave_verify(
         rand::Rng::fill(&mut rand::rng(), &mut nonce);
 
         let spinner = out.spinner("Fetching attestation...");
-        let attestation_doc = client
-            .get_attestation(nonce)
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let attestation_doc = client.get_attestation(nonce).map_err(|e| {
+            KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+                "enclave: {}",
+                e
+            )))
+        })?;
         spinner.finish();
 
         let expected_pcrs = if let (Some(p0), Some(p1), Some(p2)) = (pcr0, pcr1, pcr2) {
             Some(
                 keep_enclave_host::ExpectedPcrs::from_hex(p0, p1, p2)
-                    .map_err(|e| KeepError::Other(e.to_string()))?,
+                    .map_err(|e| KeepError::InvalidInput(format!("invalid PCR hex: {}", e)))?,
             )
         } else {
             None
@@ -167,10 +170,10 @@ pub fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool)
                 name: key_name,
             } => {
                 let pubkey_arr: [u8; 32] = pubkey.as_slice().try_into().map_err(|_| {
-                    KeepError::Other(format!(
-                        "Invalid pubkey length: expected 32, got {}",
+                    KeepError::CryptoErr(keep_core::error::CryptoError::invalid_key(format!(
+                        "expected 32 bytes, got {}",
                         pubkey.len()
-                    ))
+                    )))
                 })?;
                 let npub = keep_core::keys::bytes_to_npub(&pubkey_arr);
                 out.success("Key generated in mock enclave!");
@@ -193,16 +196,19 @@ pub fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool)
         let client = keep_enclave_host::EnclaveClient::with_cid(cid);
 
         let spinner = out.spinner("Generating key in enclave...");
-        let pubkey = client
-            .generate_key(name)
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let pubkey = client.generate_key(name).map_err(|e| {
+            KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+                "enclave: {}",
+                e
+            )))
+        })?;
         spinner.finish();
 
         let pubkey_arr: [u8; 32] = pubkey.as_slice().try_into().map_err(|_| {
-            KeepError::Other(format!(
-                "Invalid pubkey length: expected 32, got {}",
+            KeepError::CryptoErr(keep_core::error::CryptoError::invalid_key(format!(
+                "expected 32 bytes, got {}",
                 pubkey.len()
-            ))
+            )))
         })?;
         let npub = keep_core::keys::bytes_to_npub(&pubkey_arr);
 
@@ -232,7 +238,7 @@ pub fn cmd_enclave_sign(
     out.header("Sign in Enclave");
 
     let message_bytes =
-        hex::decode(message).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+        hex::decode(message).map_err(|_| KeepError::InvalidInput("invalid message hex".into()))?;
 
     if local {
         out.field("Mode", "Local (Mock)");
@@ -280,9 +286,12 @@ pub fn cmd_enclave_sign(
         };
 
         let spinner = out.spinner("Signing in enclave...");
-        let signature = client
-            .sign(request)
-            .map_err(|e| KeepError::Other(e.to_string()))?;
+        let signature = client.sign(request).map_err(|e| {
+            KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+                "enclave sign: {}",
+                e
+            )))
+        })?;
         spinner.finish();
 
         out.success("Signature generated!");
@@ -330,11 +339,14 @@ pub fn cmd_enclave_import_key(
     } else {
         out.field("Source", "stdin (hex)");
         let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| KeepError::Other(format!("Read error: {}", e)))?;
+        std::io::stdin().read_line(&mut input).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read input: {}",
+                e
+            )))
+        })?;
         let decoded =
-            hex::decode(input.trim()).map_err(|_| KeepError::Other("Invalid hex".into()))?;
+            hex::decode(input.trim()).map_err(|_| KeepError::InvalidInput("invalid hex".into()))?;
         input.zeroize();
         decoded
     };
@@ -378,7 +390,12 @@ pub fn cmd_enclave_import_key(
         let spinner = out.spinner("Importing key to enclave...");
         let result = client.import_key(name, &secret);
         secret.zeroize();
-        let pubkey = result.map_err(|e| KeepError::Other(e.to_string()))?;
+        let pubkey = result.map_err(|e| {
+            KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
+                "enclave import: {}",
+                e
+            )))
+        })?;
         spinner.finish();
 
         let npub = if pubkey.len() == 32 {

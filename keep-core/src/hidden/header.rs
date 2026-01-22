@@ -8,7 +8,7 @@
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, Argon2Params, SALT_SIZE};
-use crate::error::{KeepError, Result};
+use crate::error::{Result, StorageError};
 
 /// Size of each header block in bytes.
 pub const HEADER_SIZE: usize = 512;
@@ -116,12 +116,12 @@ impl OuterHeader {
         magic.copy_from_slice(&bytes[0..8]);
 
         if magic != *OUTER_MAGIC {
-            return Err(KeepError::Other("Invalid keep file".into()));
+            return Err(StorageError::invalid_format("invalid keep file magic").into());
         }
 
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
         if version > 1 {
-            return Err(KeepError::Other("Unsupported version".into()));
+            return Err(StorageError::invalid_format("unsupported version").into());
         }
 
         let mut salt = [0u8; SALT_SIZE];
@@ -134,6 +134,7 @@ impl OuterHeader {
         encrypted_data_key.copy_from_slice(&bytes[16 + SALT_SIZE + 24..16 + SALT_SIZE + 24 + 48]);
 
         let offset = 16 + SALT_SIZE + 24 + 48;
+        let parse_err = |field| StorageError::invalid_format(format!("outer header: {}", field));
 
         Ok(Self {
             magic,
@@ -144,34 +145,34 @@ impl OuterHeader {
             nonce,
             encrypted_data_key,
             argon2_memory_kib: u32::from_le_bytes(
-                bytes[offset..offset + 4].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_memory_kib".into())
-                })?,
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| parse_err("argon2_memory_kib"))?,
             ),
             argon2_iterations: u32::from_le_bytes(
-                bytes[offset + 4..offset + 8].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_iterations".into())
-                })?,
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .map_err(|_| parse_err("argon2_iterations"))?,
             ),
             argon2_parallelism: u32::from_le_bytes(
-                bytes[offset + 8..offset + 12].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: argon2_parallelism".into())
-                })?,
+                bytes[offset + 8..offset + 12]
+                    .try_into()
+                    .map_err(|_| parse_err("argon2_parallelism"))?,
             ),
             _align_pad: u32::from_le_bytes(
                 bytes[offset + 12..offset + 16]
                     .try_into()
-                    .map_err(|_| KeepError::Other("Invalid outer header: align_pad".into()))?,
+                    .map_err(|_| parse_err("align_pad"))?,
             ),
             outer_data_size: u64::from_le_bytes(
-                bytes[offset + 16..offset + 24].try_into().map_err(|_| {
-                    KeepError::Other("Invalid outer header: outer_data_size".into())
-                })?,
+                bytes[offset + 16..offset + 24]
+                    .try_into()
+                    .map_err(|_| parse_err("outer_data_size"))?,
             ),
             total_size: u64::from_le_bytes(
                 bytes[offset + 24..offset + 32]
                     .try_into()
-                    .map_err(|_| KeepError::Other("Invalid outer header: total_size".into()))?,
+                    .map_err(|_| parse_err("total_size"))?,
             ),
             padding: [0; 360],
         })
@@ -281,11 +282,12 @@ impl HiddenHeader {
     /// Deserialize from compact-size bytes.
     pub fn from_bytes_compact(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < Self::COMPACT_SIZE {
-            return Err(KeepError::Other(format!(
-                "Hidden header too short: {} bytes, expected at least {}",
+            return Err(StorageError::invalid_format(format!(
+                "hidden header too short: {} bytes, expected at least {}",
                 bytes.len(),
                 Self::COMPACT_SIZE
-            )));
+            ))
+            .into());
         }
 
         let mut salt = [0u8; SALT_SIZE];
@@ -302,6 +304,8 @@ impl HiddenHeader {
         let mut checksum = [0u8; 32];
         checksum.copy_from_slice(&bytes[offset + 20..offset + 52]);
 
+        let parse_err = |field| StorageError::invalid_format(format!("hidden header: {}", field));
+
         Ok(Self {
             version: u16::from_le_bytes([bytes[0], bytes[1]]),
             reserved: u16::from_le_bytes([bytes[2], bytes[3]]),
@@ -311,17 +315,17 @@ impl HiddenHeader {
             _align_pad: u32::from_le_bytes(
                 bytes[offset..offset + 4]
                     .try_into()
-                    .map_err(|_| KeepError::Other("Invalid hidden header: align_pad".into()))?,
+                    .map_err(|_| parse_err("align_pad"))?,
             ),
             hidden_data_offset: u64::from_le_bytes(
                 bytes[offset + 4..offset + 12]
                     .try_into()
-                    .map_err(|_| KeepError::Other("Invalid hidden header: data_offset".into()))?,
+                    .map_err(|_| parse_err("data_offset"))?,
             ),
             hidden_data_size: u64::from_le_bytes(
                 bytes[offset + 12..offset + 20]
                     .try_into()
-                    .map_err(|_| KeepError::Other("Invalid hidden header: data_size".into()))?,
+                    .map_err(|_| parse_err("data_size"))?,
             ),
             checksum,
             padding: [0; 352],

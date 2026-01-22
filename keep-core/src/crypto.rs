@@ -21,7 +21,7 @@ use memsecurity::EncryptedMem;
 use zeroize::Zeroize;
 
 use crate::entropy;
-use crate::error::{KeepError, Result};
+use crate::error::{CryptoError, KeepError, Result};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,8 +39,8 @@ pub fn disable_mlock() {
 
 fn warn_once() {
     if !MLOCK_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
-        eprintln!(
-            "Warning: Failed to lock memory. Secrets may be paged to disk.\n\
+        tracing::warn!(
+            "Failed to lock memory. Secrets may be paged to disk. \
              To fix: ulimit -l unlimited (or increase RLIMIT_MEMLOCK)"
         );
     }
@@ -238,23 +238,22 @@ pub struct SecretVec {
     encrypted: EncryptedMem,
 }
 
+#[allow(missing_docs)]
 impl SecretVec {
-    /// Encrypt data into a new SecretVec.
     pub fn new(mut data: Vec<u8>) -> Result<Self> {
         let mut encrypted = EncryptedMem::new();
         encrypted
             .encrypt(&data)
-            .map_err(|_| KeepError::Other("Failed to encrypt secret in RAM".into()))?;
+            .map_err(|_| CryptoError::encryption("encrypt secret in RAM"))?;
         data.zeroize();
         Ok(Self { encrypted })
     }
 
-    /// Decrypt and return the data.
     pub fn as_slice(&self) -> Result<Vec<u8>> {
         self.encrypted
             .decrypt()
             .map(|z| z.expose_borrowed().to_vec())
-            .map_err(|_| KeepError::Other("Failed to decrypt secret from RAM".into()))
+            .map_err(|_| CryptoError::decryption("decrypt secret from RAM").into())
     }
 }
 
@@ -310,44 +309,40 @@ pub struct SecretKey {
     encrypted: EncryptedMem,
 }
 
+#[allow(missing_docs)]
 impl SecretKey {
-    /// Encrypt raw bytes into a new SecretKey.
     pub fn new(mut bytes: [u8; KEY_SIZE]) -> Result<Self> {
         let mut encrypted = EncryptedMem::new();
         encrypted
             .encrypt(&bytes)
-            .map_err(|_| KeepError::Other("Failed to encrypt key in RAM".into()))?;
+            .map_err(|_| CryptoError::encryption("encrypt key in RAM"))?;
         bytes.zeroize();
         Ok(Self { encrypted })
     }
 
-    /// Generate a new random encryption key.
     pub fn generate() -> Result<Self> {
         let bytes: [u8; KEY_SIZE] = entropy::random_bytes();
         Self::new(bytes)
     }
 
-    /// Decrypt into memory-locked storage.
     pub fn decrypt(&self) -> Result<MlockedBox<KEY_SIZE>> {
         let decrypted = self
             .encrypted
             .decrypt_32byte()
-            .map_err(|_| KeepError::Other("Failed to decrypt key".into()))?;
+            .map_err(|_| CryptoError::decryption("decrypt key"))?;
         let mut bytes = *decrypted.expose_borrowed();
         Ok(MlockedBox::new(&mut bytes))
     }
 
-    /// Create a SecretKey from a byte slice.
     pub fn from_slice(slice: &[u8]) -> Result<Self> {
         if slice.len() != KEY_SIZE {
-            return Err(KeepError::Other("Invalid key length".into()));
+            return Err(CryptoError::invalid_key("invalid key length").into());
         }
         let mut bytes = [0u8; KEY_SIZE];
         bytes.copy_from_slice(slice);
         Self::new(bytes)
     }
 
-    /// Clone the key. Returns an error if RAM encryption fails.
     pub fn try_clone(&self) -> Result<Self> {
         let decrypted = self.decrypt()?;
         Self::new(*decrypted)
@@ -373,14 +368,14 @@ pub fn derive_key(
         params.parallelism,
         Some(KEY_SIZE),
     )
-    .map_err(|e| KeepError::Other(format!("Argon2 params error: {}", e)))?;
+    .map_err(|e| CryptoError::kdf(format!("argon2 params: {}", e)))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
 
     let mut output = [0u8; KEY_SIZE];
     argon2
         .hash_password_into(password, salt, &mut output)
-        .map_err(|e| KeepError::Other(format!("Argon2 error: {}", e)))?;
+        .map_err(|e| CryptoError::kdf(format!("argon2: {}", e)))?;
 
     SecretKey::new(output)
 }
@@ -419,7 +414,7 @@ impl EncryptedData {
     /// Deserialize from bytes: nonce || ciphertext.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < NONCE_SIZE + TAG_SIZE {
-            return Err(KeepError::Other("Encrypted data too short".into()));
+            return Err(CryptoError::decryption("encrypted data too short").into());
         }
 
         let mut nonce = [0u8; NONCE_SIZE];

@@ -7,7 +7,7 @@ use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
 use tracing::debug;
 
-use keep_core::error::{KeepError, Result};
+use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result, StorageError};
 use keep_core::Keep;
 
 use crate::output::Output;
@@ -50,8 +50,8 @@ pub fn cmd_frost_network_serve(
     out.field("Relay", relay);
     out.newline();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         out.info("Starting FROST coordination node...");
@@ -128,8 +128,8 @@ pub fn cmd_frost_network_peers(
     out.field("Relay", relay);
     out.newline();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         let spinner = out.spinner("Connecting and discovering peers...");
@@ -207,11 +207,15 @@ pub fn cmd_frost_network_sign(
         let (threshold, participants) = match (threshold, participants) {
             (Some(t), Some(p)) => (t, p),
             _ => {
-                let mut signer = HardwareSigner::new(device)
-                    .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
-                let info = signer
-                    .get_share_info(group_npub)
-                    .map_err(|e| KeepError::Other(format!("Failed to get share info: {}", e)))?;
+                let mut signer = HardwareSigner::new(device).map_err(|e| {
+                    KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e)))
+                })?;
+                let info = signer.get_share_info(group_npub).map_err(|e| {
+                    KeepError::FrostErr(FrostError::session(format!(
+                        "failed to get share info: {}",
+                        e
+                    )))
+                })?;
                 (
                     threshold.unwrap_or(info.threshold),
                     participants.unwrap_or(info.participants),
@@ -219,10 +223,10 @@ pub fn cmd_frost_network_sign(
             }
         };
         if threshold < 2 || threshold > participants {
-            return Err(KeepError::Other(format!(
-                "Invalid threshold: must be 2 <= threshold ({}) <= participants ({})",
+            return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+                "must be 2 <= threshold ({}) <= participants ({})",
                 threshold, participants
-            )));
+            ))));
         }
         return cmd_frost_network_sign_hardware(
             out,
@@ -239,7 +243,7 @@ pub fn cmd_frost_network_sign(
     #[cfg(feature = "warden")]
     if let Some(url) = warden_url {
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
         rt.block_on(super::frost::check_warden_policy(
             out, url, group_npub, message,
         ))?;
@@ -247,7 +251,7 @@ pub fn cmd_frost_network_sign(
 
     #[cfg(not(feature = "warden"))]
     if warden_url.is_some() {
-        return Err(KeepError::Other(
+        return Err(KeepError::NotImplemented(
             "Warden support not compiled. Rebuild with --features warden".into(),
         ));
     }
@@ -283,8 +287,8 @@ pub fn cmd_frost_network_sign(
     out.field("Relay", relay);
     out.newline();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
     rt.block_on(async {
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
@@ -352,10 +356,10 @@ fn cmd_frost_network_sign_hardware(
     participants: u16,
 ) -> Result<()> {
     let message_bytes =
-        hex::decode(message).map_err(|_| KeepError::Other("Invalid message hex".into()))?;
+        hex::decode(message).map_err(|_| KeepError::InvalidInput("Invalid message hex".into()))?;
 
     if message_bytes.len() != 32 {
-        return Err(KeepError::Other(
+        return Err(KeepError::InvalidInput(
             "Message must be 32 bytes (64 hex chars)".into(),
         ));
     }
@@ -363,7 +367,9 @@ fn cmd_frost_network_sign_hardware(
     let mut message_arr = [0u8; 32];
     message_arr.copy_from_slice(&message_bytes);
 
-    let session_id: [u8; 32] = rand::random();
+    let mut session_id = [0u8; 32];
+    ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut session_id)
+        .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))))?;
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
@@ -373,8 +379,9 @@ fn cmd_frost_network_sign_hardware(
     out.field("Relay", relay);
     out.newline();
 
-    let mut nonce_store = NonceStore::open(path)
-        .map_err(|e| KeepError::Other(format!("Failed to open nonce store: {}", e)))?;
+    let mut nonce_store = NonceStore::open(path).map_err(|e| {
+        KeepError::StorageErr(StorageError::database(format!("nonce store: {}", e)))
+    })?;
     let (available, used) = nonce_store.nonce_stats(group_npub);
     out.info(&format!(
         "Nonce status: {} available, {} used",
@@ -383,38 +390,39 @@ fn cmd_frost_network_sign_hardware(
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
-    let version = signer
-        .ping()
-        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    let version = signer.ping().map_err(|e| {
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+    })?;
     spinner.finish();
     out.field("Hardware version", &version);
 
     let spinner = out.spinner("Creating commitment (round 1)...");
     let (commitment, our_index) = signer
         .frost_commit(group_npub, &session_id, &message_arr)
-        .map_err(|e| KeepError::Other(format!("Commitment failed: {}", e)))?;
+        .map_err(|e| KeepError::FrostErr(FrostError::commitment(e.to_string())))?;
     spinner.finish();
 
     let commitment_hex = hex::encode(&commitment);
 
-    if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
-        return Err(KeepError::Other(
-            "SECURITY: Nonce has already been used. Aborting to prevent key compromise.".into(),
-        ));
+    if our_index == 0 || our_index > participants {
+        return Err(KeepError::FrostErr(FrostError::invalid_share(format!(
+            "hardware returned invalid share index {}, expected 1..={}",
+            our_index, participants
+        ))));
     }
 
-    nonce_store
-        .add_nonce(group_npub, &commitment_hex)
-        .map_err(|e| KeepError::Other(format!("Failed to track nonce: {}", e)))?;
-
-    if our_index == 0 || our_index > participants {
-        return Err(KeepError::Other(format!(
-            "Hardware returned invalid share index {}, expected 1..={}",
-            our_index, participants
+    if !nonce_store
+        .check_and_add_nonce(group_npub, &commitment_hex)
+        .map_err(|e| {
+            KeepError::StorageErr(StorageError::database(format!("nonce tracking: {}", e)))
+        })?
+    {
+        return Err(KeepError::FrostErr(FrostError::session(
+            "nonce has already been used - aborting to prevent key compromise",
         )));
     }
 
@@ -423,8 +431,8 @@ fn cmd_frost_network_sign_hardware(
     out.field("Session ID", &hex::encode(session_id));
     out.newline();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -432,7 +440,7 @@ fn cmd_frost_network_sign_hardware(
         client
             .add_relay(relay)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
         client.connect().await;
 
         out.info("Connected to relay");
@@ -463,13 +471,15 @@ fn cmd_frost_network_sign_hardware(
                 vec!["raw".to_string()],
             ))
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign request: {}", e)))?;
+            .map_err(|e| {
+                KeepError::CryptoErr(CryptoError::invalid_signature(format!("sign event: {}", e)))
+            })?;
 
         let spinner = out.spinner("Publishing sign request (Kind 21104)...");
         client
             .send_event(&request_event)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish request: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
         out.field("Request Event ID", &request_event.id.to_hex());
 
@@ -502,13 +512,17 @@ fn cmd_frost_network_sign_hardware(
                 vec!["commitment".to_string()],
             ))
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign response: {}", e)))?;
+            .map_err(|e| {
+                KeepError::CryptoErr(CryptoError::invalid_signature(format!(
+                    "sign response: {}",
+                    e
+                )))
+            })?;
 
         let spinner = out.spinner("Publishing our commitment (Kind 21105)...");
-        client
-            .send_event(&response_event)
-            .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish commitment: {}", e)))?;
+        client.send_event(&response_event).await.map_err(|e| {
+            KeepError::NetworkErr(NetworkError::publish(format!("commitment: {}", e)))
+        })?;
         spinner.finish();
 
         let filter = Filter::new().kind(Kind::Custom(21105)).custom_tag(
@@ -527,15 +541,15 @@ fn cmd_frost_network_sign_hardware(
 
         while peer_commitments.len() < threshold as usize {
             if start.elapsed() > timeout {
-                return Err(KeepError::Other(
-                    "Timeout waiting for peer commitments".into(),
-                ));
+                return Err(KeepError::NetworkErr(NetworkError::timeout(
+                    "waiting for peer commitments",
+                )));
             }
 
             let events = client
                 .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
                 .await
-                .map_err(|e| KeepError::Other(format!("Fetch failed: {}", e)))?;
+                .map_err(|e| KeepError::NetworkErr(NetworkError::request(e.to_string())))?;
 
             let our_session_id_hex = hex::encode(session_id);
             for ev in events.iter() {
@@ -599,7 +613,7 @@ fn cmd_frost_network_sign_hardware(
         let spinner = out.spinner("Generating signature share (round 2)...");
         let (sig_share, _) = signer
             .frost_sign(group_npub, &session_id, &all_commitments_hex)
-            .map_err(|e| KeepError::Other(format!("Sign failed: {}", e)))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::session(format!("sign failed: {}", e))))?;
         spinner.finish();
 
         let sig_share_hex = hex::encode(&sig_share);
@@ -634,13 +648,13 @@ fn cmd_frost_network_sign_hardware(
                 vec!["signature_share".to_string()],
             ))
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign: {}", e)))?;
+            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
 
         let spinner = out.spinner("Publishing signature share...");
         client
             .send_event(&sig_event)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
 
         out.newline();
@@ -668,7 +682,9 @@ pub fn cmd_frost_network_sign_event(
     out.newline();
     out.error("FROST network event signing not yet implemented");
     out.info("Use 'keep frost network sign' to sign raw messages instead.");
-    Err(KeepError::Other("Not implemented".into()))
+    Err(KeepError::NotImplemented(
+        "FROST network event signing".into(),
+    ))
 }
 
 #[tracing::instrument(skip(out))]
@@ -691,41 +707,41 @@ pub fn cmd_frost_network_dkg(
     out.newline();
 
     if threshold < 2 || threshold > participants {
-        return Err(KeepError::Other(format!(
-            "Invalid threshold: must be 2 <= threshold ({}) <= participants ({})",
+        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+            "must be 2 <= threshold ({}) <= participants ({})",
             threshold, participants
-        )));
+        ))));
     }
 
     if our_index < 1 || our_index > participants {
-        return Err(KeepError::Other(format!(
-            "Invalid index: must be 1..={}, got {}",
+        return Err(KeepError::FrostErr(FrostError::invalid_share(format!(
+            "index must be 1..={}, got {}",
             participants, our_index
-        )));
+        ))));
     }
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(hardware)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
-    let version = signer
-        .ping()
-        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    let version = signer.ping().map_err(|e| {
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+    })?;
     spinner.finish();
     out.field("Hardware version", &version);
 
     let spinner = out.spinner("Initializing DKG...");
     signer
         .dkg_init(group, threshold, participants, our_index)
-        .map_err(|e| KeepError::Other(format!("DKG init failed: {}", e)))?;
+        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("init: {}", e))))?;
     spinner.finish();
 
     let spinner = out.spinner("Starting DKG round 1...");
     let round1_data = signer
         .dkg_round1()
-        .map_err(|e| KeepError::Other(format!("DKG round 1 failed: {}", e)))?;
+        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 1: {}", e))))?;
     spinner.finish();
 
     let our_package = round1_data.to_json();
@@ -734,8 +750,8 @@ pub fn cmd_frost_network_dkg(
     out.field("Our package", &our_package);
     out.newline();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -743,7 +759,7 @@ pub fn cmd_frost_network_dkg(
         client
             .add_relay(relay)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
         client.connect().await;
 
         out.info("Connected to relay");
@@ -766,13 +782,13 @@ pub fn cmd_frost_network_dkg(
                 vec![our_index.to_string()],
             ))
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign: {}", e)))?;
+            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
 
         let spinner = out.spinner("Publishing round 1 package...");
         client
             .send_event(&round1_event)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
 
         let expected_peers = participants - 1;
@@ -794,13 +810,15 @@ pub fn cmd_frost_network_dkg(
 
         while received_packages.len() < expected_peers as usize {
             if start.elapsed() > timeout {
-                return Err(KeepError::Other("Timeout waiting for peer packages".into()));
+                return Err(KeepError::NetworkErr(NetworkError::timeout(
+                    "waiting for peer packages",
+                )));
             }
 
             let events = client
                 .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
                 .await
-                .map_err(|e| KeepError::Other(format!("Fetch failed: {}", e)))?;
+                .map_err(|e| KeepError::NetworkErr(NetworkError::request(e.to_string())))?;
 
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
@@ -819,10 +837,10 @@ pub fn cmd_frost_network_dkg(
                     {
                         if let Some(pkg) = content.get("package").and_then(|p| p.as_str()) {
                             signer.dkg_round1_peer(sender_idx, pkg).map_err(|e| {
-                                KeepError::Other(format!(
-                                    "Failed to process package from {}: {}",
+                                KeepError::FrostErr(FrostError::dkg(format!(
+                                    "process package from {}: {}",
                                     sender_idx, e
-                                ))
+                                )))
                             })?;
 
                             received_packages.insert(sender_idx, pkg.to_string());
@@ -847,7 +865,7 @@ pub fn cmd_frost_network_dkg(
         let spinner = out.spinner("Generating round 2 shares...");
         let shares_for_others = signer
             .dkg_round2()
-            .map_err(|e| KeepError::Other(format!("DKG round 2 failed: {}", e)))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 2: {}", e))))?;
         spinner.finish();
 
         for share in &shares_for_others {
@@ -855,9 +873,8 @@ pub fn cmd_frost_network_dkg(
                 participant_pubkeys
                     .get(&share.recipient_index)
                     .ok_or_else(|| {
-                        KeepError::Other(format!(
-                            "Missing pubkey for participant {}",
-                            share.recipient_index
+                        KeepError::FrostErr(FrostError::unknown_participant(
+                            share.recipient_index as u16,
                         ))
                     })?;
             let encrypted_content = nip44::encrypt(
@@ -870,7 +887,7 @@ pub fn cmd_frost_network_dkg(
                 .to_string(),
                 nip44::Version::default(),
             )
-            .map_err(|e| KeepError::Other(format!("Encryption failed: {}", e)))?;
+            .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(e.to_string())))?;
 
             let share_event = EventBuilder::new(Kind::Custom(21103), &encrypted_content)
                 .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
@@ -883,12 +900,16 @@ pub fn cmd_frost_network_dkg(
                     vec![share.recipient_index.to_string()],
                 ))
                 .sign_with_keys(&keys)
-                .map_err(|e| KeepError::Other(format!("Failed to sign share event: {}", e)))?;
+                .map_err(|e| {
+                    KeepError::CryptoErr(CryptoError::invalid_signature(format!(
+                        "share event: {}",
+                        e
+                    )))
+                })?;
 
-            client
-                .send_event(&share_event)
-                .await
-                .map_err(|e| KeepError::Other(format!("Failed to publish share: {}", e)))?;
+            client.send_event(&share_event).await.map_err(|e| {
+                KeepError::NetworkErr(NetworkError::publish(format!("share: {}", e)))
+            })?;
 
             out.info(&format!(
                 "Published encrypted share for participant {}",
@@ -912,13 +933,17 @@ pub fn cmd_frost_network_dkg(
 
         while received_from_peers.len() < expected_peers as usize {
             if start.elapsed() > timeout {
-                return Err(KeepError::Other("Timeout waiting for peer shares".into()));
+                return Err(KeepError::NetworkErr(NetworkError::timeout(
+                    "waiting for peer shares",
+                )));
             }
 
             let events = client
                 .fetch_events(share_filter.clone(), std::time::Duration::from_secs(5))
                 .await
-                .map_err(|e| KeepError::Other(format!("Fetch shares failed: {}", e)))?;
+                .map_err(|e| {
+                    KeepError::NetworkErr(NetworkError::request(format!("fetch shares: {}", e)))
+                })?;
 
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
@@ -980,7 +1005,7 @@ pub fn cmd_frost_network_dkg(
         let spinner = out.spinner("Finalizing DKG...");
         let result = signer
             .dkg_finalize()
-            .map_err(|e| KeepError::Other(format!("DKG finalize failed: {}", e)))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("finalize: {}", e))))?;
         spinner.finish();
 
         out.newline();
@@ -1018,15 +1043,15 @@ pub fn cmd_frost_network_group_create(
     out.newline();
 
     if threshold < 2 || threshold > participants {
-        return Err(KeepError::Other(format!(
-            "Invalid threshold: must be 2 <= threshold ({}) <= participants ({})",
+        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+            "must be 2 <= threshold ({}) <= participants ({})",
             threshold, participants
-        )));
+        ))));
     }
 
     if participant_npubs.len() != participants as usize {
-        return Err(KeepError::Other(format!(
-            "Expected {} participant npubs, got {}",
+        return Err(KeepError::InvalidInput(format!(
+            "expected {} participant npubs, got {}",
             participants,
             participant_npubs.len()
         )));
@@ -1042,8 +1067,8 @@ pub fn cmd_frost_network_group_create(
     }
     let group_id: [u8; 32] = hasher.finalize().into();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -1053,7 +1078,7 @@ pub fn cmd_frost_network_group_create(
             client
                 .add_relay(relay)
                 .await
-                .map_err(|e| KeepError::Other(format!("Failed to add relay {}: {}", relay, e)))?;
+                .map_err(|e| KeepError::NetworkErr(NetworkError::relay(format!("{}: {}", relay, e))))?;
         }
         client.connect().await;
 
@@ -1098,13 +1123,13 @@ pub fn cmd_frost_network_group_create(
 
         let event = builder
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign event: {}", e)))?;
+            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
 
         let spinner = out.spinner("Publishing group announcement...");
         client
             .send_event(&event)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
 
         out.newline();
@@ -1143,8 +1168,9 @@ pub fn cmd_frost_network_nonce_precommit(
     out.field("Nonce count", &count.to_string());
     out.newline();
 
-    let mut nonce_store = NonceStore::open(path)
-        .map_err(|e| KeepError::Other(format!("Failed to open nonce store: {}", e)))?;
+    let mut nonce_store = NonceStore::open(path).map_err(|e| {
+        KeepError::StorageErr(StorageError::database(format!("nonce store: {}", e)))
+    })?;
 
     let (available, used) = nonce_store.nonce_stats(group);
     if available > 0 {
@@ -1156,19 +1182,19 @@ pub fn cmd_frost_network_nonce_precommit(
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::Other(format!("Connection failed: {}", e)))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
-    let version = signer
-        .ping()
-        .map_err(|e| KeepError::Other(format!("Ping failed: {}", e)))?;
+    let version = signer.ping().map_err(|e| {
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+    })?;
     spinner.finish();
     out.field("Hardware version", &version);
 
-    let (_pubkey_hex, share_index) = signer
-        .get_share_pubkey(group)
-        .map_err(|e| KeepError::Other(format!("Failed to get share pubkey: {}", e)))?;
+    let (_pubkey_hex, share_index) = signer.get_share_pubkey(group).map_err(|e| {
+        KeepError::FrostErr(FrostError::invalid_share(format!("get pubkey: {}", e)))
+    })?;
     out.field("Share index", &share_index.to_string());
     out.newline();
 
@@ -1176,11 +1202,17 @@ pub fn cmd_frost_network_nonce_precommit(
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
     for i in 0..count {
-        let dummy_session: [u8; 32] = rand::random();
-        let dummy_message: [u8; 32] = rand::random();
+        let mut dummy_session = [0u8; 32];
+        let mut dummy_message = [0u8; 32];
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session)
+            .expect("OS RNG failed");
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message)
+            .expect("OS RNG failed");
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
-            .map_err(|e| KeepError::Other(format!("Commitment {} failed: {}", i, e)))?;
+            .map_err(|e| {
+                KeepError::FrostErr(FrostError::commitment(format!("nonce {}: {}", i, e)))
+            })?;
         let commitment_hex = hex::encode(&commitment);
         commitments_hex.push(commitment_hex.clone());
         nonces.push(serde_json::json!({
@@ -1192,14 +1224,14 @@ pub fn cmd_frost_network_nonce_precommit(
 
     let spinner = out.spinner("Storing nonces locally...");
     for commitment_hex in &commitments_hex {
-        nonce_store
-            .add_nonce(group, commitment_hex)
-            .map_err(|e| KeepError::Other(format!("Failed to store nonce: {}", e)))?;
+        nonce_store.add_nonce(group, commitment_hex).map_err(|e| {
+            KeepError::StorageErr(StorageError::database(format!("store nonce: {}", e)))
+        })?;
     }
     spinner.finish();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -1208,7 +1240,7 @@ pub fn cmd_frost_network_nonce_precommit(
         client
             .add_relay(relay)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to add relay: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
         client.connect().await;
 
         out.info("Connected to relay");
@@ -1237,13 +1269,13 @@ pub fn cmd_frost_network_nonce_precommit(
                 vec![count.to_string()],
             ))
             .sign_with_keys(&keys)
-            .map_err(|e| KeepError::Other(format!("Failed to sign event: {}", e)))?;
+            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
 
         let spinner = out.spinner("Publishing nonce commitments...");
         client
             .send_event(&event)
             .await
-            .map_err(|e| KeepError::Other(format!("Failed to publish: {}", e)))?;
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
 
         Ok::<_, KeepError>(())
