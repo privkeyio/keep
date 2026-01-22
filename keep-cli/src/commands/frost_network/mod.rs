@@ -172,16 +172,16 @@ pub fn cmd_frost_network_peers(
             out.table_header(&[("SHARE", 8), ("STATUS", 10), ("NAME", 20)]);
 
             for (share_index, peer_status, name) in status {
+                use keep_frost_net::PeerStatus;
                 let status_str = match peer_status {
-                    keep_frost_net::PeerStatus::Online => "Online",
-                    keep_frost_net::PeerStatus::Offline => "Offline",
-                    keep_frost_net::PeerStatus::Unknown => "Unknown",
+                    PeerStatus::Online => "Online",
+                    PeerStatus::Offline => "Offline",
+                    PeerStatus::Unknown => "Unknown",
                 };
-                let name_str = name.unwrap_or_else(|| "-".to_string());
                 out.table_row(&[
                     (&share_index.to_string(), 8, false),
                     (status_str, 10, false),
-                    (&name_str, 20, false),
+                    (&name.unwrap_or_else(|| "-".to_string()), 20, false),
                 ]);
             }
         }
@@ -270,10 +270,9 @@ pub fn cmd_frost_network_sign(
     spinner.finish();
 
     let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
-    let share = if let Some(idx) = share_index {
-        keep.frost_get_share_by_index(&group_pubkey, idx)?
-    } else {
-        keep.frost_get_share(&group_pubkey)?
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
     };
 
     out.newline();

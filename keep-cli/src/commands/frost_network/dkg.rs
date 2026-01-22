@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::{HashMap, HashSet};
+
 use nostr_sdk::prelude::*;
 
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result};
@@ -122,10 +124,8 @@ pub fn cmd_frost_network_dkg(
             .kind(Kind::Custom(21102))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
 
-        let mut received_packages: std::collections::HashMap<u8, String> =
-            std::collections::HashMap::new();
-        let mut participant_pubkeys: std::collections::HashMap<u8, PublicKey> =
-            std::collections::HashMap::new();
+        let mut received_packages: HashMap<u8, String> = HashMap::new();
+        let mut participant_pubkeys: HashMap<u8, PublicKey> = HashMap::new();
         let timeout = std::time::Duration::from_secs(300);
         let start = std::time::Instant::now();
 
@@ -249,8 +249,7 @@ pub fn cmd_frost_network_dkg(
             .kind(Kind::Custom(21103))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
 
-        let mut received_from_peers: std::collections::HashSet<u8> =
-            std::collections::HashSet::new();
+        let mut received_from_peers: HashSet<u8> = HashSet::new();
         let start = std::time::Instant::now();
 
         while received_from_peers.len() < expected_peers as usize {

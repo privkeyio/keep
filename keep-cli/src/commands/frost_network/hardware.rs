@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::path::Path;
 
 use nostr_sdk::prelude::*;
@@ -199,8 +201,7 @@ pub fn cmd_frost_network_sign_hardware(
 
         out.info("Waiting for peer commitments...");
         out.field("Threshold", &format!("{}-of-{}", threshold, participants));
-        let mut peer_commitments: std::collections::HashMap<u16, String> =
-            std::collections::HashMap::new();
+        let mut peer_commitments: HashMap<u16, String> = HashMap::new();
         peer_commitments.insert(our_index, hex::encode(&commitment));
 
         let timeout = std::time::Duration::from_secs(120);
@@ -248,9 +249,7 @@ pub fn cmd_frost_network_sign_hardware(
                     if peer_commitment.is_empty() || hex::decode(peer_commitment).is_err() {
                         continue;
                     }
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        peer_commitments.entry(peer_idx)
-                    {
+                    if let Entry::Vacant(e) = peer_commitments.entry(peer_idx) {
                         e.insert(peer_commitment.to_string());
                         out.success(&format!(
                             "Received commitment from participant {}",
