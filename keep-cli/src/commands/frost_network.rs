@@ -369,7 +369,7 @@ fn cmd_frost_network_sign_hardware(
 
     let mut session_id = [0u8; 32];
     ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut session_id)
-        .expect("OS RNG failed");
+        .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))))?;
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
