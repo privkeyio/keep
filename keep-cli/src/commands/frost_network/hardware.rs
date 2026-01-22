@@ -392,10 +392,12 @@ pub fn cmd_frost_network_nonce_precommit(
     for i in 0..count {
         let mut dummy_session = [0u8; 32];
         let mut dummy_message = [0u8; 32];
-        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session)
-            .expect("OS RNG failed");
-        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message)
-            .expect("OS RNG failed");
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session).map_err(
+            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))),
+        )?;
+        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message).map_err(
+            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))),
+        )?;
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
             .map_err(|e| {

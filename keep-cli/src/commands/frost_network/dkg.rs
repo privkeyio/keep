@@ -153,6 +153,7 @@ pub fn cmd_frost_network_dkg(
                         .unwrap_or(0) as u8;
 
                     if sender_idx > 0
+                        && sender_idx <= participants
                         && sender_idx != our_index
                         && !received_packages.contains_key(&sender_idx)
                     {
@@ -295,7 +296,10 @@ pub fn cmd_frost_network_dkg(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u8;
 
-                    if sender_idx > 0 && !received_from_peers.contains(&sender_idx) {
+                    if sender_idx > 0
+                        && sender_idx <= participants
+                        && !received_from_peers.contains(&sender_idx)
+                    {
                         if let Some(share_hex) = content.get("share").and_then(|s| s.as_str()) {
                             match signer.dkg_receive_share(sender_idx, share_hex) {
                                 Ok(()) => {
