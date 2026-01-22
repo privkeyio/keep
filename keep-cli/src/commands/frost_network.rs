@@ -423,12 +423,19 @@ fn cmd_frost_network_sign_hardware(
 
     let commitment_hex = hex::encode(&commitment);
 
-    if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
-        return Err(KeepError::CryptoErr(
-            keep_core::error::CryptoError::invalid_key(
-                "nonce has already been used - aborting to prevent key compromise",
-            ),
+    if our_index == 0 || our_index > participants {
+        return Err(KeepError::FrostErr(
+            keep_core::error::FrostError::invalid_share(format!(
+                "hardware returned invalid share index {}, expected 1..={}",
+                our_index, participants
+            )),
         ));
+    }
+
+    if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
+        return Err(KeepError::FrostErr(keep_core::error::FrostError::session(
+            "nonce has already been used - aborting to prevent key compromise",
+        )));
     }
 
     nonce_store
@@ -439,15 +446,6 @@ fn cmd_frost_network_sign_hardware(
                 e
             )))
         })?;
-
-    if our_index == 0 || our_index > participants {
-        return Err(KeepError::FrostErr(
-            keep_core::error::FrostError::invalid_share(format!(
-                "hardware returned invalid share index {}, expected 1..={}",
-                our_index, participants
-            )),
-        ));
-    }
 
     out.field("Share index", &our_index.to_string());
     out.field("Commitment", &commitment_hex);

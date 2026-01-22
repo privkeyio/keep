@@ -283,7 +283,7 @@ impl Server {
                     Ok(None) => Nip46Response::ok(id, "ack"),
                     Err(e) => {
                         warn!(error = %e, "connect failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -291,7 +291,7 @@ impl Server {
                 Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
                 Err(e) => {
                     warn!(error = %e, "get_public_key failed");
-                    Nip46Response::error(id, &sanitize_error_for_client(&e))
+                    Nip46Response::error(id, sanitize_error_for_client(&e))
                 }
             },
             "sign_event" => {
@@ -333,7 +333,7 @@ impl Server {
                     },
                     Err(e) => {
                         warn!(error = %e, "sign_event failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -352,7 +352,7 @@ impl Server {
                     Ok(ct) => Nip46Response::ok(id, &ct),
                     Err(e) => {
                         warn!(error = %e, "nip44_encrypt failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -371,7 +371,7 @@ impl Server {
                     Ok(pt) => Nip46Response::ok(id, &pt),
                     Err(e) => {
                         warn!(error = %e, "nip44_decrypt failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -390,7 +390,7 @@ impl Server {
                     Ok(ct) => Nip46Response::ok(id, &ct),
                     Err(e) => {
                         warn!(error = %e, "nip04_encrypt failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -409,7 +409,7 @@ impl Server {
                     Ok(pt) => Nip46Response::ok(id, &pt),
                     Err(e) => {
                         warn!(error = %e, "nip04_decrypt failed");
-                        Nip46Response::error(id, &sanitize_error_for_client(&e))
+                        Nip46Response::error(id, sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -467,6 +467,7 @@ impl Nip46Response {
     }
 }
 
+#[allow(unreachable_patterns)]
 fn sanitize_error_for_client(e: &KeepError) -> &'static str {
     match e {
         KeepError::InvalidPassword => "Authentication failed",

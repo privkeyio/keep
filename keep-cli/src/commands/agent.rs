@@ -73,26 +73,14 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     let mut stdout = std::io::stdout();
 
     for line in stdin.lock().lines() {
-        let line = line.map_err(|e| {
-            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read input: {}",
-                e
-            )))
-        })?;
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
 
         let response = server.handle_request(&line);
-        writeln!(stdout, "{}", response).map_err(|e| {
-            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "write output: {}",
-                e
-            )))
-        })?;
-        stdout.flush().map_err(|e| {
-            KeepError::StorageErr(keep_core::error::StorageError::io(format!("flush: {}", e)))
-        })?;
+        writeln!(stdout, "{}", response)?;
+        stdout.flush()?;
     }
 
     Ok(())
