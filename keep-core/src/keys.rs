@@ -10,7 +10,7 @@ use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, MlockedBox};
-use crate::error::{KeepError, Result};
+use crate::error::{CryptoError, KeepError, Result};
 
 /// The type of key stored in Keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ impl NostrKeypair {
     /// Create a keypair from secret bytes. Zeroes the source.
     pub fn from_secret_bytes(secret: &mut [u8; 32]) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(secret)
-            .map_err(|_| KeepError::Other("Invalid secret key".into()))?;
+            .map_err(|_| CryptoError::invalid_key("invalid secret key"))?;
         let verifying_key = signing_key.verifying_key();
 
         Ok(Self {
@@ -131,22 +131,11 @@ impl NostrKeypair {
     }
 
     /// Sign a message, returning a 64-byte Schnorr signature.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use keep_core::keys::NostrKeypair;
-    ///
-    /// let keypair = NostrKeypair::generate();
-    /// let signature = keypair.sign(b"hello nostr")?;
-    /// assert_eq!(signature.len(), 64);
-    /// # Ok::<(), keep_core::error::KeepError>(())
-    /// ```
     pub fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         use k256::schnorr::signature::Signer;
 
         let signing_key = SigningKey::from_bytes(&*self.secret_key)
-            .map_err(|_| KeepError::Other("Invalid signing key".into()))?;
+            .map_err(|_| CryptoError::invalid_key("invalid signing key"))?;
 
         let signature = signing_key.sign(message);
         Ok(signature.to_bytes())

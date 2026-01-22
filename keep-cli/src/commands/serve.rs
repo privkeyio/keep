@@ -59,7 +59,7 @@ pub fn cmd_serve(
         out.newline();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
         return rt.block_on(async {
             out.info("Connecting to FROST network...");
@@ -123,8 +123,8 @@ pub fn cmd_serve(
     };
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     if headless {
         rt.block_on(async {
@@ -227,7 +227,8 @@ pub fn cmd_serve(
         });
     });
 
-    tui.run().map_err(|e| KeepError::Other(e.to_string()))?;
+    tui.run()
+        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
     Ok(())
 }
 
@@ -260,8 +261,8 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     }
 
     let keyring = Arc::new(Mutex::new(keyring));
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     if headless {
         rt.block_on(async {
@@ -323,7 +324,8 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
         });
     });
 
-    tui.run().map_err(|e| KeepError::Other(e.to_string()))?;
+    tui.run()
+        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
     Ok(())
 }
 
@@ -358,8 +360,8 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     }
 
     let keyring = Arc::new(Mutex::new(keyring));
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| KeepError::Other(format!("Runtime error: {}", e)))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
 
     if headless {
         rt.block_on(async {
@@ -421,6 +423,7 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
         });
     });
 
-    tui.run().map_err(|e| KeepError::Other(e.to_string()))?;
+    tui.run()
+        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
     Ok(())
 }

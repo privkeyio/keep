@@ -896,8 +896,12 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
 
             let path = Config::default_path()?;
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| KeepError::Other(format!("Failed to create directory: {}", e)))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                        "create directory: {}",
+                        e
+                    )))
+                })?;
             }
 
             let mut file = match std::fs::OpenOptions::new()
@@ -911,20 +915,32 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
                     return Ok(());
                 }
                 Err(e) => {
-                    return Err(KeepError::Other(format!("Failed to create config: {}", e)));
+                    return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
+                        format!("create config: {}", e),
+                    )));
                 }
             };
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                    .map_err(|e| KeepError::Other(format!("Failed to set permissions: {}", e)))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |e| {
+                        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                            "set permissions: {}",
+                            e
+                        )))
+                    },
+                )?;
             }
 
             let example = include_str!("../contrib/config.toml.example");
-            file.write_all(example.as_bytes())
-                .map_err(|e| KeepError::Other(format!("Failed to write config: {}", e)))?;
+            file.write_all(example.as_bytes()).map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "write config: {}",
+                    e
+                )))
+            })?;
 
             out.success(&format!("Created config file: {}", path.display()));
             Ok(())

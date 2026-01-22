@@ -38,7 +38,12 @@ fn read_password(prompt: &str) -> Result<String> {
     Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))
+        .map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read password: {}",
+                e
+            )))
+        })
 }
 
 pub fn get_password(prompt: &str) -> Result<SecretString> {
@@ -63,7 +68,12 @@ pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretSt
         .with_prompt(prompt)
         .with_confirmation(confirm, "Passwords don't match")
         .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read password: {}", e)))?;
+        .map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read password: {}",
+                e
+            )))
+        })?;
     Ok(SecretString::from(pw))
 }
 
@@ -75,7 +85,12 @@ pub fn get_confirm(prompt: &str) -> Result<bool> {
         .with_prompt(prompt)
         .default(false)
         .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read confirmation: {}", e)))
+        .map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read confirmation: {}",
+                e
+            )))
+        })
 }
 
 pub fn get_nsec(prompt: &str) -> Result<SecretString> {
@@ -86,7 +101,12 @@ pub fn get_nsec(prompt: &str) -> Result<SecretString> {
     let nsec = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .interact()
-        .map_err(|e| KeepError::Other(format!("Failed to read nsec: {}", e)))?;
+        .map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read nsec: {}",
+                e
+            )))
+        })?;
     Ok(SecretString::from(nsec))
 }
 

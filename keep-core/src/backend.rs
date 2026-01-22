@@ -9,11 +9,11 @@ use std::sync::{PoisonError, RwLock};
 use redb::{Database, ReadableTable, TableDefinition};
 use tracing::info;
 
-use crate::error::{KeepError, Result};
+use crate::error::{KeepError, Result, StorageError};
 use crate::migration;
 
 fn lock_error<T>(_: PoisonError<T>) -> KeepError {
-    KeepError::Other("lock poisoned".into())
+    KeepError::Runtime("lock poisoned".into())
 }
 
 /// Table name for key records.
@@ -119,7 +119,7 @@ impl RedbBackend {
         }
         Err(last_err
             .map(|e| e.into())
-            .unwrap_or_else(|| KeepError::Other("database open failed after retries".into())))
+            .unwrap_or_else(|| StorageError::database("open failed after retries").into()))
     }
 
     fn table_def(
@@ -129,7 +129,7 @@ impl RedbBackend {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
-            _ => Err(KeepError::Other(format!("unknown table: {}", name))),
+            _ => Err(StorageError::database(format!("unknown table: {}", name)).into()),
         }
     }
 }

@@ -43,7 +43,7 @@ use rand::RngCore;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
-use crate::error::{KeepError, Result};
+use crate::error::{KeepError, Result, StorageError};
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 
@@ -116,7 +116,7 @@ impl HiddenStorage {
         }
 
         if !(0.0..=1.0).contains(&hidden_ratio) {
-            return Err(KeepError::Other(format!(
+            return Err(KeepError::InvalidInput(format!(
                 "hidden_ratio must be between 0.0 and 1.0, got {}",
                 hidden_ratio
             )));
@@ -129,19 +129,19 @@ impl HiddenStorage {
         };
 
         if hidden_password.is_some() && hidden_size < MIN_HIDDEN_SIZE {
-            return Err(KeepError::Other(format!(
-                "Hidden volume size {} too small, need at least {} bytes",
+            return Err(KeepError::InvalidInput(format!(
+                "hidden volume size {} too small, need at least {} bytes",
                 hidden_size, MIN_HIDDEN_SIZE
             )));
         }
 
         let required_min = DATA_START_OFFSET
             .checked_add(hidden_size)
-            .ok_or_else(|| KeepError::Other("Volume size overflow".into()))?;
+            .ok_or_else(|| KeepError::InvalidInput("volume size overflow".into()))?;
 
         if total_size < required_min {
-            return Err(KeepError::Other(format!(
-                "Total size {} too small, need at least {} bytes (header: {}, hidden: {})",
+            return Err(KeepError::InvalidInput(format!(
+                "total size {} too small, need at least {} bytes (header: {}, hidden: {})",
                 total_size, required_min, DATA_START_OFFSET, hidden_size
             )));
         }
@@ -564,7 +564,7 @@ impl HiddenStorage {
 
         let total_size = encrypted_length_bytes.len() + encrypted_bytes.len();
         if total_size as u64 > hidden_header.hidden_data_size {
-            return Err(KeepError::Other("Hidden volume full".into()));
+            return Err(StorageError::hidden_volume_full().into());
         }
 
         let vault_path = self.path.join("keep.vault");

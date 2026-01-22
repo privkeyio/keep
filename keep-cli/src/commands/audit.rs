@@ -94,16 +94,16 @@ fn resolve_output_path(out_path: &str) -> Result<PathBuf> {
             .parent()
             .unwrap_or(Path::new("."))
             .canonicalize()
-            .map_err(|_| KeepError::Other("Output directory does not exist".to_string()))?;
+            .map_err(|_| KeepError::InvalidInput("output directory does not exist".to_string()))?;
         let file_name = out_path
             .file_name()
-            .ok_or_else(|| KeepError::Other("Invalid output path".to_string()))?;
+            .ok_or_else(|| KeepError::InvalidInput("invalid output path".to_string()))?;
         parent.join(file_name)
     };
 
     if canonical.to_string_lossy().contains("..") {
-        return Err(KeepError::Other(
-            "Path traversal detected in output path".to_string(),
+        return Err(KeepError::InvalidInput(
+            "path traversal detected in output path".to_string(),
         ));
     }
 
