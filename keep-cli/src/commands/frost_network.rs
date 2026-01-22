@@ -426,7 +426,7 @@ fn cmd_frost_network_sign_hardware(
     if nonce_store.is_nonce_used(group_npub, &commitment_hex) {
         return Err(KeepError::CryptoErr(
             keep_core::error::CryptoError::invalid_key(
-                "nonce has already been used - aborting to prevent key compromise".into(),
+                "nonce has already been used - aborting to prevent key compromise",
             ),
         ));
     }
@@ -569,7 +569,7 @@ fn cmd_frost_network_sign_hardware(
         while peer_commitments.len() < threshold as usize {
             if start.elapsed() > timeout {
                 return Err(KeepError::NetworkErr(
-                    keep_core::error::NetworkError::timeout("waiting for peer commitments".into()),
+                    keep_core::error::NetworkError::timeout("waiting for peer commitments"),
                 ));
             }
 
@@ -863,7 +863,7 @@ pub fn cmd_frost_network_dkg(
         while received_packages.len() < expected_peers as usize {
             if start.elapsed() > timeout {
                 return Err(KeepError::NetworkErr(
-                    keep_core::error::NetworkError::timeout("waiting for peer packages".into()),
+                    keep_core::error::NetworkError::timeout("waiting for peer packages"),
                 ));
             }
 
@@ -993,7 +993,7 @@ pub fn cmd_frost_network_dkg(
         while received_from_peers.len() < expected_peers as usize {
             if start.elapsed() > timeout {
                 return Err(KeepError::NetworkErr(
-                    keep_core::error::NetworkError::timeout("waiting for peer shares".into()),
+                    keep_core::error::NetworkError::timeout("waiting for peer shares"),
                 ));
             }
 

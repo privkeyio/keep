@@ -122,7 +122,7 @@ impl WardenClient {
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
             return Err(
-                NetworkError::request(format!("warden returned {}: {}", status, body)).into(),
+                NetworkError::response(format!("warden returned {}: {}", status, body)).into(),
             );
         }
 
@@ -227,7 +227,7 @@ pub async fn wait_for_approval(
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            return Err(NetworkError::request(format!(
+            return Err(NetworkError::response(format!(
                 "workflow status check: status={} body={}",
                 status, body
             ))

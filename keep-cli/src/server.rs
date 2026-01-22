@@ -494,5 +494,6 @@ fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::Serialization(_) => "Data format error",
         KeepError::Io(_) => "IO error",
         KeepError::Other(_) => "Unknown error",
+        _ => "Unknown error",
     }
 }
