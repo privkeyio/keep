@@ -9,10 +9,14 @@ license = "AGPL-3.0-or-later"
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+default = []
+cli = ["uniffi/cli"]
+
 [dependencies]
 keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net", default-features = false }
-uniffi = { version = "0.28", features = ["cli"] }
+uniffi = "0.28"
 thiserror = "1.0"
 
 [build-dependencies]
@@ -21,3 +25,4 @@ uniffi = { version = "0.28", features = ["build"] }
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
