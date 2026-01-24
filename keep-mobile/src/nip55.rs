@@ -97,7 +97,8 @@ impl Nip55Handler {
         intent.push_str(&format!("S.result={};", result_b64));
 
         if let Some(error) = &response.error {
-            intent.push_str(&format!("S.error={};", error));
+            let error_b64 = base64::engine::general_purpose::STANDARD.encode(error);
+            intent.push_str(&format!("S.error={};", error_b64));
         }
 
         intent.push_str("end");
@@ -144,9 +145,15 @@ impl Nip55Handler {
         signed_event["id"] = serde_json::Value::String(hex::encode(event_hash));
         signed_event["sig"] = serde_json::Value::String(signature_hex.clone());
 
+        let signed_event_json = serde_json::to_string(&signed_event).map_err(|e| {
+            KeepMobileError::Serialization {
+                message: e.to_string(),
+            }
+        })?;
+
         Ok(Nip55Response {
             result: signature_hex,
-            event: Some(serde_json::to_string(&signed_event).unwrap_or_default()),
+            event: Some(signed_event_json),
             error: None,
         })
     }
@@ -203,7 +210,7 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+    let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.chars();
 
     while let Some(c) = chars.next() {
@@ -212,19 +219,22 @@ fn url_decode(s: &str) -> String {
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() == 2 {
                     if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                        result.push(byte as char);
+                        bytes.push(byte);
                         continue;
                     }
                 }
-                result.push('%');
-                result.push_str(&hex);
+                bytes.push(b'%');
+                bytes.extend(hex.as_bytes());
             }
-            '+' => result.push(' '),
-            _ => result.push(c),
+            '+' => bytes.push(b' '),
+            _ => {
+                let mut buf = [0u8; 4];
+                bytes.extend(c.encode_utf8(&mut buf).as_bytes());
+            }
         }
     }
 
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn is_safe_callback_url(url: &str) -> bool {

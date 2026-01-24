@@ -19,6 +19,7 @@ enum KeepMobileError {
     "InvalidRelayUrl",
     "InitializationFailed",
     "NotSupported",
+    "Serialization",
 };
 
 dictionary ShareMetadataInfo {

@@ -46,6 +46,9 @@ pub enum KeepMobileError {
 
     #[error("Operation not supported")]
     NotSupported { message: String },
+
+    #[error("Serialization error")]
+    Serialization { message: String },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {

@@ -47,16 +47,19 @@ impl SigningHooks for MobileSigningHooks {
             ));
         }
 
-        let rt = tokio::runtime::Handle::try_current()
-            .or_else(|_| {
-                tokio::runtime::Builder::new_current_thread()
+        let owned_rt;
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                owned_rt = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
-                    .map(|rt| rt.handle().clone())
-            })
-            .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
+                    .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
+                owned_rt.handle().clone()
+            }
+        };
 
-        let result = rt.block_on(async {
+        let result = handle.block_on(async {
             tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await
         });
 
@@ -292,41 +295,63 @@ impl KeepMobile {
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
         pending: Arc<Mutex<Vec<PendingRequest>>>,
     ) {
+        let mut event_closed = false;
+        let mut request_closed = false;
+
         loop {
+            if event_closed && request_closed {
+                break;
+            }
+
             tokio::select! {
-                Ok(event) = event_rx.recv() => {
-                    let session_id = match event {
-                        KfpNodeEvent::SignatureComplete { session_id, .. }
-                        | KfpNodeEvent::SigningFailed { session_id, .. } => Some(session_id),
-                        _ => None,
-                    };
-                    if let Some(session_id) = session_id {
-                        let id = hex::encode(session_id);
-                        pending.lock().await.retain(|r| r.info.id != id);
+                result = event_rx.recv(), if !event_closed => {
+                    match result {
+                        Ok(event) => {
+                            let session_id = match event {
+                                KfpNodeEvent::SignatureComplete { session_id, .. }
+                                | KfpNodeEvent::SigningFailed { session_id, .. } => Some(session_id),
+                                _ => None,
+                            };
+                            if let Some(session_id) = session_id {
+                                let id = hex::encode(session_id);
+                                pending.lock().await.retain(|r| r.info.id != id);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            event_closed = true;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
                     }
                 }
-                Some((session, response_tx)) = request_rx.recv() => {
-                    let mut guard = pending.lock().await;
-                    if guard.len() >= MAX_PENDING_REQUESTS {
-                        let _ = response_tx.send(false).await;
-                        continue;
+                result = request_rx.recv(), if !request_closed => {
+                    match result {
+                        Some((session, response_tx)) => {
+                            let mut guard = pending.lock().await;
+                            if guard.len() >= MAX_PENDING_REQUESTS {
+                                let _ = response_tx.send(false).await;
+                                continue;
+                            }
+                            let request = SignRequest {
+                                id: hex::encode(session.session_id),
+                                session_id: session.session_id.to_vec(),
+                                message_type: String::new(),
+                                message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
+                                from_peer: 0,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                metadata: None,
+                            };
+                            guard.push(PendingRequest {
+                                info: request,
+                                response_tx,
+                            });
+                        }
+                        None => {
+                            request_closed = true;
+                        }
                     }
-                    let request = SignRequest {
-                        id: hex::encode(session.session_id),
-                        session_id: session.session_id.to_vec(),
-                        message_type: String::new(),
-                        message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
-                        from_peer: 0,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        metadata: None,
-                    };
-                    guard.push(PendingRequest {
-                        info: request,
-                        response_tx,
-                    });
                 }
             }
         }
@@ -415,7 +440,8 @@ fn is_internal_host(host: &str) -> bool {
 
     let host_lower = host.to_lowercase();
 
-    if host_lower.starts_with("10.")
+    if host_lower.starts_with("127.")
+        || host_lower.starts_with("10.")
         || host_lower.starts_with("192.168.")
         || host_lower.starts_with("169.254.")
     {
