@@ -10,6 +10,7 @@ Self-custodial key management for Nostr and Bitcoin.
 - [Remote Signing (NIP-46)](#remote-signing-nip-46)
 - [Bitcoin](#bitcoin)
 - [Threshold Signatures (FROST)](#threshold-signatures-frost)
+- [Mobile (NIP-55)](#mobile-nip-55)
 - [Agent SDK](#agent-sdk)
 - [AWS Nitro Enclaves](#aws-nitro-enclaves)
 - [Hidden Volumes](#hidden-volumes)
@@ -237,6 +238,26 @@ keep frost network dkg \
 ```
 
 All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
+
+---
+
+## Mobile (NIP-55)
+
+UniFFI library for Android/iOS apps to hold FROST shares and sign via NIP-55 protocol.
+
+```kotlin
+// Android: Initialize with secure storage
+val mobile = KeepMobile(AndroidSecureStorage(context))
+mobile.importShare(kshare, passphrase, "phone")
+mobile.initialize(listOf("wss://relay.example.com"))
+
+// Handle NIP-55 intents
+val handler = Nip55Handler(mobile)
+val request = handler.parseIntentUri(intentUri)
+val response = handler.handleRequest(request, callerPackage)
+```
+
+Supports `get_public_key`, `sign_event`, `nip44_encrypt`, `nip44_decrypt`.
 
 ---
 
