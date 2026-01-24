@@ -550,7 +550,7 @@ pub mod nip44 {
         }
         let next_power = (unpadded_len as f64).log2().ceil() as u32;
         let chunk = 2_usize.pow(next_power.max(5) - 5);
-        chunk * ((unpadded_len + chunk - 1) / chunk)
+        chunk * unpadded_len.div_ceil(chunk)
     }
 
     /// Encrypt plaintext using NIP-44 v2 with a raw ECDH shared secret.
