@@ -140,11 +140,11 @@ impl KeepMobile {
     ) -> Result<ShareInfo, KeepMobileError> {
         let export = match ShareExport::from_bech32(&data) {
             Ok(exp) => exp,
-            Err(bech32_err) => ShareExport::from_json(&data).map_err(|json_err| {
-                KeepMobileError::InvalidShare {
+            Err(bech32_err) => {
+                ShareExport::from_json(&data).map_err(|json_err| KeepMobileError::InvalidShare {
                     message: format!("bech32: {}, json: {}", bech32_err, json_err),
-                }
-            })?,
+                })?
+            }
         };
 
         let share =
@@ -424,15 +424,15 @@ fn is_internal_host(host: &str) -> bool {
         return true;
     }
 
-    let stripped = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    let stripped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
 
     if let Ok(addr) = stripped.parse::<IpAddr>() {
         return match addr {
             IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
             }
             IpAddr::V6(v6) => {
                 v6.is_loopback()
