@@ -1,2 +1,112 @@
-namespace keep_mobile {
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+namespace keep_mobile {};
+
+[Error]
+enum KeepMobileError {
+    "NotInitialized",
+    "RequestNotFound",
+    "InvalidSession",
+    "BiometricRequired",
+    "BiometricFailed",
+    "StorageError",
+    "NetworkError",
+    "FrostError",
+    "InvalidShare",
+    "TooManyPendingRequests",
+    "Timeout",
+    "InvalidRelayUrl",
+    "InitializationFailed",
+};
+
+dictionary ShareMetadataInfo {
+    string name;
+    u16 identifier;
+    u16 threshold;
+    u16 total_shares;
+    sequence<u8> group_pubkey;
+};
+
+dictionary ShareInfo {
+    string name;
+    u16 share_index;
+    u16 threshold;
+    u16 total_shares;
+    string group_pubkey;
+};
+
+dictionary SignRequest {
+    string id;
+    sequence<u8> session_id;
+    string message_type;
+    string message_preview;
+    u16 from_peer;
+    u64 timestamp;
+    SignRequestMetadata? metadata;
+};
+
+dictionary SignRequestMetadata {
+    u32? event_kind;
+    string? content_preview;
+    u64? amount_sats;
+    string? destination;
+};
+
+dictionary PeerInfo {
+    u16 share_index;
+    string? name;
+    PeerStatus status;
+};
+
+enum PeerStatus {
+    "Online",
+    "Offline",
+    "Unknown",
+};
+
+[Trait, WithForeign]
+interface SecureStorage {
+    [Throws=KeepMobileError]
+    void store_share(sequence<u8> data, ShareMetadataInfo metadata);
+
+    [Throws=KeepMobileError]
+    sequence<u8> load_share();
+
+    boolean has_share();
+
+    ShareMetadataInfo? get_share_metadata();
+
+    [Throws=KeepMobileError]
+    void delete_share();
+};
+
+interface KeepMobile {
+    [Throws=KeepMobileError]
+    constructor(SecureStorage storage);
+
+    [Throws=KeepMobileError]
+    void initialize(sequence<string> relays);
+
+    [Throws=KeepMobileError]
+    ShareInfo import_share(string data, string passphrase, string name);
+
+    sequence<SignRequest> get_pending_requests();
+
+    [Throws=KeepMobileError]
+    void approve_request(string request_id);
+
+    void reject_request(string request_id);
+
+    sequence<PeerInfo> get_peers();
+
+    boolean has_share();
+
+    ShareInfo? get_share_info();
+
+    [Throws=KeepMobileError]
+    void delete_share();
+
+    [Throws=KeepMobileError]
+    string export_share(string passphrase);
 };
