@@ -1,0 +1,151 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+namespace keep_mobile {};
+
+[Error]
+enum KeepMobileError {
+    "NotInitialized",
+    "RequestNotFound",
+    "InvalidSession",
+    "BiometricRequired",
+    "BiometricFailed",
+    "StorageError",
+    "NetworkError",
+    "FrostError",
+    "InvalidShare",
+    "TooManyPendingRequests",
+    "Timeout",
+    "InvalidRelayUrl",
+    "InitializationFailed",
+    "NotSupported",
+    "Serialization",
+    "PubkeyMismatch",
+    "RateLimited",
+    "InvalidTimestamp",
+};
+
+dictionary ShareMetadataInfo {
+    string name;
+    u16 identifier;
+    u16 threshold;
+    u16 total_shares;
+    sequence<u8> group_pubkey;
+};
+
+dictionary ShareInfo {
+    string name;
+    u16 share_index;
+    u16 threshold;
+    u16 total_shares;
+    string group_pubkey;
+};
+
+dictionary SignRequest {
+    string id;
+    sequence<u8> session_id;
+    string message_type;
+    string message_preview;
+    u16 from_peer;
+    u64 timestamp;
+    SignRequestMetadata? metadata;
+};
+
+dictionary SignRequestMetadata {
+    u32? event_kind;
+    string? content_preview;
+    u64? amount_sats;
+    string? destination;
+};
+
+dictionary PeerInfo {
+    u16 share_index;
+    string? name;
+    PeerStatus status;
+};
+
+enum PeerStatus {
+    "Online",
+    "Offline",
+    "Unknown",
+};
+
+[Trait, WithForeign]
+interface SecureStorage {
+    [Throws=KeepMobileError]
+    void store_share(sequence<u8> data, ShareMetadataInfo metadata);
+
+    [Throws=KeepMobileError]
+    sequence<u8> load_share();
+
+    boolean has_share();
+
+    ShareMetadataInfo? get_share_metadata();
+
+    [Throws=KeepMobileError]
+    void delete_share();
+};
+
+interface KeepMobile {
+    [Throws=KeepMobileError]
+    constructor(SecureStorage storage);
+
+    [Throws=KeepMobileError]
+    void initialize(sequence<string> relays);
+
+    [Throws=KeepMobileError]
+    ShareInfo import_share(string data, string passphrase, string name);
+
+    sequence<SignRequest> get_pending_requests();
+
+    [Throws=KeepMobileError]
+    void approve_request(string request_id);
+
+    void reject_request(string request_id);
+
+    sequence<PeerInfo> get_peers();
+
+    boolean has_share();
+
+    ShareInfo? get_share_info();
+
+    [Throws=KeepMobileError]
+    void delete_share();
+
+    [Throws=KeepMobileError]
+    string export_share(string passphrase);
+};
+
+enum Nip55RequestType {
+    "GetPublicKey",
+    "SignEvent",
+    "Nip44Encrypt",
+    "Nip44Decrypt",
+};
+
+dictionary Nip55Request {
+    Nip55RequestType request_type;
+    string content;
+    string? pubkey;
+    string return_type;
+    string? callback_url;
+};
+
+dictionary Nip55Response {
+    string result;
+    string? event;
+    string? error;
+};
+
+interface Nip55Handler {
+    constructor(KeepMobile mobile);
+
+    [Throws=KeepMobileError]
+    Nip55Response handle_request(Nip55Request request, string caller_id);
+
+    [Throws=KeepMobileError]
+    Nip55Request parse_intent_uri(string uri);
+
+    [Throws=KeepMobileError]
+    string build_result_intent(Nip55Response response, string package);
+};

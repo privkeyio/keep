@@ -58,6 +58,7 @@
 
 mod attestation;
 mod audit;
+mod ecdh;
 mod error;
 mod event;
 mod node;
@@ -69,17 +70,21 @@ mod session;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
+pub use ecdh::{
+    aggregate_ecdh_shares, compute_partial_ecdh, derive_ecdh_session_id, EcdhSession,
+    EcdhSessionManager, EcdhSessionState,
+};
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
-    AnnouncePayload, CommitmentPayload, EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload,
-    PongPayload, SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
-    DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
-    MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH,
-    MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS,
-    MAX_SIGNATURE_SHARE_SIZE,
+    AnnouncePayload, CommitmentPayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
+    EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload, PongPayload, SignRequestPayload,
+    SignatureCompletePayload, SignatureSharePayload, DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND,
+    KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
+    MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH,
+    MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};

@@ -28,6 +28,9 @@ pub enum KfpMessage {
     Commitment(CommitmentPayload),
     SignatureShare(SignatureSharePayload),
     SignatureComplete(SignatureCompletePayload),
+    EcdhRequest(EcdhRequestPayload),
+    EcdhShare(EcdhSharePayload),
+    EcdhComplete(EcdhCompletePayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -41,6 +44,9 @@ impl KfpMessage {
             KfpMessage::Commitment(_) => "commitment",
             KfpMessage::SignatureShare(_) => "signature_share",
             KfpMessage::SignatureComplete(_) => "signature_complete",
+            KfpMessage::EcdhRequest(_) => "ecdh_request",
+            KfpMessage::EcdhShare(_) => "ecdh_share",
+            KfpMessage::EcdhComplete(_) => "ecdh_complete",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -53,6 +59,9 @@ impl KfpMessage {
             KfpMessage::Commitment(p) => Some(&p.session_id),
             KfpMessage::SignatureShare(p) => Some(&p.session_id),
             KfpMessage::SignatureComplete(p) => Some(&p.session_id),
+            KfpMessage::EcdhRequest(p) => Some(&p.session_id),
+            KfpMessage::EcdhShare(p) => Some(&p.session_id),
+            KfpMessage::EcdhComplete(p) => Some(&p.session_id),
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -62,6 +71,7 @@ impl KfpMessage {
         match self {
             KfpMessage::Announce(p) => Some(&p.group_pubkey),
             KfpMessage::SignRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -121,6 +131,21 @@ impl KfpMessage {
                 }
                 if p.message.len() > MAX_ERROR_MESSAGE_LENGTH {
                     return Err("Error message exceeds maximum length");
+                }
+            }
+            KfpMessage::EcdhRequest(p) => {
+                if p.participants.len() > MAX_PARTICIPANTS {
+                    return Err("Participants list exceeds maximum size");
+                }
+            }
+            KfpMessage::EcdhShare(p) => {
+                if p.partial_point.len() != 33 {
+                    return Err("Invalid partial point size");
+                }
+            }
+            KfpMessage::EcdhComplete(p) => {
+                if p.shared_secret.len() != 32 {
+                    return Err("Invalid shared secret size");
                 }
             }
             _ => {}
@@ -391,6 +416,78 @@ impl ErrorPayload {
     pub fn with_session(mut self, session_id: [u8; 32]) -> Self {
         self.session_id = Some(session_id);
         self
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EcdhRequestPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes_33")]
+    pub recipient_pubkey: [u8; 33],
+    pub participants: Vec<u16>,
+    pub created_at: u64,
+}
+
+impl EcdhRequestPayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        recipient_pubkey: [u8; 33],
+        participants: Vec<u16>,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            recipient_pubkey,
+            participants,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EcdhSharePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    #[serde(with = "hex_vec")]
+    pub partial_point: Vec<u8>,
+}
+
+impl EcdhSharePayload {
+    pub fn new(session_id: [u8; 32], share_index: u16, partial_point: Vec<u8>) -> Self {
+        Self {
+            session_id,
+            share_index,
+            partial_point,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EcdhCompletePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_vec")]
+    pub shared_secret: Vec<u8>,
+}
+
+impl EcdhCompletePayload {
+    pub fn new(session_id: [u8; 32], shared_secret: [u8; 32]) -> Self {
+        Self {
+            session_id,
+            shared_secret: shared_secret.to_vec(),
+        }
     }
 }
 

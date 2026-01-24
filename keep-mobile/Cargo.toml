@@ -1,0 +1,31 @@
+[package]
+name = "keep-mobile"
+version = "0.1.3"
+edition = "2021"
+rust-version = "1.85"
+description = "UniFFI bindings for Keep mobile platforms"
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+keep-frost-net = { path = "../keep-frost-net", default-features = false }
+frost-secp256k1-tr = { version = "2.1", default-features = false }
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "1.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2.5"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
