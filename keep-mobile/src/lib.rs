@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod error;
+mod nip55;
 mod storage;
 mod types;
 
 pub use error::KeepMobileError;
+pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo};
 pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
 
@@ -73,10 +75,10 @@ impl SigningHooks for MobileSigningHooks {
 
 #[derive(uniffi::Object)]
 pub struct KeepMobile {
-    node: Arc<RwLock<Option<KfpNode>>>,
+    pub(crate) node: Arc<RwLock<Option<KfpNode>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
-    runtime: tokio::runtime::Runtime,
+    pub(crate) runtime: tokio::runtime::Runtime,
 }
 
 struct PendingRequest {
@@ -394,21 +396,57 @@ fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
 }
 
 fn is_internal_host(host: &str) -> bool {
-    const FORBIDDEN_EXACT: &[&str] = &["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
+    const FORBIDDEN_EXACT: &[&str] = &[
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "[::1]",
+        "169.254.169.254",
+    ];
 
     if FORBIDDEN_EXACT.contains(&host) {
         return true;
     }
 
-    if host.starts_with("10.") || host.starts_with("192.168.") {
+    if host.ends_with(".local") || host.ends_with(".localhost") {
         return true;
     }
 
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(octet) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
-            return (16..=31).contains(&octet);
-        }
+    let host_lower = host.to_lowercase();
+
+    if host_lower.starts_with("10.")
+        || host_lower.starts_with("192.168.")
+        || host_lower.starts_with("169.254.")
+    {
+        return true;
     }
 
-    false
+    if is_private_ipv4_range(&host_lower, "100.", 64..=127)
+        || is_private_ipv4_range(&host_lower, "172.", 16..=31)
+    {
+        return true;
+    }
+
+    is_private_ipv6(host)
+}
+
+fn is_private_ipv4_range(host: &str, prefix: &str, range: std::ops::RangeInclusive<u8>) -> bool {
+    host.strip_prefix(prefix)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|s| s.parse::<u8>().ok())
+        .is_some_and(|octet| range.contains(&octet))
+}
+
+fn is_private_ipv6(host: &str) -> bool {
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_lowercase();
+
+    normalized.starts_with("fc")
+        || normalized.starts_with("fd")
+        || normalized.starts_with("fe80:")
+        || normalized.starts_with("fe80%")
 }

@@ -43,6 +43,9 @@ pub enum KeepMobileError {
 
     #[error("Initialization failed")]
     InitializationFailed { message: String },
+
+    #[error("Operation not supported")]
+    NotSupported { message: String },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {

@@ -18,6 +18,7 @@ enum KeepMobileError {
     "Timeout",
     "InvalidRelayUrl",
     "InitializationFailed",
+    "NotSupported",
 };
 
 dictionary ShareMetadataInfo {
@@ -109,4 +110,38 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     string export_share(string passphrase);
+};
+
+enum Nip55RequestType {
+    "GetPublicKey",
+    "SignEvent",
+    "Nip44Encrypt",
+    "Nip44Decrypt",
+};
+
+dictionary Nip55Request {
+    Nip55RequestType request_type;
+    string content;
+    string? pubkey;
+    string return_type;
+    string? callback_url;
+};
+
+dictionary Nip55Response {
+    string result;
+    string? event;
+    string? error;
+};
+
+interface Nip55Handler {
+    constructor(KeepMobile mobile);
+
+    [Throws=KeepMobileError]
+    Nip55Response handle_request(Nip55Request request);
+
+    [Throws=KeepMobileError]
+    Nip55Request parse_intent_uri(string uri);
+
+    [Throws=KeepMobileError]
+    string build_result_intent(Nip55Response response, string package);
 };
