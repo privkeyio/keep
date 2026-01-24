@@ -9,8 +9,7 @@ pub use error::KeepMobileError;
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo};
 pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
 
-use keep_core::frost::ShareExport;
-use keep_core::frost::SharePackage;
+use keep_core::frost::{ShareExport, SharePackage};
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -248,11 +247,7 @@ impl KeepMobile {
                 .map(|(share_index, status, name)| PeerInfo {
                     share_index,
                     name,
-                    status: match status {
-                        keep_frost_net::PeerStatus::Online => PeerStatus::Online,
-                        keep_frost_net::PeerStatus::Offline => PeerStatus::Offline,
-                        keep_frost_net::PeerStatus::Unknown => PeerStatus::Unknown,
-                    },
+                    status: convert_peer_status(status),
                 })
                 .collect()
         })
@@ -380,40 +375,40 @@ impl KeepMobile {
             .and_then(|s| s.split(':').next())
             .unwrap_or("");
 
-        let forbidden = [
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            "::1",
-            "[::1]",
-            "10.",
-            "192.168.",
-            "172.16.",
-            "172.17.",
-            "172.18.",
-            "172.19.",
-            "172.20.",
-            "172.21.",
-            "172.22.",
-            "172.23.",
-            "172.24.",
-            "172.25.",
-            "172.26.",
-            "172.27.",
-            "172.28.",
-            "172.29.",
-            "172.30.",
-            "172.31.",
-        ];
-
-        for pattern in &forbidden {
-            if host.starts_with(pattern) || host == *pattern {
-                return Err(KeepMobileError::InvalidRelayUrl {
-                    message: "Internal addresses not allowed".into(),
-                });
-            }
+        if is_internal_host(host) {
+            return Err(KeepMobileError::InvalidRelayUrl {
+                message: "Internal addresses not allowed".into(),
+            });
         }
 
         Ok(())
     }
+}
+
+fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
+    match status {
+        keep_frost_net::PeerStatus::Online => PeerStatus::Online,
+        keep_frost_net::PeerStatus::Offline => PeerStatus::Offline,
+        keep_frost_net::PeerStatus::Unknown => PeerStatus::Unknown,
+    }
+}
+
+fn is_internal_host(host: &str) -> bool {
+    const FORBIDDEN_EXACT: &[&str] = &["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
+
+    if FORBIDDEN_EXACT.contains(&host) {
+        return true;
+    }
+
+    if host.starts_with("10.") || host.starts_with("192.168.") {
+        return true;
+    }
+
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(octet) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            return (16..=31).contains(&octet);
+        }
+    }
+
+    false
 }
