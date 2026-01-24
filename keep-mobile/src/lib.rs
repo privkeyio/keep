@@ -389,18 +389,20 @@ impl KeepMobile {
         })
     }
 
-    fn validate_relay_url(url: &str) -> Result<(), KeepMobileError> {
-        if !url.starts_with("wss://") {
+    fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError> {
+        let parsed = url::Url::parse(relay_url).map_err(|_| KeepMobileError::InvalidRelayUrl {
+            message: "Invalid URL format".into(),
+        })?;
+
+        if parsed.scheme() != "wss" {
             return Err(KeepMobileError::InvalidRelayUrl {
                 message: "Must use wss:// protocol".into(),
             });
         }
 
-        let host = url
-            .strip_prefix("wss://")
-            .and_then(|s| s.split('/').next())
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("");
+        let host = parsed.host_str().ok_or(KeepMobileError::InvalidRelayUrl {
+            message: "Missing host".into(),
+        })?;
 
         if is_internal_host(host) {
             return Err(KeepMobileError::InvalidRelayUrl {
@@ -421,6 +423,8 @@ fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
 }
 
 fn is_internal_host(host: &str) -> bool {
+    let host = host.to_lowercase();
+
     const FORBIDDEN_EXACT: &[&str] = &[
         "localhost",
         "127.0.0.1",
@@ -430,7 +434,7 @@ fn is_internal_host(host: &str) -> bool {
         "169.254.169.254",
     ];
 
-    if FORBIDDEN_EXACT.contains(&host) {
+    if FORBIDDEN_EXACT.contains(&host.as_str()) {
         return true;
     }
 
@@ -438,23 +442,21 @@ fn is_internal_host(host: &str) -> bool {
         return true;
     }
 
-    let host_lower = host.to_lowercase();
-
-    if host_lower.starts_with("127.")
-        || host_lower.starts_with("10.")
-        || host_lower.starts_with("192.168.")
-        || host_lower.starts_with("169.254.")
+    if host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
     {
         return true;
     }
 
-    if is_private_ipv4_range(&host_lower, "100.", 64..=127)
-        || is_private_ipv4_range(&host_lower, "172.", 16..=31)
+    if is_private_ipv4_range(&host, "100.", 64..=127)
+        || is_private_ipv4_range(&host, "172.", 16..=31)
     {
         return true;
     }
 
-    is_private_ipv6(host)
+    is_private_ipv6(&host)
 }
 
 fn is_private_ipv4_range(host: &str, prefix: &str, range: std::ops::RangeInclusive<u8>) -> bool {
@@ -468,8 +470,13 @@ fn is_private_ipv6(host: &str) -> bool {
     let normalized = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-        .to_lowercase();
+        .unwrap_or(host);
+
+    if let Ok(addr) = normalized.parse::<std::net::Ipv6Addr>() {
+        if let Some(mapped_v4) = addr.to_ipv4_mapped() {
+            return mapped_v4.is_loopback() || mapped_v4.is_private() || mapped_v4.is_link_local();
+        }
+    }
 
     normalized.starts_with("fc")
         || normalized.starts_with("fd")

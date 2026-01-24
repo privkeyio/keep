@@ -49,6 +49,15 @@ pub enum KeepMobileError {
 
     #[error("Serialization error")]
     Serialization { message: String },
+
+    #[error("Pubkey mismatch")]
+    PubkeyMismatch,
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Invalid timestamp")]
+    InvalidTimestamp,
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {

@@ -20,6 +20,9 @@ enum KeepMobileError {
     "InitializationFailed",
     "NotSupported",
     "Serialization",
+    "PubkeyMismatch",
+    "RateLimited",
+    "InvalidTimestamp",
 };
 
 dictionary ShareMetadataInfo {
@@ -138,7 +141,7 @@ interface Nip55Handler {
     constructor(KeepMobile mobile);
 
     [Throws=KeepMobileError]
-    Nip55Response handle_request(Nip55Request request);
+    Nip55Response handle_request(Nip55Request request, string caller_id);
 
     [Throws=KeepMobileError]
     Nip55Request parse_intent_uri(string uri);

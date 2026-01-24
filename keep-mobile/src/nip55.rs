@@ -4,9 +4,17 @@
 use crate::{KeepMobile, KeepMobileError};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const URI_SCHEME: &str = "nostrsigner:";
+const MAX_TAGS_COUNT: usize = 1000;
+const MAX_EVENT_SIZE: usize = 128 * 1024;
+const TIMESTAMP_DRIFT_SECS: i64 = 15 * 60;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_REQUESTS_PER_WINDOW: u32 = 10;
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(uniffi::Enum, Clone, Debug)]
 pub enum Nip55RequestType {
@@ -32,20 +40,46 @@ pub struct Nip55Response {
     pub error: Option<String>,
 }
 
+struct RateLimitState {
+    requests: Vec<Instant>,
+    backoff_until: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+impl Default for RateLimitState {
+    fn default() -> Self {
+        Self {
+            requests: Vec::new(),
+            backoff_until: None,
+            consecutive_failures: 0,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
     mobile: Arc<KeepMobile>,
+    rate_limits: Mutex<HashMap<String, RateLimitState>>,
 }
 
 #[uniffi::export]
 impl Nip55Handler {
     #[uniffi::constructor]
     pub fn new(mobile: Arc<KeepMobile>) -> Self {
-        Self { mobile }
+        Self {
+            mobile,
+            rate_limits: Mutex::new(HashMap::new()),
+        }
     }
 
-    pub fn handle_request(&self, request: Nip55Request) -> Result<Nip55Response, KeepMobileError> {
-        match request.request_type {
+    pub fn handle_request(
+        &self,
+        request: Nip55Request,
+        caller_id: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        self.check_rate_limit(&caller_id)?;
+
+        let result = match request.request_type {
             Nip55RequestType::GetPublicKey => self.handle_get_public_key(),
             Nip55RequestType::SignEvent => self.handle_sign_event(request.content),
             Nip55RequestType::Nip44Encrypt => Err(KeepMobileError::NotSupported {
@@ -54,7 +88,10 @@ impl Nip55Handler {
             Nip55RequestType::Nip44Decrypt => Err(KeepMobileError::NotSupported {
                 message: "NIP-44 decryption requires threshold ECDH".into(),
             }),
-        }
+        };
+
+        self.record_result(&caller_id, result.is_ok());
+        result
     }
 
     pub fn parse_intent_uri(&self, uri: String) -> Result<Nip55Request, KeepMobileError> {
@@ -126,6 +163,18 @@ impl Nip55Handler {
 
         validate_nostr_event(&event)?;
 
+        let share_info = self
+            .mobile
+            .get_share_info()
+            .ok_or(KeepMobileError::NotInitialized)?;
+
+        let event_pubkey = event["pubkey"]
+            .as_str()
+            .ok_or(KeepMobileError::InvalidSession)?;
+        if event_pubkey != share_info.group_pubkey {
+            return Err(KeepMobileError::PubkeyMismatch);
+        }
+
         let event_hash = compute_nostr_event_id(&event)?;
 
         let signature = self.mobile.runtime.block_on(async {
@@ -155,6 +204,46 @@ impl Nip55Handler {
             event: Some(signed_event_json),
             error: None,
         })
+    }
+
+    fn check_rate_limit(&self, caller_id: &str) -> Result<(), KeepMobileError> {
+        let mut limits = self.rate_limits.lock().unwrap();
+        let state = limits.entry(caller_id.to_string()).or_default();
+        let now = Instant::now();
+
+        if let Some(backoff_until) = state.backoff_until {
+            if now < backoff_until {
+                return Err(KeepMobileError::RateLimited);
+            }
+            state.backoff_until = None;
+        }
+
+        state
+            .requests
+            .retain(|&t| now.duration_since(t) < RATE_LIMIT_WINDOW);
+
+        if state.requests.len() >= MAX_REQUESTS_PER_WINDOW as usize {
+            return Err(KeepMobileError::RateLimited);
+        }
+
+        state.requests.push(now);
+        Ok(())
+    }
+
+    fn record_result(&self, caller_id: &str, success: bool) {
+        let mut limits = self.rate_limits.lock().unwrap();
+        let state = limits.entry(caller_id.to_string()).or_default();
+
+        if success {
+            state.consecutive_failures = 0;
+        } else {
+            state.consecutive_failures += 1;
+            if state.consecutive_failures >= 3 {
+                let backoff = Duration::from_secs(2u64.pow(state.consecutive_failures.min(8)))
+                    .min(MAX_BACKOFF);
+                state.backoff_until = Some(Instant::now() + backoff);
+            }
+        }
     }
 }
 
@@ -237,8 +326,10 @@ fn url_decode(s: &str) -> String {
 }
 
 fn is_safe_callback_url(url: &str) -> bool {
+    const ALLOWED_SCHEMES: &[&str] = &["nostrsigner:", "nostr:"];
+
     let lower = url.to_lowercase();
-    !lower.starts_with("http://") && !lower.starts_with("https://")
+    ALLOWED_SCHEMES.iter().any(|s| lower.starts_with(s))
 }
 
 fn is_valid_package_name(name: &str) -> bool {
@@ -269,6 +360,27 @@ fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError
 
     if !valid {
         return Err(KeepMobileError::InvalidSession);
+    }
+
+    let tags = event["tags"].as_array().unwrap();
+    if tags.len() > MAX_TAGS_COUNT {
+        return Err(KeepMobileError::InvalidSession);
+    }
+
+    let event_str = serde_json::to_string(event).map_err(|_| KeepMobileError::InvalidSession)?;
+    if event_str.len() > MAX_EVENT_SIZE {
+        return Err(KeepMobileError::InvalidSession);
+    }
+
+    let created_at = event["created_at"]
+        .as_i64()
+        .ok_or(KeepMobileError::InvalidSession)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if (created_at - now).abs() > TIMESTAMP_DRIFT_SECS {
+        return Err(KeepMobileError::InvalidTimestamp);
     }
 
     Ok(())
