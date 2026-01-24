@@ -8,6 +8,7 @@ members = [
     "keep-bitcoin",
     "keep-agent",
     "keep-frost-net",
+    "keep-mobile",
 ]
 exclude = [
     "keep-enclave/enclave",
