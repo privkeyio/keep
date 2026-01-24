@@ -9,7 +9,11 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
+chacha20 = "0.9"
 blake2 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.9"
 frost-secp256k1-tr = "2.2.0"

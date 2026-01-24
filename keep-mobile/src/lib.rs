@@ -434,29 +434,16 @@ fn is_internal_host(host: &str) -> bool {
         "169.254.169.254",
     ];
 
-    if FORBIDDEN_EXACT.contains(&host.as_str()) {
-        return true;
-    }
-
-    if host.ends_with(".local") || host.ends_with(".localhost") {
-        return true;
-    }
-
-    if host.starts_with("127.")
+    FORBIDDEN_EXACT.contains(&host.as_str())
+        || host.ends_with(".local")
+        || host.ends_with(".localhost")
+        || host.starts_with("127.")
         || host.starts_with("10.")
         || host.starts_with("192.168.")
         || host.starts_with("169.254.")
-    {
-        return true;
-    }
-
-    if is_private_ipv4_range(&host, "100.", 64..=127)
+        || is_private_ipv4_range(&host, "100.", 64..=127)
         || is_private_ipv4_range(&host, "172.", 16..=31)
-    {
-        return true;
-    }
-
-    is_private_ipv6(&host)
+        || is_private_ipv6(&host)
 }
 
 fn is_private_ipv4_range(host: &str, prefix: &str, range: std::ops::RangeInclusive<u8>) -> bool {

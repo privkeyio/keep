@@ -471,6 +471,164 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     entropy::random_bytes()
 }
 
+/// NIP-44 encryption using a raw ECDH shared secret.
+///
+/// This module implements NIP-44 v2 encryption/decryption for use with
+/// threshold ECDH, where the shared secret is computed via distributed
+/// key operations rather than from a single private key.
+pub mod nip44 {
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use chacha20::XChaCha20;
+    use hkdf::Hkdf;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    use super::{entropy, CryptoError, Result};
+
+    const NIP44_SALT: &[u8] = b"nip44-v2";
+    #[allow(dead_code)]
+    const MIN_PLAINTEXT_SIZE: usize = 1;
+    const MAX_PLAINTEXT_SIZE: usize = 65535;
+
+    fn derive_conversation_key(shared_secret: &[u8; 32]) -> Result<[u8; 32]> {
+        let hk = Hkdf::<Sha256>::new(Some(NIP44_SALT), shared_secret);
+        let mut key = [0u8; 32];
+        hk.expand(b"", &mut key)
+            .map_err(|_| CryptoError::kdf("NIP-44 conversation key derivation failed"))?;
+        Ok(key)
+    }
+
+    fn derive_message_keys(
+        conversation_key: &[u8; 32],
+        nonce: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+        let hk = Hkdf::<Sha256>::new(Some(nonce), conversation_key);
+        let mut keys = [0u8; 96];
+        hk.expand(b"nip44-v2", &mut keys)
+            .map_err(|_| CryptoError::kdf("NIP-44 message key derivation failed"))?;
+
+        let mut chacha_key = [0u8; 32];
+        let mut chacha_nonce = [0u8; 32];
+        let mut hmac_key = [0u8; 32];
+        chacha_key.copy_from_slice(&keys[0..32]);
+        chacha_nonce.copy_from_slice(&keys[32..64]);
+        hmac_key.copy_from_slice(&keys[64..96]);
+
+        Ok((chacha_key, chacha_nonce, hmac_key))
+    }
+
+    fn pad_plaintext(plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.is_empty() || plaintext.len() > MAX_PLAINTEXT_SIZE {
+            return Err(CryptoError::encryption("Plaintext size out of range").into());
+        }
+
+        let len = plaintext.len();
+        let padded_len = calc_padded_len(len);
+        let mut padded = vec![0u8; 2 + padded_len];
+        padded[0] = (len >> 8) as u8;
+        padded[1] = (len & 0xff) as u8;
+        padded[2..2 + len].copy_from_slice(plaintext);
+        Ok(padded)
+    }
+
+    fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>> {
+        if padded.len() < 2 {
+            return Err(CryptoError::decryption("Padded data too short").into());
+        }
+
+        let len = ((padded[0] as usize) << 8) | (padded[1] as usize);
+        if len == 0 || len > MAX_PLAINTEXT_SIZE || 2 + len > padded.len() {
+            return Err(CryptoError::decryption("Invalid plaintext length").into());
+        }
+
+        Ok(padded[2..2 + len].to_vec())
+    }
+
+    fn calc_padded_len(unpadded_len: usize) -> usize {
+        if unpadded_len <= 32 {
+            return 32;
+        }
+        let next_power = (unpadded_len as f64).log2().ceil() as u32;
+        let chunk = 2_usize.pow(next_power.max(5) - 5);
+        chunk * ((unpadded_len + chunk - 1) / chunk)
+    }
+
+    /// Encrypt plaintext using NIP-44 v2 with a raw ECDH shared secret.
+    ///
+    /// Returns the encrypted payload as raw bytes (version + nonce + ciphertext + MAC).
+    pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let conversation_key = derive_conversation_key(shared_secret)?;
+        let nonce: [u8; 32] = entropy::random_bytes();
+        let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
+
+        let padded = pad_plaintext(plaintext)?;
+
+        let mut ciphertext = padded;
+        let mut cipher = XChaCha20::new(
+            chacha_key.as_ref().into(),
+            chacha_nonce[..24].as_ref().into(),
+        );
+        cipher.apply_keystream(&mut ciphertext);
+
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+            .map_err(|_| CryptoError::encryption("Failed to create HMAC"))?;
+        mac.update(&nonce);
+        mac.update(&ciphertext);
+        let tag = mac.finalize().into_bytes();
+
+        let version = 2u8;
+        let mut result = Vec::with_capacity(1 + 32 + ciphertext.len() + 32);
+        result.push(version);
+        result.extend_from_slice(&nonce);
+        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(&tag);
+
+        Ok(result)
+    }
+
+    /// Decrypt a NIP-44 v2 payload using a raw ECDH shared secret.
+    ///
+    /// Takes the encrypted payload as raw bytes and returns the plaintext.
+    pub fn decrypt(shared_secret: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>> {
+        if payload.len() < 1 + 32 + 2 + 32 {
+            return Err(CryptoError::decryption("Payload too short").into());
+        }
+
+        let version = payload[0];
+        if version != 2 {
+            return Err(CryptoError::decryption("Unsupported NIP-44 version").into());
+        }
+
+        let nonce: [u8; 32] = payload[1..33]
+            .try_into()
+            .map_err(|_| CryptoError::decryption("Invalid nonce"))?;
+
+        let ciphertext = &payload[33..payload.len() - 32];
+        let expected_tag: [u8; 32] = payload[payload.len() - 32..]
+            .try_into()
+            .map_err(|_| CryptoError::decryption("Invalid tag"))?;
+
+        let conversation_key = derive_conversation_key(shared_secret)?;
+        let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
+
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+            .map_err(|_| CryptoError::decryption("Failed to create HMAC"))?;
+        mac.update(&nonce);
+        mac.update(ciphertext);
+        mac.verify_slice(&expected_tag)
+            .map_err(|_| CryptoError::decryption("HMAC verification failed"))?;
+
+        let mut plaintext = ciphertext.to_vec();
+        let mut cipher = XChaCha20::new(
+            chacha_key.as_ref().into(),
+            chacha_nonce[..24].as_ref().into(),
+        );
+        cipher.apply_keystream(&mut plaintext);
+
+        unpad_plaintext(&plaintext)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2081,6 +2081,7 @@ dependencies = [
  "bech32",
  "bincode",
  "blake2",
+ "chacha20",
  "chacha20poly1305",
  "chrono",
  "criterion",
@@ -2088,6 +2089,8 @@ dependencies = [
  "frost-secp256k1-tr",
  "fs2",
  "hex",
+ "hkdf",
+ "hmac",
  "k256",
  "memsec 0.7.0",
  "memsecurity",
@@ -2097,6 +2100,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 1.0.69",
@@ -2187,6 +2191,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
+ "url",
 ]
 
 [[package]]

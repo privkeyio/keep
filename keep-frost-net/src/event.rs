@@ -209,6 +209,76 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    pub fn ecdh_request(
+        keys: &Keys,
+        recipient: &PublicKey,
+        request: EcdhRequestPayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::EcdhRequest(request.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(request.group_pubkey)],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(request.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["ecdh_request"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
+    pub fn ecdh_share(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: EcdhSharePayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::EcdhShare(payload.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(payload.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["ecdh_share"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
+    pub fn ecdh_complete(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: EcdhCompletePayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::EcdhComplete(payload.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(payload.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["ecdh_complete"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn decrypt_message(keys: &Keys, event: &Event) -> Result<KfpMessage> {
         const MAX_ENCRYPTED_CONTENT_SIZE: usize = MAX_MESSAGE_SIZE * 2;
         if event.content.len() > MAX_ENCRYPTED_CONTENT_SIZE {
