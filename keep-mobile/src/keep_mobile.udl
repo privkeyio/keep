@@ -20,14 +20,16 @@ enum KeepMobileError {
     "InitializationFailed",
 };
 
+// group_pubkey is hex-encoded (64 lowercase hex characters for secp256k1 x-only pubkey)
 dictionary ShareMetadataInfo {
     string name;
     u16 identifier;
     u16 threshold;
     u16 total_shares;
-    sequence<u8> group_pubkey;
+    string group_pubkey;
 };
 
+// group_pubkey is hex-encoded (64 lowercase hex characters for secp256k1 x-only pubkey)
 dictionary ShareInfo {
     string name;
     u16 share_index;
@@ -91,17 +93,22 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     ShareInfo import_share(string data, string passphrase, string name);
 
+    [Throws=KeepMobileError]
     sequence<SignRequest> get_pending_requests();
 
     [Throws=KeepMobileError]
     void approve_request(string request_id);
 
+    [Throws=KeepMobileError]
     void reject_request(string request_id);
 
+    [Throws=KeepMobileError]
     sequence<PeerInfo> get_peers();
 
+    [Throws=KeepMobileError]
     boolean has_share();
 
+    [Throws=KeepMobileError]
     ShareInfo? get_share_info();
 
     [Throws=KeepMobileError]

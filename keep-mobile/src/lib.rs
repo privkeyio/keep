@@ -35,14 +35,18 @@ struct MobileSigningHooks {
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        if self
-            .request_tx
-            .blocking_send((session.clone(), response_tx))
-            .is_err()
-        {
-            return Err(keep_frost_net::FrostNetError::Session(
-                "Channel closed".into(),
-            ));
+        match self.request_tx.try_send((session.clone(), response_tx)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(keep_frost_net::FrostNetError::Session(
+                    "Request queue full".into(),
+                ));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(keep_frost_net::FrostNetError::Session(
+                    "Channel closed".into(),
+                ));
+            }
         }
 
         let rt = tokio::runtime::Handle::try_current()
@@ -134,14 +138,14 @@ impl KeepMobile {
         passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
-        let export = if data.starts_with("kshare") {
-            ShareExport::from_bech32(&data)
-        } else {
-            ShareExport::from_json(&data)
-        }
-        .map_err(|e| KeepMobileError::InvalidShare {
-            message: e.to_string(),
-        })?;
+        let export = match ShareExport::from_bech32(&data) {
+            Ok(exp) => exp,
+            Err(bech32_err) => ShareExport::from_json(&data).map_err(|json_err| {
+                KeepMobileError::InvalidShare {
+                    message: format!("bech32: {}, json: {}", bech32_err, json_err),
+                }
+            })?,
+        };
 
         let share =
             export
@@ -155,7 +159,7 @@ impl KeepMobile {
             identifier: share.metadata.identifier,
             threshold: share.metadata.threshold,
             total_shares: share.metadata.total_shares,
-            group_pubkey: share.metadata.group_pubkey.to_vec(),
+            group_pubkey: hex::encode(share.metadata.group_pubkey),
         };
 
         let stored = StoredShareData {
@@ -196,19 +200,19 @@ impl KeepMobile {
             share_index: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
-            group_pubkey: hex::encode(&metadata.group_pubkey),
+            group_pubkey: metadata.group_pubkey,
         })
     }
 
-    pub fn get_pending_requests(&self) -> Vec<SignRequest> {
-        self.runtime.block_on(async {
+    pub fn get_pending_requests(&self) -> Result<Vec<SignRequest>, KeepMobileError> {
+        Ok(self.runtime.block_on(async {
             self.pending_requests
                 .lock()
                 .await
                 .iter()
                 .map(|r| r.info.clone())
                 .collect()
-        })
+        }))
     }
 
     pub fn approve_request(&self, request_id: String) -> Result<(), KeepMobileError> {
@@ -220,23 +224,33 @@ impl KeepMobile {
                 .ok_or(KeepMobileError::RequestNotFound)?;
 
             let request = pending.remove(idx);
-            let _ = request.response_tx.send(true).await;
-            Ok(())
+            request
+                .response_tx
+                .send(true)
+                .await
+                .map_err(|_| KeepMobileError::Timeout)
         })
     }
 
-    pub fn reject_request(&self, request_id: String) {
+    pub fn reject_request(&self, request_id: String) -> Result<(), KeepMobileError> {
         self.runtime.block_on(async {
             let mut pending = self.pending_requests.lock().await;
-            if let Some(idx) = pending.iter().position(|r| r.info.id == request_id) {
-                let request = pending.remove(idx);
-                let _ = request.response_tx.send(false).await;
-            }
-        });
+            let idx = pending
+                .iter()
+                .position(|r| r.info.id == request_id)
+                .ok_or(KeepMobileError::RequestNotFound)?;
+
+            let request = pending.remove(idx);
+            request
+                .response_tx
+                .send(false)
+                .await
+                .map_err(|_| KeepMobileError::Timeout)
+        })
     }
 
-    pub fn get_peers(&self) -> Vec<PeerInfo> {
-        self.runtime.block_on(async {
+    pub fn get_peers(&self) -> Result<Vec<PeerInfo>, KeepMobileError> {
+        Ok(self.runtime.block_on(async {
             let node_guard = self.node.read().await;
             let Some(node) = node_guard.as_ref() else {
                 return Vec::new();
@@ -250,21 +264,21 @@ impl KeepMobile {
                     status: convert_peer_status(status),
                 })
                 .collect()
-        })
+        }))
     }
 
-    pub fn has_share(&self) -> bool {
-        self.storage.has_share()
+    pub fn has_share(&self) -> Result<bool, KeepMobileError> {
+        Ok(self.storage.has_share())
     }
 
-    pub fn get_share_info(&self) -> Option<ShareInfo> {
-        self.storage.get_share_metadata().map(|m| ShareInfo {
+    pub fn get_share_info(&self) -> Result<Option<ShareInfo>, KeepMobileError> {
+        Ok(self.storage.get_share_metadata().map(|m| ShareInfo {
             name: m.name,
             share_index: m.identifier,
             threshold: m.threshold,
             total_shares: m.total_shares,
-            group_pubkey: hex::encode(&m.group_pubkey),
-        })
+            group_pubkey: m.group_pubkey,
+        }))
     }
 
     pub fn delete_share(&self) -> Result<(), KeepMobileError> {
@@ -362,18 +376,26 @@ impl KeepMobile {
         })
     }
 
-    fn validate_relay_url(url: &str) -> Result<(), KeepMobileError> {
-        if !url.starts_with("wss://") {
+    fn validate_relay_url(url_str: &str) -> Result<(), KeepMobileError> {
+        let parsed = url::Url::parse(url_str).map_err(|e| KeepMobileError::InvalidRelayUrl {
+            message: format!("Invalid URL: {}", e),
+        })?;
+
+        if parsed.scheme() != "wss" {
             return Err(KeepMobileError::InvalidRelayUrl {
                 message: "Must use wss:// protocol".into(),
             });
         }
 
-        let host = url
-            .strip_prefix("wss://")
-            .and_then(|s| s.split('/').next())
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("");
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(KeepMobileError::InvalidRelayUrl {
+                message: "Userinfo not allowed in relay URL".into(),
+            });
+        }
+
+        let host = parsed.host_str().ok_or(KeepMobileError::InvalidRelayUrl {
+            message: "Missing host".into(),
+        })?;
 
         if is_internal_host(host) {
             return Err(KeepMobileError::InvalidRelayUrl {
@@ -394,21 +416,40 @@ fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
 }
 
 fn is_internal_host(host: &str) -> bool {
-    const FORBIDDEN_EXACT: &[&str] = &["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
+    use std::net::IpAddr;
+
+    const FORBIDDEN_EXACT: &[&str] = &["localhost"];
 
     if FORBIDDEN_EXACT.contains(&host) {
         return true;
     }
 
-    if host.starts_with("10.") || host.starts_with("192.168.") {
-        return true;
-    }
+    let stripped = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
 
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(octet) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
-            return (16..=31).contains(&octet);
-        }
+    if let Ok(addr) = stripped.parse::<IpAddr>() {
+        return match addr {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || is_unique_local(&v6)
+                    || is_unicast_link_local(&v6)
+            }
+        };
     }
 
     false
+}
+
+fn is_unique_local(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_unicast_link_local(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }

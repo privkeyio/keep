@@ -17,6 +17,7 @@ uniffi = { version = "0.28", features = ["cli"] }
 thiserror = "1.0"
 tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time"] }
 hex = "0.4"
+url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
