@@ -145,11 +145,10 @@ impl Nip55Handler {
         signed_event["id"] = serde_json::Value::String(hex::encode(event_hash));
         signed_event["sig"] = serde_json::Value::String(signature_hex.clone());
 
-        let signed_event_json = serde_json::to_string(&signed_event).map_err(|e| {
-            KeepMobileError::Serialization {
+        let signed_event_json =
+            serde_json::to_string(&signed_event).map_err(|e| KeepMobileError::Serialization {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         Ok(Nip55Response {
             result: signature_hex,

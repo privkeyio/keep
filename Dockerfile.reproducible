@@ -21,6 +21,7 @@ COPY keep-bitcoin ./keep-bitcoin
 COPY keep-agent ./keep-agent
 COPY keep-frost-net ./keep-frost-net
 COPY keep-enclave ./keep-enclave
+COPY keep-mobile ./keep-mobile
 
 RUN cargo build --release --locked \
     && mkdir -p /out \
