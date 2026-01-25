@@ -97,7 +97,7 @@ impl KeepMobile {
             .enable_all()
             .build()
             .map_err(|e| KeepMobileError::InitializationFailed {
-                message: format!("Runtime: {}", e),
+                msg: format!("Runtime: {}", e),
             })?;
 
         Ok(Self {
@@ -144,16 +144,11 @@ impl KeepMobile {
         } else {
             ShareExport::from_json(&data)
         }
-        .map_err(|e| KeepMobileError::InvalidShare {
-            message: e.to_string(),
-        })?;
+        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        let share =
-            export
-                .to_share(&passphrase, &name)
-                .map_err(|e| KeepMobileError::InvalidShare {
-                    message: e.to_string(),
-                })?;
+        let share = export
+            .to_share(&passphrase, &name)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         let metadata = ShareMetadataInfo {
             name: share.metadata.name.clone(),
@@ -164,35 +159,26 @@ impl KeepMobile {
         };
 
         let stored = StoredShareData {
-            metadata_json: serde_json::to_string(&share.metadata).map_err(|e| {
-                KeepMobileError::StorageError {
-                    message: e.to_string(),
-                }
-            })?,
+            metadata_json: serde_json::to_string(&share.metadata)
+                .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
             key_package_bytes: share
                 .key_package()
-                .map_err(|e| KeepMobileError::FrostError {
-                    message: e.to_string(),
-                })?
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
                 .serialize()
                 .map_err(|e| KeepMobileError::FrostError {
-                    message: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {}", e),
                 })?,
             pubkey_package_bytes: share
                 .pubkey_package()
-                .map_err(|e| KeepMobileError::FrostError {
-                    message: e.to_string(),
-                })?
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
                 .serialize()
                 .map_err(|e| KeepMobileError::FrostError {
-                    message: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {}", e),
                 })?,
         };
 
-        let serialized =
-            serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
-                message: e.to_string(),
-            })?;
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
         self.storage.store_share(serialized, metadata.clone())?;
 
@@ -278,14 +264,11 @@ impl KeepMobile {
 
     pub fn export_share(&self, passphrase: String) -> Result<String, KeepMobileError> {
         let share = self.load_share_package()?;
-        let export = ShareExport::from_share(&share, &passphrase).map_err(|e| {
-            KeepMobileError::FrostError {
-                message: e.to_string(),
-            }
-        })?;
-        export.to_bech32().map_err(|e| KeepMobileError::FrostError {
-            message: e.to_string(),
-        })
+        let export = ShareExport::from_share(&share, &passphrase)
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+        export
+            .to_bech32()
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
 }
 
@@ -359,54 +342,47 @@ impl KeepMobile {
 
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
         let data = self.storage.load_share()?;
-        let stored: StoredShareData =
-            serde_json::from_slice(&data).map_err(|e| KeepMobileError::InvalidShare {
-                message: e.to_string(),
-            })?;
+        let stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         let metadata: keep_core::frost::ShareMetadata = serde_json::from_str(&stored.metadata_json)
-            .map_err(|e| KeepMobileError::InvalidShare {
-                message: e.to_string(),
-            })?;
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(
             &stored.key_package_bytes,
         )
         .map_err(|e| KeepMobileError::InvalidShare {
-            message: format!("Invalid key package: {}", e),
+            msg: format!("Invalid key package: {}", e),
         })?;
 
         let pubkey_package =
             frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
                 .map_err(|e| KeepMobileError::InvalidShare {
-                message: format!("Invalid pubkey package: {}", e),
+                msg: format!("Invalid pubkey package: {}", e),
             })?;
 
-        SharePackage::new(metadata, &key_package, &pubkey_package).map_err(|e| {
-            KeepMobileError::FrostError {
-                message: e.to_string(),
-            }
-        })
+        SharePackage::new(metadata, &key_package, &pubkey_package)
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
 
     fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError> {
         let parsed = url::Url::parse(relay_url).map_err(|_| KeepMobileError::InvalidRelayUrl {
-            message: "Invalid URL format".into(),
+            msg: "Invalid URL format".into(),
         })?;
 
         if parsed.scheme() != "wss" {
             return Err(KeepMobileError::InvalidRelayUrl {
-                message: "Must use wss:// protocol".into(),
+                msg: "Must use wss:// protocol".into(),
             });
         }
 
         let host = parsed.host_str().ok_or(KeepMobileError::InvalidRelayUrl {
-            message: "Missing host".into(),
+            msg: "Missing host".into(),
         })?;
 
         if is_internal_host(host) {
             return Err(KeepMobileError::InvalidRelayUrl {
-                message: "Internal addresses not allowed".into(),
+                msg: "Internal addresses not allowed".into(),
             });
         }
 

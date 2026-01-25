@@ -46,11 +46,6 @@ fn is_rdrand_validated() -> bool {
     })
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn is_rdrand_validated() -> bool {
-    false
-}
-
 #[cfg(target_arch = "x86_64")]
 fn rdrand64_with_retry() -> Option<u64> {
     const MAX_RETRIES: u32 = 10;
