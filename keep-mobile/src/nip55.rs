@@ -177,14 +177,12 @@ impl Nip55Handler {
 
             node.request_ecdh(&pubkey_bytes)
                 .await
-                .map_err(|e| KeepMobileError::FrostError {
-                    message: e.to_string(),
-                })
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
         })?;
 
         let encrypted = nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|e| {
             KeepMobileError::FrostError {
-                message: format!("NIP-44 encryption failed: {}", e),
+                msg: format!("NIP-44 encryption failed: {}", e),
             }
         })?;
 
@@ -215,18 +213,16 @@ impl Nip55Handler {
 
             node.request_ecdh(&pubkey_bytes)
                 .await
-                .map_err(|e| KeepMobileError::FrostError {
-                    message: e.to_string(),
-                })
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
         })?;
 
         let decrypted =
             nip44::decrypt(&shared_secret, &payload).map_err(|e| KeepMobileError::FrostError {
-                message: format!("NIP-44 decryption failed: {}", e),
+                msg: format!("NIP-44 decryption failed: {}", e),
             })?;
 
         let result = String::from_utf8(decrypted).map_err(|_| KeepMobileError::Serialization {
-            message: "Decrypted content is not valid UTF-8".into(),
+            msg: "Decrypted content is not valid UTF-8".into(),
         })?;
 
         Ok(Nip55Response {
@@ -263,9 +259,7 @@ impl Nip55Handler {
 
             node.request_signature(event_hash.to_vec(), "nostr_event")
                 .await
-                .map_err(|e| KeepMobileError::FrostError {
-                    message: e.to_string(),
-                })
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
         })?;
 
         let signature_hex = hex::encode(signature);
@@ -274,10 +268,8 @@ impl Nip55Handler {
         signed_event["id"] = serde_json::Value::String(hex::encode(event_hash));
         signed_event["sig"] = serde_json::Value::String(signature_hex.clone());
 
-        let signed_event_json =
-            serde_json::to_string(&signed_event).map_err(|e| KeepMobileError::Serialization {
-                message: e.to_string(),
-            })?;
+        let signed_event_json = serde_json::to_string(&signed_event)
+            .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
 
         Ok(Nip55Response {
             result: signature_hex,

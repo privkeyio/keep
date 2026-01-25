@@ -21,16 +21,16 @@ pub enum KeepMobileError {
     BiometricFailed,
 
     #[error("Storage error")]
-    StorageError { message: String },
+    StorageError { msg: String },
 
     #[error("Network error")]
-    NetworkError { message: String },
+    NetworkError { msg: String },
 
     #[error("FROST error")]
-    FrostError { message: String },
+    FrostError { msg: String },
 
     #[error("Invalid share data")]
-    InvalidShare { message: String },
+    InvalidShare { msg: String },
 
     #[error("Too many pending requests")]
     TooManyPendingRequests,
@@ -39,16 +39,16 @@ pub enum KeepMobileError {
     Timeout,
 
     #[error("Invalid relay URL")]
-    InvalidRelayUrl { message: String },
+    InvalidRelayUrl { msg: String },
 
     #[error("Initialization failed")]
-    InitializationFailed { message: String },
+    InitializationFailed { msg: String },
 
     #[error("Operation not supported")]
-    NotSupported { message: String },
+    NotSupported { msg: String },
 
     #[error("Serialization error")]
-    Serialization { message: String },
+    Serialization { msg: String },
 
     #[error("Pubkey mismatch")]
     PubkeyMismatch,
@@ -62,16 +62,12 @@ pub enum KeepMobileError {
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
     fn from(e: keep_frost_net::FrostNetError) -> Self {
-        KeepMobileError::NetworkError {
-            message: e.to_string(),
-        }
+        KeepMobileError::NetworkError { msg: e.to_string() }
     }
 }
 
 impl From<keep_core::error::KeepError> for KeepMobileError {
     fn from(e: keep_core::error::KeepError) -> Self {
-        KeepMobileError::FrostError {
-            message: e.to_string(),
-        }
+        KeepMobileError::FrostError { msg: e.to_string() }
     }
 }
