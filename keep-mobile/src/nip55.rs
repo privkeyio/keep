@@ -24,6 +24,7 @@ pub enum Nip55RequestType {
     SignEvent,
     Nip44Encrypt,
     Nip44Decrypt,
+    DecryptZapEvent,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -34,6 +35,8 @@ pub struct Nip55Request {
     pub return_type: String,
     pub callback_url: Option<String>,
     pub id: Option<String>,
+    pub current_user: Option<String>,
+    pub permissions: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -74,6 +77,10 @@ impl Nip55Handler {
     ) -> Result<Nip55Response, KeepMobileError> {
         self.check_rate_limit(&caller_id)?;
 
+        if let Some(ref current_user) = request.current_user {
+            self.validate_current_user(current_user)?;
+        }
+
         let request_id = request.id.clone();
         let pubkey = request.pubkey.clone();
 
@@ -88,6 +95,9 @@ impl Nip55Handler {
                 let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
                 self.handle_nip44_decrypt(request.content, pk)
             }
+            Nip55RequestType::DecryptZapEvent => Err(KeepMobileError::NotSupported {
+                msg: "decrypt_zap_event requires NIP-04 which is not supported".into(),
+            }),
         };
 
         if let Ok(ref mut response) = result {
@@ -115,7 +125,28 @@ impl Nip55Handler {
             return_type: params.return_type,
             callback_url: params.callback_url,
             id: params.id,
+            current_user: params.current_user,
+            permissions: params.permissions,
         })
+    }
+
+    pub fn handle_batch_request(
+        &self,
+        requests: Vec<Nip55Request>,
+        caller_id: String,
+    ) -> Vec<Nip55Response> {
+        requests
+            .into_iter()
+            .map(|req| {
+                self.handle_request(req, caller_id.clone())
+                    .unwrap_or_else(|e| Nip55Response {
+                        result: String::new(),
+                        event: None,
+                        error: Some(e.to_string()),
+                        id: None,
+                    })
+            })
+            .collect()
     }
 
     pub fn build_result_intent(
@@ -147,9 +178,43 @@ impl Nip55Handler {
         intent.push_str("end");
         Ok(intent)
     }
+
+    pub fn serialize_batch_results(&self, responses: Vec<Nip55Response>) -> String {
+        let results: Vec<serde_json::Value> = responses
+            .iter()
+            .map(|r| {
+                let mut obj = serde_json::json!({
+                    "result": r.result,
+                });
+                if let Some(ref event) = r.event {
+                    obj["event"] = serde_json::Value::String(event.clone());
+                }
+                if let Some(ref error) = r.error {
+                    obj["error"] = serde_json::Value::String(error.clone());
+                }
+                if let Some(ref id) = r.id {
+                    obj["id"] = serde_json::Value::String(id.clone());
+                }
+                obj
+            })
+            .collect();
+        serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
+    }
 }
 
 impl Nip55Handler {
+    fn validate_current_user(&self, current_user: &str) -> Result<(), KeepMobileError> {
+        let info = self
+            .mobile
+            .get_share_info()
+            .ok_or(KeepMobileError::NotInitialized)?;
+
+        if current_user != info.group_pubkey {
+            return Err(KeepMobileError::PubkeyMismatch);
+        }
+        Ok(())
+    }
+
     fn handle_get_public_key(&self) -> Result<Nip55Response, KeepMobileError> {
         let info = self
             .mobile
@@ -338,6 +403,8 @@ struct QueryParams {
     return_type: String,
     callback_url: Option<String>,
     id: Option<String>,
+    current_user: Option<String>,
+    permissions: Option<String>,
 }
 
 fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
@@ -347,6 +414,8 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
         return_type: "signature".to_string(),
         callback_url: None,
         id: None,
+        current_user: None,
+        permissions: None,
     };
 
     for param in query.split('&') {
@@ -366,6 +435,8 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
                 }
             }
             "id" => params.id = Some(decoded),
+            "current_user" => params.current_user = Some(decoded),
+            "permissions" => params.permissions = Some(decoded),
             _ => {}
         }
     }
@@ -422,6 +493,7 @@ fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> 
         "sign_event" => Ok(Nip55RequestType::SignEvent),
         "nip44_encrypt" => Ok(Nip55RequestType::Nip44Encrypt),
         "nip44_decrypt" => Ok(Nip55RequestType::Nip44Decrypt),
+        "decrypt_zap_event" => Ok(Nip55RequestType::DecryptZapEvent),
         _ => Err(KeepMobileError::InvalidSession),
     }
 }
