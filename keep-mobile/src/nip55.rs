@@ -173,12 +173,13 @@ impl Nip55Handler {
         requests
             .into_iter()
             .map(|req| {
+                let req_id = req.id.clone();
                 self.handle_request(req, caller_id.clone())
                     .unwrap_or_else(|_| Nip55Response {
                         result: String::new(),
                         event: None,
                         error: Some("request failed".into()),
-                        id: None,
+                        id: req_id,
                     })
             })
             .collect()
