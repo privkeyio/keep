@@ -188,6 +188,13 @@ enum FrostCommands {
         share: u16,
         #[arg(short, long)]
         group: String,
+        #[arg(
+            short,
+            long,
+            default_value = "json",
+            help = "Output format (json or bech32)"
+        )]
+        format: String,
     },
     Import,
     Sign {
@@ -606,9 +613,11 @@ fn dispatch_frost(
             shares,
         } => commands::frost::cmd_frost_split(out, path, &key, threshold, shares),
         FrostCommands::List => commands::frost::cmd_frost_list(out, path),
-        FrostCommands::Export { share, group } => {
-            commands::frost::cmd_frost_export(out, path, share, &group)
-        }
+        FrostCommands::Export {
+            share,
+            group,
+            format,
+        } => commands::frost::cmd_frost_export(out, path, share, &group, &format),
         FrostCommands::Import => commands::frost::cmd_frost_import(out, path),
         FrostCommands::Sign {
             message,

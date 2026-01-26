@@ -179,8 +179,14 @@ pub fn cmd_frost_export(
     path: &Path,
     identifier: u16,
     group_npub: &str,
+    format: &str,
 ) -> Result<()> {
-    debug!(identifier, group = group_npub, "exporting FROST share");
+    debug!(
+        identifier,
+        group = group_npub,
+        format,
+        "exporting FROST share"
+    );
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -199,14 +205,23 @@ pub fn cmd_frost_export(
         keep.frost_export_share(&group_pubkey, identifier, export_password.expose_secret())?;
     spinner.finish();
 
-    let json = export.to_json()?;
+    let (output, format_name) = match format {
+        "json" => (export.to_json()?, "JSON"),
+        "bech32" => (export.to_bech32()?, "Bech32"),
+        _ => {
+            return Err(KeepError::InvalidInput(format!(
+                "invalid format '{}': valid options are 'json' or 'bech32'",
+                format
+            )))
+        }
+    };
 
     out.newline();
     out.success("Share exported!");
     out.newline();
-    out.info("Copy this export data (JSON format):");
+    out.info(&format!("Copy this export data ({} format):", format_name));
     out.newline();
-    println!("{}", json);
+    println!("{}", output);
 
     Ok(())
 }
