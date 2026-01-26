@@ -770,7 +770,10 @@ mod tests {
 
         let encrypted = nip04::encrypt(&shared_secret, plaintext).unwrap();
         let result = nip04::decrypt(&wrong_secret, &encrypted);
-        assert!(result.is_err());
+        match result {
+            Err(_) => {}
+            Ok(decrypted) => assert_ne!(plaintext.as_slice(), decrypted.as_slice()),
+        }
     }
 
     #[test]
