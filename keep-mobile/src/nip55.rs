@@ -73,10 +73,6 @@ impl Nip55Handler {
         }
     }
 
-    /// Handle a NIP-55 request from a caller.
-    ///
-    /// SECURITY: caller_id MUST be derived from a verified system identity on Android
-    /// (e.g., Binder.getCallingUid()). Never accept caller_id from untrusted input.
     pub fn handle_request(
         &self,
         request: Nip55Request,
@@ -199,17 +195,15 @@ impl Nip55Handler {
         let results: Vec<serde_json::Value> = responses
             .iter()
             .map(|r| {
-                let mut obj = serde_json::json!({
-                    "result": r.result,
-                });
+                let mut obj = serde_json::json!({ "result": r.result });
                 if let Some(ref event) = r.event {
-                    obj["event"] = serde_json::Value::String(event.clone());
+                    obj["event"] = event.clone().into();
                 }
                 if let Some(ref error) = r.error {
-                    obj["error"] = serde_json::Value::String(error.clone());
+                    obj["error"] = error.clone().into();
                 }
                 if let Some(ref id) = r.id {
-                    obj["id"] = serde_json::Value::String(id.clone());
+                    obj["id"] = id.clone().into();
                 }
                 obj
             })
@@ -245,24 +239,27 @@ impl Nip55Handler {
         })
     }
 
+    fn request_ecdh(&self, pubkey_bytes: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
+        self.mobile.runtime.block_on(async {
+            let node_guard = self.mobile.node.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+
+            node.request_ecdh(pubkey_bytes)
+                .await
+                .map(Zeroizing::new)
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "ECDH failed".into(),
+                })
+        })
+    }
+
     fn handle_nip44_encrypt(
         &self,
         plaintext: String,
         pubkey: String,
     ) -> Result<Nip55Response, KeepMobileError> {
         let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
-
-        let shared_secret: Zeroizing<[u8; 32]> = self.mobile.runtime.block_on(async {
-            let node_guard = self.mobile.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            node.request_ecdh(&pubkey_bytes)
-                .await
-                .map(Zeroizing::new)
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "ECDH failed".into(),
-                })
-        })?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
 
         let encrypted =
             nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|_| {
@@ -292,17 +289,7 @@ impl Nip55Handler {
             .decode(&ciphertext)
             .map_err(|_| KeepMobileError::InvalidSession)?;
 
-        let shared_secret: Zeroizing<[u8; 32]> = self.mobile.runtime.block_on(async {
-            let node_guard = self.mobile.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            node.request_ecdh(&pubkey_bytes)
-                .await
-                .map(Zeroizing::new)
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "ECDH failed".into(),
-                })
-        })?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
 
         let decrypted =
             nip44::decrypt(&shared_secret, &payload).map_err(|_| KeepMobileError::FrostError {
@@ -422,12 +409,12 @@ impl Nip55Handler {
         }
 
         limits.retain(|_, state| {
-            let has_recent_requests = state
+            let recent = state
                 .requests
                 .iter()
                 .any(|&t| now.duration_since(t) < RATE_LIMIT_WINDOW);
-            let in_backoff = state.backoff_until.map_or(false, |b| now < b);
-            has_recent_requests || in_backoff
+            let in_backoff = state.backoff_until.is_some_and(|b| now < b);
+            recent || in_backoff
         });
     }
 }
@@ -499,15 +486,14 @@ fn url_decode(s: &str) -> String {
         match c {
             '%' => {
                 let hex: String = chars.by_ref().take(2).collect();
-                if let Some(byte) = (hex.len() == 2)
-                    .then(|| u8::from_str_radix(&hex, 16).ok())
-                    .flatten()
-                {
-                    bytes.push(byte);
-                } else {
-                    bytes.push(b'%');
-                    bytes.extend(hex.as_bytes());
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        bytes.push(byte);
+                        continue;
+                    }
                 }
+                bytes.push(b'%');
+                bytes.extend(hex.as_bytes());
             }
             '+' => bytes.push(b' '),
             _ => {
@@ -571,13 +557,12 @@ fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError
         .as_array()
         .ok_or(KeepMobileError::InvalidSession)?;
 
-    let valid = event["pubkey"].is_string()
-        && event["created_at"].is_number()
-        && event["kind"].is_number()
-        && event["content"].is_string()
-        && tags.len() <= MAX_TAGS_COUNT;
-
-    if !valid {
+    if !event["pubkey"].is_string()
+        || !event["created_at"].is_number()
+        || !event["kind"].is_number()
+        || !event["content"].is_string()
+        || tags.len() > MAX_TAGS_COUNT
+    {
         return Err(KeepMobileError::InvalidSession);
     }
 
