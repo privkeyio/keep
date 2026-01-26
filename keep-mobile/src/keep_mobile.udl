@@ -119,8 +119,11 @@ interface KeepMobile {
 enum Nip55RequestType {
     "GetPublicKey",
     "SignEvent",
+    "Nip04Encrypt",
+    "Nip04Decrypt",
     "Nip44Encrypt",
     "Nip44Decrypt",
+    "DecryptZapEvent",
 };
 
 dictionary Nip55Request {
@@ -128,13 +131,18 @@ dictionary Nip55Request {
     string content;
     string? pubkey;
     string return_type;
+    string compression_type;
     string? callback_url;
+    string? id;
+    string? current_user;
+    string? permissions;
 };
 
 dictionary Nip55Response {
     string result;
     string? event;
     string? error;
+    string? id;
 };
 
 interface Nip55Handler {
@@ -143,9 +151,13 @@ interface Nip55Handler {
     [Throws=KeepMobileError]
     Nip55Response handle_request(Nip55Request request, string caller_id);
 
+    sequence<Nip55Response> handle_batch_request(sequence<Nip55Request> requests, string caller_id);
+
     [Throws=KeepMobileError]
     Nip55Request parse_intent_uri(string uri);
 
     [Throws=KeepMobileError]
     string build_result_intent(Nip55Response response, string package);
+
+    string serialize_batch_results(sequence<Nip55Response> responses);
 };
