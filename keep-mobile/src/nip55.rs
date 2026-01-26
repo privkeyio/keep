@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 const URI_SCHEME: &str = "nostrsigner:";
 const MAX_TAGS_COUNT: usize = 1000;
@@ -17,6 +18,8 @@ const TIMESTAMP_DRIFT_SECS: i64 = 15 * 60;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_WINDOW: u32 = 10;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const MAX_BATCH_SIZE: usize = 20;
+const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
 
 #[derive(uniffi::Enum, Clone, Debug)]
 pub enum Nip55RequestType {
@@ -70,6 +73,10 @@ impl Nip55Handler {
         }
     }
 
+    /// Handle a NIP-55 request from a caller.
+    ///
+    /// SECURITY: caller_id MUST be derived from a verified system identity on Android
+    /// (e.g., Binder.getCallingUid()). Never accept caller_id from untrusted input.
     pub fn handle_request(
         &self,
         request: Nip55Request,
@@ -135,14 +142,23 @@ impl Nip55Handler {
         requests: Vec<Nip55Request>,
         caller_id: String,
     ) -> Vec<Nip55Response> {
+        if requests.len() > MAX_BATCH_SIZE {
+            return vec![Nip55Response {
+                result: String::new(),
+                event: None,
+                error: Some("batch size exceeded".into()),
+                id: None,
+            }];
+        }
+
         requests
             .into_iter()
             .map(|req| {
                 self.handle_request(req, caller_id.clone())
-                    .unwrap_or_else(|e| Nip55Response {
+                    .unwrap_or_else(|_| Nip55Response {
                         result: String::new(),
                         event: None,
-                        error: Some(e.to_string()),
+                        error: Some("request failed".into()),
                         id: None,
                     })
             })
@@ -236,20 +252,24 @@ impl Nip55Handler {
     ) -> Result<Nip55Response, KeepMobileError> {
         let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
 
-        let shared_secret = self.mobile.runtime.block_on(async {
+        let shared_secret: Zeroizing<[u8; 32]> = self.mobile.runtime.block_on(async {
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
             node.request_ecdh(&pubkey_bytes)
                 .await
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+                .map(Zeroizing::new)
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "ECDH failed".into(),
+                })
         })?;
 
-        let encrypted = nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|e| {
-            KeepMobileError::FrostError {
-                msg: format!("NIP-44 encryption failed: {}", e),
-            }
-        })?;
+        let encrypted =
+            nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|_| {
+                KeepMobileError::FrostError {
+                    msg: "encryption failed".into(),
+                }
+            })?;
 
         let result = base64::engine::general_purpose::STANDARD.encode(&encrypted);
 
@@ -272,22 +292,25 @@ impl Nip55Handler {
             .decode(&ciphertext)
             .map_err(|_| KeepMobileError::InvalidSession)?;
 
-        let shared_secret = self.mobile.runtime.block_on(async {
+        let shared_secret: Zeroizing<[u8; 32]> = self.mobile.runtime.block_on(async {
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
             node.request_ecdh(&pubkey_bytes)
                 .await
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+                .map(Zeroizing::new)
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "ECDH failed".into(),
+                })
         })?;
 
         let decrypted =
-            nip44::decrypt(&shared_secret, &payload).map_err(|e| KeepMobileError::FrostError {
-                msg: format!("NIP-44 decryption failed: {}", e),
+            nip44::decrypt(&shared_secret, &payload).map_err(|_| KeepMobileError::FrostError {
+                msg: "decryption failed".into(),
             })?;
 
         let result = String::from_utf8(decrypted).map_err(|_| KeepMobileError::Serialization {
-            msg: "Decrypted content is not valid UTF-8".into(),
+            msg: "invalid content".into(),
         })?;
 
         Ok(Nip55Response {
@@ -345,9 +368,15 @@ impl Nip55Handler {
     }
 
     fn check_rate_limit(&self, caller_id: &str) -> Result<(), KeepMobileError> {
-        let mut limits = self.rate_limits.lock().unwrap();
-        let state = limits.entry(caller_id.to_string()).or_default();
+        let mut limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
+
+        self.evict_stale_entries(&mut limits, now);
+
+        let state = limits.entry(caller_id.to_string()).or_default();
 
         if let Some(backoff_until) = state.backoff_until {
             if now < backoff_until {
@@ -369,7 +398,10 @@ impl Nip55Handler {
     }
 
     fn record_result(&self, caller_id: &str, success: bool) {
-        let mut limits = self.rate_limits.lock().unwrap();
+        let mut limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let state = limits.entry(caller_id.to_string()).or_default();
 
         if success {
@@ -382,6 +414,21 @@ impl Nip55Handler {
                 state.backoff_until = Some(Instant::now() + backoff);
             }
         }
+    }
+
+    fn evict_stale_entries(&self, limits: &mut HashMap<String, RateLimitState>, now: Instant) {
+        if limits.len() <= MAX_RATE_LIMIT_ENTRIES {
+            return;
+        }
+
+        limits.retain(|_, state| {
+            let has_recent_requests = state
+                .requests
+                .iter()
+                .any(|&t| now.duration_since(t) < RATE_LIMIT_WINDOW);
+            let in_backoff = state.backoff_until.map_or(false, |b| now < b);
+            has_recent_requests || in_backoff
+        });
     }
 }
 
