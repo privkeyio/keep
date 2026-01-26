@@ -25,6 +25,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
 
+fn pubkey_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
+}
+
 #[derive(uniffi::Enum, Clone, Debug)]
 pub enum Nip55RequestType {
     GetPublicKey,
@@ -61,6 +65,26 @@ pub struct Nip55Response {
     pub event: Option<String>,
     pub error: Option<String>,
     pub id: Option<String>,
+}
+
+impl Nip55Response {
+    fn ok(result: String) -> Self {
+        Self {
+            result,
+            event: None,
+            error: None,
+            id: None,
+        }
+    }
+
+    fn with_event(result: String, event: String) -> Self {
+        Self {
+            result,
+            event: Some(event),
+            error: None,
+            id: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -244,7 +268,7 @@ impl Nip55Handler {
             .get_share_info()
             .ok_or(KeepMobileError::NotInitialized)?;
 
-        if current_user.as_bytes().ct_eq(info.group_pubkey.as_bytes()).unwrap_u8() != 1 {
+        if !pubkey_eq(current_user, &info.group_pubkey) {
             return Err(KeepMobileError::PubkeyMismatch);
         }
         Ok(())
@@ -256,12 +280,7 @@ impl Nip55Handler {
             .get_share_info()
             .ok_or(KeepMobileError::NotInitialized)?;
 
-        Ok(Nip55Response {
-            result: info.group_pubkey,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(info.group_pubkey))
     }
 
     fn request_ecdh(
@@ -297,12 +316,7 @@ impl Nip55Handler {
 
         let result = base64::engine::general_purpose::STANDARD.encode(&encrypted);
 
-        Ok(Nip55Response {
-            result,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(result))
     }
 
     fn handle_nip44_decrypt(
@@ -327,12 +341,7 @@ impl Nip55Handler {
             msg: "invalid content".into(),
         })?;
 
-        Ok(Nip55Response {
-            result,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(result))
     }
 
     fn handle_nip04_encrypt(
@@ -349,12 +358,7 @@ impl Nip55Handler {
             }
         })?;
 
-        Ok(Nip55Response {
-            result: encrypted,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(encrypted))
     }
 
     fn handle_nip04_decrypt(
@@ -375,12 +379,7 @@ impl Nip55Handler {
             msg: "invalid content".into(),
         })?;
 
-        Ok(Nip55Response {
-            result,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(result))
     }
 
     fn handle_decrypt_zap_event(
@@ -403,9 +402,8 @@ impl Nip55Handler {
 
         let description = tags
             .iter()
-            .find(|tag| tag.get(0).and_then(|v| v.as_str()) == Some("description"))
-            .and_then(|tag| tag.get(1))
-            .and_then(|v| v.as_str())
+            .find(|tag| tag[0].as_str() == Some("description"))
+            .and_then(|tag| tag[1].as_str())
             .ok_or(KeepMobileError::InvalidSession)?;
 
         let zap_request: serde_json::Value =
@@ -423,12 +421,7 @@ impl Nip55Handler {
             .ok_or(KeepMobileError::InvalidSession)?;
 
         if content.is_empty() {
-            return Ok(Nip55Response {
-                result: description.to_string(),
-                event: None,
-                error: None,
-                id: None,
-            });
+            return Ok(Nip55Response::ok(description.to_string()));
         }
 
         let sender_pubkey = zap_request["pubkey"]
@@ -454,12 +447,7 @@ impl Nip55Handler {
         let result = serde_json::to_string(&decrypted_zap)
             .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
 
-        Ok(Nip55Response {
-            result,
-            event: None,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::ok(result))
     }
 
     fn handle_sign_event(
@@ -481,7 +469,7 @@ impl Nip55Handler {
         let event_pubkey = event["pubkey"]
             .as_str()
             .ok_or(KeepMobileError::InvalidSession)?;
-        if event_pubkey.as_bytes().ct_eq(share_info.group_pubkey.as_bytes()).unwrap_u8() != 1 {
+        if !pubkey_eq(event_pubkey, &share_info.group_pubkey) {
             return Err(KeepMobileError::PubkeyMismatch);
         }
 
@@ -508,17 +496,12 @@ impl Nip55Handler {
         let event_result = if return_type == "event" && *compression == CompressionType::Gzip {
             let compressed = compress_gzip(signed_event_json.as_bytes())?;
             let b64 = base64::engine::general_purpose::STANDARD;
-            Some(format!("Signer1{}", b64.encode(&compressed)))
+            format!("Signer1{}", b64.encode(&compressed))
         } else {
-            Some(signed_event_json)
+            signed_event_json
         };
 
-        Ok(Nip55Response {
-            result: signature_hex,
-            event: event_result,
-            error: None,
-            id: None,
-        })
+        Ok(Nip55Response::with_event(signature_hex, event_result))
     }
 
     fn check_rate_limit(&self, caller_id: &str) -> Result<(), KeepMobileError> {
@@ -627,12 +610,10 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
         match key {
             "type" => params.request_type = parse_request_type(&decoded)?,
             "pubkey" => params.pubkey = Some(decoded),
-            "return_type" => params.return_type = decoded,
+            "returnType" | "return_type" => params.return_type = decoded,
             "compressionType" => params.compression_type = decoded,
-            "callbackUrl" => {
-                if is_safe_callback_url(&decoded) {
-                    params.callback_url = Some(decoded);
-                }
+            "callbackUrl" if is_safe_callback_url(&decoded) => {
+                params.callback_url = Some(decoded);
             }
             "id" => params.id = Some(decoded),
             "current_user" => params.current_user = Some(decoded),
