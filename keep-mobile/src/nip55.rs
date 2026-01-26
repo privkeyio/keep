@@ -12,6 +12,7 @@ use std::fmt::Write;
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const URI_SCHEME: &str = "nostrsigner:";
@@ -243,7 +244,7 @@ impl Nip55Handler {
             .get_share_info()
             .ok_or(KeepMobileError::NotInitialized)?;
 
-        if current_user != info.group_pubkey {
+        if current_user.as_bytes().ct_eq(info.group_pubkey.as_bytes()).unwrap_u8() != 1 {
             return Err(KeepMobileError::PubkeyMismatch);
         }
         Ok(())
@@ -480,7 +481,7 @@ impl Nip55Handler {
         let event_pubkey = event["pubkey"]
             .as_str()
             .ok_or(KeepMobileError::InvalidSession)?;
-        if event_pubkey != share_info.group_pubkey {
+        if event_pubkey.as_bytes().ct_eq(share_info.group_pubkey.as_bytes()).unwrap_u8() != 1 {
             return Err(KeepMobileError::PubkeyMismatch);
         }
 
@@ -619,7 +620,9 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
             continue;
         };
 
-        let decoded = url_decode(value);
+        let Some(decoded) = url_decode(value) else {
+            continue;
+        };
 
         match key {
             "type" => params.request_type = parse_request_type(&decoded)?,
@@ -641,7 +644,7 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
     Ok(params)
 }
 
-fn url_decode(s: &str) -> String {
+fn url_decode(s: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.chars();
 
@@ -666,7 +669,7 @@ fn url_decode(s: &str) -> String {
         }
     }
 
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8(bytes).ok()
 }
 
 fn is_safe_callback_url(url: &str) -> bool {
@@ -680,7 +683,7 @@ fn is_valid_package_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> {

@@ -23,6 +23,7 @@ sha2 = "0.10"
 base64 = "0.22"
 url = "2.5"
 zeroize = { workspace = true }
+subtle = { workspace = true }
 flate2 = "1.1"
 
 [build-dependencies]
