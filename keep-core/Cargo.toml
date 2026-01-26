@@ -10,6 +10,8 @@ license = "AGPL-3.0-or-later"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 chacha20 = "0.9"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 blake2 = "0.10"
 sha2 = "0.10"
 hkdf = "0.12"

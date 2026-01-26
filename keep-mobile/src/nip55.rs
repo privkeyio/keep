@@ -3,10 +3,13 @@
 
 use crate::{KeepMobile, KeepMobileError};
 use base64::Engine;
-use keep_core::crypto::nip44;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use keep_core::crypto::{nip04, nip44};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -25,9 +28,17 @@ const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
 pub enum Nip55RequestType {
     GetPublicKey,
     SignEvent,
+    Nip04Encrypt,
+    Nip04Decrypt,
     Nip44Encrypt,
     Nip44Decrypt,
     DecryptZapEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompressionType {
+    None,
+    Gzip,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -36,6 +47,7 @@ pub struct Nip55Request {
     pub content: String,
     pub pubkey: Option<String>,
     pub return_type: String,
+    pub compression_type: String,
     pub callback_url: Option<String>,
     pub id: Option<String>,
     pub current_user: Option<String>,
@@ -86,10 +98,22 @@ impl Nip55Handler {
 
         let request_id = request.id.clone();
         let pubkey = request.pubkey.clone();
+        let compression = parse_compression_type(&request.compression_type);
+        let return_type = request.return_type.clone();
 
         let mut result = match request.request_type {
             Nip55RequestType::GetPublicKey => self.handle_get_public_key(),
-            Nip55RequestType::SignEvent => self.handle_sign_event(request.content),
+            Nip55RequestType::SignEvent => {
+                self.handle_sign_event(request.content, &return_type, &compression)
+            }
+            Nip55RequestType::Nip04Encrypt => {
+                let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
+                self.handle_nip04_encrypt(request.content, pk)
+            }
+            Nip55RequestType::Nip04Decrypt => {
+                let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
+                self.handle_nip04_decrypt(request.content, pk)
+            }
             Nip55RequestType::Nip44Encrypt => {
                 let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
                 self.handle_nip44_encrypt(request.content, pk)
@@ -98,9 +122,7 @@ impl Nip55Handler {
                 let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
                 self.handle_nip44_decrypt(request.content, pk)
             }
-            Nip55RequestType::DecryptZapEvent => Err(KeepMobileError::NotSupported {
-                msg: "decrypt_zap_event requires NIP-04 which is not supported".into(),
-            }),
+            Nip55RequestType::DecryptZapEvent => self.handle_decrypt_zap_event(request.content),
         };
 
         if let Ok(ref mut response) = result {
@@ -126,6 +148,7 @@ impl Nip55Handler {
             content,
             pubkey: params.pubkey,
             return_type: params.return_type,
+            compression_type: params.compression_type,
             callback_url: params.callback_url,
             id: params.id,
             current_user: params.current_user,
@@ -239,7 +262,10 @@ impl Nip55Handler {
         })
     }
 
-    fn request_ecdh(&self, pubkey_bytes: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
+    fn request_ecdh(
+        &self,
+        pubkey_bytes: &[u8; 33],
+    ) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
         self.mobile.runtime.block_on(async {
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
@@ -261,12 +287,11 @@ impl Nip55Handler {
         let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
         let shared_secret = self.request_ecdh(&pubkey_bytes)?;
 
-        let encrypted =
-            nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|_| {
-                KeepMobileError::FrostError {
-                    msg: "encryption failed".into(),
-                }
-            })?;
+        let encrypted = nip44::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|_| {
+            KeepMobileError::FrostError {
+                msg: "encryption failed".into(),
+            }
+        })?;
 
         let result = base64::engine::general_purpose::STANDARD.encode(&encrypted);
 
@@ -308,7 +333,139 @@ impl Nip55Handler {
         })
     }
 
-    fn handle_sign_event(&self, event_json: String) -> Result<Nip55Response, KeepMobileError> {
+    fn handle_nip04_encrypt(
+        &self,
+        plaintext: String,
+        pubkey: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
+
+        let encrypted = nip04::encrypt(&shared_secret, plaintext.as_bytes()).map_err(|_| {
+            KeepMobileError::FrostError {
+                msg: "NIP-04 encryption failed".into(),
+            }
+        })?;
+
+        Ok(Nip55Response {
+            result: encrypted,
+            event: None,
+            error: None,
+            id: None,
+        })
+    }
+
+    fn handle_nip04_decrypt(
+        &self,
+        ciphertext: String,
+        pubkey: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
+
+        let decrypted = nip04::decrypt(&shared_secret, &ciphertext).map_err(|_| {
+            KeepMobileError::FrostError {
+                msg: "NIP-04 decryption failed".into(),
+            }
+        })?;
+
+        let result = String::from_utf8(decrypted).map_err(|_| KeepMobileError::Serialization {
+            msg: "invalid content".into(),
+        })?;
+
+        Ok(Nip55Response {
+            result,
+            event: None,
+            error: None,
+            id: None,
+        })
+    }
+
+    fn handle_decrypt_zap_event(
+        &self,
+        event_json: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        let event: serde_json::Value =
+            serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
+
+        let kind = event["kind"]
+            .as_u64()
+            .ok_or(KeepMobileError::InvalidSession)?;
+        if kind != 9735 {
+            return Err(KeepMobileError::InvalidSession);
+        }
+
+        let tags = event["tags"]
+            .as_array()
+            .ok_or(KeepMobileError::InvalidSession)?;
+
+        let description = tags
+            .iter()
+            .find(|tag| tag.get(0).and_then(|v| v.as_str()) == Some("description"))
+            .and_then(|tag| tag.get(1))
+            .and_then(|v| v.as_str())
+            .ok_or(KeepMobileError::InvalidSession)?;
+
+        let zap_request: serde_json::Value =
+            serde_json::from_str(description).map_err(|_| KeepMobileError::InvalidSession)?;
+
+        let zap_kind = zap_request["kind"]
+            .as_u64()
+            .ok_or(KeepMobileError::InvalidSession)?;
+        if zap_kind != 9734 {
+            return Err(KeepMobileError::InvalidSession);
+        }
+
+        let content = zap_request["content"]
+            .as_str()
+            .ok_or(KeepMobileError::InvalidSession)?;
+
+        if content.is_empty() {
+            return Ok(Nip55Response {
+                result: description.to_string(),
+                event: None,
+                error: None,
+                id: None,
+            });
+        }
+
+        let sender_pubkey = zap_request["pubkey"]
+            .as_str()
+            .ok_or(KeepMobileError::InvalidSession)?;
+
+        let pubkey_bytes = parse_pubkey_to_compressed(sender_pubkey)?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
+
+        let decrypted_content =
+            nip04::decrypt(&shared_secret, content).map_err(|_| KeepMobileError::FrostError {
+                msg: "Failed to decrypt zap message".into(),
+            })?;
+
+        let decrypted_str =
+            String::from_utf8(decrypted_content).map_err(|_| KeepMobileError::Serialization {
+                msg: "invalid content".into(),
+            })?;
+
+        let mut decrypted_zap = zap_request;
+        decrypted_zap["content"] = serde_json::Value::String(decrypted_str);
+
+        let result = serde_json::to_string(&decrypted_zap)
+            .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
+
+        Ok(Nip55Response {
+            result,
+            event: None,
+            error: None,
+            id: None,
+        })
+    }
+
+    fn handle_sign_event(
+        &self,
+        event_json: String,
+        return_type: &str,
+        compression: &CompressionType,
+    ) -> Result<Nip55Response, KeepMobileError> {
         let event: serde_json::Value =
             serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
 
@@ -346,19 +503,24 @@ impl Nip55Handler {
         let signed_event_json = serde_json::to_string(&signed_event)
             .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
 
+        let event_result = if return_type == "event" && *compression == CompressionType::Gzip {
+            let compressed = compress_gzip(signed_event_json.as_bytes())?;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            Some(format!("Signer1{}", b64.encode(&compressed)))
+        } else {
+            Some(signed_event_json)
+        };
+
         Ok(Nip55Response {
             result: signature_hex,
-            event: Some(signed_event_json),
+            event: event_result,
             error: None,
             id: None,
         })
     }
 
     fn check_rate_limit(&self, caller_id: &str) -> Result<(), KeepMobileError> {
-        let mut limits = self
-            .rate_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut limits = self.rate_limits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
         self.evict_stale_entries(&mut limits, now);
@@ -385,10 +547,7 @@ impl Nip55Handler {
     }
 
     fn record_result(&self, caller_id: &str, success: bool) {
-        let mut limits = self
-            .rate_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut limits = self.rate_limits.lock().unwrap_or_else(|e| e.into_inner());
         let state = limits.entry(caller_id.to_string()).or_default();
 
         if success {
@@ -435,6 +594,7 @@ struct QueryParams {
     request_type: Nip55RequestType,
     pubkey: Option<String>,
     return_type: String,
+    compression_type: String,
     callback_url: Option<String>,
     id: Option<String>,
     current_user: Option<String>,
@@ -446,6 +606,7 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
         request_type: Nip55RequestType::GetPublicKey,
         pubkey: None,
         return_type: "signature".to_string(),
+        compression_type: "none".to_string(),
         callback_url: None,
         id: None,
         current_user: None,
@@ -463,6 +624,7 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
             "type" => params.request_type = parse_request_type(&decoded)?,
             "pubkey" => params.pubkey = Some(decoded),
             "return_type" => params.return_type = decoded,
+            "compressionType" => params.compression_type = decoded,
             "callbackUrl" => {
                 if is_safe_callback_url(&decoded) {
                     params.callback_url = Some(decoded);
@@ -507,7 +669,7 @@ fn url_decode(s: &str) -> String {
 }
 
 fn is_safe_callback_url(url: &str) -> bool {
-    const ALLOWED_SCHEMES: &[&str] = &["nostrsigner:", "nostr:"];
+    const ALLOWED_SCHEMES: &[&str] = &["nostrsigner:", "nostr:", "https://"];
 
     let lower = url.to_lowercase();
     ALLOWED_SCHEMES.iter().any(|s| lower.starts_with(s))
@@ -524,11 +686,30 @@ fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> 
     match value {
         "get_public_key" => Ok(Nip55RequestType::GetPublicKey),
         "sign_event" => Ok(Nip55RequestType::SignEvent),
+        "nip04_encrypt" => Ok(Nip55RequestType::Nip04Encrypt),
+        "nip04_decrypt" => Ok(Nip55RequestType::Nip04Decrypt),
         "nip44_encrypt" => Ok(Nip55RequestType::Nip44Encrypt),
         "nip44_decrypt" => Ok(Nip55RequestType::Nip44Decrypt),
         "decrypt_zap_event" => Ok(Nip55RequestType::DecryptZapEvent),
         _ => Err(KeepMobileError::InvalidSession),
     }
+}
+
+fn parse_compression_type(value: &str) -> CompressionType {
+    match value.to_lowercase().as_str() {
+        "gzip" => CompressionType::Gzip,
+        _ => CompressionType::None,
+    }
+}
+
+fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, KeepMobileError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
+    encoder
+        .finish()
+        .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })
 }
 
 fn parse_pubkey_to_compressed(pubkey_hex: &str) -> Result<[u8; 33], KeepMobileError> {

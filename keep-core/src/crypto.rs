@@ -629,6 +629,60 @@ pub mod nip44 {
     }
 }
 
+/// NIP-04 encryption using a raw ECDH shared secret.
+///
+/// This module implements NIP-04 AES-256-CBC encryption/decryption for use with
+/// threshold ECDH, where the shared secret is computed via distributed
+/// key operations rather than from a single private key.
+pub mod nip04 {
+    use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use base64::Engine;
+
+    use super::{entropy, CryptoError, Result};
+
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+
+    /// Encrypt plaintext using NIP-04 (AES-256-CBC) with a raw ECDH shared secret.
+    ///
+    /// Returns the encrypted payload in NIP-04 format: base64(ciphertext)?iv=base64(iv)
+    pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<String> {
+        let iv: [u8; 16] = entropy::random_bytes();
+
+        let cipher = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
+        let ciphertext = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        Ok(format!("{}?iv={}", b64.encode(&ciphertext), b64.encode(iv)))
+    }
+
+    /// Decrypt a NIP-04 payload using a raw ECDH shared secret.
+    ///
+    /// Takes the encrypted payload in format: base64(ciphertext)?iv=base64(iv)
+    pub fn decrypt(shared_secret: &[u8; 32], payload: &str) -> Result<Vec<u8>> {
+        let (ciphertext_b64, iv_b64) = payload
+            .split_once("?iv=")
+            .ok_or_else(|| CryptoError::decryption("Invalid NIP-04 format: missing ?iv="))?;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let ciphertext = b64
+            .decode(ciphertext_b64)
+            .map_err(|_| CryptoError::decryption("Invalid base64 ciphertext"))?;
+
+        let iv: [u8; 16] = b64
+            .decode(iv_b64)
+            .map_err(|_| CryptoError::decryption("Invalid base64 IV"))?
+            .try_into()
+            .map_err(|_| CryptoError::decryption("Invalid IV length"))?;
+
+        let cipher = Aes256CbcDec::new(shared_secret.into(), &iv.into());
+        cipher
+            .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
+            .map_err(|_| CryptoError::decryption("AES decryption failed").into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +748,46 @@ mod tests {
         let key = SecretKey::generate().unwrap();
         let decrypted = key.decrypt().unwrap();
         assert!(!decrypted.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_nip04_roundtrip() {
+        let shared_secret: [u8; 32] = random_bytes();
+        let plaintext = b"Hello, NIP-04!";
+
+        let encrypted = nip04::encrypt(&shared_secret, plaintext).unwrap();
+        assert!(encrypted.contains("?iv="));
+
+        let decrypted = nip04::decrypt(&shared_secret, &encrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_nip04_wrong_key_fails() {
+        let shared_secret: [u8; 32] = random_bytes();
+        let wrong_secret: [u8; 32] = random_bytes();
+        let plaintext = b"Secret message";
+
+        let encrypted = nip04::encrypt(&shared_secret, plaintext).unwrap();
+        let result = nip04::decrypt(&wrong_secret, &encrypted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nip04_invalid_format() {
+        let shared_secret: [u8; 32] = random_bytes();
+
+        let result = nip04::decrypt(&shared_secret, "invalid_no_iv");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nip44_roundtrip() {
+        let shared_secret: [u8; 32] = random_bytes();
+        let plaintext = b"Hello, NIP-44!";
+
+        let encrypted = nip44::encrypt(&shared_secret, plaintext).unwrap();
+        let decrypted = nip44::decrypt(&shared_secret, &encrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 }

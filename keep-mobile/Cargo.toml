@@ -23,6 +23,7 @@ sha2 = "0.10"
 base64 = "0.22"
 url = "2.5"
 zeroize = { workspace = true }
+flate2 = "1.0"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
