@@ -191,7 +191,7 @@ enum FrostCommands {
         #[arg(
             short,
             long,
-            default_value = "json",
+            default_value = "bech32",
             help = "Output format (json or bech32)"
         )]
         format: String,

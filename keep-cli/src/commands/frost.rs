@@ -237,10 +237,10 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    out.info("Paste the share export JSON (end with empty line):");
+    out.info("Paste the share export data (JSON or bech32, end with empty line):");
 
-    const MAX_JSON_BYTES: usize = 10 * 1024 * 1024;
-    let mut json = String::new();
+    const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
+    let mut input = String::new();
     let mut total_bytes = 0usize;
     loop {
         let mut line = String::new();
@@ -254,16 +254,21 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
             break;
         }
         total_bytes = total_bytes.saturating_add(line.len());
-        if total_bytes > MAX_JSON_BYTES {
+        if total_bytes > MAX_INPUT_BYTES {
             return Err(KeepError::InvalidInput(format!(
                 "input exceeds maximum size of {} bytes",
-                MAX_JSON_BYTES
+                MAX_INPUT_BYTES
             )));
         }
-        json.push_str(&line);
+        input.push_str(&line);
     }
 
-    let export = ShareExport::from_json(json.trim())?;
+    let trimmed = input.trim();
+    let export = if trimmed.starts_with("kshare") {
+        ShareExport::from_bech32(trimmed)?
+    } else {
+        ShareExport::from_json(trimmed)?
+    };
     let import_password = get_password("Enter share passphrase")?;
 
     let spinner = out.spinner("Decrypting and importing share...");
