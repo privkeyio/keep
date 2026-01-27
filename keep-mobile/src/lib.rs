@@ -139,12 +139,8 @@ impl KeepMobile {
         passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
-        let export = if data.starts_with("kshare") {
-            ShareExport::from_bech32(&data)
-        } else {
-            ShareExport::from_json(&data)
-        }
-        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+        let export = ShareExport::parse(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         let share = export
             .to_share(&passphrase, &name)

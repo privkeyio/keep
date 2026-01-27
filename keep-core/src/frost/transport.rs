@@ -139,6 +139,20 @@ impl ShareExport {
             .map_err(|e| KeepError::Frost(format!("JSON deserialization failed: {}", e)))
     }
 
+    /// Parse from either bech32 or JSON format, auto-detecting based on prefix.
+    pub fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        let is_bech32 = input
+            .find('1')
+            .map(|sep| input[..sep].eq_ignore_ascii_case(SHARE_HRP))
+            .unwrap_or(false);
+        if is_bech32 {
+            Self::from_bech32(input)
+        } else {
+            Self::from_json(input)
+        }
+    }
+
     /// Encode as a bech32 string with `kshare` prefix.
     pub fn to_bech32(&self) -> Result<String> {
         let json = self.to_json()?;
@@ -153,7 +167,7 @@ impl ShareExport {
         let (hrp, data) = bech32::decode(encoded)
             .map_err(|e| KeepError::Frost(format!("Bech32 decoding failed: {}", e)))?;
 
-        if hrp.as_str() != SHARE_HRP {
+        if !hrp.as_str().eq_ignore_ascii_case(SHARE_HRP) {
             return Err(KeepError::Frost(format!(
                 "Invalid prefix: expected {}, got {}",
                 SHARE_HRP,
