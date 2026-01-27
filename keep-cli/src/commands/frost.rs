@@ -229,7 +229,7 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
 
     out.info("Paste the share export data (JSON or bech32, end with empty line):");
 
-    const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_INPUT_BYTES: usize = 256 * 1024;
     let mut input = String::new();
     let mut total_bytes = 0usize;
     loop {
@@ -253,12 +253,7 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
         input.push_str(&line);
     }
 
-    let trimmed = input.trim();
-    let export = if trimmed.starts_with("kshare") {
-        ShareExport::from_bech32(trimmed)?
-    } else {
-        ShareExport::from_json(trimmed)?
-    };
+    let export = ShareExport::parse(input.trim())?;
     let import_password = get_password("Enter share passphrase")?;
 
     let spinner = out.spinner("Decrypting and importing share...");

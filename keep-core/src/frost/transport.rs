@@ -139,6 +139,15 @@ impl ShareExport {
             .map_err(|e| KeepError::Frost(format!("JSON deserialization failed: {}", e)))
     }
 
+    /// Parse from either bech32 or JSON format, auto-detecting based on prefix.
+    pub fn parse(input: &str) -> Result<Self> {
+        if input.starts_with(SHARE_HRP) {
+            Self::from_bech32(input)
+        } else {
+            Self::from_json(input)
+        }
+    }
+
     /// Encode as a bech32 string with `kshare` prefix.
     pub fn to_bech32(&self) -> Result<String> {
         let json = self.to_json()?;
