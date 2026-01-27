@@ -17,7 +17,7 @@ mod warden;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::debug;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
@@ -164,6 +164,12 @@ enum ConfigCommands {
     Init,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum ExportFormat {
+    Json,
+    Bech32,
+}
+
 #[derive(Subcommand)]
 enum FrostCommands {
     Generate {
@@ -188,13 +194,8 @@ enum FrostCommands {
         share: u16,
         #[arg(short, long)]
         group: String,
-        #[arg(
-            short,
-            long,
-            default_value = "bech32",
-            help = "Output format (json or bech32)"
-        )]
-        format: String,
+        #[arg(short, long, default_value = "bech32")]
+        format: ExportFormat,
     },
     Import,
     Sign {
@@ -617,7 +618,7 @@ fn dispatch_frost(
             share,
             group,
             format,
-        } => commands::frost::cmd_frost_export(out, path, share, &group, &format),
+        } => commands::frost::cmd_frost_export(out, path, share, &group, format),
         FrostCommands::Import => commands::frost::cmd_frost_import(out, path),
         FrostCommands::Sign {
             message,

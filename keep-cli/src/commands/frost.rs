@@ -12,6 +12,7 @@ use keep_core::keys::bytes_to_npub;
 use keep_core::Keep;
 
 use crate::output::Output;
+use crate::ExportFormat;
 
 use super::{get_password, get_password_with_confirm};
 
@@ -179,14 +180,9 @@ pub fn cmd_frost_export(
     path: &Path,
     identifier: u16,
     group_npub: &str,
-    format: &str,
+    format: ExportFormat,
 ) -> Result<()> {
-    debug!(
-        identifier,
-        group = group_npub,
-        format,
-        "exporting FROST share"
-    );
+    debug!(identifier, group = group_npub, "exporting FROST share");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -205,21 +201,15 @@ pub fn cmd_frost_export(
         keep.frost_export_share(&group_pubkey, identifier, export_password.expose_secret())?;
     spinner.finish();
 
-    let (output, format_name) = match format {
-        "json" => (export.to_json()?, "JSON"),
-        "bech32" => (export.to_bech32()?, "Bech32"),
-        _ => {
-            return Err(KeepError::InvalidInput(format!(
-                "invalid format '{}': valid options are 'json' or 'bech32'",
-                format
-            )))
-        }
+    let (output, label) = match format {
+        ExportFormat::Json => (export.to_json()?, "JSON"),
+        ExportFormat::Bech32 => (export.to_bech32()?, "Bech32"),
     };
 
     out.newline();
     out.success("Share exported!");
     out.newline();
-    out.info(&format!("Copy this export data ({} format):", format_name));
+    out.info(&format!("Copy this export data ({label} format):"));
     out.newline();
     println!("{}", output);
 
