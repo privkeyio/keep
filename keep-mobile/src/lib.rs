@@ -20,12 +20,16 @@ use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
 const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
+const MAX_STORED_SHARES: usize = 100;
 
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
@@ -144,6 +148,20 @@ impl KeepMobile {
         passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
+        if data.len() > MAX_IMPORT_DATA_SIZE {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Import data exceeds maximum size".into(),
+            });
+        }
+
+        let share_count = self.storage.list_all_shares().len();
+        if share_count >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
+            });
+        }
+
+        let passphrase = Zeroizing::new(passphrase);
         let export = ShareExport::parse(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
@@ -184,7 +202,8 @@ impl KeepMobile {
         let group_pubkey_hex = hex::encode(&metadata.group_pubkey);
         self.storage
             .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
-        self.storage.set_active_share_key(Some(group_pubkey_hex.clone()))?;
+        self.storage
+            .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
         Ok(ShareInfo {
             name: metadata.name,
@@ -267,6 +286,7 @@ impl KeepMobile {
     }
 
     pub fn export_share(&self, passphrase: String) -> Result<String, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
         let share = self.load_share_package()?;
         let export = ShareExport::from_share(&share, &passphrase)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
@@ -279,15 +299,22 @@ impl KeepMobile {
         self.storage
             .list_all_shares()
             .into_iter()
-            .map(|m| StoredShareInfo {
-                group_pubkey: hex::encode(&m.group_pubkey),
-                name: m.name,
-                share_index: m.identifier,
-                threshold: m.threshold,
-                total_shares: m.total_shares,
-                created_at: 0,
-                last_used: None,
-                sign_count: 0,
+            .filter_map(|m| {
+                let key = hex::encode(&m.group_pubkey);
+                let data = self.storage.load_share_by_key(key.clone()).ok()?;
+                let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+                let metadata: keep_core::frost::ShareMetadata =
+                    serde_json::from_str(&stored.metadata_json).ok()?;
+                Some(StoredShareInfo {
+                    group_pubkey: key,
+                    name: metadata.name,
+                    share_index: metadata.identifier,
+                    threshold: metadata.threshold,
+                    total_shares: metadata.total_shares,
+                    created_at: metadata.created_at,
+                    last_used: metadata.last_used,
+                    sign_count: metadata.sign_count,
+                })
             })
             .collect()
     }
@@ -312,8 +339,13 @@ impl KeepMobile {
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
         let _ = self.storage.load_share_by_key(group_pubkey.clone())?;
-        self.storage.set_active_share_key(Some(group_pubkey))?;
+        self.storage
+            .set_active_share_key(Some(group_pubkey.clone()))?;
+
+        let _ = self.storage.load_share_by_key(group_pubkey)?;
 
         self.runtime.block_on(async {
             let mut node_guard = self.node.write().await;
@@ -326,8 +358,15 @@ impl KeepMobile {
     }
 
     pub fn delete_share_by_key(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
         let active_key = self.storage.get_active_share_key();
-        if active_key.as_ref() == Some(&group_pubkey) {
+        let is_active = active_key
+            .as_ref()
+            .map(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()))
+            .unwrap_or(false);
+
+        if is_active {
             self.runtime.block_on(async {
                 let mut node_guard = self.node.write().await;
                 *node_guard = None;
@@ -402,18 +441,18 @@ impl KeepMobile {
         let metadata: keep_core::frost::ShareMetadata = serde_json::from_str(&stored.metadata_json)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        let key_package =
-            frost_secp256k1_tr::keys::KeyPackage::deserialize(&stored.key_package_bytes).map_err(
-                |e| KeepMobileError::InvalidShare {
-                    msg: format!("Invalid key package: {}", e),
-                },
-            )?;
+        let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(
+            &stored.key_package_bytes,
+        )
+        .map_err(|e| KeepMobileError::InvalidShare {
+            msg: format!("Invalid key package: {}", e),
+        })?;
 
         let pubkey_package =
             frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
                 .map_err(|e| KeepMobileError::InvalidShare {
-                    msg: format!("Invalid pubkey package: {}", e),
-                })?;
+                msg: format!("Invalid pubkey package: {}", e),
+            })?;
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
@@ -499,4 +538,25 @@ fn is_private_ipv6(host: &str) -> bool {
         || normalized.starts_with("fd")
         || normalized.starts_with("fe80:")
         || normalized.starts_with("fe80%")
+}
+
+fn validate_hex_pubkey(key: &str) -> Result<(), KeepMobileError> {
+    if key.len() != 64 {
+        return Err(KeepMobileError::InvalidShare {
+            msg: "Group pubkey must be 64 hex characters".into(),
+        });
+    }
+    if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(KeepMobileError::InvalidShare {
+            msg: "Group pubkey must be valid hex".into(),
+        });
+    }
+    Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    bool::from(a.ct_eq(b))
 }
