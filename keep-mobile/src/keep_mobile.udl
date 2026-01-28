@@ -116,6 +116,47 @@ interface KeepMobile {
     string export_share(string passphrase);
 };
 
+enum BunkerStatus {
+    "Stopped",
+    "Starting",
+    "Running",
+    "Error",
+};
+
+dictionary BunkerLogEvent {
+    string app;
+    string action;
+    boolean success;
+    string? detail;
+};
+
+dictionary BunkerApprovalRequest {
+    string app_pubkey;
+    string app_name;
+    string method;
+    u32? event_kind;
+    string? event_content;
+};
+
+[Trait, WithForeign]
+interface BunkerCallbacks {
+    void on_log(BunkerLogEvent event);
+    boolean request_approval(BunkerApprovalRequest request);
+};
+
+interface BunkerHandler {
+    constructor(KeepMobile mobile);
+
+    [Throws=KeepMobileError]
+    void start_bunker(sequence<string> relays, BunkerCallbacks callbacks);
+
+    void stop_bunker();
+
+    string? get_bunker_url();
+
+    BunkerStatus get_bunker_status();
+};
+
 enum Nip55RequestType {
     "GetPublicKey",
     "SignEvent",
