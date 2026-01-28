@@ -360,6 +360,8 @@ impl KeepMobile {
             .get_active_share_key()
             .is_some_and(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()));
 
+        self.storage.delete_share_by_key(group_pubkey)?;
+
         if is_active {
             self.runtime.block_on(async {
                 *self.node.write().await = None;
@@ -367,7 +369,7 @@ impl KeepMobile {
             self.storage.set_active_share_key(None)?;
         }
 
-        self.storage.delete_share_by_key(group_pubkey)
+        Ok(())
     }
 }
 
@@ -457,12 +459,12 @@ impl KeepMobile {
         }
 
         let legacy_data = self.storage.load_share()?;
-        let legacy_metadata = self
-            .storage
-            .get_share_metadata()
-            .ok_or(KeepMobileError::StorageError {
-                msg: "Legacy share missing metadata".into(),
-            })?;
+        let legacy_metadata =
+            self.storage
+                .get_share_metadata()
+                .ok_or(KeepMobileError::StorageError {
+                    msg: "Legacy share missing metadata".into(),
+                })?;
 
         let key = hex::encode(&legacy_metadata.group_pubkey);
 
