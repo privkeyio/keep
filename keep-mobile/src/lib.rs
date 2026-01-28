@@ -345,6 +345,7 @@ impl KeepMobile {
         self.storage.set_active_share_key(Some(group_pubkey))?;
 
         self.runtime.block_on(async {
+            self.pending_requests.lock().await.clear();
             *self.node.write().await = None;
         });
 
@@ -420,12 +421,10 @@ impl KeepMobile {
     }
 
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
-        let key = self
-            .storage
-            .get_active_share_key()
-            .ok_or(KeepMobileError::StorageError {
-                msg: "No active share set".into(),
-            })?;
+        let key = match self.storage.get_active_share_key() {
+            Some(k) => k,
+            None => self.migrate_legacy_share()?,
+        };
         let data = self.storage.load_share_by_key(key)?;
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
@@ -448,6 +447,30 @@ impl KeepMobile {
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+    }
+
+    fn migrate_legacy_share(&self) -> Result<String, KeepMobileError> {
+        if !self.storage.has_share() {
+            return Err(KeepMobileError::StorageError {
+                msg: "No active share set".into(),
+            });
+        }
+
+        let legacy_data = self.storage.load_share()?;
+        let legacy_metadata = self
+            .storage
+            .get_share_metadata()
+            .ok_or(KeepMobileError::StorageError {
+                msg: "Legacy share missing metadata".into(),
+            })?;
+
+        let key = hex::encode(&legacy_metadata.group_pubkey);
+
+        self.storage
+            .store_share_by_key(key.clone(), legacy_data, legacy_metadata)?;
+        self.storage.set_active_share_key(Some(key.clone()))?;
+
+        Ok(key)
     }
 }
 
