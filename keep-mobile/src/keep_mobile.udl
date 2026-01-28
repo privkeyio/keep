@@ -41,6 +41,17 @@ dictionary ShareInfo {
     string group_pubkey;
 };
 
+dictionary StoredShareInfo {
+    string group_pubkey;
+    string name;
+    u16 share_index;
+    u16 threshold;
+    u16 total_shares;
+    i64 created_at;
+    i64? last_used;
+    u64 sign_count;
+};
+
 dictionary SignRequest {
     string id;
     sequence<u8> session_id;
@@ -84,6 +95,22 @@ interface SecureStorage {
 
     [Throws=KeepMobileError]
     void delete_share();
+
+    [Throws=KeepMobileError]
+    void store_share_by_key(string key, sequence<u8> data, ShareMetadataInfo metadata);
+
+    [Throws=KeepMobileError]
+    sequence<u8> load_share_by_key(string key);
+
+    sequence<ShareMetadataInfo> list_all_shares();
+
+    [Throws=KeepMobileError]
+    void delete_share_by_key(string key);
+
+    string? get_active_share_key();
+
+    [Throws=KeepMobileError]
+    void set_active_share_key(string? key);
 };
 
 interface KeepMobile {
@@ -114,6 +141,16 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     string export_share(string passphrase);
+
+    sequence<StoredShareInfo> list_shares();
+
+    StoredShareInfo? get_active_share();
+
+    [Throws=KeepMobileError]
+    void set_active_share(string group_pubkey);
+
+    [Throws=KeepMobileError]
+    void delete_share_by_key(string group_pubkey);
 };
 
 enum BunkerStatus {
