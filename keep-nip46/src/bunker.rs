@@ -21,7 +21,7 @@ pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&
 #[cfg(test)]
 pub fn parse_bunker_url(
     bunker_url: &str,
-) -> Result<(PublicKey, Vec<String>, Option<String>), String> {
+) -> std::result::Result<(PublicKey, Vec<String>, Option<String>), String> {
     if !bunker_url.starts_with("bunker://") {
         return Err("Invalid bunker URL: must start with bunker://".into());
     }

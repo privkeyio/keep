@@ -3,21 +3,39 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use keep_core::error::{CryptoError, KeepError, NetworkError, Result, StorageError};
+use keep_core::error::{CryptoError, KeepError, NetworkError, StorageError};
 use keep_core::keyring::Keyring;
 
+use crate::audit::AuditLog;
 use crate::bunker::generate_bunker_url;
-use crate::signer::{AuditLog, FrostSigner, NetworkFrostSigner, PermissionManager, SignerHandler};
-use crate::tui::{LogEntry, TuiEvent};
+use crate::error::Result;
+use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
+use crate::handler::SignerHandler;
+use crate::permissions::PermissionManager;
+use crate::rate_limit::RateLimitConfig;
+use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 
-const MAX_EVENT_JSON_SIZE: usize = 64 * 1024;
+pub struct ServerConfig {
+    pub max_event_json_size: usize,
+    pub audit_log_capacity: usize,
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_event_json_size: 64 * 1024,
+            audit_log_capacity: 10_000,
+            rate_limit: None,
+        }
+    }
+}
 
 pub struct Server {
     keys: Keys,
@@ -25,16 +43,25 @@ pub struct Server {
     client: Client,
     handler: Arc<SignerHandler>,
     running: bool,
-    tui_tx: Option<Sender<TuiEvent>>,
+    callbacks: Option<Arc<dyn ServerCallbacks>>,
+    config: ServerConfig,
 }
 
 impl Server {
     pub async fn new(
         keyring: Arc<Mutex<Keyring>>,
         relay_url: &str,
-        tui_tx: Option<Sender<TuiEvent>>,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
-        Self::new_with_frost(keyring, None, None, relay_url, tui_tx).await
+        Self::new_with_config(
+            keyring,
+            None,
+            None,
+            relay_url,
+            callbacks,
+            ServerConfig::default(),
+        )
+        .await
     }
 
     pub async fn new_with_frost(
@@ -42,7 +69,26 @@ impl Server {
         frost_signer: Option<FrostSigner>,
         transport_secret: Option<[u8; 32]>,
         relay_url: &str,
-        tui_tx: Option<Sender<TuiEvent>>,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+    ) -> Result<Self> {
+        Self::new_with_config(
+            keyring,
+            frost_signer,
+            transport_secret,
+            relay_url,
+            callbacks,
+            ServerConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn new_with_config(
+        keyring: Arc<Mutex<Keyring>>,
+        frost_signer: Option<FrostSigner>,
+        transport_secret: Option<[u8; 32]>,
+        relay_url: &str,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
     ) -> Result<Self> {
         let keys = if let Some(secret_bytes) = transport_secret {
             let secret = SecretKey::from_slice(&secret_bytes)
@@ -68,10 +114,13 @@ impl Server {
             .map_err(|e| NetworkError::relay(e.to_string()))?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
-        let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
-        let mut handler = SignerHandler::new(keyring, permissions, audit, tui_tx.clone());
+        let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
+        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone());
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
+        }
+        if let Some(ref rl_config) = config.rate_limit {
+            handler = handler.with_rate_limit(rl_config.clone());
         }
 
         Ok(Self {
@@ -80,7 +129,8 @@ impl Server {
             client,
             handler: Arc::new(handler),
             running: false,
-            tui_tx,
+            callbacks,
+            config,
         })
     }
 
@@ -88,7 +138,7 @@ impl Server {
         frost_signer: FrostSigner,
         transport_secret: [u8; 32],
         relay_url: &str,
-        tui_tx: Option<Sender<TuiEvent>>,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         Self::new_with_frost(
@@ -96,7 +146,7 @@ impl Server {
             Some(frost_signer),
             Some(transport_secret),
             relay_url,
-            tui_tx,
+            callbacks,
         )
         .await
     }
@@ -105,7 +155,7 @@ impl Server {
         network_signer: NetworkFrostSigner,
         transport_secret: [u8; 32],
         relay_url: &str,
-        tui_tx: Option<Sender<TuiEvent>>,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         let secret = SecretKey::from_slice(&transport_secret)
             .map_err(|e| CryptoError::invalid_key(format!("transport key: {}", e)))?;
@@ -118,11 +168,15 @@ impl Server {
             .await
             .map_err(|e| NetworkError::relay(e.to_string()))?;
 
+        let config = ServerConfig::default();
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
-        let audit = Arc::new(Mutex::new(AuditLog::new(10000)));
-        let handler = SignerHandler::new(keyring, permissions, audit, tui_tx.clone())
+        let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
+        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer);
+        if let Some(ref rl_config) = config.rate_limit {
+            handler = handler.with_rate_limit(rl_config.clone());
+        }
 
         Ok(Self {
             keys,
@@ -130,7 +184,8 @@ impl Server {
             client,
             handler: Arc::new(handler),
             running: false,
-            tui_tx,
+            callbacks,
+            config,
         })
     }
 
@@ -171,14 +226,15 @@ impl Server {
         let handler = self.handler.clone();
         let keys = self.keys.clone();
         let client = self.client.clone();
-        let tui_tx = self.tui_tx.clone();
+        let callbacks = self.callbacks.clone();
+        let max_event_json_size = self.config.max_event_json_size;
 
         self.client
             .handle_notifications(|notification| {
                 let handler = handler.clone();
                 let keys = keys.clone();
                 let client = client.clone();
-                let tui_tx = tui_tx.clone();
+                let callbacks = callbacks.clone();
 
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
@@ -188,7 +244,8 @@ impl Server {
                                 &keys,
                                 &client,
                                 &event,
-                                tui_tx.as_ref(),
+                                callbacks.as_deref(),
+                                max_event_json_size,
                             )
                             .await
                             {
@@ -210,7 +267,8 @@ impl Server {
         keys: &Keys,
         client: &Client,
         event: &Event,
-        tui_tx: Option<&Sender<TuiEvent>>,
+        callbacks: Option<&dyn ServerCallbacks>,
+        max_event_json_size: usize,
     ) -> Result<()> {
         let app_pubkey = event.pubkey;
         let app_id = &app_pubkey.to_hex()[..8];
@@ -224,15 +282,23 @@ impl Server {
         debug!(method = %request.method, app_id, "NIP-46 request");
 
         let method = request.method.clone();
-        let response =
-            Self::dispatch_request(handler, keys.public_key(), app_pubkey, request, tui_tx).await;
+        let response = Self::dispatch_request(
+            handler,
+            keys.public_key(),
+            app_pubkey,
+            request,
+            max_event_json_size,
+        )
+        .await;
 
         let success = response.error.is_none();
-        if let Some(tx) = tui_tx {
-            let detail = response.error.as_deref();
-            let _ = tx.send(TuiEvent::Log(
-                LogEntry::new(app_id, &method, success).with_detail(detail.unwrap_or("")),
-            ));
+        if let Some(cb) = callbacks {
+            cb.on_log(LogEvent {
+                app: app_id.to_string(),
+                action: method,
+                success,
+                detail: response.error.clone(),
+            });
         }
 
         let response_json = serde_json::to_string(&response)
@@ -263,7 +329,7 @@ impl Server {
         user_pubkey: PublicKey,
         app_pubkey: PublicKey,
         request: Nip46Request,
-        _tui_tx: Option<&Sender<TuiEvent>>,
+        max_event_json_size: usize,
     ) -> Nip46Response {
         let id = request.id.clone();
 
@@ -283,7 +349,7 @@ impl Server {
                     Ok(None) => Nip46Response::ok(id, "ack"),
                     Err(e) => {
                         warn!(error = %e, "connect failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -291,7 +357,7 @@ impl Server {
                 Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
                 Err(e) => {
                     warn!(error = %e, "get_public_key failed");
-                    Nip46Response::error(id, sanitize_error_for_client(&e))
+                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                 }
             },
             "sign_event" => {
@@ -300,14 +366,18 @@ impl Server {
                     None => return Nip46Response::error(id, "Missing event parameter"),
                 };
 
-                if event_json.len() > MAX_EVENT_JSON_SIZE {
+                if event_json.len() > max_event_json_size {
                     return Nip46Response::error(id, "Event JSON too large");
                 }
 
                 let partial: PartialEvent = match serde_json::from_str(event_json) {
                     Ok(p) => p,
-                    Err(e) => return Nip46Response::error(id, &format!("Invalid event: {}", e)),
+                    Err(_) => return Nip46Response::error(id, "Invalid event format"),
                 };
+
+                if partial.created_at < 0 {
+                    return Nip46Response::error(id, "Invalid created_at timestamp");
+                }
 
                 let tags: Vec<Tag> = partial
                     .tags
@@ -333,7 +403,7 @@ impl Server {
                     },
                     Err(e) => {
                         warn!(error = %e, "sign_event failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -352,7 +422,7 @@ impl Server {
                     Ok(ct) => Nip46Response::ok(id, &ct),
                     Err(e) => {
                         warn!(error = %e, "nip44_encrypt failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -371,7 +441,7 @@ impl Server {
                     Ok(pt) => Nip46Response::ok(id, &pt),
                     Err(e) => {
                         warn!(error = %e, "nip44_decrypt failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -390,7 +460,7 @@ impl Server {
                     Ok(ct) => Nip46Response::ok(id, &ct),
                     Err(e) => {
                         warn!(error = %e, "nip04_encrypt failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
@@ -409,12 +479,12 @@ impl Server {
                     Ok(pt) => Nip46Response::ok(id, &pt),
                     Err(e) => {
                         warn!(error = %e, "nip04_decrypt failed");
-                        Nip46Response::error(id, sanitize_error_for_client(&e))
+                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }
             }
             "ping" => Nip46Response::ok(id, "pong"),
-            _ => Nip46Response::error(id, &format!("Unknown method: {}", request.method)),
+            _ => Nip46Response::error(id, "Unknown method"),
         }
     }
 
@@ -422,77 +492,5 @@ impl Server {
     pub async fn stop(&mut self) {
         self.running = false;
         self.client.disconnect().await;
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Nip46Request {
-    id: String,
-    method: String,
-    #[serde(default)]
-    params: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PartialEvent {
-    kind: u16,
-    content: String,
-    #[serde(default)]
-    tags: Vec<Vec<String>>,
-    created_at: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct Nip46Response {
-    id: String,
-    result: Option<String>,
-    error: Option<String>,
-}
-
-impl Nip46Response {
-    fn ok(id: String, result: &str) -> Self {
-        Self {
-            id,
-            result: Some(result.to_string()),
-            error: None,
-        }
-    }
-
-    fn error(id: String, error: &str) -> Self {
-        Self {
-            id,
-            result: None,
-            error: Some(error.to_string()),
-        }
-    }
-}
-
-fn sanitize_error_for_client(e: &KeepError) -> &'static str {
-    match e {
-        KeepError::InvalidPassword => "Authentication failed",
-        KeepError::RateLimited(_) => "Rate limited",
-        KeepError::DecryptionFailed | KeepError::RotationFailed(_) => "Operation failed",
-        KeepError::KeyNotFound(_) => "Key not found",
-        KeepError::KeyAlreadyExists(_) => "Key already exists",
-        KeepError::InvalidNsec | KeepError::InvalidNpub => "Invalid key format",
-        KeepError::KeyringFull(_) => "Storage limit reached",
-        KeepError::Locked => "Signer locked",
-        KeepError::AlreadyExists(_) | KeepError::NotFound(_) => "Resource error",
-        KeepError::InvalidNetwork(_) => "Invalid network",
-        KeepError::Encryption(_) | KeepError::CryptoErr(_) => "Cryptographic operation failed",
-        KeepError::Database(_) | KeepError::Migration(_) | KeepError::StorageErr(_) => {
-            "Storage error"
-        }
-        KeepError::HomeNotFound | KeepError::Config(_) => "Configuration error",
-        KeepError::PermissionDenied(_) => "Permission denied",
-        KeepError::UserRejected => "User rejected",
-        KeepError::InvalidInput(_) => "Invalid input",
-        KeepError::NotImplemented(_) => "Not supported",
-        KeepError::Runtime(_) => "Internal error",
-        KeepError::Frost(_) | KeepError::FrostErr(_) => "Signing protocol error",
-        KeepError::NetworkErr(_) => "Network error",
-        KeepError::Serialization(_) => "Data format error",
-        KeepError::Io(_) => "IO error",
-        _ => "Unknown error",
     }
 }

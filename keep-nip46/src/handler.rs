@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::mpsc::{self, Sender};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -13,21 +13,11 @@ use tracing::{debug, info};
 use keep_core::error::{CryptoError, KeepError, Result};
 use keep_core::keyring::Keyring;
 
-use crate::tui::{ApprovalRequest as TuiApprovalRequest, TuiEvent};
-
-use super::audit::{AuditAction, AuditEntry, AuditLog};
-use super::frost_signer::{FrostSigner, NetworkFrostSigner};
-use super::permissions::{Permission, PermissionManager};
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ApprovalRequest {
-    pub app_pubkey: PublicKey,
-    pub app_name: String,
-    pub method: String,
-    pub event_kind: Option<Kind>,
-    pub event_content: Option<String>,
-}
+use crate::audit::{AuditAction, AuditEntry, AuditLog};
+use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
+use crate::permissions::{Permission, PermissionManager};
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::types::{ApprovalRequest, ServerCallbacks};
 
 pub struct SignerHandler {
     keyring: Arc<Mutex<Keyring>>,
@@ -35,8 +25,9 @@ pub struct SignerHandler {
     network_frost_signer: Option<Arc<NetworkFrostSigner>>,
     permissions: Arc<Mutex<PermissionManager>>,
     audit: Arc<Mutex<AuditLog>>,
-    tui_tx: Option<Sender<TuiEvent>>,
-    next_approval_id: std::sync::atomic::AtomicU64,
+    callbacks: Option<Arc<dyn ServerCallbacks>>,
+    rate_limiters: Mutex<HashMap<PublicKey, RateLimiter>>,
+    rate_limit_config: Option<RateLimitConfig>,
 }
 
 impl SignerHandler {
@@ -44,7 +35,7 @@ impl SignerHandler {
         keyring: Arc<Mutex<Keyring>>,
         permissions: Arc<Mutex<PermissionManager>>,
         audit: Arc<Mutex<AuditLog>>,
-        tui_tx: Option<Sender<TuiEvent>>,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Self {
         Self {
             keyring,
@@ -52,8 +43,9 @@ impl SignerHandler {
             network_frost_signer: None,
             permissions,
             audit,
-            tui_tx,
-            next_approval_id: std::sync::atomic::AtomicU64::new(0),
+            callbacks,
+            rate_limiters: Mutex::new(HashMap::new()),
+            rate_limit_config: None,
         }
     }
 
@@ -67,6 +59,42 @@ impl SignerHandler {
         self
     }
 
+    pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
+        self.rate_limit_config = Some(config);
+        self
+    }
+
+    const MAX_RATE_LIMITERS: usize = 10_000;
+
+    async fn check_rate_limit(&self, app_pubkey: &PublicKey) -> Result<()> {
+        let config = match &self.rate_limit_config {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let mut limiters = self.rate_limiters.lock().await;
+
+        if limiters.len() >= Self::MAX_RATE_LIMITERS && !limiters.contains_key(app_pubkey) {
+            limiters.retain(|_, rl| {
+                rl.cleanup();
+                !rl.is_empty()
+            });
+            if limiters.len() >= Self::MAX_RATE_LIMITERS {
+                return Err(KeepError::RateLimited(60));
+            }
+        }
+
+        let limiter = limiters
+            .entry(*app_pubkey)
+            .or_insert_with(|| RateLimiter::new(config.clone()));
+
+        if limiter.check_and_record().is_allowed() {
+            Ok(())
+        } else {
+            Err(KeepError::RateLimited(60))
+        }
+    }
+
     pub async fn handle_connect(
         &self,
         app_pubkey: PublicKey,
@@ -74,6 +102,8 @@ impl SignerHandler {
         secret: Option<String>,
         _permissions: Option<String>,
     ) -> Result<Option<String>> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         if let Some(expected) = our_pubkey {
             let actual = if let Some(ref net_frost) = self.network_frost_signer {
                 PublicKey::from_slice(net_frost.group_pubkey())
@@ -150,6 +180,8 @@ impl SignerHandler {
         app_pubkey: PublicKey,
         unsigned_event: UnsignedEvent,
     ) -> Result<Event> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         let kind = unsigned_event.kind;
 
         {
@@ -297,6 +329,8 @@ impl SignerHandler {
         recipient: PublicKey,
         plaintext: &str,
     ) -> Result<String> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         {
             let pm = self.permissions.lock().await;
             if !pm.has_permission(&app_pubkey, Permission::NIP44_ENCRYPT) {
@@ -332,6 +366,8 @@ impl SignerHandler {
         sender: PublicKey,
         ciphertext: &str,
     ) -> Result<String> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         {
             let pm = self.permissions.lock().await;
             if !pm.has_permission(&app_pubkey, Permission::NIP44_DECRYPT) {
@@ -367,6 +403,8 @@ impl SignerHandler {
         recipient: PublicKey,
         plaintext: &str,
     ) -> Result<String> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         {
             let pm = self.permissions.lock().await;
             if !pm.has_permission(&app_pubkey, Permission::NIP04_ENCRYPT) {
@@ -402,6 +440,8 @@ impl SignerHandler {
         sender: PublicKey,
         ciphertext: &str,
     ) -> Result<String> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         {
             let pm = self.permissions.lock().await;
             if !pm.has_permission(&app_pubkey, Permission::NIP04_DECRYPT) {
@@ -431,7 +471,7 @@ impl SignerHandler {
         Ok(plaintext)
     }
 
-    async fn get_app_name(&self, pubkey: &PublicKey) -> String {
+    pub(crate) async fn get_app_name(&self, pubkey: &PublicKey) -> String {
         let pm = self.permissions.lock().await;
         pm.get_app(pubkey)
             .map(|app| app.name.clone())
@@ -439,29 +479,10 @@ impl SignerHandler {
     }
 
     async fn request_approval(&self, request: ApprovalRequest) -> bool {
-        let method = request.method.clone();
-        if let Some(ref tx) = self.tui_tx {
-            let (response_tx, response_rx) = mpsc::channel();
-            let id = self
-                .next_approval_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            let tui_req = TuiApprovalRequest {
-                id,
-                app: request.app_name,
-                action: request.method,
-                kind: request.event_kind.map(|k| k.as_u16()),
-                content_preview: request.event_content,
-                response_tx,
-            };
-
-            if tx.send(TuiEvent::Approval(tui_req)).is_ok() {
-                return tokio::task::spawn_blocking(move || response_rx.recv().unwrap_or(false))
-                    .await
-                    .unwrap_or(false);
-            }
+        if let Some(ref callbacks) = self.callbacks {
+            return callbacks.request_approval(request);
         }
-        info!(method, "auto-approving in headless mode");
+        info!(method = %request.method, "auto-approving in headless mode");
         true
     }
 }
@@ -469,6 +490,8 @@ impl SignerHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditLog;
+    use crate::permissions::PermissionManager;
     use keep_core::keyring::Keyring;
     use keep_core::keys::{KeyType, NostrKeypair};
 

@@ -2075,6 +2075,7 @@ dependencies = [
  "keep-core",
  "keep-enclave-host",
  "keep-frost-net",
+ "keep-nip46",
  "nostr-sdk",
  "rand 0.9.2",
  "ratatui",
@@ -2222,6 +2223,24 @@ dependencies = [
  "uniffi",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "keep-nip46"
+version = "0.1.4"
+dependencies = [
+ "bitflags 2.10.0",
+ "chrono",
+ "keep-core",
+ "keep-frost-net",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
 ]
 
 [[package]]
