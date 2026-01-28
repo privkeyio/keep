@@ -341,17 +341,11 @@ impl KeepMobile {
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
-        let _ = self.storage.load_share_by_key(group_pubkey.clone())?;
-        self.storage
-            .set_active_share_key(Some(group_pubkey.clone()))?;
-
-        let _ = self.storage.load_share_by_key(group_pubkey)?;
+        self.storage.load_share_by_key(group_pubkey.clone())?;
+        self.storage.set_active_share_key(Some(group_pubkey))?;
 
         self.runtime.block_on(async {
-            let mut node_guard = self.node.write().await;
-            if node_guard.is_some() {
-                *node_guard = None;
-            }
+            *self.node.write().await = None;
         });
 
         Ok(())
@@ -360,16 +354,14 @@ impl KeepMobile {
     pub fn delete_share_by_key(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
-        let active_key = self.storage.get_active_share_key();
-        let is_active = active_key
-            .as_ref()
-            .map(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()))
-            .unwrap_or(false);
+        let is_active = self
+            .storage
+            .get_active_share_key()
+            .is_some_and(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()));
 
         if is_active {
             self.runtime.block_on(async {
-                let mut node_guard = self.node.write().await;
-                *node_guard = None;
+                *self.node.write().await = None;
             });
             self.storage.set_active_share_key(None)?;
         }
