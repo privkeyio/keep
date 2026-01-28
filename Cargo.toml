@@ -8,6 +8,7 @@ members = [
     "keep-bitcoin",
     "keep-agent",
     "keep-frost-net",
+    "keep-nip46",
     "keep-mobile",
 ]
 exclude = [
@@ -30,6 +31,7 @@ keep-bitcoin = { path = "keep-bitcoin" }
 keep-enclave-host = { path = "keep-enclave/host" }
 keep-agent = { path = "keep-agent" }
 keep-frost-net = { path = "keep-frost-net" }
+keep-nip46 = { path = "keep-nip46" }
 
 # Crypto
 argon2 = "0.5"

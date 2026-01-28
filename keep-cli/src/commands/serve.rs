@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::path::Path;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::ToBech32;
@@ -12,12 +13,43 @@ use zeroize::Zeroize;
 
 use keep_core::error::{KeepError, Result};
 use keep_core::Keep;
+use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
+use keep_nip46::{FrostSigner, NetworkFrostSigner, Server};
 
 use crate::output::Output;
-use crate::server::Server;
-use crate::signer::{FrostSigner, NetworkFrostSigner};
+use crate::tui::{ApprovalRequest as TuiApprovalRequest, LogEntry, TuiEvent};
 
 use super::{get_password, is_hidden_vault};
+
+struct TuiCallbacks {
+    tx: Sender<TuiEvent>,
+}
+
+impl ServerCallbacks for TuiCallbacks {
+    fn on_log(&self, event: LogEvent) {
+        let _ = self.tx.send(TuiEvent::Log(
+            LogEntry::new(&event.app, &event.action, event.success)
+                .with_detail(event.detail.as_deref().unwrap_or("")),
+        ));
+    }
+
+    fn request_approval(&self, request: ApprovalRequest) -> bool {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let tui_req = TuiApprovalRequest {
+            id: 0,
+            app: request.app_name,
+            action: request.method,
+            kind: request.event_kind.map(|k| k.as_u16()),
+            content_preview: request.event_content,
+            response_tx,
+        };
+
+        if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
+            return false;
+        }
+        response_rx.recv().unwrap_or(false)
+    }
+}
 
 pub fn cmd_serve(
     out: &Output,
@@ -177,51 +209,45 @@ pub fn cmd_serve(
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "runtime error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "runtime error", false).with_detail(&e.to_string()),
                 ));
                 return;
             }
         };
         rt.block_on(async {
-            let mut server = if let (Some(frost), Some(transport_key)) =
-                (frost_signer, transport_key_for_tui)
-            {
-                match Server::new_frost(
-                    frost,
-                    transport_key,
-                    &relay_clone,
-                    Some(tui_tx_clone.clone()),
-                )
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                            crate::tui::LogEntry::new("system", "server error", false)
-                                .with_detail(&e.to_string()),
-                        ));
-                        return;
+            let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
+                tx: tui_tx_clone.clone(),
+            }));
+
+            let mut server =
+                if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
+                    match Server::new_frost(frost, transport_key, &relay_clone, callbacks).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tui_tx_clone.send(TuiEvent::Log(
+                                LogEntry::new("system", "server error", false)
+                                    .with_detail(&e.to_string()),
+                            ));
+                            return;
+                        }
                     }
-                }
-            } else {
-                match Server::new(keyring_for_tui, &relay_clone, Some(tui_tx_clone.clone())).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                            crate::tui::LogEntry::new("system", "server error", false)
-                                .with_detail(&e.to_string()),
-                        ));
-                        return;
+                } else {
+                    match Server::new(keyring_for_tui, &relay_clone, callbacks).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tui_tx_clone.send(TuiEvent::Log(
+                                LogEntry::new("system", "server error", false)
+                                    .with_detail(&e.to_string()),
+                            ));
+                            return;
+                        }
                     }
-                }
-            };
+                };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });
@@ -295,30 +321,30 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "runtime error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "runtime error", false).with_detail(&e.to_string()),
                 ));
                 return;
             }
         };
         rt.block_on(async {
-            let mut server =
-                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                            crate::tui::LogEntry::new("system", "server error", false)
-                                .with_detail(&e.to_string()),
-                        ));
-                        return;
-                    }
-                };
+            let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
+                tx: tui_tx_clone.clone(),
+            }));
+
+            let mut server = match Server::new(keyring, &relay_clone, callbacks).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(TuiEvent::Log(
+                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });
@@ -394,30 +420,30 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "runtime error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "runtime error", false).with_detail(&e.to_string()),
                 ));
                 return;
             }
         };
         rt.block_on(async {
-            let mut server =
-                match Server::new(keyring, &relay_clone, Some(tui_tx_clone.clone())).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                            crate::tui::LogEntry::new("system", "server error", false)
-                                .with_detail(&e.to_string()),
-                        ));
-                        return;
-                    }
-                };
+            let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
+                tx: tui_tx_clone.clone(),
+            }));
+
+            let mut server = match Server::new(keyring, &relay_clone, callbacks).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(TuiEvent::Log(
+                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
 
             if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(crate::tui::TuiEvent::Log(
-                    crate::tui::LogEntry::new("system", "server error", false)
-                        .with_detail(&e.to_string()),
+                let _ = tui_tx_clone.send(TuiEvent::Log(
+                    LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
                 ));
             }
         });

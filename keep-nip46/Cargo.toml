@@ -1,0 +1,21 @@
+[package]
+name = "keep-nip46"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+keep-frost-net = { path = "../keep-frost-net" }
+
+nostr-sdk.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
+urlencoding.workspace = true
+url.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-mod bunker;
 mod commands;
 mod config;
 mod output;
 mod panic;
 #[cfg(windows)]
 mod panic_windows;
-mod server;
 mod signer;
 mod tui;
 #[cfg(feature = "warden")]
