@@ -157,18 +157,40 @@ impl Server {
         relay_url: &str,
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
+        Self::new_network_frost_with_config(
+            network_signer,
+            transport_secret,
+            &[relay_url.to_string()],
+            callbacks,
+            ServerConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn new_network_frost_with_config(
+        network_signer: NetworkFrostSigner,
+        transport_secret: [u8; 32],
+        relay_urls: &[String],
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
+    ) -> Result<Self> {
+        if relay_urls.is_empty() {
+            return Err(NetworkError::relay("at least one relay required".to_string()).into());
+        }
+
         let secret = SecretKey::from_slice(&transport_secret)
             .map_err(|e| CryptoError::invalid_key(format!("transport key: {}", e)))?;
         let keys = Keys::new(secret);
 
         let client = Client::new(keys.clone());
 
-        client
-            .add_relay(relay_url)
-            .await
-            .map_err(|e| NetworkError::relay(e.to_string()))?;
+        for relay_url in relay_urls {
+            client
+                .add_relay(relay_url)
+                .await
+                .map_err(|e| NetworkError::relay(e.to_string()))?;
+        }
 
-        let config = ServerConfig::default();
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
@@ -180,7 +202,7 @@ impl Server {
 
         Ok(Self {
             keys,
-            relay_url: relay_url.to_string(),
+            relay_url: relay_urls[0].clone(),
             client,
             handler: Arc::new(handler),
             running: false,
@@ -407,78 +429,41 @@ impl Server {
                     }
                 }
             }
-            "nip44_encrypt" => {
+            "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt" => {
                 if request.params.len() < 2 {
                     return Nip46Response::error(id, "Missing parameters");
                 }
-                let recipient = match PublicKey::from_hex(&request.params[0]) {
+                let peer = match PublicKey::from_hex(&request.params[0]) {
                     Ok(pk) => pk,
                     Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
                 };
-                match handler
-                    .handle_nip44_encrypt(app_pubkey, recipient, &request.params[1])
-                    .await
-                {
-                    Ok(ct) => Nip46Response::ok(id, &ct),
-                    Err(e) => {
-                        warn!(error = %e, "nip44_encrypt failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                let result = match request.method.as_str() {
+                    "nip44_encrypt" => {
+                        handler
+                            .handle_nip44_encrypt(app_pubkey, peer, &request.params[1])
+                            .await
                     }
-                }
-            }
-            "nip44_decrypt" => {
-                if request.params.len() < 2 {
-                    return Nip46Response::error(id, "Missing parameters");
-                }
-                let sender = match PublicKey::from_hex(&request.params[0]) {
-                    Ok(pk) => pk,
-                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
-                };
-                match handler
-                    .handle_nip44_decrypt(app_pubkey, sender, &request.params[1])
-                    .await
-                {
-                    Ok(pt) => Nip46Response::ok(id, &pt),
-                    Err(e) => {
-                        warn!(error = %e, "nip44_decrypt failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                    "nip44_decrypt" => {
+                        handler
+                            .handle_nip44_decrypt(app_pubkey, peer, &request.params[1])
+                            .await
                     }
-                }
-            }
-            "nip04_encrypt" => {
-                if request.params.len() < 2 {
-                    return Nip46Response::error(id, "Missing parameters");
-                }
-                let recipient = match PublicKey::from_hex(&request.params[0]) {
-                    Ok(pk) => pk,
-                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
-                };
-                match handler
-                    .handle_nip04_encrypt(app_pubkey, recipient, &request.params[1])
-                    .await
-                {
-                    Ok(ct) => Nip46Response::ok(id, &ct),
-                    Err(e) => {
-                        warn!(error = %e, "nip04_encrypt failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                    "nip04_encrypt" => {
+                        handler
+                            .handle_nip04_encrypt(app_pubkey, peer, &request.params[1])
+                            .await
                     }
-                }
-            }
-            "nip04_decrypt" => {
-                if request.params.len() < 2 {
-                    return Nip46Response::error(id, "Missing parameters");
-                }
-                let sender = match PublicKey::from_hex(&request.params[0]) {
-                    Ok(pk) => pk,
-                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
+                    "nip04_decrypt" => {
+                        handler
+                            .handle_nip04_decrypt(app_pubkey, peer, &request.params[1])
+                            .await
+                    }
+                    _ => unreachable!(),
                 };
-                match handler
-                    .handle_nip04_decrypt(app_pubkey, sender, &request.params[1])
-                    .await
-                {
-                    Ok(pt) => Nip46Response::ok(id, &pt),
+                match result {
+                    Ok(data) => Nip46Response::ok(id, &data),
                     Err(e) => {
-                        warn!(error = %e, "nip04_decrypt failed");
+                        warn!(error = %e, method = %request.method, "encryption method failed");
                         Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                     }
                 }

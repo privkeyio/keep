@@ -2214,6 +2214,7 @@ dependencies = [
  "hex",
  "keep-core",
  "keep-frost-net",
+ "keep-nip46",
  "serde",
  "serde_json",
  "sha2",

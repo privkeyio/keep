@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod error;
+mod nip46;
 mod nip55;
 mod storage;
 mod types;
 
 pub use error::KeepMobileError;
+pub use nip46::{
+    BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
+};
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo};
 pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
@@ -78,7 +82,7 @@ impl SigningHooks for MobileSigningHooks {
 
 #[derive(uniffi::Object)]
 pub struct KeepMobile {
-    pub(crate) node: Arc<RwLock<Option<KfpNode>>>,
+    pub(crate) node: Arc<RwLock<Option<Arc<KfpNode>>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     pub(crate) runtime: tokio::runtime::Runtime,
@@ -110,7 +114,7 @@ impl KeepMobile {
 
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
         for relay in &relays {
-            Self::validate_relay_url(relay)?;
+            validate_relay_url(relay)?;
         }
 
         let share = self.load_share_package()?;
@@ -123,6 +127,7 @@ impl KeepMobile {
             node.set_hooks(hooks);
 
             let event_rx = node.subscribe();
+            let node = Arc::new(node);
             let pending = self.pending_requests.clone();
             tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, pending).await;
@@ -274,63 +279,44 @@ impl KeepMobile {
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
         pending: Arc<Mutex<Vec<PendingRequest>>>,
     ) {
-        let mut event_closed = false;
-        let mut request_closed = false;
-
         loop {
-            if event_closed && request_closed {
-                break;
-            }
-
             tokio::select! {
-                result = event_rx.recv(), if !event_closed => {
+                result = event_rx.recv() => {
                     match result {
-                        Ok(event) => {
-                            let session_id = match event {
-                                KfpNodeEvent::SignatureComplete { session_id, .. }
-                                | KfpNodeEvent::SigningFailed { session_id, .. } => Some(session_id),
-                                _ => None,
-                            };
-                            if let Some(session_id) = session_id {
-                                let id = hex::encode(session_id);
-                                pending.lock().await.retain(|r| r.info.id != id);
-                            }
+                        Ok(KfpNodeEvent::SignatureComplete { session_id, .. })
+                        | Ok(KfpNodeEvent::SigningFailed { session_id, .. }) => {
+                            let id = hex::encode(session_id);
+                            pending.lock().await.retain(|r| r.info.id != id);
                         }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            event_closed = true;
-                        }
+                        Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                result = request_rx.recv(), if !request_closed => {
-                    match result {
-                        Some((session, response_tx)) => {
-                            let mut guard = pending.lock().await;
-                            if guard.len() >= MAX_PENDING_REQUESTS {
-                                let _ = response_tx.send(false).await;
-                                continue;
-                            }
-                            let request = SignRequest {
-                                id: hex::encode(session.session_id),
-                                session_id: session.session_id.to_vec(),
-                                message_type: String::new(),
-                                message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
-                                from_peer: 0,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                metadata: None,
-                            };
-                            guard.push(PendingRequest {
-                                info: request,
-                                response_tx,
-                            });
-                        }
-                        None => {
-                            request_closed = true;
-                        }
+                result = request_rx.recv() => {
+                    let Some((session, response_tx)) = result else {
+                        break;
+                    };
+                    let mut guard = pending.lock().await;
+                    if guard.len() >= MAX_PENDING_REQUESTS {
+                        let _ = response_tx.send(false).await;
+                        continue;
                     }
+                    guard.push(PendingRequest {
+                        info: SignRequest {
+                            id: hex::encode(session.session_id),
+                            session_id: session.session_id.to_vec(),
+                            message_type: String::new(),
+                            message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
+                            from_peer: 0,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            metadata: None,
+                        },
+                        response_tx,
+                    });
                 }
             }
         }
@@ -360,30 +346,30 @@ impl KeepMobile {
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
+}
 
-    fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError> {
-        let parsed = url::Url::parse(relay_url).map_err(|_| KeepMobileError::InvalidRelayUrl {
-            msg: "Invalid URL format".into(),
-        })?;
+pub(crate) fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError> {
+    let parsed = url::Url::parse(relay_url).map_err(|_| KeepMobileError::InvalidRelayUrl {
+        msg: "Invalid URL format".into(),
+    })?;
 
-        if parsed.scheme() != "wss" {
-            return Err(KeepMobileError::InvalidRelayUrl {
-                msg: "Must use wss:// protocol".into(),
-            });
-        }
-
-        let host = parsed.host_str().ok_or(KeepMobileError::InvalidRelayUrl {
-            msg: "Missing host".into(),
-        })?;
-
-        if is_internal_host(host) {
-            return Err(KeepMobileError::InvalidRelayUrl {
-                msg: "Internal addresses not allowed".into(),
-            });
-        }
-
-        Ok(())
+    if parsed.scheme() != "wss" {
+        return Err(KeepMobileError::InvalidRelayUrl {
+            msg: "Must use wss:// protocol".into(),
+        });
     }
+
+    let host = parsed.host_str().ok_or(KeepMobileError::InvalidRelayUrl {
+        msg: "Missing host".into(),
+    })?;
+
+    if is_internal_host(host) {
+        return Err(KeepMobileError::InvalidRelayUrl {
+            msg: "Internal addresses not allowed".into(),
+        });
+    }
+
+    Ok(())
 }
 
 fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {

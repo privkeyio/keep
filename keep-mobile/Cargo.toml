@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net", default-features = false }
+keep-nip46 = { path = "../keep-nip46" }
 frost-secp256k1-tr = { version = "2.1", default-features = false }
 uniffi = { version = "0.28", features = ["cli"] }
 thiserror = "1.0"
