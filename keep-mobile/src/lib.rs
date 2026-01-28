@@ -12,7 +12,7 @@ pub use nip46::{
     BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
-pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo};
+pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
 
 use keep_core::frost::{ShareExport, SharePackage};
@@ -181,14 +181,17 @@ impl KeepMobile {
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-        self.storage.store_share(serialized, metadata.clone())?;
+        let group_pubkey_hex = hex::encode(&metadata.group_pubkey);
+        self.storage
+            .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
+        self.storage.set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
         Ok(ShareInfo {
             name: metadata.name,
             share_index: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
-            group_pubkey: hex::encode(&metadata.group_pubkey),
+            group_pubkey: group_pubkey_hex,
         })
     }
 
@@ -271,6 +274,69 @@ impl KeepMobile {
             .to_bech32()
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
+
+    pub fn list_shares(&self) -> Vec<StoredShareInfo> {
+        self.storage
+            .list_all_shares()
+            .into_iter()
+            .map(|m| StoredShareInfo {
+                group_pubkey: hex::encode(&m.group_pubkey),
+                name: m.name,
+                share_index: m.identifier,
+                threshold: m.threshold,
+                total_shares: m.total_shares,
+                created_at: 0,
+                last_used: None,
+                sign_count: 0,
+            })
+            .collect()
+    }
+
+    pub fn get_active_share(&self) -> Option<StoredShareInfo> {
+        let key = self.storage.get_active_share_key()?;
+        let data = self.storage.load_share_by_key(key.clone()).ok()?;
+        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+        let metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json).ok()?;
+
+        Some(StoredShareInfo {
+            group_pubkey: key,
+            name: metadata.name,
+            share_index: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            created_at: metadata.created_at,
+            last_used: metadata.last_used,
+            sign_count: metadata.sign_count,
+        })
+    }
+
+    pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        let _ = self.storage.load_share_by_key(group_pubkey.clone())?;
+        self.storage.set_active_share_key(Some(group_pubkey))?;
+
+        self.runtime.block_on(async {
+            let mut node_guard = self.node.write().await;
+            if node_guard.is_some() {
+                *node_guard = None;
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn delete_share_by_key(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        let active_key = self.storage.get_active_share_key();
+        if active_key.as_ref() == Some(&group_pubkey) {
+            self.runtime.block_on(async {
+                let mut node_guard = self.node.write().await;
+                *node_guard = None;
+            });
+            self.storage.set_active_share_key(None)?;
+        }
+
+        self.storage.delete_share_by_key(group_pubkey)
+    }
 }
 
 impl KeepMobile {
@@ -323,25 +389,31 @@ impl KeepMobile {
     }
 
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
-        let data = self.storage.load_share()?;
+        let key = self
+            .storage
+            .get_active_share_key()
+            .ok_or(KeepMobileError::StorageError {
+                msg: "No active share set".into(),
+            })?;
+        let data = self.storage.load_share_by_key(key)?;
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         let metadata: keep_core::frost::ShareMetadata = serde_json::from_str(&stored.metadata_json)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(
-            &stored.key_package_bytes,
-        )
-        .map_err(|e| KeepMobileError::InvalidShare {
-            msg: format!("Invalid key package: {}", e),
-        })?;
+        let key_package =
+            frost_secp256k1_tr::keys::KeyPackage::deserialize(&stored.key_package_bytes).map_err(
+                |e| KeepMobileError::InvalidShare {
+                    msg: format!("Invalid key package: {}", e),
+                },
+            )?;
 
         let pubkey_package =
             frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
                 .map_err(|e| KeepMobileError::InvalidShare {
-                msg: format!("Invalid pubkey package: {}", e),
-            })?;
+                    msg: format!("Invalid pubkey package: {}", e),
+                })?;
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
