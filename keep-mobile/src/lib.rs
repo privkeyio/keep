@@ -22,7 +22,9 @@ pub use types::{
     SignRequest, SignRequestMetadata, ThresholdConfig,
 };
 
-use keep_core::frost::{ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer};
+use keep_core::frost::{
+    ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
+};
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -467,8 +469,9 @@ impl KeepMobile {
             });
         }
 
-        let mut secret = [0u8; 32];
+        let mut secret = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&key_bytes);
+        drop(key_bytes);
 
         let config = CoreThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
@@ -531,8 +534,14 @@ impl KeepMobile {
             .collect();
 
         self.runtime.block_on(async {
-            let round2_packages = self.dkg_session.receive_round1_packages(round1_packages).await?;
-            Ok(round2_packages.into_iter().map(|p| p.package_bytes).collect())
+            let round2_packages = self
+                .dkg_session
+                .receive_round1_packages(round1_packages)
+                .await?;
+            Ok(round2_packages
+                .into_iter()
+                .map(|p| p.package_bytes)
+                .collect())
         })
     }
 
@@ -550,26 +559,11 @@ impl KeepMobile {
         }
 
         self.runtime.block_on(async {
-            let status = self.dkg_session.status().await;
-            let our_index = match &status {
-                DkgStatus::Round2 => {
-                    // We're in round 2 state, extract our index from the session
-                    // The DKG session tracks this internally
-                    0 // This will be replaced by actual recipient filtering in receive_round2_packages
-                }
-                _ => {
-                    return Err(KeepMobileError::FrostError {
-                        msg: "DKG not in round 2 state".into(),
-                    });
-                }
-            };
-
             let round2_packages: Vec<DkgRound2Package> = packages
                 .into_iter()
                 .zip(sender_indices)
                 .map(|(pkg, idx)| DkgRound2Package {
                     sender_index: idx,
-                    recipient_index: our_index,
                     package_bytes: pkg,
                 })
                 .collect();

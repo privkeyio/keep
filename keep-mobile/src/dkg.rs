@@ -13,6 +13,7 @@ use crate::types::{DkgConfig, DkgStatus};
 use crate::validate_relay_url;
 
 const MAX_DKG_PARTICIPANTS: u16 = 255;
+const MAX_PACKAGE_SIZE: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct DkgRound1Package {
@@ -23,7 +24,6 @@ pub struct DkgRound1Package {
 #[derive(Clone)]
 pub struct DkgRound2Package {
     pub sender_index: u16,
-    pub recipient_index: u16,
     pub package_bytes: Vec<u8>,
 }
 
@@ -87,18 +87,14 @@ impl DkgSession {
 
         if config.our_index < 1 || config.our_index > config.participants {
             return Err(KeepMobileError::FrostError {
-                msg: format!(
-                    "Our index must be between 1 and {}",
-                    config.participants
-                ),
+                msg: format!("Our index must be between 1 and {}", config.participants),
             });
         }
 
-        let our_identifier = Identifier::try_from(config.our_index).map_err(|e| {
-            KeepMobileError::FrostError {
+        let our_identifier =
+            Identifier::try_from(config.our_index).map_err(|e| KeepMobileError::FrostError {
                 msg: format!("Invalid identifier: {}", e),
-            }
-        })?;
+            })?;
 
         let (secret_package, round1_package) = dkg::part1(
             our_identifier,
@@ -110,11 +106,12 @@ impl DkgSession {
             msg: format!("DKG round 1 failed: {}", e),
         })?;
 
-        let package_bytes = round1_package.serialize().map_err(|e| {
-            KeepMobileError::Serialization {
-                msg: format!("Failed to serialize round 1 package: {}", e),
-            }
-        })?;
+        let package_bytes =
+            round1_package
+                .serialize()
+                .map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Failed to serialize round 1 package: {}", e),
+                })?;
 
         let mut state = self.state.write().await;
         *state = DkgState::Initialized {
@@ -180,23 +177,50 @@ impl DkgSession {
         round1_packages.insert(our_identifier, our_round1_package);
 
         for pkg in &packages {
+            if pkg.participant_index < 1 || pkg.participant_index > config.participants {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!(
+                        "Participant index {} out of range (1-{})",
+                        pkg.participant_index, config.participants
+                    ),
+                });
+            }
+
+            if pkg.package_bytes.len() > MAX_PACKAGE_SIZE {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!(
+                        "Round 1 package from {} exceeds maximum size",
+                        pkg.participant_index
+                    ),
+                });
+            }
+
             let identifier = Identifier::try_from(pkg.participant_index).map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Invalid participant index: {}", e),
                 }
             })?;
 
+            if round1_packages.contains_key(&identifier) {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!("Duplicate participant index: {}", pkg.participant_index),
+                });
+            }
+
             let package = dkg::round1::Package::deserialize(&pkg.package_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
-                    msg: format!("Invalid round 1 package from {}: {}", pkg.participant_index, e),
+                    msg: format!(
+                        "Invalid round 1 package from {}: {}",
+                        pkg.participant_index, e
+                    ),
                 }
             })?;
 
             round1_packages.insert(identifier, package);
         }
 
-        let (round2_secret, round2_packages) =
-            dkg::part2(secret_package.clone(), &round1_packages).map_err(|e| {
+        let (round2_secret, round2_packages) = dkg::part2(secret_package.clone(), &round1_packages)
+            .map_err(|e| {
                 *state = DkgState::Failed {
                     reason: format!("DKG round 2 failed: {}", e),
                 };
@@ -207,23 +231,15 @@ impl DkgSession {
 
         let result_packages: Result<Vec<DkgRound2Package>, KeepMobileError> = round2_packages
             .iter()
-            .enumerate()
-            .map(|(enum_idx, (_, pkg))| {
-                let package_bytes = pkg.serialize().map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Failed to serialize round 2 package: {}", e),
-                })?;
-
-                // Calculate recipient index: for participant at our_index, round2 packages
-                // are sent to all other participants (1..=participants, excluding our_index)
-                let recipient_index = if (enum_idx + 1) as u16 >= config.our_index {
-                    (enum_idx + 2) as u16
-                } else {
-                    (enum_idx + 1) as u16
-                };
+            .map(|(_, pkg)| {
+                let package_bytes =
+                    pkg.serialize()
+                        .map_err(|e| KeepMobileError::Serialization {
+                            msg: format!("Failed to serialize round 2 package: {}", e),
+                        })?;
 
                 Ok(DkgRound2Package {
                     sender_index: config.our_index,
-                    recipient_index,
                     package_bytes,
                 })
             })
@@ -292,8 +308,22 @@ impl DkgSession {
 
         let mut round2_packages = BTreeMap::new();
         for pkg in &packages {
-            if pkg.recipient_index != config.our_index {
-                continue;
+            if pkg.sender_index < 1 || pkg.sender_index > config.participants {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!(
+                        "Sender index {} out of range (1-{})",
+                        pkg.sender_index, config.participants
+                    ),
+                });
+            }
+
+            if pkg.package_bytes.len() > MAX_PACKAGE_SIZE {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!(
+                        "Round 2 package from {} exceeds maximum size",
+                        pkg.sender_index
+                    ),
+                });
             }
 
             let sender_id = Identifier::try_from(pkg.sender_index).map_err(|e| {
@@ -301,6 +331,12 @@ impl DkgSession {
                     msg: format!("Invalid sender index: {}", e),
                 }
             })?;
+
+            if round2_packages.contains_key(&sender_id) {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!("Duplicate sender index: {}", pkg.sender_index),
+                });
+            }
 
             let package = dkg::round2::Package::deserialize(&pkg.package_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
@@ -322,11 +358,11 @@ impl DkgSession {
             })?;
 
         let verifying_key = pubkey_package.verifying_key();
-        let serialized = verifying_key.serialize().map_err(|e| {
-            KeepMobileError::FrostError {
+        let serialized = verifying_key
+            .serialize()
+            .map_err(|e| KeepMobileError::FrostError {
                 msg: format!("Failed to serialize verifying key: {}", e),
-            }
-        })?;
+            })?;
         let vk_bytes = serialized.as_slice();
 
         let mut group_pubkey = [0u8; 32];
