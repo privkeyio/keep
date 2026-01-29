@@ -10,6 +10,14 @@ const MAX_AUDIT_ENTRIES: usize = 10_000;
 const MAX_PUBKEY_LENGTH: usize = 256;
 const MAX_DETAILS_LENGTH: usize = 4096;
 
+fn truncate_str(s: &str, max_len: usize) -> &str {
+    if s.len() > max_len {
+        &s[..max_len]
+    } else {
+        s
+    }
+}
+
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditEventType {
     Sign,
@@ -60,12 +68,7 @@ impl AuditEntry {
     }
 
     pub fn with_pubkey(mut self, pubkey: &str) -> Self {
-        let truncated = if pubkey.len() > MAX_PUBKEY_LENGTH {
-            &pubkey[..MAX_PUBKEY_LENGTH]
-        } else {
-            pubkey
-        };
-        self.pubkey = Some(truncated.to_string());
+        self.pubkey = Some(truncate_str(pubkey, MAX_PUBKEY_LENGTH).to_string());
         self
     }
 
@@ -75,12 +78,7 @@ impl AuditEntry {
     }
 
     pub fn with_details(mut self, details: &str) -> Self {
-        let truncated = if details.len() > MAX_DETAILS_LENGTH {
-            &details[..MAX_DETAILS_LENGTH]
-        } else {
-            details
-        };
-        self.details = Some(truncated.to_string());
+        self.details = Some(truncate_str(details, MAX_DETAILS_LENGTH).to_string());
         self
     }
 
@@ -170,45 +168,36 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let (entry_json, new_hash) =
-            {
-                let last_hash =
-                    self.last_hash
-                        .lock()
-                        .map_err(|_| KeepMobileError::StorageError {
-                            msg: "Lock poisoned".into(),
-                        })?;
-
-                let mut entry = AuditEntry::new(event_type, *last_hash);
-                if let Some(pk) = pubkey {
-                    entry = entry.with_pubkey(&pk);
-                }
-                entry = entry.with_success(success);
-                if let Some(d) = details {
-                    entry = entry.with_details(&d);
-                }
-                entry = entry.finalize();
-
-                let entry_json = serde_json::to_string(&entry)
-                    .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
-
-                let new_hash: [u8; 32] = entry.hash.as_slice().try_into().map_err(|_| {
-                    KeepMobileError::Serialization {
-                        msg: "Invalid hash length".into(),
-                    }
-                })?;
-
-                (entry_json, new_hash)
-            };
-
-        self.storage.store_entry(entry_json)?;
-
         let mut last_hash = self
             .last_hash
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
+
+        let mut entry = AuditEntry::new(event_type, *last_hash);
+        if let Some(pk) = pubkey {
+            entry = entry.with_pubkey(&pk);
+        }
+        entry = entry.with_success(success);
+        if let Some(d) = details {
+            entry = entry.with_details(&d);
+        }
+        entry = entry.finalize();
+
+        let entry_json = serde_json::to_string(&entry)
+            .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
+
+        let new_hash: [u8; 32] =
+            entry
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| KeepMobileError::Serialization {
+                    msg: "Invalid hash length".into(),
+                })?;
+
+        self.storage.store_entry(entry_json)?;
         *last_hash = new_hash;
 
         Ok(())
@@ -249,7 +238,7 @@ impl AuditLog {
             if !entry.verify(&prev_hash) {
                 return Ok(false);
             }
-            let hash: [u8; 32] =
+            prev_hash =
                 entry
                     .hash
                     .as_slice()
@@ -257,7 +246,6 @@ impl AuditLog {
                     .map_err(|_| KeepMobileError::Serialization {
                         msg: "Invalid hash length".into(),
                     })?;
-            prev_hash = hash;
         }
 
         Ok(true)
