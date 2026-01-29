@@ -32,6 +32,7 @@ const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
 const MAX_STORED_SHARES: usize = 100;
+const MAX_SHARE_NAME_LENGTH: usize = 64;
 
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
@@ -153,6 +154,15 @@ impl KeepMobile {
         if data.len() > MAX_IMPORT_DATA_SIZE {
             return Err(KeepMobileError::InvalidShare {
                 msg: "Import data exceeds maximum size".into(),
+            });
+        }
+
+        if name.len() > MAX_SHARE_NAME_LENGTH {
+            return Err(KeepMobileError::InvalidShare {
+                msg: format!(
+                    "Share name exceeds maximum length of {} characters",
+                    MAX_SHARE_NAME_LENGTH
+                ),
             });
         }
 

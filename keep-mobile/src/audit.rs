@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 const MAX_AUDIT_ENTRIES: usize = 10_000;
+const MAX_PUBKEY_LENGTH: usize = 256;
+const MAX_DETAILS_LENGTH: usize = 4096;
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditEventType {
@@ -58,7 +60,12 @@ impl AuditEntry {
     }
 
     pub fn with_pubkey(mut self, pubkey: &str) -> Self {
-        self.pubkey = Some(pubkey.to_string());
+        let truncated = if pubkey.len() > MAX_PUBKEY_LENGTH {
+            &pubkey[..MAX_PUBKEY_LENGTH]
+        } else {
+            pubkey
+        };
+        self.pubkey = Some(truncated.to_string());
         self
     }
 
@@ -68,7 +75,12 @@ impl AuditEntry {
     }
 
     pub fn with_details(mut self, details: &str) -> Self {
-        self.details = Some(details.to_string());
+        let truncated = if details.len() > MAX_DETAILS_LENGTH {
+            &details[..MAX_DETAILS_LENGTH]
+        } else {
+            details
+        };
+        self.details = Some(truncated.to_string());
         self
     }
 
@@ -107,6 +119,7 @@ impl AuditEntry {
 pub trait AuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
     fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError>;
+    /// Privileged operation: callers must ensure proper authorization before invoking.
     fn clear_entries(&self) -> Result<(), KeepMobileError>;
 }
 
@@ -121,12 +134,18 @@ impl AuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn AuditStorage>) -> Result<Self, KeepMobileError> {
         let entries = storage.load_entries(None)?;
+
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Audit log exceeds maximum of {} entries", MAX_AUDIT_ENTRIES),
+            });
+        }
+
         let last_hash = if let Some(last_json) = entries.last() {
-            let entry: AuditEntry = serde_json::from_str(last_json).map_err(|e| {
-                KeepMobileError::Serialization {
+            let entry: AuditEntry =
+                serde_json::from_str(last_json).map_err(|e| KeepMobileError::Serialization {
                     msg: format!("Invalid audit entry: {}", e),
-                }
-            })?;
+                })?;
             entry
                 .hash
                 .as_slice()
@@ -151,38 +170,45 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
+        let (entry_json, new_hash) =
+            {
+                let last_hash =
+                    self.last_hash
+                        .lock()
+                        .map_err(|_| KeepMobileError::StorageError {
+                            msg: "Lock poisoned".into(),
+                        })?;
+
+                let mut entry = AuditEntry::new(event_type, *last_hash);
+                if let Some(pk) = pubkey {
+                    entry = entry.with_pubkey(&pk);
+                }
+                entry = entry.with_success(success);
+                if let Some(d) = details {
+                    entry = entry.with_details(&d);
+                }
+                entry = entry.finalize();
+
+                let entry_json = serde_json::to_string(&entry)
+                    .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
+
+                let new_hash: [u8; 32] = entry.hash.as_slice().try_into().map_err(|_| {
+                    KeepMobileError::Serialization {
+                        msg: "Invalid hash length".into(),
+                    }
+                })?;
+
+                (entry_json, new_hash)
+            };
+
+        self.storage.store_entry(entry_json)?;
+
         let mut last_hash = self
             .last_hash
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
-
-        let mut entry = AuditEntry::new(event_type, *last_hash);
-        if let Some(pk) = pubkey {
-            entry = entry.with_pubkey(&pk);
-        }
-        entry = entry.with_success(success);
-        if let Some(d) = details {
-            entry = entry.with_details(&d);
-        }
-        entry = entry.finalize();
-
-        let entry_json =
-            serde_json::to_string(&entry).map_err(|e| KeepMobileError::Serialization {
-                msg: e.to_string(),
-            })?;
-
-        self.storage.store_entry(entry_json)?;
-
-        let new_hash: [u8; 32] =
-            entry
-                .hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| KeepMobileError::Serialization {
-                    msg: "Invalid hash length".into(),
-                })?;
         *last_hash = new_hash;
 
         Ok(())
@@ -239,7 +265,8 @@ impl AuditLog {
 
     pub fn entry_count(&self) -> Result<u32, KeepMobileError> {
         let entries = self.storage.load_entries(None)?;
-        Ok(entries.len() as u32)
+        let count = entries.len().min(MAX_AUDIT_ENTRIES);
+        Ok(count as u32)
     }
 }
 
@@ -269,7 +296,13 @@ mod tests {
         fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError> {
             let entries = self.entries.lock().unwrap();
             match limit {
-                Some(n) => Ok(entries.iter().rev().take(n as usize).rev().cloned().collect()),
+                Some(n) => Ok(entries
+                    .iter()
+                    .rev()
+                    .take(n as usize)
+                    .rev()
+                    .cloned()
+                    .collect()),
                 None => Ok(entries.clone()),
             }
         }
