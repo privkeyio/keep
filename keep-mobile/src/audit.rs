@@ -11,11 +11,14 @@ const MAX_PUBKEY_LENGTH: usize = 256;
 const MAX_DETAILS_LENGTH: usize = 4096;
 
 fn truncate_str(s: &str, max_len: usize) -> &str {
-    if s.len() > max_len {
-        &s[..max_len]
-    } else {
-        s
+    if s.len() <= max_len {
+        return s;
     }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +171,16 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
+        let entry_count = self.storage.load_entries(None)?.len();
+        if entry_count >= MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "Audit log full: {} entries (max {})",
+                    entry_count, MAX_AUDIT_ENTRIES
+                ),
+            });
+        }
+
         let mut last_hash = self
             .last_hash
             .lock()

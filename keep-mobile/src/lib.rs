@@ -157,7 +157,7 @@ impl KeepMobile {
             });
         }
 
-        if name.len() > MAX_SHARE_NAME_LENGTH {
+        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
             return Err(KeepMobileError::InvalidShare {
                 msg: format!(
                     "Share name exceeds maximum length of {} characters",
