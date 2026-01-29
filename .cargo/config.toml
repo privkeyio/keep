@@ -1,0 +1,20 @@
+[build]
+jobs = 16
+
+# Local dev: enable sccache for faster rebuilds
+# Install: cargo install sccache
+# Then uncomment or set: RUSTC_WRAPPER=sccache
+# rustc-wrapper = "sccache"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# macOS (uncomment if needed)
+# [target.aarch64-apple-darwin]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# [target.x86_64-apple-darwin]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

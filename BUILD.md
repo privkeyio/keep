@@ -33,6 +33,19 @@ xcode-select --install
 - 1GB disk space
 - x86_64 or aarch64 architecture
 
+### Faster Builds (Optional)
+
+**Linux:**
+```bash
+sudo apt-get install -y mold clang
+```
+
+**Compilation cache:**
+```bash
+cargo install sccache
+export RUSTC_WRAPPER=sccache
+```
+
 ---
 
 ## Standard Build
