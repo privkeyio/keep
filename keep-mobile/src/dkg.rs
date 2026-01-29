@@ -237,8 +237,8 @@ impl DkgSession {
             })?;
 
         let result_packages: Result<Vec<DkgRound2Package>, KeepMobileError> = round2_packages
-            .iter()
-            .map(|(_, pkg)| {
+            .values()
+            .map(|pkg| {
                 let package_bytes =
                     pkg.serialize()
                         .map_err(|e| KeepMobileError::Serialization {
