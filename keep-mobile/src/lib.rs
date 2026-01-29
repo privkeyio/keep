@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod audit;
+mod dkg;
 mod error;
 mod nip46;
 mod nip55;
@@ -9,22 +10,28 @@ mod storage;
 mod types;
 
 pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
+pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
 pub use error::KeepMobileError;
 pub use nip46::{
     BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
-pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
+pub use types::{
+    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, PeerInfo, PeerStatus,
+    SignRequest, SignRequestMetadata, ThresholdConfig,
+};
 
-use keep_core::frost::{ShareExport, SharePackage};
+use keep_core::frost::{
+    ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
+};
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
 
@@ -92,6 +99,7 @@ pub struct KeepMobile {
     pub(crate) node: Arc<RwLock<Option<Arc<KfpNode>>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
+    dkg_session: DkgSession,
     pub(crate) runtime: tokio::runtime::Runtime,
 }
 
@@ -115,6 +123,7 @@ impl KeepMobile {
             node: Arc::new(RwLock::new(None)),
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
+            dkg_session: DkgSession::new(),
             runtime,
         })
     }
@@ -157,14 +166,7 @@ impl KeepMobile {
             });
         }
 
-        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
-            return Err(KeepMobileError::InvalidShare {
-                msg: format!(
-                    "Share name exceeds maximum length of {} characters",
-                    MAX_SHARE_NAME_LENGTH
-                ),
-            });
-        }
+        Self::validate_share_name(&name)?;
 
         let share_count = self.storage.list_all_shares().len();
         if share_count >= MAX_STORED_SHARES {
@@ -311,43 +313,13 @@ impl KeepMobile {
         self.storage
             .list_all_shares()
             .into_iter()
-            .filter_map(|m| {
-                let key = hex::encode(&m.group_pubkey);
-                let data = self.storage.load_share_by_key(key.clone()).ok()?;
-                let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
-                let metadata: keep_core::frost::ShareMetadata =
-                    serde_json::from_str(&stored.metadata_json).ok()?;
-                Some(StoredShareInfo {
-                    group_pubkey: key,
-                    name: metadata.name,
-                    share_index: metadata.identifier,
-                    threshold: metadata.threshold,
-                    total_shares: metadata.total_shares,
-                    created_at: metadata.created_at,
-                    last_used: metadata.last_used,
-                    sign_count: metadata.sign_count,
-                })
-            })
+            .filter_map(|m| self.load_stored_share_info(hex::encode(&m.group_pubkey)))
             .collect()
     }
 
     pub fn get_active_share(&self) -> Option<StoredShareInfo> {
         let key = self.storage.get_active_share_key()?;
-        let data = self.storage.load_share_by_key(key.clone()).ok()?;
-        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
-        let metadata: keep_core::frost::ShareMetadata =
-            serde_json::from_str(&stored.metadata_json).ok()?;
-
-        Some(StoredShareInfo {
-            group_pubkey: key,
-            name: metadata.name,
-            share_index: metadata.identifier,
-            threshold: metadata.threshold,
-            total_shares: metadata.total_shares,
-            created_at: metadata.created_at,
-            last_used: metadata.last_used,
-            sign_count: metadata.sign_count,
-        })
+        self.load_stored_share_info(key)
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
@@ -383,9 +355,176 @@ impl KeepMobile {
 
         Ok(())
     }
+
+    pub fn frost_generate(
+        &self,
+        threshold: u16,
+        total_shares: u16,
+        name: String,
+        passphrase: String,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        Self::validate_share_name(&name)?;
+
+        let config = CoreThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+        let (shares, _) = dealer.generate(&name)?;
+
+        let passphrase = Zeroizing::new(passphrase);
+        Self::build_generation_result(&shares, &passphrase)
+    }
+
+    pub fn frost_split(
+        &self,
+        existing_key: String,
+        threshold: u16,
+        total_shares: u16,
+        name: String,
+        passphrase: String,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        Self::validate_share_name(&name)?;
+
+        let mut key_bytes =
+            hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
+                msg: "Invalid hex encoding for existing key".into(),
+            })?;
+
+        if key_bytes.len() != 32 {
+            key_bytes.zeroize();
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Existing key must be exactly 32 bytes".into(),
+            });
+        }
+
+        let mut secret = Zeroizing::new([0u8; 32]);
+        secret.copy_from_slice(&key_bytes);
+        key_bytes.zeroize();
+
+        let config = CoreThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+        let (shares, _) = dealer.split_existing(&secret, &name)?;
+
+        let passphrase = Zeroizing::new(passphrase);
+        Self::build_generation_result(&shares, &passphrase)
+    }
+
+    pub fn frost_start_dkg(&self, config: DkgConfig) -> Result<Vec<u8>, KeepMobileError> {
+        self.runtime.block_on(async {
+            let round1_pkg = self.dkg_session.start(config).await?;
+            Ok(round1_pkg.package_bytes)
+        })
+    }
+
+    pub fn frost_dkg_round1_packages(
+        &self,
+        packages: Vec<Vec<u8>>,
+        participant_indices: Vec<u16>,
+    ) -> Result<Vec<DkgRound2Package>, KeepMobileError> {
+        if packages.len() != participant_indices.len() {
+            return Err(KeepMobileError::FrostError {
+                msg: "Packages and indices must have same length".into(),
+            });
+        }
+
+        let round1_packages: Vec<DkgRound1Package> = packages
+            .into_iter()
+            .zip(participant_indices)
+            .map(|(pkg, idx)| DkgRound1Package {
+                participant_index: idx,
+                package_bytes: pkg,
+            })
+            .collect();
+
+        self.runtime.block_on(async {
+            self.dkg_session
+                .receive_round1_packages(round1_packages)
+                .await
+        })
+    }
+
+    pub fn frost_dkg_round2_packages(
+        &self,
+        packages: Vec<Vec<u8>>,
+        sender_indices: Vec<u16>,
+        name: String,
+        passphrase: String,
+    ) -> Result<String, KeepMobileError> {
+        if packages.len() != sender_indices.len() {
+            return Err(KeepMobileError::FrostError {
+                msg: "Packages and indices must have same length".into(),
+            });
+        }
+
+        self.runtime.block_on(async {
+            let round2_packages: Vec<DkgRound2Package> = packages
+                .into_iter()
+                .zip(sender_indices)
+                .map(|(pkg, idx)| DkgRound2Package {
+                    sender_index: idx,
+                    recipient_index: 0,
+                    package_bytes: pkg,
+                })
+                .collect();
+
+            let result = self
+                .dkg_session
+                .receive_round2_packages(round2_packages, &name, &passphrase)
+                .await?;
+            Ok(result.share_export)
+        })
+    }
+
+    pub fn frost_dkg_status(&self) -> DkgStatus {
+        self.runtime.block_on(self.dkg_session.status())
+    }
+
+    pub fn frost_dkg_reset(&self) {
+        self.runtime.block_on(self.dkg_session.reset())
+    }
 }
 
 impl KeepMobile {
+    fn validate_share_name(name: &str) -> Result<(), KeepMobileError> {
+        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
+            return Err(KeepMobileError::InvalidShare {
+                msg: format!(
+                    "Share name exceeds maximum length of {} characters",
+                    MAX_SHARE_NAME_LENGTH
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn build_generation_result(
+        shares: &[SharePackage],
+        passphrase: &Zeroizing<String>,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        let mut share_infos = Vec::with_capacity(shares.len());
+
+        for share in shares {
+            let export = ShareExport::from_share(share, passphrase)?;
+            let export_data = export.to_bech32()?;
+
+            share_infos.push(GeneratedShareInfo {
+                share_index: share.metadata.identifier,
+                threshold: share.metadata.threshold,
+                total_shares: share.metadata.total_shares,
+                group_pubkey: hex::encode(share.metadata.group_pubkey),
+                export_data,
+            });
+        }
+
+        let group_pubkey = shares
+            .first()
+            .map(|s| hex::encode(s.metadata.group_pubkey))
+            .unwrap_or_default();
+
+        Ok(FrostGenerationResult {
+            group_pubkey,
+            shares: share_infos,
+        })
+    }
+
     async fn event_listener(
         mut event_rx: broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
@@ -461,6 +600,24 @@ impl KeepMobile {
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+    }
+
+    fn load_stored_share_info(&self, key: String) -> Option<StoredShareInfo> {
+        let data = self.storage.load_share_by_key(key.clone()).ok()?;
+        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+        let metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json).ok()?;
+
+        Some(StoredShareInfo {
+            group_pubkey: key,
+            name: metadata.name,
+            share_index: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            created_at: metadata.created_at,
+            last_used: metadata.last_used,
+            sign_count: metadata.sign_count,
+        })
     }
 
     fn migrate_legacy_share(&self) -> Result<String, KeepMobileError> {
