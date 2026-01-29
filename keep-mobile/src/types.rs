@@ -33,3 +33,43 @@ pub enum PeerStatus {
     Offline,
     Unknown,
 }
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ThresholdConfig {
+    pub threshold: u16,
+    pub total_shares: u16,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct GeneratedShareInfo {
+    pub share_index: u16,
+    pub threshold: u16,
+    pub total_shares: u16,
+    pub group_pubkey: String,
+    pub export_data: String,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FrostGenerationResult {
+    pub group_pubkey: String,
+    pub shares: Vec<GeneratedShareInfo>,
+}
+
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum DkgStatus {
+    NotStarted,
+    Waiting,
+    Round1,
+    Round2,
+    Complete,
+    Failed { reason: String },
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct DkgConfig {
+    pub group_name: String,
+    pub threshold: u16,
+    pub participants: u16,
+    pub our_index: u16,
+    pub relays: Vec<String>,
+}

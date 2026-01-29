@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod audit;
+mod dkg;
 mod error;
 mod nip46;
 mod nip55;
@@ -9,15 +10,19 @@ mod storage;
 mod types;
 
 pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
+pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
 pub use error::KeepMobileError;
 pub use nip46::{
     BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
-pub use types::{PeerInfo, PeerStatus, SignRequest, SignRequestMetadata};
+pub use types::{
+    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, PeerInfo, PeerStatus,
+    SignRequest, SignRequestMetadata, ThresholdConfig,
+};
 
-use keep_core::frost::{ShareExport, SharePackage};
+use keep_core::frost::{ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer};
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -92,6 +97,7 @@ pub struct KeepMobile {
     pub(crate) node: Arc<RwLock<Option<Arc<KfpNode>>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
+    dkg_session: DkgSession,
     pub(crate) runtime: tokio::runtime::Runtime,
 }
 
@@ -115,6 +121,7 @@ impl KeepMobile {
             node: Arc::new(RwLock::new(None)),
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
+            dkg_session: DkgSession::new(),
             runtime,
         })
     }
@@ -382,6 +389,205 @@ impl KeepMobile {
         }
 
         Ok(())
+    }
+
+    pub fn frost_generate(
+        &self,
+        threshold: u16,
+        total_shares: u16,
+        name: String,
+        passphrase: String,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
+            return Err(KeepMobileError::InvalidShare {
+                msg: format!(
+                    "Share name exceeds maximum length of {} characters",
+                    MAX_SHARE_NAME_LENGTH
+                ),
+            });
+        }
+
+        let config = CoreThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+
+        let (shares, _) = dealer.generate(&name)?;
+
+        let passphrase = Zeroizing::new(passphrase);
+        let mut share_infos = Vec::with_capacity(shares.len());
+
+        for share in &shares {
+            let export = ShareExport::from_share(share, &passphrase)?;
+            let export_data = export.to_bech32()?;
+
+            share_infos.push(GeneratedShareInfo {
+                share_index: share.metadata.identifier,
+                threshold: share.metadata.threshold,
+                total_shares: share.metadata.total_shares,
+                group_pubkey: hex::encode(share.metadata.group_pubkey),
+                export_data,
+            });
+        }
+
+        let group_pubkey = if let Some(first) = shares.first() {
+            hex::encode(first.metadata.group_pubkey)
+        } else {
+            String::new()
+        };
+
+        Ok(FrostGenerationResult {
+            group_pubkey,
+            shares: share_infos,
+        })
+    }
+
+    pub fn frost_split(
+        &self,
+        existing_key: String,
+        threshold: u16,
+        total_shares: u16,
+        name: String,
+        passphrase: String,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
+            return Err(KeepMobileError::InvalidShare {
+                msg: format!(
+                    "Share name exceeds maximum length of {} characters",
+                    MAX_SHARE_NAME_LENGTH
+                ),
+            });
+        }
+
+        let key_bytes = hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
+            msg: "Invalid hex encoding for existing key".into(),
+        })?;
+
+        if key_bytes.len() != 32 {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Existing key must be exactly 32 bytes".into(),
+            });
+        }
+
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&key_bytes);
+
+        let config = CoreThresholdConfig::new(threshold, total_shares)?;
+        let dealer = TrustedDealer::new(config);
+
+        let (shares, _) = dealer.split_existing(&secret, &name)?;
+
+        let passphrase = Zeroizing::new(passphrase);
+        let mut share_infos = Vec::with_capacity(shares.len());
+
+        for share in &shares {
+            let export = ShareExport::from_share(share, &passphrase)?;
+            let export_data = export.to_bech32()?;
+
+            share_infos.push(GeneratedShareInfo {
+                share_index: share.metadata.identifier,
+                threshold: share.metadata.threshold,
+                total_shares: share.metadata.total_shares,
+                group_pubkey: hex::encode(share.metadata.group_pubkey),
+                export_data,
+            });
+        }
+
+        let group_pubkey = if let Some(first) = shares.first() {
+            hex::encode(first.metadata.group_pubkey)
+        } else {
+            String::new()
+        };
+
+        Ok(FrostGenerationResult {
+            group_pubkey,
+            shares: share_infos,
+        })
+    }
+
+    pub fn frost_start_dkg(&self, config: DkgConfig) -> Result<Vec<u8>, KeepMobileError> {
+        self.runtime.block_on(async {
+            let round1_pkg = self.dkg_session.start(config).await?;
+            Ok(round1_pkg.package_bytes)
+        })
+    }
+
+    pub fn frost_dkg_round1_packages(
+        &self,
+        packages: Vec<Vec<u8>>,
+        participant_indices: Vec<u16>,
+    ) -> Result<Vec<Vec<u8>>, KeepMobileError> {
+        if packages.len() != participant_indices.len() {
+            return Err(KeepMobileError::FrostError {
+                msg: "Packages and indices must have same length".into(),
+            });
+        }
+
+        let round1_packages: Vec<DkgRound1Package> = packages
+            .into_iter()
+            .zip(participant_indices)
+            .map(|(pkg, idx)| DkgRound1Package {
+                participant_index: idx,
+                package_bytes: pkg,
+            })
+            .collect();
+
+        self.runtime.block_on(async {
+            let round2_packages = self.dkg_session.receive_round1_packages(round1_packages).await?;
+            Ok(round2_packages.into_iter().map(|p| p.package_bytes).collect())
+        })
+    }
+
+    pub fn frost_dkg_round2_packages(
+        &self,
+        packages: Vec<Vec<u8>>,
+        sender_indices: Vec<u16>,
+        name: String,
+        passphrase: String,
+    ) -> Result<String, KeepMobileError> {
+        if packages.len() != sender_indices.len() {
+            return Err(KeepMobileError::FrostError {
+                msg: "Packages and indices must have same length".into(),
+            });
+        }
+
+        self.runtime.block_on(async {
+            let status = self.dkg_session.status().await;
+            let our_index = match &status {
+                DkgStatus::Round2 => {
+                    // We're in round 2 state, extract our index from the session
+                    // The DKG session tracks this internally
+                    0 // This will be replaced by actual recipient filtering in receive_round2_packages
+                }
+                _ => {
+                    return Err(KeepMobileError::FrostError {
+                        msg: "DKG not in round 2 state".into(),
+                    });
+                }
+            };
+
+            let round2_packages: Vec<DkgRound2Package> = packages
+                .into_iter()
+                .zip(sender_indices)
+                .map(|(pkg, idx)| DkgRound2Package {
+                    sender_index: idx,
+                    recipient_index: our_index,
+                    package_bytes: pkg,
+                })
+                .collect();
+
+            let result = self
+                .dkg_session
+                .receive_round2_packages(round2_packages, &name, &passphrase)
+                .await?;
+            Ok(result.share_export)
+        })
+    }
+
+    pub fn frost_dkg_status(&self) -> DkgStatus {
+        self.runtime.block_on(self.dkg_session.status())
+    }
+
+    pub fn frost_dkg_reset(&self) {
+        self.runtime.block_on(self.dkg_session.reset())
     }
 }
 
