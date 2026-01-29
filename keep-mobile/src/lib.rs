@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+mod audit;
 mod error;
 mod nip46;
 mod nip55;
 mod storage;
 mod types;
 
+pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
 pub use error::KeepMobileError;
 pub use nip46::{
     BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
