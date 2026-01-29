@@ -13,6 +13,7 @@ use crate::types::{DkgConfig, DkgStatus};
 use crate::validate_relay_url;
 
 const MAX_DKG_PARTICIPANTS: u16 = 255;
+const MAX_SHARE_NAME_LENGTH: usize = 64;
 const MAX_PACKAGE_SIZE: usize = 16 * 1024;
 
 fn validate_participant_index(
@@ -39,15 +40,28 @@ fn validate_package_size(bytes: &[u8], sender: u16) -> Result<(), KeepMobileErro
     Ok(())
 }
 
+fn validate_share_name(name: &str) -> Result<(), KeepMobileError> {
+    if name.chars().count() > MAX_SHARE_NAME_LENGTH {
+        return Err(KeepMobileError::InvalidShare {
+            msg: format!(
+                "Share name exceeds maximum length of {} characters",
+                MAX_SHARE_NAME_LENGTH
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct DkgRound1Package {
     pub participant_index: u16,
     pub package_bytes: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, uniffi::Record)]
 pub struct DkgRound2Package {
     pub sender_index: u16,
+    pub recipient_index: u16,
     pub package_bytes: Vec<u8>,
 }
 
@@ -87,6 +101,18 @@ impl DkgSession {
     }
 
     pub async fn start(&self, config: DkgConfig) -> Result<DkgRound1Package, KeepMobileError> {
+        {
+            let state = self.state.read().await;
+            match &*state {
+                DkgState::Initialized { .. } | DkgState::Round1Complete { .. } => {
+                    return Err(KeepMobileError::FrostError {
+                        msg: "DKG session already in progress".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         for relay in &config.relays {
             validate_relay_url(relay)?;
         }
@@ -237,16 +263,26 @@ impl DkgSession {
             })?;
 
         let result_packages: Result<Vec<DkgRound2Package>, KeepMobileError> = round2_packages
-            .values()
-            .map(|pkg| {
+            .iter()
+            .map(|(recipient_id, pkg)| {
                 let package_bytes =
                     pkg.serialize()
                         .map_err(|e| KeepMobileError::Serialization {
                             msg: format!("Failed to serialize round 2 package: {}", e),
                         })?;
 
+                let id_bytes = recipient_id.serialize();
+                let recipient_index = if id_bytes.len() >= 2 {
+                    u16::from_le_bytes([id_bytes[0], id_bytes[1]])
+                } else {
+                    return Err(KeepMobileError::FrostError {
+                        msg: "Invalid recipient identifier serialization".into(),
+                    });
+                };
+
                 Ok(DkgRound2Package {
                     sender_index: config.our_index,
+                    recipient_index,
                     package_bytes,
                 })
             })
@@ -271,6 +307,8 @@ impl DkgSession {
     ) -> Result<DkgResult, KeepMobileError> {
         use keep_core::frost::{ShareExport, ShareMetadata, SharePackage};
         use zeroize::Zeroizing;
+
+        validate_share_name(name)?;
 
         let mut state = self.state.write().await;
 
@@ -496,5 +534,29 @@ mod tests {
 
         session.reset().await;
         assert_eq!(session.status().await, DkgStatus::NotStarted);
+    }
+
+    #[tokio::test]
+    async fn test_dkg_start_rejects_in_progress() {
+        let session = DkgSession::new();
+        let config = DkgConfig {
+            group_name: "test".to_string(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.example.com".to_string()],
+        };
+
+        session.start(config.clone()).await.unwrap();
+        assert_eq!(session.status().await, DkgStatus::Round1);
+
+        let result = session.start(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(KeepMobileError::FrostError { msg }) => {
+                assert!(msg.contains("already in progress"));
+            }
+            _ => panic!("Expected FrostError with 'already in progress' message"),
+        }
     }
 }

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
 
@@ -383,11 +383,13 @@ impl KeepMobile {
     ) -> Result<FrostGenerationResult, KeepMobileError> {
         Self::validate_share_name(&name)?;
 
-        let key_bytes = hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
-            msg: "Invalid hex encoding for existing key".into(),
-        })?;
+        let mut key_bytes =
+            hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
+                msg: "Invalid hex encoding for existing key".into(),
+            })?;
 
         if key_bytes.len() != 32 {
+            key_bytes.zeroize();
             return Err(KeepMobileError::InvalidShare {
                 msg: "Existing key must be exactly 32 bytes".into(),
             });
@@ -395,7 +397,7 @@ impl KeepMobile {
 
         let mut secret = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&key_bytes);
-        drop(key_bytes);
+        key_bytes.zeroize();
 
         let config = CoreThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
@@ -416,7 +418,7 @@ impl KeepMobile {
         &self,
         packages: Vec<Vec<u8>>,
         participant_indices: Vec<u16>,
-    ) -> Result<Vec<Vec<u8>>, KeepMobileError> {
+    ) -> Result<Vec<DkgRound2Package>, KeepMobileError> {
         if packages.len() != participant_indices.len() {
             return Err(KeepMobileError::FrostError {
                 msg: "Packages and indices must have same length".into(),
@@ -433,14 +435,9 @@ impl KeepMobile {
             .collect();
 
         self.runtime.block_on(async {
-            let round2_packages = self
-                .dkg_session
+            self.dkg_session
                 .receive_round1_packages(round1_packages)
-                .await?;
-            Ok(round2_packages
-                .into_iter()
-                .map(|p| p.package_bytes)
-                .collect())
+                .await
         })
     }
 
@@ -463,6 +460,7 @@ impl KeepMobile {
                 .zip(sender_indices)
                 .map(|(pkg, idx)| DkgRound2Package {
                     sender_index: idx,
+                    recipient_index: 0,
                     package_bytes: pkg,
                 })
                 .collect();
