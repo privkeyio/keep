@@ -104,8 +104,4 @@ anyhow = "1.0"
 tempfile = "3.10"
 
 [profile.dev]
-opt-level = 0
 debug = "line-tables-only"
-
-[profile.dev.package."*"]
-opt-level = 2
