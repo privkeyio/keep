@@ -243,7 +243,7 @@ All participants must run the command within 5 minutes. On completion, each devi
 
 ## Mobile (NIP-55)
 
-UniFFI library for Android/iOS apps to hold FROST shares and sign via NIP-55 protocol.
+UniFFI library for Android/iOS apps to hold FROST shares and sign via NIP-55 protocol. See [keep-android](https://github.com/privkeyio/keep-android) for the Android app implementation.
 
 ```kotlin
 // Android: Initialize with secure storage
