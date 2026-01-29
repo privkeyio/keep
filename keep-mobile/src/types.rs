@@ -58,7 +58,6 @@ pub struct FrostGenerationResult {
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum DkgStatus {
     NotStarted,
-    Waiting,
     Round1,
     Round2,
     Complete,

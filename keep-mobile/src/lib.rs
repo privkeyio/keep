@@ -166,14 +166,7 @@ impl KeepMobile {
             });
         }
 
-        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
-            return Err(KeepMobileError::InvalidShare {
-                msg: format!(
-                    "Share name exceeds maximum length of {} characters",
-                    MAX_SHARE_NAME_LENGTH
-                ),
-            });
-        }
+        Self::validate_share_name(&name)?;
 
         let share_count = self.storage.list_all_shares().len();
         if share_count >= MAX_STORED_SHARES {
@@ -320,43 +313,13 @@ impl KeepMobile {
         self.storage
             .list_all_shares()
             .into_iter()
-            .filter_map(|m| {
-                let key = hex::encode(&m.group_pubkey);
-                let data = self.storage.load_share_by_key(key.clone()).ok()?;
-                let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
-                let metadata: keep_core::frost::ShareMetadata =
-                    serde_json::from_str(&stored.metadata_json).ok()?;
-                Some(StoredShareInfo {
-                    group_pubkey: key,
-                    name: metadata.name,
-                    share_index: metadata.identifier,
-                    threshold: metadata.threshold,
-                    total_shares: metadata.total_shares,
-                    created_at: metadata.created_at,
-                    last_used: metadata.last_used,
-                    sign_count: metadata.sign_count,
-                })
-            })
+            .filter_map(|m| self.load_stored_share_info(hex::encode(&m.group_pubkey)))
             .collect()
     }
 
     pub fn get_active_share(&self) -> Option<StoredShareInfo> {
         let key = self.storage.get_active_share_key()?;
-        let data = self.storage.load_share_by_key(key.clone()).ok()?;
-        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
-        let metadata: keep_core::frost::ShareMetadata =
-            serde_json::from_str(&stored.metadata_json).ok()?;
-
-        Some(StoredShareInfo {
-            group_pubkey: key,
-            name: metadata.name,
-            share_index: metadata.identifier,
-            threshold: metadata.threshold,
-            total_shares: metadata.total_shares,
-            created_at: metadata.created_at,
-            last_used: metadata.last_used,
-            sign_count: metadata.sign_count,
-        })
+        self.load_stored_share_info(key)
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
@@ -400,46 +363,14 @@ impl KeepMobile {
         name: String,
         passphrase: String,
     ) -> Result<FrostGenerationResult, KeepMobileError> {
-        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
-            return Err(KeepMobileError::InvalidShare {
-                msg: format!(
-                    "Share name exceeds maximum length of {} characters",
-                    MAX_SHARE_NAME_LENGTH
-                ),
-            });
-        }
+        Self::validate_share_name(&name)?;
 
         let config = CoreThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
-
         let (shares, _) = dealer.generate(&name)?;
 
         let passphrase = Zeroizing::new(passphrase);
-        let mut share_infos = Vec::with_capacity(shares.len());
-
-        for share in &shares {
-            let export = ShareExport::from_share(share, &passphrase)?;
-            let export_data = export.to_bech32()?;
-
-            share_infos.push(GeneratedShareInfo {
-                share_index: share.metadata.identifier,
-                threshold: share.metadata.threshold,
-                total_shares: share.metadata.total_shares,
-                group_pubkey: hex::encode(share.metadata.group_pubkey),
-                export_data,
-            });
-        }
-
-        let group_pubkey = if let Some(first) = shares.first() {
-            hex::encode(first.metadata.group_pubkey)
-        } else {
-            String::new()
-        };
-
-        Ok(FrostGenerationResult {
-            group_pubkey,
-            shares: share_infos,
-        })
+        Self::build_generation_result(&shares, &passphrase)
     }
 
     pub fn frost_split(
@@ -450,14 +381,7 @@ impl KeepMobile {
         name: String,
         passphrase: String,
     ) -> Result<FrostGenerationResult, KeepMobileError> {
-        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
-            return Err(KeepMobileError::InvalidShare {
-                msg: format!(
-                    "Share name exceeds maximum length of {} characters",
-                    MAX_SHARE_NAME_LENGTH
-                ),
-            });
-        }
+        Self::validate_share_name(&name)?;
 
         let key_bytes = hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
             msg: "Invalid hex encoding for existing key".into(),
@@ -475,35 +399,10 @@ impl KeepMobile {
 
         let config = CoreThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
-
         let (shares, _) = dealer.split_existing(&secret, &name)?;
 
         let passphrase = Zeroizing::new(passphrase);
-        let mut share_infos = Vec::with_capacity(shares.len());
-
-        for share in &shares {
-            let export = ShareExport::from_share(share, &passphrase)?;
-            let export_data = export.to_bech32()?;
-
-            share_infos.push(GeneratedShareInfo {
-                share_index: share.metadata.identifier,
-                threshold: share.metadata.threshold,
-                total_shares: share.metadata.total_shares,
-                group_pubkey: hex::encode(share.metadata.group_pubkey),
-                export_data,
-            });
-        }
-
-        let group_pubkey = if let Some(first) = shares.first() {
-            hex::encode(first.metadata.group_pubkey)
-        } else {
-            String::new()
-        };
-
-        Ok(FrostGenerationResult {
-            group_pubkey,
-            shares: share_infos,
-        })
+        Self::build_generation_result(&shares, &passphrase)
     }
 
     pub fn frost_start_dkg(&self, config: DkgConfig) -> Result<Vec<u8>, KeepMobileError> {
@@ -586,6 +485,48 @@ impl KeepMobile {
 }
 
 impl KeepMobile {
+    fn validate_share_name(name: &str) -> Result<(), KeepMobileError> {
+        if name.chars().count() > MAX_SHARE_NAME_LENGTH {
+            return Err(KeepMobileError::InvalidShare {
+                msg: format!(
+                    "Share name exceeds maximum length of {} characters",
+                    MAX_SHARE_NAME_LENGTH
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn build_generation_result(
+        shares: &[SharePackage],
+        passphrase: &Zeroizing<String>,
+    ) -> Result<FrostGenerationResult, KeepMobileError> {
+        let mut share_infos = Vec::with_capacity(shares.len());
+
+        for share in shares {
+            let export = ShareExport::from_share(share, passphrase)?;
+            let export_data = export.to_bech32()?;
+
+            share_infos.push(GeneratedShareInfo {
+                share_index: share.metadata.identifier,
+                threshold: share.metadata.threshold,
+                total_shares: share.metadata.total_shares,
+                group_pubkey: hex::encode(share.metadata.group_pubkey),
+                export_data,
+            });
+        }
+
+        let group_pubkey = shares
+            .first()
+            .map(|s| hex::encode(s.metadata.group_pubkey))
+            .unwrap_or_default();
+
+        Ok(FrostGenerationResult {
+            group_pubkey,
+            shares: share_infos,
+        })
+    }
+
     async fn event_listener(
         mut event_rx: broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
@@ -661,6 +602,24 @@ impl KeepMobile {
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+    }
+
+    fn load_stored_share_info(&self, key: String) -> Option<StoredShareInfo> {
+        let data = self.storage.load_share_by_key(key.clone()).ok()?;
+        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+        let metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json).ok()?;
+
+        Some(StoredShareInfo {
+            group_pubkey: key,
+            name: metadata.name,
+            share_index: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            created_at: metadata.created_at,
+            last_used: metadata.last_used,
+            sign_count: metadata.sign_count,
+        })
     }
 
     fn migrate_legacy_share(&self) -> Result<String, KeepMobileError> {

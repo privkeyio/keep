@@ -15,6 +15,30 @@ use crate::validate_relay_url;
 const MAX_DKG_PARTICIPANTS: u16 = 255;
 const MAX_PACKAGE_SIZE: usize = 16 * 1024;
 
+fn validate_participant_index(
+    index: u16,
+    participants: u16,
+    label: &str,
+) -> Result<Identifier, KeepMobileError> {
+    if index < 1 || index > participants {
+        return Err(KeepMobileError::FrostError {
+            msg: format!("{} {} out of range (1-{})", label, index, participants),
+        });
+    }
+    Identifier::try_from(index).map_err(|e| KeepMobileError::FrostError {
+        msg: format!("Invalid {}: {}", label.to_lowercase(), e),
+    })
+}
+
+fn validate_package_size(bytes: &[u8], sender: u16) -> Result<(), KeepMobileError> {
+    if bytes.len() > MAX_PACKAGE_SIZE {
+        return Err(KeepMobileError::FrostError {
+            msg: format!("Package from {} exceeds maximum size", sender),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct DkgRound1Package {
     pub participant_index: u16,
@@ -177,29 +201,12 @@ impl DkgSession {
         round1_packages.insert(our_identifier, our_round1_package);
 
         for pkg in &packages {
-            if pkg.participant_index < 1 || pkg.participant_index > config.participants {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!(
-                        "Participant index {} out of range (1-{})",
-                        pkg.participant_index, config.participants
-                    ),
-                });
-            }
-
-            if pkg.package_bytes.len() > MAX_PACKAGE_SIZE {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!(
-                        "Round 1 package from {} exceeds maximum size",
-                        pkg.participant_index
-                    ),
-                });
-            }
-
-            let identifier = Identifier::try_from(pkg.participant_index).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Invalid participant index: {}", e),
-                }
-            })?;
+            validate_package_size(&pkg.package_bytes, pkg.participant_index)?;
+            let identifier = validate_participant_index(
+                pkg.participant_index,
+                config.participants,
+                "Participant index",
+            )?;
 
             if round1_packages.contains_key(&identifier) {
                 return Err(KeepMobileError::FrostError {
@@ -308,29 +315,9 @@ impl DkgSession {
 
         let mut round2_packages = BTreeMap::new();
         for pkg in &packages {
-            if pkg.sender_index < 1 || pkg.sender_index > config.participants {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!(
-                        "Sender index {} out of range (1-{})",
-                        pkg.sender_index, config.participants
-                    ),
-                });
-            }
-
-            if pkg.package_bytes.len() > MAX_PACKAGE_SIZE {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!(
-                        "Round 2 package from {} exceeds maximum size",
-                        pkg.sender_index
-                    ),
-                });
-            }
-
-            let sender_id = Identifier::try_from(pkg.sender_index).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Invalid sender index: {}", e),
-                }
-            })?;
+            validate_package_size(&pkg.package_bytes, pkg.sender_index)?;
+            let sender_id =
+                validate_participant_index(pkg.sender_index, config.participants, "Sender index")?;
 
             if round2_packages.contains_key(&sender_id) {
                 return Err(KeepMobileError::FrostError {
@@ -365,16 +352,15 @@ impl DkgSession {
             })?;
         let vk_bytes = serialized.as_slice();
 
-        let mut group_pubkey = [0u8; 32];
-        if vk_bytes.len() == 33 {
-            group_pubkey.copy_from_slice(&vk_bytes[1..33]);
-        } else if vk_bytes.len() == 32 {
-            group_pubkey.copy_from_slice(vk_bytes);
-        } else {
-            return Err(KeepMobileError::FrostError {
-                msg: format!("Invalid group pubkey length: {}", vk_bytes.len()),
-            });
-        }
+        let group_pubkey: [u8; 32] = match vk_bytes.len() {
+            33 => vk_bytes[1..33].try_into().unwrap(),
+            32 => vk_bytes.try_into().unwrap(),
+            len => {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!("Invalid group pubkey length: {}", len),
+                })
+            }
+        };
 
         let metadata = ShareMetadata::new(
             config.our_index,
