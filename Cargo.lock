@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "keep-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "chrono",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "keep-nip46"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitflags 2.10.0",
  "chrono",
