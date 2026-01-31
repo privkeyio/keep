@@ -132,10 +132,43 @@ impl PolicyRules {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct HourRange {
     pub start: u8,
     pub end: u8,
+}
+
+impl<'de> Deserialize<'de> for HourRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawHourRange {
+            start: u8,
+            end: u8,
+        }
+
+        let raw = RawHourRange::deserialize(deserializer)?;
+
+        if raw.start > 23 {
+            return Err(serde::de::Error::custom(format!(
+                "invalid start hour {}: must be 0-23",
+                raw.start
+            )));
+        }
+        if raw.end > 23 {
+            return Err(serde::de::Error::custom(format!(
+                "invalid end hour {}: must be 0-23",
+                raw.end
+            )));
+        }
+
+        Ok(HourRange {
+            start: raw.start,
+            end: raw.end,
+        })
+    }
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
