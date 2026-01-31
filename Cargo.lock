@@ -2214,6 +2214,7 @@ dependencies = [
  "flate2",
  "frost-secp256k1-tr",
  "hex",
+ "k256",
  "keep-bitcoin",
  "keep-core",
  "keep-frost-net",

@@ -8,9 +8,11 @@ mod dkg;
 mod error;
 mod nip46;
 mod nip55;
+mod policy;
 mod psbt;
 mod storage;
 mod types;
+mod velocity;
 
 pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
 pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
@@ -19,6 +21,7 @@ pub use nip46::{
     BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
+pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
@@ -30,11 +33,13 @@ use keep_core::frost::{
     ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
 };
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
+use policy::{PolicyBundle, PolicyEvaluator};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use velocity::VelocityTracker;
 use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
@@ -105,6 +110,8 @@ pub struct KeepMobile {
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     dkg_session: DkgSession,
     pub(crate) runtime: tokio::runtime::Runtime,
+    policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
+    velocity: Arc<std::sync::Mutex<VelocityTracker>>,
 }
 
 struct PendingRequest {
@@ -123,12 +130,19 @@ impl KeepMobile {
                 msg: format!("Runtime: {}", e),
             })?;
 
+        let velocity = Arc::new(std::sync::Mutex::new(VelocityTracker::new()));
+        let policy = Arc::new(std::sync::RwLock::new(PolicyEvaluator::new(
+            velocity.clone(),
+        )));
+
         Ok(Self {
             node: Arc::new(RwLock::new(None)),
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_session: DkgSession::new(),
             runtime,
+            policy,
+            velocity,
         })
     }
 
@@ -483,6 +497,79 @@ impl KeepMobile {
 
     pub fn frost_dkg_reset(&self) {
         self.runtime.block_on(self.dkg_session.reset())
+    }
+
+    pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
+        let bundle_bytes =
+            hex::decode(&bundle_hex).map_err(|e| KeepMobileError::InvalidPolicy {
+                msg: format!("Invalid hex: {}", e),
+            })?;
+
+        let bundle = PolicyBundle::from_bytes(&bundle_bytes)?;
+        bundle.verify_signature()?;
+        bundle.verify_hash()?;
+
+        let info = bundle.to_policy_info();
+
+        let mut policy = self
+            .policy
+            .write()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.set_policy(bundle);
+
+        Ok(info)
+    }
+
+    pub fn get_policy_info(&self) -> Option<PolicyInfo> {
+        let policy = self.policy.read().ok()?;
+        policy.policy().map(|b| b.to_policy_info())
+    }
+
+    pub fn delete_policy(&self) -> Result<(), KeepMobileError> {
+        let mut policy = self
+            .policy
+            .write()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.clear_policy();
+        Ok(())
+    }
+
+    pub fn evaluate_policy(
+        &self,
+        ctx: TransactionContext,
+    ) -> Result<PolicyDecision, KeepMobileError> {
+        let policy = self
+            .policy
+            .read()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.evaluate(&ctx)
+    }
+
+    pub fn record_policy_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
+        let policy = self
+            .policy
+            .read()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.record_transaction(amount_sats)
+    }
+
+    pub fn clear_velocity_tracker(&self) -> Result<(), KeepMobileError> {
+        let mut velocity = self
+            .velocity
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Velocity lock poisoned".into(),
+            })?;
+        velocity.clear();
+        Ok(())
     }
 }
 
