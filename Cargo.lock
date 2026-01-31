@@ -2209,10 +2209,12 @@ name = "keep-mobile"
 version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
+ "bitcoin",
  "chrono",
  "flate2",
  "frost-secp256k1-tr",
  "hex",
+ "keep-bitcoin",
  "keep-core",
  "keep-frost-net",
  "keep-nip46",

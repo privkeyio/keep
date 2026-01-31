@@ -58,6 +58,9 @@ pub enum KeepMobileError {
 
     #[error("Invalid timestamp")]
     InvalidTimestamp,
+
+    #[error("PSBT error")]
+    PsbtError { msg: String },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
