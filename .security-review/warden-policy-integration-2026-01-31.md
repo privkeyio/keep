@@ -187,7 +187,7 @@ The codebase demonstrates several security best practices:
 ## Recommendations Summary
 
 | Priority | Issue | Action |
-|----------|-------|--------|
+| --- | --- | --- |
 | Critical | Policy not persisted | Add persistence to SecureStorage |
 | Critical | No pubkey pinning | Add trusted warden key registry |
 | Critical | Case-sensitive addresses | Normalize to lowercase |

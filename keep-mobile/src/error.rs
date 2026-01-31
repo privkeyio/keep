@@ -62,7 +62,7 @@ pub enum KeepMobileError {
     #[error("PSBT error")]
     PsbtError { msg: String },
 
-    #[error("Policy violation")]
+    #[error("Policy violation: {reason}")]
     PolicyViolation { reason: String },
 
     #[error("Invalid policy bundle")]

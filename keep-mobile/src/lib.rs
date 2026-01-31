@@ -523,6 +523,17 @@ impl KeepMobile {
     }
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
+        const MAX_BUNDLE_HEX_LEN: usize = 8192;
+        if bundle_hex.len() > MAX_BUNDLE_HEX_LEN {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: format!(
+                    "Bundle hex too large: {} bytes (max {})",
+                    bundle_hex.len(),
+                    MAX_BUNDLE_HEX_LEN
+                ),
+            });
+        }
+
         let bundle_bytes =
             hex::decode(&bundle_hex).map_err(|e| KeepMobileError::InvalidPolicy {
                 msg: format!("Invalid hex: {}", e),

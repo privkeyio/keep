@@ -149,6 +149,7 @@ pub struct TransactionContext {
     pub amount_sats: u64,
     pub fee_sats: u64,
     pub destinations: Vec<String>,
+    pub has_unknown_destination: bool,
 }
 
 impl PolicyBundle {
@@ -452,7 +453,7 @@ impl PolicyEvaluator {
                 })?;
 
             if let Some(daily_limit) = rules.daily_limit {
-                if velocity.daily_total() + ctx.amount_sats > daily_limit {
+                if velocity.daily_total().saturating_add(ctx.amount_sats) > daily_limit {
                     return Ok(PolicyDecision::Deny {
                         reason: "Would exceed daily spending limit".into(),
                     });
@@ -460,7 +461,7 @@ impl PolicyEvaluator {
             }
 
             if let Some(weekly_limit) = rules.weekly_limit {
-                if velocity.weekly_total() + ctx.amount_sats > weekly_limit {
+                if velocity.weekly_total().saturating_add(ctx.amount_sats) > weekly_limit {
                     return Ok(PolicyDecision::Deny {
                         reason: "Would exceed weekly spending limit".into(),
                     });
@@ -496,6 +497,11 @@ impl PolicyEvaluator {
         }
 
         if let Some(whitelist) = &rules.whitelist {
+            if ctx.has_unknown_destination {
+                return Ok(PolicyDecision::Deny {
+                    reason: "Transaction has unknown destination".into(),
+                });
+            }
             for dest in &ctx.destinations {
                 if !whitelist.iter().any(|w| w.eq_ignore_ascii_case(dest)) {
                     return Ok(PolicyDecision::Deny {
@@ -532,17 +538,14 @@ impl PolicyEvaluator {
 
 impl TransactionContext {
     pub fn from_psbt_info(info: &crate::PsbtInfo) -> Self {
-        let amount_sats = info
-            .outputs
-            .iter()
-            .filter(|o| !o.is_change)
-            .map(|o| o.amount_sats)
-            .sum();
+        let non_change_outputs: Vec<_> = info.outputs.iter().filter(|o| !o.is_change).collect();
 
-        let destinations = info
-            .outputs
+        let amount_sats = non_change_outputs.iter().map(|o| o.amount_sats).sum();
+
+        let has_unknown_destination = non_change_outputs.iter().any(|o| o.address.is_none());
+
+        let destinations = non_change_outputs
             .iter()
-            .filter(|o| !o.is_change)
             .filter_map(|o| o.address.clone())
             .collect();
 
@@ -550,6 +553,7 @@ impl TransactionContext {
             amount_sats,
             fee_sats: info.fee_sats,
             destinations,
+            has_unknown_destination,
         }
     }
 }
@@ -675,6 +679,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec![],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
 
@@ -682,6 +687,7 @@ mod tests {
             amount_sats: 150_000,
             fee_sats: 500,
             destinations: vec![],
+            has_unknown_destination: false,
         };
         assert!(matches!(
             evaluator.evaluate(&ctx).unwrap(),
@@ -705,6 +711,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec![],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
 
@@ -712,6 +719,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 5_000,
             destinations: vec![],
+            has_unknown_destination: false,
         };
         assert!(matches!(
             evaluator.evaluate(&ctx).unwrap(),
@@ -735,6 +743,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["bc1allowed".to_string()],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
 
@@ -742,6 +751,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["bc1blocked".to_string()],
+            has_unknown_destination: false,
         };
         assert!(matches!(
             evaluator.evaluate(&ctx).unwrap(),
@@ -765,6 +775,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["bc1allowed".to_string()],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
 
@@ -772,6 +783,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["bc1blocked".to_string()],
+            has_unknown_destination: false,
         };
         assert!(matches!(
             evaluator.evaluate(&ctx).unwrap(),
@@ -788,6 +800,7 @@ mod tests {
             amount_sats: u64::MAX,
             fee_sats: u64::MAX,
             destinations: vec!["any".to_string()],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
     }
@@ -868,6 +881,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["bc1qallowed".to_string()],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
 
@@ -875,6 +889,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["BC1QALLOWED".to_string()],
+            has_unknown_destination: false,
         };
         assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
     }
@@ -895,6 +910,7 @@ mod tests {
             amount_sats: 50_000,
             fee_sats: 500,
             destinations: vec!["BC1QBLOCKED".to_string()],
+            has_unknown_destination: false,
         };
         assert!(matches!(
             evaluator.evaluate(&ctx).unwrap(),
