@@ -23,6 +23,7 @@ enum KeepMobileError {
     "PubkeyMismatch",
     "RateLimited",
     "InvalidTimestamp",
+    "PsbtError",
 };
 
 dictionary ShareMetadataInfo {
@@ -67,6 +68,55 @@ dictionary SignRequestMetadata {
     string? content_preview;
     u64? amount_sats;
     string? destination;
+};
+
+dictionary PsbtInfo {
+    u32 num_inputs;
+    u32 num_outputs;
+    u64 total_input_sats;
+    u64 total_output_sats;
+    u64 fee_sats;
+    sequence<PsbtOutputInfo> outputs;
+};
+
+dictionary PsbtOutputInfo {
+    u32 index;
+    string? address;
+    u64 amount_sats;
+    boolean is_change;
+};
+
+dictionary PsbtInputSighash {
+    u32 input_index;
+    sequence<u8> sighash;
+};
+
+interface PsbtParser {
+    [Throws=KeepMobileError, Name=from_base64]
+    constructor(string base64_psbt);
+
+    [Throws=KeepMobileError, Name=from_bytes]
+    constructor(sequence<u8> data);
+
+    [Throws=KeepMobileError]
+    PsbtParser set_network(string network);
+
+    [Throws=KeepMobileError]
+    PsbtInfo analyze();
+
+    [Throws=KeepMobileError]
+    sequence<PsbtInputSighash> get_taproot_sighashes();
+
+    [Throws=KeepMobileError]
+    sequence<u8> get_sighash_for_input(u32 input_index);
+
+    string to_base64();
+
+    sequence<u8> to_bytes();
+
+    u32 get_input_count();
+
+    u32 get_output_count();
 };
 
 dictionary PeerInfo {
