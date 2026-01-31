@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const MAX_TRACKED_TRANSACTIONS: usize = 10_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TrackedTransaction {
     timestamp: DateTime<Utc>,
     amount_sats: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct VelocityTracker {
     transactions: VecDeque<TrackedTransaction>,
 }
@@ -72,6 +74,16 @@ impl VelocityTracker {
     #[allow(dead_code)]
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut tracker: Self = serde_json::from_slice(data)?;
+        tracker.cleanup_old();
+        Ok(tracker)
     }
 }
 

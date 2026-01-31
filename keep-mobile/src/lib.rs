@@ -33,8 +33,9 @@ use keep_core::frost::{
     ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
 };
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
-use policy::{PolicyBundle, PolicyEvaluator};
+use policy::{PolicyBundle, PolicyEvaluator, POLICY_PUBKEY_LEN};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -49,6 +50,10 @@ const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
 const MAX_STORED_SHARES: usize = 100;
 const MAX_SHARE_NAME_LENGTH: usize = 64;
+
+const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
+const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
+const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
 
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
@@ -130,10 +135,28 @@ impl KeepMobile {
                 msg: format!("Runtime: {}", e),
             })?;
 
-        let velocity = Arc::new(std::sync::Mutex::new(VelocityTracker::new()));
-        let policy = Arc::new(std::sync::RwLock::new(PolicyEvaluator::new(
-            velocity.clone(),
-        )));
+        let velocity = Self::load_velocity(&storage)?;
+        let velocity = Arc::new(std::sync::Mutex::new(velocity));
+
+        let mut evaluator = PolicyEvaluator::new(velocity.clone());
+
+        if let Ok(wardens) = Self::load_trusted_wardens(&storage) {
+            evaluator.set_trusted_wardens(wardens);
+        }
+
+        if let Ok(bundle) = Self::load_policy(&storage) {
+            if bundle.verify_signature().is_ok()
+                && bundle.verify_hash().is_ok()
+                && bundle.verify_timestamp().is_ok()
+                && bundle
+                    .verify_trusted_warden(evaluator.trusted_wardens())
+                    .is_ok()
+            {
+                evaluator.set_policy(bundle);
+            }
+        }
+
+        let policy = Arc::new(std::sync::RwLock::new(evaluator));
 
         Ok(Self {
             node: Arc::new(RwLock::new(None)),
@@ -508,8 +531,7 @@ impl KeepMobile {
         let bundle = PolicyBundle::from_bytes(&bundle_bytes)?;
         bundle.verify_signature()?;
         bundle.verify_hash()?;
-
-        let info = bundle.to_policy_info();
+        bundle.verify_timestamp()?;
 
         let mut policy = self
             .policy
@@ -517,7 +539,14 @@ impl KeepMobile {
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Policy lock poisoned".into(),
             })?;
-        policy.set_policy(bundle);
+
+        bundle.verify_trusted_warden(policy.trusted_wardens())?;
+        bundle.verify_version_upgrade(policy.policy())?;
+
+        let info = bundle.to_policy_info();
+        policy.set_policy(bundle.clone());
+
+        Self::persist_policy(&self.storage, &bundle)?;
 
         Ok(info)
     }
@@ -535,6 +564,8 @@ impl KeepMobile {
                 msg: "Policy lock poisoned".into(),
             })?;
         policy.clear_policy();
+
+        let _ = self.storage.delete_share_by_key(POLICY_STORAGE_KEY.into());
         Ok(())
     }
 
@@ -558,7 +589,17 @@ impl KeepMobile {
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Policy lock poisoned".into(),
             })?;
-        policy.record_transaction(amount_sats)
+        policy.record_transaction(amount_sats)?;
+
+        let velocity = self
+            .velocity
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Velocity lock poisoned".into(),
+            })?;
+        Self::persist_velocity(&self.storage, &velocity)?;
+
+        Ok(())
     }
 
     pub fn clear_velocity_tracker(&self) -> Result<(), KeepMobileError> {
@@ -569,7 +610,72 @@ impl KeepMobile {
                 msg: "Velocity lock poisoned".into(),
             })?;
         velocity.clear();
+        Self::persist_velocity(&self.storage, &velocity)?;
         Ok(())
+    }
+
+    pub fn add_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
+        let pubkey_bytes =
+            hex::decode(&pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
+                msg: format!("Invalid hex: {}", e),
+            })?;
+
+        if pubkey_bytes.len() != POLICY_PUBKEY_LEN {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
+            });
+        }
+
+        let mut pubkey = [0u8; POLICY_PUBKEY_LEN];
+        pubkey.copy_from_slice(&pubkey_bytes);
+
+        let mut policy = self
+            .policy
+            .write()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.add_trusted_warden(pubkey);
+
+        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())?;
+        Ok(())
+    }
+
+    pub fn remove_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
+        let pubkey_bytes =
+            hex::decode(&pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
+                msg: format!("Invalid hex: {}", e),
+            })?;
+
+        if pubkey_bytes.len() != POLICY_PUBKEY_LEN {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
+            });
+        }
+
+        let mut pubkey = [0u8; POLICY_PUBKEY_LEN];
+        pubkey.copy_from_slice(&pubkey_bytes);
+
+        let mut policy = self
+            .policy
+            .write()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        policy.remove_trusted_warden(&pubkey);
+
+        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())?;
+        Ok(())
+    }
+
+    pub fn list_trusted_wardens(&self) -> Result<Vec<String>, KeepMobileError> {
+        let policy = self
+            .policy
+            .read()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })?;
+        Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
     }
 }
 
@@ -733,6 +839,101 @@ impl KeepMobile {
         self.storage.set_active_share_key(Some(key.clone()))?;
 
         Ok(key)
+    }
+
+    fn load_policy(storage: &Arc<dyn SecureStorage>) -> Result<PolicyBundle, KeepMobileError> {
+        let data = storage.load_share_by_key(POLICY_STORAGE_KEY.into())?;
+        serde_json::from_slice(&data).map_err(|e| KeepMobileError::InvalidPolicy {
+            msg: format!("Failed to deserialize policy: {}", e),
+        })
+    }
+
+    fn persist_policy(
+        storage: &Arc<dyn SecureStorage>,
+        bundle: &PolicyBundle,
+    ) -> Result<(), KeepMobileError> {
+        let data = serde_json::to_vec(bundle).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to serialize policy: {}", e),
+        })?;
+        let metadata = ShareMetadataInfo {
+            name: "policy".into(),
+            identifier: 0,
+            threshold: 0,
+            total_shares: 0,
+            group_pubkey: vec![],
+        };
+        storage.store_share_by_key(POLICY_STORAGE_KEY.into(), data, metadata)
+    }
+
+    fn load_velocity(storage: &Arc<dyn SecureStorage>) -> Result<VelocityTracker, KeepMobileError> {
+        match storage.load_share_by_key(VELOCITY_STORAGE_KEY.into()) {
+            Ok(data) => {
+                VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("Failed to deserialize velocity: {}", e),
+                })
+            }
+            Err(_) => Ok(VelocityTracker::new()),
+        }
+    }
+
+    fn persist_velocity(
+        storage: &Arc<dyn SecureStorage>,
+        tracker: &VelocityTracker,
+    ) -> Result<(), KeepMobileError> {
+        let data = tracker
+            .to_bytes()
+            .map_err(|e| KeepMobileError::StorageError {
+                msg: format!("Failed to serialize velocity: {}", e),
+            })?;
+        let metadata = ShareMetadataInfo {
+            name: "velocity".into(),
+            identifier: 0,
+            threshold: 0,
+            total_shares: 0,
+            group_pubkey: vec![],
+        };
+        storage.store_share_by_key(VELOCITY_STORAGE_KEY.into(), data, metadata)
+    }
+
+    fn load_trusted_wardens(
+        storage: &Arc<dyn SecureStorage>,
+    ) -> Result<HashSet<[u8; POLICY_PUBKEY_LEN]>, KeepMobileError> {
+        let data = storage.load_share_by_key(TRUSTED_WARDENS_KEY.into())?;
+        let hex_list: Vec<String> =
+            serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                msg: format!("Failed to deserialize trusted wardens: {}", e),
+            })?;
+
+        let mut wardens = HashSet::new();
+        for hex_str in hex_list {
+            let bytes = hex::decode(&hex_str).map_err(|e| KeepMobileError::StorageError {
+                msg: format!("Invalid warden pubkey hex: {}", e),
+            })?;
+            if bytes.len() == POLICY_PUBKEY_LEN {
+                let mut arr = [0u8; POLICY_PUBKEY_LEN];
+                arr.copy_from_slice(&bytes);
+                wardens.insert(arr);
+            }
+        }
+        Ok(wardens)
+    }
+
+    fn persist_trusted_wardens(
+        storage: &Arc<dyn SecureStorage>,
+        wardens: &HashSet<[u8; POLICY_PUBKEY_LEN]>,
+    ) -> Result<(), KeepMobileError> {
+        let hex_list: Vec<String> = wardens.iter().map(hex::encode).collect();
+        let data = serde_json::to_vec(&hex_list).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to serialize trusted wardens: {}", e),
+        })?;
+        let metadata = ShareMetadataInfo {
+            name: "trusted_wardens".into(),
+            identifier: 0,
+            threshold: 0,
+            total_shares: 0,
+            group_pubkey: vec![],
+        };
+        storage.store_share_by_key(TRUSTED_WARDENS_KEY.into(), data, metadata)
     }
 }
 

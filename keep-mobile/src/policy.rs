@@ -7,6 +7,7 @@ use chrono::{Datelike, Timelike, Utc};
 use k256::schnorr::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 
@@ -19,14 +20,64 @@ pub const POLICY_HASH_LEN: usize = 32;
 const POLICY_HEADER_LEN: usize = 1 + POLICY_PUBKEY_LEN + POLICY_HASH_LEN + 4;
 const POLICY_MIN_LEN: usize = POLICY_HEADER_LEN + 8 + POLICY_SIGNATURE_LEN;
 
-#[derive(Clone, Debug)]
+const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyBundle {
     pub version: u8,
+    #[serde(with = "hex_array_32")]
     pub warden_pubkey: [u8; POLICY_PUBKEY_LEN],
+    #[serde(with = "hex_array_32")]
     pub policy_hash: [u8; POLICY_HASH_LEN],
     pub rules_json: String,
     pub created_at: u64,
+    #[serde(with = "hex_array_64")]
     pub signature: [u8; POLICY_SIGNATURE_LEN],
+}
+
+mod hex_array_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(data: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid length"))
+    }
+}
+
+mod hex_array_64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(data: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid length"))
+    }
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -230,6 +281,57 @@ impl PolicyBundle {
         Ok(())
     }
 
+    pub fn verify_trusted_warden(
+        &self,
+        trusted_wardens: &HashSet<[u8; POLICY_PUBKEY_LEN]>,
+    ) -> Result<(), KeepMobileError> {
+        if trusted_wardens.is_empty() {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "No trusted wardens configured".into(),
+            });
+        }
+
+        if !trusted_wardens.contains(&self.warden_pubkey) {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "Policy signed by untrusted warden".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_timestamp(&self) -> Result<(), KeepMobileError> {
+        let now = Utc::now().timestamp() as u64;
+
+        if self.created_at > now + MAX_POLICY_FUTURE_SECS {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "Policy timestamp is in the future".into(),
+            });
+        }
+
+        if now > self.created_at + MAX_POLICY_AGE_SECS {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "Policy has expired".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_version_upgrade(
+        &self,
+        current: Option<&PolicyBundle>,
+    ) -> Result<(), KeepMobileError> {
+        if let Some(current) = current {
+            if self.created_at < current.created_at {
+                return Err(KeepMobileError::InvalidPolicy {
+                    msg: "Cannot downgrade to older policy".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn parse_rules(&self) -> Result<PolicyRules, KeepMobileError> {
         serde_json::from_str(&self.rules_json).map_err(|e| KeepMobileError::InvalidPolicy {
             msg: format!("Invalid rules JSON: {}", e),
@@ -287,6 +389,7 @@ impl PolicyBundle {
 pub struct PolicyEvaluator {
     policy: Option<PolicyBundle>,
     velocity: Arc<Mutex<VelocityTracker>>,
+    trusted_wardens: HashSet<[u8; POLICY_PUBKEY_LEN]>,
 }
 
 impl PolicyEvaluator {
@@ -294,7 +397,28 @@ impl PolicyEvaluator {
         Self {
             policy: None,
             velocity,
+            trusted_wardens: HashSet::new(),
         }
+    }
+
+    pub fn add_trusted_warden(&mut self, pubkey: [u8; POLICY_PUBKEY_LEN]) {
+        self.trusted_wardens.insert(pubkey);
+    }
+
+    pub fn remove_trusted_warden(&mut self, pubkey: &[u8; POLICY_PUBKEY_LEN]) {
+        self.trusted_wardens.remove(pubkey);
+    }
+
+    pub fn clear_trusted_wardens(&mut self) {
+        self.trusted_wardens.clear();
+    }
+
+    pub fn trusted_wardens(&self) -> &HashSet<[u8; POLICY_PUBKEY_LEN]> {
+        &self.trusted_wardens
+    }
+
+    pub fn set_trusted_wardens(&mut self, wardens: HashSet<[u8; POLICY_PUBKEY_LEN]>) {
+        self.trusted_wardens = wardens;
     }
 
     pub fn set_policy(&mut self, bundle: PolicyBundle) {
@@ -319,10 +443,7 @@ impl PolicyEvaluator {
         if let Some(max_amount) = rules.max_amount {
             if ctx.amount_sats > max_amount {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!(
-                        "Amount {} sats exceeds maximum {} sats",
-                        ctx.amount_sats, max_amount
-                    ),
+                    reason: "Amount exceeds policy limit".into(),
                 });
             }
         }
@@ -330,7 +451,7 @@ impl PolicyEvaluator {
         if let Some(max_fee) = rules.max_fee {
             if ctx.fee_sats > max_fee {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!("Fee {} sats exceeds maximum {} sats", ctx.fee_sats, max_fee),
+                    reason: "Fee exceeds policy limit".into(),
                 });
             }
         }
@@ -345,10 +466,7 @@ impl PolicyEvaluator {
             let daily_total = velocity.daily_total();
             if daily_total + ctx.amount_sats > daily_limit {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!(
-                        "Would exceed daily limit: {} + {} > {} sats",
-                        daily_total, ctx.amount_sats, daily_limit
-                    ),
+                    reason: "Would exceed daily spending limit".into(),
                 });
             }
         }
@@ -363,10 +481,7 @@ impl PolicyEvaluator {
             let weekly_total = velocity.weekly_total();
             if weekly_total + ctx.amount_sats > weekly_limit {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!(
-                        "Would exceed weekly limit: {} + {} > {} sats",
-                        weekly_total, ctx.amount_sats, weekly_limit
-                    ),
+                    reason: "Would exceed weekly spending limit".into(),
                 });
             }
         }
@@ -381,10 +496,7 @@ impl PolicyEvaluator {
             };
             if !allowed {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!(
-                        "Current hour {} outside allowed range {:02}:00-{:02}:00",
-                        hour, hour_range.start, hour_range.end
-                    ),
+                    reason: "Transaction outside allowed hours".into(),
                 });
             }
         }
@@ -403,26 +515,30 @@ impl PolicyEvaluator {
             let allowed = allowed_days.iter().any(|d| d.to_lowercase() == day_name);
             if !allowed {
                 return Ok(PolicyDecision::Deny {
-                    reason: format!("Transactions not allowed on {}", day_name.to_uppercase()),
+                    reason: "Transaction not allowed on this day".into(),
                 });
             }
         }
 
         if let Some(whitelist) = &rules.whitelist {
+            let whitelist_lower: Vec<String> = whitelist.iter().map(|s| s.to_lowercase()).collect();
             for dest in &ctx.destinations {
-                if !whitelist.contains(dest) {
+                let dest_lower = dest.to_lowercase();
+                if !whitelist_lower.contains(&dest_lower) {
                     return Ok(PolicyDecision::Deny {
-                        reason: format!("Destination {} not in whitelist", dest),
+                        reason: "Destination not in whitelist".into(),
                     });
                 }
             }
         }
 
         if let Some(blacklist) = &rules.blacklist {
+            let blacklist_lower: Vec<String> = blacklist.iter().map(|s| s.to_lowercase()).collect();
             for dest in &ctx.destinations {
-                if blacklist.contains(dest) {
+                let dest_lower = dest.to_lowercase();
+                if blacklist_lower.contains(&dest_lower) {
                     return Ok(PolicyDecision::Deny {
-                        reason: format!("Destination {} is blacklisted", dest),
+                        reason: "Destination is blacklisted".into(),
                     });
                 }
             }
@@ -709,5 +825,115 @@ mod tests {
         assert!(info.rules_summary.contains("max_amount"));
         assert!(info.rules_summary.contains("max_fee"));
         assert!(info.rules_summary.contains("daily_limit"));
+    }
+
+    #[test]
+    fn test_trusted_warden_verification() {
+        let rules = PolicyRules::default();
+        let bundle = create_test_bundle(&rules);
+
+        let mut trusted = HashSet::new();
+        assert!(bundle.verify_trusted_warden(&trusted).is_err());
+
+        trusted.insert(bundle.warden_pubkey);
+        assert!(bundle.verify_trusted_warden(&trusted).is_ok());
+
+        let mut untrusted = HashSet::new();
+        untrusted.insert([0u8; 32]);
+        assert!(bundle.verify_trusted_warden(&untrusted).is_err());
+    }
+
+    #[test]
+    fn test_timestamp_validation() {
+        let rules = PolicyRules::default();
+        let mut bundle = create_test_bundle(&rules);
+
+        assert!(bundle.verify_timestamp().is_ok());
+
+        bundle.created_at = Utc::now().timestamp() as u64 + MAX_POLICY_FUTURE_SECS + 3600;
+        assert!(bundle.verify_timestamp().is_err());
+
+        bundle.created_at = Utc::now().timestamp() as u64 - MAX_POLICY_AGE_SECS - 3600;
+        assert!(bundle.verify_timestamp().is_err());
+    }
+
+    #[test]
+    fn test_version_rollback_protection() {
+        let rules = PolicyRules::default();
+        let bundle1 = create_test_bundle(&rules);
+        let mut bundle2 = create_test_bundle(&rules);
+
+        assert!(bundle2.verify_version_upgrade(Some(&bundle1)).is_ok());
+
+        bundle2.created_at = bundle1.created_at - 1;
+        assert!(bundle2.verify_version_upgrade(Some(&bundle1)).is_err());
+    }
+
+    #[test]
+    fn test_case_insensitive_whitelist() {
+        let rules = PolicyRules {
+            whitelist: Some(vec!["BC1QALLOWED".to_string()]),
+            ..Default::default()
+        };
+        let bundle = create_test_bundle(&rules);
+
+        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let mut evaluator = PolicyEvaluator::new(velocity);
+        evaluator.set_policy(bundle);
+
+        let ctx = TransactionContext {
+            amount_sats: 50_000,
+            fee_sats: 500,
+            destinations: vec!["bc1qallowed".to_string()],
+        };
+        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+
+        let ctx = TransactionContext {
+            amount_sats: 50_000,
+            fee_sats: 500,
+            destinations: vec!["BC1QALLOWED".to_string()],
+        };
+        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn test_case_insensitive_blacklist() {
+        let rules = PolicyRules {
+            blacklist: Some(vec!["bc1qblocked".to_string()]),
+            ..Default::default()
+        };
+        let bundle = create_test_bundle(&rules);
+
+        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let mut evaluator = PolicyEvaluator::new(velocity);
+        evaluator.set_policy(bundle);
+
+        let ctx = TransactionContext {
+            amount_sats: 50_000,
+            fee_sats: 500,
+            destinations: vec!["BC1QBLOCKED".to_string()],
+        };
+        assert!(matches!(
+            evaluator.evaluate(&ctx).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_policy_serialization() {
+        let rules = PolicyRules {
+            max_amount: Some(100_000),
+            ..Default::default()
+        };
+        let bundle = create_test_bundle(&rules);
+
+        let json = serde_json::to_string(&bundle).unwrap();
+        let parsed: PolicyBundle = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.version, bundle.version);
+        assert_eq!(parsed.warden_pubkey, bundle.warden_pubkey);
+        assert_eq!(parsed.policy_hash, bundle.policy_hash);
+        assert_eq!(parsed.created_at, bundle.created_at);
+        assert_eq!(parsed.signature, bundle.signature);
     }
 }
