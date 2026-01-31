@@ -533,38 +533,27 @@ impl KeepMobile {
         bundle.verify_hash()?;
         bundle.verify_timestamp()?;
 
-        let mut policy = self
-            .policy
-            .write()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
-
+        let mut policy = self.policy_write_lock()?;
         bundle.verify_trusted_warden(policy.trusted_wardens())?;
         bundle.verify_version_upgrade(policy.policy())?;
 
         let info = bundle.to_policy_info();
         policy.set_policy(bundle.clone());
-
         Self::persist_policy(&self.storage, &bundle)?;
 
         Ok(info)
     }
 
     pub fn get_policy_info(&self) -> Option<PolicyInfo> {
-        let policy = self.policy.read().ok()?;
-        policy.policy().map(|b| b.to_policy_info())
+        self.policy
+            .read()
+            .ok()?
+            .policy()
+            .map(|b| b.to_policy_info())
     }
 
     pub fn delete_policy(&self) -> Result<(), KeepMobileError> {
-        let mut policy = self
-            .policy
-            .write()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
-        policy.clear_policy();
-
+        self.policy_write_lock()?.clear_policy();
         let _ = self.storage.delete_share_by_key(POLICY_STORAGE_KEY.into());
         Ok(())
     }
@@ -573,109 +562,67 @@ impl KeepMobile {
         &self,
         ctx: TransactionContext,
     ) -> Result<PolicyDecision, KeepMobileError> {
-        let policy = self
-            .policy
-            .read()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
-        policy.evaluate(&ctx)
+        self.policy_read_lock()?.evaluate(&ctx)
     }
 
     pub fn record_policy_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
-        let policy = self
-            .policy
-            .read()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
-        policy.record_transaction(amount_sats)?;
-
-        let velocity = self
-            .velocity
-            .lock()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Velocity lock poisoned".into(),
-            })?;
-        Self::persist_velocity(&self.storage, &velocity)?;
-
-        Ok(())
+        self.policy_read_lock()?.record_transaction(amount_sats)?;
+        Self::persist_velocity(&self.storage, &*self.velocity_lock()?)
     }
 
     pub fn clear_velocity_tracker(&self) -> Result<(), KeepMobileError> {
-        let mut velocity = self
-            .velocity
-            .lock()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Velocity lock poisoned".into(),
-            })?;
+        let mut velocity = self.velocity_lock()?;
         velocity.clear();
-        Self::persist_velocity(&self.storage, &velocity)?;
-        Ok(())
+        Self::persist_velocity(&self.storage, &velocity)
     }
 
     pub fn add_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
-        let pubkey_bytes =
-            hex::decode(&pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
-                msg: format!("Invalid hex: {}", e),
-            })?;
-
-        if pubkey_bytes.len() != POLICY_PUBKEY_LEN {
-            return Err(KeepMobileError::InvalidPolicy {
-                msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
-            });
-        }
-
-        let mut pubkey = [0u8; POLICY_PUBKEY_LEN];
-        pubkey.copy_from_slice(&pubkey_bytes);
-
-        let mut policy = self
-            .policy
-            .write()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
+        let pubkey = parse_warden_pubkey(&pubkey_hex)?;
+        let mut policy = self.policy_write_lock()?;
         policy.add_trusted_warden(pubkey);
-
-        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())?;
-        Ok(())
+        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())
     }
 
     pub fn remove_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
-        let pubkey_bytes =
-            hex::decode(&pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
-                msg: format!("Invalid hex: {}", e),
-            })?;
-
-        if pubkey_bytes.len() != POLICY_PUBKEY_LEN {
-            return Err(KeepMobileError::InvalidPolicy {
-                msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
-            });
-        }
-
-        let mut pubkey = [0u8; POLICY_PUBKEY_LEN];
-        pubkey.copy_from_slice(&pubkey_bytes);
-
-        let mut policy = self
-            .policy
-            .write()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Policy lock poisoned".into(),
-            })?;
+        let pubkey = parse_warden_pubkey(&pubkey_hex)?;
+        let mut policy = self.policy_write_lock()?;
         policy.remove_trusted_warden(&pubkey);
-
-        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())?;
-        Ok(())
+        Self::persist_trusted_wardens(&self.storage, policy.trusted_wardens())
     }
 
     pub fn list_trusted_wardens(&self) -> Result<Vec<String>, KeepMobileError> {
-        let policy = self
-            .policy
+        let policy = self.policy_read_lock()?;
+        Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
+    }
+}
+
+impl KeepMobile {
+    fn policy_read_lock(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, PolicyEvaluator>, KeepMobileError> {
+        self.policy
             .read()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Policy lock poisoned".into(),
-            })?;
-        Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
+            })
+    }
+
+    fn policy_write_lock(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, PolicyEvaluator>, KeepMobileError> {
+        self.policy
+            .write()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Policy lock poisoned".into(),
+            })
+    }
+
+    fn velocity_lock(&self) -> Result<std::sync::MutexGuard<'_, VelocityTracker>, KeepMobileError> {
+        self.velocity
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Velocity lock poisoned".into(),
+            })
     }
 }
 
@@ -1037,4 +984,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     bool::from(a.ct_eq(b))
+}
+
+fn parse_warden_pubkey(pubkey_hex: &str) -> Result<[u8; POLICY_PUBKEY_LEN], KeepMobileError> {
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
+        msg: format!("Invalid hex: {}", e),
+    })?;
+
+    pubkey_bytes
+        .try_into()
+        .map_err(|_| KeepMobileError::InvalidPolicy {
+            msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
+        })
 }

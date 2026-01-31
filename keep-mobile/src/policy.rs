@@ -36,49 +36,34 @@ pub struct PolicyBundle {
     pub signature: [u8; POLICY_SIGNATURE_LEN],
 }
 
-mod hex_array_32 {
-    use serde::{Deserialize, Deserializer, Serializer};
+macro_rules! hex_array_serde {
+    ($mod_name:ident, $size:expr) => {
+        mod $mod_name {
+            use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(data: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(data))
-    }
+            pub fn serialize<S>(data: &[u8; $size], serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&hex::encode(data))
+            }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid length"))
-    }
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; $size], D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("invalid length"))
+            }
+        }
+    };
 }
 
-mod hex_array_64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(data: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(data))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid length"))
-    }
-}
+hex_array_serde!(hex_array_32, 32);
+hex_array_serde!(hex_array_64, 64);
 
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct PolicyInfo {
@@ -108,6 +93,43 @@ pub struct PolicyRules {
     pub whitelist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blacklist: Option<Vec<String>>,
+}
+
+impl PolicyRules {
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(max) = self.max_amount {
+            parts.push(format!("max_amount: {} sats", max));
+        }
+        if let Some(max) = self.max_fee {
+            parts.push(format!("max_fee: {} sats", max));
+        }
+        if let Some(daily) = self.daily_limit {
+            parts.push(format!("daily_limit: {} sats", daily));
+        }
+        if let Some(weekly) = self.weekly_limit {
+            parts.push(format!("weekly_limit: {} sats", weekly));
+        }
+        if self.allowed_hours.is_some() {
+            parts.push("time_restricted".to_string());
+        }
+        if self.allowed_days.is_some() {
+            parts.push("day_restricted".to_string());
+        }
+        if self.whitelist.is_some() {
+            parts.push("whitelist".to_string());
+        }
+        if self.blacklist.is_some() {
+            parts.push("blacklist".to_string());
+        }
+
+        if parts.is_empty() {
+            "no restrictions".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -340,38 +362,7 @@ impl PolicyBundle {
 
     pub fn to_policy_info(&self) -> PolicyInfo {
         let rules_summary = match self.parse_rules() {
-            Ok(rules) => {
-                let mut parts = Vec::new();
-                if let Some(max) = rules.max_amount {
-                    parts.push(format!("max_amount: {} sats", max));
-                }
-                if let Some(max) = rules.max_fee {
-                    parts.push(format!("max_fee: {} sats", max));
-                }
-                if let Some(daily) = rules.daily_limit {
-                    parts.push(format!("daily_limit: {} sats", daily));
-                }
-                if let Some(weekly) = rules.weekly_limit {
-                    parts.push(format!("weekly_limit: {} sats", weekly));
-                }
-                if rules.allowed_hours.is_some() {
-                    parts.push("time_restricted".to_string());
-                }
-                if rules.allowed_days.is_some() {
-                    parts.push("day_restricted".to_string());
-                }
-                if rules.whitelist.is_some() {
-                    parts.push("whitelist".to_string());
-                }
-                if rules.blacklist.is_some() {
-                    parts.push("blacklist".to_string());
-                }
-                if parts.is_empty() {
-                    "no restrictions".to_string()
-                } else {
-                    parts.join(", ")
-                }
-            }
+            Ok(rules) => rules.summary(),
             Err(_) => "invalid rules".to_string(),
         };
 
@@ -456,33 +447,28 @@ impl PolicyEvaluator {
             }
         }
 
-        if let Some(daily_limit) = rules.daily_limit {
+        if rules.daily_limit.is_some() || rules.weekly_limit.is_some() {
             let velocity = self
                 .velocity
                 .lock()
                 .map_err(|_| KeepMobileError::StorageError {
                     msg: "Velocity lock poisoned".into(),
                 })?;
-            let daily_total = velocity.daily_total();
-            if daily_total + ctx.amount_sats > daily_limit {
-                return Ok(PolicyDecision::Deny {
-                    reason: "Would exceed daily spending limit".into(),
-                });
-            }
-        }
 
-        if let Some(weekly_limit) = rules.weekly_limit {
-            let velocity = self
-                .velocity
-                .lock()
-                .map_err(|_| KeepMobileError::StorageError {
-                    msg: "Velocity lock poisoned".into(),
-                })?;
-            let weekly_total = velocity.weekly_total();
-            if weekly_total + ctx.amount_sats > weekly_limit {
-                return Ok(PolicyDecision::Deny {
-                    reason: "Would exceed weekly spending limit".into(),
-                });
+            if let Some(daily_limit) = rules.daily_limit {
+                if velocity.daily_total() + ctx.amount_sats > daily_limit {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Would exceed daily spending limit".into(),
+                    });
+                }
+            }
+
+            if let Some(weekly_limit) = rules.weekly_limit {
+                if velocity.weekly_total() + ctx.amount_sats > weekly_limit {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Would exceed weekly spending limit".into(),
+                    });
+                }
             }
         }
 
@@ -502,18 +488,11 @@ impl PolicyEvaluator {
         }
 
         if let Some(allowed_days) = &rules.allowed_days {
-            let now = Utc::now();
-            let day_name = match now.weekday() {
-                chrono::Weekday::Mon => "mon",
-                chrono::Weekday::Tue => "tue",
-                chrono::Weekday::Wed => "wed",
-                chrono::Weekday::Thu => "thu",
-                chrono::Weekday::Fri => "fri",
-                chrono::Weekday::Sat => "sat",
-                chrono::Weekday::Sun => "sun",
-            };
-            let allowed = allowed_days.iter().any(|d| d.to_lowercase() == day_name);
-            if !allowed {
+            let day_name = weekday_abbrev(Utc::now().weekday());
+            if !allowed_days
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(day_name))
+            {
                 return Ok(PolicyDecision::Deny {
                     reason: "Transaction not allowed on this day".into(),
                 });
@@ -521,10 +500,8 @@ impl PolicyEvaluator {
         }
 
         if let Some(whitelist) = &rules.whitelist {
-            let whitelist_lower: Vec<String> = whitelist.iter().map(|s| s.to_lowercase()).collect();
             for dest in &ctx.destinations {
-                let dest_lower = dest.to_lowercase();
-                if !whitelist_lower.contains(&dest_lower) {
+                if !whitelist.iter().any(|w| w.eq_ignore_ascii_case(dest)) {
                     return Ok(PolicyDecision::Deny {
                         reason: "Destination not in whitelist".into(),
                     });
@@ -533,10 +510,8 @@ impl PolicyEvaluator {
         }
 
         if let Some(blacklist) = &rules.blacklist {
-            let blacklist_lower: Vec<String> = blacklist.iter().map(|s| s.to_lowercase()).collect();
             for dest in &ctx.destinations {
-                let dest_lower = dest.to_lowercase();
-                if blacklist_lower.contains(&dest_lower) {
+                if blacklist.iter().any(|b| b.eq_ignore_ascii_case(dest)) {
                     return Ok(PolicyDecision::Deny {
                         reason: "Destination is blacklisted".into(),
                     });
@@ -580,6 +555,18 @@ impl TransactionContext {
             fee_sats: info.fee_sats,
             destinations,
         }
+    }
+}
+
+fn weekday_abbrev(weekday: chrono::Weekday) -> &'static str {
+    match weekday {
+        chrono::Weekday::Mon => "mon",
+        chrono::Weekday::Tue => "tue",
+        chrono::Weekday::Wed => "wed",
+        chrono::Weekday::Thu => "thu",
+        chrono::Weekday::Fri => "fri",
+        chrono::Weekday::Sat => "sat",
+        chrono::Weekday::Sun => "sun",
     }
 }
 
