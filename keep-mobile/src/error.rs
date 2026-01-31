@@ -61,6 +61,15 @@ pub enum KeepMobileError {
 
     #[error("PSBT error")]
     PsbtError { msg: String },
+
+    #[error("Policy violation: {reason}")]
+    PolicyViolation { reason: String },
+
+    #[error("Invalid policy bundle")]
+    InvalidPolicy { msg: String },
+
+    #[error("Policy signature verification failed")]
+    PolicySignatureInvalid,
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
