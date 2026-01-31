@@ -400,10 +400,6 @@ impl PolicyEvaluator {
         self.trusted_wardens.remove(pubkey);
     }
 
-    pub fn clear_trusted_wardens(&mut self) {
-        self.trusted_wardens.clear();
-    }
-
     pub fn trusted_wardens(&self) -> &HashSet<[u8; POLICY_PUBKEY_LEN]> {
         &self.trusted_wardens
     }
