@@ -196,6 +196,12 @@ impl PsbtParser {
             });
         }
 
+        if !self.is_taproot_input(index) {
+            return Err(KeepMobileError::PsbtError {
+                msg: format!("Input {} is not a taproot input", index),
+            });
+        }
+
         let input = &self.psbt.inputs[index];
 
         if !input.tap_scripts.is_empty() {
@@ -742,6 +748,53 @@ mod tests {
 
         let result = parser.get_taproot_sighashes();
         assert!(result.is_err());
+
+        let result = parser.get_sighash_for_input(0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_taproot_input_rejected() {
+        use bitcoin::PublicKey;
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let pubkey = PublicKey::new(keypair.public_key());
+        let p2wpkh_script = ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().unwrap());
+
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: p2wpkh_script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100000),
+            script_pubkey: p2wpkh_script,
+        });
+
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+
+        let sighashes = parser.get_taproot_sighashes().unwrap();
+        assert!(sighashes.is_empty());
 
         let result = parser.get_sighash_for_input(0);
         assert!(result.is_err());
