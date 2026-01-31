@@ -138,18 +138,7 @@ impl PsbtParser {
     }
 
     pub fn get_taproot_sighashes(&self) -> Result<Vec<PsbtInputSighash>, KeepMobileError> {
-        let prevouts: Vec<TxOut> = self
-            .psbt
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, input)| {
-                input.witness_utxo.clone().ok_or(KeepMobileError::PsbtError {
-                    msg: format!("Missing witness UTXO for input {}", i),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let prevouts = self.collect_prevouts()?;
         let prevouts_ref = Prevouts::All(&prevouts);
         let mut sighash_cache = SighashCache::new(&self.psbt.unsigned_tx);
         let mut sighashes = Vec::new();
@@ -187,18 +176,7 @@ impl PsbtParser {
             });
         }
 
-        let prevouts: Vec<TxOut> = self
-            .psbt
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, input)| {
-                input.witness_utxo.clone().ok_or(KeepMobileError::PsbtError {
-                    msg: format!("Missing witness UTXO for input {}", i),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let prevouts = self.collect_prevouts()?;
         let prevouts_ref = Prevouts::All(&prevouts);
         let mut sighash_cache = SighashCache::new(&self.psbt.unsigned_tx);
 
@@ -229,25 +207,37 @@ impl PsbtParser {
 }
 
 impl PsbtParser {
+    fn collect_prevouts(&self) -> Result<Vec<TxOut>, KeepMobileError> {
+        self.psbt
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| {
+                input
+                    .witness_utxo
+                    .clone()
+                    .ok_or(KeepMobileError::PsbtError {
+                        msg: format!("Missing witness UTXO for input {}", i),
+                    })
+            })
+            .collect()
+    }
+
     fn is_change_output(&self, _index: usize) -> bool {
         false
     }
 
     fn is_taproot_input(&self, index: usize) -> bool {
-        if let Some(input) = self.psbt.inputs.get(index) {
-            if input.tap_internal_key.is_some() {
-                return true;
-            }
-            if !input.tap_key_origins.is_empty() {
-                return true;
-            }
-            if let Some(utxo) = &input.witness_utxo {
-                if utxo.script_pubkey.is_p2tr() {
-                    return true;
-                }
-            }
-        }
-        false
+        let Some(input) = self.psbt.inputs.get(index) else {
+            return false;
+        };
+
+        input.tap_internal_key.is_some()
+            || !input.tap_key_origins.is_empty()
+            || input
+                .witness_utxo
+                .as_ref()
+                .is_some_and(|utxo| utxo.script_pubkey.is_p2tr())
     }
 }
 
