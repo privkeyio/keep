@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::error::KeepMobileError;
+use base64::Engine;
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -43,12 +44,19 @@ pub struct PsbtParser {
 impl PsbtParser {
     #[uniffi::constructor]
     pub fn from_base64(base64_psbt: String) -> Result<Self, KeepMobileError> {
-        if base64_psbt.len() > MAX_PSBT_SIZE {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&base64_psbt)
+            .map_err(|e| KeepMobileError::PsbtError {
+                msg: format!("Invalid base64: {e}"),
+            })?;
+
+        if data.len() > MAX_PSBT_SIZE {
             return Err(KeepMobileError::PsbtError {
                 msg: "PSBT data exceeds maximum size".into(),
             });
         }
-        let psbt = keep_bitcoin::psbt::parse_psbt_base64(&base64_psbt)?;
+
+        let psbt = keep_bitcoin::psbt::parse_psbt(&data)?;
         Ok(Self {
             psbt,
             network: Network::Bitcoin,
