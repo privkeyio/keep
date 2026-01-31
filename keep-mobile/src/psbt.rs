@@ -91,14 +91,13 @@ impl PsbtParser {
     pub fn analyze(&self) -> Result<PsbtInfo, KeepMobileError> {
         let mut total_input_sats = 0u64;
 
-        for input in &self.psbt.inputs {
-            if let Some(utxo) = &input.witness_utxo {
-                total_input_sats = total_input_sats
-                    .checked_add(utxo.value.to_sat())
-                    .ok_or_else(|| KeepMobileError::PsbtError {
-                        msg: "Input value overflow".into(),
-                    })?;
-            }
+        for i in 0..self.psbt.inputs.len() {
+            let prevout = self.resolve_prevout(i)?;
+            total_input_sats = total_input_sats
+                .checked_add(prevout.value.to_sat())
+                .ok_or_else(|| KeepMobileError::PsbtError {
+                    msg: "Input value overflow".into(),
+                })?;
         }
 
         let mut outputs = Vec::new();
@@ -125,7 +124,12 @@ impl PsbtParser {
             });
         }
 
-        let fee_sats = total_input_sats.saturating_sub(total_output_sats);
+        let fee_sats =
+            total_input_sats
+                .checked_sub(total_output_sats)
+                .ok_or_else(|| KeepMobileError::PsbtError {
+                    msg: "Outputs exceed inputs (negative fee)".into(),
+                })?;
 
         Ok(PsbtInfo {
             num_inputs: self.psbt.inputs.len() as u32,
@@ -207,24 +211,73 @@ impl PsbtParser {
 }
 
 impl PsbtParser {
+    fn resolve_prevout(&self, input_index: usize) -> Result<TxOut, KeepMobileError> {
+        let input = self.psbt.inputs.get(input_index).ok_or_else(|| {
+            KeepMobileError::PsbtError {
+                msg: format!("Input index {} out of bounds", input_index),
+            }
+        })?;
+
+        if let Some(utxo) = &input.witness_utxo {
+            return Ok(utxo.clone());
+        }
+
+        if let Some(non_witness_tx) = &input.non_witness_utxo {
+            let tx_input =
+                self.psbt
+                    .unsigned_tx
+                    .input
+                    .get(input_index)
+                    .ok_or_else(|| KeepMobileError::PsbtError {
+                        msg: format!("Missing unsigned_tx input at index {}", input_index),
+                    })?;
+
+            if non_witness_tx.compute_txid() != tx_input.previous_output.txid {
+                return Err(KeepMobileError::PsbtError {
+                    msg: format!(
+                        "non_witness_utxo txid mismatch at input {}: expected {}, got {}",
+                        input_index,
+                        tx_input.previous_output.txid,
+                        non_witness_tx.compute_txid()
+                    ),
+                });
+            }
+
+            let vout = tx_input.previous_output.vout as usize;
+            let prevout = non_witness_tx.output.get(vout).ok_or_else(|| {
+                KeepMobileError::PsbtError {
+                    msg: format!(
+                        "non_witness_utxo output index {} out of bounds at input {}",
+                        vout, input_index
+                    ),
+                }
+            })?;
+
+            return Ok(prevout.clone());
+        }
+
+        Err(KeepMobileError::PsbtError {
+            msg: format!(
+                "Missing prevout for input {} (no witness_utxo or non_witness_utxo)",
+                input_index
+            ),
+        })
+    }
+
     fn collect_prevouts(&self) -> Result<Vec<TxOut>, KeepMobileError> {
-        self.psbt
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, input)| {
-                input
-                    .witness_utxo
-                    .clone()
-                    .ok_or(KeepMobileError::PsbtError {
-                        msg: format!("Missing witness UTXO for input {}", i),
-                    })
-            })
+        (0..self.psbt.inputs.len())
+            .map(|i| self.resolve_prevout(i))
             .collect()
     }
 
-    fn is_change_output(&self, _index: usize) -> bool {
-        false
+    fn is_change_output(&self, index: usize) -> bool {
+        let Some(output) = self.psbt.outputs.get(index) else {
+            return false;
+        };
+
+        !output.bip32_derivation.is_empty()
+            || !output.tap_key_origins.is_empty()
+            || output.tap_internal_key.is_some()
     }
 
     fn is_taproot_input(&self, index: usize) -> bool {
@@ -391,5 +444,139 @@ mod tests {
         let parser = PsbtParser::from_bytes(bytes).unwrap();
         let result = parser.set_network("invalid".to_string());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_witness_utxo_fallback() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_tx.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: tap_script,
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(prev_tx);
+
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+        let info = parser.analyze().unwrap();
+
+        assert_eq!(info.total_input_sats, 100000);
+        assert_eq!(info.total_output_sats, 50000);
+        assert_eq!(info.fee_sats, 50000);
+    }
+
+    #[test]
+    fn test_outputs_exceed_inputs_error() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(200000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100000),
+            script_pubkey: tap_script,
+        });
+
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+        let result = parser.analyze();
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            KeepMobileError::PsbtError { .. }
+        ));
+    }
+
+    #[test]
+    fn test_missing_prevout_error() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: tap_script,
+            }],
+        };
+
+        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+        let result = parser.analyze();
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            KeepMobileError::PsbtError { .. }
+        ));
     }
 }
