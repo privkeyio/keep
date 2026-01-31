@@ -7,6 +7,8 @@ use bitcoin::psbt::Psbt;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{Address, Network, TxOut};
 
+const MAX_PSBT_SIZE: usize = 64 * 1024;
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct PsbtInfo {
     pub num_inputs: u32,
@@ -41,6 +43,11 @@ pub struct PsbtParser {
 impl PsbtParser {
     #[uniffi::constructor]
     pub fn from_base64(base64_psbt: String) -> Result<Self, KeepMobileError> {
+        if base64_psbt.len() > MAX_PSBT_SIZE {
+            return Err(KeepMobileError::PsbtError {
+                msg: "PSBT data exceeds maximum size".into(),
+            });
+        }
         let psbt = keep_bitcoin::psbt::parse_psbt_base64(&base64_psbt)?;
         Ok(Self {
             psbt,
@@ -50,6 +57,11 @@ impl PsbtParser {
 
     #[uniffi::constructor]
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, KeepMobileError> {
+        if data.len() > MAX_PSBT_SIZE {
+            return Err(KeepMobileError::PsbtError {
+                msg: "PSBT data exceeds maximum size".into(),
+            });
+        }
         let psbt = keep_bitcoin::psbt::parse_psbt(&data)?;
         Ok(Self {
             psbt,
@@ -81,7 +93,11 @@ impl PsbtParser {
 
         for input in &self.psbt.inputs {
             if let Some(utxo) = &input.witness_utxo {
-                total_input_sats += utxo.value.to_sat();
+                total_input_sats = total_input_sats
+                    .checked_add(utxo.value.to_sat())
+                    .ok_or_else(|| KeepMobileError::PsbtError {
+                        msg: "Input value overflow".into(),
+                    })?;
             }
         }
 
@@ -89,7 +105,11 @@ impl PsbtParser {
         let mut total_output_sats = 0u64;
 
         for (i, output) in self.psbt.unsigned_tx.output.iter().enumerate() {
-            total_output_sats += output.value.to_sat();
+            total_output_sats = total_output_sats
+                .checked_add(output.value.to_sat())
+                .ok_or_else(|| KeepMobileError::PsbtError {
+                    msg: "Output value overflow".into(),
+                })?;
 
             let address = Address::from_script(&output.script_pubkey, self.network)
                 .ok()
@@ -209,15 +229,7 @@ impl PsbtParser {
 }
 
 impl PsbtParser {
-    fn is_change_output(&self, index: usize) -> bool {
-        if let Some(output) = self.psbt.outputs.get(index) {
-            if output.tap_internal_key.is_some() {
-                return true;
-            }
-            if !output.tap_key_origins.is_empty() {
-                return true;
-            }
-        }
+    fn is_change_output(&self, _index: usize) -> bool {
         false
     }
 
