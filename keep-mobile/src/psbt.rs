@@ -124,12 +124,11 @@ impl PsbtParser {
             });
         }
 
-        let fee_sats =
-            total_input_sats
-                .checked_sub(total_output_sats)
-                .ok_or_else(|| KeepMobileError::PsbtError {
-                    msg: "Outputs exceed inputs (negative fee)".into(),
-                })?;
+        let fee_sats = total_input_sats
+            .checked_sub(total_output_sats)
+            .ok_or_else(|| KeepMobileError::PsbtError {
+                msg: "Outputs exceed inputs (negative fee)".into(),
+            })?;
 
         Ok(PsbtInfo {
             num_inputs: self.psbt.inputs.len() as u32,
@@ -152,10 +151,27 @@ impl PsbtParser {
                 continue;
             }
 
+            let input = &self.psbt.inputs[i];
+
+            if !input.tap_scripts.is_empty() {
+                return Err(KeepMobileError::PsbtError {
+                    msg: format!(
+                        "Input {} is a taproot script-path spend ({} tap_scripts), only key-path spends are supported",
+                        i,
+                        input.tap_scripts.len()
+                    ),
+                });
+            }
+
+            let sighash_type = self.get_taproot_sighash_type(i)?;
+
             let sighash = sighash_cache
-                .taproot_key_spend_signature_hash(i, &prevouts_ref, TapSighashType::Default)
+                .taproot_key_spend_signature_hash(i, &prevouts_ref, sighash_type)
                 .map_err(|e| KeepMobileError::PsbtError {
-                    msg: format!("Sighash computation failed for input {}: {}", i, e),
+                    msg: format!(
+                        "Sighash computation failed for input {} (key-path, {:?}): {}",
+                        i, sighash_type, e
+                    ),
                 })?;
 
             sighashes.push(PsbtInputSighash {
@@ -180,14 +196,31 @@ impl PsbtParser {
             });
         }
 
+        let input = &self.psbt.inputs[index];
+
+        if !input.tap_scripts.is_empty() {
+            return Err(KeepMobileError::PsbtError {
+                msg: format!(
+                    "Input {} is a taproot script-path spend ({} tap_scripts), only key-path spends are supported",
+                    index,
+                    input.tap_scripts.len()
+                ),
+            });
+        }
+
+        let sighash_type = self.get_taproot_sighash_type(index)?;
+
         let prevouts = self.collect_prevouts()?;
         let prevouts_ref = Prevouts::All(&prevouts);
         let mut sighash_cache = SighashCache::new(&self.psbt.unsigned_tx);
 
         let sighash = sighash_cache
-            .taproot_key_spend_signature_hash(index, &prevouts_ref, TapSighashType::Default)
+            .taproot_key_spend_signature_hash(index, &prevouts_ref, sighash_type)
             .map_err(|e| KeepMobileError::PsbtError {
-                msg: format!("Sighash computation failed for input {}: {}", index, e),
+                msg: format!(
+                    "Sighash computation failed for input {} (key-path, {:?}): {}",
+                    index, sighash_type, e
+                ),
             })?;
 
         Ok(sighash.to_byte_array().to_vec())
@@ -212,25 +245,27 @@ impl PsbtParser {
 
 impl PsbtParser {
     fn resolve_prevout(&self, input_index: usize) -> Result<TxOut, KeepMobileError> {
-        let input = self.psbt.inputs.get(input_index).ok_or_else(|| {
-            KeepMobileError::PsbtError {
-                msg: format!("Input index {} out of bounds", input_index),
-            }
-        })?;
+        let input =
+            self.psbt
+                .inputs
+                .get(input_index)
+                .ok_or_else(|| KeepMobileError::PsbtError {
+                    msg: format!("Input index {} out of bounds", input_index),
+                })?;
 
         if let Some(utxo) = &input.witness_utxo {
             return Ok(utxo.clone());
         }
 
         if let Some(non_witness_tx) = &input.non_witness_utxo {
-            let tx_input =
-                self.psbt
-                    .unsigned_tx
-                    .input
-                    .get(input_index)
-                    .ok_or_else(|| KeepMobileError::PsbtError {
-                        msg: format!("Missing unsigned_tx input at index {}", input_index),
-                    })?;
+            let tx_input = self
+                .psbt
+                .unsigned_tx
+                .input
+                .get(input_index)
+                .ok_or_else(|| KeepMobileError::PsbtError {
+                    msg: format!("Missing unsigned_tx input at index {}", input_index),
+                })?;
 
             if non_witness_tx.compute_txid() != tx_input.previous_output.txid {
                 return Err(KeepMobileError::PsbtError {
@@ -244,14 +279,16 @@ impl PsbtParser {
             }
 
             let vout = tx_input.previous_output.vout as usize;
-            let prevout = non_witness_tx.output.get(vout).ok_or_else(|| {
-                KeepMobileError::PsbtError {
-                    msg: format!(
-                        "non_witness_utxo output index {} out of bounds at input {}",
-                        vout, input_index
-                    ),
-                }
-            })?;
+            let prevout =
+                non_witness_tx
+                    .output
+                    .get(vout)
+                    .ok_or_else(|| KeepMobileError::PsbtError {
+                        msg: format!(
+                            "non_witness_utxo output index {} out of bounds at input {}",
+                            vout, input_index
+                        ),
+                    })?;
 
             return Ok(prevout.clone());
         }
@@ -280,17 +317,41 @@ impl PsbtParser {
             || output.tap_internal_key.is_some()
     }
 
+    fn get_taproot_sighash_type(&self, index: usize) -> Result<TapSighashType, KeepMobileError> {
+        let input = self
+            .psbt
+            .inputs
+            .get(index)
+            .ok_or_else(|| KeepMobileError::PsbtError {
+                msg: format!("Input index {} out of bounds", index),
+            })?;
+
+        match &input.sighash_type {
+            Some(psbt_sighash) => {
+                psbt_sighash
+                    .taproot_hash_ty()
+                    .map_err(|e| KeepMobileError::PsbtError {
+                        msg: format!("Invalid taproot sighash type for input {}: {}", index, e),
+                    })
+            }
+            None => Ok(TapSighashType::Default),
+        }
+    }
+
     fn is_taproot_input(&self, index: usize) -> bool {
         let Some(input) = self.psbt.inputs.get(index) else {
             return false;
         };
 
-        input.tap_internal_key.is_some()
-            || !input.tap_key_origins.is_empty()
-            || input
-                .witness_utxo
-                .as_ref()
-                .is_some_and(|utxo| utxo.script_pubkey.is_p2tr())
+        if input.tap_internal_key.is_some() || !input.tap_key_origins.is_empty() {
+            return true;
+        }
+
+        if let Ok(prevout) = self.resolve_prevout(index) {
+            return prevout.script_pubkey.is_p2tr();
+        }
+
+        false
     }
 }
 
@@ -578,5 +639,111 @@ mod tests {
             result.unwrap_err(),
             KeepMobileError::PsbtError { .. }
         ));
+    }
+
+    #[test]
+    fn test_taproot_sighash_from_non_witness_utxo() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_tx.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: tap_script,
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(prev_tx);
+
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+
+        let sighashes = parser.get_taproot_sighashes().unwrap();
+        assert_eq!(sighashes.len(), 1);
+        assert_eq!(sighashes[0].input_index, 0);
+        assert_eq!(sighashes[0].sighash.len(), 32);
+
+        let single_sighash = parser.get_sighash_for_input(0).unwrap();
+        assert_eq!(single_sighash, sighashes[0].sighash);
+    }
+
+    #[test]
+    fn test_script_path_spend_rejected() {
+        use bitcoin::taproot::{ControlBlock, LeafVersion};
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100000),
+            script_pubkey: tap_script,
+        });
+        psbt.inputs[0].tap_internal_key = Some(x_only_pubkey);
+
+        let dummy_script = ScriptBuf::from_bytes(vec![0x51]);
+        let mut control_block_bytes = vec![0xc0u8];
+        control_block_bytes.extend_from_slice(&x_only_pubkey.serialize());
+        let control_block = ControlBlock::decode(&control_block_bytes).unwrap();
+        psbt.inputs[0]
+            .tap_scripts
+            .insert(control_block, (dummy_script, LeafVersion::TapScript));
+
+        let bytes = psbt.serialize();
+        let parser = PsbtParser::from_bytes(bytes).unwrap();
+
+        let result = parser.get_taproot_sighashes();
+        assert!(result.is_err());
+
+        let result = parser.get_sighash_for_input(0);
+        assert!(result.is_err());
     }
 }
