@@ -170,29 +170,17 @@ impl KeepMobile {
     }
 
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
-        for relay in &relays {
-            validate_relay_url(relay)?;
-        }
+        self.do_initialize(relays, None)
+    }
 
-        let share = self.load_share_package()?;
-
-        self.runtime.block_on(async {
-            let node = KfpNode::new(share, relays).await?;
-
-            let (request_tx, request_rx) = mpsc::channel(32);
-            let hooks = Arc::new(MobileSigningHooks { request_tx });
-            node.set_hooks(hooks);
-
-            let event_rx = node.subscribe();
-            let node = Arc::new(node);
-            let pending = self.pending_requests.clone();
-            tokio::spawn(async move {
-                Self::event_listener(event_rx, request_rx, pending).await;
-            });
-
-            *self.node.write().await = Some(node);
-            Ok(())
-        })
+    pub fn initialize_with_proxy(
+        &self,
+        relays: Vec<String>,
+        proxy_host: String,
+        proxy_port: u16,
+    ) -> Result<(), KeepMobileError> {
+        let proxy = parse_loopback_proxy(&proxy_host, proxy_port)?;
+        self.do_initialize(relays, Some(proxy))
     }
 
     pub fn import_share(
@@ -608,6 +596,39 @@ impl KeepMobile {
 }
 
 impl KeepMobile {
+    fn do_initialize(
+        &self,
+        relays: Vec<String>,
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<(), KeepMobileError> {
+        for relay in &relays {
+            validate_relay_url(relay)?;
+        }
+
+        let share = self.load_share_package()?;
+
+        self.runtime.block_on(async {
+            let node = match proxy {
+                Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,
+                None => KfpNode::new(share, relays).await?,
+            };
+
+            let (request_tx, request_rx) = mpsc::channel(32);
+            let hooks = Arc::new(MobileSigningHooks { request_tx });
+            node.set_hooks(hooks);
+
+            let event_rx = node.subscribe();
+            let node = Arc::new(node);
+            let pending = self.pending_requests.clone();
+            tokio::spawn(async move {
+                Self::event_listener(event_rx, request_rx, pending).await;
+            });
+
+            *self.node.write().await = Some(node);
+            Ok(())
+        })
+    }
+
     fn policy_read_lock(
         &self,
     ) -> Result<std::sync::RwLockReadGuard<'_, PolicyEvaluator>, KeepMobileError> {
@@ -995,6 +1016,23 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     bool::from(a.ct_eq(b))
+}
+
+fn parse_loopback_proxy(host: &str, port: u16) -> Result<std::net::SocketAddr, KeepMobileError> {
+    let ip: std::net::IpAddr = match host {
+        "localhost" => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        _ => host.parse().map_err(|_| KeepMobileError::InvalidRelayUrl {
+            msg: "Invalid proxy host".into(),
+        })?,
+    };
+
+    if !ip.is_loopback() {
+        return Err(KeepMobileError::InvalidRelayUrl {
+            msg: "Proxy must be a loopback address".into(),
+        });
+    }
+
+    Ok(std::net::SocketAddr::new(ip, port))
 }
 
 fn parse_warden_pubkey(pubkey_hex: &str) -> Result<[u8; POLICY_PUBKEY_LEN], KeepMobileError> {

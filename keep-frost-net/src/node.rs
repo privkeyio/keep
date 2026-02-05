@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,7 +157,15 @@ pub struct KfpNode {
 
 impl KfpNode {
     pub async fn new(share: SharePackage, relays: Vec<String>) -> Result<Self> {
-        Self::with_nonce_store(share, relays, None).await
+        Self::with_nonce_store(share, relays, None, None).await
+    }
+
+    pub async fn new_with_proxy(
+        share: SharePackage,
+        relays: Vec<String>,
+        proxy: SocketAddr,
+    ) -> Result<Self> {
+        Self::with_nonce_store(share, relays, None, Some(proxy)).await
     }
 
     pub async fn with_nonce_store_path(
@@ -165,16 +174,30 @@ impl KfpNode {
         nonce_store_path: &Path,
     ) -> Result<Self> {
         let store = FileNonceStore::new(nonce_store_path)?;
-        Self::with_nonce_store(share, relays, Some(Arc::new(store) as Arc<dyn NonceStore>)).await
+        Self::with_nonce_store(
+            share,
+            relays,
+            Some(Arc::new(store) as Arc<dyn NonceStore>),
+            None,
+        )
+        .await
     }
 
     pub async fn with_nonce_store(
         share: SharePackage,
         relays: Vec<String>,
         nonce_store: Option<Arc<dyn NonceStore>>,
+        proxy: Option<SocketAddr>,
     ) -> Result<Self> {
         let keys = derive_keys_from_share(&share)?;
-        let client = Client::new(keys.clone());
+        let client = match proxy {
+            Some(addr) => {
+                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
+                let opts = ClientOptions::new().connection(connection);
+                Client::builder().signer(keys.clone()).opts(opts).build()
+            }
+            None => Client::new(keys.clone()),
+        };
 
         for relay in &relays {
             client.add_relay(relay).await.map_err(|e| {
