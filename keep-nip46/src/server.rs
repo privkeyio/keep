@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -174,6 +175,25 @@ impl Server {
         callbacks: Option<Arc<dyn ServerCallbacks>>,
         config: ServerConfig,
     ) -> Result<Self> {
+        Self::new_network_frost_with_proxy(
+            network_signer,
+            transport_secret,
+            relay_urls,
+            callbacks,
+            config,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_network_frost_with_proxy(
+        network_signer: NetworkFrostSigner,
+        transport_secret: [u8; 32],
+        relay_urls: &[String],
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         if relay_urls.is_empty() {
             return Err(NetworkError::relay("at least one relay required".to_string()).into());
         }
@@ -182,7 +202,14 @@ impl Server {
             .map_err(|e| CryptoError::invalid_key(format!("transport key: {}", e)))?;
         let keys = Keys::new(secret);
 
-        let client = Client::new(keys.clone());
+        let client = match proxy {
+            Some(addr) => {
+                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
+                let opts = ClientOptions::new().connection(connection);
+                Client::builder().signer(keys.clone()).opts(opts).build()
+            }
+            None => Client::new(keys.clone()),
+        };
 
         for relay_url in relay_urls {
             client

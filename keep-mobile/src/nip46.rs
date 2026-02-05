@@ -103,6 +103,56 @@ impl BunkerHandler {
         relays: Vec<String>,
         callbacks: Arc<dyn BunkerCallbacks>,
     ) -> Result<(), KeepMobileError> {
+        self.do_start_bunker(relays, callbacks, None)
+    }
+
+    pub fn start_bunker_with_proxy(
+        &self,
+        relays: Vec<String>,
+        callbacks: Arc<dyn BunkerCallbacks>,
+        proxy_host: String,
+        proxy_port: u16,
+    ) -> Result<(), KeepMobileError> {
+        let proxy = crate::parse_loopback_proxy(&proxy_host, proxy_port)?;
+        self.do_start_bunker(relays, callbacks, Some(proxy))
+    }
+
+    pub fn stop_bunker(&self) {
+        let tx = self
+            .shutdown_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+        *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub fn get_bunker_url(&self) -> Option<String> {
+        self.bunker_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn get_bunker_status(&self) -> BunkerStatus {
+        match self.load_status() {
+            STATUS_STARTING => BunkerStatus::Starting,
+            STATUS_RUNNING => BunkerStatus::Running,
+            STATUS_ERROR => BunkerStatus::Error,
+            _ => BunkerStatus::Stopped,
+        }
+    }
+}
+
+impl BunkerHandler {
+    fn do_start_bunker(
+        &self,
+        relays: Vec<String>,
+        callbacks: Arc<dyn BunkerCallbacks>,
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<(), KeepMobileError> {
         if relays.is_empty() {
             return Err(KeepMobileError::InvalidRelayUrl {
                 msg: "At least one relay required".into(),
@@ -156,12 +206,13 @@ impl BunkerHandler {
                 ..ServerConfig::default()
             };
 
-            let server = Server::new_network_frost_with_config(
+            let server = Server::new_network_frost_with_proxy(
                 network_signer,
                 transport_secret,
                 &relays,
                 Some(Arc::new(CallbackBridge { callbacks }) as Arc<dyn ServerCallbacks>),
                 config,
+                proxy,
             )
             .await
             .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
@@ -184,34 +235,6 @@ impl BunkerHandler {
             self.set_status(STATUS_STOPPED);
         }
         result
-    }
-
-    pub fn stop_bunker(&self) {
-        let tx = self
-            .shutdown_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(tx) = tx {
-            let _ = tx.send(());
-        }
-        *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
-    pub fn get_bunker_url(&self) -> Option<String> {
-        self.bunker_url
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub fn get_bunker_status(&self) -> BunkerStatus {
-        match self.load_status() {
-            STATUS_STARTING => BunkerStatus::Starting,
-            STATUS_RUNNING => BunkerStatus::Running,
-            STATUS_ERROR => BunkerStatus::Error,
-            _ => BunkerStatus::Stopped,
-        }
     }
 }
 
