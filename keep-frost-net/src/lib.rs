@@ -58,6 +58,7 @@
 
 mod attestation;
 mod audit;
+mod cert_pin;
 mod ecdh;
 mod error;
 mod event;
@@ -70,6 +71,7 @@ mod session;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
+pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use ecdh::{
     aggregate_ecdh_shares, compute_partial_ecdh, derive_ecdh_session_id, EcdhSession,
     EcdhSessionManager, EcdhSessionState,
@@ -88,3 +90,9 @@ pub use protocol::{
     MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
+
+pub fn install_default_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}

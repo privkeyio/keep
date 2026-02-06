@@ -23,6 +23,9 @@ pub enum KeepMobileError {
     #[error("Storage error")]
     StorageError { msg: String },
 
+    #[error("Key not found in storage")]
+    StorageNotFound,
+
     #[error("Network error")]
     NetworkError { msg: String },
 
@@ -70,11 +73,32 @@ pub enum KeepMobileError {
 
     #[error("Policy signature verification failed")]
     PolicySignatureInvalid,
+
+    #[error("Certificate pin mismatch")]
+    CertificatePinMismatch {
+        hostname: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
     fn from(e: keep_frost_net::FrostNetError) -> Self {
-        KeepMobileError::NetworkError { msg: e.to_string() }
+        match e {
+            keep_frost_net::FrostNetError::CertificatePinMismatch {
+                hostname,
+                expected,
+                actual,
+            } => KeepMobileError::CertificatePinMismatch {
+                hostname,
+                expected,
+                actual,
+            },
+            keep_frost_net::FrostNetError::Timeout(_) => KeepMobileError::Timeout,
+            other => KeepMobileError::NetworkError {
+                msg: other.to_string(),
+            },
+        }
     }
 }
 
