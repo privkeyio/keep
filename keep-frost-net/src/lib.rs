@@ -90,3 +90,9 @@ pub use protocol::{
     MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
+
+pub fn install_default_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}

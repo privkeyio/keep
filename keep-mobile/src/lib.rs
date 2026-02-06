@@ -135,9 +135,7 @@ struct PendingRequest {
 impl KeepMobile {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SecureStorage>) -> Result<Self, KeepMobileError> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        keep_frost_net::install_default_crypto_provider();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -624,7 +622,7 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
-        let mut pins = Self::load_cert_pins(&self.storage).unwrap_or_default();
+        let mut pins = Self::load_cert_pins(&self.storage)?;
         pins.remove_pin(&hostname);
         Self::persist_cert_pins(&self.storage, &pins)
     }
@@ -647,7 +645,7 @@ impl KeepMobile {
             for relay in &relays {
                 keep_frost_net::verify_relay_certificate(relay, &mut pins).await?;
             }
-            let _ = Self::persist_cert_pins(&self.storage, &pins);
+            Self::persist_cert_pins(&self.storage, &pins)?;
 
             let node = match proxy {
                 Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,

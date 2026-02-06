@@ -2279,7 +2279,6 @@ dependencies = [
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
- "rustls",
  "serde",
  "serde_json",
  "sha2",
