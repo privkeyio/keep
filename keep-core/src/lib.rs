@@ -427,6 +427,65 @@ impl Keep {
         Ok(())
     }
 
+    /// Refresh all FROST shares for a group, invalidating old shares.
+    pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<frost::ShareMetadata>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let data_key = self.get_data_key()?;
+        let all_shares = self.storage.list_shares()?;
+        let group_shares: Vec<_> = all_shares
+            .into_iter()
+            .filter(|s| s.metadata.group_pubkey == *group_pubkey)
+            .collect();
+
+        if group_shares.is_empty() {
+            return Err(KeepError::KeyNotFound("No shares for group".into()));
+        }
+
+        let threshold = group_shares[0].metadata.threshold;
+
+        if (group_shares.len() as u16) < threshold {
+            return Err(KeepError::Frost(format!(
+                "Need at least {} shares to refresh, only {} available locally",
+                threshold,
+                group_shares.len()
+            )));
+        }
+
+        let decrypted: Vec<SharePackage> = group_shares
+            .iter()
+            .map(|s| s.decrypt(&data_key))
+            .collect::<Result<_>>()?;
+
+        let (refreshed, _) = frost::refresh_shares(&decrypted)?;
+
+        let encrypted_shares: Vec<StoredShare> = refreshed
+            .iter()
+            .map(|share| StoredShare::encrypt(share, &data_key))
+            .collect::<Result<_>>()?;
+
+        for encrypted in &encrypted_shares {
+            if let Err(e) = self.storage.store_share(encrypted) {
+                for original in &group_shares {
+                    let _ = self.storage.store_share(original);
+                }
+                return Err(e);
+            }
+        }
+
+        let metadata: Vec<_> = refreshed.iter().map(|s| s.metadata.clone()).collect();
+        let participants: Vec<u16> = metadata.iter().map(|m| m.identifier).collect();
+        self.audit_event(AuditEventType::FrostShareRefresh, |e| {
+            e.with_group(group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
+        Ok(metadata)
+    }
+
     /// Delete a FROST share.
     pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         self.storage.delete_share(group_pubkey, identifier)?;

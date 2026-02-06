@@ -18,6 +18,7 @@ use crate::error::{Result, StorageError};
 
 /// Type of audit event being logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum AuditEventType {
     /// A new key was generated.
     KeyGenerate,
@@ -57,6 +58,8 @@ pub enum AuditEventType {
     VaultUnlock,
     /// The vault was locked.
     VaultLock,
+    /// FROST shares were refreshed.
+    FrostShareRefresh,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -81,6 +84,7 @@ impl std::fmt::Display for AuditEventType {
             Self::AuthFailed => write!(f, "auth_failed"),
             Self::VaultUnlock => write!(f, "vault_unlock"),
             Self::VaultLock => write!(f, "vault_lock"),
+            Self::FrostShareRefresh => write!(f, "frost_share_refresh"),
         }
     }
 }
