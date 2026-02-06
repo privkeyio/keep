@@ -16,10 +16,8 @@ const MAX_KEYS_PER_TIER: usize = 20;
 const MAX_CSV_BLOCKS: u32 = 0xFFFF;
 
 const NUMS_POINT: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54,
-    0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5,
-    0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,9 +69,7 @@ impl RecoveryConfig {
                 MAX_KEYS_PER_TIER
             )));
         }
-        if self.primary.threshold == 0
-            || self.primary.threshold > self.primary.keys.len() as u32
-        {
+        if self.primary.threshold == 0 || self.primary.threshold > self.primary.keys.len() as u32 {
             return Err(BitcoinError::Recovery("invalid primary threshold".into()));
         }
         for (i, tier) in self.recovery_tiers.iter().enumerate() {
@@ -149,8 +145,7 @@ impl RecoveryConfig {
 
         if self.primary.keys.len() > 1 || self.primary.threshold > 1 {
             let pubkeys = parse_xonly_keys(&self.primary.keys)?;
-            let script =
-                build_multisig_script(&self.primary.keys, self.primary.threshold)?;
+            let script = build_multisig_script(&self.primary.keys, self.primary.threshold)?;
             tiers.push(TierInfo {
                 name: "primary".to_string(),
                 leaf_hash: TapLeafHash::from_script(&script, LeafVersion::TapScript),
@@ -164,11 +159,7 @@ impl RecoveryConfig {
         for (i, tier) in self.recovery_tiers.iter().enumerate() {
             let timelock_blocks = months_to_blocks(tier.timelock_months)?;
             let pubkeys = parse_xonly_keys(&tier.keys)?;
-            let script = build_timelocked_multisig(
-                &tier.keys,
-                tier.threshold,
-                timelock_blocks,
-            )?;
+            let script = build_timelocked_multisig(&tier.keys, tier.threshold, timelock_blocks)?;
             tiers.push(TierInfo {
                 name: format!("recovery_{}", i + 1),
                 leaf_hash: TapLeafHash::from_script(&script, LeafVersion::TapScript),
@@ -191,9 +182,7 @@ impl RecoveryConfig {
         if tiers.is_empty() {
             return TaprootBuilder::new()
                 .finalize(secp, internal_key)
-                .map_err(|e| {
-                    BitcoinError::Recovery(format!("taproot finalize: {:?}", e))
-                });
+                .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {:?}", e)));
         }
 
         let mut builder = TaprootBuilder::new();
@@ -202,21 +191,15 @@ impl RecoveryConfig {
         for (i, tier) in tiers.iter().enumerate() {
             builder = builder
                 .add_leaf(depths[i], tier.script.clone())
-                .map_err(|e| {
-                    BitcoinError::Recovery(format!("add leaf: {:?}", e))
-                })?;
+                .map_err(|e| BitcoinError::Recovery(format!("add leaf: {:?}", e)))?;
         }
 
-        builder.finalize(secp, internal_key).map_err(|e| {
-            BitcoinError::Recovery(format!("taproot finalize: {:?}", e))
-        })
+        builder
+            .finalize(secp, internal_key)
+            .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {:?}", e)))
     }
 
-    fn format_descriptor(
-        &self,
-        internal_key: XOnlyPublicKey,
-        tiers: &[TierInfo],
-    ) -> String {
+    fn format_descriptor(&self, internal_key: XOnlyPublicKey, tiers: &[TierInfo]) -> String {
         let mut desc = format!("tr({}", internal_key);
         if !tiers.is_empty() {
             desc.push_str(",{");
@@ -241,8 +224,7 @@ impl RecoveryConfig {
 }
 
 fn build_multisig_script(keys: &[[u8; 32]], threshold: u32) -> Result<ScriptBuf> {
-    let pubkeys: Vec<XOnlyPublicKey> =
-        keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
+    let pubkeys: Vec<XOnlyPublicKey> = keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
 
     let mut builder = ScriptBuf::builder();
     builder = push_checksig_chain(builder, &pubkeys);
@@ -269,14 +251,10 @@ fn build_timelocked_multisig(
     }
 
     let seq_u16 = u16::try_from(timelock_blocks).map_err(|_| {
-        BitcoinError::Recovery(format!(
-            "timelock {} exceeds u16 maximum",
-            timelock_blocks
-        ))
+        BitcoinError::Recovery(format!("timelock {} exceeds u16 maximum", timelock_blocks))
     })?;
 
-    let pubkeys: Vec<XOnlyPublicKey> =
-        keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
+    let pubkeys: Vec<XOnlyPublicKey> = keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
 
     let mut builder = ScriptBuf::builder()
         .push_sequence(Sequence::from_height(seq_u16))
@@ -310,8 +288,7 @@ fn push_checksig_chain(
 }
 
 fn parse_xonly(bytes: &[u8; 32]) -> Result<XOnlyPublicKey> {
-    XOnlyPublicKey::from_slice(bytes)
-        .map_err(|e| BitcoinError::InvalidPublicKey(e.to_string()))
+    XOnlyPublicKey::from_slice(bytes).map_err(|e| BitcoinError::InvalidPublicKey(e.to_string()))
 }
 
 fn parse_xonly_keys(keys: &[[u8; 32]]) -> Result<Vec<XOnlyPublicKey>> {
@@ -348,14 +325,9 @@ pub fn recovery_sequence(timelock_blocks: u32) -> Result<Sequence> {
 }
 
 pub fn months_to_blocks(months: u32) -> Result<u32> {
-    months
-        .checked_mul(BLOCKS_PER_MONTH)
-        .ok_or_else(|| {
-            BitcoinError::Recovery(format!(
-                "timelock {} months overflows block count",
-                months
-            ))
-        })
+    months.checked_mul(BLOCKS_PER_MONTH).ok_or_else(|| {
+        BitcoinError::Recovery(format!("timelock {} months overflows block count", months))
+    })
 }
 
 #[cfg(test)]
@@ -393,10 +365,7 @@ mod tests {
         let output = config.build().unwrap();
         assert!(output.address.to_string().starts_with("tb1p"));
         assert_eq!(output.tiers.len(), 1);
-        assert_eq!(
-            output.tiers[0].timelock_blocks,
-            Some(6 * BLOCKS_PER_MONTH)
-        );
+        assert_eq!(output.tiers[0].timelock_blocks, Some(6 * BLOCKS_PER_MONTH));
     }
 
     #[test]
@@ -427,14 +396,8 @@ mod tests {
         assert!(output.address.to_string().starts_with("tb1p"));
         assert_eq!(output.tiers.len(), 3);
         assert!(output.tiers[0].timelock_blocks.is_none());
-        assert_eq!(
-            output.tiers[1].timelock_blocks,
-            Some(6 * BLOCKS_PER_MONTH)
-        );
-        assert_eq!(
-            output.tiers[2].timelock_blocks,
-            Some(12 * BLOCKS_PER_MONTH)
-        );
+        assert_eq!(output.tiers[1].timelock_blocks, Some(6 * BLOCKS_PER_MONTH));
+        assert_eq!(output.tiers[2].timelock_blocks, Some(12 * BLOCKS_PER_MONTH));
     }
 
     #[test]
@@ -610,10 +573,7 @@ mod tests {
         let keys: Vec<[u8; 32]> = (1..=21).map(|i| test_keypair(i as u8)).collect();
 
         let config = RecoveryConfig {
-            primary: SpendingTier {
-                keys,
-                threshold: 1,
-            },
+            primary: SpendingTier { keys, threshold: 1 },
             recovery_tiers: vec![],
             network: Network::Testnet,
         };

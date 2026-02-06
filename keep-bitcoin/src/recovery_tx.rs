@@ -68,10 +68,9 @@ impl RecoveryTxBuilder {
         });
 
         let control_block = self.control_block(tier)?;
-        psbt.inputs[0].tap_scripts.insert(
-            control_block,
-            (tier.script.clone(), LeafVersion::TapScript),
-        );
+        psbt.inputs[0]
+            .tap_scripts
+            .insert(control_block, (tier.script.clone(), LeafVersion::TapScript));
 
         Ok(psbt)
     }
@@ -127,11 +126,7 @@ impl RecoveryTxBuilder {
         Ok(())
     }
 
-    pub fn finalize_recovery(
-        &self,
-        psbt: &mut Psbt,
-        tier_index: usize,
-    ) -> Result<Transaction> {
+    pub fn finalize_recovery(&self, psbt: &mut Psbt, tier_index: usize) -> Result<Transaction> {
         let tier = self.get_tier(tier_index)?;
         let control_block = self.control_block(tier)?;
 
@@ -150,10 +145,7 @@ impl RecoveryTxBuilder {
 
         let mut witness = Witness::new();
         for key in tier.keys.iter().rev() {
-            if let Some(sig) = psbt.inputs[0]
-                .tap_script_sigs
-                .get(&(*key, tier.leaf_hash))
-            {
+            if let Some(sig) = psbt.inputs[0].tap_script_sigs.get(&(*key, tier.leaf_hash)) {
                 witness.push(sig.to_vec());
             } else {
                 witness.push([]);
@@ -179,9 +171,7 @@ impl RecoveryTxBuilder {
         self.recovery_output
             .spend_info
             .control_block(&(tier.script.clone(), LeafVersion::TapScript))
-            .ok_or_else(|| {
-                BitcoinError::Recovery("no control block for tier script".into())
-            })
+            .ok_or_else(|| BitcoinError::Recovery("no control block for tier script".into()))
     }
 }
 
@@ -237,9 +227,7 @@ mod tests {
         assert_eq!(psbt.unsigned_tx.input.len(), 1);
         assert_eq!(psbt.unsigned_tx.output.len(), 1);
         assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 99_000);
-        assert!(psbt.unsigned_tx.input[0]
-            .sequence
-            .is_relative_lock_time());
+        assert!(psbt.unsigned_tx.input[0].sequence.is_relative_lock_time());
     }
 
     #[test]
