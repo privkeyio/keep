@@ -641,7 +641,18 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
-            let mut pins = Self::load_cert_pins(&self.storage).unwrap_or_default();
+            let mut pins = match Self::load_cert_pins(&self.storage) {
+                Ok(pins) => pins,
+                Err(KeepMobileError::StorageError { ref msg })
+                    if msg.to_lowercase().contains("not found")
+                        || msg.to_lowercase().contains("no data")
+                        || msg.to_lowercase().contains("no entry")
+                        || msg.to_lowercase().contains("does not exist") =>
+                {
+                    keep_frost_net::CertificatePinSet::new()
+                }
+                Err(e) => return Err(e),
+            };
             for relay in &relays {
                 keep_frost_net::verify_relay_certificate(relay, &mut pins).await?;
             }
@@ -798,12 +809,30 @@ impl KeepMobile {
             })?;
 
         let mut pins = keep_frost_net::CertificatePinSet::new();
+        let mut malformed = Vec::new();
         for (hostname, hash_hex) in map {
-            if let Ok(bytes) = hex::decode(&hash_hex) {
-                if let Ok(hash) = <[u8; 32]>::try_from(bytes) {
-                    pins.add_pin(hostname, hash);
-                }
+            match hex::decode(&hash_hex) {
+                Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
+                    Ok(hash) => {
+                        pins.add_pin(hostname, hash);
+                    }
+                    Err(_) => malformed.push(format!(
+                        "{}: invalid length {}",
+                        hostname,
+                        hex::decode(&hash_hex).unwrap().len()
+                    )),
+                },
+                Err(e) => malformed.push(format!("{}: hex decode failed: {}", hostname, e)),
             }
+        }
+        if !malformed.is_empty() {
+            return Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "{}: malformed pins: {}",
+                    CERT_PINS_STORAGE_KEY,
+                    malformed.join(", ")
+                ),
+            });
         }
         Ok(pins)
     }

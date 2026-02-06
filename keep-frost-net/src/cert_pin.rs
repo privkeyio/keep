@@ -60,7 +60,11 @@ pub async fn verify_relay_certificate(
         .to_string();
 
     let port = url.port_or_known_default().unwrap_or(443);
-    let addr = format!("{}:{}", hostname, port);
+    let addr = if hostname.contains(':') {
+        format!("[{}]:{}", hostname, port)
+    } else {
+        format!("{}:{}", hostname, port)
+    };
 
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
