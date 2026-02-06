@@ -446,6 +446,14 @@ impl Keep {
 
         let threshold = group_shares[0].metadata.threshold;
 
+        if (group_shares.len() as u16) < threshold {
+            return Err(KeepError::Frost(format!(
+                "Need at least {} shares to refresh, only {} available locally",
+                threshold,
+                group_shares.len()
+            )));
+        }
+
         let decrypted: Vec<SharePackage> = group_shares
             .iter()
             .map(|s| s.decrypt(&data_key))
@@ -458,9 +466,9 @@ impl Keep {
             .map(|share| StoredShare::encrypt(share, &data_key))
             .collect::<Result<_>>()?;
 
-        for (stored_count, encrypted) in encrypted_shares.iter().enumerate() {
+        for encrypted in &encrypted_shares {
             if let Err(e) = self.storage.store_share(encrypted) {
-                for original in group_shares.iter().take(stored_count) {
+                for original in &group_shares {
                     let _ = self.storage.store_share(original);
                 }
                 return Err(e);

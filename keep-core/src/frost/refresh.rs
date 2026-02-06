@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
-use frost::keys::{KeyPackage, PublicKeyPackage, SecretShare};
+use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::rand_core::OsRng;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
@@ -30,6 +30,8 @@ fn rebuild_metadata(
         name,
     );
     metadata.created_at = share.metadata.created_at;
+    metadata.last_used = share.metadata.last_used;
+    metadata.sign_count = share.metadata.sign_count;
     metadata
 }
 
@@ -43,6 +45,16 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
     let total = shares[0].metadata.total_shares;
     let name = shares[0].metadata.name.clone();
 
+    let group_pubkey = *shares[0].group_pubkey();
+
+    for share in &shares[1..] {
+        if *share.group_pubkey() != group_pubkey {
+            return Err(KeepError::Frost(
+                "All shares must belong to the same group".into(),
+            ));
+        }
+    }
+
     if (shares.len() as u16) < threshold {
         return Err(KeepError::Frost(format!(
             "Need at least {} shares to refresh, only {} available",
@@ -50,7 +62,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             shares.len()
         )));
     }
-    let group_pubkey = *shares[0].group_pubkey();
+
     let pubkey_pkg = shares[0].pubkey_package()?;
 
     let key_packages: Vec<KeyPackage> = shares
@@ -70,7 +82,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         )
         .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {}", e)))?;
 
-    let refreshing_by_id: BTreeMap<Identifier, SecretShare> =
+    let refreshing_by_id: BTreeMap<Identifier, _> =
         identifiers.iter().copied().zip(refreshing_shares).collect();
 
     let mut new_packages = Vec::with_capacity(shares.len());
@@ -89,28 +101,14 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
+    let new_group_pubkey = *new_packages[0].group_pubkey();
+    if new_group_pubkey != group_pubkey {
+        return Err(KeepError::Frost(
+            "Group public key changed after refresh - aborting".into(),
+        ));
+    }
+
     Ok((new_packages, new_pubkey_pkg))
-}
-
-/// Refresh a single share given a refreshing share from the trusted dealer.
-pub fn refresh_single_share(
-    share: &SharePackage,
-    refreshing_share: SecretShare,
-    new_pubkey_pkg: &PublicKeyPackage,
-) -> Result<SharePackage> {
-    let current_kp = share.key_package()?;
-
-    let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, &current_kp)
-        .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
-
-    let metadata = rebuild_metadata(
-        share,
-        share.metadata.threshold,
-        share.metadata.total_shares,
-        *share.group_pubkey(),
-        share.metadata.name.clone(),
-    );
-    SharePackage::new(metadata, &new_kp, new_pubkey_pkg)
 }
 
 #[cfg(test)]

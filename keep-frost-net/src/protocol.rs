@@ -165,6 +165,9 @@ impl KfpMessage {
                 if p.participants.len() > MAX_PARTICIPANTS {
                     return Err("Participants list exceeds maximum size");
                 }
+                if p.participants.len() < 2 {
+                    return Err("Refresh requires at least 2 participants");
+                }
             }
             KfpMessage::RefreshRound1(p) => {
                 if p.package.len() > MAX_MESSAGE_SIZE {
@@ -174,6 +177,14 @@ impl KfpMessage {
             KfpMessage::RefreshRound2(p) => {
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round2 package exceeds maximum size");
+                }
+                if p.target_index == 0 {
+                    return Err("target_index must be non-zero");
+                }
+            }
+            KfpMessage::RefreshComplete(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
                 }
             }
             _ => {}
@@ -575,7 +586,7 @@ impl RefreshRound1Payload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RefreshRound2Payload {
     #[serde(with = "hex_bytes")]
     pub session_id: [u8; 32],
@@ -607,6 +618,18 @@ impl RefreshRound2Payload {
         let min_valid = now.saturating_sub(window_secs);
         let max_valid = now.saturating_add(window_secs);
         self.created_at >= min_valid && self.created_at <= max_valid
+    }
+}
+
+impl std::fmt::Debug for RefreshRound2Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshRound2Payload")
+            .field("session_id", &hex::encode(self.session_id))
+            .field("share_index", &self.share_index)
+            .field("target_index", &self.target_index)
+            .field("package", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 

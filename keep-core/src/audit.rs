@@ -18,6 +18,7 @@ use crate::error::{Result, StorageError};
 
 /// Type of audit event being logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum AuditEventType {
     /// A new key was generated.
     KeyGenerate,
