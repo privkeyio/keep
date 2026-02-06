@@ -212,6 +212,7 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     void delete_share_by_key(string group_pubkey);
 
+    [Throws=KeepMobileError]
     sequence<CertificatePin> get_certificate_pins();
 
     [Throws=KeepMobileError]

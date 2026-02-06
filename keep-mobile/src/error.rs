@@ -94,6 +94,7 @@ impl From<keep_frost_net::FrostNetError> for KeepMobileError {
                 expected,
                 actual,
             },
+            keep_frost_net::FrostNetError::Timeout(_) => KeepMobileError::Timeout,
             other => KeepMobileError::NetworkError {
                 msg: other.to_string(),
             },

@@ -602,10 +602,8 @@ impl KeepMobile {
         Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
     }
 
-    pub fn get_certificate_pins(&self) -> Vec<CertificatePin> {
-        Self::load_cert_pins(&self.storage)
-            .ok()
-            .flatten()
+    pub fn get_certificate_pins(&self) -> Result<Vec<CertificatePin>, KeepMobileError> {
+        Ok(Self::load_cert_pins(&self.storage)?
             .unwrap_or_default()
             .pins()
             .iter()
@@ -613,7 +611,7 @@ impl KeepMobile {
                 hostname: hostname.clone(),
                 spki_hash: hex::encode(hash),
             })
-            .collect()
+            .collect())
     }
 
     pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
