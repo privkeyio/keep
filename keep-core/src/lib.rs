@@ -466,9 +466,9 @@ impl Keep {
             .map(|share| StoredShare::encrypt(share, &data_key))
             .collect::<Result<_>>()?;
 
-        for (stored_count, encrypted) in encrypted_shares.iter().enumerate() {
+        for encrypted in &encrypted_shares {
             if let Err(e) = self.storage.store_share(encrypted) {
-                for original in group_shares.iter().take(stored_count) {
+                for original in &group_shares {
                     let _ = self.storage.store_share(original);
                 }
                 return Err(e);
