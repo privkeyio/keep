@@ -32,9 +32,7 @@ fn rebuild_metadata(
 }
 
 /// Refresh all shares, producing new shares for the same group public key.
-pub fn refresh_shares(
-    shares: &[SharePackage],
-) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
+pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
     if shares.is_empty() {
         return Err(KeepError::Frost("No shares provided".into()));
     }
@@ -72,10 +70,8 @@ pub fn refresh_shares(
 
     let mut new_packages = Vec::with_capacity(shares.len());
 
-    for ((share, current_kp), refreshing_share) in shares
-        .iter()
-        .zip(&key_packages)
-        .zip(refreshing_shares)
+    for ((share, current_kp), refreshing_share) in
+        shares.iter().zip(&key_packages).zip(refreshing_shares)
     {
         let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, current_kp)
             .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
