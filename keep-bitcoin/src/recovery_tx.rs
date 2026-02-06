@@ -10,7 +10,7 @@ use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{All, Keypair, Message};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 pub struct RecoveryTxBuilder {
     recovery_output: RecoveryOutput,
@@ -34,15 +34,15 @@ impl RecoveryTxBuilder {
         fee_sats: u64,
     ) -> Result<Psbt> {
         let tier = self.get_tier(tier_index)?;
-        let timelock_blocks = tier
-            .timelock_blocks
-            .ok_or_else(|| BitcoinError::Recovery("tier has no timelock".into()))?;
 
         if utxo_value <= fee_sats {
             return Err(BitcoinError::Recovery("insufficient funds".into()));
         }
 
-        let sequence = crate::recovery::recovery_sequence(timelock_blocks)?;
+        let sequence = match tier.timelock_blocks {
+            Some(timelock_blocks) => crate::recovery::recovery_sequence(timelock_blocks)?,
+            None => Sequence::ENABLE_RBF_NO_LOCKTIME,
+        };
 
         let tx = Transaction {
             version: bitcoin::transaction::Version(2),
