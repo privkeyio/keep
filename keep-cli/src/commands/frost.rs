@@ -14,7 +14,7 @@ use keep_core::Keep;
 use crate::output::Output;
 use crate::ExportFormat;
 
-use super::{get_password, get_password_with_confirm};
+use super::{get_confirm, get_password, get_password_with_confirm};
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_generate(
@@ -309,6 +309,14 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     let threshold = group_shares[0].metadata.threshold;
     let total = group_shares[0].metadata.total_shares;
 
+    if (group_shares.len() as u16) < threshold {
+        return Err(KeepError::Frost(format!(
+            "Need at least {} shares to refresh, only {} available locally",
+            threshold,
+            group_shares.len()
+        )));
+    }
+
     out.newline();
     out.info(&format!(
         "Refreshing {}-of-{} shares for group {}",
@@ -316,6 +324,11 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     ));
     out.warn("Old shares will be invalidated after refresh.");
     out.newline();
+
+    let confirm = get_confirm("Proceed with share refresh?")?;
+    if !confirm {
+        return Err(KeepError::UserRejected);
+    }
 
     let spinner = out.spinner("Refreshing shares...");
     let refreshed = keep.frost_refresh(&group_pubkey)?;
@@ -329,11 +342,8 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     out.field("Threshold", &format!("{}-of-{}", threshold, total));
     out.newline();
 
-    for share in &refreshed {
-        out.info(&format!(
-            "Share {}: refreshed",
-            share.metadata.identifier
-        ));
+    for meta in &refreshed {
+        out.info(&format!("Share {}: refreshed", meta.identifier));
     }
 
     out.newline();

@@ -567,7 +567,6 @@ impl KfpNode {
             KfpMessage::Announce(_)
                 | KfpMessage::SignRequest(_)
                 | KfpMessage::EcdhRequest(_)
-                | KfpMessage::RefreshRequest(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -601,27 +600,31 @@ impl KfpNode {
                 self.handle_ecdh_complete(event.pubkey, payload).await?;
             }
             KfpMessage::RefreshRequest(payload) => {
-                debug!(
+                // TODO: implement distributed refresh protocol handler
+                warn!(
                     session_id = %hex::encode(payload.session_id),
-                    "Received refresh request (not yet handled by node)"
+                    "Received refresh request but distributed refresh is not yet implemented"
                 );
             }
             KfpMessage::RefreshRound1(payload) => {
-                debug!(
+                // TODO: implement distributed refresh round1 handler
+                warn!(
                     session_id = %hex::encode(payload.session_id),
-                    "Received refresh round1 (not yet handled by node)"
+                    "Received refresh round1 but distributed refresh is not yet implemented"
                 );
             }
             KfpMessage::RefreshRound2(payload) => {
-                debug!(
+                // TODO: implement distributed refresh round2 handler
+                warn!(
                     session_id = %hex::encode(payload.session_id),
-                    "Received refresh round2 (not yet handled by node)"
+                    "Received refresh round2 but distributed refresh is not yet implemented"
                 );
             }
             KfpMessage::RefreshComplete(payload) => {
-                debug!(
+                // TODO: implement distributed refresh complete handler
+                warn!(
                     session_id = %hex::encode(payload.session_id),
-                    "Received refresh complete (not yet handled by node)"
+                    "Received refresh complete but distributed refresh is not yet implemented"
                 );
             }
             KfpMessage::Ping(payload) => {

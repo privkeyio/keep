@@ -428,7 +428,7 @@ impl Keep {
     }
 
     /// Refresh all FROST shares for a group, invalidating old shares.
-    pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<SharePackage>> {
+    pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<frost::ShareMetadata>> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
@@ -453,24 +453,21 @@ impl Keep {
 
         let (refreshed, _) = frost::refresh_shares(&decrypted)?;
 
-        for old in &group_shares {
-            self.storage
-                .delete_share(&old.metadata.group_pubkey, old.metadata.identifier)?;
-        }
-
+        let mut metadata = Vec::with_capacity(refreshed.len());
         for share in &refreshed {
             let stored = StoredShare::encrypt(share, &data_key)?;
             self.storage.store_share(&stored)?;
+            metadata.push(share.metadata.clone());
         }
 
-        let participants: Vec<u16> = refreshed.iter().map(|s| s.metadata.identifier).collect();
+        let participants: Vec<u16> = metadata.iter().map(|m| m.identifier).collect();
         self.audit_event(AuditEventType::FrostShareRefresh, |e| {
             e.with_group(group_pubkey)
                 .with_threshold(threshold)
                 .with_participants(participants)
         });
 
-        Ok(refreshed)
+        Ok(metadata)
     }
 
     /// Delete a FROST share.

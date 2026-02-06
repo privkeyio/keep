@@ -176,6 +176,7 @@ impl KfpMessage {
                     return Err("Round2 package exceeds maximum size");
                 }
             }
+            KfpMessage::RefreshComplete(_) => {}
             _ => {}
         }
         Ok(())
@@ -554,6 +555,7 @@ pub struct RefreshRound1Payload {
     pub share_index: u16,
     #[serde(with = "hex_vec")]
     pub package: Vec<u8>,
+    pub created_at: u64,
 }
 
 impl RefreshRound1Payload {
@@ -562,7 +564,15 @@ impl RefreshRound1Payload {
             session_id,
             share_index,
             package,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
     }
 }
 
@@ -574,6 +584,7 @@ pub struct RefreshRound2Payload {
     pub target_index: u16,
     #[serde(with = "hex_vec")]
     pub package: Vec<u8>,
+    pub created_at: u64,
 }
 
 impl RefreshRound2Payload {
@@ -588,7 +599,15 @@ impl RefreshRound2Payload {
             share_index,
             target_index,
             package,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
     }
 }
 
@@ -598,6 +617,7 @@ pub struct RefreshCompletePayload {
     pub session_id: [u8; 32],
     pub share_index: u16,
     pub success: bool,
+    pub created_at: u64,
 }
 
 impl RefreshCompletePayload {
@@ -606,7 +626,15 @@ impl RefreshCompletePayload {
             session_id,
             share_index,
             success,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
     }
 }
 

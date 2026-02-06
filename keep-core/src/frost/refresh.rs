@@ -22,8 +22,16 @@ pub fn refresh_shares(
     }
 
     let threshold = shares[0].metadata.threshold;
-    let total = shares.len() as u16;
+    let total = shares[0].metadata.total_shares;
     let name = shares[0].metadata.name.clone();
+
+    if (shares.len() as u16) < threshold {
+        return Err(KeepError::Frost(format!(
+            "Need at least {} shares to refresh, only {} available",
+            threshold,
+            shares.len()
+        )));
+    }
     let group_pubkey = *shares[0].group_pubkey();
     let pubkey_pkg = shares[0].pubkey_package()?;
 
@@ -54,13 +62,14 @@ pub fn refresh_shares(
         let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, current_kp)
             .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
 
-        let metadata = ShareMetadata::new(
+        let mut metadata = ShareMetadata::new(
             share.metadata.identifier,
             threshold,
             total,
             group_pubkey,
             name.clone(),
         );
+        metadata.created_at = share.metadata.created_at;
 
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
