@@ -27,7 +27,9 @@ fn resolve_group_pubkey(
     let share = shares
         .iter()
         .find(|s| s.metadata.name == group_id)
-        .ok_or_else(|| KeepError::KeyNotFound(format!("No group found with name: {}", group_id)))?;
+        .ok_or_else(|| {
+            KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
+        })?;
     Ok(share.metadata.group_pubkey)
 }
 
