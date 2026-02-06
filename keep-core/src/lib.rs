@@ -458,15 +458,13 @@ impl Keep {
             .map(|share| StoredShare::encrypt(share, &data_key))
             .collect::<Result<_>>()?;
 
-        let mut stored_count = 0usize;
-        for encrypted in &encrypted_shares {
+        for (stored_count, encrypted) in encrypted_shares.iter().enumerate() {
             if let Err(e) = self.storage.store_share(encrypted) {
                 for original in group_shares.iter().take(stored_count) {
                     let _ = self.storage.store_share(original);
                 }
                 return Err(e);
             }
-            stored_count += 1;
         }
 
         let metadata: Vec<_> = refreshed.iter().map(|s| s.metadata.clone()).collect();
