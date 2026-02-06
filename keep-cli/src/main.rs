@@ -209,6 +209,10 @@ enum FrostCommands {
         )]
         warden_url: Option<String>,
     },
+    Refresh {
+        #[arg(short, long)]
+        group: String,
+    },
     Network {
         #[command(subcommand)]
         command: FrostNetworkCommands,
@@ -631,6 +635,7 @@ fn dispatch_frost(
             interactive,
             warden_url.as_deref(),
         ),
+        FrostCommands::Refresh { group } => commands::frost::cmd_frost_refresh(out, path, &group),
         FrostCommands::Network { command } => dispatch_frost_network(out, path, cfg, command),
         FrostCommands::Hardware { command } => dispatch_frost_hardware(out, path, command),
     }

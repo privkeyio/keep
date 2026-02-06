@@ -269,6 +269,79 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()> {
+    debug!(group = group_id, "refreshing FROST shares");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let shares = keep.frost_list_shares()?;
+
+    let group_pubkey = if group_id.starts_with("npub1") {
+        keep_core::keys::npub_to_bytes(group_id)?
+    } else {
+        let share = shares
+            .iter()
+            .find(|s| s.metadata.name == group_id)
+            .ok_or_else(|| {
+                KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
+            })?;
+        share.metadata.group_pubkey
+    };
+
+    let group_shares: Vec<_> = shares
+        .iter()
+        .filter(|s| s.metadata.group_pubkey == group_pubkey)
+        .collect();
+
+    if group_shares.is_empty() {
+        return Err(KeepError::KeyNotFound(format!(
+            "No shares found for group {}",
+            group_id
+        )));
+    }
+
+    let threshold = group_shares[0].metadata.threshold;
+    let total = group_shares[0].metadata.total_shares;
+
+    out.newline();
+    out.info(&format!(
+        "Refreshing {}-of-{} shares for group {}",
+        threshold, total, group_id
+    ));
+    out.warn("Old shares will be invalidated after refresh.");
+    out.newline();
+
+    let spinner = out.spinner("Refreshing shares...");
+    let refreshed = keep.frost_refresh(&group_pubkey)?;
+    spinner.finish();
+
+    let npub = bytes_to_npub(&group_pubkey);
+
+    out.newline();
+    out.success("Shares refreshed!");
+    out.key_field("Pubkey (unchanged)", &npub);
+    out.field("Threshold", &format!("{}-of-{}", threshold, total));
+    out.newline();
+
+    for share in &refreshed {
+        out.info(&format!(
+            "Share {}: refreshed",
+            share.metadata.identifier
+        ));
+    }
+
+    out.newline();
+    out.warn("IMPORTANT: Re-export shares to update all backup locations.");
+
+    Ok(())
+}
+
 #[cfg(feature = "warden")]
 pub async fn check_warden_policy(
     out: &Output,

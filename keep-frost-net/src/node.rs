@@ -564,7 +564,10 @@ impl KfpNode {
 
         if !matches!(
             msg,
-            KfpMessage::Announce(_) | KfpMessage::SignRequest(_) | KfpMessage::EcdhRequest(_)
+            KfpMessage::Announce(_)
+                | KfpMessage::SignRequest(_)
+                | KfpMessage::EcdhRequest(_)
+                | KfpMessage::RefreshRequest(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -596,6 +599,30 @@ impl KfpNode {
             }
             KfpMessage::EcdhComplete(payload) => {
                 self.handle_ecdh_complete(event.pubkey, payload).await?;
+            }
+            KfpMessage::RefreshRequest(payload) => {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Received refresh request (not yet handled by node)"
+                );
+            }
+            KfpMessage::RefreshRound1(payload) => {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Received refresh round1 (not yet handled by node)"
+                );
+            }
+            KfpMessage::RefreshRound2(payload) => {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Received refresh round2 (not yet handled by node)"
+                );
+            }
+            KfpMessage::RefreshComplete(payload) => {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Received refresh complete (not yet handled by node)"
+                );
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

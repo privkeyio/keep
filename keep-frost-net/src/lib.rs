@@ -83,11 +83,13 @@ pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
     AnnouncePayload, CommitmentPayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
-    EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload, PongPayload, SignRequestPayload,
-    SignatureCompletePayload, SignatureSharePayload, DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND,
-    KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
-    MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH,
-    MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
+    EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload, PongPayload,
+    RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
+    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
+    DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
+    MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH,
+    MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS,
+    MAX_SIGNATURE_SHARE_SIZE,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

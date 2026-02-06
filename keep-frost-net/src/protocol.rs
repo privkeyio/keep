@@ -31,6 +31,10 @@ pub enum KfpMessage {
     EcdhRequest(EcdhRequestPayload),
     EcdhShare(EcdhSharePayload),
     EcdhComplete(EcdhCompletePayload),
+    RefreshRequest(RefreshRequestPayload),
+    RefreshRound1(RefreshRound1Payload),
+    RefreshRound2(RefreshRound2Payload),
+    RefreshComplete(RefreshCompletePayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -47,6 +51,10 @@ impl KfpMessage {
             KfpMessage::EcdhRequest(_) => "ecdh_request",
             KfpMessage::EcdhShare(_) => "ecdh_share",
             KfpMessage::EcdhComplete(_) => "ecdh_complete",
+            KfpMessage::RefreshRequest(_) => "refresh_request",
+            KfpMessage::RefreshRound1(_) => "refresh_round1",
+            KfpMessage::RefreshRound2(_) => "refresh_round2",
+            KfpMessage::RefreshComplete(_) => "refresh_complete",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -62,6 +70,10 @@ impl KfpMessage {
             KfpMessage::EcdhRequest(p) => Some(&p.session_id),
             KfpMessage::EcdhShare(p) => Some(&p.session_id),
             KfpMessage::EcdhComplete(p) => Some(&p.session_id),
+            KfpMessage::RefreshRequest(p) => Some(&p.session_id),
+            KfpMessage::RefreshRound1(p) => Some(&p.session_id),
+            KfpMessage::RefreshRound2(p) => Some(&p.session_id),
+            KfpMessage::RefreshComplete(p) => Some(&p.session_id),
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -72,6 +84,7 @@ impl KfpMessage {
             KfpMessage::Announce(p) => Some(&p.group_pubkey),
             KfpMessage::SignRequest(p) => Some(&p.group_pubkey),
             KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::RefreshRequest(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -146,6 +159,21 @@ impl KfpMessage {
             KfpMessage::EcdhComplete(p) => {
                 if p.shared_secret.len() != 32 {
                     return Err("Invalid shared secret size");
+                }
+            }
+            KfpMessage::RefreshRequest(p) => {
+                if p.participants.len() > MAX_PARTICIPANTS {
+                    return Err("Participants list exceeds maximum size");
+                }
+            }
+            KfpMessage::RefreshRound1(p) => {
+                if p.package.len() > MAX_MESSAGE_SIZE {
+                    return Err("Round1 package exceeds maximum size");
+                }
+            }
+            KfpMessage::RefreshRound2(p) => {
+                if p.package.len() > MAX_MESSAGE_SIZE {
+                    return Err("Round2 package exceeds maximum size");
                 }
             }
             _ => {}
@@ -487,6 +515,97 @@ impl EcdhCompletePayload {
         Self {
             session_id,
             shared_secret: shared_secret.to_vec(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefreshRequestPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub participants: Vec<u16>,
+    pub created_at: u64,
+}
+
+impl RefreshRequestPayload {
+    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], participants: Vec<u16>) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            participants,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let min_valid = now.saturating_sub(window_secs);
+        let max_valid = now.saturating_add(window_secs);
+        self.created_at >= min_valid && self.created_at <= max_valid
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefreshRound1Payload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    #[serde(with = "hex_vec")]
+    pub package: Vec<u8>,
+}
+
+impl RefreshRound1Payload {
+    pub fn new(session_id: [u8; 32], share_index: u16, package: Vec<u8>) -> Self {
+        Self {
+            session_id,
+            share_index,
+            package,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefreshRound2Payload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    pub target_index: u16,
+    #[serde(with = "hex_vec")]
+    pub package: Vec<u8>,
+}
+
+impl RefreshRound2Payload {
+    pub fn new(
+        session_id: [u8; 32],
+        share_index: u16,
+        target_index: u16,
+        package: Vec<u8>,
+    ) -> Self {
+        Self {
+            session_id,
+            share_index,
+            target_index,
+            package,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefreshCompletePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    pub success: bool,
+}
+
+impl RefreshCompletePayload {
+    pub fn new(session_id: [u8; 32], share_index: u16, success: bool) -> Self {
+        Self {
+            session_id,
+            share_index,
+            success,
         }
     }
 }

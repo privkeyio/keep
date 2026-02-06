@@ -427,6 +427,52 @@ impl Keep {
         Ok(())
     }
 
+    /// Refresh all FROST shares for a group, invalidating old shares.
+    pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<SharePackage>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let data_key = self.get_data_key()?;
+        let all_shares = self.storage.list_shares()?;
+        let group_shares: Vec<_> = all_shares
+            .into_iter()
+            .filter(|s| s.metadata.group_pubkey == *group_pubkey)
+            .collect();
+
+        if group_shares.is_empty() {
+            return Err(KeepError::KeyNotFound("No shares for group".into()));
+        }
+
+        let threshold = group_shares[0].metadata.threshold;
+
+        let decrypted: Vec<SharePackage> = group_shares
+            .iter()
+            .map(|s| s.decrypt(&data_key))
+            .collect::<Result<_>>()?;
+
+        let (refreshed, _) = frost::refresh_shares(&decrypted)?;
+
+        for old in &group_shares {
+            self.storage
+                .delete_share(&old.metadata.group_pubkey, old.metadata.identifier)?;
+        }
+
+        for share in &refreshed {
+            let stored = StoredShare::encrypt(share, &data_key)?;
+            self.storage.store_share(&stored)?;
+        }
+
+        let participants: Vec<u16> = refreshed.iter().map(|s| s.metadata.identifier).collect();
+        self.audit_event(AuditEventType::FrostShareRefresh, |e| {
+            e.with_group(group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
+        Ok(refreshed)
+    }
+
     /// Delete a FROST share.
     pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         self.storage.delete_share(group_pubkey, identifier)?;
