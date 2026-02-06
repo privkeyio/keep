@@ -97,6 +97,12 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share.clone(), current_kp)
                 .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
 
+        if new_kp.identifier() != &id {
+            return Err(KeepError::Frost(
+                "refreshing share identifier does not match target share".into(),
+            ));
+        }
+
         let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }

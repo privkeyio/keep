@@ -180,10 +180,16 @@ impl KfpMessage {
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round1 package exceeds maximum size");
                 }
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
             }
             KfpMessage::RefreshRound2(p) => {
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round2 package exceeds maximum size");
+                }
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
                 }
                 if p.target_index == 0 {
                     return Err("target_index must be non-zero");
