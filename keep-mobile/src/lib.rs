@@ -615,10 +615,8 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
-        let _ = self
-            .storage
-            .delete_share_by_key(CERT_PINS_STORAGE_KEY.into());
-        Ok(())
+        self.storage
+            .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
@@ -816,11 +814,9 @@ impl KeepMobile {
                     Ok(hash) => {
                         pins.add_pin(hostname, hash);
                     }
-                    Err(_) => malformed.push(format!(
-                        "{}: invalid length {}",
-                        hostname,
-                        hex::decode(&hash_hex).unwrap().len()
-                    )),
+                    Err(bytes) => {
+                        malformed.push(format!("{}: invalid length {}", hostname, bytes.len()))
+                    }
                 },
                 Err(e) => malformed.push(format!("{}: hex decode failed: {}", hostname, e)),
             }

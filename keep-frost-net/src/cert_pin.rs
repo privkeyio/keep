@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +11,7 @@ use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::ServerName;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -107,7 +110,7 @@ pub async fn verify_relay_certificate(
     let spki_hash = hash_spki(spki_bytes);
 
     if let Some(expected) = pins.get_pin(&hostname) {
-        if spki_hash != *expected {
+        if spki_hash.ct_ne(expected).into() {
             return Err(FrostNetError::CertificatePinMismatch {
                 hostname,
                 expected: hex::encode(expected),
