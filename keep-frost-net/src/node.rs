@@ -567,7 +567,6 @@ impl KfpNode {
             KfpMessage::Announce(_)
                 | KfpMessage::SignRequest(_)
                 | KfpMessage::EcdhRequest(_)
-                | KfpMessage::RefreshRequest(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
