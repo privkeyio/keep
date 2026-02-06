@@ -42,6 +42,9 @@ pub enum BitcoinError {
 
     #[error("Descriptor error: {0}")]
     Descriptor(String),
+
+    #[error("Recovery error: {0}")]
+    Recovery(String),
 }
 
 pub type Result<T> = std::result::Result<T, BitcoinError>;
