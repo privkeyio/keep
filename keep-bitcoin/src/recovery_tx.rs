@@ -163,9 +163,15 @@ impl RecoveryTxBuilder {
         }
 
         let mut witness = Witness::new();
+        let mut sigs_included: u32 = 0;
         for key in tier.keys.iter().rev() {
-            if let Some(sig) = psbt.inputs[0].tap_script_sigs.get(&(*key, tier.leaf_hash)) {
-                witness.push(sig.to_vec());
+            if sigs_included < tier.threshold {
+                if let Some(sig) = psbt.inputs[0].tap_script_sigs.get(&(*key, tier.leaf_hash)) {
+                    witness.push(sig.to_vec());
+                    sigs_included += 1;
+                } else {
+                    witness.push([]);
+                }
             } else {
                 witness.push([]);
             }
@@ -286,5 +292,65 @@ mod tests {
 
         let tx = builder.finalize_recovery(&mut psbt, 0).unwrap();
         assert!(!tx.input[0].witness.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_with_excess_signatures() {
+        let (_, pk1) = test_keypair_full(1);
+        let (sk2, pk2) = test_keypair_full(2);
+        let (sk3, pk3) = test_keypair_full(3);
+        let (sk4, pk4) = test_keypair_full(4);
+        let secp = Secp256k1::new();
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2, pk3, pk4],
+                threshold: 2,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+
+        let output = config.build().unwrap();
+        let builder = RecoveryTxBuilder::new(output);
+
+        let utxo = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let xonly_pk1 = XOnlyPublicKey::from_slice(&pk1).unwrap();
+        let dest = ScriptBuf::new_p2tr(&secp, xonly_pk1, None);
+
+        let mut psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+
+        builder.sign_recovery(&mut psbt, 0, &sk2).unwrap();
+        builder.sign_recovery(&mut psbt, 0, &sk3).unwrap();
+        builder.sign_recovery(&mut psbt, 0, &sk4).unwrap();
+
+        assert_eq!(
+            psbt.inputs[0]
+                .tap_script_sigs
+                .iter()
+                .filter(|((_, lh), _)| *lh == builder.recovery_output.tiers[0].leaf_hash)
+                .count(),
+            3
+        );
+
+        let tx = builder.finalize_recovery(&mut psbt, 0).unwrap();
+        assert!(!tx.input[0].witness.is_empty());
+
+        let sig_count = tx.input[0]
+            .witness
+            .iter()
+            .take(3)
+            .filter(|w| !w.is_empty())
+            .count();
+        assert_eq!(sig_count, 2);
     }
 }
