@@ -7,12 +7,16 @@ mod address;
 mod descriptor;
 mod error;
 pub mod psbt;
+pub mod recovery;
+pub mod recovery_tx;
 mod signer;
 
 pub use address::{AddressDerivation, DerivedAddress};
 pub use descriptor::DescriptorExport;
 pub use error::{BitcoinError, Result};
 pub use psbt::{PsbtAnalysis, PsbtSigner};
+pub use recovery::{RecoveryConfig, RecoveryOutput, RecoveryTier, SpendingTier};
+pub use recovery_tx::RecoveryTxBuilder;
 pub use signer::BitcoinSigner;
 
 pub use bitcoin::Network;
