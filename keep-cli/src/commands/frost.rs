@@ -16,6 +16,23 @@ use crate::ExportFormat;
 
 use super::{get_confirm, get_password, get_password_with_confirm};
 
+fn resolve_group_pubkey(
+    shares: &[keep_core::frost::StoredShare],
+    group_id: &str,
+) -> Result<[u8; 32]> {
+    if group_id.starts_with("npub1") {
+        return keep_core::keys::npub_to_bytes(group_id);
+    }
+
+    let share = shares
+        .iter()
+        .find(|s| s.metadata.name == group_id)
+        .ok_or_else(|| {
+            KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
+        })?;
+    Ok(share.metadata.group_pubkey)
+}
+
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_generate(
     out: &Output,
@@ -281,18 +298,7 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     spinner.finish();
 
     let shares = keep.frost_list_shares()?;
-
-    let group_pubkey = if group_id.starts_with("npub1") {
-        keep_core::keys::npub_to_bytes(group_id)?
-    } else {
-        let share = shares
-            .iter()
-            .find(|s| s.metadata.name == group_id)
-            .ok_or_else(|| {
-                KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
-            })?;
-        share.metadata.group_pubkey
-    };
+    let group_pubkey = resolve_group_pubkey(&shares, group_id)?;
 
     let group_shares: Vec<_> = shares
         .iter()
@@ -325,8 +331,7 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     out.warn("Old shares will be invalidated after refresh.");
     out.newline();
 
-    let confirm = get_confirm("Proceed with share refresh?")?;
-    if !confirm {
+    if !get_confirm("Proceed with share refresh?")? {
         return Err(KeepError::UserRejected);
     }
 
@@ -476,20 +481,8 @@ pub fn cmd_frost_sign(
     spinner.finish();
 
     let shares = keep.frost_list_shares()?;
+    let group_pubkey = resolve_group_pubkey(&shares, group_id)?;
 
-    // Try to parse as npub first, otherwise look up by group name
-    let group_pubkey = if group_id.starts_with("npub1") {
-        keep_core::keys::npub_to_bytes(group_id)?
-    } else {
-        // Look up by group name
-        let share = shares
-            .iter()
-            .find(|s| s.metadata.name == group_id)
-            .ok_or_else(|| {
-                KeepError::KeyNotFound(format!("No group found with name: {}", group_id))
-            })?;
-        share.metadata.group_pubkey
-    };
     let our_shares: Vec<_> = shares
         .iter()
         .filter(|s| s.metadata.group_pubkey == group_pubkey)

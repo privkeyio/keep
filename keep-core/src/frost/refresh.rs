@@ -13,6 +13,24 @@ use crate::error::{KeepError, Result};
 
 use super::share::{ShareMetadata, SharePackage};
 
+fn rebuild_metadata(
+    share: &SharePackage,
+    threshold: u16,
+    total: u16,
+    group_pubkey: [u8; 32],
+    name: String,
+) -> ShareMetadata {
+    let mut metadata = ShareMetadata::new(
+        share.metadata.identifier,
+        threshold,
+        total,
+        group_pubkey,
+        name,
+    );
+    metadata.created_at = share.metadata.created_at;
+    metadata
+}
+
 /// Refresh all shares, producing new shares for the same group public key.
 pub fn refresh_shares(
     shares: &[SharePackage],
@@ -62,15 +80,7 @@ pub fn refresh_shares(
         let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, current_kp)
             .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
 
-        let mut metadata = ShareMetadata::new(
-            share.metadata.identifier,
-            threshold,
-            total,
-            group_pubkey,
-            name.clone(),
-        );
-        metadata.created_at = share.metadata.created_at;
-
+        let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
@@ -88,14 +98,13 @@ pub fn refresh_single_share(
     let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, &current_kp)
         .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
 
-    let metadata = ShareMetadata::new(
-        share.metadata.identifier,
+    let metadata = rebuild_metadata(
+        share,
         share.metadata.threshold,
         share.metadata.total_shares,
         *share.group_pubkey(),
         share.metadata.name.clone(),
     );
-
     SharePackage::new(metadata, &new_kp, new_pubkey_pkg)
 }
 

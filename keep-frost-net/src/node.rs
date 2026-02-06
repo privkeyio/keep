@@ -599,33 +599,17 @@ impl KfpNode {
             KfpMessage::EcdhComplete(payload) => {
                 self.handle_ecdh_complete(event.pubkey, payload).await?;
             }
-            KfpMessage::RefreshRequest(payload) => {
-                // TODO: implement distributed refresh protocol handler
-                warn!(
-                    session_id = %hex::encode(payload.session_id),
-                    "Received refresh request but distributed refresh is not yet implemented"
-                );
+            KfpMessage::RefreshRequest(p) => {
+                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
             }
-            KfpMessage::RefreshRound1(payload) => {
-                // TODO: implement distributed refresh round1 handler
-                warn!(
-                    session_id = %hex::encode(payload.session_id),
-                    "Received refresh round1 but distributed refresh is not yet implemented"
-                );
+            KfpMessage::RefreshRound1(p) => {
+                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
             }
-            KfpMessage::RefreshRound2(payload) => {
-                // TODO: implement distributed refresh round2 handler
-                warn!(
-                    session_id = %hex::encode(payload.session_id),
-                    "Received refresh round2 but distributed refresh is not yet implemented"
-                );
+            KfpMessage::RefreshRound2(p) => {
+                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
             }
-            KfpMessage::RefreshComplete(payload) => {
-                // TODO: implement distributed refresh complete handler
-                warn!(
-                    session_id = %hex::encode(payload.session_id),
-                    "Received refresh complete but distributed refresh is not yet implemented"
-                );
+            KfpMessage::RefreshComplete(p) => {
+                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

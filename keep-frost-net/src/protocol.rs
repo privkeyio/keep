@@ -176,7 +176,6 @@ impl KfpMessage {
                     return Err("Round2 package exceeds maximum size");
                 }
             }
-            KfpMessage::RefreshComplete(_) => {}
             _ => {}
         }
         Ok(())
