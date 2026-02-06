@@ -17,6 +17,8 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{FrostNetError, Result};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub type SpkiHash = [u8; 32];
 
 #[derive(Clone, Debug, Default)]
@@ -81,27 +83,24 @@ pub async fn verify_relay_certificate(
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {}", hostname)))?
         .to_owned();
 
-    let tcp_stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
         .await
         .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {}", addr)))?
         .map_err(|e| FrostNetError::Transport(format!("TCP connect to {}: {}", addr, e)))?;
 
-    let tls_stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        connector.connect(server_name, tcp_stream),
-    )
-    .await
-    .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {}", hostname)))?
-    .map_err(|e| FrostNetError::Transport(format!("TLS handshake with {}: {}", hostname, e)))?;
+    let tls_stream =
+        tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
+            .await
+            .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {}", hostname)))?
+            .map_err(|e| {
+                FrostNetError::Transport(format!("TLS handshake with {}: {}", hostname, e))
+            })?;
 
     let (_, server_conn) = tls_stream.get_ref();
-    let certs = server_conn
+    let leaf_cert = server_conn
         .peer_certificates()
+        .and_then(|c| c.first())
         .ok_or_else(|| FrostNetError::Transport(format!("No certificates from {}", hostname)))?;
-
-    let leaf_cert = certs
-        .first()
-        .ok_or_else(|| FrostNetError::Transport(format!("Empty cert chain from {}", hostname)))?;
 
     let spki_bytes = extract_spki_from_der(leaf_cert.as_ref()).ok_or_else(|| {
         FrostNetError::Transport(format!("Failed to parse certificate from {}", hostname))

@@ -11,6 +11,7 @@ interface KeepMobileError {
     BiometricRequired();
     BiometricFailed();
     StorageError(string msg);
+    StorageNotFound();
     NetworkError(string msg);
     FrostError(string msg);
     InvalidShare(string msg);

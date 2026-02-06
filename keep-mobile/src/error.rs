@@ -23,6 +23,9 @@ pub enum KeepMobileError {
     #[error("Storage error")]
     StorageError { msg: String },
 
+    #[error("Key not found in storage")]
+    StorageNotFound,
+
     #[error("Network error")]
     NetworkError { msg: String },
 

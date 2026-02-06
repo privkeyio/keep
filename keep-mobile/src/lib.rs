@@ -604,6 +604,8 @@ impl KeepMobile {
 
     pub fn get_certificate_pins(&self) -> Vec<CertificatePin> {
         Self::load_cert_pins(&self.storage)
+            .ok()
+            .flatten()
             .unwrap_or_default()
             .pins()
             .iter()
@@ -620,7 +622,7 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
-        let mut pins = Self::load_cert_pins(&self.storage)?;
+        let mut pins = Self::load_cert_pins(&self.storage)?.unwrap_or_default();
         pins.remove_pin(&hostname);
         Self::persist_cert_pins(&self.storage, &pins)
     }
@@ -639,18 +641,7 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
-            let mut pins = match Self::load_cert_pins(&self.storage) {
-                Ok(pins) => pins,
-                Err(KeepMobileError::StorageError { ref msg })
-                    if msg.to_lowercase().contains("not found")
-                        || msg.to_lowercase().contains("no data")
-                        || msg.to_lowercase().contains("no entry")
-                        || msg.to_lowercase().contains("does not exist") =>
-                {
-                    keep_frost_net::CertificatePinSet::new()
-                }
-                Err(e) => return Err(e),
-            };
+            let mut pins = Self::load_cert_pins(&self.storage)?.unwrap_or_default();
             for relay in &relays {
                 keep_frost_net::verify_relay_certificate(relay, &mut pins).await?;
             }
@@ -799,8 +790,12 @@ impl KeepMobile {
 
     fn load_cert_pins(
         storage: &Arc<dyn SecureStorage>,
-    ) -> Result<keep_frost_net::CertificatePinSet, KeepMobileError> {
-        let data = storage.load_share_by_key(CERT_PINS_STORAGE_KEY.into())?;
+    ) -> Result<Option<keep_frost_net::CertificatePinSet>, KeepMobileError> {
+        let data = match storage.load_share_by_key(CERT_PINS_STORAGE_KEY.into()) {
+            Ok(data) => data,
+            Err(KeepMobileError::StorageNotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let map: HashMap<String, String> =
             serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
                 msg: format!("Failed to deserialize cert pins: {}", e),
@@ -811,9 +806,7 @@ impl KeepMobile {
         for (hostname, hash_hex) in map {
             match hex::decode(&hash_hex) {
                 Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
-                    Ok(hash) => {
-                        pins.add_pin(hostname, hash);
-                    }
+                    Ok(hash) => pins.add_pin(hostname, hash),
                     Err(bytes) => {
                         malformed.push(format!("{}: invalid length {}", hostname, bytes.len()))
                     }
@@ -821,16 +814,17 @@ impl KeepMobile {
                 Err(e) => malformed.push(format!("{}: hex decode failed: {}", hostname, e)),
             }
         }
-        if !malformed.is_empty() {
-            return Err(KeepMobileError::StorageError {
+        if malformed.is_empty() {
+            Ok(Some(pins))
+        } else {
+            Err(KeepMobileError::StorageError {
                 msg: format!(
                     "{}: malformed pins: {}",
                     CERT_PINS_STORAGE_KEY,
                     malformed.join(", ")
                 ),
-            });
+            })
         }
-        Ok(pins)
     }
 
     fn persist_cert_pins(
