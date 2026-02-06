@@ -20,6 +20,13 @@ pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 
+fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
+    let now = chrono::Utc::now().timestamp() as u64;
+    let min_valid = now.saturating_sub(window_secs);
+    let max_valid = now.saturating_add(window_secs);
+    created_at >= min_valid && created_at <= max_valid
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KfpMessage {
@@ -330,10 +337,7 @@ impl SignRequestPayload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -487,10 +491,7 @@ impl EcdhRequestPayload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -551,10 +552,7 @@ impl RefreshRequestPayload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -579,10 +577,7 @@ impl RefreshRound1Payload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -614,10 +609,7 @@ impl RefreshRound2Payload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -653,10 +645,7 @@ impl RefreshCompletePayload {
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(window_secs);
-        let max_valid = now.saturating_add(window_secs);
-        self.created_at >= min_valid && self.created_at <= max_valid
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
