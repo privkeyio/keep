@@ -30,6 +30,7 @@ url = "2.5"
 zeroize = { workspace = true }
 subtle = { workspace = true }
 flate2 = "1.1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

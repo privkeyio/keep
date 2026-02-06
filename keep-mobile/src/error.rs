@@ -70,11 +70,31 @@ pub enum KeepMobileError {
 
     #[error("Policy signature verification failed")]
     PolicySignatureInvalid,
+
+    #[error("Certificate pin mismatch")]
+    CertificatePinMismatch {
+        hostname: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
     fn from(e: keep_frost_net::FrostNetError) -> Self {
-        KeepMobileError::NetworkError { msg: e.to_string() }
+        match e {
+            keep_frost_net::FrostNetError::CertificatePinMismatch {
+                hostname,
+                expected,
+                actual,
+            } => KeepMobileError::CertificatePinMismatch {
+                hostname,
+                expected,
+                actual,
+            },
+            other => KeepMobileError::NetworkError {
+                msg: other.to_string(),
+            },
+        }
     }
 }
 

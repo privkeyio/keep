@@ -32,6 +32,13 @@ pub enum FrostNetError {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    #[error("Certificate pin mismatch for {hostname}: expected {expected}, got {actual}")]
+    CertificatePinMismatch {
+        hostname: String,
+        expected: String,
+        actual: String,
+    },
+
     #[error("Timeout: {0}")]
     Timeout(String),
 

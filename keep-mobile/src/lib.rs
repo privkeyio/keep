@@ -35,7 +35,7 @@ use keep_core::frost::{
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use policy::{PolicyBundle, PolicyEvaluator, POLICY_PUBKEY_LEN};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -54,6 +54,13 @@ const MAX_SHARE_NAME_LENGTH: usize = 64;
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
+const CERT_PINS_STORAGE_KEY: &str = "__keep_cert_pins_v1";
+
+#[derive(uniffi::Record)]
+pub struct CertificatePin {
+    pub hostname: String,
+    pub spki_hash: String,
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
@@ -128,6 +135,9 @@ struct PendingRequest {
 impl KeepMobile {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SecureStorage>) -> Result<Self, KeepMobileError> {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -593,6 +603,31 @@ impl KeepMobile {
         let policy = self.policy_read_lock()?;
         Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
     }
+
+    pub fn get_certificate_pins(&self) -> Vec<CertificatePin> {
+        Self::load_cert_pins(&self.storage)
+            .unwrap_or_default()
+            .pins()
+            .iter()
+            .map(|(hostname, hash)| CertificatePin {
+                hostname: hostname.clone(),
+                spki_hash: hex::encode(hash),
+            })
+            .collect()
+    }
+
+    pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
+        let _ = self
+            .storage
+            .delete_share_by_key(CERT_PINS_STORAGE_KEY.into());
+        Ok(())
+    }
+
+    pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
+        let mut pins = Self::load_cert_pins(&self.storage).unwrap_or_default();
+        pins.remove_pin(&hostname);
+        Self::persist_cert_pins(&self.storage, &pins)
+    }
 }
 
 impl KeepMobile {
@@ -608,6 +643,12 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
+            let mut pins = Self::load_cert_pins(&self.storage).unwrap_or_default();
+            for relay in &relays {
+                keep_frost_net::verify_relay_certificate(relay, &mut pins).await?;
+            }
+            let _ = Self::persist_cert_pins(&self.storage, &pins);
+
             let node = match proxy {
                 Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,
                 None => KfpNode::new(share, relays).await?,
@@ -747,6 +788,48 @@ impl KeepMobile {
                 }
             }
         }
+    }
+
+    fn load_cert_pins(
+        storage: &Arc<dyn SecureStorage>,
+    ) -> Result<keep_frost_net::CertificatePinSet, KeepMobileError> {
+        let data = storage.load_share_by_key(CERT_PINS_STORAGE_KEY.into())?;
+        let map: HashMap<String, String> =
+            serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                msg: format!("Failed to deserialize cert pins: {}", e),
+            })?;
+
+        let mut pins = keep_frost_net::CertificatePinSet::new();
+        for (hostname, hash_hex) in map {
+            if let Ok(bytes) = hex::decode(&hash_hex) {
+                if let Ok(hash) = <[u8; 32]>::try_from(bytes) {
+                    pins.add_pin(hostname, hash);
+                }
+            }
+        }
+        Ok(pins)
+    }
+
+    fn persist_cert_pins(
+        storage: &Arc<dyn SecureStorage>,
+        pins: &keep_frost_net::CertificatePinSet,
+    ) -> Result<(), KeepMobileError> {
+        let map: HashMap<String, String> = pins
+            .pins()
+            .iter()
+            .map(|(k, v)| (k.clone(), hex::encode(v)))
+            .collect();
+        let data = serde_json::to_vec(&map).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to serialize cert pins: {}", e),
+        })?;
+        let metadata = ShareMetadataInfo {
+            name: "cert_pins".into(),
+            identifier: 0,
+            threshold: 0,
+            total_shares: 0,
+            group_pubkey: vec![],
+        };
+        storage.store_share_by_key(CERT_PINS_STORAGE_KEY.into(), data, metadata)
     }
 
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {

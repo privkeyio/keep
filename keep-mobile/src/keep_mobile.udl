@@ -4,26 +4,30 @@
 namespace keep_mobile {};
 
 [Error]
-enum KeepMobileError {
-    "NotInitialized",
-    "RequestNotFound",
-    "InvalidSession",
-    "BiometricRequired",
-    "BiometricFailed",
-    "StorageError",
-    "NetworkError",
-    "FrostError",
-    "InvalidShare",
-    "TooManyPendingRequests",
-    "Timeout",
-    "InvalidRelayUrl",
-    "InitializationFailed",
-    "NotSupported",
-    "Serialization",
-    "PubkeyMismatch",
-    "RateLimited",
-    "InvalidTimestamp",
-    "PsbtError",
+interface KeepMobileError {
+    NotInitialized();
+    RequestNotFound();
+    InvalidSession();
+    BiometricRequired();
+    BiometricFailed();
+    StorageError(string msg);
+    NetworkError(string msg);
+    FrostError(string msg);
+    InvalidShare(string msg);
+    TooManyPendingRequests();
+    Timeout();
+    InvalidRelayUrl(string msg);
+    InitializationFailed(string msg);
+    NotSupported(string msg);
+    Serialization(string msg);
+    PubkeyMismatch();
+    RateLimited();
+    InvalidTimestamp();
+    PsbtError(string msg);
+    PolicyViolation(string reason);
+    InvalidPolicy(string msg);
+    PolicySignatureInvalid();
+    CertificatePinMismatch(string hostname, string expected, string actual);
 };
 
 dictionary ShareMetadataInfo {
@@ -125,6 +129,11 @@ dictionary PeerInfo {
     PeerStatus status;
 };
 
+dictionary CertificatePin {
+    string hostname;
+    string spki_hash;
+};
+
 enum PeerStatus {
     "Online",
     "Offline",
@@ -201,6 +210,14 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void delete_share_by_key(string group_pubkey);
+
+    sequence<CertificatePin> get_certificate_pins();
+
+    [Throws=KeepMobileError]
+    void clear_certificate_pins();
+
+    [Throws=KeepMobileError]
+    void clear_certificate_pin(string hostname);
 };
 
 enum BunkerStatus {
