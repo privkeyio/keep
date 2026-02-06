@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
 use frost::keys::{KeyPackage, PublicKeyPackage, SecretShare};
 use frost::rand_core::OsRng;
@@ -68,13 +70,20 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         )
         .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {}", e)))?;
 
+    let refreshing_by_id: BTreeMap<Identifier, SecretShare> =
+        identifiers.iter().copied().zip(refreshing_shares).collect();
+
     let mut new_packages = Vec::with_capacity(shares.len());
 
-    for ((share, current_kp), refreshing_share) in
-        shares.iter().zip(&key_packages).zip(refreshing_shares)
-    {
-        let new_kp = refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share, current_kp)
-            .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
+    for (share, current_kp) in shares.iter().zip(&key_packages) {
+        let id = *current_kp.identifier();
+        let refreshing_share = refreshing_by_id.get(&id).ok_or_else(|| {
+            KeepError::Frost(format!("No refreshing share for identifier {:?}", id))
+        })?;
+
+        let new_kp =
+            refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share.clone(), current_kp)
+                .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
 
         let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);

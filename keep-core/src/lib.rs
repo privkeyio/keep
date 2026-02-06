@@ -453,13 +453,23 @@ impl Keep {
 
         let (refreshed, _) = frost::refresh_shares(&decrypted)?;
 
-        let mut metadata = Vec::with_capacity(refreshed.len());
-        for share in &refreshed {
-            let stored = StoredShare::encrypt(share, &data_key)?;
-            self.storage.store_share(&stored)?;
-            metadata.push(share.metadata.clone());
+        let encrypted_shares: Vec<StoredShare> = refreshed
+            .iter()
+            .map(|share| StoredShare::encrypt(share, &data_key))
+            .collect::<Result<_>>()?;
+
+        let mut stored_count = 0usize;
+        for encrypted in &encrypted_shares {
+            if let Err(e) = self.storage.store_share(encrypted) {
+                for original in group_shares.iter().take(stored_count) {
+                    let _ = self.storage.store_share(original);
+                }
+                return Err(e);
+            }
+            stored_count += 1;
         }
 
+        let metadata: Vec<_> = refreshed.iter().map(|s| s.metadata.clone()).collect();
         let participants: Vec<u16> = metadata.iter().map(|m| m.identifier).collect();
         self.audit_event(AuditEventType::FrostShareRefresh, |e| {
             e.with_group(group_pubkey)
