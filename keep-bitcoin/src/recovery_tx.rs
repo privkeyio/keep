@@ -11,6 +11,9 @@ use bitcoin::secp256k1::{All, Keypair, Message};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use zeroize::Zeroize;
+
+const MAX_FEE_SATS: u64 = 100_000_000; // 1 BTC
 
 pub struct RecoveryTxBuilder {
     recovery_output: RecoveryOutput,
@@ -35,8 +38,20 @@ impl RecoveryTxBuilder {
     ) -> Result<Psbt> {
         let tier = self.get_tier(tier_index)?;
 
+        if fee_sats > MAX_FEE_SATS {
+            return Err(BitcoinError::Recovery(format!(
+                "fee {} sats exceeds maximum {} sats",
+                fee_sats, MAX_FEE_SATS
+            )));
+        }
         if utxo_value <= fee_sats {
             return Err(BitcoinError::Recovery("insufficient funds".into()));
+        }
+        let output_value = utxo_value - fee_sats;
+        if output_value < 330 {
+            return Err(BitcoinError::Recovery(
+                "output below dust threshold (330 sats)".into(),
+            ));
         }
 
         let sequence = match tier.timelock_blocks {
@@ -54,7 +69,7 @@ impl RecoveryTxBuilder {
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(utxo_value - fee_sats),
+                value: Amount::from_sat(output_value),
                 script_pubkey: destination.clone(),
             }],
         };
@@ -82,8 +97,12 @@ impl RecoveryTxBuilder {
         secret_key: &[u8; 32],
     ) -> Result<()> {
         let tier = self.get_tier(tier_index)?;
-        let keypair = Keypair::from_seckey_slice(&self.secp, secret_key)
-            .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))?;
+        let mut sk_bytes = *secret_key;
+        let keypair = Keypair::from_seckey_slice(&self.secp, &sk_bytes).map_err(|e| {
+            sk_bytes.zeroize();
+            BitcoinError::InvalidSecretKey(e.to_string())
+        })?;
+        sk_bytes.zeroize();
         let (x_only, _) = keypair.x_only_public_key();
 
         let prevouts: Vec<TxOut> = psbt

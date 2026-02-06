@@ -9,12 +9,15 @@ use bitcoin::secp256k1::All;
 use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
 use bitcoin::{Address, Network, ScriptBuf, Sequence, TapLeafHash, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 const BLOCKS_PER_DAY: u32 = 144;
 const BLOCKS_PER_MONTH: u32 = BLOCKS_PER_DAY * 30;
 const MAX_KEYS_PER_TIER: usize = 20;
+const MAX_RECOVERY_TIERS: usize = 10;
 const MAX_CSV_BLOCKS: u32 = 0xFFFF;
 
+// BIP-341 unspendable internal key (no known discrete log).
 const NUMS_POINT: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
@@ -72,6 +75,23 @@ impl RecoveryConfig {
         if self.primary.threshold == 0 || self.primary.threshold > self.primary.keys.len() as u32 {
             return Err(BitcoinError::Recovery("invalid primary threshold".into()));
         }
+        check_duplicate_keys("primary", &self.primary.keys)?;
+
+        if self.recovery_tiers.is_empty() {
+            return Err(BitcoinError::Recovery(
+                "at least one recovery tier is required".into(),
+            ));
+        }
+        if self.recovery_tiers.len() > MAX_RECOVERY_TIERS {
+            return Err(BitcoinError::Recovery(format!(
+                "recovery tier count {} exceeds maximum {}",
+                self.recovery_tiers.len(),
+                MAX_RECOVERY_TIERS
+            )));
+        }
+
+        let mut all_keys: HashSet<[u8; 32]> = self.primary.keys.iter().copied().collect();
+
         for (i, tier) in self.recovery_tiers.iter().enumerate() {
             if tier.keys.is_empty() {
                 return Err(BitcoinError::Recovery(format!(
@@ -103,6 +123,15 @@ impl RecoveryConfig {
                     "recovery tier {} timelock {} months ({} blocks) exceeds CSV maximum {}",
                     i, tier.timelock_months, timelock_blocks, MAX_CSV_BLOCKS
                 )));
+            }
+            check_duplicate_keys(&format!("recovery tier {}", i), &tier.keys)?;
+            for key in &tier.keys {
+                if !all_keys.insert(*key) {
+                    return Err(BitcoinError::Recovery(format!(
+                        "duplicate key across tiers: {}",
+                        hex::encode(key)
+                    )));
+                }
             }
         }
         for w in self.recovery_tiers.windows(2) {
@@ -243,15 +272,11 @@ fn build_timelocked_multisig(
     threshold: u32,
     timelock_blocks: u32,
 ) -> Result<ScriptBuf> {
-    if timelock_blocks > MAX_CSV_BLOCKS {
-        return Err(BitcoinError::Recovery(format!(
-            "timelock {} exceeds CSV maximum {}",
-            timelock_blocks, MAX_CSV_BLOCKS,
-        )));
-    }
-
     let seq_u16 = u16::try_from(timelock_blocks).map_err(|_| {
-        BitcoinError::Recovery(format!("timelock {} exceeds u16 maximum", timelock_blocks))
+        BitcoinError::Recovery(format!(
+            "timelock {} exceeds CSV maximum {}",
+            timelock_blocks, MAX_CSV_BLOCKS
+        ))
     })?;
 
     let pubkeys: Vec<XOnlyPublicKey> = keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
@@ -299,12 +324,26 @@ fn needs_threshold_check(threshold: u32, key_count: usize) -> bool {
     threshold > 1 || key_count > 1
 }
 
+fn check_duplicate_keys(tier_name: &str, keys: &[[u8; 32]]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(keys.len());
+    for key in keys {
+        if !seen.insert(key) {
+            return Err(BitcoinError::Recovery(format!(
+                "duplicate key in {}: {}",
+                tier_name,
+                hex::encode(key)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn optimal_depth(count: usize) -> Vec<u8> {
     match count {
         0 => vec![],
         1 => vec![0],
         _ => {
-            let depth = (count as f64).log2().ceil() as u8;
+            let depth = (usize::BITS - (count - 1).leading_zeros()) as u8;
             let full_capacity = 1usize << depth;
             let shallow_count = full_capacity - count;
             (0..count)
@@ -370,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_multisig_primary_with_two_recovery_tiers() {
-        let keys: Vec<[u8; 32]> = (1..=8).map(test_keypair).collect();
+        let keys: Vec<[u8; 32]> = (1..=9).map(test_keypair).collect();
 
         let config = RecoveryConfig {
             primary: SpendingTier {
@@ -384,7 +423,7 @@ mod tests {
                     timelock_months: 6,
                 },
                 RecoveryTier {
-                    keys: vec![keys[3]],
+                    keys: vec![keys[8]],
                     threshold: 1,
                     timelock_months: 12,
                 },
@@ -403,6 +442,9 @@ mod tests {
     #[test]
     fn test_validation_errors() {
         let pk = test_keypair(1);
+        let pk2 = test_keypair(2);
+        let pk3 = test_keypair(3);
+        let pk4 = test_keypair(4);
 
         let config = RecoveryConfig {
             primary: SpendingTier {
@@ -420,7 +462,7 @@ mod tests {
                 threshold: 1,
             },
             recovery_tiers: vec![RecoveryTier {
-                keys: vec![pk],
+                keys: vec![pk2],
                 threshold: 1,
                 timelock_months: 0,
             }],
@@ -435,12 +477,12 @@ mod tests {
             },
             recovery_tiers: vec![
                 RecoveryTier {
-                    keys: vec![pk],
+                    keys: vec![pk3],
                     threshold: 1,
                     timelock_months: 12,
                 },
                 RecoveryTier {
-                    keys: vec![pk],
+                    keys: vec![pk4],
                     threshold: 1,
                     timelock_months: 6,
                 },
@@ -571,10 +613,15 @@ mod tests {
     #[test]
     fn test_key_count_limit() {
         let keys: Vec<[u8; 32]> = (1..=21).map(|i| test_keypair(i as u8)).collect();
+        let recovery_pk = test_keypair(100);
 
         let config = RecoveryConfig {
             primary: SpendingTier { keys, threshold: 1 },
-            recovery_tiers: vec![],
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![recovery_pk],
+                threshold: 1,
+                timelock_months: 6,
+            }],
             network: Network::Testnet,
         };
         assert!(config.validate().is_err());
@@ -602,5 +649,81 @@ mod tests {
         let output = config.build().unwrap();
         assert_eq!(output.tiers[0].threshold, 2);
         assert_eq!(output.tiers[0].keys.len(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_keys_within_tier() {
+        let pk = test_keypair(1);
+        let pk2 = test_keypair(2);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk, pk],
+                threshold: 2,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_duplicate_keys_across_tiers() {
+        let pk = test_keypair(1);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_empty_recovery_tiers_rejected() {
+        let pk = test_keypair(1);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk],
+                threshold: 1,
+            },
+            recovery_tiers: vec![],
+            network: Network::Testnet,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_max_recovery_tiers_exceeded() {
+        let pk = test_keypair(1);
+        let tiers: Vec<RecoveryTier> = (0..11)
+            .map(|i| RecoveryTier {
+                keys: vec![test_keypair((i + 2) as u8)],
+                threshold: 1,
+                timelock_months: (i + 1) as u32,
+            })
+            .collect();
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk],
+                threshold: 1,
+            },
+            recovery_tiers: tiers,
+            network: Network::Testnet,
+        };
+        assert!(config.validate().is_err());
     }
 }
