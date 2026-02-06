@@ -52,8 +52,6 @@ pub enum AuditEventType {
     FrostShareExport,
     /// A FROST share was deleted.
     FrostShareDelete,
-    /// FROST shares were refreshed.
-    FrostShareRefresh,
     /// Authentication failed.
     AuthFailed,
     /// The vault was unlocked.
@@ -83,7 +81,6 @@ impl std::fmt::Display for AuditEventType {
             Self::FrostShareImport => write!(f, "frost_share_import"),
             Self::FrostShareExport => write!(f, "frost_share_export"),
             Self::FrostShareDelete => write!(f, "frost_share_delete"),
-            Self::FrostShareRefresh => write!(f, "frost_share_refresh"),
             Self::AuthFailed => write!(f, "auth_failed"),
             Self::VaultUnlock => write!(f, "vault_unlock"),
             Self::VaultLock => write!(f, "vault_lock"),
