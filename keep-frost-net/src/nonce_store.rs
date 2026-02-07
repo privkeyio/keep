@@ -121,8 +121,8 @@ impl NonceStore for FileNonceStore {
             .map_err(|e| FrostNetError::Session(format!("Failed to sync nonce store: {}", e)))?;
 
         guard.insert(*session_id);
-        drop(guard);
         self.insertion_order.write().push_back(*session_id);
+        drop(guard);
         debug!(session_id = %hex_id, "Recorded consumed session ID");
         self.prune_if_needed();
 
@@ -141,6 +141,7 @@ impl NonceStore for FileNonceStore {
         let mut consumed = self.consumed.write();
         let mut order = self.insertion_order.write();
 
+        let before = consumed.len();
         while consumed.len() > self.max_entries {
             if let Some(oldest) = order.pop_front() {
                 consumed.remove(&oldest);
@@ -148,7 +149,27 @@ impl NonceStore for FileNonceStore {
                 break;
             }
         }
+
+        if consumed.len() < before {
+            if let Err(e) = rewrite_nonce_file(&self.path, order.iter()) {
+                warn!(error = %e, "Failed to rewrite nonce store after pruning");
+            }
+        }
     }
+}
+
+fn rewrite_nonce_file<'a>(
+    path: &Path,
+    entries: impl Iterator<Item = &'a [u8; 32]>,
+) -> std::result::Result<(), std::io::Error> {
+    let tmp_path = path.with_extension("tmp");
+    let mut file = File::create(&tmp_path)?;
+    for entry in entries {
+        writeln!(file, "{}", hex::encode(entry))?;
+    }
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 const DEFAULT_MAX_ENTRIES: usize = 100_000;

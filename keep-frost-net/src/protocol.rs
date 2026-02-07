@@ -183,12 +183,8 @@ impl KfpMessage {
                 if p.participants.iter().any(|&id| id == 0) {
                     return Err("Participant index must be non-zero");
                 }
-                if p.participants.len()
-                    != p.participants
-                        .iter()
-                        .collect::<std::collections::HashSet<_>>()
-                        .len()
-                {
+                let unique: std::collections::HashSet<_> = p.participants.iter().collect();
+                if unique.len() != p.participants.len() {
                     return Err("Duplicate participant indices");
                 }
             }

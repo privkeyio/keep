@@ -397,9 +397,9 @@ impl KfpNode {
             .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {}", e)))?;
 
         let signing_share = key_package.signing_share();
-        let signing_share_serialized = signing_share.serialize();
         let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            signing_share_serialized
+            signing_share
+                .serialize()
                 .as_slice()
                 .try_into()
                 .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,

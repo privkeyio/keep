@@ -79,7 +79,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
 
     let pubkey_pkg = shares[0].pubkey_package()?;
 
-    let key_packages: Vec<KeyPackage> = shares
+    let mut key_packages: Vec<KeyPackage> = shares
         .iter()
         .map(|s| s.key_package())
         .collect::<Result<_>>()?;
@@ -129,9 +129,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
-    let mut key_packages = key_packages;
     key_packages.iter_mut().for_each(|kp| kp.zeroize());
-    drop(key_packages);
 
     let new_group_pubkey = *new_packages[0].group_pubkey();
     if new_group_pubkey != group_pubkey {

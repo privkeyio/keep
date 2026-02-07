@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use tracing::{debug, info, warn};
-
 use zeroize::Zeroizing;
 
 use crate::ecdh::{compute_partial_ecdh, derive_ecdh_session_id};
