@@ -179,7 +179,10 @@ impl KfpMessage {
                     return Err("Participant index must be non-zero");
                 }
                 if p.participants.len()
-                    != p.participants.iter().collect::<std::collections::HashSet<_>>().len()
+                    != p.participants
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
                 {
                     return Err("Duplicate participant indices");
                 }
@@ -683,71 +686,35 @@ impl RefreshCompletePayload {
     }
 }
 
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
+macro_rules! hex_bytes_serde {
+    ($mod_name:ident, $size:expr) => {
+        mod $mod_name {
+            use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
+            pub fn serialize<S>(bytes: &[u8; $size], serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&hex::encode(bytes))
+            }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
-    }
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; $size], D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom(format!("expected {} bytes", $size)))
+            }
+        }
+    };
 }
 
-mod hex_bytes_33 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 33 bytes"))
-    }
-}
-
-mod hex_bytes_64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
-    }
-}
+hex_bytes_serde!(hex_bytes, 32);
+hex_bytes_serde!(hex_bytes_33, 33);
+hex_bytes_serde!(hex_bytes_64, 64);
 
 mod hex_bytes_option {
     use serde::{Deserialize, Deserializer, Serializer};
