@@ -53,6 +53,16 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
                 "All shares must belong to the same group".into(),
             ));
         }
+        if share.metadata.threshold != threshold {
+            return Err(KeepError::Frost(
+                "Inconsistent threshold across shares".into(),
+            ));
+        }
+        if share.metadata.total_shares != total {
+            return Err(KeepError::Frost(
+                "Inconsistent total_shares across shares".into(),
+            ));
+        }
     }
 
     if (shares.len() as u16) < threshold {
@@ -106,6 +116,8 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
+
+    drop(key_packages);
 
     let new_group_pubkey = *new_packages[0].group_pubkey();
     if new_group_pubkey != group_pubkey {

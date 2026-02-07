@@ -438,6 +438,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Store multiple FROST shares atomically.
+    pub fn store_shares_atomic(&self, shares: &[StoredShare]) -> Result<()> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let mut entries_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(shares.len());
+        for share in shares {
+            let serialized = bincode::serialize(share)?;
+            let encrypted = crypto::encrypt(&serialized, data_key)?;
+            let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
+            entries_data.push((id.to_vec(), encrypted.to_bytes()));
+        }
+
+        let entries_refs: Vec<(&[u8], &[u8])> = entries_data
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        backend.put_batch(SHARES_TABLE, &entries_refs)
+    }
+
     /// List all stored FROST shares.
     pub fn list_shares(&self) -> Result<Vec<StoredShare>> {
         trace!("listing FROST shares");

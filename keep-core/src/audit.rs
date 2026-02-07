@@ -21,45 +21,45 @@ use crate::error::{Result, StorageError};
 #[repr(u8)]
 pub enum AuditEventType {
     /// A new key was generated.
-    KeyGenerate,
+    KeyGenerate = 0,
     /// A key was imported.
-    KeyImport,
+    KeyImport = 1,
     /// A key was exported.
-    KeyExport,
+    KeyExport = 2,
     /// A key was deleted.
-    KeyDelete,
+    KeyDelete = 3,
     /// A signing operation succeeded.
-    Sign,
+    Sign = 4,
     /// A signing operation failed.
-    SignFailed,
+    SignFailed = 5,
     /// A new FROST key was generated.
-    FrostGenerate,
+    FrostGenerate = 6,
     /// An existing key was split into FROST shares.
-    FrostSplit,
+    FrostSplit = 7,
     /// A FROST signing operation succeeded.
-    FrostSign,
+    FrostSign = 8,
     /// A FROST signing operation failed.
-    FrostSignFailed,
+    FrostSignFailed = 9,
     /// A FROST signing session was started.
-    FrostSessionStart,
+    FrostSessionStart = 10,
     /// A FROST signing session completed successfully.
-    FrostSessionComplete,
+    FrostSessionComplete = 11,
     /// A FROST signing session failed.
-    FrostSessionFailed,
+    FrostSessionFailed = 12,
     /// A FROST share was imported.
-    FrostShareImport,
+    FrostShareImport = 13,
     /// A FROST share was exported.
-    FrostShareExport,
+    FrostShareExport = 14,
     /// A FROST share was deleted.
-    FrostShareDelete,
+    FrostShareDelete = 15,
     /// Authentication failed.
-    AuthFailed,
+    AuthFailed = 16,
     /// The vault was unlocked.
-    VaultUnlock,
+    VaultUnlock = 17,
     /// The vault was locked.
-    VaultLock,
+    VaultLock = 18,
     /// FROST shares were refreshed.
-    FrostShareRefresh,
+    FrostShareRefresh = 19,
 }
 
 impl std::fmt::Display for AuditEventType {

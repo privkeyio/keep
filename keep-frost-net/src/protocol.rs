@@ -175,8 +175,19 @@ impl KfpMessage {
                 if p.participants.len() < 2 {
                     return Err("Refresh requires at least 2 participants");
                 }
+                if p.participants.iter().any(|&id| id == 0) {
+                    return Err("Participant index must be non-zero");
+                }
+                if p.participants.len()
+                    != p.participants.iter().collect::<std::collections::HashSet<_>>().len()
+                {
+                    return Err("Duplicate participant indices");
+                }
             }
             KfpMessage::RefreshRound1(p) => {
+                if p.package.is_empty() {
+                    return Err("Package must not be empty");
+                }
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round1 package exceeds maximum size");
                 }
@@ -185,6 +196,9 @@ impl KfpMessage {
                 }
             }
             KfpMessage::RefreshRound2(p) => {
+                if p.package.is_empty() {
+                    return Err("Package must not be empty");
+                }
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round2 package exceeds maximum size");
                 }
@@ -193,6 +207,9 @@ impl KfpMessage {
                 }
                 if p.target_index == 0 {
                     return Err("target_index must be non-zero");
+                }
+                if p.share_index == p.target_index {
+                    return Err("share_index must differ from target_index");
                 }
             }
             KfpMessage::RefreshComplete(p) => {
@@ -562,7 +579,7 @@ impl RefreshRequestPayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RefreshRound1Payload {
     #[serde(with = "hex_bytes")]
     pub session_id: [u8; 32],
@@ -584,6 +601,17 @@ impl RefreshRound1Payload {
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
         within_replay_window(self.created_at, window_secs)
+    }
+}
+
+impl std::fmt::Debug for RefreshRound1Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshRound1Payload")
+            .field("session_id", &hex::encode(self.session_id))
+            .field("share_index", &self.share_index)
+            .field("package", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 

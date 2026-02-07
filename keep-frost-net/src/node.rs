@@ -597,17 +597,13 @@ impl KfpNode {
             KfpMessage::EcdhComplete(payload) => {
                 self.handle_ecdh_complete(event.pubkey, payload).await?;
             }
-            KfpMessage::RefreshRequest(p) => {
-                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
-            }
-            KfpMessage::RefreshRound1(p) => {
-                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
-            }
-            KfpMessage::RefreshRound2(p) => {
-                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
-            }
-            KfpMessage::RefreshComplete(p) => {
-                warn!(session_id = %hex::encode(p.session_id), "Distributed refresh not yet implemented");
+            KfpMessage::RefreshRequest(_)
+            | KfpMessage::RefreshRound1(_)
+            | KfpMessage::RefreshRound2(_)
+            | KfpMessage::RefreshComplete(_) => {
+                if let Some(sid) = msg.session_id() {
+                    warn!(session_id = %hex::encode(sid), "Distributed refresh not yet implemented");
+                }
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;
