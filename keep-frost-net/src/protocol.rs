@@ -20,10 +20,12 @@ pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 
+const MAX_FUTURE_SKEW_SECS: u64 = 30;
+
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     let now = chrono::Utc::now().timestamp() as u64;
     let min_valid = now.saturating_sub(window_secs);
-    let max_valid = now.saturating_add(window_secs);
+    let max_valid = now.saturating_add(MAX_FUTURE_SKEW_SECS);
     created_at >= min_valid && created_at <= max_valid
 }
 
@@ -110,6 +112,9 @@ impl KfpMessage {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             KfpMessage::Announce(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
                 if let Some(ref name) = p.name {
                     if name.len() > MAX_NAME_LENGTH {
                         return Err("Name exceeds maximum length");
@@ -175,8 +180,18 @@ impl KfpMessage {
                 if p.participants.len() < 2 {
                     return Err("Refresh requires at least 2 participants");
                 }
+                if p.participants.iter().any(|&id| id == 0) {
+                    return Err("Participant index must be non-zero");
+                }
+                let unique: std::collections::HashSet<_> = p.participants.iter().collect();
+                if unique.len() != p.participants.len() {
+                    return Err("Duplicate participant indices");
+                }
             }
             KfpMessage::RefreshRound1(p) => {
+                if p.package.is_empty() {
+                    return Err("Package must not be empty");
+                }
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round1 package exceeds maximum size");
                 }
@@ -185,6 +200,9 @@ impl KfpMessage {
                 }
             }
             KfpMessage::RefreshRound2(p) => {
+                if p.package.is_empty() {
+                    return Err("Package must not be empty");
+                }
                 if p.package.len() > MAX_MESSAGE_SIZE {
                     return Err("Round2 package exceeds maximum size");
                 }
@@ -193,6 +211,9 @@ impl KfpMessage {
                 }
                 if p.target_index == 0 {
                     return Err("target_index must be non-zero");
+                }
+                if p.share_index == p.target_index {
+                    return Err("share_index must differ from target_index");
                 }
             }
             KfpMessage::RefreshComplete(p) => {
@@ -562,7 +583,7 @@ impl RefreshRequestPayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RefreshRound1Payload {
     #[serde(with = "hex_bytes")]
     pub session_id: [u8; 32],
@@ -584,6 +605,17 @@ impl RefreshRound1Payload {
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
         within_replay_window(self.created_at, window_secs)
+    }
+}
+
+impl std::fmt::Debug for RefreshRound1Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshRound1Payload")
+            .field("session_id", &hex::encode(self.session_id))
+            .field("share_index", &self.share_index)
+            .field("package", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 
@@ -655,71 +687,35 @@ impl RefreshCompletePayload {
     }
 }
 
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
+macro_rules! hex_bytes_serde {
+    ($mod_name:ident, $size:expr) => {
+        mod $mod_name {
+            use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
+            pub fn serialize<S>(bytes: &[u8; $size], serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&hex::encode(bytes))
+            }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
-    }
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; $size], D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom(format!("expected {} bytes", $size)))
+            }
+        }
+    };
 }
 
-mod hex_bytes_33 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 33 bytes"))
-    }
-}
-
-mod hex_bytes_64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
-    }
-}
+hex_bytes_serde!(hex_bytes, 32);
+hex_bytes_serde!(hex_bytes_33, 33);
+hex_bytes_serde!(hex_bytes_64, 64);
 
 mod hex_bytes_option {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -979,10 +975,14 @@ mod tests {
         assert!(!old_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
         assert!(old_payload.is_within_replay_window(500));
 
-        let mut future_payload = payload.clone();
-        future_payload.created_at = chrono::Utc::now().timestamp() as u64 + 400;
-        assert!(!future_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
-        assert!(future_payload.is_within_replay_window(500));
+        let mut slight_future = payload.clone();
+        slight_future.created_at = chrono::Utc::now().timestamp() as u64 + 10;
+        assert!(slight_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+
+        let mut far_future = payload.clone();
+        far_future.created_at = chrono::Utc::now().timestamp() as u64 + 400;
+        assert!(!far_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+        assert!(!far_future.is_within_replay_window(500));
     }
 
     #[test]

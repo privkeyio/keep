@@ -438,6 +438,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Store multiple FROST shares atomically.
+    pub fn store_shares_atomic(&self, shares: &[StoredShare]) -> Result<()> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let mut entries_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(shares.len());
+        for share in shares {
+            let serialized = bincode::serialize(share)?;
+            let encrypted = crypto::encrypt(&serialized, data_key)?;
+            let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
+            entries_data.push((id.to_vec(), encrypted.to_bytes()));
+        }
+
+        let entries_refs: Vec<(&[u8], &[u8])> = entries_data
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        backend.put_batch(SHARES_TABLE, &entries_refs)
+    }
+
     /// List all stored FROST shares.
     pub fn list_shares(&self) -> Result<Vec<StoredShare>> {
         trace!("listing FROST shares");
@@ -705,7 +726,7 @@ impl Storage {
             let new_data_key = SecretKey::generate()?;
             self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
 
-            let new_header = self.encrypt_data_key_in_header(password, &new_data_key)?;
+            let new_header = self.create_header_with_key(password, &new_data_key)?;
             write_header_atomically(&self.path, &new_header)?;
 
             self.header = new_header;
@@ -894,24 +915,6 @@ impl Storage {
         }
 
         Ok(())
-    }
-
-    fn encrypt_data_key_in_header(&self, password: &str, data_key: &SecretKey) -> Result<Header> {
-        let master_key = crypto::derive_key(
-            password.as_bytes(),
-            &self.header.salt,
-            self.header.argon2_params(),
-        )?;
-        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
-        let data_key_bytes = data_key.decrypt()?;
-        let encrypted = crypto::encrypt(&*data_key_bytes, &header_key)?;
-
-        let mut new_header = self.header.clone();
-        new_header.nonce.copy_from_slice(&encrypted.nonce);
-        new_header
-            .encrypted_data_key
-            .copy_from_slice(&encrypted.ciphertext);
-        Ok(new_header)
     }
 }
 

@@ -446,11 +446,14 @@ impl Keep {
 
         let threshold = group_shares[0].metadata.threshold;
 
-        if (group_shares.len() as u16) < threshold {
+        let share_count: u16 = group_shares
+            .len()
+            .try_into()
+            .map_err(|_| KeepError::Frost("Too many shares".into()))?;
+        if share_count < threshold {
             return Err(KeepError::Frost(format!(
                 "Need at least {} shares to refresh, only {} available locally",
-                threshold,
-                group_shares.len()
+                threshold, share_count
             )));
         }
 
@@ -466,14 +469,7 @@ impl Keep {
             .map(|share| StoredShare::encrypt(share, &data_key))
             .collect::<Result<_>>()?;
 
-        for encrypted in &encrypted_shares {
-            if let Err(e) = self.storage.store_share(encrypted) {
-                for original in &group_shares {
-                    let _ = self.storage.store_share(original);
-                }
-                return Err(e);
-            }
-        }
+        self.storage.store_shares_atomic(&encrypted_shares)?;
 
         let metadata: Vec<_> = refreshed.iter().map(|s| s.metadata.clone()).collect();
         let participants: Vec<u16> = metadata.iter().map(|m| m.identifier).collect();

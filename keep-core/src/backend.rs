@@ -36,6 +36,14 @@ pub trait StorageBackend: Send + Sync {
     /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
 
+    /// Store multiple key-value pairs in a single atomic operation.
+    fn put_batch(&self, table: &str, entries: &[(&[u8], &[u8])]) -> Result<()> {
+        for (key, value) in entries {
+            self.put(table, key, value)?;
+        }
+        Ok(())
+    }
+
     /// Get the current schema version.
     ///
     /// Default implementation returns `CURRENT_SCHEMA_VERSION`, suitable for
@@ -173,6 +181,18 @@ impl StorageBackend for RedbBackend {
     fn create_table(&self, table: &str) -> Result<()> {
         let wtxn = self.db.begin_write()?;
         wtxn.open_table(self.table_def(table)?)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn put_batch(&self, table: &str, entries: &[(&[u8], &[u8])]) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut tbl = wtxn.open_table(self.table_def(table)?)?;
+            for (key, value) in entries {
+                tbl.insert(*key, *value)?;
+            }
+        }
         wtxn.commit()?;
         Ok(())
     }

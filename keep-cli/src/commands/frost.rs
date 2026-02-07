@@ -313,11 +313,14 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     let threshold = group_shares[0].metadata.threshold;
     let total = group_shares[0].metadata.total_shares;
 
-    if (group_shares.len() as u16) < threshold {
+    let share_count: u16 = group_shares
+        .len()
+        .try_into()
+        .map_err(|_| KeepError::Frost("Too many shares".into()))?;
+    if share_count < threshold {
         return Err(KeepError::Frost(format!(
             "Need at least {} shares to refresh, only {} available locally",
-            threshold,
-            group_shares.len()
+            threshold, share_count
         )));
     }
 
