@@ -6,6 +6,8 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 use tracing::{debug, info, warn};
 
+use zeroize::Zeroizing;
+
 use crate::ecdh::{compute_partial_ecdh, derive_ecdh_session_id};
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
@@ -57,11 +59,13 @@ impl KfpNode {
 
         let key_package = self.share.key_package()?;
         let signing_share = key_package.signing_share();
-        let signing_share_bytes: [u8; 32] = signing_share
-            .serialize()
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share
+                .serialize()
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
 
         let partial = compute_partial_ecdh(&signing_share_bytes, &request.recipient_pubkey)?;
 
@@ -213,11 +217,13 @@ impl KfpNode {
 
         let key_package = self.share.key_package()?;
         let signing_share = key_package.signing_share();
-        let signing_share_bytes: [u8; 32] = signing_share
-            .serialize()
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share
+                .serialize()
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
 
         let our_partial = compute_partial_ecdh(&signing_share_bytes, recipient_pubkey)?;
 

@@ -20,10 +20,12 @@ pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 
+const MAX_FUTURE_SKEW_SECS: u64 = 30;
+
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     let now = chrono::Utc::now().timestamp() as u64;
     let min_valid = now.saturating_sub(window_secs);
-    let max_valid = now.saturating_add(window_secs);
+    let max_valid = now.saturating_add(MAX_FUTURE_SKEW_SECS);
     created_at >= min_valid && created_at <= max_valid
 }
 
@@ -110,6 +112,9 @@ impl KfpMessage {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             KfpMessage::Announce(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
                 if let Some(ref name) = p.name {
                     if name.len() > MAX_NAME_LENGTH {
                         return Err("Name exceeds maximum length");
@@ -974,10 +979,14 @@ mod tests {
         assert!(!old_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
         assert!(old_payload.is_within_replay_window(500));
 
-        let mut future_payload = payload.clone();
-        future_payload.created_at = chrono::Utc::now().timestamp() as u64 + 400;
-        assert!(!future_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
-        assert!(future_payload.is_within_replay_window(500));
+        let mut slight_future = payload.clone();
+        slight_future.created_at = chrono::Utc::now().timestamp() as u64 + 10;
+        assert!(slight_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+
+        let mut far_future = payload.clone();
+        far_future.created_at = chrono::Utc::now().timestamp() as u64 + 400;
+        assert!(!far_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
+        assert!(!far_future.is_within_replay_window(500));
     }
 
     #[test]

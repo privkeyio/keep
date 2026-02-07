@@ -10,6 +10,7 @@ use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::rand_core::OsRng;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
+use zeroize::Zeroize;
 
 use crate::error::{KeepError, Result};
 
@@ -65,11 +66,14 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         }
     }
 
-    if (shares.len() as u16) < threshold {
+    let share_count: u16 = shares
+        .len()
+        .try_into()
+        .map_err(|_| KeepError::Frost("Too many shares".into()))?;
+    if share_count < threshold {
         return Err(KeepError::Frost(format!(
             "Need at least {} shares to refresh, only {} available",
-            threshold,
-            shares.len()
+            threshold, share_count
         )));
     }
 
@@ -91,6 +95,14 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             &mut OsRng,
         )
         .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {}", e)))?;
+
+    if refreshing_shares.len() != identifiers.len() {
+        return Err(KeepError::Frost(format!(
+            "Expected {} refreshing shares, got {}",
+            identifiers.len(),
+            refreshing_shares.len()
+        )));
+    }
 
     let refreshing_by_id: BTreeMap<Identifier, _> =
         identifiers.iter().copied().zip(refreshing_shares).collect();
@@ -117,6 +129,8 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
+    let mut key_packages = key_packages;
+    key_packages.iter_mut().for_each(|kp| kp.zeroize());
     drop(key_packages);
 
     let new_group_pubkey = *new_packages[0].group_pubkey();

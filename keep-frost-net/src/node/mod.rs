@@ -18,6 +18,7 @@ use rand_09::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 use keep_core::frost::SharePackage;
 
@@ -397,10 +398,12 @@ impl KfpNode {
 
         let signing_share = key_package.signing_share();
         let signing_share_serialized = signing_share.serialize();
-        let signing_share_bytes: [u8; 32] = signing_share_serialized
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share_serialized
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
 
         let verifying_share = key_package.verifying_share();
         let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
@@ -803,17 +806,10 @@ impl KfpNode {
 }
 
 fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
-    let key_package = share
-        .key_package()
-        .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {}", e)))?;
-    let verifying_share = key_package.verifying_share();
-    let vs_bytes = verifying_share.serialize().map_err(|e| {
-        FrostNetError::Crypto(format!("Failed to serialize verifying share: {}", e))
-    })?;
     let mut hasher = Sha256::new();
-    hasher.update(b"keep-frost-node-identity-v1");
+    hasher.update(b"keep-frost-node-identity-v2");
     hasher.update(share.metadata.group_pubkey);
-    hasher.update(vs_bytes.as_slice());
+    hasher.update(share.metadata.identifier.to_be_bytes());
     let derived: [u8; 32] = hasher.finalize().into();
     let secret_key = SecretKey::from_slice(&derived)
         .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {}", e)))?;

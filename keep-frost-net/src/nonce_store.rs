@@ -25,11 +25,14 @@ pub trait NonceStore: Send + Sync {
 pub struct FileNonceStore {
     path: PathBuf,
     consumed: Arc<RwLock<HashSet<[u8; 32]>>>,
+    insertion_order: Arc<RwLock<VecDeque<[u8; 32]>>>,
+    max_entries: usize,
 }
 
 impl FileNonceStore {
     pub fn new(path: &Path) -> Result<Self> {
         let consumed = Arc::new(RwLock::new(HashSet::new()));
+        let insertion_order = Arc::new(RwLock::new(VecDeque::new()));
 
         if path.exists() {
             let file = File::open(path).map_err(|e| {
@@ -63,7 +66,9 @@ impl FileNonceStore {
 
                 let mut session_id = [0u8; 32];
                 session_id.copy_from_slice(&bytes);
-                guard.insert(session_id);
+                if guard.insert(session_id) {
+                    insertion_order.write().push_back(session_id);
+                }
             }
             debug!(count = guard.len(), path = ?path, "Loaded consumed session IDs");
 
@@ -75,6 +80,8 @@ impl FileNonceStore {
         Ok(Self {
             path: path.to_path_buf(),
             consumed,
+            insertion_order,
+            max_entries: DEFAULT_MAX_ENTRIES,
         })
     }
 }
@@ -114,7 +121,10 @@ impl NonceStore for FileNonceStore {
             .map_err(|e| FrostNetError::Session(format!("Failed to sync nonce store: {}", e)))?;
 
         guard.insert(*session_id);
+        drop(guard);
+        self.insertion_order.write().push_back(*session_id);
         debug!(session_id = %hex_id, "Recorded consumed session ID");
+        self.prune_if_needed();
 
         Ok(())
     }
@@ -125,6 +135,19 @@ impl NonceStore for FileNonceStore {
 
     fn count(&self) -> usize {
         self.consumed.read().len()
+    }
+
+    fn prune_if_needed(&self) {
+        let mut consumed = self.consumed.write();
+        let mut order = self.insertion_order.write();
+
+        while consumed.len() > self.max_entries {
+            if let Some(oldest) = order.pop_front() {
+                consumed.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 }
 
