@@ -114,7 +114,7 @@ impl BunkerHandler {
         proxy_host: String,
         proxy_port: u16,
     ) -> Result<(), KeepMobileError> {
-        let proxy = crate::parse_loopback_proxy(&proxy_host, proxy_port)?;
+        let proxy = crate::network::parse_loopback_proxy(&proxy_host, proxy_port)?;
         self.do_start_bunker(relays, callbacks, Some(proxy))
     }
 
