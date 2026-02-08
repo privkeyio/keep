@@ -703,7 +703,9 @@ impl KeepMobile {
 
             let run_node = node.clone();
             tokio::spawn(async move {
-                let _ = run_node.run().await;
+                if let Err(e) = run_node.run().await {
+                    log::error!(target: "KeepFrost", "Node run failed: {e}");
+                }
             });
 
             *self.node.write().await = Some(node);
@@ -734,13 +736,13 @@ impl KeepMobile {
             });
         }
 
-        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
-            KeepMobileError::FrostError {
-                msg: format!("Invalid signing key: {e}"),
-            }
-        })?;
-
-        let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
+        let vk = frost_secp256k1_tr::VerifyingKey::from(
+            &frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("Invalid signing key: {e}"),
+                }
+            })?,
+        );
         let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
             msg: format!("Failed to serialize verifying key: {e}"),
         })?;
@@ -752,7 +754,11 @@ impl KeepMobile {
         })?;
 
         let signing_share = frost_secp256k1_tr::keys::SigningShare::deserialize(
-            &signing_key.serialize(),
+            &frost_secp256k1_tr::SigningKey::deserialize(&key_bytes)
+                .map_err(|e| KeepMobileError::FrostError {
+                    msg: format!("Invalid signing key: {e}"),
+                })?
+                .serialize(),
         )
         .map_err(|e| KeepMobileError::FrostError {
             msg: format!("Failed to create signing share: {e}"),
@@ -766,11 +772,7 @@ impl KeepMobile {
         let key_package = frost_secp256k1_tr::keys::KeyPackage::new(
             identifier,
             signing_share,
-            frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {e}"),
-                }
-            })?,
+            verifying_share,
             frost_secp256k1_tr::VerifyingKey::deserialize(&vk_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
