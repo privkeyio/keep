@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -10,8 +11,9 @@ use iced::{Element, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
 use tracing::error;
+use zeroize::Zeroizing;
 
-use crate::message::Message;
+use crate::message::{Message, ShareIdentity};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
@@ -25,10 +27,30 @@ pub struct App {
     screen: Screen,
 }
 
+fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
+    keep.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let keep_path = keep_core::default_keep_path()
-            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".keep"));
+        let keep_path = match keep_core::default_keep_path() {
+            Ok(p) => p,
+            Err(_) => match dirs::home_dir() {
+                Some(home) => home.join(".keep"),
+                None => {
+                    return (
+                        Self {
+                            keep: Arc::new(Mutex::new(None)),
+                            keep_path: PathBuf::new(),
+                            screen: Screen::Unlock(UnlockScreen::with_error(
+                                "Cannot determine home directory. Set $HOME and restart.".into(),
+                            )),
+                        },
+                        Task::none(),
+                    );
+                }
+            },
+        };
         let vault_exists = keep_path.exists();
         (
             Self {
@@ -44,23 +66,36 @@ impl App {
         match message {
             Message::PasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
-                    s.password = p;
+                    *s.password = p;
                 }
                 Task::none()
             }
             Message::ConfirmPasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
-                    s.confirm_password = p;
+                    *s.confirm_password = p;
                 }
                 Task::none()
             }
             Message::Unlock => self.handle_unlock(),
             Message::UnlockResult(result) => self.handle_unlock_result(result),
             Message::StartFresh => {
+                if let Screen::Unlock(s) = &mut self.screen {
+                    s.start_fresh_confirm = true;
+                }
+                Task::none()
+            }
+            Message::CancelStartFresh => {
+                if let Screen::Unlock(s) = &mut self.screen {
+                    s.start_fresh_confirm = false;
+                }
+                Task::none()
+            }
+            Message::ConfirmStartFresh => {
                 if self.keep_path.exists() {
                     if let Err(e) = std::fs::remove_dir_all(&self.keep_path) {
                         if let Screen::Unlock(s) = &mut self.screen {
                             s.error = Some(format!("Failed to remove vault: {e}"));
+                            s.start_fresh_confirm = false;
                         }
                         return Task::none();
                     }
@@ -90,7 +125,7 @@ impl App {
                 Task::none()
             }
             Message::Lock => {
-                let mut guard = self.keep.lock().unwrap();
+                let mut guard = lock_keep(&self.keep);
                 if let Some(keep) = guard.as_mut() {
                     keep.lock();
                 }
@@ -106,8 +141,8 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ConfirmDelete(i) => {
-                self.handle_delete(i);
+            Message::ConfirmDelete(id) => {
+                self.handle_delete(id);
                 Task::none()
             }
             Message::CancelDelete => {
@@ -140,7 +175,7 @@ impl App {
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
-                    s.passphrase = p;
+                    *s.passphrase = p;
                 }
                 Task::none()
             }
@@ -156,7 +191,7 @@ impl App {
             }
             Message::ImportPassphraseChanged(p) => {
                 if let Screen::Import(s) = &mut self.screen {
-                    s.passphrase = p;
+                    *s.passphrase = p;
                 }
                 Task::none()
             }
@@ -170,7 +205,7 @@ impl App {
     }
 
     fn current_shares(&self) -> Vec<ShareEntry> {
-        let guard = self.keep.lock().unwrap();
+        let guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_ref() {
             match keep.frost_list_shares() {
                 Ok(stored) => stored.iter().map(ShareEntry::from_stored).collect(),
@@ -200,13 +235,13 @@ impl App {
                     s.error = Some("Password required".into());
                     return Task::none();
                 }
-                if !s.vault_exists && s.password != s.confirm_password {
+                if !s.vault_exists && *s.password != *s.confirm_password {
                     s.error = Some("Passwords do not match".into());
                     return Task::none();
                 }
                 s.loading = true;
                 s.error = None;
-                (s.password.clone(), s.vault_exists)
+                (Zeroizing::new(s.password.to_string()), s.vault_exists)
             }
             _ => return Task::none(),
         };
@@ -233,7 +268,7 @@ impl App {
                         .map(ShareEntry::from_stored)
                         .collect();
 
-                    *keep_arc.lock().unwrap() = Some(keep);
+                    *lock_keep(&keep_arc) = Some(keep);
                     Ok(shares)
                 })
                 .await
@@ -258,20 +293,12 @@ impl App {
         Task::none()
     }
 
-    fn handle_delete(&mut self, index: usize) {
-        let shares = self.current_shares();
-        let share = match shares.get(index) {
-            Some(s) => s.clone(),
-            None => return,
-        };
-
+    fn handle_delete(&mut self, id: ShareIdentity) {
         let result = {
-            let mut guard = self.keep.lock().unwrap();
-            if let Some(keep) = guard.as_mut() {
-                Some(keep.frost_delete_share(&share.group_pubkey, share.identifier))
-            } else {
-                None
-            }
+            let mut guard = lock_keep(&self.keep);
+            guard
+                .as_mut()
+                .map(|keep| keep.frost_delete_share(&id.group_pubkey, id.identifier))
         };
 
         match result {
@@ -318,13 +345,11 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = keep_arc
-                        .lock()
-                        .unwrap()
+                    let mut keep = lock_keep(&keep_arc)
                         .take()
                         .ok_or_else(|| "Keep not available".to_string())?;
 
-                    let result = (|| {
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         keep.frost_generate(threshold, total, &name)
                             .map_err(|e| e.to_string())?;
                         let shares = keep
@@ -334,10 +359,14 @@ impl App {
                             .map(ShareEntry::from_stored)
                             .collect();
                         Ok(shares)
-                    })();
+                    }));
 
-                    *keep_arc.lock().unwrap() = Some(keep);
-                    result
+                    *lock_keep(&keep_arc) = Some(keep);
+
+                    match result {
+                        Ok(r) => r,
+                        Err(_) => Err("Internal error during keyset creation".to_string()),
+                    }
                 })
                 .await
                 .map_err(|e| e.to_string())?
@@ -366,7 +395,7 @@ impl App {
             Screen::Export(s) => {
                 s.loading = true;
                 s.error = None;
-                (s.share.clone(), s.passphrase.clone())
+                (s.share.clone(), Zeroizing::new(s.passphrase.to_string()))
             }
             _ => return Task::none(),
         };
@@ -375,21 +404,23 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = keep_arc
-                        .lock()
-                        .unwrap()
+                    let mut keep = lock_keep(&keep_arc)
                         .take()
                         .ok_or_else(|| "Keep not available".to_string())?;
 
-                    let result = (|| {
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
                         export.to_bech32().map_err(|e| e.to_string())
-                    })();
+                    }));
 
-                    *keep_arc.lock().unwrap() = Some(keep);
-                    result
+                    *lock_keep(&keep_arc) = Some(keep);
+
+                    match result {
+                        Ok(r) => r,
+                        Err(_) => Err("Internal error during export".to_string()),
+                    }
                 })
                 .await
                 .map_err(|e| e.to_string())?
@@ -420,7 +451,7 @@ impl App {
             Screen::Import(s) => {
                 s.loading = true;
                 s.error = None;
-                (s.data.clone(), s.passphrase.clone())
+                (s.data.clone(), Zeroizing::new(s.passphrase.to_string()))
             }
             _ => return Task::none(),
         };
@@ -429,13 +460,11 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = keep_arc
-                        .lock()
-                        .unwrap()
+                    let mut keep = lock_keep(&keep_arc)
                         .take()
                         .ok_or_else(|| "Keep not available".to_string())?;
 
-                    let result = (|| {
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let export = ShareExport::parse(&data).map_err(|e| e.to_string())?;
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(|e| e.to_string())?;
@@ -446,10 +475,14 @@ impl App {
                             .map(ShareEntry::from_stored)
                             .collect();
                         Ok(shares)
-                    })();
+                    }));
 
-                    *keep_arc.lock().unwrap() = Some(keep);
-                    result
+                    *lock_keep(&keep_arc) = Some(keep);
+
+                    match result {
+                        Ok(r) => r,
+                        Err(_) => Err("Internal error during import".to_string()),
+                    }
                 })
                 .await
                 .map_err(|e| e.to_string())?

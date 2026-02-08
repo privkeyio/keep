@@ -5,14 +5,15 @@
 
 use iced::widget::{button, column, container, qr_code, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use zeroize::Zeroizing;
 
 use crate::message::Message;
 use crate::screen::shares::ShareEntry;
 
 pub struct ExportScreen {
     pub share: ShareEntry,
-    pub passphrase: String,
-    pub bech32: Option<String>,
+    pub passphrase: Zeroizing<String>,
+    pub bech32: Option<Zeroizing<String>>,
     pub qr_data: Option<qr_code::Data>,
     pub error: Option<String>,
     pub loading: bool,
@@ -22,7 +23,7 @@ impl ExportScreen {
     pub fn new(share: ShareEntry) -> Self {
         Self {
             share,
-            passphrase: String::new(),
+            passphrase: Zeroizing::new(String::new()),
             bech32: None,
             qr_data: None,
             error: None,
@@ -34,7 +35,7 @@ impl ExportScreen {
         match qr_code::Data::new(&bech32) {
             Ok(data) => {
                 self.qr_data = Some(data);
-                self.bech32 = Some(bech32);
+                self.bech32 = Some(Zeroizing::new(bech32));
                 self.error = None;
             }
             Err(e) => {
@@ -71,7 +72,7 @@ impl ExportScreen {
             let display = if bech32.len() > 80 {
                 format!("{}...", &bech32[..80])
             } else {
-                bech32.clone()
+                bech32.to_string()
             };
             content = content.push(
                 text(display)
@@ -81,7 +82,7 @@ impl ExportScreen {
 
             content = content.push(
                 button(text("Copy to Clipboard"))
-                    .on_press(Message::CopyToClipboard(bech32.clone()))
+                    .on_press(Message::CopyToClipboard(bech32.to_string()))
                     .padding(8),
             );
         } else {

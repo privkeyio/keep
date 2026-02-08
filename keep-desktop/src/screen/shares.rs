@@ -6,7 +6,7 @@
 use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
-use crate::message::Message;
+use crate::message::{Message, ShareIdentity};
 
 #[derive(Debug, Clone)]
 pub struct ShareEntry {
@@ -118,7 +118,10 @@ impl ShareListScreen {
                         Space::with_width(Length::Fill),
                         text("Delete?").size(14),
                         button(text("Yes"))
-                            .on_press(Message::ConfirmDelete(i))
+                            .on_press(Message::ConfirmDelete(ShareIdentity {
+                                group_pubkey: share.group_pubkey,
+                                identifier: share.identifier,
+                            }))
                             .padding(6),
                         button(text("No"))
                             .on_press(Message::CancelDelete)

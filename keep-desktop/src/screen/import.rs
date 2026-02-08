@@ -5,12 +5,13 @@
 
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use zeroize::Zeroizing;
 
 use crate::message::Message;
 
 pub struct ImportScreen {
     pub data: String,
-    pub passphrase: String,
+    pub passphrase: Zeroizing<String>,
     pub error: Option<String>,
     pub loading: bool,
 }
@@ -19,7 +20,7 @@ impl ImportScreen {
     pub fn new() -> Self {
         Self {
             data: String::new(),
-            passphrase: String::new(),
+            passphrase: Zeroizing::new(String::new()),
             error: None,
             loading: false,
         }
