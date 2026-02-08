@@ -46,13 +46,10 @@ pub fn verify_proof(
     share_index: u16,
     timestamp: u64,
 ) -> Result<()> {
-    // Validate SEC1 compressed point prefix (0x02 = even y, 0x03 = odd y)
-    // BIP-340 x-only keys use even-y representation, so we only accept 0x02 prefix
-    // to ensure signing/verification consistency
     let prefix = verifying_share[0];
-    if prefix != 0x02 {
+    if prefix != 0x02 && prefix != 0x03 {
         return Err(FrostNetError::Crypto(format!(
-            "Invalid verifying share prefix: expected 0x02, got 0x{prefix:02x}"
+            "Invalid verifying share prefix: expected 0x02 or 0x03, got 0x{prefix:02x}"
         )));
     }
 
@@ -178,16 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_rejects_odd_y_prefix() {
+    fn test_proof_accepts_odd_y_prefix() {
         let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
         let verifying_key = signing_key.verifying_key();
 
         let mut signing_share = [0u8; 32];
         signing_share.copy_from_slice(&signing_key.to_bytes());
 
-        // Create verifying share with odd-y prefix (0x03)
         let mut verifying_share = [0u8; 33];
-        verifying_share[0] = 0x03; // Invalid: odd y prefix
+        verifying_share[0] = 0x03;
         verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
 
         let group_pubkey = [1u8; 32];
@@ -203,13 +199,27 @@ mod tests {
         )
         .unwrap();
 
-        let result = verify_proof(
+        verify_proof(
             &verifying_share,
             &signature,
             &group_pubkey,
             share_index,
             timestamp,
-        );
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_proof_rejects_invalid_prefix() {
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x04;
+        verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+        let group_pubkey = [1u8; 32];
+        let result = verify_proof(&verifying_share, &[0u8; 64], &group_pubkey, 1, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prefix"));
     }
