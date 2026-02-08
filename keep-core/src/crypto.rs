@@ -368,14 +368,14 @@ pub fn derive_key(
         params.parallelism,
         Some(KEY_SIZE),
     )
-    .map_err(|e| CryptoError::kdf(format!("argon2 params: {}", e)))?;
+    .map_err(|e| CryptoError::kdf(format!("argon2 params: {e}")))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
 
     let mut output = [0u8; KEY_SIZE];
     argon2
         .hash_password_into(password, salt, &mut output)
-        .map_err(|e| CryptoError::kdf(format!("argon2: {}", e)))?;
+        .map_err(|e| CryptoError::kdf(format!("argon2: {e}")))?;
 
     SecretKey::new(output)
 }

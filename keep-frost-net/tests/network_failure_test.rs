@@ -404,8 +404,7 @@ fn test_session_cleanup_removes_nonces() {
             err,
             FrostNetError::ReplayDetected(_) | FrostNetError::NonceConsumed(_)
         ),
-        "Expected ReplayDetected or NonceConsumed, got: {}",
-        err
+        "Expected ReplayDetected or NonceConsumed, got: {err}"
     );
 }
 
@@ -428,8 +427,7 @@ fn test_no_nonce_reuse_across_retried_sessions() {
     let err = result.err().expect("Expected error for nonce reuse");
     assert!(
         err.to_string().contains("Nonce") || err.to_string().contains("active"),
-        "Expected nonce consumption error, got: {}",
-        err
+        "Expected nonce consumption error, got: {err}"
     );
 }
 

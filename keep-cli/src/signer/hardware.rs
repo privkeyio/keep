@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
@@ -43,7 +40,7 @@ impl HardwareSigner {
         let port = serialport::new(device, 115200)
             .timeout(Duration::from_secs(30))
             .open()
-            .with_context(|| format!("Failed to open serial port: {}", device))?;
+            .with_context(|| format!("Failed to open serial port: {device}"))?;
 
         let reader_port = port
             .try_clone()
@@ -71,7 +68,7 @@ impl HardwareSigner {
         };
 
         let request_json = serde_json::to_string(&request)?;
-        writeln!(self.port, "{}", request_json)?;
+        writeln!(self.port, "{request_json}")?;
         self.port.flush()?;
 
         let mut response_line = String::new();
@@ -155,7 +152,7 @@ impl HardwareSigner {
             .ok_or_else(|| anyhow!("Missing index in response"))?;
         let index: u16 = index_u64
             .try_into()
-            .map_err(|_| anyhow!("index out of range: {}", index_u64))?;
+            .map_err(|_| anyhow!("index out of range: {index_u64}"))?;
         Ok((pubkey, index))
     }
 
@@ -280,7 +277,7 @@ impl HardwareSigner {
             .ok_or_else(|| anyhow!("Missing index in response"))?;
         let index: u16 = index_u64
             .try_into()
-            .map_err(|_| anyhow!("index out of range: {}", index_u64))?;
+            .map_err(|_| anyhow!("index out of range: {index_u64}"))?;
 
         Ok((commitment, index))
     }
@@ -310,7 +307,7 @@ impl HardwareSigner {
             .ok_or_else(|| anyhow!("Missing index in response"))?;
         let index: u16 = index_u64
             .try_into()
-            .map_err(|_| anyhow!("index out of range: {}", index_u64))?;
+            .map_err(|_| anyhow!("index out of range: {index_u64}"))?;
 
         Ok((sig_share, index))
     }

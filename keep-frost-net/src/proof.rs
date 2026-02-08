@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use k256::schnorr::{
     signature::{Signer, Verifier},
     Signature, SigningKey, VerifyingKey,
@@ -37,7 +34,7 @@ pub fn sign_proof(
 ) -> Result<[u8; 64]> {
     let message = compute_proof_message(group_pubkey, share_index, verifying_share, timestamp);
     let signing_key = SigningKey::from_bytes(signing_share_bytes)
-        .map_err(|e| FrostNetError::Crypto(format!("Invalid signing share: {}", e)))?;
+        .map_err(|e| FrostNetError::Crypto(format!("Invalid signing share: {e}")))?;
     let signature = signing_key.sign(&message);
     Ok(signature.to_bytes())
 }
@@ -55,8 +52,7 @@ pub fn verify_proof(
     let prefix = verifying_share[0];
     if prefix != 0x02 {
         return Err(FrostNetError::Crypto(format!(
-            "Invalid verifying share prefix: expected 0x02, got 0x{:02x}",
-            prefix
+            "Invalid verifying share prefix: expected 0x02, got 0x{prefix:02x}"
         )));
     }
 
@@ -65,9 +61,9 @@ pub fn verify_proof(
         .try_into()
         .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
     let verifying_key = VerifyingKey::from_bytes(&x_only)
-        .map_err(|e| FrostNetError::Crypto(format!("Invalid verifying share: {}", e)))?;
+        .map_err(|e| FrostNetError::Crypto(format!("Invalid verifying share: {e}")))?;
     let signature = Signature::try_from(proof_signature.as_slice())
-        .map_err(|e| FrostNetError::Crypto(format!("Invalid proof signature: {}", e)))?;
+        .map_err(|e| FrostNetError::Crypto(format!("Invalid proof signature: {e}")))?;
     verifying_key
         .verify(&message, &signature)
         .map_err(|_| FrostNetError::Crypto("Proof-of-share verification failed".into()))

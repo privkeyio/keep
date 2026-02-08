@@ -56,8 +56,7 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
                 .interact()
                 .map_err(|e| {
                     KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                        "read password: {}",
-                        e
+                        "read password: {e}"
                     )))
                 })?;
             SecretString::from(pw)
@@ -691,7 +690,7 @@ pub fn cmd_delete(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
 
     let pubkey = slot.pubkey;
 
-    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name))? {
+    if !get_confirm(&format!("Delete key '{name}'? This cannot be undone!"))? {
         out.info("Cancelled.");
         return Ok(());
     }
@@ -700,7 +699,7 @@ pub fn cmd_delete(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
     info!(name, "key deleted");
 
     out.newline();
-    out.success(&format!("Deleted key: {}", name));
+    out.success(&format!("Deleted key: {name}"));
 
     Ok(())
 }
@@ -726,7 +725,7 @@ fn cmd_delete_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
 
     let id = crypto::blake2b_256(&record.pubkey);
 
-    if !get_confirm(&format!("Delete key '{}'? This cannot be undone!", name))? {
+    if !get_confirm(&format!("Delete key '{name}'? This cannot be undone!"))? {
         out.info("Cancelled.");
         return Ok(());
     }
@@ -735,7 +734,7 @@ fn cmd_delete_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     info!(name, "key deleted from outer volume");
 
     out.newline();
-    out.success(&format!("Deleted key: {}", name));
+    out.success(&format!("Deleted key: {name}"));
 
     Ok(())
 }
@@ -762,8 +761,7 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     let id = crypto::blake2b_256(&record.pubkey);
 
     if !get_confirm(&format!(
-        "Delete key '{}' from hidden volume? This cannot be undone!",
-        name
+        "Delete key '{name}' from hidden volume? This cannot be undone!"
     ))? {
         out.info("Cancelled.");
         return Ok(());
@@ -773,7 +771,7 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     info!(name, "key deleted from hidden volume");
 
     out.newline();
-    out.success(&format!("Deleted key from hidden volume: {}", name));
+    out.success(&format!("Deleted key from hidden volume: {name}"));
 
     Ok(())
 }

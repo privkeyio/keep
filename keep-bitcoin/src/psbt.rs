@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use crate::error::{BitcoinError, Result};
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
@@ -218,7 +215,7 @@ pub fn parse_psbt_base64(base64: &str) -> Result<Psbt> {
     use bitcoin::base64::{engine::general_purpose::STANDARD, Engine};
     let bytes = STANDARD
         .decode(base64)
-        .map_err(|e| BitcoinError::InvalidPsbt(format!("Invalid base64: {}", e)))?;
+        .map_err(|e| BitcoinError::InvalidPsbt(format!("Invalid base64: {e}")))?;
     parse_psbt(&bytes)
 }
 

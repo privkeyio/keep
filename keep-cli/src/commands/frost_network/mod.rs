@@ -52,12 +52,12 @@ pub fn cmd_frost_network_serve(
     out.header("FROST Network Node");
     out.field("Group", group_npub);
     out.field("Share", &share_index.to_string());
-    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.field("Threshold", &format!("{threshold}-of-{total_shares}"));
     out.field("Relay", relay);
     out.newline();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         out.info("Starting FROST coordination node...");
@@ -135,7 +135,7 @@ pub fn cmd_frost_network_peers(
     out.newline();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         let spinner = out.spinner("Connecting and discovering peers...");
@@ -214,12 +214,11 @@ pub fn cmd_frost_network_sign(
             (Some(t), Some(p)) => (t, p),
             _ => {
                 let mut signer = HardwareSigner::new(device).map_err(|e| {
-                    KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e)))
+                    KeepError::NetworkErr(NetworkError::connection(format!("hardware: {e}")))
                 })?;
                 let info = signer.get_share_info(group_npub).map_err(|e| {
                     KeepError::FrostErr(FrostError::session(format!(
-                        "failed to get share info: {}",
-                        e
+                        "failed to get share info: {e}"
                     )))
                 })?;
                 (
@@ -230,8 +229,7 @@ pub fn cmd_frost_network_sign(
         };
         if threshold < 2 || threshold > participants {
             return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-                "must be 2 <= threshold ({}) <= participants ({})",
-                threshold, participants
+                "must be 2 <= threshold ({threshold}) <= participants ({participants})"
             ))));
         }
         return cmd_frost_network_sign_hardware(
@@ -293,7 +291,7 @@ pub fn cmd_frost_network_sign(
     out.newline();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     rt.block_on(async {
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await

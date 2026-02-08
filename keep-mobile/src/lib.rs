@@ -140,7 +140,7 @@ impl KeepMobile {
             .enable_all()
             .build()
             .map_err(|e| KeepMobileError::InitializationFailed {
-                msg: format!("Runtime: {}", e),
+                msg: format!("Runtime: {e}"),
             })?;
 
         let velocity = Self::load_velocity(&storage)?;
@@ -236,14 +236,14 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
                 .serialize()
                 .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 })?,
             pubkey_package_bytes: share
                 .pubkey_package()
                 .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
                 .serialize()
                 .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 })?,
         };
 
@@ -532,7 +532,7 @@ impl KeepMobile {
 
         let bundle_bytes =
             hex::decode(&bundle_hex).map_err(|e| KeepMobileError::InvalidPolicy {
-                msg: format!("Invalid hex: {}", e),
+                msg: format!("Invalid hex: {e}"),
             })?;
 
         let bundle = PolicyBundle::from_bytes(&bundle_bytes)?;
@@ -700,8 +700,7 @@ impl KeepMobile {
         if name.chars().count() > MAX_SHARE_NAME_LENGTH {
             return Err(KeepMobileError::InvalidShare {
                 msg: format!(
-                    "Share name exceeds maximum length of {} characters",
-                    MAX_SHARE_NAME_LENGTH
+                    "Share name exceeds maximum length of {MAX_SHARE_NAME_LENGTH} characters"
                 ),
             });
         }
@@ -796,7 +795,7 @@ impl KeepMobile {
         };
         let map: HashMap<String, String> =
             serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-                msg: format!("Failed to deserialize cert pins: {}", e),
+                msg: format!("Failed to deserialize cert pins: {e}"),
             })?;
 
         let mut pins = keep_frost_net::CertificatePinSet::new();
@@ -809,7 +808,7 @@ impl KeepMobile {
                         malformed.push(format!("{}: invalid length {}", hostname, bytes.len()))
                     }
                 },
-                Err(e) => malformed.push(format!("{}: hex decode failed: {}", hostname, e)),
+                Err(e) => malformed.push(format!("{hostname}: hex decode failed: {e}")),
             }
         }
         if malformed.is_empty() {
@@ -835,7 +834,7 @@ impl KeepMobile {
             .map(|(k, v)| (k.clone(), hex::encode(v)))
             .collect();
         let data = serde_json::to_vec(&map).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to serialize cert pins: {}", e),
+            msg: format!("Failed to serialize cert pins: {e}"),
         })?;
         let metadata = ShareMetadataInfo {
             name: "cert_pins".into(),
@@ -863,13 +862,13 @@ impl KeepMobile {
             &stored.key_package_bytes,
         )
         .map_err(|e| KeepMobileError::InvalidShare {
-            msg: format!("Invalid key package: {}", e),
+            msg: format!("Invalid key package: {e}"),
         })?;
 
         let pubkey_package =
             frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
                 .map_err(|e| KeepMobileError::InvalidShare {
-                msg: format!("Invalid pubkey package: {}", e),
+                msg: format!("Invalid pubkey package: {e}"),
             })?;
 
         SharePackage::new(metadata, &key_package, &pubkey_package)
@@ -921,7 +920,7 @@ impl KeepMobile {
     fn load_policy(storage: &Arc<dyn SecureStorage>) -> Result<PolicyBundle, KeepMobileError> {
         let data = storage.load_share_by_key(POLICY_STORAGE_KEY.into())?;
         serde_json::from_slice(&data).map_err(|e| KeepMobileError::InvalidPolicy {
-            msg: format!("Failed to deserialize policy: {}", e),
+            msg: format!("Failed to deserialize policy: {e}"),
         })
     }
 
@@ -930,7 +929,7 @@ impl KeepMobile {
         bundle: &PolicyBundle,
     ) -> Result<(), KeepMobileError> {
         let data = serde_json::to_vec(bundle).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to serialize policy: {}", e),
+            msg: format!("Failed to serialize policy: {e}"),
         })?;
         let metadata = ShareMetadataInfo {
             name: "policy".into(),
@@ -946,7 +945,7 @@ impl KeepMobile {
         match storage.load_share_by_key(VELOCITY_STORAGE_KEY.into()) {
             Ok(data) => {
                 VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
-                    msg: format!("Failed to deserialize velocity: {}", e),
+                    msg: format!("Failed to deserialize velocity: {e}"),
                 })
             }
             Err(_) => Ok(VelocityTracker::new()),
@@ -960,7 +959,7 @@ impl KeepMobile {
         let data = tracker
             .to_bytes()
             .map_err(|e| KeepMobileError::StorageError {
-                msg: format!("Failed to serialize velocity: {}", e),
+                msg: format!("Failed to serialize velocity: {e}"),
             })?;
         let metadata = ShareMetadataInfo {
             name: "velocity".into(),
@@ -978,13 +977,13 @@ impl KeepMobile {
         let data = storage.load_share_by_key(TRUSTED_WARDENS_KEY.into())?;
         let hex_list: Vec<String> =
             serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-                msg: format!("Failed to deserialize trusted wardens: {}", e),
+                msg: format!("Failed to deserialize trusted wardens: {e}"),
             })?;
 
         let mut wardens = HashSet::new();
         for hex_str in hex_list {
             let bytes = hex::decode(&hex_str).map_err(|e| KeepMobileError::StorageError {
-                msg: format!("Invalid warden pubkey hex: {}", e),
+                msg: format!("Invalid warden pubkey hex: {e}"),
             })?;
             if bytes.len() == POLICY_PUBKEY_LEN {
                 let mut arr = [0u8; POLICY_PUBKEY_LEN];
@@ -1001,7 +1000,7 @@ impl KeepMobile {
     ) -> Result<(), KeepMobileError> {
         let hex_list: Vec<String> = wardens.iter().map(hex::encode).collect();
         let data = serde_json::to_vec(&hex_list).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to serialize trusted wardens: {}", e),
+            msg: format!("Failed to serialize trusted wardens: {e}"),
         })?;
         let metadata = ShareMetadataInfo {
             name: "trusted_wardens".into(),
@@ -1135,12 +1134,12 @@ fn parse_loopback_proxy(host: &str, port: u16) -> Result<std::net::SocketAddr, K
 
 fn parse_warden_pubkey(pubkey_hex: &str) -> Result<[u8; POLICY_PUBKEY_LEN], KeepMobileError> {
     let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
-        msg: format!("Invalid hex: {}", e),
+        msg: format!("Invalid hex: {e}"),
     })?;
 
     pubkey_bytes
         .try_into()
         .map_err(|_| KeepMobileError::InvalidPolicy {
-            msg: format!("Warden pubkey must be {} bytes", POLICY_PUBKEY_LEN),
+            msg: format!("Warden pubkey must be {POLICY_PUBKEY_LEN} bytes"),
         })
 }

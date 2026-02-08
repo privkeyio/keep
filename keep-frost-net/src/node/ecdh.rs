@@ -46,8 +46,7 @@ impl KfpNode {
         if !self.can_receive_from(&from) {
             debug!(from = %from, "Rejecting ECDH request: policy denies receive");
             return Err(FrostNetError::PolicyViolation(format!(
-                "Peer {} not allowed to send ECDH requests",
-                from
+                "Peer {from} not allowed to send ECDH requests"
             )));
         }
 

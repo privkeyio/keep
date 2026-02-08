@@ -3,7 +3,6 @@
 
 //! FROST signing session management.
 
-#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use std::collections::BTreeMap;
@@ -161,7 +160,7 @@ impl SigningSession {
         let signing_package = SigningPackage::new(self.commitments.clone(), &self.message);
 
         let share = frost::round2::sign(&signing_package, &nonces, key_package)
-            .map_err(|e| KeepError::Frost(format!("Signing failed: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Signing failed: {e}")))?;
 
         self.signature_shares
             .insert(*key_package.identifier(), share);
@@ -198,7 +197,7 @@ impl SigningSession {
                 }
                 Err(e) => {
                     self.state = SessionState::Failed;
-                    return Err(KeepError::Frost(format!("Aggregation failed: {}", e)));
+                    return Err(KeepError::Frost(format!("Aggregation failed: {e}")));
                 }
             }
         }
@@ -215,9 +214,9 @@ impl SigningSession {
     pub fn signature_bytes(&self) -> Result<Option<[u8; 64]>> {
         match &self.signature {
             Some(s) => {
-                let serialized = s.serialize().map_err(|e| {
-                    KeepError::Frost(format!("Failed to serialize signature: {}", e))
-                })?;
+                let serialized = s
+                    .serialize()
+                    .map_err(|e| KeepError::Frost(format!("Failed to serialize signature: {e}")))?;
                 let bytes_slice = serialized.as_slice();
                 if bytes_slice.len() != 64 {
                     return Err(KeepError::Frost("Invalid signature length".into()));
@@ -278,18 +277,18 @@ pub fn sign_with_local_shares(shares: &[super::SharePackage], message: &[u8]) ->
             .remove(&id)
             .ok_or_else(|| KeepError::Frost("Missing nonces for share".into()))?;
         let sig_share = round2::sign(&signing_package, &nonces, &kp)
-            .map_err(|e| KeepError::Frost(format!("Signing failed: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Signing failed: {e}")))?;
         signature_shares.insert(id, sig_share);
     }
 
     let first_kp = signing_shares[0].key_package()?;
     let pubkey_pkg = PublicKeyPackage::new(verifying_shares, *first_kp.verifying_key());
     let signature = frost::aggregate(&signing_package, &signature_shares, &pubkey_pkg)
-        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))?;
 
     let serialized = signature
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Failed to serialize signature: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize signature: {e}")))?;
     let bytes_slice = serialized.as_slice();
     if bytes_slice.len() != 64 {
         return Err(KeepError::Frost("Invalid signature length".into()));

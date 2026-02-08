@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -255,7 +252,7 @@ impl AgentClient {
 
         let signer_pubkey = PublicKey::from_bech32(pubkey_part)
             .or_else(|_| PublicKey::from_hex(pubkey_part))
-            .map_err(|e| AgentError::Connection(format!("Invalid pubkey: {}", e)))?;
+            .map_err(|e| AgentError::Connection(format!("Invalid pubkey: {e}")))?;
 
         let mut relay_url = None;
         let mut secret = None;

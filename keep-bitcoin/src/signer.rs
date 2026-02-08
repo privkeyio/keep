@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use crate::address::AddressDerivation;
@@ -118,8 +117,7 @@ impl BitcoinSigner {
                 if let Some(addr) = &output.address {
                     if blocklist.contains(addr) {
                         return Err(BitcoinError::PolicyDenied(format!(
-                            "Address {} is blocked",
-                            addr
+                            "Address {addr} is blocked"
                         )));
                     }
                 }

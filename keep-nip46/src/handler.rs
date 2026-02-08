@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -107,18 +104,18 @@ impl SignerHandler {
         if let Some(expected) = our_pubkey {
             let actual = if let Some(ref net_frost) = self.network_frost_signer {
                 PublicKey::from_slice(net_frost.group_pubkey())
-                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {}", e)))?
+                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
             } else if let Some(ref frost) = self.frost_signer {
                 let signer = frost.lock().await;
                 PublicKey::from_slice(signer.group_pubkey())
-                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {}", e)))?
+                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
             } else {
                 let keyring = self.keyring.lock().await;
                 let slot = keyring
                     .get_primary()
                     .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
                 PublicKey::from_slice(&slot.pubkey)
-                    .map_err(|e| CryptoError::invalid_key(format!("pubkey: {}", e)))?
+                    .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?
             };
             if expected != actual {
                 return Err(CryptoError::invalid_key("pubkey mismatch").into());
@@ -155,18 +152,18 @@ impl SignerHandler {
 
         let pubkey = if let Some(ref net_frost) = self.network_frost_signer {
             PublicKey::from_slice(net_frost.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {}", e)))?
+                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
         } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;
             PublicKey::from_slice(signer.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {}", e)))?
+                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
         } else {
             let keyring = self.keyring.lock().await;
             let slot = keyring
                 .get_primary()
                 .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
             PublicKey::from_slice(&slot.pubkey)
-                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {}", e)))?
+                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?
         };
 
         let mut audit = self.audit.lock().await;
@@ -228,7 +225,7 @@ impl SignerHandler {
 
         let signed_event = if let Some(ref net_frost) = self.network_frost_signer {
             let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
             let mut frost_event = UnsignedEvent::new(
                 pubkey,
                 unsigned_event.created_at,
@@ -255,7 +252,7 @@ impl SignerHandler {
         } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;
             let pubkey = PublicKey::from_slice(signer.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
             let mut frost_event = UnsignedEvent::new(
                 pubkey,
                 unsigned_event.created_at,
@@ -287,13 +284,13 @@ impl SignerHandler {
 
             let keypair = slot.to_nostr_keypair()?;
             let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
             let keys = Keys::new(secret);
 
             unsigned_event
                 .sign(&keys)
                 .await
-                .map_err(|e| CryptoError::invalid_signature(format!("signing: {}", e)))?
+                .map_err(|e| CryptoError::invalid_signature(format!("signing: {e}")))?
         };
 
         {
@@ -348,10 +345,10 @@ impl SignerHandler {
 
             let keypair = slot.to_nostr_keypair()?;
             let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
             nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
-                .map_err(|e| CryptoError::encryption(format!("NIP-44: {}", e)))?
+                .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?
         };
 
         let mut audit = self.audit.lock().await;
@@ -385,10 +382,10 @@ impl SignerHandler {
 
             let keypair = slot.to_nostr_keypair()?;
             let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
             nip44::decrypt(&secret, &sender, ciphertext)
-                .map_err(|e| CryptoError::decryption(format!("NIP-44: {}", e)))?
+                .map_err(|e| CryptoError::decryption(format!("NIP-44: {e}")))?
         };
 
         let mut audit = self.audit.lock().await;
@@ -422,10 +419,10 @@ impl SignerHandler {
 
             let keypair = slot.to_nostr_keypair()?;
             let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
             nip04::encrypt(&secret, &recipient, plaintext)
-                .map_err(|e| CryptoError::encryption(format!("NIP-04: {}", e)))?
+                .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?
         };
 
         let mut audit = self.audit.lock().await;
@@ -459,10 +456,10 @@ impl SignerHandler {
 
             let keypair = slot.to_nostr_keypair()?;
             let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
             nip04::decrypt(&secret, &sender, ciphertext)
-                .map_err(|e| CryptoError::decryption(format!("NIP-04: {}", e)))?
+                .map_err(|e| CryptoError::decryption(format!("NIP-04: {e}")))?
         };
 
         let mut audit = self.audit.lock().await;

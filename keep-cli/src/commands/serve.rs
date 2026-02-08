@@ -85,13 +85,13 @@ pub fn cmd_serve(
         out.newline();
         out.header("NIP-46 Bunker (FROST Network Mode)");
         out.field("Group", group_npub);
-        out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+        out.field("Threshold", &format!("{threshold}-of-{total_shares}"));
         out.field("FROST Relay", frost_relay);
         out.field("Bunker Relay", relay);
         out.newline();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
         return rt.block_on(async {
             out.info("Connecting to FROST network...");
@@ -142,7 +142,7 @@ pub fn cmd_serve(
             let group_pubkey = *first_group;
             match FrostSigner::new(group_pubkey, group_shares, data_key) {
                 Ok(signer) => {
-                    out.info(&format!("Using FROST signing ({}-of-{})", threshold, total));
+                    out.info(&format!("Using FROST signing ({threshold}-of-{total})"));
                     Some(signer)
                 }
                 Err(_) => None,
@@ -156,7 +156,7 @@ pub fn cmd_serve(
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
         rt.block_on(async {
@@ -254,7 +254,7 @@ pub fn cmd_serve(
     });
 
     tui.run()
-        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
+        .map_err(|e| KeepError::Runtime(format!("TUI: {e}")))?;
     Ok(())
 }
 
@@ -288,7 +288,7 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
 
     let keyring = Arc::new(Mutex::new(keyring));
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
         rt.block_on(async {
@@ -351,7 +351,7 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     });
 
     tui.run()
-        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
+        .map_err(|e| KeepError::Runtime(format!("TUI: {e}")))?;
     Ok(())
 }
 
@@ -387,7 +387,7 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 
     let keyring = Arc::new(Mutex::new(keyring));
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
         rt.block_on(async {
@@ -450,6 +450,6 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     });
 
     tui.run()
-        .map_err(|e| KeepError::Runtime(format!("TUI: {}", e)))?;
+        .map_err(|e| KeepError::Runtime(format!("TUI: {e}")))?;
     Ok(())
 }

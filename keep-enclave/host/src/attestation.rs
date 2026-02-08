@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use crate::error::{EnclaveError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
@@ -91,10 +88,8 @@ impl AttestationVerifier {
             .as_ref()
             .ok_or_else(|| EnclaveError::Attestation("Missing COSE payload".into()))?;
 
-        let attestation: AttestationDocument =
-            ciborium::from_reader(payload.as_slice()).map_err(|e| {
-                EnclaveError::Attestation(format!("Failed to parse attestation: {}", e))
-            })?;
+        let attestation: AttestationDocument = ciborium::from_reader(payload.as_slice())
+            .map_err(|e| EnclaveError::Attestation(format!("Failed to parse attestation: {e}")))?;
 
         self.verify_certificate_chain(&attestation.certificate, &attestation.cabundle, &cose)?;
 
@@ -130,15 +125,14 @@ impl AttestationVerifier {
         cabundle: &[Vec<u8>],
         cose: &CoseSign1,
     ) -> Result<()> {
-        let signing_cert = Certificate::from_der(signing_cert_der).map_err(|e| {
-            EnclaveError::Certificate(format!("Failed to parse signing cert: {}", e))
-        })?;
+        let signing_cert = Certificate::from_der(signing_cert_der)
+            .map_err(|e| EnclaveError::Certificate(format!("Failed to parse signing cert: {e}")))?;
         verify_cert_validity(&signing_cert)?;
 
         let signing_pubkey = extract_p384_pubkey(&signing_cert)?;
         let sig_bytes = cose.signature.as_slice();
         let signature = Signature::from_der(sig_bytes)
-            .map_err(|e| EnclaveError::Attestation(format!("Invalid COSE signature: {}", e)))?;
+            .map_err(|e| EnclaveError::Attestation(format!("Invalid COSE signature: {e}")))?;
 
         let to_verify = cose.sig_structure()?;
         signing_pubkey
@@ -150,23 +144,22 @@ impl AttestationVerifier {
         }
 
         let issuer_cert_der = &cabundle[0];
-        let issuer_cert = Certificate::from_der(issuer_cert_der).map_err(|e| {
-            EnclaveError::Certificate(format!("Failed to parse issuer cert: {}", e))
-        })?;
+        let issuer_cert = Certificate::from_der(issuer_cert_der)
+            .map_err(|e| EnclaveError::Certificate(format!("Failed to parse issuer cert: {e}")))?;
         verify_cert_validity(&issuer_cert)?;
 
         let issuer_pubkey = extract_p384_pubkey(&issuer_cert)?;
         let tbs_bytes = signing_cert
             .tbs_certificate
             .to_der()
-            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
 
         let cert_sig_bytes = signing_cert.signature.as_bytes().ok_or_else(|| {
             EnclaveError::Certificate("Missing signature bytes on signing cert".into())
         })?;
 
         let cert_signature = Signature::from_der(cert_sig_bytes)
-            .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {}", e)))?;
+            .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {e}")))?;
 
         issuer_pubkey
             .verify(&tbs_bytes, &cert_signature)
@@ -177,7 +170,7 @@ impl AttestationVerifier {
         let mut certs = Vec::with_capacity(cabundle.len());
         for cert_der in cabundle {
             let cert = Certificate::from_der(cert_der)
-                .map_err(|e| EnclaveError::Certificate(format!("Failed to parse cert: {}", e)))?;
+                .map_err(|e| EnclaveError::Certificate(format!("Failed to parse cert: {e}")))?;
             verify_cert_validity(&cert)?;
             certs.push(cert);
         }
@@ -190,7 +183,7 @@ impl AttestationVerifier {
             let tbs_bytes = subject
                 .tbs_certificate
                 .to_der()
-                .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+                .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
 
             let sig_bytes = subject
                 .signature
@@ -198,7 +191,7 @@ impl AttestationVerifier {
                 .ok_or_else(|| EnclaveError::Certificate("Missing signature bytes".into()))?;
 
             let signature = Signature::from_der(sig_bytes)
-                .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {}", e)))?;
+                .map_err(|e| EnclaveError::Certificate(format!("Invalid signature: {e}")))?;
 
             issuer_pubkey
                 .verify(&tbs_bytes, &signature)
@@ -211,11 +204,11 @@ impl AttestationVerifier {
 
         let chain_root_der = chain_root
             .to_der()
-            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
         let expected_root_der = self
             .root_cert
             .to_der()
-            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
 
         if chain_root_der != expected_root_der {
             return Err(EnclaveError::Certificate(
@@ -234,7 +227,7 @@ impl AttestationVerifier {
         let check = |idx: u32, expected: &[u8; 48]| -> Result<()> {
             let actual = pcrs
                 .get(&idx)
-                .ok_or_else(|| EnclaveError::Attestation(format!("Missing PCR{}", idx)))?;
+                .ok_or_else(|| EnclaveError::Attestation(format!("Missing PCR{idx}")))?;
             if actual.as_slice() != expected {
                 return Err(EnclaveError::PcrMismatch {
                     pcr: idx,
@@ -261,7 +254,7 @@ fn extract_p384_pubkey(cert: &Certificate) -> Result<VerifyingKey> {
         .ok_or_else(|| EnclaveError::Certificate("Missing public key bytes".into()))?;
 
     VerifyingKey::from_sec1_bytes(key_bytes)
-        .map_err(|e| EnclaveError::Certificate(format!("Invalid P-384 key: {}", e)))
+        .map_err(|e| EnclaveError::Certificate(format!("Invalid P-384 key: {e}")))
 }
 
 fn verify_cert_validity(cert: &Certificate) -> Result<()> {
@@ -312,7 +305,7 @@ struct CoseSign1 {
 impl CoseSign1 {
     fn from_bytes(data: &[u8]) -> Result<Self> {
         let value: ciborium::Value = ciborium::from_reader(data)
-            .map_err(|e| EnclaveError::Attestation(format!("Invalid CBOR: {}", e)))?;
+            .map_err(|e| EnclaveError::Attestation(format!("Invalid CBOR: {e}")))?;
 
         let arr = value
             .as_array()
@@ -365,7 +358,7 @@ impl CoseSign1 {
 
         let mut buf = Vec::new();
         ciborium::into_writer(&structure, &mut buf).map_err(|e| {
-            EnclaveError::Attestation(format!("Failed to encode sig structure: {}", e))
+            EnclaveError::Attestation(format!("Failed to encode sig structure: {e}"))
         })?;
         Ok(buf)
     }

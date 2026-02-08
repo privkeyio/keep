@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -64,7 +61,7 @@ impl FrostParticipant {
 
         let serialized = commitment
             .serialize()
-            .map_err(|e| AgentError::Other(format!("Serialize failed: {}", e)))?;
+            .map_err(|e| AgentError::Other(format!("Serialize failed: {e}")))?;
 
         Ok(FrostCommitment {
             session_id: hex::encode(session.session_id()),

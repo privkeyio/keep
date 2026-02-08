@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use crate::error::{EnclaveError, Result};
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -46,15 +43,15 @@ impl<K: KmsProvider> EnvelopeEncryption<K> {
 
         let mut nonce_bytes = [0u8; 12];
         getrandom::getrandom(&mut nonce_bytes)
-            .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {e}")))?;
 
         let cipher = Aes256Gcm::new_from_slice(&data_key_result.plaintext)
-            .map_err(|e| EnclaveError::Kms(format!("Invalid key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Invalid key: {e}")))?;
 
         let nonce = Nonce::from_slice(&nonce_bytes);
         let encrypted_wallet_key = cipher
             .encrypt(nonce, wallet_key)
-            .map_err(|e| EnclaveError::Kms(format!("Encryption failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Encryption failed: {e}")))?;
 
         let mut plaintext = data_key_result.plaintext;
         plaintext.zeroize();
@@ -76,12 +73,12 @@ impl<K: KmsProvider> EnvelopeEncryption<K> {
             .decrypt_data_key(&encrypted.encrypted_data_key, attestation_doc)?;
 
         let cipher = Aes256Gcm::new_from_slice(&data_key)
-            .map_err(|e| EnclaveError::Kms(format!("Invalid key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Invalid key: {e}")))?;
 
         let nonce = Nonce::from_slice(&encrypted.nonce);
         let wallet_key = cipher
             .decrypt(nonce, encrypted.encrypted_wallet_key.as_ref())
-            .map_err(|e| EnclaveError::Kms(format!("Decryption failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Decryption failed: {e}")))?;
 
         data_key.zeroize();
 
@@ -115,19 +112,19 @@ impl KmsProvider for MockKmsProvider {
     fn generate_data_key(&self) -> Result<DataKeyResult> {
         let mut plaintext = vec![0u8; 32];
         getrandom::getrandom(&mut plaintext)
-            .map_err(|e| EnclaveError::Kms(format!("Failed to generate data key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Failed to generate data key: {e}")))?;
 
         let mut nonce_bytes = [0u8; 12];
         getrandom::getrandom(&mut nonce_bytes)
-            .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {e}")))?;
 
         let cipher = Aes256Gcm::new_from_slice(&self.master_key)
-            .map_err(|e| EnclaveError::Kms(format!("Invalid master key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Invalid master key: {e}")))?;
 
         let nonce = Nonce::from_slice(&nonce_bytes);
         let mut ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
-            .map_err(|e| EnclaveError::Kms(format!("Failed to encrypt data key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Failed to encrypt data key: {e}")))?;
 
         ciphertext.splice(0..0, nonce_bytes.iter().cloned());
 
@@ -150,11 +147,11 @@ impl KmsProvider for MockKmsProvider {
         let ciphertext = &encrypted_key[12..];
 
         let cipher = Aes256Gcm::new_from_slice(&self.master_key)
-            .map_err(|e| EnclaveError::Kms(format!("Invalid master key: {}", e)))?;
+            .map_err(|e| EnclaveError::Kms(format!("Invalid master key: {e}")))?;
 
         cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| EnclaveError::Kms(format!("Failed to decrypt data key: {}", e)))
+            .map_err(|e| EnclaveError::Kms(format!("Failed to decrypt data key: {e}")))
     }
 }
 

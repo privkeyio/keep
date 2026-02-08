@@ -10,6 +10,7 @@ members = [
     "keep-frost-net",
     "keep-nip46",
     "keep-mobile",
+    "keep-desktop",
 ]
 exclude = [
     "keep-enclave/enclave",
@@ -21,7 +22,7 @@ exclude = [
 [workspace.package]
 version = "0.1.5"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/privkeyio/keep"
 
@@ -79,12 +80,6 @@ url = "2.5"
 # Storage
 redb = "2.6.3"
 
-# MSRV 1.85 compatibility pins (edition2024 crates)
-base64ct = ">=1.0, <1.8"  # 1.8+ uses edition2024
-blake3 = ">=1.0, <1.8.3"  # 1.8.3+ uses edition2024
-constant_time_eq = ">=0.1, <0.4"  # 0.4+ uses edition2024
-darling = ">=0.13, <0.23"  # 0.23+ requires MSRV 1.88
-instability = ">=0.3, <0.3.11"  # 0.3.11+ requires MSRV 1.88
 
 # Misc
 bitflags = "2.4"

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::backtrace::Backtrace;
 use std::panic::PanicHookInfo;
 use std::path::PathBuf;
@@ -40,7 +38,7 @@ fn log_panic(info: &PanicHookInfo<'_>) {
     if backtrace.status() == std::backtrace::BacktraceStatus::Captured
         && std::env::var("KEEP_NO_BACKTRACE").is_err()
     {
-        eprintln!("\nBacktrace (may reveal function call patterns - set KEEP_NO_BACKTRACE=1 to disable):\n{}", backtrace);
+        eprintln!("\nBacktrace (may reveal function call patterns - set KEEP_NO_BACKTRACE=1 to disable):\n{backtrace}");
     }
 }
 
@@ -90,7 +88,7 @@ fn write_crash_dump(
     backtrace: &Backtrace,
 ) -> std::io::Result<PathBuf> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("keep_crash_{}.log", timestamp);
+    let filename = format!("keep_crash_{timestamp}.log");
     let path = std::env::temp_dir().join(&filename);
 
     let content = format!(

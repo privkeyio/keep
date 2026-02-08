@@ -23,7 +23,7 @@ fn validate_participant_index(
 ) -> Result<Identifier, KeepMobileError> {
     if index < 1 || index > participants {
         return Err(KeepMobileError::FrostError {
-            msg: format!("{} {} out of range (1-{})", label, index, participants),
+            msg: format!("{label} {index} out of range (1-{participants})"),
         });
     }
     Identifier::try_from(index).map_err(|e| KeepMobileError::FrostError {
@@ -34,7 +34,7 @@ fn validate_participant_index(
 fn validate_package_size(bytes: &[u8], sender: u16) -> Result<(), KeepMobileError> {
     if bytes.len() > MAX_PACKAGE_SIZE {
         return Err(KeepMobileError::FrostError {
-            msg: format!("Package from {} exceeds maximum size", sender),
+            msg: format!("Package from {sender} exceeds maximum size"),
         });
     }
     Ok(())
@@ -43,10 +43,7 @@ fn validate_package_size(bytes: &[u8], sender: u16) -> Result<(), KeepMobileErro
 fn validate_share_name(name: &str) -> Result<(), KeepMobileError> {
     if name.chars().count() > MAX_SHARE_NAME_LENGTH {
         return Err(KeepMobileError::InvalidShare {
-            msg: format!(
-                "Share name exceeds maximum length of {} characters",
-                MAX_SHARE_NAME_LENGTH
-            ),
+            msg: format!("Share name exceeds maximum length of {MAX_SHARE_NAME_LENGTH} characters"),
         });
     }
     Ok(())
@@ -131,7 +128,7 @@ impl DkgSession {
 
         if config.participants > MAX_DKG_PARTICIPANTS {
             return Err(KeepMobileError::FrostError {
-                msg: format!("Maximum {} participants supported", MAX_DKG_PARTICIPANTS),
+                msg: format!("Maximum {MAX_DKG_PARTICIPANTS} participants supported"),
             });
         }
 
@@ -143,7 +140,7 @@ impl DkgSession {
 
         let our_identifier =
             Identifier::try_from(config.our_index).map_err(|e| KeepMobileError::FrostError {
-                msg: format!("Invalid identifier: {}", e),
+                msg: format!("Invalid identifier: {e}"),
             })?;
 
         let (secret_package, round1_package) = dkg::part1(
@@ -153,14 +150,14 @@ impl DkgSession {
             frost_secp256k1_tr::rand_core::OsRng,
         )
         .map_err(|e| KeepMobileError::FrostError {
-            msg: format!("DKG round 1 failed: {}", e),
+            msg: format!("DKG round 1 failed: {e}"),
         })?;
 
         let package_bytes =
             round1_package
                 .serialize()
                 .map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Failed to serialize round 1 package: {}", e),
+                    msg: format!("Failed to serialize round 1 package: {e}"),
                 })?;
 
         let mut state = self.state.write().await;
@@ -202,7 +199,7 @@ impl DkgSession {
             }
             DkgState::Failed { reason } => {
                 return Err(KeepMobileError::FrostError {
-                    msg: format!("DKG failed: {}", reason),
+                    msg: format!("DKG failed: {reason}"),
                 })
             }
             _ => {
@@ -255,10 +252,10 @@ impl DkgSession {
         let (round2_secret, round2_packages) = dkg::part2(secret_package.clone(), &round1_packages)
             .map_err(|e| {
                 *state = DkgState::Failed {
-                    reason: format!("DKG round 2 failed: {}", e),
+                    reason: format!("DKG round 2 failed: {e}"),
                 };
                 KeepMobileError::FrostError {
-                    msg: format!("DKG round 2 failed: {}", e),
+                    msg: format!("DKG round 2 failed: {e}"),
                 }
             })?;
 
@@ -268,7 +265,7 @@ impl DkgSession {
                 let package_bytes =
                     pkg.serialize()
                         .map_err(|e| KeepMobileError::Serialization {
-                            msg: format!("Failed to serialize round 2 package: {}", e),
+                            msg: format!("Failed to serialize round 2 package: {e}"),
                         })?;
 
                 let id_bytes = recipient_id.serialize();
@@ -330,7 +327,7 @@ impl DkgSession {
             }
             DkgState::Failed { reason } => {
                 return Err(KeepMobileError::FrostError {
-                    msg: format!("DKG failed: {}", reason),
+                    msg: format!("DKG failed: {reason}"),
                 })
             }
             _ => {
@@ -375,10 +372,10 @@ impl DkgSession {
         let (key_package, pubkey_package) =
             dkg::part3(&secret_package, &round1_packages, &round2_packages).map_err(|e| {
                 *state = DkgState::Failed {
-                    reason: format!("DKG finalization failed: {}", e),
+                    reason: format!("DKG finalization failed: {e}"),
                 };
                 KeepMobileError::FrostError {
-                    msg: format!("DKG finalization failed: {}", e),
+                    msg: format!("DKG finalization failed: {e}"),
                 }
             })?;
 
@@ -386,7 +383,7 @@ impl DkgSession {
         let serialized = verifying_key
             .serialize()
             .map_err(|e| KeepMobileError::FrostError {
-                msg: format!("Failed to serialize verifying key: {}", e),
+                msg: format!("Failed to serialize verifying key: {e}"),
             })?;
         let vk_bytes = serialized.as_slice();
 
@@ -395,7 +392,7 @@ impl DkgSession {
             32 => vk_bytes.try_into().unwrap(),
             len => {
                 return Err(KeepMobileError::FrostError {
-                    msg: format!("Invalid group pubkey length: {}", len),
+                    msg: format!("Invalid group pubkey length: {len}"),
                 })
             }
         };

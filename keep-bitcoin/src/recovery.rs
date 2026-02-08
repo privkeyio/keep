@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use crate::error::{BitcoinError, Result};
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::All;
@@ -68,8 +65,7 @@ impl RecoveryConfig {
         }
         if self.primary.keys.len() > MAX_KEYS_PER_TIER {
             return Err(BitcoinError::Recovery(format!(
-                "primary tier exceeds {} keys",
-                MAX_KEYS_PER_TIER
+                "primary tier exceeds {MAX_KEYS_PER_TIER} keys"
             )));
         }
         if self.primary.threshold == 0 || self.primary.threshold > self.primary.keys.len() as u32 {
@@ -95,26 +91,22 @@ impl RecoveryConfig {
         for (i, tier) in self.recovery_tiers.iter().enumerate() {
             if tier.keys.is_empty() {
                 return Err(BitcoinError::Recovery(format!(
-                    "recovery tier {} has no keys",
-                    i
+                    "recovery tier {i} has no keys"
                 )));
             }
             if tier.keys.len() > MAX_KEYS_PER_TIER {
                 return Err(BitcoinError::Recovery(format!(
-                    "recovery tier {} exceeds {} keys",
-                    i, MAX_KEYS_PER_TIER
+                    "recovery tier {i} exceeds {MAX_KEYS_PER_TIER} keys"
                 )));
             }
             if tier.threshold == 0 || tier.threshold > tier.keys.len() as u32 {
                 return Err(BitcoinError::Recovery(format!(
-                    "invalid threshold for recovery tier {}",
-                    i
+                    "invalid threshold for recovery tier {i}"
                 )));
             }
             if tier.timelock_months == 0 {
                 return Err(BitcoinError::Recovery(format!(
-                    "recovery tier {} must have nonzero timelock",
-                    i
+                    "recovery tier {i} must have nonzero timelock"
                 )));
             }
             let timelock_blocks = months_to_blocks(tier.timelock_months)?;
@@ -124,7 +116,7 @@ impl RecoveryConfig {
                     i, tier.timelock_months, timelock_blocks, MAX_CSV_BLOCKS
                 )));
             }
-            check_duplicate_keys(&format!("recovery tier {}", i), &tier.keys)?;
+            check_duplicate_keys(&format!("recovery tier {i}"), &tier.keys)?;
             for key in &tier.keys {
                 if !all_keys.insert(*key) {
                     return Err(BitcoinError::Recovery(format!(
@@ -166,7 +158,7 @@ impl RecoveryConfig {
             return parse_xonly(&self.primary.keys[0]);
         }
         XOnlyPublicKey::from_slice(&NUMS_POINT)
-            .map_err(|e| BitcoinError::Recovery(format!("NUMS point: {}", e)))
+            .map_err(|e| BitcoinError::Recovery(format!("NUMS point: {e}")))
     }
 
     fn build_tier_infos(&self) -> Result<Vec<TierInfo>> {
@@ -211,7 +203,7 @@ impl RecoveryConfig {
         if tiers.is_empty() {
             return TaprootBuilder::new()
                 .finalize(secp, internal_key)
-                .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {:?}", e)));
+                .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {e:?}")));
         }
 
         let mut builder = TaprootBuilder::new();
@@ -220,16 +212,16 @@ impl RecoveryConfig {
         for (i, tier) in tiers.iter().enumerate() {
             builder = builder
                 .add_leaf(depths[i], tier.script.clone())
-                .map_err(|e| BitcoinError::Recovery(format!("add leaf: {:?}", e)))?;
+                .map_err(|e| BitcoinError::Recovery(format!("add leaf: {e:?}")))?;
         }
 
         builder
             .finalize(secp, internal_key)
-            .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {:?}", e)))
+            .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {e:?}")))
     }
 
     fn format_descriptor(&self, internal_key: XOnlyPublicKey, tiers: &[TierInfo]) -> String {
-        let mut desc = format!("tr({}", internal_key);
+        let mut desc = format!("tr({internal_key}");
         if !tiers.is_empty() {
             desc.push_str(",{");
             for (i, tier) in tiers.iter().enumerate() {
@@ -274,8 +266,7 @@ fn build_timelocked_multisig(
 ) -> Result<ScriptBuf> {
     let seq_u16 = u16::try_from(timelock_blocks).map_err(|_| {
         BitcoinError::Recovery(format!(
-            "timelock {} exceeds CSV maximum {}",
-            timelock_blocks, MAX_CSV_BLOCKS
+            "timelock {timelock_blocks} exceeds CSV maximum {MAX_CSV_BLOCKS}"
         ))
     })?;
 
@@ -356,8 +347,7 @@ fn optimal_depth(count: usize) -> Vec<u8> {
 pub fn recovery_sequence(timelock_blocks: u32) -> Result<Sequence> {
     let blocks_u16 = u16::try_from(timelock_blocks).map_err(|_| {
         BitcoinError::Recovery(format!(
-            "timelock {} exceeds maximum relative lock height 65535",
-            timelock_blocks
+            "timelock {timelock_blocks} exceeds maximum relative lock height 65535"
         ))
     })?;
     Ok(Sequence::from_height(blocks_u16))
@@ -365,7 +355,7 @@ pub fn recovery_sequence(timelock_blocks: u32) -> Result<Sequence> {
 
 pub fn months_to_blocks(months: u32) -> Result<u32> {
     months.checked_mul(BLOCKS_PER_MONTH).ok_or_else(|| {
-        BitcoinError::Recovery(format!("timelock {} months overflows block count", months))
+        BitcoinError::Recovery(format!("timelock {months} months overflows block count"))
     })
 }
 

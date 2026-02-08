@@ -23,8 +23,7 @@ pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     let spinner = out.spinner("Connecting to hardware signer...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -32,13 +31,12 @@ pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     let spinner = out.spinner("Sending ping...");
     let version = signer.ping().map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware ping: {}",
-            e
+            "hardware ping: {e}"
         )))
     })?;
     spinner.finish();
 
-    out.success(&format!("Hardware signer v{} - OK", version));
+    out.success(&format!("Hardware signer v{version} - OK"));
     Ok(())
 }
 
@@ -51,8 +49,7 @@ pub fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
     let spinner = out.spinner("Connecting...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -60,8 +57,7 @@ pub fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
     let spinner = out.spinner("Listing shares...");
     let shares = signer.list_shares().map_err(|e| {
         KeepError::FrostErr(keep_core::error::FrostError::session(format!(
-            "list shares: {}",
-            e
+            "list shares: {e}"
         )))
     })?;
     spinner.finish();
@@ -132,14 +128,14 @@ pub fn cmd_frost_hardware_import(
 
     let verifying_share_bytes = verifying_share
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying share: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying share: {e}")))?;
     let mut pubkey_compressed = [0u8; 33];
     pubkey_compressed.copy_from_slice(&verifying_share_bytes);
 
     let group_vk = pubkey_package.verifying_key();
     let group_vk_bytes = group_vk
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Failed to serialize group key: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize group key: {e}")))?;
     let mut group_pubkey_compressed = [0u8; 33];
     group_pubkey_compressed.copy_from_slice(&group_vk_bytes);
 
@@ -157,8 +153,7 @@ pub fn cmd_frost_hardware_import(
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -166,8 +161,7 @@ pub fn cmd_frost_hardware_import(
     let spinner = out.spinner("Verifying connection...");
     let version = signer.ping().map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware ping: {}",
-            e
+            "hardware ping: {e}"
         )))
     })?;
     spinner.finish();
@@ -176,8 +170,7 @@ pub fn cmd_frost_hardware_import(
     let spinner = out.spinner("Importing share to hardware...");
     signer.import_share(group_npub, &share_hex).map_err(|e| {
         KeepError::FrostErr(keep_core::error::FrostError::invalid_share(format!(
-            "import: {}",
-            e
+            "import: {e}"
         )))
     })?;
     spinner.finish();
@@ -203,8 +196,7 @@ pub fn cmd_frost_hardware_delete(out: &Output, device: &str, group_npub: &str) -
     let spinner = out.spinner("Connecting...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -212,8 +204,7 @@ pub fn cmd_frost_hardware_delete(out: &Output, device: &str, group_npub: &str) -
     let spinner = out.spinner("Deleting share...");
     signer.delete_share(group_npub).map_err(|e| {
         KeepError::FrostErr(keep_core::error::FrostError::session(format!(
-            "delete: {}",
-            e
+            "delete: {e}"
         )))
     })?;
     spinner.finish();
@@ -249,8 +240,7 @@ pub fn cmd_frost_hardware_sign(
     let spinner = out.spinner("Connecting...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -259,10 +249,7 @@ pub fn cmd_frost_hardware_sign(
     let (sig_share, index) = signer
         .frost_sign(group_npub, &session_id, commitments_hex)
         .map_err(|e| {
-            KeepError::FrostErr(keep_core::error::FrostError::session(format!(
-                "sign: {}",
-                e
-            )))
+            KeepError::FrostErr(keep_core::error::FrostError::session(format!("sign: {e}")))
         })?;
     spinner.finish();
 
@@ -308,8 +295,7 @@ pub fn cmd_frost_hardware_export(
     let spinner = out.spinner("Connecting...");
     let mut signer = HardwareSigner::new(device).map_err(|e| {
         KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-            "hardware: {}",
-            e
+            "hardware: {e}"
         )))
     })?;
     spinner.finish();
@@ -319,8 +305,7 @@ pub fn cmd_frost_hardware_export(
         .export_share(group_npub, passphrase.expose_secret())
         .map_err(|e| {
             KeepError::FrostErr(keep_core::error::FrostError::session(format!(
-                "export: {}",
-                e
+                "export: {e}"
             )))
         })?;
     spinner.finish();
@@ -342,14 +327,12 @@ pub fn cmd_frost_hardware_export(
                 .open(path)
                 .map_err(|e| {
                     KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                        "create file: {}",
-                        e
+                        "create file: {e}"
                     )))
                 })?;
             file.write_all(json_str.as_bytes()).map_err(|e| {
                 KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                    "write file: {}",
-                    e
+                    "write file: {e}"
                 )))
             })?;
         }
@@ -374,9 +357,9 @@ pub fn cmd_frost_hardware_export(
             "Threshold",
             &format!("{}-of-{}", exported.threshold, exported.participants),
         );
-        out.success(&format!("Share exported to {}", path));
+        out.success(&format!("Share exported to {path}"));
     } else {
-        println!("{}", json_str);
+        println!("{json_str}");
     }
 
     Ok(())

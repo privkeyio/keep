@@ -29,7 +29,7 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
                 out.success("Mock enclave is running");
             }
             keep_enclave_host::EnclaveResponse::Error { message, .. } => {
-                out.error(&format!("Mock enclave error: {}", message));
+                out.error(&format!("Mock enclave error: {message}"));
             }
             _ => {
                 out.error("Unexpected response from mock enclave");
@@ -51,7 +51,7 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
                 out.success("Enclave is running and responding");
             }
             Err(e) => {
-                out.error(&format!("Enclave not available: {}", e));
+                out.error(&format!("Enclave not available: {e}"));
             }
         }
     }
@@ -89,7 +89,7 @@ pub fn cmd_enclave_verify(
                 out.warn("Mock attestation - not cryptographically verified");
             }
             keep_enclave_host::EnclaveResponse::Error { message, .. } => {
-                out.error(&format!("Mock enclave error: {}", message));
+                out.error(&format!("Mock enclave error: {message}"));
             }
             _ => {
                 out.error("Unexpected response from mock enclave");
@@ -109,8 +109,7 @@ pub fn cmd_enclave_verify(
         let spinner = out.spinner("Fetching attestation...");
         let attestation_doc = client.get_attestation(nonce).map_err(|e| {
             KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-                "enclave: {}",
-                e
+                "enclave: {e}"
             )))
         })?;
         spinner.finish();
@@ -118,7 +117,7 @@ pub fn cmd_enclave_verify(
         let expected_pcrs = if let (Some(p0), Some(p1), Some(p2)) = (pcr0, pcr1, pcr2) {
             Some(
                 keep_enclave_host::ExpectedPcrs::from_hex(p0, p1, p2)
-                    .map_err(|e| KeepError::InvalidInput(format!("invalid PCR hex: {}", e)))?,
+                    .map_err(|e| KeepError::InvalidInput(format!("invalid PCR hex: {e}")))?,
             )
         } else {
             None
@@ -134,12 +133,12 @@ pub fn cmd_enclave_verify(
                 out.newline();
 
                 for (pcr_idx, pcr_val) in &verified.pcrs {
-                    out.field(&format!("PCR{}", pcr_idx), &hex::encode(pcr_val));
+                    out.field(&format!("PCR{pcr_idx}"), &hex::encode(pcr_val));
                 }
             }
             Err(e) => {
                 spinner.finish();
-                out.error(&format!("Verification failed: {}", e));
+                out.error(&format!("Verification failed: {e}"));
             }
         }
     }
@@ -182,7 +181,7 @@ pub fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool)
                 out.warn("Mock key - persisted to /tmp for local testing");
             }
             keep_enclave_host::EnclaveResponse::Error { message, .. } => {
-                out.error(&format!("Mock enclave error: {}", message));
+                out.error(&format!("Mock enclave error: {message}"));
             }
             _ => {
                 out.error("Unexpected response from mock enclave");
@@ -198,8 +197,7 @@ pub fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool)
         let spinner = out.spinner("Generating key in enclave...");
         let pubkey = client.generate_key(name).map_err(|e| {
             KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-                "enclave: {}",
-                e
+                "enclave: {e}"
             )))
         })?;
         spinner.finish();
@@ -262,7 +260,7 @@ pub fn cmd_enclave_sign(
                 println!("{}", hex::encode(&signature));
             }
             keep_enclave_host::EnclaveResponse::Error { message, .. } => {
-                out.error(&format!("Mock enclave error: {}", message));
+                out.error(&format!("Mock enclave error: {message}"));
             }
             _ => {
                 out.error("Unexpected response from mock enclave");
@@ -288,8 +286,7 @@ pub fn cmd_enclave_sign(
         let spinner = out.spinner("Signing in enclave...");
         let signature = client.sign(request).map_err(|e| {
             KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-                "enclave sign: {}",
-                e
+                "enclave sign: {e}"
             )))
         })?;
         spinner.finish();
@@ -320,7 +317,7 @@ pub fn cmd_enclave_import_key(
     out.header("Import Key to Enclave");
 
     let mut secret = if let Some(vault_key) = from_vault {
-        out.field("Source", &format!("vault key '{}'", vault_key));
+        out.field("Source", &format!("vault key '{vault_key}'"));
 
         let mut keep = Keep::open(path)?;
         let password = get_password("Enter password")?;
@@ -341,8 +338,7 @@ pub fn cmd_enclave_import_key(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read input: {}",
-                e
+                "read input: {e}"
             )))
         })?;
         let decoded =
@@ -374,7 +370,7 @@ pub fn cmd_enclave_import_key(
                 out.warn("Mock key - persisted to /tmp for local testing");
             }
             keep_enclave_host::EnclaveResponse::Error { message, .. } => {
-                out.error(&format!("Mock enclave error: {}", message));
+                out.error(&format!("Mock enclave error: {message}"));
             }
             _ => {
                 out.error("Unexpected response from mock enclave");
@@ -392,8 +388,7 @@ pub fn cmd_enclave_import_key(
         secret.zeroize();
         let pubkey = result.map_err(|e| {
             KeepError::NetworkErr(keep_core::error::NetworkError::connection(format!(
-                "enclave import: {}",
-                e
+                "enclave import: {e}"
             )))
         })?;
         spinner.finish();

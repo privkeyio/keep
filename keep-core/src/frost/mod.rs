@@ -6,9 +6,6 @@
 //! This module provides threshold signatures using the FROST protocol,
 //! allowing multiple parties to collaboratively sign messages without
 //! any single party having access to the complete private key.
-
-#![forbid(unsafe_code)]
-
 mod coordinator;
 mod dealer;
 mod refresh;

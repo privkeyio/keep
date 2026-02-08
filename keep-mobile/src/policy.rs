@@ -100,16 +100,16 @@ impl PolicyRules {
         let mut parts = Vec::new();
 
         if let Some(max) = self.max_amount {
-            parts.push(format!("max_amount: {} sats", max));
+            parts.push(format!("max_amount: {max} sats"));
         }
         if let Some(max) = self.max_fee {
-            parts.push(format!("max_fee: {} sats", max));
+            parts.push(format!("max_fee: {max} sats"));
         }
         if let Some(daily) = self.daily_limit {
-            parts.push(format!("daily_limit: {} sats", daily));
+            parts.push(format!("daily_limit: {daily} sats"));
         }
         if let Some(weekly) = self.weekly_limit {
-            parts.push(format!("weekly_limit: {} sats", weekly));
+            parts.push(format!("weekly_limit: {weekly} sats"));
         }
         if self.allowed_hours.is_some() {
             parts.push("time_restricted".to_string());
@@ -200,7 +200,7 @@ impl PolicyBundle {
         let version = data[0];
         if version != POLICY_VERSION {
             return Err(KeepMobileError::InvalidPolicy {
-                msg: format!("Unsupported policy version: {}", version),
+                msg: format!("Unsupported policy version: {version}"),
             });
         }
 
@@ -224,10 +224,7 @@ impl PolicyBundle {
 
         if rules_len > POLICY_MAX_RULES_LEN {
             return Err(KeepMobileError::InvalidPolicy {
-                msg: format!(
-                    "Rules too large: {} bytes (max {})",
-                    rules_len, POLICY_MAX_RULES_LEN
-                ),
+                msg: format!("Rules too large: {rules_len} bytes (max {POLICY_MAX_RULES_LEN})"),
             });
         }
 
@@ -303,13 +300,13 @@ impl PolicyBundle {
     pub fn verify_signature(&self) -> Result<(), KeepMobileError> {
         let verifying_key = VerifyingKey::from_bytes(&self.warden_pubkey).map_err(|e| {
             KeepMobileError::InvalidPolicy {
-                msg: format!("Invalid warden pubkey: {}", e),
+                msg: format!("Invalid warden pubkey: {e}"),
             }
         })?;
 
         let signature = Signature::try_from(self.signature.as_slice()).map_err(|e| {
             KeepMobileError::InvalidPolicy {
-                msg: format!("Invalid signature format: {}", e),
+                msg: format!("Invalid signature format: {e}"),
             }
         })?;
 
@@ -390,7 +387,7 @@ impl PolicyBundle {
 
     pub fn parse_rules(&self) -> Result<PolicyRules, KeepMobileError> {
         serde_json::from_str(&self.rules_json).map_err(|e| KeepMobileError::InvalidPolicy {
-            msg: format!("Invalid rules JSON: {}", e),
+            msg: format!("Invalid rules JSON: {e}"),
         })
     }
 

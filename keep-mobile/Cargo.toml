@@ -2,7 +2,7 @@
 name = "keep-mobile"
 version = "0.1.4"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "UniFFI bindings for Keep mobile platforms"
 license = "AGPL-3.0-or-later"
 
