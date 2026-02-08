@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::fmt;
 
+use zeroize::Zeroizing;
+
 use crate::screen::shares::ShareEntry;
 
 #[derive(Clone)]
 pub enum Message {
     // Unlock
-    PasswordChanged(String),
-    ConfirmPasswordChanged(String),
+    PasswordChanged(Zeroizing<String>),
+    ConfirmPasswordChanged(Zeroizing<String>),
     Unlock,
     UnlockResult(Result<Vec<ShareEntry>, String>),
     StartFresh,
@@ -35,14 +37,14 @@ pub enum Message {
     CreateResult(Result<Vec<ShareEntry>, String>),
 
     // Export
-    ExportPassphraseChanged(String),
+    ExportPassphraseChanged(Zeroizing<String>),
     GenerateExport,
     ExportGenerated(Result<String, String>),
     CopyToClipboard(String),
 
     // Import
     ImportDataChanged(String),
-    ImportPassphraseChanged(String),
+    ImportPassphraseChanged(Zeroizing<String>),
     ImportShare,
     ImportResult(Result<Vec<ShareEntry>, String>),
 

@@ -35,7 +35,7 @@ impl ImportScreen {
             .width(Length::Fill);
 
         let passphrase_input = text_input("Decryption passphrase", &self.passphrase)
-            .on_input(Message::ImportPassphraseChanged)
+            .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))
             .on_submit(Message::ImportShare)
             .secure(true)
             .padding(10)

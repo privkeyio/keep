@@ -42,7 +42,7 @@ impl UnlockScreen {
         .size(28);
 
         let password_input = text_input("Password", &self.password)
-            .on_input(Message::PasswordChanged)
+            .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
             .on_submit(Message::Unlock)
             .secure(true)
             .padding(10)
@@ -55,7 +55,7 @@ impl UnlockScreen {
 
         if !self.vault_exists {
             let confirm_input = text_input("Confirm password", &self.confirm_password)
-                .on_input(Message::ConfirmPasswordChanged)
+                .on_input(|s| Message::ConfirmPasswordChanged(Zeroizing::new(s)))
                 .on_submit(Message::Unlock)
                 .secure(true)
                 .padding(10)

@@ -125,13 +125,13 @@ impl App {
 
             Message::PasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
-                    *s.password = p;
+                    s.password = p;
                 }
                 Task::none()
             }
             Message::ConfirmPasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
-                    *s.confirm_password = p;
+                    s.confirm_password = p;
                 }
                 Task::none()
             }
@@ -226,7 +226,7 @@ impl App {
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
-                    *s.passphrase = p;
+                    s.passphrase = p;
                 }
                 Task::none()
             }
@@ -246,7 +246,7 @@ impl App {
             }
             Message::ImportPassphraseChanged(p) => {
                 if let Screen::Import(s) = &mut self.screen {
-                    *s.passphrase = p;
+                    s.passphrase = p;
                 }
                 Task::none()
             }

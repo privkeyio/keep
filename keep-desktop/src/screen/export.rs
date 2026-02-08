@@ -84,7 +84,7 @@ impl ExportScreen {
             );
         } else {
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
-                .on_input(Message::ExportPassphraseChanged)
+                .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
                 .on_submit(Message::GenerateExport)
                 .secure(true)
                 .padding(10)
