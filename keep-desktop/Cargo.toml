@@ -1,0 +1,20 @@
+[package]
+name = "keep-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "keep-desktop"
+path = "src/main.rs"
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+iced = { version = "0.13.1", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
+hex = { workspace = true }
+dirs = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

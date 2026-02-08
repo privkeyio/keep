@@ -1,0 +1,135 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+#![forbid(unsafe_code)]
+
+use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
+use iced::{Alignment, Element, Length};
+
+use crate::message::Message;
+
+#[derive(Debug, Clone)]
+pub struct ShareEntry {
+    pub name: String,
+    pub identifier: u16,
+    pub threshold: u16,
+    pub total_shares: u16,
+    pub group_pubkey: [u8; 32],
+    pub group_pubkey_hex: String,
+}
+
+impl ShareEntry {
+    pub fn from_stored(stored: &keep_core::frost::StoredShare) -> Self {
+        let m = &stored.metadata;
+        Self {
+            name: m.name.clone(),
+            identifier: m.identifier,
+            threshold: m.threshold,
+            total_shares: m.total_shares,
+            group_pubkey: m.group_pubkey,
+            group_pubkey_hex: hex::encode(m.group_pubkey),
+        }
+    }
+}
+
+pub struct ShareListScreen {
+    pub shares: Vec<ShareEntry>,
+    pub delete_confirm: Option<usize>,
+    pub error: Option<String>,
+}
+
+impl ShareListScreen {
+    pub fn new(shares: Vec<ShareEntry>) -> Self {
+        Self {
+            shares,
+            delete_confirm: None,
+            error: None,
+        }
+    }
+
+    pub fn view(&self) -> Element<Message> {
+        let header = row![
+            text("FROST Shares").size(24),
+            Space::with_width(Length::Fill),
+            button(text("Import")).on_press(Message::GoToImport).padding(8),
+            button(text("Lock")).on_press(Message::Lock).padding(8),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let mut content = column![header, horizontal_rule(1)].spacing(10);
+
+        if let Some(err) = &self.error {
+            content = content.push(
+                text(err.as_str())
+                    .size(14)
+                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+            );
+        }
+
+        if self.shares.is_empty() {
+            content = content.push(
+                container(text("No shares found. Import one to get started.").size(16))
+                    .center_x(Length::Fill)
+                    .center_y(200),
+            );
+        } else {
+            let mut list = column![].spacing(5);
+            for (i, share) in self.shares.iter().enumerate() {
+                let truncated_pubkey = if share.group_pubkey_hex.len() > 16 {
+                    format!("{}...", &share.group_pubkey_hex[..16])
+                } else {
+                    share.group_pubkey_hex.clone()
+                };
+
+                let info = column![
+                    text(&share.name).size(16),
+                    text(format!(
+                        "{}-of-{}  |  Share #{}  |  {}",
+                        share.threshold, share.total_shares, share.identifier, truncated_pubkey
+                    ))
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                ]
+                .spacing(2);
+
+                let share_row = if self.delete_confirm == Some(i) {
+                    row![
+                        info,
+                        Space::with_width(Length::Fill),
+                        text("Delete?").size(14),
+                        button(text("Yes"))
+                            .on_press(Message::ConfirmDelete(i))
+                            .padding(6),
+                        button(text("No"))
+                            .on_press(Message::CancelDelete)
+                            .padding(6),
+                    ]
+                } else {
+                    row![
+                        info,
+                        Space::with_width(Length::Fill),
+                        button(text("Export QR"))
+                            .on_press(Message::GoToExport(i))
+                            .padding(6),
+                        button(text("Delete"))
+                            .on_press(Message::RequestDelete(i))
+                            .padding(6),
+                    ]
+                }
+                .spacing(8)
+                .align_y(Alignment::Center);
+
+                list = list.push(share_row);
+                list = list.push(horizontal_rule(1));
+            }
+            content = content.push(scrollable(list).height(Length::Fill));
+        }
+
+        container(content)
+            .padding(20)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+}

@@ -10,6 +10,7 @@ members = [
     "keep-frost-net",
     "keep-nip46",
     "keep-mobile",
+    "keep-desktop",
 ]
 exclude = [
     "keep-enclave/enclave",

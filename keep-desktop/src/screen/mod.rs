@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+#![forbid(unsafe_code)]
+
+pub mod export;
+pub mod import;
+pub mod shares;
+pub mod unlock;
+
+use crate::message::Message;
+
+pub enum Screen {
+    Unlock(unlock::UnlockScreen),
+    ShareList(shares::ShareListScreen),
+    Export(export::ExportScreen),
+    Import(import::ImportScreen),
+}
+
+impl Screen {
+    pub fn view(&self) -> iced::Element<Message> {
+        match self {
+            Screen::Unlock(s) => s.view(),
+            Screen::ShareList(s) => s.view(),
+            Screen::Export(s) => s.view(),
+            Screen::Import(s) => s.view(),
+        }
+    }
+}
