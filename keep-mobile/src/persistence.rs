@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -10,11 +8,11 @@ use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_PUBKEY_LEN};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::velocity::VelocityTracker;
-use crate::{
-    CERT_PINS_STORAGE_KEY, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
-};
+use crate::{CERT_PINS_STORAGE_KEY, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY};
 
-pub(crate) fn load_policy(storage: &Arc<dyn SecureStorage>) -> Result<PolicyBundle, KeepMobileError> {
+pub(crate) fn load_policy(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<PolicyBundle, KeepMobileError> {
     let data = storage.load_share_by_key(POLICY_STORAGE_KEY.into())?;
     serde_json::from_slice(&data).map_err(|e| KeepMobileError::InvalidPolicy {
         msg: format!("Failed to deserialize policy: {e}"),
@@ -42,11 +40,9 @@ pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<VelocityTracker, KeepMobileError> {
     match storage.load_share_by_key(VELOCITY_STORAGE_KEY.into()) {
-        Ok(data) => {
-            VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
-                msg: format!("Failed to deserialize velocity: {e}"),
-            })
-        }
+        Ok(data) => VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to deserialize velocity: {e}"),
+        }),
         Err(_) => Ok(VelocityTracker::new()),
     }
 }

@@ -9,8 +9,8 @@ use frost_secp256k1_tr::Identifier;
 use tokio::sync::RwLock;
 
 use crate::error::KeepMobileError;
-use crate::types::{DkgConfig, DkgStatus};
 use crate::network::validate_relay_url;
+use crate::types::{DkgConfig, DkgStatus};
 
 const MAX_DKG_PARTICIPANTS: u16 = 255;
 const MAX_SHARE_NAME_LENGTH: usize = 64;

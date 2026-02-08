@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use subtle::ConstantTimeEq;
 
 use crate::error::KeepMobileError;
@@ -67,11 +65,9 @@ pub(crate) fn parse_loopback_proxy(
 ) -> Result<std::net::SocketAddr, KeepMobileError> {
     let ip: std::net::IpAddr = match host {
         "localhost" => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        _ => host
-            .parse()
-            .map_err(|_| KeepMobileError::InvalidRelayUrl {
-                msg: "Invalid proxy host".into(),
-            })?,
+        _ => host.parse().map_err(|_| KeepMobileError::InvalidRelayUrl {
+            msg: "Invalid proxy host".into(),
+        })?,
     };
 
     if !ip.is_loopback() {

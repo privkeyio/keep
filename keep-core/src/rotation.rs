@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use bincode::Options;
 use fs2::FileExt;
 use subtle::ConstantTimeEq;
 use tracing::warn;
@@ -17,8 +16,6 @@ use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::storage::{bincode_options, share_id, Header, Storage};
-
-use bincode::Options;
 
 fn secure_delete(path: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {

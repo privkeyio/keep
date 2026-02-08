@@ -493,7 +493,6 @@ pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
     crypto::blake2b_256(&data)
 }
 
-
 impl Drop for Storage {
     fn drop(&mut self) {
         self.lock();
