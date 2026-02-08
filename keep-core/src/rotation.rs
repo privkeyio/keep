@@ -149,7 +149,6 @@ impl Storage {
             self.header = old_header;
             if let Err(restore_err) = copy_with_retry(&backup_path, &header_path) {
                 warn!(error = %restore_err, "failed to restore backup during rollback - vault may be corrupted");
-                let _ = secure_delete(&backup_path);
                 drop(lock);
                 return Err(KeepError::RotationFailed(format!(
                     "verification failed and backup restoration failed: {e} (restore error: {restore_err})"
