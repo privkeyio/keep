@@ -300,6 +300,12 @@ impl KeepMobile {
         mut hex_key: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
+        if hex_key.len() != 64 {
+            hex_key.zeroize();
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Key must be exactly 64 hex characters".into(),
+            });
+        }
         let result = self.do_import_nsec(&hex_key, name);
         hex_key.zeroize();
         result
@@ -452,7 +458,7 @@ impl KeepMobile {
 
     pub fn frost_split(
         &self,
-        existing_key: String,
+        mut existing_key: String,
         threshold: u16,
         total_shares: u16,
         name: String,
@@ -461,9 +467,13 @@ impl KeepMobile {
         Self::validate_share_name(&name)?;
 
         let mut key_bytes =
-            hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
-                msg: "Invalid hex encoding for existing key".into(),
+            hex::decode(&existing_key).map_err(|e| {
+                existing_key.zeroize();
+                KeepMobileError::InvalidShare {
+                    msg: format!("Invalid hex encoding for existing key: {e}"),
+                }
             })?;
+        existing_key.zeroize();
 
         if key_bytes.len() != 32 {
             key_bytes.zeroize();
@@ -736,16 +746,17 @@ impl KeepMobile {
             });
         }
 
-        let vk = frost_secp256k1_tr::VerifyingKey::from(
-            &frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
+        let signing_key =
+            frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Invalid signing key: {e}"),
                 }
-            })?,
-        );
+            })?;
+        let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
         let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
             msg: format!("Failed to serialize verifying key: {e}"),
         })?;
+        let signing_key_bytes = signing_key.serialize();
 
         let identifier = frost_secp256k1_tr::Identifier::try_from(1u16).map_err(|e| {
             KeepMobileError::FrostError {
@@ -753,16 +764,12 @@ impl KeepMobile {
             }
         })?;
 
-        let signing_share = frost_secp256k1_tr::keys::SigningShare::deserialize(
-            &frost_secp256k1_tr::SigningKey::deserialize(&key_bytes)
-                .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Invalid signing key: {e}"),
-                })?
-                .serialize(),
-        )
-        .map_err(|e| KeepMobileError::FrostError {
-            msg: format!("Failed to create signing share: {e}"),
-        })?;
+        let signing_share =
+            frost_secp256k1_tr::keys::SigningShare::deserialize(&signing_key_bytes).map_err(
+                |e| KeepMobileError::FrostError {
+                    msg: format!("Failed to create signing share: {e}"),
+                },
+            )?;
 
         let verifying_share = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes)
             .map_err(|e| KeepMobileError::FrostError {
@@ -786,7 +793,9 @@ impl KeepMobile {
         let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
 
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
-            33 => vk_bytes[1..33].try_into().unwrap(),
+            33 => vk_bytes[1..33].try_into().map_err(|_| KeepMobileError::FrostError {
+                msg: "Failed to extract group pubkey from verifying key".into(),
+            })?,
             len => {
                 return Err(KeepMobileError::FrostError {
                     msg: format!("Invalid group pubkey length: {len}"),
