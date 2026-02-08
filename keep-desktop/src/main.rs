@@ -9,6 +9,7 @@ mod message;
 mod screen;
 
 use app::App;
+use iced::Size;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
@@ -16,6 +17,6 @@ fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("Keep")
         .subscription(App::subscription)
-        .window_size((900.0, 600.0))
+        .window_size(Size::new(900.0, 600.0))
         .run()
 }

@@ -56,10 +56,11 @@ fn with_keep_blocking<T: Send + 'static>(
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| f(&mut keep)));
 
-    *lock_keep(keep_arc) = Some(keep);
-
     match result {
-        Ok(r) => r,
+        Ok(r) => {
+            *lock_keep(keep_arc) = Some(keep);
+            r
+        }
         Err(payload) => {
             error!("{}: {}", panic_msg, panic_message(&payload));
             Err(panic_msg.to_string())
@@ -79,6 +80,7 @@ impl App {
                             keep: Arc::new(Mutex::new(None)),
                             keep_path: PathBuf::new(),
                             screen: Screen::Unlock(UnlockScreen::with_error(
+                                false,
                                 "Cannot determine home directory. Set $HOME and restart.".into(),
                             )),
                             last_activity: Instant::now(),

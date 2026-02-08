@@ -84,7 +84,7 @@ impl CreateScreen {
                     .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
             );
         }
-        if !self.total.is_empty() && total_val.is_some() && !total_valid {
+        if !self.total.is_empty() && threshold_val.is_some() && total_val.is_some() && !total_valid {
             content = content.push(
                 text("Total must be >= threshold")
                     .size(12)

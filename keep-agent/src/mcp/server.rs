@@ -76,7 +76,15 @@ impl McpServer {
             .expect("Failed to create runtime");
         let response = rt.block_on(self.handle_request_async(input));
         serde_json::to_string(&response).unwrap_or_else(|e| {
-            format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"{e}"}}}}"#)
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32603,
+                    "message": e.to_string()
+                }
+            }))
+            .expect("static JSON structure must serialize")
         })
     }
 

@@ -27,8 +27,8 @@ impl UnlockScreen {
         }
     }
 
-    pub fn with_error(error: String) -> Self {
-        let mut s = Self::new(false);
+    pub fn with_error(vault_exists: bool, error: String) -> Self {
+        let mut s = Self::new(vault_exists);
         s.error = Some(error);
         s
     }
