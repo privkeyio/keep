@@ -30,7 +30,7 @@ pub use types::{
 };
 
 use keep_core::frost::{
-    ShareExport, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
+    ShareExport, ShareMetadata, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
 };
 use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use policy::{PolicyBundle, PolicyEvaluator, POLICY_PUBKEY_LEN};
@@ -44,6 +44,35 @@ use velocity::VelocityTracker;
 use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
+
+fn init_android_logging() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Debug)
+                .with_tag("KeepRust"),
+        );
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(|| LogWriter))
+            .try_init();
+    });
+}
+
+struct LogWriter;
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let s = String::from_utf8_lossy(buf);
+        log::debug!(target: "KeepFrost", "{}", s.trim_end());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -135,6 +164,7 @@ struct PendingRequest {
 impl KeepMobile {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SecureStorage>) -> Result<Self, KeepMobileError> {
+        init_android_logging();
         keep_frost_net::install_default_crypto_provider();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -263,6 +293,16 @@ impl KeepMobile {
             total_shares: metadata.total_shares,
             group_pubkey: group_pubkey_hex,
         })
+    }
+
+    pub fn import_nsec(
+        &self,
+        mut hex_key: String,
+        name: String,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        let result = self.do_import_nsec(&hex_key, name);
+        hex_key.zeroize();
+        result
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -661,8 +701,138 @@ impl KeepMobile {
                 Self::event_listener(event_rx, request_rx, pending).await;
             });
 
+            let run_node = node.clone();
+            tokio::spawn(async move {
+                let _ = run_node.run().await;
+            });
+
             *self.node.write().await = Some(node);
             Ok(())
+        })
+    }
+
+    fn do_import_nsec(&self, hex_key: &str, name: String) -> Result<ShareInfo, KeepMobileError> {
+        Self::validate_share_name(&name)?;
+
+        let share_count = self.storage.list_all_shares().len();
+        if share_count >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
+            });
+        }
+
+        let key_bytes =
+            Zeroizing::new(
+                hex::decode(hex_key).map_err(|_| KeepMobileError::InvalidShare {
+                    msg: "Invalid hex encoding".into(),
+                })?,
+            );
+
+        if key_bytes.len() != 32 {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Key must be exactly 32 bytes".into(),
+            });
+        }
+
+        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
+            KeepMobileError::FrostError {
+                msg: format!("Invalid signing key: {}", e),
+            }
+        })?;
+
+        let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
+        let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
+            msg: format!("Failed to serialize verifying key: {}", e),
+        })?;
+
+        let identifier = frost_secp256k1_tr::Identifier::try_from(1u16).map_err(|e| {
+            KeepMobileError::FrostError {
+                msg: format!("Failed to create identifier: {}", e),
+            }
+        })?;
+
+        let signing_share = frost_secp256k1_tr::keys::SigningShare::deserialize(
+            &signing_key.serialize(),
+        )
+        .map_err(|e| KeepMobileError::FrostError {
+            msg: format!("Failed to create signing share: {}", e),
+        })?;
+
+        let verifying_share = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes)
+            .map_err(|e| KeepMobileError::FrostError {
+                msg: format!("Failed to create verifying share: {}", e),
+            })?;
+
+        let key_package = frost_secp256k1_tr::keys::KeyPackage::new(
+            identifier,
+            signing_share,
+            frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes).map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("Serialization failed: {}", e),
+                }
+            })?,
+            frost_secp256k1_tr::VerifyingKey::deserialize(&vk_bytes).map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("Serialization failed: {}", e),
+                }
+            })?,
+            1,
+        );
+
+        let mut verifying_shares = std::collections::BTreeMap::new();
+        verifying_shares.insert(identifier, verifying_share);
+        let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
+
+        let mut group_pubkey = [0u8; 32];
+        if vk_bytes.len() == 33 {
+            group_pubkey.copy_from_slice(&vk_bytes[1..33]);
+        } else {
+            group_pubkey.copy_from_slice(&vk_bytes[..32]);
+        }
+
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name);
+
+        let metadata_info = ShareMetadataInfo {
+            name: metadata.name.clone(),
+            identifier: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            group_pubkey: metadata.group_pubkey.to_vec(),
+        };
+
+        let stored = StoredShareData {
+            metadata_json: serde_json::to_string(&metadata)
+                .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
+            key_package_bytes: key_package.serialize().map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("Serialization failed: {}", e),
+                }
+            })?,
+            pubkey_package_bytes: pubkey_package.serialize().map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("Serialization failed: {}", e),
+                }
+            })?,
+        };
+
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
+        self.storage.store_share_by_key(
+            group_pubkey_hex.clone(),
+            serialized,
+            metadata_info.clone(),
+        )?;
+        self.storage
+            .set_active_share_key(Some(group_pubkey_hex.clone()))?;
+
+        Ok(ShareInfo {
+            name: metadata_info.name,
+            share_index: metadata_info.identifier,
+            threshold: metadata_info.threshold,
+            total_shares: metadata_info.total_shares,
+            group_pubkey: group_pubkey_hex,
         })
     }
 
