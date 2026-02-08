@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Trusted dealer key generation for FROST.
-
-#![forbid(unsafe_code)]
-
 use frost::keys::{IdentifierList, KeyPackage, PublicKeyPackage};
 use frost::rand_core::OsRng;
 use frost_secp256k1_tr as frost;

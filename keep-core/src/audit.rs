@@ -2,9 +2,6 @@
 //!
 //! This module provides encrypted audit logging with cryptographic integrity guarantees.
 //! Each entry links to the previous via a hash chain, making tampering detectable.
-
-#![forbid(unsafe_code)]
-
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

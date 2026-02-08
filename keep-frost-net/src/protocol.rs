@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use serde::{Deserialize, Serialize};
 
 pub const KFP_EVENT_KIND: u16 = 24242;

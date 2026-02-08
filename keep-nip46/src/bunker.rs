@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use nostr_sdk::prelude::*;
 
 pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&str>) -> String {

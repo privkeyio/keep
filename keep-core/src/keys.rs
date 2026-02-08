@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Key types and Nostr keypair operations.
-
-#![forbid(unsafe_code)]
-
 use bech32::{Bech32, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};

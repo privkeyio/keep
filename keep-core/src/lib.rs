@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: (C) 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![deny(unsafe_code)]
+
 //! Sovereign key management for Nostr and Bitcoin.
 //!
 //! This crate provides encrypted key storage with the following features:

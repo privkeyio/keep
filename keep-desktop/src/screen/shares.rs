@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 

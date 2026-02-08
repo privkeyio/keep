@@ -3,7 +3,6 @@
 
 //! FROST share types and encrypted storage.
 
-#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use frost_secp256k1_tr::{

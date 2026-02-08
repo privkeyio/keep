@@ -1,7 +1,4 @@
 //! Pluggable storage backends for encrypted key storage.
-
-#![forbid(unsafe_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{PoisonError, RwLock};

@@ -1,7 +1,4 @@
 //! Database schema versioning and migrations.
-
-#![forbid(unsafe_code)]
-
 use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, info};
 

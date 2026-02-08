@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Header structures for hidden volume storage.
-
-#![forbid(unsafe_code)]
-
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, Argon2Params, SALT_SIZE};

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::backtrace::Backtrace;
 use std::panic::PanicHookInfo;
 use std::path::PathBuf;

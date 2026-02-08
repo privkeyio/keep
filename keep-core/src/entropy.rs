@@ -1,4 +1,6 @@
 //! Multi-source entropy mixing for defense-in-depth randomness.
+// SAFETY: CPUID and RDRAND intrinsics require unsafe for hardware entropy.
+#![allow(unsafe_code)]
 
 use blake2::{Blake2b512, Digest};
 use rand::RngCore;

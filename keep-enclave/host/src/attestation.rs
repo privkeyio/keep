@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use crate::error::{EnclaveError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};

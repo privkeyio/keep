@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! In-memory keyring for managing unlocked keys.
-
-#![forbid(unsafe_code)]
-
 use std::collections::HashMap;
 
 use secrecy::{ExposeSecret, SecretBox};

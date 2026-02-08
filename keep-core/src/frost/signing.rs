@@ -3,7 +3,6 @@
 
 //! FROST signing session management.
 
-#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use std::collections::BTreeMap;

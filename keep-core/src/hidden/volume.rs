@@ -32,9 +32,6 @@
 //! - Wrong password for hidden volume produces same error as "no hidden volume"
 //! - Both volumes use independent Argon2id key derivation
 //! - Unlock attempts both decryptions to prevent timing attacks
-
-#![forbid(unsafe_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
