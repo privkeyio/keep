@@ -79,7 +79,7 @@ impl ExportScreen {
 
             content = content.push(
                 button(text("Copy to Clipboard"))
-                    .on_press(Message::CopyToClipboard(Zeroizing::new(bech32.to_string())))
+                    .on_press(Message::CopyToClipboard(bech32.clone()))
                     .padding(8),
             );
         } else {

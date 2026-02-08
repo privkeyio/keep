@@ -3249,7 +3249,6 @@ dependencies = [
  "hex",
  "iced",
  "keep-core",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",

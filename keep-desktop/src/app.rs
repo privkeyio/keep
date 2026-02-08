@@ -52,6 +52,12 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+fn collect_shares(keep: &Keep) -> Result<Vec<ShareEntry>, String> {
+    keep.frost_list_shares()
+        .map(|stored| stored.iter().map(ShareEntry::from_stored).collect())
+        .map_err(|e| e.to_string())
+}
+
 fn with_keep_blocking<T: Send + 'static>(
     keep_arc: &Arc<Mutex<Option<Keep>>>,
     panic_msg: &'static str,
@@ -70,7 +76,7 @@ fn with_keep_blocking<T: Send + 'static>(
         }
         Err(payload) => {
             error!("{}: {}", panic_msg, panic_message(&payload));
-            Err(format!("{panic_msg}; please lock and re-unlock"))
+            Err(format!("{panic_msg}; please re-unlock your vault"))
         }
     }
 }
@@ -244,7 +250,7 @@ impl App {
             Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
-                iced::clipboard::write((*t).clone())
+                iced::clipboard::write(t.to_string())
             }
 
             Message::ImportDataChanged(d) => {
@@ -297,13 +303,10 @@ impl App {
         let Some(keep) = guard.as_ref() else {
             return Vec::new();
         };
-        match keep.frost_list_shares() {
-            Ok(stored) => stored.iter().map(ShareEntry::from_stored).collect(),
-            Err(e) => {
-                error!("Failed to list shares: {e}");
-                Vec::new()
-            }
-        }
+        collect_shares(keep).unwrap_or_else(|e| {
+            error!("Failed to list shares: {e}");
+            Vec::new()
+        })
     }
 
     fn refresh_shares(&mut self) {
@@ -359,13 +362,7 @@ impl App {
                                 keep.unlock(&password).map_err(|e| e.to_string())?;
                             }
 
-                            let shares = keep
-                                .frost_list_shares()
-                                .map_err(|e| e.to_string())?
-                                .iter()
-                                .map(ShareEntry::from_stored)
-                                .collect();
-
+                            let shares = collect_shares(&keep)?;
                             *lock_keep(&keep_arc) = Some(keep);
                             Ok(shares)
                         }));
@@ -420,9 +417,9 @@ impl App {
                     return Task::none();
                 }
                 let threshold: u16 = match s.threshold.parse() {
-                    Ok(v) if v >= 2 => v,
+                    Ok(v) if (2..=255).contains(&v) => v,
                     _ => {
-                        s.error = Some("Threshold must be at least 2".into());
+                        s.error = Some("Threshold must be between 2 and 255".into());
                         return Task::none();
                     }
                 };
@@ -458,12 +455,7 @@ impl App {
                         move |keep| {
                             keep.frost_generate(threshold, total, &name)
                                 .map_err(|e| e.to_string())?;
-                            Ok(keep
-                                .frost_list_shares()
-                                .map_err(|e| e.to_string())?
-                                .iter()
-                                .map(ShareEntry::from_stored)
-                                .collect())
+                            collect_shares(keep)
                         },
                     )
                 })
@@ -482,7 +474,7 @@ impl App {
                 }
                 s.loading = true;
                 s.error = None;
-                (s.share.clone(), Zeroizing::new(s.passphrase.to_string()))
+                (s.share.clone(), s.passphrase.clone())
             }
             _ => return Task::none(),
         };
@@ -495,7 +487,10 @@ impl App {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        export.to_bech32().map(Zeroizing::new).map_err(|e| e.to_string())
+                        export
+                            .to_bech32()
+                            .map(Zeroizing::new)
+                            .map_err(|e| e.to_string())
                     })
                 })
                 .await
@@ -505,7 +500,10 @@ impl App {
         )
     }
 
-    fn handle_export_generated(&mut self, result: Result<Zeroizing<String>, String>) -> Task<Message> {
+    fn handle_export_generated(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+    ) -> Task<Message> {
         match result {
             Ok(bech32) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -525,7 +523,7 @@ impl App {
                 }
                 s.loading = true;
                 s.error = None;
-                (Zeroizing::new(s.data.to_string()), Zeroizing::new(s.passphrase.to_string()))
+                (s.data.clone(), s.passphrase.clone())
             }
             _ => return Task::none(),
         };
@@ -538,12 +536,7 @@ impl App {
                         let export = ShareExport::parse(&data).map_err(|e| e.to_string())?;
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        Ok(keep
-                            .frost_list_shares()
-                            .map_err(|e| e.to_string())?
-                            .iter()
-                            .map(ShareEntry::from_stored)
-                            .collect())
+                        collect_shares(keep)
                     })
                 })
                 .await

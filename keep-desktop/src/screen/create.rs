@@ -60,13 +60,16 @@ impl CreateScreen {
             .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
         let name_valid = !self.name.is_empty() && self.name.len() <= 64;
-        let threshold_val: Option<u16> = self.threshold.parse().ok().filter(|&v| v >= 2);
+        let threshold_val: Option<u16> = self
+            .threshold
+            .parse()
+            .ok()
+            .filter(|v| (2..=255).contains(v));
         let total_val: Option<u16> = self.total.parse().ok().filter(|&v| v <= 255);
-        let total_valid = match (threshold_val, total_val) {
-            (Some(t), Some(n)) => n >= t,
-            _ => false,
-        };
+        let total_valid = matches!((threshold_val, total_val), (Some(t), Some(n)) if n >= t);
         let can_create = name_valid && threshold_val.is_some() && total_valid;
+
+        let error_color = iced::Color::from_rgb(0.8, 0.2, 0.2);
 
         let mut content = column![
             header,
@@ -82,35 +85,28 @@ impl CreateScreen {
             content = content.push(
                 text("Name must be 64 characters or fewer")
                     .size(12)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                    .color(error_color),
             );
         }
         if !self.threshold.is_empty() && threshold_val.is_none() {
             content = content.push(
-                text("Threshold must be a number >= 2")
+                text("Threshold must be between 2 and 255")
                     .size(12)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                    .color(error_color),
             );
         }
-        if !self.total.is_empty() && threshold_val.is_some() && total_val.is_some() && !total_valid {
-            content = content.push(
-                text("Total must be >= threshold")
-                    .size(12)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-            );
-        } else if !self.total.is_empty() && total_val.is_none() {
-            if self.total.parse::<u16>().map_or(false, |v| v > 255) {
-                content = content.push(
-                    text("Total must be 255 or fewer")
-                        .size(12)
-                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-                );
+        if !self.total.is_empty() {
+            let total_error = if total_val.is_some() && !total_valid {
+                Some("Total must be >= threshold")
+            } else if total_val.is_none() && self.total.parse::<u16>().is_ok() {
+                Some("Total must be 255 or fewer")
+            } else if total_val.is_none() {
+                Some("Total must be a valid number")
             } else {
-                content = content.push(
-                    text("Total must be a valid number")
-                        .size(12)
-                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-                );
+                None
+            };
+            if let Some(msg) = total_error {
+                content = content.push(text(msg).size(12).color(error_color));
             }
         }
 
@@ -128,11 +124,7 @@ impl CreateScreen {
         }
 
         if let Some(err) = &self.error {
-            content = content.push(
-                text(err.as_str())
-                    .size(14)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-            );
+            content = content.push(text(err.as_str()).size(14).color(error_color));
         }
 
         container(content)
