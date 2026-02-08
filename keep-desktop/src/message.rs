@@ -90,9 +90,7 @@ impl fmt::Debug for Message {
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
             Self::Lock => f.write_str("Lock"),
-            Self::ToggleShareDetails(i) => {
-                f.debug_tuple("ToggleShareDetails").field(i).finish()
-            }
+            Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::RequestDelete(i) => f.debug_tuple("RequestDelete").field(i).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),

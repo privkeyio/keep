@@ -215,11 +215,7 @@ impl App {
 
             Message::ToggleShareDetails(i) => {
                 if let Screen::ShareList(s) = &mut self.screen {
-                    s.expanded = if s.expanded == Some(i) {
-                        None
-                    } else {
-                        Some(i)
-                    };
+                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
                 }
                 Task::none()
             }
@@ -348,8 +344,7 @@ impl App {
         if let Screen::Export(s) = &self.screen {
             if s.is_animated() {
                 subs.push(
-                    iced::time::every(Duration::from_millis(800))
-                        .map(|_| Message::AdvanceQrFrame),
+                    iced::time::every(Duration::from_millis(800)).map(|_| Message::AdvanceQrFrame),
                 );
             }
         }
@@ -390,6 +385,7 @@ impl App {
             s.shares = shares;
             s.delete_confirm = None;
             s.error = None;
+            s.success_message = None;
         }
     }
 
@@ -566,9 +562,7 @@ impl App {
                             .to_bech32()
                             .map(Zeroizing::new)
                             .map_err(|e| e.to_string())?;
-                        let frames = export
-                            .to_animated_frames(600)
-                            .map_err(|e| e.to_string())?;
+                        let frames = export.to_animated_frames(600).map_err(|e| e.to_string())?;
                         Ok(ExportData { bech32, frames })
                     })
                 })

@@ -104,13 +104,11 @@ impl ExportScreen {
             match qr_display {
                 QrDisplay::Single(data) => {
                     let qr_widget = qr_code::QRCode::new(data).cell_size(5);
-                    content =
-                        content.push(container(qr_widget).center_x(Length::Fill).padding(10));
+                    content = content.push(container(qr_widget).center_x(Length::Fill).padding(10));
                 }
                 QrDisplay::Animated { frames, current } => {
                     let qr_widget = qr_code::QRCode::new(&frames[*current]).cell_size(5);
-                    content =
-                        content.push(container(qr_widget).center_x(Length::Fill).padding(10));
+                    content = content.push(container(qr_widget).center_x(Length::Fill).padding(10));
                     content = content.push(
                         text(format!("Frame {} of {}", current + 1, frames.len()))
                             .size(12)

@@ -134,11 +134,7 @@ impl ShareListScreen {
                 .size(12)
                 .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
 
-                let arrow = if self.expanded == Some(i) {
-                    "v"
-                } else {
-                    ">"
-                };
+                let arrow = if self.expanded == Some(i) { "v" } else { ">" };
                 let name_btn = button(text(format!("{arrow} {}", share.name)).size(16))
                     .on_press(Message::ToggleShareDetails(i))
                     .style(button::text)
