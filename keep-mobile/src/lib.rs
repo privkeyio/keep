@@ -464,16 +464,13 @@ impl KeepMobile {
         name: String,
         passphrase: String,
     ) -> Result<FrostGenerationResult, KeepMobileError> {
-        Self::validate_share_name(&name)?;
-
-        let mut key_bytes =
-            hex::decode(&existing_key).map_err(|e| {
-                existing_key.zeroize();
-                KeepMobileError::InvalidShare {
-                    msg: format!("Invalid hex encoding for existing key: {e}"),
-                }
-            })?;
+        let name_result = Self::validate_share_name(&name);
+        let key_result = hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
+            msg: "Invalid hex encoding for existing key".into(),
+        });
         existing_key.zeroize();
+        name_result?;
+        let mut key_bytes = key_result?;
 
         if key_bytes.len() != 32 {
             key_bytes.zeroize();
@@ -756,7 +753,7 @@ impl KeepMobile {
         let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
             msg: format!("Failed to serialize verifying key: {e}"),
         })?;
-        let signing_key_bytes = signing_key.serialize();
+        let signing_key_bytes = Zeroizing::new(signing_key.serialize());
 
         let identifier = frost_secp256k1_tr::Identifier::try_from(1u16).map_err(|e| {
             KeepMobileError::FrostError {
@@ -780,17 +777,14 @@ impl KeepMobile {
             identifier,
             signing_share,
             verifying_share,
-            frost_secp256k1_tr::VerifyingKey::deserialize(&vk_bytes).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {e}"),
-                }
-            })?,
+            vk,
             1,
         );
 
         let mut verifying_shares = std::collections::BTreeMap::new();
         verifying_shares.insert(identifier, verifying_share);
-        let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
+        let pubkey_package =
+            frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
 
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33].try_into().map_err(|_| KeepMobileError::FrostError {
