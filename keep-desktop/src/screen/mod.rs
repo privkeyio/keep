@@ -12,7 +12,7 @@ pub enum Screen {
     Unlock(unlock::UnlockScreen),
     ShareList(shares::ShareListScreen),
     Create(create::CreateScreen),
-    Export(export::ExportScreen),
+    Export(Box<export::ExportScreen>),
     Import(import::ImportScreen),
 }
 

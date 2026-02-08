@@ -252,7 +252,7 @@ impl AgentClient {
 
         let signer_pubkey = PublicKey::from_bech32(pubkey_part)
             .or_else(|_| PublicKey::from_hex(pubkey_part))
-            .map_err(|e| AgentError::Connection(format!("Invalid pubkey: {}", e)))?;
+            .map_err(|e| AgentError::Connection(format!("Invalid pubkey: {e}")))?;
 
         let mut relay_url = None;
         let mut secret = None;

@@ -36,46 +36,45 @@ impl EnclaveClient {
         use std::time::Duration;
 
         let mut stream = vsock::VsockStream::connect_with_cid_port(self.cid, self.port)
-            .map_err(|e| EnclaveError::Vsock(format!("Connection failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Connection failed: {e}")))?;
 
         stream
             .set_read_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)))
-            .map_err(|e| EnclaveError::Vsock(format!("Set read timeout failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Set read timeout failed: {e}")))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)))
-            .map_err(|e| EnclaveError::Vsock(format!("Set write timeout failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Set write timeout failed: {e}")))?;
 
         let request_bytes = postcard::to_allocvec(request)
-            .map_err(|e| EnclaveError::Serialization(format!("Request encode failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Serialization(format!("Request encode failed: {e}")))?;
 
         let len = request_bytes.len() as u32;
         stream
             .write_all(&len.to_le_bytes())
-            .map_err(|e| EnclaveError::Vsock(format!("Write length failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Write length failed: {e}")))?;
         stream
             .write_all(&request_bytes)
-            .map_err(|e| EnclaveError::Vsock(format!("Write request failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Write request failed: {e}")))?;
 
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
-            .map_err(|e| EnclaveError::Vsock(format!("Read length failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Read length failed: {e}")))?;
         let response_len = u32::from_le_bytes(len_buf) as usize;
 
         if response_len == 0 || response_len > MAX_RESPONSE_SIZE {
             return Err(EnclaveError::Vsock(format!(
-                "Invalid response size: {} (max: {})",
-                response_len, MAX_RESPONSE_SIZE
+                "Invalid response size: {response_len} (max: {MAX_RESPONSE_SIZE})"
             )));
         }
 
         let mut response_bytes = vec![0u8; response_len];
         stream
             .read_exact(&mut response_bytes)
-            .map_err(|e| EnclaveError::Vsock(format!("Read response failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Vsock(format!("Read response failed: {e}")))?;
 
         let response: EnclaveResponse = postcard::from_bytes(&response_bytes)
-            .map_err(|e| EnclaveError::Serialization(format!("Response decode failed: {}", e)))?;
+            .map_err(|e| EnclaveError::Serialization(format!("Response decode failed: {e}")))?;
 
         Ok(response)
     }
@@ -224,8 +223,7 @@ impl EnclaveClient {
         match response {
             EnclaveResponse::PolicySet => Ok(()),
             EnclaveResponse::Error { message, .. } => Err(EnclaveError::PolicyConfig(format!(
-                "Policy set failed: {}",
-                message
+                "Policy set failed: {message}"
             ))),
             _ => Err(EnclaveError::PolicyConfig("Unexpected response".into())),
         }

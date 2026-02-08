@@ -282,7 +282,7 @@ impl AuditLog {
         entry.hash = entry.compute_hash();
 
         let serialized = serde_json::to_vec(&entry)
-            .map_err(|e| StorageError::serialization(format!("audit entry: {}", e)))?;
+            .map_err(|e| StorageError::serialization(format!("audit entry: {e}")))?;
 
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let line = format!("{}\n", STANDARD.encode(encrypted.to_bytes()));
@@ -351,7 +351,7 @@ impl AuditLog {
     pub fn export(&self, data_key: &SecretKey) -> Result<String> {
         let entries = self.read_all(data_key)?;
         serde_json::to_string_pretty(&entries)
-            .map_err(|e| StorageError::serialization(format!("export audit log: {}", e)).into())
+            .map_err(|e| StorageError::serialization(format!("export audit log: {e}")).into())
     }
 
     fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
@@ -369,8 +369,7 @@ impl AuditLog {
         for (line_num, line) in reader.lines().enumerate() {
             if entries.len() >= MAX_ENTRIES {
                 return Err(StorageError::io(format!(
-                    "audit log exceeds maximum of {} entries",
-                    MAX_ENTRIES
+                    "audit log exceeds maximum of {MAX_ENTRIES} entries"
                 ))
                 .into());
             }
@@ -390,13 +389,13 @@ impl AuditLog {
     fn decrypt_line(line: &str, data_key: &SecretKey) -> Result<AuditEntry> {
         let bytes = STANDARD
             .decode(line)
-            .map_err(|e| StorageError::invalid_format(format!("audit line: {}", e)))?;
+            .map_err(|e| StorageError::invalid_format(format!("audit line: {e}")))?;
 
         let encrypted = crypto::EncryptedData::from_bytes(&bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
 
         serde_json::from_slice(&decrypted.as_slice()?)
-            .map_err(|e| StorageError::invalid_format(format!("audit entry: {}", e)).into())
+            .map_err(|e| StorageError::invalid_format(format!("audit entry: {e}")).into())
     }
 
     fn rewrite(&mut self, entries: &[AuditEntry], data_key: &SecretKey) -> Result<()> {
@@ -414,7 +413,7 @@ impl AuditLog {
         if self.path.exists() {
             if let Err(e) = std::fs::rename(&self.path, &backup_path) {
                 let _ = std::fs::remove_file(&temp_path);
-                return Err(StorageError::io(format!("backup existing audit log: {}", e)).into());
+                return Err(StorageError::io(format!("backup existing audit log: {e}")).into());
             }
         }
 
@@ -423,7 +422,7 @@ impl AuditLog {
                 let _ = std::fs::rename(&backup_path, &self.path);
             }
             let _ = std::fs::remove_file(&temp_path);
-            return Err(StorageError::io(format!("replace audit log: {}", e)).into());
+            return Err(StorageError::io(format!("replace audit log: {e}")).into());
         }
 
         let _ = std::fs::remove_file(&backup_path);

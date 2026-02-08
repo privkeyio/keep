@@ -27,7 +27,7 @@ impl CreateScreen {
     pub fn view(&self) -> Element<Message> {
         let back_btn = button(text("< Back")).on_press(Message::GoBack).padding(8);
         let title = text("Create Keyset").size(24);
-        let header = row![back_btn, Space::with_width(10), title].align_y(Alignment::Center);
+        let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
 
         let name_input = text_input("Keyset name (e.g. my-keyset)", &self.name)
             .on_input(Message::CreateNameChanged)
@@ -69,10 +69,10 @@ impl CreateScreen {
 
         let mut content = column![
             header,
-            Space::with_height(20),
+            Space::new().height(20),
             text("Name").size(14),
             name_input,
-            Space::with_height(10),
+            Space::new().height(10),
             threshold_row,
         ]
         .spacing(5);
@@ -99,7 +99,7 @@ impl CreateScreen {
         }
 
         content = content.push(hint);
-        content = content.push(Space::with_height(10));
+        content = content.push(Space::new().height(10));
 
         if self.loading {
             content = content.push(text("Generating keyset...").size(14));

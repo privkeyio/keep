@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, rule, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::{Message, ShareIdentity};
@@ -47,7 +47,7 @@ impl ShareListScreen {
     pub fn view(&self) -> Element<Message> {
         let header = row![
             text("FROST Shares").size(24),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             button(text("Create"))
                 .on_press(Message::GoToCreate)
                 .padding(8),
@@ -59,7 +59,7 @@ impl ShareListScreen {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let mut content = column![header, horizontal_rule(1)].spacing(10);
+        let mut content = column![header, rule::horizontal(1)].spacing(10);
 
         if let Some(err) = &self.error {
             content = content.push(
@@ -72,11 +72,11 @@ impl ShareListScreen {
         if self.shares.is_empty() {
             let empty = column![
                 text("No shares yet").size(18),
-                Space::with_height(20),
+                Space::new().height(20),
                 button(text("Create Keyset").width(250).align_x(Alignment::Center),)
                     .on_press(Message::GoToCreate)
                     .padding(12),
-                Space::with_height(8),
+                Space::new().height(8),
                 button(text("Import Share").width(250).align_x(Alignment::Center),)
                     .on_press(Message::GoToImport)
                     .padding(12),
@@ -108,7 +108,7 @@ impl ShareListScreen {
                 let share_row = if self.delete_confirm == Some(i) {
                     row![
                         info,
-                        Space::with_width(Length::Fill),
+                        Space::new().width(Length::Fill),
                         text("Delete? This cannot be undone.")
                             .size(14)
                             .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
@@ -125,7 +125,7 @@ impl ShareListScreen {
                 } else {
                     row![
                         info,
-                        Space::with_width(Length::Fill),
+                        Space::new().width(Length::Fill),
                         button(text("Export QR"))
                             .on_press(Message::GoToExport(i))
                             .padding(6),
@@ -138,7 +138,7 @@ impl ShareListScreen {
                 .align_y(Alignment::Center);
 
                 list = list.push(share_row);
-                list = list.push(horizontal_rule(1));
+                list = list.push(rule::horizontal(1));
             }
             content = content.push(scrollable(list).height(Length::Fill));
         }

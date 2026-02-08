@@ -362,10 +362,7 @@ async fn test_full_signing_flow() {
         graceful_shutdown(shutdown1, node1_handle).await;
         graceful_shutdown(shutdown2, node2_handle).await;
         graceful_shutdown(shutdown3, node3_handle).await;
-        panic!(
-            "Peer discovery timed out: only {} peers discovered",
-            peers_discovered
-        );
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
     }
 
     let message = b"Hello, FROST!".to_vec();
@@ -384,7 +381,7 @@ async fn test_full_signing_flow() {
             assert_eq!(signature.len(), 64);
         }
         Ok(Err(e)) => {
-            panic!("Signing failed: {:?}", e);
+            panic!("Signing failed: {e:?}");
         }
         Err(_) => {
             panic!("Signing timed out after 60 seconds");

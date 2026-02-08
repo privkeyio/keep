@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 PrivKey LLC
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-FROM rust:1.85.0-slim-bookworm AS builder
+FROM rust:1.88.0-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev-dev \

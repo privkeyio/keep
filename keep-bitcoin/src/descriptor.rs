@@ -19,15 +19,12 @@ impl DescriptorExport {
 
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
 
-        let descriptor = format!(
-            "tr([{}/86'/{}'/{}']{}/0/*)",
-            fingerprint, coin_type, account, xpub
-        );
+        let descriptor = format!("tr([{fingerprint}/86'/{coin_type}'/{account}']{xpub}/0/*)");
 
         let checksum = compute_checksum(&descriptor)?;
 
         Ok(Self {
-            descriptor: format!("{}#{}", descriptor, checksum),
+            descriptor: format!("{descriptor}#{checksum}"),
             checksum,
             fingerprint: fingerprint.to_string(),
             network,
@@ -46,7 +43,7 @@ impl DescriptorExport {
             .unwrap_or(&self.descriptor);
         let internal = desc.replace("/0/*)", "/1/*)");
         let checksum = compute_checksum(&internal)?;
-        Ok(format!("{}#{}", internal, checksum))
+        Ok(format!("{internal}#{checksum}"))
     }
 
     pub fn to_sparrow_json(&self, name: &str) -> Result<String> {

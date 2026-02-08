@@ -37,8 +37,7 @@ impl RecoveryTxBuilder {
 
         if fee_sats > MAX_FEE_SATS {
             return Err(BitcoinError::Recovery(format!(
-                "fee {} sats exceeds maximum {} sats",
-                fee_sats, MAX_FEE_SATS
+                "fee {fee_sats} sats exceeds maximum {MAX_FEE_SATS} sats"
             )));
         }
         if utxo_value <= fee_sats {
@@ -186,7 +185,7 @@ impl RecoveryTxBuilder {
         self.recovery_output
             .tiers
             .get(index)
-            .ok_or_else(|| BitcoinError::Recovery(format!("tier {} not found", index)))
+            .ok_or_else(|| BitcoinError::Recovery(format!("tier {index} not found")))
     }
 
     fn control_block(&self, tier: &TierInfo) -> Result<ControlBlock> {

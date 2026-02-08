@@ -90,7 +90,7 @@ impl Server {
     ) -> Result<Self> {
         let keys = if let Some(secret_bytes) = transport_secret {
             let secret = SecretKey::from_slice(&secret_bytes)
-                .map_err(|e| CryptoError::invalid_key(format!("transport key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("transport key: {e}")))?;
             Keys::new(secret)
         } else {
             let kr = keyring.lock().await;
@@ -99,7 +99,7 @@ impl Server {
                 .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
 
             let secret = SecretKey::from_slice(slot.expose_secret())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {}", e)))?;
+                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
             Keys::new(secret)
         };
@@ -196,7 +196,7 @@ impl Server {
         }
 
         let secret = SecretKey::from_slice(&transport_secret)
-            .map_err(|e| CryptoError::invalid_key(format!("transport key: {}", e)))?;
+            .map_err(|e| CryptoError::invalid_key(format!("transport key: {e}")))?;
         let keys = Keys::new(secret);
 
         let client = match proxy {
@@ -303,7 +303,7 @@ impl Server {
                 }
             })
             .await
-            .map_err(|e| NetworkError::relay(format!("notification handler: {}", e)))?;
+            .map_err(|e| NetworkError::relay(format!("notification handler: {e}")))?;
 
         Ok(())
     }
@@ -323,7 +323,7 @@ impl Server {
             .map_err(|e| CryptoError::decryption(e.to_string()))?;
 
         let request: Nip46Request = serde_json::from_str(&decrypted)
-            .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {}", e)))?;
+            .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
 
         debug!(method = %request.method, app_id, "NIP-46 request");
 
@@ -361,7 +361,7 @@ impl Server {
         let response_event = EventBuilder::new(Kind::NostrConnect, encrypted)
             .tag(Tag::public_key(app_pubkey))
             .sign_with_keys(keys)
-            .map_err(|e| CryptoError::invalid_signature(format!("sign response: {}", e)))?;
+            .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
 
         if let Err(e) = client.send_event(&response_event).await {
             error!(error = %e, "failed to send response");

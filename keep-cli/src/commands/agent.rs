@@ -53,19 +53,19 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let (token, session_id) = rt.block_on(async {
         let (token, session_id) = server
             .create_session(config)
             .await
-            .map_err(|e| KeepError::Runtime(format!("create session: {}", e)))?;
+            .map_err(|e| KeepError::Runtime(format!("create session: {e}")))?;
         server.set_session(token.clone(), session_id.clone()).await;
         Ok::<_, KeepError>((token, session_id))
     })?;
 
-    eprintln!("Keep MCP server started for key: {}", key_name);
-    eprintln!("Session ID: {}", session_id);
+    eprintln!("Keep MCP server started for key: {key_name}");
+    eprintln!("Session ID: {session_id}");
     eprintln!("Reading JSON-RPC from stdin, writing to stdout");
     drop(token);
 
@@ -79,7 +79,7 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
         }
 
         let response = server.handle_request(&line);
-        writeln!(stdout, "{}", response)?;
+        writeln!(stdout, "{response}")?;
         stdout.flush()?;
     }
 

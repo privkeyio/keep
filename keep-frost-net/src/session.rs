@@ -172,13 +172,12 @@ impl NetworkSession {
 
         if !self.is_participant(share_index) {
             return Err(FrostNetError::Session(format!(
-                "Share {} not a participant",
-                share_index
+                "Share {share_index} not a participant"
             )));
         }
 
         let id = Identifier::try_from(share_index)
-            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {e}")))?;
 
         if self.commitments.contains_key(&id) {
             return Err(FrostNetError::Session("Duplicate commitment".into()));
@@ -222,13 +221,12 @@ impl NetworkSession {
 
         if !self.is_participant(share_index) {
             return Err(FrostNetError::Session(format!(
-                "Share {} not a participant",
-                share_index
+                "Share {share_index} not a participant"
             )));
         }
 
         let id = Identifier::try_from(share_index)
-            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {e}")))?;
 
         if self.signature_shares.contains_key(&id) {
             return Err(FrostNetError::Session("Duplicate signature share".into()));
@@ -261,12 +259,12 @@ impl NetworkSession {
                     .verify(&self.message, &signature)
                     .map_err(|e| {
                         self.state = SessionState::Failed;
-                        FrostNetError::Crypto(format!("Signature verification failed: {}", e))
+                        FrostNetError::Crypto(format!("Signature verification failed: {e}"))
                     })?;
 
                 let serialized = signature
                     .serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Serialize signature: {}", e)))?;
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize signature: {e}")))?;
 
                 let bytes = serialized.as_slice();
                 if bytes.len() != 64 {
@@ -283,7 +281,7 @@ impl NetworkSession {
             }
             Err(e) => {
                 self.state = SessionState::Failed;
-                Err(FrostNetError::Crypto(format!("Aggregation failed: {}", e)))
+                Err(FrostNetError::Crypto(format!("Aggregation failed: {e}")))
             }
         }
     }
@@ -327,7 +325,7 @@ impl NetworkSession {
             .map(|(id, c)| {
                 let c_bytes = c
                     .serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
                 Ok((id.serialize(), c_bytes))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -343,7 +341,7 @@ impl NetworkSession {
             .as_ref()
             .map(|n| {
                 n.serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Serialize nonces: {}", e)))
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize nonces: {e}")))
             })
             .transpose()?;
 
@@ -352,7 +350,7 @@ impl NetworkSession {
             .as_ref()
             .map(|c| {
                 c.serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))
             })
             .transpose()?;
 
@@ -430,18 +428,18 @@ impl NetworkSession {
         let mut commitments = BTreeMap::new();
         for (id_bytes, c_bytes) in cached.commitments {
             let id = Identifier::deserialize(&id_bytes)
-                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {e}")))?;
             let commitment = SigningCommitments::deserialize(&c_bytes)
-                .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {e}")))?;
             commitments.insert(id, commitment);
         }
 
         let mut signature_shares = BTreeMap::new();
         for (id_bytes, s_bytes) in cached.signature_shares {
             let id = Identifier::deserialize(&id_bytes)
-                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize identifier: {e}")))?;
             let share = SignatureShare::deserialize(&s_bytes)
-                .map_err(|e| FrostNetError::Crypto(format!("Deserialize share: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Deserialize share: {e}")))?;
             signature_shares.insert(id, share);
         }
 
@@ -449,7 +447,7 @@ impl NetworkSession {
             .our_nonces
             .map(|bytes| {
                 SigningNonces::deserialize(&bytes)
-                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize nonces: {}", e)))
+                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize nonces: {e}")))
             })
             .transpose()?;
 
@@ -457,7 +455,7 @@ impl NetworkSession {
             .our_commitment
             .map(|bytes| {
                 SigningCommitments::deserialize(&bytes)
-                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {}", e)))
+                    .map_err(|e| FrostNetError::Crypto(format!("Deserialize commitment: {e}")))
             })
             .transpose()?;
 

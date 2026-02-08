@@ -175,7 +175,7 @@ impl App {
             Message::GoToExport(index) => {
                 let shares = self.current_shares();
                 if let Some(share) = shares.get(index).cloned() {
-                    self.screen = Screen::Export(ExportScreen::new(share));
+                    self.screen = Screen::Export(Box::new(ExportScreen::new(share)));
                 }
                 Task::none()
             }

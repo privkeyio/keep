@@ -62,13 +62,11 @@ where
 {
     let relays: Vec<String> = Vec::deserialize(deserializer)?;
     for relay in &relays {
-        let parsed = url::Url::parse(relay).map_err(|e| {
-            serde::de::Error::custom(format!("Invalid relay URL '{}': {}", relay, e))
-        })?;
+        let parsed = url::Url::parse(relay)
+            .map_err(|e| serde::de::Error::custom(format!("Invalid relay URL '{relay}': {e}")))?;
         if parsed.scheme() != "wss" && parsed.scheme() != "ws" {
             return Err(serde::de::Error::custom(format!(
-                "Invalid relay URL '{}': scheme must be wss:// or ws://",
-                relay
+                "Invalid relay URL '{relay}': scheme must be wss:// or ws://"
             )));
         }
     }
@@ -88,8 +86,7 @@ where
         }
         if timeout > MAX_TIMEOUT_SECS {
             return Err(serde::de::Error::custom(format!(
-                "timeout must not exceed {} seconds (24 hours)",
-                MAX_TIMEOUT_SECS
+                "timeout must not exceed {MAX_TIMEOUT_SECS} seconds (24 hours)"
             )));
         }
     }
@@ -143,7 +140,7 @@ impl Config {
 
     pub fn parse(content: &str) -> Result<Self> {
         toml::from_str(content)
-            .map_err(|e| StorageError::invalid_format(format!("config: {}", e)).into())
+            .map_err(|e| StorageError::invalid_format(format!("config: {e}")).into())
     }
 
     pub fn default_path() -> Result<PathBuf> {

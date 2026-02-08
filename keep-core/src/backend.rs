@@ -134,7 +134,7 @@ impl RedbBackend {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
-            _ => Err(StorageError::database(format!("unknown table: {}", name)).into()),
+            _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }
 }

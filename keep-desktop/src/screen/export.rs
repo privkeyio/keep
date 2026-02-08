@@ -57,9 +57,9 @@ impl ExportScreen {
         .size(12)
         .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
-        let header = row![back_btn, Space::with_width(10), title].align_y(Alignment::Center);
+        let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
 
-        let mut content = column![header, info, Space::with_height(20)].spacing(8);
+        let mut content = column![header, info, Space::new().height(20)].spacing(8);
 
         if let (Some(qr), Some(bech32)) = (&self.qr_data, &self.bech32) {
             let qr_widget = qr_code::QRCode::new(qr).cell_size(5);

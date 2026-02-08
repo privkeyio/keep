@@ -48,7 +48,7 @@ impl UnlockScreen {
             .padding(10)
             .width(300);
 
-        let mut col = column![title, Space::with_height(20), password_input,]
+        let mut col = column![title, Space::new().height(20), password_input,]
             .align_x(Alignment::Center)
             .spacing(10)
             .width(350);
@@ -63,7 +63,7 @@ impl UnlockScreen {
             col = col.push(confirm_input);
         }
 
-        col = col.push(Space::with_height(10));
+        col = col.push(Space::new().height(10));
 
         if self.loading {
             col = col.push(text("Unlocking...").size(14));
@@ -88,7 +88,7 @@ impl UnlockScreen {
         }
 
         if self.vault_exists && !self.loading {
-            col = col.push(Space::with_height(20));
+            col = col.push(Space::new().height(20));
             if self.start_fresh_confirm {
                 col = col.push(
                     text("This will permanently delete all vault data.")

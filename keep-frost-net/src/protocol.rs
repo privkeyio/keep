@@ -177,7 +177,7 @@ impl KfpMessage {
                 if p.participants.len() < 2 {
                     return Err("Refresh requires at least 2 participants");
                 }
-                if p.participants.iter().any(|&id| id == 0) {
+                if p.participants.contains(&0) {
                     return Err("Participant index must be non-zero");
                 }
                 let unique: std::collections::HashSet<_> = p.participants.iter().collect();
@@ -894,9 +894,8 @@ mod tests {
 
     #[test]
     fn test_announce_capabilities_count_limit() {
-        let too_many_caps: Vec<String> = (0..=MAX_CAPABILITIES)
-            .map(|i| format!("cap{}", i))
-            .collect();
+        let too_many_caps: Vec<String> =
+            (0..=MAX_CAPABILITIES).map(|i| format!("cap{i}")).collect();
         let mut payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890);
         payload.capabilities = too_many_caps;
         let msg = KfpMessage::Announce(payload);

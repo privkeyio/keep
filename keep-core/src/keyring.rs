@@ -207,7 +207,7 @@ mod tests {
             pubkey[0] = i as u8;
             let secret: [u8; 32] = crypto::random_bytes();
 
-            kr.load_key(pubkey, secret, KeyType::Nostr, format!("key{}", i))
+            kr.load_key(pubkey, secret, KeyType::Nostr, format!("key{i}"))
                 .unwrap();
         }
 

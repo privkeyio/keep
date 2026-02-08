@@ -65,7 +65,7 @@ impl Output {
             .map(|(name, width)| format!("{:<width$}", style(*name).bold(), width = width))
             .collect::<Vec<_>>()
             .join(" ");
-        let _ = self.term.write_line(&format!("\n{}", header));
+        let _ = self.term.write_line(&format!("\n{header}"));
         let _ = self.term.write_line(&"─".repeat(70));
     }
 
@@ -76,7 +76,7 @@ impl Output {
                 if *highlight {
                     format!("{:<width$}", style(*val).yellow(), width = width)
                 } else {
-                    format!("{:<width$}", val, width = width)
+                    format!("{val:<width$}")
                 }
             })
             .collect::<Vec<_>>()

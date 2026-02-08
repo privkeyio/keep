@@ -71,7 +71,7 @@ impl Coordinator {
 
         let commit_bytes = commitment
             .serialize()
-            .map_err(|e| KeepError::Frost(format!("Serialize commitment: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Serialize commitment: {e}")))?;
 
         Ok(FrostMessage::commitment(
             &self.session_id,
@@ -92,10 +92,10 @@ impl Coordinator {
 
         let payload = msg.payload_bytes()?;
         let commitment = SigningCommitments::deserialize(&payload)
-            .map_err(|e| KeepError::Frost(format!("Invalid commitment: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid commitment: {e}")))?;
 
         let id = Identifier::try_from(msg.identifier)
-            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {e}")))?;
 
         self.commitments.insert(id, commitment);
         Ok(())
@@ -129,7 +129,7 @@ impl Coordinator {
         let signing_package = SigningPackage::new(self.commitments.clone(), &self.message);
 
         let sig_share = frost::round2::sign(&signing_package, &nonces, &kp)
-            .map_err(|e| KeepError::Frost(format!("Sign failed: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Sign failed: {e}")))?;
 
         self.signature_shares.insert(our_id, sig_share);
 
@@ -154,10 +154,10 @@ impl Coordinator {
 
         let payload = msg.payload_bytes()?;
         let sig_share = SignatureShare::deserialize(&payload)
-            .map_err(|e| KeepError::Frost(format!("Invalid signature share: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid signature share: {e}")))?;
 
         let id = Identifier::try_from(msg.identifier)
-            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {e}")))?;
 
         self.signature_shares.insert(id, sig_share);
         Ok(())
@@ -182,7 +182,7 @@ impl Coordinator {
         let pubkey_pkg = share.pubkey_package()?;
 
         frost::aggregate(&signing_package, &self.signature_shares, &pubkey_pkg)
-            .map_err(|e| KeepError::Frost(format!("Aggregation failed: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))
     }
 
     /// Aggregate shares and return the 64-byte signature.
@@ -190,7 +190,7 @@ impl Coordinator {
         let signature = self.aggregate(share)?;
         let serialized = signature
             .serialize()
-            .map_err(|e| KeepError::Frost(format!("Serialize signature: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Serialize signature: {e}")))?;
 
         let bytes = serialized.as_slice();
         if bytes.len() != 64 {

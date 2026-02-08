@@ -138,14 +138,14 @@ impl AuditLog {
 
         if entries.len() > MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {} entries", MAX_AUDIT_ENTRIES),
+                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
             });
         }
 
         let last_hash = if let Some(last_json) = entries.last() {
             let entry: AuditEntry =
                 serde_json::from_str(last_json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid audit entry: {}", e),
+                    msg: format!("Invalid audit entry: {e}"),
                 })?;
             entry
                 .hash
@@ -174,10 +174,7 @@ impl AuditLog {
         let entry_count = self.storage.load_entries(None)?.len();
         if entry_count >= MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
-                msg: format!(
-                    "Audit log full: {} entries (max {})",
-                    entry_count, MAX_AUDIT_ENTRIES
-                ),
+                msg: format!("Audit log full: {entry_count} entries (max {MAX_AUDIT_ENTRIES})"),
             });
         }
 
@@ -221,7 +218,7 @@ impl AuditLog {
 
         if entry_jsons.len() > MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {} entries", MAX_AUDIT_ENTRIES),
+                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
             });
         }
 
@@ -229,7 +226,7 @@ impl AuditLog {
         for json in entry_jsons {
             let entry: AuditEntry =
                 serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid audit entry: {}", e),
+                    msg: format!("Invalid audit entry: {e}"),
                 })?;
             entries.push(entry);
         }
@@ -239,7 +236,7 @@ impl AuditLog {
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
         let entries = self.get_entries(None)?;
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
-            msg: format!("Export failed: {}", e),
+            msg: format!("Export failed: {e}"),
         })
     }
 
@@ -355,8 +352,8 @@ mod tests {
             .unwrap();
 
         let json = log.export_json().unwrap();
-        assert!(json.contains("Sign"), "JSON: {}", json);
-        assert!(json.contains("pk1"), "JSON: {}", json);
+        assert!(json.contains("Sign"), "JSON: {json}");
+        assert!(json.contains("pk1"), "JSON: {json}");
     }
 
     #[test]

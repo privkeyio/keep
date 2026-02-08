@@ -117,8 +117,7 @@ impl BitcoinSigner {
                 if let Some(addr) = &output.address {
                     if blocklist.contains(addr) {
                         return Err(BitcoinError::PolicyDenied(format!(
-                            "Address {} is blocked",
-                            addr
+                            "Address {addr} is blocked"
                         )));
                     }
                 }

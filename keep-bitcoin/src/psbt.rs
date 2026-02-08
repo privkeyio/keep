@@ -215,7 +215,7 @@ pub fn parse_psbt_base64(base64: &str) -> Result<Psbt> {
     use bitcoin::base64::{engine::general_purpose::STANDARD, Engine};
     let bytes = STANDARD
         .decode(base64)
-        .map_err(|e| BitcoinError::InvalidPsbt(format!("Invalid base64: {}", e)))?;
+        .map_err(|e| BitcoinError::InvalidPsbt(format!("Invalid base64: {e}")))?;
     parse_psbt(&bytes)
 }
 

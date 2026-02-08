@@ -19,8 +19,8 @@ impl ExpectedPcrs {
 
     pub fn from_hex(pcr0: &str, pcr1: &str, pcr2: &str) -> Result<Self> {
         let parse = |s: &str| -> Result<[u8; 48]> {
-            let bytes = hex::decode(s)
-                .map_err(|e| AgentError::Attestation(format!("Invalid hex: {}", e)))?;
+            let bytes =
+                hex::decode(s).map_err(|e| AgentError::Attestation(format!("Invalid hex: {e}")))?;
             bytes
                 .try_into()
                 .map_err(|_| AgentError::Attestation("PCR must be 48 bytes".into()))
@@ -205,7 +205,7 @@ fn verify_timestamp_freshness(attestation_timestamp: u64, max_skew: Duration) ->
 fn verify_pcr(pcrs: &HashMap<u32, Vec<u8>>, index: u32, expected: &[u8; 48]) -> Result<()> {
     let actual = pcrs
         .get(&index)
-        .ok_or_else(|| AgentError::Attestation(format!("Missing PCR{}", index)))?;
+        .ok_or_else(|| AgentError::Attestation(format!("Missing PCR{index}")))?;
 
     if actual.len() != 48 {
         return Err(AgentError::PcrMismatch {
@@ -325,7 +325,7 @@ mod tests {
             AgentError::AttestationTimestamp(msg) => {
                 assert!(msg.contains("old"));
             }
-            e => panic!("Expected AttestationTimestamp error, got {:?}", e),
+            e => panic!("Expected AttestationTimestamp error, got {e:?}"),
         }
     }
 
@@ -344,7 +344,7 @@ mod tests {
             AgentError::AttestationTimestamp(msg) => {
                 assert!(msg.contains("future"));
             }
-            e => panic!("Expected AttestationTimestamp error, got {:?}", e),
+            e => panic!("Expected AttestationTimestamp error, got {e:?}"),
         }
     }
 

@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 keep-core = { path = "../keep-core" }
-iced = { version = "0.13.1", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
+iced = { version = "0.14.0", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
 hex = { workspace = true }
 dirs = { workspace = true }
 zeroize = { workspace = true }

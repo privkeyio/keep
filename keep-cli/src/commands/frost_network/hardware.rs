@@ -38,7 +38,7 @@ pub fn cmd_frost_network_sign_hardware(
 
     let mut session_id = [0u8; 32];
     ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut session_id)
-        .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))))?;
+        .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))))?;
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
@@ -48,23 +48,19 @@ pub fn cmd_frost_network_sign_hardware(
     out.field("Relay", relay);
     out.newline();
 
-    let mut nonce_store = NonceStore::open(path).map_err(|e| {
-        KeepError::StorageErr(StorageError::database(format!("nonce store: {}", e)))
-    })?;
+    let mut nonce_store = NonceStore::open(path)
+        .map_err(|e| KeepError::StorageErr(StorageError::database(format!("nonce store: {e}"))))?;
     let (available, used) = nonce_store.nonce_stats(group_npub);
-    out.info(&format!(
-        "Nonce status: {} available, {} used",
-        available, used
-    ));
+    out.info(&format!("Nonce status: {available} available, {used} used"));
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {e}"))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
     let version = signer.ping().map_err(|e| {
-        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {e}")))
     })?;
     spinner.finish();
     out.field("Hardware version", &version);
@@ -79,15 +75,14 @@ pub fn cmd_frost_network_sign_hardware(
 
     if our_index == 0 || our_index > participants {
         return Err(KeepError::FrostErr(FrostError::invalid_share(format!(
-            "hardware returned invalid share index {}, expected 1..={}",
-            our_index, participants
+            "hardware returned invalid share index {our_index}, expected 1..={participants}"
         ))));
     }
 
     if !nonce_store
         .check_and_add_nonce(group_npub, &commitment_hex)
         .map_err(|e| {
-            KeepError::StorageErr(StorageError::database(format!("nonce tracking: {}", e)))
+            KeepError::StorageErr(StorageError::database(format!("nonce tracking: {e}")))
         })?
     {
         return Err(KeepError::FrostErr(FrostError::session(
@@ -101,7 +96,7 @@ pub fn cmd_frost_network_sign_hardware(
     out.newline();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -141,7 +136,7 @@ pub fn cmd_frost_network_sign_hardware(
             ))
             .sign_with_keys(&keys)
             .map_err(|e| {
-                KeepError::CryptoErr(CryptoError::invalid_signature(format!("sign event: {}", e)))
+                KeepError::CryptoErr(CryptoError::invalid_signature(format!("sign event: {e}")))
             })?;
 
         let spinner = out.spinner("Publishing sign request (Kind 21104)...");
@@ -183,14 +178,13 @@ pub fn cmd_frost_network_sign_hardware(
             .sign_with_keys(&keys)
             .map_err(|e| {
                 KeepError::CryptoErr(CryptoError::invalid_signature(format!(
-                    "sign response: {}",
-                    e
+                    "sign response: {e}"
                 )))
             })?;
 
         let spinner = out.spinner("Publishing our commitment (Kind 21105)...");
         client.send_event(&response_event).await.map_err(|e| {
-            KeepError::NetworkErr(NetworkError::publish(format!("commitment: {}", e)))
+            KeepError::NetworkErr(NetworkError::publish(format!("commitment: {e}")))
         })?;
         spinner.finish();
 
@@ -200,7 +194,7 @@ pub fn cmd_frost_network_sign_hardware(
         );
 
         out.info("Waiting for peer commitments...");
-        out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+        out.field("Threshold", &format!("{threshold}-of-{participants}"));
         let mut peer_commitments: HashMap<u16, String> = HashMap::new();
         peer_commitments.insert(our_index, hex::encode(&commitment));
 
@@ -251,10 +245,7 @@ pub fn cmd_frost_network_sign_hardware(
                     }
                     if let Entry::Vacant(e) = peer_commitments.entry(peer_idx) {
                         e.insert(peer_commitment.to_string());
-                        out.success(&format!(
-                            "Received commitment from participant {}",
-                            peer_idx
-                        ));
+                        out.success(&format!("Received commitment from participant {peer_idx}"));
                     }
                 }
             }
@@ -272,14 +263,14 @@ pub fn cmd_frost_network_sign_hardware(
 
         let all_commitments_hex: String = peer_commitments
             .iter()
-            .map(|(idx, c)| format!("{}:{}", idx, c))
+            .map(|(idx, c)| format!("{idx}:{c}"))
             .collect::<Vec<_>>()
             .join(",");
 
         let spinner = out.spinner("Generating signature share (round 2)...");
         let (sig_share, _) = signer
             .frost_sign(group_npub, &session_id, &all_commitments_hex)
-            .map_err(|e| KeepError::FrostErr(FrostError::session(format!("sign failed: {}", e))))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::session(format!("sign failed: {e}"))))?;
         spinner.finish();
 
         let sig_share_hex = hex::encode(&sig_share);
@@ -355,53 +346,49 @@ pub fn cmd_frost_network_nonce_precommit(
     out.field("Nonce count", &count.to_string());
     out.newline();
 
-    let mut nonce_store = NonceStore::open(path).map_err(|e| {
-        KeepError::StorageErr(StorageError::database(format!("nonce store: {}", e)))
-    })?;
+    let mut nonce_store = NonceStore::open(path)
+        .map_err(|e| KeepError::StorageErr(StorageError::database(format!("nonce store: {e}"))))?;
 
     let (available, used) = nonce_store.nonce_stats(group);
     if available > 0 {
         out.info(&format!(
-            "Existing nonces: {} available, {} used",
-            available, used
+            "Existing nonces: {available} available, {used} used"
         ));
     }
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(device)
-        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {e}"))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
     let version = signer.ping().map_err(|e| {
-        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {e}")))
     })?;
     spinner.finish();
     out.field("Hardware version", &version);
 
-    let (_pubkey_hex, share_index) = signer.get_share_pubkey(group).map_err(|e| {
-        KeepError::FrostErr(FrostError::invalid_share(format!("get pubkey: {}", e)))
-    })?;
+    let (_pubkey_hex, share_index) = signer
+        .get_share_pubkey(group)
+        .map_err(|e| KeepError::FrostErr(FrostError::invalid_share(format!("get pubkey: {e}"))))?;
     out.field("Share index", &share_index.to_string());
     out.newline();
 
-    let spinner = out.spinner(&format!("Generating {} nonce commitments...", count));
+    let spinner = out.spinner(&format!("Generating {count} nonce commitments..."));
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
     for i in 0..count {
         let mut dummy_session = [0u8; 32];
         let mut dummy_message = [0u8; 32];
         ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session).map_err(
-            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))),
+            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))),
         )?;
         ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message).map_err(
-            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {}", e))),
+            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))),
         )?;
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
-            .map_err(|e| {
-                KeepError::FrostErr(FrostError::commitment(format!("nonce {}: {}", i, e)))
-            })?;
+            .map_err(|e| KeepError::FrostErr(FrostError::commitment(format!("nonce {i}: {e}"))))?;
         let commitment_hex = hex::encode(&commitment);
         commitments_hex.push(commitment_hex.clone());
         nonces.push(serde_json::json!({
@@ -414,13 +401,13 @@ pub fn cmd_frost_network_nonce_precommit(
     let spinner = out.spinner("Storing nonces locally...");
     for commitment_hex in &commitments_hex {
         nonce_store.add_nonce(group, commitment_hex).map_err(|e| {
-            KeepError::StorageErr(StorageError::database(format!("store nonce: {}", e)))
+            KeepError::StorageErr(StorageError::database(format!("store nonce: {e}")))
         })?;
     }
     spinner.finish();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -472,11 +459,10 @@ pub fn cmd_frost_network_nonce_precommit(
 
     let (available, used) = nonce_store.nonce_stats(group);
     out.newline();
-    out.success(&format!("Published {} nonce commitments!", count));
+    out.success(&format!("Published {count} nonce commitments!"));
     out.newline();
     out.info(&format!(
-        "Nonce status for group: {} available, {} used",
-        available, used
+        "Nonce status for group: {available} available, {used} used"
     ));
     out.warn("Each nonce can only be used once. Reusing nonces compromises security.");
 

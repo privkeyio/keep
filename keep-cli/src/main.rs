@@ -33,7 +33,7 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_request_id() -> String {
     let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("req-{:08x}", id)
+    format!("req-{id:08x}")
 }
 
 fn init_logging() {
@@ -460,7 +460,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             out.newline();
             let vault_path_str = match cfg.vault_path() {
                 Ok(p) => p.display().to_string(),
-                Err(e) => format!("(error: {})", e),
+                Err(e) => format!("(error: {e})"),
             };
             out.field("vault_path", &vault_path_str);
             out.field("argon2_profile", &cfg.argon2_profile.to_string());
@@ -487,8 +487,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                        "create directory: {}",
-                        e
+                        "create directory: {e}"
                     )))
                 })?;
             }
@@ -505,7 +504,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
                 }
                 Err(e) => {
                     return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
-                        format!("create config: {}", e),
+                        format!("create config: {e}"),
                     )));
                 }
             };
@@ -516,8 +515,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
                     |e| {
                         KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                            "set permissions: {}",
-                            e
+                            "set permissions: {e}"
                         )))
                     },
                 )?;
@@ -526,8 +524,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             let example = include_str!("../contrib/config.toml.example");
             file.write_all(example.as_bytes()).map_err(|e| {
                 KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                    "write config: {}",
-                    e
+                    "write config: {e}"
                 )))
             })?;
 

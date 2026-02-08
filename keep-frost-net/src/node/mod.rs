@@ -201,7 +201,7 @@ impl KfpNode {
 
         for relay in &relays {
             client.add_relay(relay).await.map_err(|e| {
-                FrostNetError::Transport(format!("Failed to add relay {}: {}", relay, e))
+                FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
             })?;
         }
 
@@ -391,7 +391,7 @@ impl KfpNode {
         let key_package = self
             .share
             .key_package()
-            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
 
         let signing_share = key_package.signing_share();
         let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
@@ -404,7 +404,7 @@ impl KfpNode {
 
         let verifying_share = key_package.verifying_share();
         let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
-            FrostNetError::Crypto(format!("Failed to serialize verifying share: {}", e))
+            FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
         })?;
         let verifying_share_bytes: [u8; 33] = verifying_share_serialized
             .as_slice()
@@ -734,12 +734,11 @@ impl KfpNode {
     pub(crate) fn verify_peer_share_index(&self, from: PublicKey, share_index: u16) -> Result<()> {
         let peers = self.peers.read();
         let peer = peers.get_peer(share_index).ok_or_else(|| {
-            FrostNetError::UntrustedPeer(format!("Share index {} not announced", share_index))
+            FrostNetError::UntrustedPeer(format!("Share index {share_index} not announced"))
         })?;
         if peer.pubkey != from {
             return Err(FrostNetError::UntrustedPeer(format!(
-                "Sender {} doesn't match share index {}",
-                from, share_index
+                "Sender {from} doesn't match share index {share_index}"
             )));
         }
         Ok(())
@@ -809,7 +808,7 @@ fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
     hasher.update(share.metadata.identifier.to_be_bytes());
     let derived: [u8; 32] = hasher.finalize().into();
     let secret_key = SecretKey::from_slice(&derived)
-        .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {}", e)))?;
+        .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {e}")))?;
     Ok(Keys::new(secret_key))
 }
 

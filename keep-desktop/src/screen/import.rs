@@ -27,7 +27,7 @@ impl ImportScreen {
         let back_btn = button(text("< Back")).on_press(Message::GoBack).padding(8);
         let title = text("Import Share").size(24);
 
-        let header = row![back_btn, Space::with_width(10), title].align_y(Alignment::Center);
+        let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
 
         let data_input = text_input("Paste kshare1... or JSON here", &self.data)
             .on_input(Message::ImportDataChanged)
@@ -45,13 +45,13 @@ impl ImportScreen {
 
         let mut content = column![
             header,
-            Space::with_height(20),
+            Space::new().height(20),
             text("Share data").size(14),
             data_input,
-            Space::with_height(10),
+            Space::new().height(10),
             text("Passphrase").size(14),
             passphrase_input,
-            Space::with_height(10),
+            Space::new().height(10),
         ]
         .spacing(5);
 

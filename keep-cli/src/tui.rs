@@ -214,14 +214,14 @@ impl Tui {
                         format!("[{}] ", entry.timestamp),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(format!("{} ", symbol), Style::default().fg(color)),
+                    Span::styled(format!("{symbol} "), Style::default().fg(color)),
                     Span::styled(&entry.app, Style::default().fg(Color::White)),
                     Span::raw(" "),
                     Span::styled(&entry.action, Style::default().fg(Color::Gray)),
                 ];
                 if let Some(ref detail) = entry.detail {
                     spans.push(Span::styled(
-                        format!(" ({})", detail),
+                        format!(" ({detail})"),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }

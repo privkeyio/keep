@@ -131,7 +131,7 @@ impl OuterHeader {
         encrypted_data_key.copy_from_slice(&bytes[16 + SALT_SIZE + 24..16 + SALT_SIZE + 24 + 48]);
 
         let offset = 16 + SALT_SIZE + 24 + 48;
-        let parse_err = |field| StorageError::invalid_format(format!("outer header: {}", field));
+        let parse_err = |field| StorageError::invalid_format(format!("outer header: {field}"));
 
         Ok(Self {
             magic,
@@ -301,7 +301,7 @@ impl HiddenHeader {
         let mut checksum = [0u8; 32];
         checksum.copy_from_slice(&bytes[offset + 20..offset + 52]);
 
-        let parse_err = |field| StorageError::invalid_format(format!("hidden header: {}", field));
+        let parse_err = |field| StorageError::invalid_format(format!("hidden header: {field}"));
 
         Ok(Self {
             version: u16::from_le_bytes([bytes[0], bytes[1]]),

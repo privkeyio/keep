@@ -58,7 +58,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv

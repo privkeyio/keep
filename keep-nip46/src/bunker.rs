@@ -6,10 +6,10 @@ pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&
     let mut url = format!("bunker://{}", pubkey.to_hex());
 
     let encoded_relay = urlencoding::encode(relay_url);
-    url.push_str(&format!("?relay={}", encoded_relay));
+    url.push_str(&format!("?relay={encoded_relay}"));
 
     if let Some(s) = secret {
-        url.push_str(&format!("&secret={}", s));
+        url.push_str(&format!("&secret={s}"));
     }
 
     url
@@ -23,10 +23,10 @@ pub fn parse_bunker_url(
         return Err("Invalid bunker URL: must start with bunker://".into());
     }
 
-    let url = ::url::Url::parse(bunker_url).map_err(|e| format!("Invalid URL: {}", e))?;
+    let url = ::url::Url::parse(bunker_url).map_err(|e| format!("Invalid URL: {e}"))?;
 
     let pubkey_hex = url.host_str().ok_or("Missing pubkey in URL")?;
-    let pubkey = PublicKey::from_hex(pubkey_hex).map_err(|e| format!("Invalid pubkey: {}", e))?;
+    let pubkey = PublicKey::from_hex(pubkey_hex).map_err(|e| format!("Invalid pubkey: {e}"))?;
 
     let mut relays = Vec::new();
     let mut secret = None;

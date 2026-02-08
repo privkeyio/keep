@@ -32,20 +32,18 @@ impl FileNonceStore {
         let insertion_order = Arc::new(RwLock::new(VecDeque::new()));
 
         if path.exists() {
-            let file = File::open(path).map_err(|e| {
-                FrostNetError::Session(format!("Failed to open nonce store: {}", e))
-            })?;
+            let file = File::open(path)
+                .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
-            file.lock_exclusive().map_err(|e| {
-                FrostNetError::Session(format!("Failed to lock nonce store: {}", e))
-            })?;
+            file.lock_exclusive()
+                .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 
             let reader = BufReader::new(&file);
 
             let mut guard = consumed.write();
             for line in reader.lines() {
                 let line = line.map_err(|e| {
-                    FrostNetError::Session(format!("Failed to read nonce store: {}", e))
+                    FrostNetError::Session(format!("Failed to read nonce store: {e}"))
                 })?;
                 let line = line.trim();
                 if line.is_empty() {
@@ -53,7 +51,7 @@ impl FileNonceStore {
                 }
 
                 let bytes = hex::decode(line).map_err(|e| {
-                    FrostNetError::Session(format!("Invalid hex in nonce store: {}", e))
+                    FrostNetError::Session(format!("Invalid hex in nonce store: {e}"))
                 })?;
 
                 if bytes.len() != 32 {
@@ -70,7 +68,7 @@ impl FileNonceStore {
             debug!(count = guard.len(), path = ?path, "Loaded consumed session IDs");
 
             FileExt::unlock(&file).map_err(|e| {
-                FrostNetError::Session(format!("Failed to unlock nonce store: {}", e))
+                FrostNetError::Session(format!("Failed to unlock nonce store: {e}"))
             })?;
         }
 
@@ -94,13 +92,13 @@ impl NonceStore for FileNonceStore {
             .create(true)
             .append(true)
             .open(&self.path)
-            .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {}", e)))?;
+            .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
         file.lock_exclusive()
-            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {}", e)))?;
+            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 
         let hex_id = hex::encode(session_id);
-        let write_result = writeln!(file, "{}", hex_id);
+        let write_result = writeln!(file, "{hex_id}");
         let sync_result = if write_result.is_ok() {
             file.sync_all()
         } else {
@@ -108,14 +106,13 @@ impl NonceStore for FileNonceStore {
         };
 
         FileExt::unlock(&file)
-            .map_err(|e| FrostNetError::Session(format!("Failed to unlock nonce store: {}", e)))?;
+            .map_err(|e| FrostNetError::Session(format!("Failed to unlock nonce store: {e}")))?;
 
-        write_result.map_err(|e| {
-            FrostNetError::Session(format!("Failed to write to nonce store: {}", e))
-        })?;
+        write_result
+            .map_err(|e| FrostNetError::Session(format!("Failed to write to nonce store: {e}")))?;
 
         sync_result
-            .map_err(|e| FrostNetError::Session(format!("Failed to sync nonce store: {}", e)))?;
+            .map_err(|e| FrostNetError::Session(format!("Failed to sync nonce store: {e}")))?;
 
         guard.insert(*session_id);
         self.insertion_order.write().push_back(*session_id);

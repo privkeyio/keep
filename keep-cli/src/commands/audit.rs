@@ -60,10 +60,10 @@ pub fn cmd_audit_list(out: &Output, path: &Path, limit: Option<usize>, hidden: b
             details.push(format!("msg:{}", &mh[..mh.len().min(8)]));
         }
         if let Some(t) = entry.threshold {
-            details.push(format!("t:{}", t));
+            details.push(format!("t:{t}"));
         }
         if let Some(ref reason) = entry.reason {
-            details.push(format!("reason:{}", reason));
+            details.push(format!("reason:{reason}"));
         }
 
         let detail_str = if details.is_empty() {
@@ -126,7 +126,7 @@ pub fn cmd_audit_export(
             std::fs::write(&canonical, &json)?;
             out.success(&format!("Audit log exported to {}", canonical.display()));
         }
-        None => println!("{}", json),
+        None => println!("{json}"),
     }
 
     Ok(())
@@ -171,7 +171,7 @@ pub fn cmd_audit_retention(
     if apply {
         let removed = keep.audit_apply_retention()?;
         if removed > 0 {
-            out.success(&format!("Removed {} old audit entries", removed));
+            out.success(&format!("Removed {removed} old audit entries"));
         } else {
             out.info("No entries needed to be removed");
         }
@@ -248,8 +248,8 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
 
     out.info("Audit Log Statistics");
     out.info(&format!("Total entries: {}", entries.len()));
-    out.info(&format!("First entry: {}", first_time));
-    out.info(&format!("Last entry: {}", last_time));
+    out.info(&format!("First entry: {first_time}"));
+    out.info(&format!("Last entry: {last_time}"));
     out.newline();
     out.info("Key Operations:");
     out.info(&format!("  Generated: {}", stats.key_gen));

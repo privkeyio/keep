@@ -25,7 +25,7 @@ fn rate_limit_path(storage_path: &Path) -> PathBuf {
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        parent.join(format!(".{}.ratelimit", name))
+        parent.join(format!(".{name}.ratelimit"))
     }
 }
 

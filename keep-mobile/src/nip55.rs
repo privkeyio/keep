@@ -220,7 +220,7 @@ impl Nip55Handler {
         }
 
         let b64 = base64::engine::general_purpose::STANDARD;
-        let mut intent = format!("intent:#Intent;scheme=nostrsigner;package={};", package);
+        let mut intent = format!("intent:#Intent;scheme=nostrsigner;package={package};");
 
         if let Some(event) = &response.event {
             let _ = write!(intent, "S.event={};", b64.encode(event));

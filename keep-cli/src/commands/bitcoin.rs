@@ -50,7 +50,7 @@ pub fn cmd_bitcoin_address(
         let addr = signer
             .get_receive_address(i)
             .map_err(|e| KeepError::Runtime(e.to_string()))?;
-        out.info(&format!("Index {}: {}", i, addr));
+        out.info(&format!("Index {i}: {addr}"));
     }
 
     Ok(())
@@ -101,7 +101,7 @@ pub fn cmd_bitcoin_descriptor(
     let internal = export
         .internal_descriptor()
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
-    println!("{}", internal);
+    println!("{internal}");
 
     Ok(())
 }
@@ -136,8 +136,7 @@ pub fn cmd_bitcoin_sign(
 
     let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
         KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-            "read PSBT: {}",
-            e
+            "read PSBT: {e}"
         )))
     })?;
 
@@ -155,18 +154,17 @@ pub fn cmd_bitcoin_sign(
     if let Some(output) = output_path {
         std::fs::write(output, &signed_base64).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "write output: {}",
-                e
+                "write output: {e}"
             )))
         })?;
         out.newline();
-        out.success(&format!("Signed {} input(s)", signed_count));
+        out.success(&format!("Signed {signed_count} input(s)"));
         out.field("Output", output);
     } else {
         out.newline();
-        out.success(&format!("Signed {} input(s)", signed_count));
+        out.success(&format!("Signed {signed_count} input(s)"));
         out.newline();
-        println!("{}", signed_base64);
+        println!("{signed_base64}");
     }
 
     Ok(())
@@ -175,8 +173,7 @@ pub fn cmd_bitcoin_sign(
 pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Result<()> {
     let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
         KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-            "read PSBT: {}",
-            e
+            "read PSBT: {e}"
         )))
     })?;
 
@@ -232,8 +229,7 @@ pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
         "signet" => Ok(keep_bitcoin::Network::Signet),
         "regtest" => Ok(keep_bitcoin::Network::Regtest),
         _ => Err(KeepError::InvalidNetwork(format!(
-            "'{}' (valid: mainnet, testnet, signet, regtest)",
-            s
+            "'{s}' (valid: mainnet, testnet, signet, regtest)"
         ))),
     }
 }

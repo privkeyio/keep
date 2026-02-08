@@ -48,7 +48,7 @@ pub fn compute_partial_ecdh(
 
 pub fn lagrange_coefficient(identifier: u16, all_identifiers: &[u16]) -> Result<Scalar> {
     let id = Identifier::try_from(identifier)
-        .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {}", e)))?;
+        .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {e}")))?;
     let id_scalar = id.to_scalar();
 
     let mut numerator = Scalar::ONE;
@@ -59,7 +59,7 @@ pub fn lagrange_coefficient(identifier: u16, all_identifiers: &[u16]) -> Result<
             continue;
         }
         let other = Identifier::try_from(other_id)
-            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {e}")))?;
         let other_scalar = other.to_scalar();
 
         numerator *= other_scalar;
@@ -183,13 +183,12 @@ impl EcdhSession {
 
         if !self.is_participant(share_index) {
             return Err(FrostNetError::Session(format!(
-                "Share {} not a participant",
-                share_index
+                "Share {share_index} not a participant"
             )));
         }
 
         let id = Identifier::try_from(share_index)
-            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier: {e}")))?;
 
         if self.partial_points.contains_key(&id) {
             return Err(FrostNetError::Session("Duplicate ECDH share".into()));

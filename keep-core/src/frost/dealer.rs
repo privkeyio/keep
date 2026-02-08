@@ -86,7 +86,7 @@ impl TrustedDealer {
             IdentifierList::Default,
             OsRng,
         )
-        .map_err(|e| KeepError::Frost(format!("Key generation failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Key generation failed: {e}")))?;
 
         let group_pubkey = extract_group_pubkey(&pubkey_pkg)?;
 
@@ -94,9 +94,8 @@ impl TrustedDealer {
             .into_iter()
             .enumerate()
             .map(|(idx, (_, secret_share))| {
-                let key_package = KeyPackage::try_from(secret_share).map_err(|e| {
-                    KeepError::Frost(format!("KeyPackage conversion failed: {}", e))
-                })?;
+                let key_package = KeyPackage::try_from(secret_share)
+                    .map_err(|e| KeepError::Frost(format!("KeyPackage conversion failed: {e}")))?;
 
                 let identifier = (idx + 1) as u16;
 
@@ -122,7 +121,7 @@ impl TrustedDealer {
         name: &str,
     ) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
         let signing_key = frost::SigningKey::deserialize(secret)
-            .map_err(|e| KeepError::Frost(format!("Invalid signing key: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid signing key: {e}")))?;
 
         let (shares, pubkey_pkg) = frost::keys::split(
             &signing_key,
@@ -131,7 +130,7 @@ impl TrustedDealer {
             IdentifierList::Default,
             &mut OsRng,
         )
-        .map_err(|e| KeepError::Frost(format!("Key split failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Key split failed: {e}")))?;
 
         let group_pubkey = extract_group_pubkey(&pubkey_pkg)?;
 
@@ -139,9 +138,8 @@ impl TrustedDealer {
             .into_iter()
             .enumerate()
             .map(|(idx, (_, secret_share))| {
-                let key_package = KeyPackage::try_from(secret_share).map_err(|e| {
-                    KeepError::Frost(format!("KeyPackage conversion failed: {}", e))
-                })?;
+                let key_package = KeyPackage::try_from(secret_share)
+                    .map_err(|e| KeepError::Frost(format!("KeyPackage conversion failed: {e}")))?;
 
                 let identifier = (idx + 1) as u16;
 
@@ -165,7 +163,7 @@ fn extract_group_pubkey(pubkey_pkg: &PublicKeyPackage) -> Result<[u8; 32]> {
     let verifying_key = pubkey_pkg.verifying_key();
     let serialized = verifying_key
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying key: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying key: {e}")))?;
     let bytes = serialized.as_slice();
 
     let mut pubkey = [0u8; 32];

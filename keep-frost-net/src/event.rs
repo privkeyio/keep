@@ -294,7 +294,7 @@ impl KfpEventBuilder {
 
         let content = if is_addressed_to_us {
             nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)
-                .map_err(|e| FrostNetError::Crypto(format!("Decryption failed: {}", e)))?
+                .map_err(|e| FrostNetError::Crypto(format!("Decryption failed: {e}")))?
         } else {
             event.content.clone()
         };

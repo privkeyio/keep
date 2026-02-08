@@ -61,7 +61,7 @@ impl FrostParticipant {
 
         let serialized = commitment
             .serialize()
-            .map_err(|e| AgentError::Other(format!("Serialize failed: {}", e)))?;
+            .map_err(|e| AgentError::Other(format!("Serialize failed: {e}")))?;
 
         Ok(FrostCommitment {
             session_id: hex::encode(session.session_id()),
