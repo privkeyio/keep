@@ -14,6 +14,7 @@ fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
 
     iced::application("Keep", App::update, App::view)
+        .subscription(App::subscription)
         .window_size((900.0, 600.0))
         .run_with(App::new)
 }

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
@@ -42,6 +44,7 @@ impl CreateScreen {
 
         let total_input = text_input("3", &self.total)
             .on_input(Message::CreateTotalChanged)
+            .on_submit(Message::CreateKeyset)
             .padding(10)
             .width(80);
 
@@ -59,8 +62,13 @@ impl CreateScreen {
             .size(12)
             .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
-        let can_create =
-            !self.name.is_empty() && !self.threshold.is_empty() && !self.total.is_empty();
+        let threshold_val: Option<u16> = self.threshold.parse().ok().filter(|&v| v >= 2);
+        let total_val: Option<u16> = self.total.parse().ok();
+        let total_valid = match (threshold_val, total_val) {
+            (Some(t), Some(n)) => n >= t,
+            _ => false,
+        };
+        let can_create = !self.name.is_empty() && threshold_val.is_some() && total_valid;
 
         let mut content = column![
             header,
@@ -69,10 +77,32 @@ impl CreateScreen {
             name_input,
             Space::with_height(10),
             threshold_row,
-            hint,
-            Space::with_height(10),
         ]
         .spacing(5);
+
+        if !self.threshold.is_empty() && threshold_val.is_none() {
+            content = content.push(
+                text("Threshold must be a number >= 2")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+            );
+        }
+        if !self.total.is_empty() && total_val.is_some() && !total_valid {
+            content = content.push(
+                text("Total must be >= threshold")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+            );
+        } else if !self.total.is_empty() && total_val.is_none() {
+            content = content.push(
+                text("Total must be a valid number")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+            );
+        }
+
+        content = content.push(hint);
+        content = content.push(Space::with_height(10));
 
         if self.loading {
             content = content.push(text("Generating keyset...").size(14));

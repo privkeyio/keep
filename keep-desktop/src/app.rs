@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use iced::{Element, Task};
+use iced::{Element, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
 use tracing::error;
@@ -19,14 +22,30 @@ use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::Screen;
 
+const AUTO_LOCK_SECS: u64 = 300;
+const CLIPBOARD_CLEAR_SECS: u64 = 30;
+const MIN_PASSWORD_LEN: usize = 8;
+
 pub struct App {
     keep: Arc<Mutex<Option<Keep>>>,
     keep_path: PathBuf,
     screen: Screen,
+    last_activity: Instant,
+    clipboard_clear_at: Option<Instant>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
     keep.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn with_keep_blocking<T: Send + 'static>(
@@ -44,7 +63,10 @@ fn with_keep_blocking<T: Send + 'static>(
 
     match result {
         Ok(r) => r,
-        Err(_) => Err(panic_msg.to_string()),
+        Err(payload) => {
+            error!("{}: {}", panic_msg, panic_message(&payload));
+            Err(panic_msg.to_string())
+        }
     }
 }
 
@@ -62,6 +84,8 @@ impl App {
                             screen: Screen::Unlock(UnlockScreen::with_error(
                                 "Cannot determine home directory. Set $HOME and restart.".into(),
                             )),
+                            last_activity: Instant::now(),
+                            clipboard_clear_at: None,
                         },
                         Task::none(),
                     );
@@ -74,13 +98,34 @@ impl App {
                 keep: Arc::new(Mutex::new(None)),
                 keep_path,
                 screen: Screen::Unlock(UnlockScreen::new(vault_exists)),
+                last_activity: Instant::now(),
+                clipboard_clear_at: None,
             },
             Task::none(),
         )
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if !matches!(message, Message::Tick) {
+            self.last_activity = Instant::now();
+        }
+
         match message {
+            Message::Tick => {
+                if self.last_activity.elapsed() >= Duration::from_secs(AUTO_LOCK_SECS)
+                    && !matches!(self.screen, Screen::Unlock(_))
+                {
+                    return self.do_lock();
+                }
+                if let Some(clear_at) = self.clipboard_clear_at {
+                    if Instant::now() >= clear_at {
+                        self.clipboard_clear_at = None;
+                        return iced::clipboard::write(String::new());
+                    }
+                }
+                Task::none()
+            }
+
             Message::PasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
                     *s.password = p;
@@ -142,16 +187,7 @@ impl App {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
                 Task::none()
             }
-            Message::Lock => {
-                let mut guard = lock_keep(&self.keep);
-                if let Some(keep) = guard.as_mut() {
-                    keep.lock();
-                }
-                *guard = None;
-                drop(guard);
-                self.screen = Screen::Unlock(UnlockScreen::new(true));
-                Task::none()
-            }
+            Message::Lock => self.do_lock(),
 
             Message::RequestDelete(i) => {
                 if let Screen::ShareList(s) = &mut self.screen {
@@ -199,7 +235,11 @@ impl App {
             }
             Message::GenerateExport => self.handle_generate_export(),
             Message::ExportGenerated(result) => self.handle_export_generated(result),
-            Message::CopyToClipboard(t) => iced::clipboard::write(t),
+            Message::CopyToClipboard(t) => {
+                self.clipboard_clear_at =
+                    Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                iced::clipboard::write(t)
+            }
 
             Message::ImportDataChanged(d) => {
                 if let Screen::Import(s) = &mut self.screen {
@@ -220,6 +260,26 @@ impl App {
 
     pub fn view(&self) -> Element<Message> {
         self.screen.view()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        if matches!(self.screen, Screen::Unlock(_)) {
+            Subscription::none()
+        } else {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
+        }
+    }
+
+    fn do_lock(&mut self) -> Task<Message> {
+        let mut guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_mut() {
+            keep.lock();
+        }
+        *guard = None;
+        drop(guard);
+        self.clipboard_clear_at = None;
+        self.screen = Screen::Unlock(UnlockScreen::new(true));
+        Task::none()
     }
 
     fn current_shares(&self) -> Vec<ShareEntry> {
@@ -248,8 +308,17 @@ impl App {
     fn handle_unlock(&mut self) -> Task<Message> {
         let (password, vault_exists) = match &mut self.screen {
             Screen::Unlock(s) => {
+                if s.loading {
+                    return Task::none();
+                }
                 if s.password.is_empty() {
                     s.error = Some("Password required".into());
+                    return Task::none();
+                }
+                if !s.vault_exists && s.password.len() < MIN_PASSWORD_LEN {
+                    s.error = Some(format!(
+                        "Password must be at least {MIN_PASSWORD_LEN} characters"
+                    ));
                     return Task::none();
                 }
                 if !s.vault_exists && *s.password != *s.confirm_password {
@@ -293,7 +362,10 @@ impl App {
 
                     match result {
                         Ok(r) => r,
-                        Err(_) => Err("Internal error during unlock".to_string()),
+                        Err(payload) => {
+                            error!("Panic during unlock: {}", panic_message(&payload));
+                            Err("Internal error during unlock".to_string())
+                        }
                     }
                 })
                 .await
@@ -334,6 +406,9 @@ impl App {
     fn handle_create_keyset(&mut self) -> Task<Message> {
         let (name, threshold, total) = match &mut self.screen {
             Screen::Create(s) => {
+                if s.loading {
+                    return Task::none();
+                }
                 let threshold: u16 = match s.threshold.parse() {
                     Ok(v) if v >= 2 => v,
                     _ => {
@@ -388,6 +463,9 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
+                if s.loading || s.passphrase.is_empty() {
+                    return Task::none();
+                }
                 s.loading = true;
                 s.error = None;
                 (s.share.clone(), Zeroizing::new(s.passphrase.to_string()))
@@ -428,6 +506,9 @@ impl App {
     fn handle_import(&mut self) -> Task<Message> {
         let (data, passphrase) = match &mut self.screen {
             Screen::Import(s) => {
+                if s.loading || s.data.is_empty() || s.passphrase.is_empty() {
+                    return Task::none();
+                }
                 s.loading = true;
                 s.error = None;
                 (s.data.clone(), Zeroizing::new(s.passphrase.to_string()))

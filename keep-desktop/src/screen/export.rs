@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use iced::widget::{button, column, container, qr_code, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -86,6 +88,7 @@ impl ExportScreen {
         } else {
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(Message::ExportPassphraseChanged)
+                .on_submit(Message::GenerateExport)
                 .secure(true)
                 .padding(10)
                 .width(400);

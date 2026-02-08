@@ -27,7 +27,7 @@ COPY keep-desktop ./keep-desktop
 
 RUN cargo build --release --locked \
     && mkdir -p /out \
-    && cp target/release/keep /out/
+    && cp target/release/keep target/release/keep-desktop /out/
 
 FROM scratch AS export
 COPY --from=builder /out/* /

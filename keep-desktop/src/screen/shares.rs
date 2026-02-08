@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
@@ -110,7 +112,9 @@ impl ShareListScreen {
                     row![
                         info,
                         Space::with_width(Length::Fill),
-                        text("Delete?").size(14),
+                        text("Delete? This cannot be undone.")
+                            .size(14)
+                            .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
                         button(text("Yes"))
                             .on_press(Message::ConfirmDelete(ShareIdentity {
                                 group_pubkey: share.group_pubkey,

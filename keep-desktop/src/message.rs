@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use crate::screen::shares::ShareEntry;
@@ -46,6 +48,9 @@ pub enum Message {
     ImportPassphraseChanged(String),
     ImportShare,
     ImportResult(Result<Vec<ShareEntry>, String>),
+
+    // Timer
+    Tick,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +101,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("ImportResult")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::Tick => f.write_str("Tick"),
         }
     }
 }

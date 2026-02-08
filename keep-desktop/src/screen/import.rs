@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![forbid(unsafe_code)]
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -37,6 +39,7 @@ impl ImportScreen {
 
         let passphrase_input = text_input("Decryption passphrase", &self.passphrase)
             .on_input(Message::ImportPassphraseChanged)
+            .on_submit(Message::ImportShare)
             .secure(true)
             .padding(10)
             .width(400);
