@@ -111,7 +111,7 @@ impl UnlockScreen {
                     button(
                         text("Start Fresh")
                             .size(13)
-                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                     )
                     .on_press(Message::StartFresh)
                     .style(button::text),

@@ -57,7 +57,7 @@ impl CreateScreen {
 
         let hint = text("A 2-of-3 keyset means any 2 of 3 devices can sign together.")
             .size(12)
-            .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
+            .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
 
         let name_valid = !self.name.is_empty() && self.name.len() <= 64;
         let threshold_val: Option<u16> = self

@@ -11,7 +11,7 @@ use keep_core::Keep;
 use tracing::error;
 use zeroize::Zeroizing;
 
-use crate::message::{Message, ShareIdentity};
+use crate::message::{ExportData, Message, ShareIdentity};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
@@ -213,6 +213,16 @@ impl App {
             }
             Message::Lock => self.do_lock(),
 
+            Message::ToggleShareDetails(i) => {
+                if let Screen::ShareList(s) = &mut self.screen {
+                    s.expanded = if s.expanded == Some(i) {
+                        None
+                    } else {
+                        Some(i)
+                    };
+                }
+                Task::none()
+            }
             Message::RequestDelete(i) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = Some(i);
@@ -272,6 +282,12 @@ impl App {
             }
             Message::GenerateExport => self.handle_generate_export(),
             Message::ExportGenerated(result) => self.handle_export_generated(result),
+            Message::AdvanceQrFrame => {
+                if let Screen::Export(s) = &mut self.screen {
+                    s.advance_frame();
+                }
+                Task::none()
+            }
             Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
@@ -314,24 +330,31 @@ impl App {
         if matches!(self.screen, Screen::Unlock(_)) {
             return Subscription::none();
         }
-        let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
+        let mut subs = vec![iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)];
+
         if matches!(
             self.screen,
             Screen::Create(_) | Screen::Export(_) | Screen::Import(_)
         ) {
-            Subscription::batch([
-                tick,
-                iced::keyboard::listen().map(|event| match event {
-                    iced::keyboard::Event::KeyPressed {
-                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                        ..
-                    } => Message::GoBack,
-                    _ => Message::Tick,
-                }),
-            ])
-        } else {
-            tick
+            subs.push(iced::keyboard::listen().map(|event| match event {
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                } => Message::GoBack,
+                _ => Message::Tick,
+            }));
         }
+
+        if let Screen::Export(s) = &self.screen {
+            if s.is_animated() {
+                subs.push(
+                    iced::time::every(Duration::from_millis(800))
+                        .map(|_| Message::AdvanceQrFrame),
+                );
+            }
+        }
+
+        Subscription::batch(subs)
     }
 
     fn do_lock(&mut self) -> Task<Message> {
@@ -539,10 +562,14 @@ impl App {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        export
+                        let bech32 = export
                             .to_bech32()
                             .map(Zeroizing::new)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        let frames = export
+                            .to_animated_frames(600)
+                            .map_err(|e| e.to_string())?;
+                        Ok(ExportData { bech32, frames })
                     })
                 })
                 .await
@@ -552,14 +579,11 @@ impl App {
         )
     }
 
-    fn handle_export_generated(
-        &mut self,
-        result: Result<Zeroizing<String>, String>,
-    ) -> Task<Message> {
+    fn handle_export_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
         match result {
-            Ok(bech32) => {
+            Ok(data) => {
                 if let Screen::Export(s) = &mut self.screen {
-                    s.set_bech32(bech32);
+                    s.set_export(data.bech32, data.frames);
                 }
             }
             Err(e) => self.screen.set_loading_error(e),

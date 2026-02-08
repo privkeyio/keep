@@ -7,6 +7,12 @@ use zeroize::Zeroizing;
 use crate::screen::shares::ShareEntry;
 
 #[derive(Clone)]
+pub struct ExportData {
+    pub bech32: Zeroizing<String>,
+    pub frames: Vec<String>,
+}
+
+#[derive(Clone)]
 pub enum Message {
     // Unlock
     PasswordChanged(Zeroizing<String>),
@@ -25,6 +31,7 @@ pub enum Message {
     Lock,
 
     // Share list
+    ToggleShareDetails(usize),
     RequestDelete(usize),
     ConfirmDelete(ShareIdentity),
     CancelDelete,
@@ -39,7 +46,8 @@ pub enum Message {
     // Export
     ExportPassphraseChanged(Zeroizing<String>),
     GenerateExport,
-    ExportGenerated(Result<Zeroizing<String>, String>),
+    ExportGenerated(Result<ExportData, String>),
+    AdvanceQrFrame,
     CopyToClipboard(Zeroizing<String>),
     ResetExport,
 
@@ -82,6 +90,9 @@ impl fmt::Debug for Message {
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
             Self::Lock => f.write_str("Lock"),
+            Self::ToggleShareDetails(i) => {
+                f.debug_tuple("ToggleShareDetails").field(i).finish()
+            }
             Self::RequestDelete(i) => f.debug_tuple("RequestDelete").field(i).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),
@@ -96,6 +107,7 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::GenerateExport => f.write_str("GenerateExport"),
+            Self::AdvanceQrFrame => f.write_str("AdvanceQrFrame"),
             Self::ResetExport => f.write_str("ResetExport"),
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportResult(r) => f

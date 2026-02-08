@@ -7,11 +7,19 @@ use zeroize::Zeroizing;
 use crate::message::Message;
 use crate::screen::shares::ShareEntry;
 
+pub enum QrDisplay {
+    Single(qr_code::Data),
+    Animated {
+        frames: Vec<qr_code::Data>,
+        current: usize,
+    },
+}
+
 pub struct ExportScreen {
     pub share: ShareEntry,
     pub passphrase: Zeroizing<String>,
     pub bech32: Option<Zeroizing<String>>,
-    pub qr_data: Option<qr_code::Data>,
+    pub qr_display: Option<QrDisplay>,
     pub error: Option<String>,
     pub loading: bool,
     pub copied: bool,
@@ -23,7 +31,7 @@ impl ExportScreen {
             share,
             passphrase: Zeroizing::new(String::new()),
             bech32: None,
-            qr_data: None,
+            qr_display: None,
             error: None,
             loading: false,
             copied: false,
@@ -33,24 +41,44 @@ impl ExportScreen {
     pub fn reset(&mut self) {
         self.passphrase = Zeroizing::new(String::new());
         self.bech32 = None;
-        self.qr_data = None;
+        self.qr_display = None;
         self.error = None;
         self.loading = false;
         self.copied = false;
     }
 
-    pub fn set_bech32(&mut self, bech32: Zeroizing<String>) {
-        match qr_code::Data::new(&bech32) {
-            Ok(data) => {
-                self.qr_data = Some(data);
-                self.bech32 = Some(bech32);
-                self.error = None;
-            }
-            Err(e) => {
-                self.error = Some(format!("QR generation failed: {e}"));
-            }
-        }
+    pub fn set_export(&mut self, bech32: Zeroizing<String>, frames: Vec<String>) {
         self.loading = false;
+        self.bech32 = Some(bech32.clone());
+
+        if let Ok(data) = qr_code::Data::new(&*bech32) {
+            self.qr_display = Some(QrDisplay::Single(data));
+            return;
+        }
+
+        let qr_frames: Vec<qr_code::Data> = frames
+            .iter()
+            .filter_map(|f| qr_code::Data::new(f).ok())
+            .collect();
+
+        if qr_frames.is_empty() {
+            self.error = Some("QR generation failed: data too large".into());
+        } else {
+            self.qr_display = Some(QrDisplay::Animated {
+                frames: qr_frames,
+                current: 0,
+            });
+        }
+    }
+
+    pub fn advance_frame(&mut self) {
+        if let Some(QrDisplay::Animated { frames, current }) = &mut self.qr_display {
+            *current = (*current + 1) % frames.len();
+        }
+    }
+
+    pub fn is_animated(&self) -> bool {
+        matches!(self.qr_display, Some(QrDisplay::Animated { .. }))
     }
 
     pub fn view(&self) -> Element<Message> {
@@ -66,16 +94,30 @@ impl ExportScreen {
             &self.share.group_pubkey_hex[..16]
         ))
         .size(12)
-        .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
 
         let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
 
         let mut content = column![header, info, Space::new().height(20)].spacing(8);
 
-        if let (Some(qr), Some(bech32)) = (&self.qr_data, &self.bech32) {
-            let qr_widget = qr_code::QRCode::new(qr).cell_size(5);
-
-            content = content.push(container(qr_widget).center_x(Length::Fill).padding(10));
+        if let (Some(qr_display), Some(bech32)) = (&self.qr_display, &self.bech32) {
+            match qr_display {
+                QrDisplay::Single(data) => {
+                    let qr_widget = qr_code::QRCode::new(data).cell_size(5);
+                    content =
+                        content.push(container(qr_widget).center_x(Length::Fill).padding(10));
+                }
+                QrDisplay::Animated { frames, current } => {
+                    let qr_widget = qr_code::QRCode::new(&frames[*current]).cell_size(5);
+                    content =
+                        content.push(container(qr_widget).center_x(Length::Fill).padding(10));
+                    content = content.push(
+                        text(format!("Frame {} of {}", current + 1, frames.len()))
+                            .size(12)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                    );
+                }
+            }
 
             let display = if bech32.len() > 80 {
                 format!("{}...", &bech32[..80])
@@ -85,7 +127,7 @@ impl ExportScreen {
             content = content.push(
                 text(display)
                     .size(11)
-                    .color(iced::Color::from_rgb(0.4, 0.4, 0.4)),
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.55)),
             );
 
             let copy_label = if self.copied {
