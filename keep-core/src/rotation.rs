@@ -23,13 +23,16 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
             const CHUNK: usize = 8 * 1024;
             let zeros = [0u8; CHUNK];
             let mut remaining = metadata.len();
-            file.seek(SeekFrom::Start(0))?;
-            while remaining > 0 {
-                let to_write = std::cmp::min(CHUNK as u64, remaining) as usize;
-                file.write_all(&zeros[..to_write])?;
-                remaining -= to_write as u64;
+            if file.seek(SeekFrom::Start(0)).is_ok() {
+                while remaining > 0 {
+                    let to_write = std::cmp::min(CHUNK as u64, remaining) as usize;
+                    if file.write_all(&zeros[..to_write]).is_err() {
+                        break;
+                    }
+                    remaining -= to_write as u64;
+                }
             }
-            file.sync_all()?;
+            let _ = file.sync_all();
         }
     }
     fs::remove_file(path)
@@ -125,8 +128,21 @@ impl Storage {
 
         copy_with_retry(&header_path, &backup_path)?;
 
-        let new_header = self.create_header_with_key(new_password, data_key)?;
-        write_header_atomically(&self.path, &new_header)?;
+        let new_header = match self.create_header_with_key(new_password, data_key) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = secure_delete(&backup_path);
+                drop(lock);
+                cleanup_rotation_lock(&self.path);
+                return Err(e);
+            }
+        };
+        if let Err(e) = write_header_atomically(&self.path, &new_header) {
+            let _ = secure_delete(&backup_path);
+            drop(lock);
+            cleanup_rotation_lock(&self.path);
+            return Err(e);
+        }
         self.header = new_header.clone();
 
         if let Err(e) = self.verify_header_decryption(&new_header, new_password, &*data_key_bytes) {
@@ -266,17 +282,17 @@ impl Storage {
             if let Some(ref err) = db_err {
                 warn!(error = %err, "failed to restore database backup during rollback - vault may be corrupted");
             }
-            if let Err(err) = secure_delete(&backup_path) {
-                warn!(path = %backup_path.display(), error = %err, "failed to securely delete backup file after rotation failure");
-            }
-            if let Err(err) = secure_delete(&db_backup_path) {
-                warn!(path = %db_backup_path.display(), error = %err, "failed to securely delete database backup after rotation failure");
-            }
             drop(lock);
             if header_err.is_some() || db_err.is_some() {
                 return Err(KeepError::RotationFailed(format!(
                     "rotation failed and backup restoration failed: {e} (header: {header_err:?}, db: {db_err:?})"
                 )));
+            }
+            if let Err(err) = secure_delete(&backup_path) {
+                warn!(path = %backup_path.display(), error = %err, "failed to securely delete backup file after rotation failure");
+            }
+            if let Err(err) = secure_delete(&db_backup_path) {
+                warn!(path = %db_backup_path.display(), error = %err, "failed to securely delete database backup after rotation failure");
             }
             return Err(e);
         }

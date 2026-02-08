@@ -137,10 +137,11 @@ fn is_private_ipv6(host: &str) -> bool {
         if let Some(mapped_v4) = addr.to_ipv4_mapped() {
             return mapped_v4.is_loopback() || mapped_v4.is_private() || mapped_v4.is_link_local();
         }
+        return normalized.starts_with("fc")
+            || normalized.starts_with("fd")
+            || normalized.starts_with("fe80:")
+            || normalized.starts_with("fe80%");
     }
 
-    normalized.starts_with("fc")
-        || normalized.starts_with("fd")
-        || normalized.starts_with("fe80:")
-        || normalized.starts_with("fe80%")
+    false
 }

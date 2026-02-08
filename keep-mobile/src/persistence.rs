@@ -43,7 +43,10 @@ pub(crate) fn load_velocity(
         Ok(data) => VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
             msg: format!("Failed to deserialize velocity: {e}"),
         }),
-        Err(_) => Ok(VelocityTracker::new()),
+        Err(KeepMobileError::StorageNotFound) => Ok(VelocityTracker::new()),
+        Err(e) => Err(KeepMobileError::StorageError {
+            msg: format!("Failed to load velocity tracker: {e}"),
+        }),
     }
 }
 
@@ -76,17 +79,33 @@ pub(crate) fn load_trusted_wardens(
         })?;
 
     let mut wardens = HashSet::new();
-    for hex_str in hex_list {
-        let bytes = hex::decode(&hex_str).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Invalid warden pubkey hex: {e}"),
-        })?;
-        if bytes.len() == POLICY_PUBKEY_LEN {
-            let mut arr = [0u8; POLICY_PUBKEY_LEN];
-            arr.copy_from_slice(&bytes);
-            wardens.insert(arr);
+    let mut malformed = Vec::new();
+    for hex_str in &hex_list {
+        match hex::decode(hex_str) {
+            Ok(bytes) if bytes.len() == POLICY_PUBKEY_LEN => {
+                let mut arr = [0u8; POLICY_PUBKEY_LEN];
+                arr.copy_from_slice(&bytes);
+                wardens.insert(arr);
+            }
+            Ok(bytes) => {
+                malformed.push(format!("{hex_str}: invalid length {}", bytes.len()));
+            }
+            Err(e) => {
+                malformed.push(format!("{hex_str}: hex decode failed: {e}"));
+            }
         }
     }
-    Ok(wardens)
+    if malformed.is_empty() {
+        Ok(wardens)
+    } else {
+        Err(KeepMobileError::StorageError {
+            msg: format!(
+                "{}: malformed wardens: {}",
+                TRUSTED_WARDENS_KEY,
+                malformed.join(", ")
+            ),
+        })
+    }
 }
 
 pub(crate) fn persist_trusted_wardens(
