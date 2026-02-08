@@ -736,18 +736,18 @@ impl KeepMobile {
 
         let signing_key = frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
             KeepMobileError::FrostError {
-                msg: format!("Invalid signing key: {}", e),
+                msg: format!("Invalid signing key: {e}"),
             }
         })?;
 
         let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
         let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
-            msg: format!("Failed to serialize verifying key: {}", e),
+            msg: format!("Failed to serialize verifying key: {e}"),
         })?;
 
         let identifier = frost_secp256k1_tr::Identifier::try_from(1u16).map_err(|e| {
             KeepMobileError::FrostError {
-                msg: format!("Failed to create identifier: {}", e),
+                msg: format!("Failed to create identifier: {e}"),
             }
         })?;
 
@@ -755,12 +755,12 @@ impl KeepMobile {
             &signing_key.serialize(),
         )
         .map_err(|e| KeepMobileError::FrostError {
-            msg: format!("Failed to create signing share: {}", e),
+            msg: format!("Failed to create signing share: {e}"),
         })?;
 
         let verifying_share = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes)
             .map_err(|e| KeepMobileError::FrostError {
-                msg: format!("Failed to create verifying share: {}", e),
+                msg: format!("Failed to create verifying share: {e}"),
             })?;
 
         let key_package = frost_secp256k1_tr::keys::KeyPackage::new(
@@ -768,12 +768,12 @@ impl KeepMobile {
             signing_share,
             frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 }
             })?,
             frost_secp256k1_tr::VerifyingKey::deserialize(&vk_bytes).map_err(|e| {
                 KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 }
             })?,
             1,
@@ -807,12 +807,12 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
             key_package_bytes: key_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 }
             })?,
             pubkey_package_bytes: pubkey_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {}", e),
+                    msg: format!("Serialization failed: {e}"),
                 }
             })?,
         };
