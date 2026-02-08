@@ -29,6 +29,7 @@ pub struct App {
     screen: Screen,
     last_activity: Instant,
     clipboard_clear_at: Option<Instant>,
+    copy_feedback_until: Option<Instant>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -98,6 +99,7 @@ impl App {
                             )),
                             last_activity: Instant::now(),
                             clipboard_clear_at: None,
+                            copy_feedback_until: None,
                         },
                         Task::none(),
                     );
@@ -112,6 +114,7 @@ impl App {
                 screen: Screen::Unlock(UnlockScreen::new(vault_exists)),
                 last_activity: Instant::now(),
                 clipboard_clear_at: None,
+                copy_feedback_until: None,
             },
             Task::none(),
         )
@@ -133,6 +136,14 @@ impl App {
                     if Instant::now() >= clear_at {
                         self.clipboard_clear_at = None;
                         return iced::clipboard::write(String::new());
+                    }
+                }
+                if let Some(until) = self.copy_feedback_until {
+                    if Instant::now() >= until {
+                        self.copy_feedback_until = None;
+                        if let Screen::Export(s) = &mut self.screen {
+                            s.copied = false;
+                        }
                     }
                 }
                 Task::none()
@@ -195,6 +206,7 @@ impl App {
                 Task::none()
             }
             Message::GoBack => {
+                self.copy_feedback_until = None;
                 let shares = self.current_shares();
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
                 Task::none()
@@ -237,7 +249,20 @@ impl App {
                 Task::none()
             }
             Message::CreateKeyset => self.handle_create_keyset(),
-            Message::CreateResult(result) => self.handle_shares_result(result),
+            Message::CreateResult(result) => match result {
+                Ok(shares) => {
+                    self.screen = Screen::ShareList(ShareListScreen::with_message(
+                        shares,
+                        "Keyset created! Export each share below to distribute to your devices."
+                            .into(),
+                    ));
+                    Task::none()
+                }
+                Err(e) => {
+                    self.screen.set_loading_error(e);
+                    Task::none()
+                }
+            },
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -250,7 +275,18 @@ impl App {
             Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
+                if let Screen::Export(s) = &mut self.screen {
+                    s.copied = true;
+                }
                 iced::clipboard::write(t.to_string())
+            }
+            Message::ResetExport => {
+                self.copy_feedback_until = None;
+                if let Screen::Export(s) = &mut self.screen {
+                    s.reset();
+                }
+                Task::none()
             }
 
             Message::ImportDataChanged(d) => {
@@ -276,9 +312,25 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         if matches!(self.screen, Screen::Unlock(_)) {
-            Subscription::none()
+            return Subscription::none();
+        }
+        let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
+        if matches!(
+            self.screen,
+            Screen::Create(_) | Screen::Export(_) | Screen::Import(_)
+        ) {
+            Subscription::batch([
+                tick,
+                iced::keyboard::listen().map(|event| match event {
+                    iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                        ..
+                    } => Message::GoBack,
+                    _ => Message::Tick,
+                }),
+            ])
         } else {
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
+            tick
         }
     }
 
@@ -469,7 +521,7 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
-                if s.loading || s.passphrase.is_empty() {
+                if s.loading || s.passphrase.len() < 8 {
                     return Task::none();
                 }
                 s.loading = true;

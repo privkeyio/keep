@@ -41,6 +41,7 @@ pub enum Message {
     GenerateExport,
     ExportGenerated(Result<Zeroizing<String>, String>),
     CopyToClipboard(Zeroizing<String>),
+    ResetExport,
 
     // Import
     ImportDataChanged(Zeroizing<String>),
@@ -95,6 +96,7 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::GenerateExport => f.write_str("GenerateExport"),
+            Self::ResetExport => f.write_str("ResetExport"),
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")

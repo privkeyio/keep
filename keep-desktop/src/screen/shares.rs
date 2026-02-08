@@ -33,6 +33,7 @@ pub struct ShareListScreen {
     pub shares: Vec<ShareEntry>,
     pub delete_confirm: Option<usize>,
     pub error: Option<String>,
+    pub success_message: Option<String>,
 }
 
 impl ShareListScreen {
@@ -41,6 +42,16 @@ impl ShareListScreen {
             shares,
             delete_confirm: None,
             error: None,
+            success_message: None,
+        }
+    }
+
+    pub fn with_message(shares: Vec<ShareEntry>, message: String) -> Self {
+        Self {
+            shares,
+            delete_confirm: None,
+            error: None,
+            success_message: Some(message),
         }
     }
 
@@ -60,6 +71,14 @@ impl ShareListScreen {
         .align_y(Alignment::Center);
 
         let mut content = column![header, rule::horizontal(1)].spacing(10);
+
+        if let Some(msg) = &self.success_message {
+            content = content.push(
+                text(msg.as_str())
+                    .size(14)
+                    .color(iced::Color::from_rgb(0.2, 0.6, 0.3)),
+            );
+        }
 
         if let Some(err) = &self.error {
             content = content.push(

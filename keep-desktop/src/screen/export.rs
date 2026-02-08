@@ -14,6 +14,7 @@ pub struct ExportScreen {
     pub qr_data: Option<qr_code::Data>,
     pub error: Option<String>,
     pub loading: bool,
+    pub copied: bool,
 }
 
 impl ExportScreen {
@@ -25,7 +26,17 @@ impl ExportScreen {
             qr_data: None,
             error: None,
             loading: false,
+            copied: false,
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.passphrase = Zeroizing::new(String::new());
+        self.bech32 = None;
+        self.qr_data = None;
+        self.error = None;
+        self.loading = false;
+        self.copied = false;
     }
 
     pub fn set_bech32(&mut self, bech32: Zeroizing<String>) {
@@ -77,10 +88,21 @@ impl ExportScreen {
                     .color(iced::Color::from_rgb(0.4, 0.4, 0.4)),
             );
 
+            let copy_label = if self.copied {
+                "Copied!"
+            } else {
+                "Copy to Clipboard"
+            };
             content = content.push(
-                button(text("Copy to Clipboard"))
-                    .on_press(Message::CopyToClipboard(bech32.clone()))
-                    .padding(8),
+                row![
+                    button(text(copy_label))
+                        .on_press(Message::CopyToClipboard(bech32.clone()))
+                        .padding(8),
+                    button(text("Change Passphrase"))
+                        .on_press(Message::ResetExport)
+                        .padding(8),
+                ]
+                .spacing(8),
             );
         } else {
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
@@ -92,11 +114,20 @@ impl ExportScreen {
 
             content = content.push(passphrase_input);
 
+            let passphrase_ok = self.passphrase.len() >= 8;
+            if !self.passphrase.is_empty() && !passphrase_ok {
+                content = content.push(
+                    text("Passphrase must be at least 8 characters")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                );
+            }
+
             if self.loading {
                 content = content.push(text("Generating...").size(14));
             } else {
                 let mut btn = button(text("Generate QR Code")).padding(10);
-                if !self.passphrase.is_empty() {
+                if passphrase_ok {
                     btn = btn.on_press(Message::GenerateExport);
                 }
                 content = content.push(btn);
