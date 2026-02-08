@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
@@ -96,14 +97,13 @@ impl CreateScreen {
             );
         }
         if !self.total.is_empty() {
-            let total_error = if total_val.is_some() && !total_valid {
-                Some("Total must be >= threshold")
-            } else if total_val.is_none() && self.total.parse::<u16>().is_ok() {
-                Some("Total must be 255 or fewer")
-            } else if total_val.is_none() {
-                Some("Total must be a valid number")
-            } else {
-                None
+            let total_error = match (total_val, threshold_val) {
+                (Some(n), Some(t)) if n < t => Some("Total must be >= threshold"),
+                (None, _) if self.total.parse::<u16>().is_ok() => {
+                    Some("Total must be 255 or fewer")
+                }
+                (None, _) => Some("Total must be a valid number"),
+                _ => None,
             };
             if let Some(msg) = total_error {
                 content = content.push(text(msg).size(12).color(error_color));

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use iced::widget::{button, column, container, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -43,7 +44,11 @@ impl UnlockScreen {
 
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
-            .on_submit(Message::Unlock)
+            .on_submit(if self.start_fresh_confirm {
+                Message::ConfirmStartFresh
+            } else {
+                Message::Unlock
+            })
             .secure(true)
             .padding(10)
             .width(300);
@@ -100,7 +105,7 @@ impl UnlockScreen {
                         .size(13)
                         .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
                 );
-                let can_confirm = !self.password.is_empty() && !self.loading;
+                let can_confirm = !self.password.is_empty();
                 col = col.push(
                     iced::widget::row![
                         button(text("Confirm Delete").size(13))

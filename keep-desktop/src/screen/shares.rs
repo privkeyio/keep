@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, rule, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
@@ -61,11 +62,8 @@ impl ShareListScreen {
 
     pub fn with_message(shares: Vec<ShareEntry>, message: String) -> Self {
         Self {
-            shares,
-            delete_confirm: None,
-            error: None,
             success_message: Some(message),
-            expanded: None,
+            ..Self::new(shares)
         }
     }
 
