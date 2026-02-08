@@ -783,12 +783,14 @@ impl KeepMobile {
         verifying_shares.insert(identifier, verifying_share);
         let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
 
-        let mut group_pubkey = [0u8; 32];
-        if vk_bytes.len() == 33 {
-            group_pubkey.copy_from_slice(&vk_bytes[1..33]);
-        } else {
-            group_pubkey.copy_from_slice(&vk_bytes[..32]);
-        }
+        let group_pubkey: [u8; 32] = match vk_bytes.len() {
+            33 => vk_bytes[1..33].try_into().unwrap(),
+            len => {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!("Invalid group pubkey length: {len}"),
+                })
+            }
+        };
 
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name);
 

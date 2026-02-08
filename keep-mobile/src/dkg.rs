@@ -389,7 +389,6 @@ impl DkgSession {
 
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33].try_into().unwrap(),
-            32 => vk_bytes.try_into().unwrap(),
             len => {
                 return Err(KeepMobileError::FrostError {
                     msg: format!("Invalid group pubkey length: {len}"),
