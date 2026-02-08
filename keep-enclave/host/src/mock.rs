@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -128,7 +125,7 @@ impl MockEnclaveClient {
         if let Err(e) = getrandom::getrandom(&mut secret) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
-                message: format!("Random generation failed: {}", e),
+                message: format!("Random generation failed: {e}"),
             };
         }
 
@@ -159,7 +156,7 @@ impl MockEnclaveClient {
             }
             Err(e) => EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
-                message: format!("Key generation failed: {}", e),
+                message: format!("Key generation failed: {e}"),
             },
         }
     }
@@ -195,7 +192,7 @@ impl MockEnclaveClient {
             }
             Err(e) => EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
-                message: format!("Invalid key: {}", e),
+                message: format!("Invalid key: {e}"),
             },
         }
     }
@@ -219,7 +216,7 @@ impl MockEnclaveClient {
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InternalError,
-                    message: format!("Database error: {}", e),
+                    message: format!("Database error: {e}"),
                 }
             }
         };
@@ -247,7 +244,7 @@ impl MockEnclaveClient {
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InternalError,
-                    message: format!("Database error: {}", e),
+                    message: format!("Database error: {e}"),
                 }
             }
         };
@@ -261,13 +258,13 @@ impl MockEnclaveClient {
                     },
                     Err(e) => EnclaveResponse::Error {
                         code: ErrorCode::SigningFailed,
-                        message: format!("Signing failed: {}", e),
+                        message: format!("Signing failed: {e}"),
                     },
                 }
             }
             Err(e) => EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
-                message: format!("Invalid key: {}", e),
+                message: format!("Invalid key: {e}"),
             },
         }
     }
@@ -280,7 +277,7 @@ impl MockEnclaveClient {
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InternalError,
-                    message: format!("Database error: {}", e),
+                    message: format!("Database error: {e}"),
                 }
             }
         };
@@ -308,7 +305,7 @@ impl MockEnclaveClient {
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InternalError,
-                    message: format!("Database error: {}", e),
+                    message: format!("Database error: {e}"),
                 }
             }
         };
@@ -327,7 +324,7 @@ impl MockEnclaveClient {
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InternalError,
-                    message: format!("Database error: {}", e),
+                    message: format!("Database error: {e}"),
                 }
             }
         };
@@ -356,17 +353,17 @@ impl MockEnclaveClient {
                     }
                     Err(e) => EnclaveResponse::Error {
                         code: ErrorCode::InternalError,
-                        message: format!("Invalid key: {}", e),
+                        message: format!("Invalid key: {e}"),
                     },
                 }
             }
             Ok(None) => EnclaveResponse::Error {
                 code: ErrorCode::KeyNotFound,
-                message: format!("Key not found: {}", key_id),
+                message: format!("Key not found: {key_id}"),
             },
             Err(e) => EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
-                message: format!("Database error: {}", e),
+                message: format!("Database error: {e}"),
             },
         }
     }
@@ -388,7 +385,7 @@ impl MockEnclaveClient {
         if let Err(e) = getrandom::getrandom(&mut session_id) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
-                message: format!("Random generation failed: {}", e),
+                message: format!("Random generation failed: {e}"),
             };
         }
 
@@ -523,7 +520,7 @@ impl std::str::FromStr for AppMode {
             "local" => Ok(AppMode::Local),
             "dev" => Ok(AppMode::Dev),
             "prod" => Ok(AppMode::Prod),
-            _ => Err(format!("Invalid app mode: {}", s)),
+            _ => Err(format!("Invalid app mode: {s}")),
         }
     }
 }

@@ -23,7 +23,7 @@ pub fn cmd_frost_network_dkg(
     out.newline();
     out.header("FROST Distributed Key Generation");
     out.field("Group", group);
-    out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+    out.field("Threshold", &format!("{threshold}-of-{participants}"));
     out.field("Our index", &our_index.to_string());
     out.field("Relay", relay);
     out.field("Hardware", hardware);
@@ -31,26 +31,24 @@ pub fn cmd_frost_network_dkg(
 
     if threshold < 2 || threshold > participants {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-            "must be 2 <= threshold ({}) <= participants ({})",
-            threshold, participants
+            "must be 2 <= threshold ({threshold}) <= participants ({participants})"
         ))));
     }
 
     if our_index < 1 || our_index > participants {
         return Err(KeepError::FrostErr(FrostError::invalid_share(format!(
-            "index must be 1..={}, got {}",
-            participants, our_index
+            "index must be 1..={participants}, got {our_index}"
         ))));
     }
 
     let spinner = out.spinner("Connecting to hardware...");
     let mut signer = HardwareSigner::new(hardware)
-        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {}", e))))?;
+        .map_err(|e| KeepError::NetworkErr(NetworkError::connection(format!("hardware: {e}"))))?;
     spinner.finish();
 
     let spinner = out.spinner("Verifying connection...");
     let version = signer.ping().map_err(|e| {
-        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {}", e)))
+        KeepError::NetworkErr(NetworkError::connection(format!("hardware ping: {e}")))
     })?;
     spinner.finish();
     out.field("Hardware version", &version);
@@ -58,13 +56,13 @@ pub fn cmd_frost_network_dkg(
     let spinner = out.spinner("Initializing DKG...");
     signer
         .dkg_init(group, threshold, participants, our_index)
-        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("init: {}", e))))?;
+        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("init: {e}"))))?;
     spinner.finish();
 
     let spinner = out.spinner("Starting DKG round 1...");
     let round1_data = signer
         .dkg_round1()
-        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 1: {}", e))))?;
+        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 1: {e}"))))?;
     spinner.finish();
 
     let our_package = round1_data.to_json();
@@ -74,7 +72,7 @@ pub fn cmd_frost_network_dkg(
     out.newline();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -116,8 +114,7 @@ pub fn cmd_frost_network_dkg(
 
         let expected_peers = participants - 1;
         out.info(&format!(
-            "Waiting for {} other round 1 packages...",
-            expected_peers
+            "Waiting for {expected_peers} other round 1 packages..."
         ));
 
         let filter = Filter::new()
@@ -160,16 +157,14 @@ pub fn cmd_frost_network_dkg(
                         if let Some(pkg) = content.get("package").and_then(|p| p.as_str()) {
                             signer.dkg_round1_peer(sender_idx, pkg).map_err(|e| {
                                 KeepError::FrostErr(FrostError::dkg(format!(
-                                    "process package from {}: {}",
-                                    sender_idx, e
+                                    "process package from {sender_idx}: {e}"
                                 )))
                             })?;
 
                             received_packages.insert(sender_idx, pkg.to_string());
                             participant_pubkeys.insert(sender_idx, ev.pubkey);
                             out.success(&format!(
-                                "Received round 1 package from participant {}",
-                                sender_idx
+                                "Received round 1 package from participant {sender_idx}"
                             ));
                         }
                     }
@@ -187,7 +182,7 @@ pub fn cmd_frost_network_dkg(
         let spinner = out.spinner("Generating round 2 shares...");
         let shares_for_others = signer
             .dkg_round2()
-            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 2: {}", e))))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 2: {e}"))))?;
         spinner.finish();
 
         for share in &shares_for_others {
@@ -224,14 +219,14 @@ pub fn cmd_frost_network_dkg(
                 .sign_with_keys(&keys)
                 .map_err(|e| {
                     KeepError::CryptoErr(CryptoError::invalid_signature(format!(
-                        "share event: {}",
-                        e
+                        "share event: {e}"
                     )))
                 })?;
 
-            client.send_event(&share_event).await.map_err(|e| {
-                KeepError::NetworkErr(NetworkError::publish(format!("share: {}", e)))
-            })?;
+            client
+                .send_event(&share_event)
+                .await
+                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(format!("share: {e}"))))?;
 
             out.info(&format!(
                 "Published encrypted share for participant {}",
@@ -263,7 +258,7 @@ pub fn cmd_frost_network_dkg(
                 .fetch_events(share_filter.clone(), std::time::Duration::from_secs(5))
                 .await
                 .map_err(|e| {
-                    KeepError::NetworkErr(NetworkError::request(format!("fetch shares: {}", e)))
+                    KeepError::NetworkErr(NetworkError::request(format!("fetch shares: {e}")))
                 })?;
 
             for ev in events.iter() {
@@ -304,14 +299,12 @@ pub fn cmd_frost_network_dkg(
                                 Ok(()) => {
                                     received_from_peers.insert(sender_idx);
                                     out.success(&format!(
-                                        "Received share from participant {}",
-                                        sender_idx
+                                        "Received share from participant {sender_idx}"
                                     ));
                                 }
                                 Err(e) => {
                                     out.warn(&format!(
-                                        "Failed to process share from {}: {}",
-                                        sender_idx, e
+                                        "Failed to process share from {sender_idx}: {e}"
                                     ));
                                 }
                             }
@@ -329,7 +322,7 @@ pub fn cmd_frost_network_dkg(
         let spinner = out.spinner("Finalizing DKG...");
         let result = signer
             .dkg_finalize()
-            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("finalize: {}", e))))?;
+            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("finalize: {e}"))))?;
         spinner.finish();
 
         out.newline();
@@ -339,8 +332,7 @@ pub fn cmd_frost_network_dkg(
         out.newline();
         out.info("Share has been stored on the hardware device.");
         out.info(&format!(
-            "Group '{}' is now ready for threshold signing.",
-            group
+            "Group '{group}' is now ready for threshold signing."
         ));
 
         Ok::<_, KeepError>(())
@@ -363,13 +355,12 @@ pub fn cmd_frost_network_group_create(
     out.newline();
     out.header("FROST Group Announcement (Kind 21101)");
     out.field("Name", name);
-    out.field("Threshold", &format!("{}-of-{}", threshold, participants));
+    out.field("Threshold", &format!("{threshold}-of-{participants}"));
     out.newline();
 
     if threshold < 2 || threshold > participants {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-            "must be 2 <= threshold ({}) <= participants ({})",
-            threshold, participants
+            "must be 2 <= threshold ({threshold}) <= participants ({participants})"
         ))));
     }
 
@@ -392,7 +383,7 @@ pub fn cmd_frost_network_group_create(
     let group_id: [u8; 32] = hasher.finalize().into();
 
     let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
         let keys = Keys::generate();
@@ -402,7 +393,7 @@ pub fn cmd_frost_network_group_create(
             client
                 .add_relay(relay)
                 .await
-                .map_err(|e| KeepError::NetworkErr(NetworkError::relay(format!("{}: {}", relay, e))))?;
+                .map_err(|e| KeepError::NetworkErr(NetworkError::relay(format!("{relay}: {e}"))))?;
         }
         client.connect().await;
 

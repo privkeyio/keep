@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Transport formats for FROST shares and messages.
-
-#![forbid(unsafe_code)]
-
 use bech32::{Bech32m, Hrp};
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +44,7 @@ impl ShareExport {
         let key_package = share.key_package()?;
         let key_bytes = key_package
             .serialize()
-            .map_err(|e| KeepError::Frost(format!("Serialization failed: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Serialization failed: {e}")))?;
 
         let encrypted = crypto::encrypt(&key_bytes, &key)?;
 
@@ -100,7 +97,7 @@ impl ShareExport {
         let key_bytes = decrypted.as_slice()?;
 
         let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(&key_bytes)
-            .map_err(|e| KeepError::Frost(format!("Failed to deserialize key package: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Failed to deserialize key package: {e}")))?;
 
         let group_pubkey_bytes =
             hex::decode(&self.group_pubkey).map_err(|_| KeepError::Frost(INVALID_SHARE.into()))?;
@@ -130,13 +127,13 @@ impl ShareExport {
     /// Returns an error if serialization fails.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
-            .map_err(|e| KeepError::Frost(format!("JSON serialization failed: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("JSON serialization failed: {e}")))
     }
 
     /// Deserialize from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json)
-            .map_err(|e| KeepError::Frost(format!("JSON deserialization failed: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("JSON deserialization failed: {e}")))
     }
 
     /// Parse from either bech32 or JSON format, auto-detecting based on prefix.
@@ -157,15 +154,15 @@ impl ShareExport {
     pub fn to_bech32(&self) -> Result<String> {
         let json = self.to_json()?;
         let hrp =
-            Hrp::parse(SHARE_HRP).map_err(|e| KeepError::Frost(format!("Invalid HRP: {}", e)))?;
+            Hrp::parse(SHARE_HRP).map_err(|e| KeepError::Frost(format!("Invalid HRP: {e}")))?;
         bech32::encode::<Bech32m>(hrp, json.as_bytes())
-            .map_err(|e| KeepError::Frost(format!("Bech32 encoding failed: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("Bech32 encoding failed: {e}")))
     }
 
     /// Decode from a bech32 string.
     pub fn from_bech32(encoded: &str) -> Result<Self> {
         let (hrp, data) = bech32::decode(encoded)
-            .map_err(|e| KeepError::Frost(format!("Bech32 decoding failed: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Bech32 decoding failed: {e}")))?;
 
         if !hrp.as_str().eq_ignore_ascii_case(SHARE_HRP) {
             return Err(KeepError::Frost(format!(
@@ -245,13 +242,12 @@ impl FrostMessage {
     /// Serialize to JSON.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
-            .map_err(|e| KeepError::Frost(format!("JSON encode failed: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("JSON encode failed: {e}")))
     }
 
     /// Deserialize from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json)
-            .map_err(|e| KeepError::Frost(format!("JSON decode failed: {}", e)))
+        serde_json::from_str(json).map_err(|e| KeepError::Frost(format!("JSON decode failed: {e}")))
     }
 
     /// Decode the payload from hex.
@@ -288,10 +284,7 @@ impl ShareExport {
             .enumerate()
             .map(|(i, chunk)| {
                 let chunk_hex = hex::encode(chunk);
-                format!(
-                    "{{\"f\":{},\"t\":{},\"d\":\"{}\"}}",
-                    i, total_frames, chunk_hex
-                )
+                format!("{{\"f\":{i},\"t\":{total_frames},\"d\":\"{chunk_hex}\"}}")
             })
             .collect();
 
@@ -320,7 +313,7 @@ impl ShareExport {
 
         for frame in frames {
             let parsed: serde_json::Value = serde_json::from_str(frame)
-                .map_err(|e| KeepError::Frost(format!("Invalid frame JSON: {}", e)))?;
+                .map_err(|e| KeepError::Frost(format!("Invalid frame JSON: {e}")))?;
 
             let idx = parsed["f"]
                 .as_u64()

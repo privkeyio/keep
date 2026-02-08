@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::BTreeMap;
 
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
@@ -72,8 +69,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         .map_err(|_| KeepError::Frost("Too many shares".into()))?;
     if share_count < threshold {
         return Err(KeepError::Frost(format!(
-            "Need at least {} shares to refresh, only {} available",
-            threshold, share_count
+            "Need at least {threshold} shares to refresh, only {share_count} available"
         )));
     }
 
@@ -94,7 +90,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             &identifiers,
             &mut OsRng,
         )
-        .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;
 
     if refreshing_shares.len() != identifiers.len() {
         return Err(KeepError::Frost(format!(
@@ -112,12 +108,12 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
     for (share, current_kp) in shares.iter().zip(&key_packages) {
         let id = *current_kp.identifier();
         let refreshing_share = refreshing_by_id.get(&id).ok_or_else(|| {
-            KeepError::Frost(format!("No refreshing share for identifier {:?}", id))
+            KeepError::Frost(format!("No refreshing share for identifier {id:?}"))
         })?;
 
         let new_kp =
             refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share.clone(), current_kp)
-                .map_err(|e| KeepError::Frost(format!("Refresh share failed: {}", e)))?;
+                .map_err(|e| KeepError::Frost(format!("Refresh share failed: {e}")))?;
 
         if new_kp.identifier() != &id {
             return Err(KeepError::Frost(

@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -79,10 +76,15 @@ impl McpServer {
             .expect("Failed to create runtime");
         let response = rt.block_on(self.handle_request_async(input));
         serde_json::to_string(&response).unwrap_or_else(|e| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"{}"}}}}"#,
-                e
-            )
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32603,
+                    "message": e.to_string()
+                }
+            }))
+            .expect("static JSON structure must serialize")
         })
     }
 
@@ -124,7 +126,7 @@ impl McpServer {
                 .map_err(|e| AgentError::Serialization(e.to_string()))?;
 
             stdout
-                .write_all(format!("{}\n", response_str).as_bytes())
+                .write_all(format!("{response_str}\n").as_bytes())
                 .await
                 .map_err(|e| AgentError::Other(e.to_string()))?;
             stdout
@@ -146,7 +148,7 @@ impl McpServer {
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32700,
-                        message: format!("Parse error: {}", e),
+                        message: format!("Parse error: {e}"),
                     }),
                 };
             }
@@ -329,7 +331,7 @@ impl McpServer {
                     };
 
                     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
-                        .map_err(|e| AgentError::Other(format!("Invalid PSBT: {}", e)))?;
+                        .map_err(|e| AgentError::Other(format!("Invalid PSBT: {e}")))?;
 
                     let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
@@ -444,7 +446,7 @@ impl McpServer {
                 ToolResult::success(serde_json::to_value(info).unwrap_or(Value::Null))
             }
 
-            _ => ToolResult::error(format!("Unknown tool: {}", name)),
+            _ => ToolResult::error(format!("Unknown tool: {name}")),
         };
 
         self.manager.record_request(&session_id)?;
@@ -499,7 +501,7 @@ impl McpServer {
                     Err(AgentError::Other("No active session".into()))
                 }
             }
-            _ => Err(AgentError::Other(format!("Unknown resource: {}", uri))),
+            _ => Err(AgentError::Other(format!("Unknown resource: {uri}"))),
         }
     }
 }

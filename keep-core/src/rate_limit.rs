@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +25,7 @@ fn rate_limit_path(storage_path: &Path) -> PathBuf {
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        parent.join(format!(".{}.ratelimit", name))
+        parent.join(format!(".{name}.ratelimit"))
     }
 }
 

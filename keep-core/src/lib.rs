@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: (C) 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#![deny(unsafe_code)]
+
 //! Sovereign key management for Nostr and Bitcoin.
 //!
 //! This crate provides encrypted key storage with the following features:
@@ -378,7 +380,7 @@ impl Keep {
             .find(|s| {
                 s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
             })
-            .ok_or_else(|| KeepError::KeyNotFound(format!("No share {} for group", identifier)))
+            .ok_or_else(|| KeepError::KeyNotFound(format!("No share {identifier} for group")))
     }
 
     /// Export a FROST share encrypted with a passphrase.
@@ -452,8 +454,7 @@ impl Keep {
             .map_err(|_| KeepError::Frost("Too many shares".into()))?;
         if share_count < threshold {
             return Err(KeepError::Frost(format!(
-                "Need at least {} shares to refresh, only {} available locally",
-                threshold, share_count
+                "Need at least {threshold} shares to refresh, only {share_count} available locally"
             )));
         }
 

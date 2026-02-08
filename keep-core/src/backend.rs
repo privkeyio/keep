@@ -1,7 +1,4 @@
 //! Pluggable storage backends for encrypted key storage.
-
-#![forbid(unsafe_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{PoisonError, RwLock};
@@ -137,7 +134,7 @@ impl RedbBackend {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
-            _ => Err(StorageError::database(format!("unknown table: {}", name)).into()),
+            _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }
 }

@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Persistent encrypted storage backend.
-
-#![forbid(unsafe_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -487,8 +484,7 @@ impl Storage {
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(
-                "share {} not found",
-                identifier
+                "share {identifier} not found"
             )))
         }
     }
@@ -521,9 +517,9 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "path has no parent directory")
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
     let dir = File::open(parent)?;
     dir.sync_all()
 }
@@ -620,15 +616,13 @@ impl Storage {
                 let _ = secure_delete(&backup_path);
                 drop(lock);
                 return Err(KeepError::RotationFailed(format!(
-                    "verification failed and backup restoration failed: {} (restore error: {})",
-                    e, restore_err
+                    "verification failed and backup restoration failed: {e} (restore error: {restore_err})"
                 )));
             }
             let _ = secure_delete(&backup_path);
             drop(lock);
             return Err(KeepError::RotationFailed(format!(
-                "verification failed: {}",
-                e
+                "verification failed: {e}"
             )));
         }
 
@@ -761,8 +755,7 @@ impl Storage {
             drop(lock);
             if header_err.is_some() || db_err.is_some() {
                 return Err(KeepError::RotationFailed(format!(
-                    "rotation failed and backup restoration failed: {} (header: {:?}, db: {:?})",
-                    e, header_err, db_err
+                    "rotation failed and backup restoration failed: {e} (header: {header_err:?}, db: {db_err:?})"
                 )));
             }
             return Err(e);

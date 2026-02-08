@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -134,7 +131,7 @@ impl AuditLog {
             let result = serde_json::to_string(&entry)
                 .map_err(|e| ("Failed to serialize audit log entry", e.to_string()))
                 .and_then(|json| {
-                    writeln!(file, "{}", json)
+                    writeln!(file, "{json}")
                         .map_err(|e| ("Failed to write audit log entry to file", e.to_string()))
                 });
 
@@ -180,11 +177,11 @@ impl std::fmt::Display for AuditEntry {
         )?;
 
         if let Some(kind) = self.event_kind {
-            write!(f, " kind:{}", kind)?;
+            write!(f, " kind:{kind}")?;
         }
 
         if let Some(ref reason) = self.reason {
-            write!(f, " ({})", reason)?;
+            write!(f, " ({reason})")?;
         }
 
         Ok(())

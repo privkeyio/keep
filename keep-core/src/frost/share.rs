@@ -3,7 +3,6 @@
 
 //! FROST share types and encrypted storage.
 
-#![forbid(unsafe_code)]
 #![allow(unused_assignments)]
 
 use frost_secp256k1_tr::{
@@ -92,11 +91,11 @@ impl SharePackage {
     ) -> Result<Self> {
         let key_package_bytes = key_package
             .serialize()
-            .map_err(|e| KeepError::Frost(format!("Failed to serialize key package: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Failed to serialize key package: {e}")))?;
 
         let pubkey_package_bytes = pubkey_package
             .serialize()
-            .map_err(|e| KeepError::Frost(format!("Failed to serialize pubkey package: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Failed to serialize pubkey package: {e}")))?;
 
         Ok(Self {
             metadata,
@@ -108,13 +107,13 @@ impl SharePackage {
     /// Deserialize and return the key package.
     pub fn key_package(&self) -> Result<KeyPackage> {
         KeyPackage::deserialize(&self.key_package_bytes)
-            .map_err(|e| KeepError::Frost(format!("Failed to deserialize key package: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("Failed to deserialize key package: {e}")))
     }
 
     /// Deserialize and return the public key package.
     pub fn pubkey_package(&self) -> Result<PublicKeyPackage> {
         PublicKeyPackage::deserialize(&self.pubkey_package_bytes)
-            .map_err(|e| KeepError::Frost(format!("Failed to deserialize pubkey package: {}", e)))
+            .map_err(|e| KeepError::Frost(format!("Failed to deserialize pubkey package: {e}")))
     }
 
     /// The FROST identifier for this share.

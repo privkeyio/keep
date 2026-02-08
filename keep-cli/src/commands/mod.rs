@@ -40,8 +40,7 @@ fn read_password(prompt: &str) -> Result<String> {
         .interact()
         .map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read password: {}",
-                e
+                "read password: {e}"
             )))
         })
 }
@@ -70,8 +69,7 @@ pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretSt
         .interact()
         .map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read password: {}",
-                e
+                "read password: {e}"
             )))
         })?;
     Ok(SecretString::from(pw))
@@ -87,8 +85,7 @@ pub fn get_confirm(prompt: &str) -> Result<bool> {
         .interact()
         .map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read confirmation: {}",
-                e
+                "read confirmation: {e}"
             )))
         })
 }
@@ -103,8 +100,7 @@ pub fn get_nsec(prompt: &str) -> Result<SecretString> {
         .interact()
         .map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read nsec: {}",
-                e
+                "read nsec: {e}"
             )))
         })?;
     Ok(SecretString::from(nsec))

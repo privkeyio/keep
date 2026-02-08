@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::io::{self, stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -217,14 +214,14 @@ impl Tui {
                         format!("[{}] ", entry.timestamp),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(format!("{} ", symbol), Style::default().fg(color)),
+                    Span::styled(format!("{symbol} "), Style::default().fg(color)),
                     Span::styled(&entry.app, Style::default().fg(Color::White)),
                     Span::raw(" "),
                     Span::styled(&entry.action, Style::default().fg(Color::Gray)),
                 ];
                 if let Some(ref detail) = entry.detail {
                     spans.push(Span::styled(
-                        format!(" ({})", detail),
+                        format!(" ({detail})"),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }

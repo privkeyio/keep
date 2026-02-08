@@ -47,8 +47,7 @@ impl KfpNode {
         if !self.can_receive_from(&from) {
             debug!(from = %from, "Rejecting sign request: policy denies receive");
             return Err(FrostNetError::PolicyViolation(format!(
-                "Peer {} not allowed to send sign requests",
-                from
+                "Peer {from} not allowed to send sign requests"
             )));
         }
 
@@ -74,7 +73,7 @@ impl KfpNode {
             );
             let commit_bytes = existing
                 .serialize()
-                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
 
             let payload = CommitmentPayload::new(
                 request.session_id,
@@ -130,7 +129,7 @@ impl KfpNode {
 
         let commit_bytes = commitment
             .serialize()
-            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
 
         let payload = CommitmentPayload::new(
             request.session_id,
@@ -170,7 +169,7 @@ impl KfpNode {
 
         let commitment =
             frost_secp256k1_tr::round1::SigningCommitments::deserialize(&payload.commitment)
-                .map_err(|e| FrostNetError::Crypto(format!("Invalid commitment: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Invalid commitment: {e}")))?;
 
         let proceed_to_round2 = {
             let mut sessions = self.sessions.write();
@@ -217,7 +216,7 @@ impl KfpNode {
         };
 
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
-            .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
 
         {
             let mut sessions = self.sessions.write();
@@ -281,7 +280,7 @@ impl KfpNode {
 
         let sig_share =
             frost_secp256k1_tr::round2::SignatureShare::deserialize(&payload.signature_share)
-                .map_err(|e| FrostNetError::Crypto(format!("Invalid signature share: {}", e)))?;
+                .map_err(|e| FrostNetError::Crypto(format!("Invalid signature share: {e}")))?;
 
         self.peers.write().update_last_seen(payload.share_index);
 
@@ -458,7 +457,7 @@ impl KfpNode {
 
         let our_commit_bytes = our_commitment
             .serialize()
-            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {}", e)))?;
+            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
         let our_commit_payload = CommitmentPayload::new(
             session_id,
             self.share.metadata.identifier,

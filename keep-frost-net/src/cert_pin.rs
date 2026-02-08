@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,7 +54,7 @@ pub async fn verify_relay_certificate(
     pins: &mut CertificatePinSet,
 ) -> Result<SpkiHash> {
     let url = url::Url::parse(relay_url)
-        .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {}", e)))?;
+        .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {e}")))?;
 
     let hostname = url
         .host_str()
@@ -66,9 +63,9 @@ pub async fn verify_relay_certificate(
 
     let port = url.port_or_known_default().unwrap_or(443);
     let addr = if hostname.contains(':') {
-        format!("[{}]:{}", hostname, port)
+        format!("[{hostname}]:{port}")
     } else {
-        format!("{}:{}", hostname, port)
+        format!("{hostname}:{port}")
     };
 
     let mut root_store = RootCertStore::empty();
@@ -80,30 +77,28 @@ pub async fn verify_relay_certificate(
 
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(hostname.as_str())
-        .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {}", hostname)))?
+        .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
     let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
         .await
-        .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {}", addr)))?
-        .map_err(|e| FrostNetError::Transport(format!("TCP connect to {}: {}", addr, e)))?;
+        .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
+        .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;
 
     let tls_stream =
         tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
             .await
-            .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {}", hostname)))?
-            .map_err(|e| {
-                FrostNetError::Transport(format!("TLS handshake with {}: {}", hostname, e))
-            })?;
+            .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {hostname}")))?
+            .map_err(|e| FrostNetError::Transport(format!("TLS handshake with {hostname}: {e}")))?;
 
     let (_, server_conn) = tls_stream.get_ref();
     let leaf_cert = server_conn
         .peer_certificates()
         .and_then(|c| c.first())
-        .ok_or_else(|| FrostNetError::Transport(format!("No certificates from {}", hostname)))?;
+        .ok_or_else(|| FrostNetError::Transport(format!("No certificates from {hostname}")))?;
 
     let spki_bytes = extract_spki_from_der(leaf_cert.as_ref()).ok_or_else(|| {
-        FrostNetError::Transport(format!("Failed to parse certificate from {}", hostname))
+        FrostNetError::Transport(format!("Failed to parse certificate from {hostname}"))
     })?;
 
     let spki_hash = hash_spki(spki_bytes);

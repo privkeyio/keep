@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 PrivKey LLC
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-FROM rust:1.85.0-slim-bookworm AS builder
+FROM rust:1.88.0-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev-dev \
@@ -23,10 +23,11 @@ COPY keep-agent ./keep-agent
 COPY keep-frost-net ./keep-frost-net
 COPY keep-enclave ./keep-enclave
 COPY keep-mobile ./keep-mobile
+COPY keep-desktop ./keep-desktop
 
 RUN cargo build --release --locked \
     && mkdir -p /out \
-    && cp target/release/keep /out/
+    && cp target/release/keep target/release/keep-desktop /out/
 
 FROM scratch AS export
 COPY --from=builder /out/* /

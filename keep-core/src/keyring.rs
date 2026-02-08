@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! In-memory keyring for managing unlocked keys.
-
-#![forbid(unsafe_code)]
-
 use std::collections::HashMap;
 
 use secrecy::{ExposeSecret, SecretBox};
@@ -210,7 +207,7 @@ mod tests {
             pubkey[0] = i as u8;
             let secret: [u8; 32] = crypto::random_bytes();
 
-            kr.load_key(pubkey, secret, KeyType::Nostr, format!("key{}", i))
+            kr.load_key(pubkey, secret, KeyType::Nostr, format!("key{i}"))
                 .unwrap();
         }
 

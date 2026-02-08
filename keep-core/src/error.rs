@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Error types for keep-core operations.
-
-#![forbid(unsafe_code)]
-
 use thiserror::Error;
 
 /// Machine-readable error codes for programmatic handling.

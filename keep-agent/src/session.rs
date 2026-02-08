@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use chrono::{DateTime, Duration, Utc};
 use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
@@ -118,7 +115,7 @@ impl AgentSession {
             .as_str()
             .strip_prefix("keep_sess_")
             .and_then(|s| s.get(..8))
-            .map(|s| format!("sess_{}", s))
+            .map(|s| format!("sess_{s}"))
             .unwrap_or_else(|| {
                 let hash = keep_core::crypto::blake2b_256(token.as_str().as_bytes());
                 format!("sess_{}", hex::encode(&hash[..4]))
@@ -192,8 +189,7 @@ impl AgentSession {
                 current,
                 ..
             } => Err(AgentError::RateLimitExceeded(format!(
-                "{} requests in {} (limit: {})",
-                current, window, limit
+                "{current} requests in {window} (limit: {limit})"
             ))),
         }
     }
@@ -215,8 +211,7 @@ impl AgentSession {
                 current,
                 ..
             } => Err(AgentError::RateLimitExceeded(format!(
-                "{} requests in {} (limit: {})",
-                current, window, limit
+                "{current} requests in {window} (limit: {limit})"
             ))),
         }
     }

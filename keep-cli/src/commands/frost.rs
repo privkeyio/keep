@@ -27,7 +27,7 @@ fn resolve_group_pubkey(
     let share = shares
         .iter()
         .find(|s| s.metadata.name == group_id)
-        .ok_or_else(|| KeepError::KeyNotFound(format!("No group found with name: {}", group_id)))?;
+        .ok_or_else(|| KeepError::KeyNotFound(format!("No group found with name: {group_id}")))?;
     Ok(share.metadata.group_pubkey)
 }
 
@@ -72,7 +72,7 @@ pub fn cmd_frost_generate(
     out.success("Generated FROST key group!");
     out.field("Name", name);
     out.key_field("Pubkey", &npub);
-    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.field("Threshold", &format!("{threshold}-of-{total_shares}"));
     out.newline();
 
     for share in &shares {
@@ -124,7 +124,7 @@ pub fn cmd_frost_split(
     out.newline();
     out.success("Split key into FROST shares!");
     out.key_field("Pubkey (preserved)", &npub);
-    out.field("Threshold", &format!("{}-of-{}", threshold, total_shares));
+    out.field("Threshold", &format!("{threshold}-of-{total_shares}"));
     out.newline();
 
     for share in &shares {
@@ -251,8 +251,7 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read input: {}",
-                e
+                "read input: {e}"
             )))
         })?;
         if line.trim().is_empty() {
@@ -261,8 +260,7 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
         total_bytes = total_bytes.saturating_add(line.len());
         if total_bytes > MAX_INPUT_BYTES {
             return Err(KeepError::InvalidInput(format!(
-                "input exceeds maximum size of {} bytes",
-                MAX_INPUT_BYTES
+                "input exceeds maximum size of {MAX_INPUT_BYTES} bytes"
             )));
         }
         input.push_str(&line);
@@ -305,8 +303,7 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
 
     if group_shares.is_empty() {
         return Err(KeepError::KeyNotFound(format!(
-            "No shares found for group {}",
-            group_id
+            "No shares found for group {group_id}"
         )));
     }
 
@@ -319,15 +316,13 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
         .map_err(|_| KeepError::Frost("Too many shares".into()))?;
     if share_count < threshold {
         return Err(KeepError::Frost(format!(
-            "Need at least {} shares to refresh, only {} available locally",
-            threshold, share_count
+            "Need at least {threshold} shares to refresh, only {share_count} available locally"
         )));
     }
 
     out.newline();
     out.info(&format!(
-        "Refreshing {}-of-{} shares for group {}",
-        threshold, total, group_id
+        "Refreshing {threshold}-of-{total} shares for group {group_id}"
     ));
     out.warn("Old shares will be invalidated after refresh.");
     out.newline();
@@ -345,7 +340,7 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
     out.newline();
     out.success("Shares refreshed!");
     out.key_field("Pubkey (unchanged)", &npub);
-    out.field("Threshold", &format!("{}-of-{}", threshold, total));
+    out.field("Threshold", &format!("{threshold}-of-{total}"));
     out.newline();
 
     for meta in &refreshed {
@@ -491,8 +486,7 @@ pub fn cmd_frost_sign(
 
     if our_shares.is_empty() {
         return Err(KeepError::KeyNotFound(format!(
-            "No shares found for group {}",
-            group_id
+            "No shares found for group {group_id}"
         )));
     }
 
@@ -509,10 +503,7 @@ pub fn cmd_frost_sign(
         ));
     }
 
-    out.info(&format!(
-        "Signing with {}-of-{} local shares",
-        threshold, total
-    ));
+    out.info(&format!("Signing with {threshold}-of-{total} local shares"));
 
     let spinner = out.spinner("Generating signature...");
     let sig_bytes = keep.frost_sign(&group_pubkey, &message)?;
@@ -541,8 +532,7 @@ fn cmd_frost_sign_interactive(
     use std::io::{BufRead, Write};
 
     out.info(&format!(
-        "Interactive FROST signing: {}-of-{}",
-        threshold, total
+        "Interactive FROST signing: {threshold}-of-{total}"
     ));
     out.newline();
 
@@ -559,13 +549,13 @@ fn cmd_frost_sign_interactive(
 
     let commit_bytes = our_commitment
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Serialize commitment: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Serialize commitment: {e}")))?;
     let commit_msg = FrostMessage::commitment(&session_id, our_id_u16, &commit_bytes);
     let commit_json = commit_msg.to_json()?;
 
     out.newline();
     out.info("Send this commitment to other signers:");
-    println!("{}", commit_json);
+    println!("{commit_json}");
     out.newline();
 
     let mut commitments: BTreeMap<Identifier, round1::SigningCommitments> = BTreeMap::new();
@@ -573,8 +563,7 @@ fn cmd_frost_sign_interactive(
 
     let needed = threshold as usize - 1;
     out.info(&format!(
-        "Waiting for {} commitment(s). Paste each on one line:",
-        needed
+        "Waiting for {needed} commitment(s). Paste each on one line:"
     ));
 
     let stdin = std::io::stdin();
@@ -585,8 +574,7 @@ fn cmd_frost_sign_interactive(
         let mut line = String::new();
         stdin.lock().read_line(&mut line).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read input: {}",
-                e
+                "read input: {e}"
             )))
         })?;
 
@@ -597,10 +585,10 @@ fn cmd_frost_sign_interactive(
 
         let payload = msg.payload_bytes()?;
         let commit = round1::SigningCommitments::deserialize(&payload)
-            .map_err(|e| KeepError::Frost(format!("Invalid commitment: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid commitment: {e}")))?;
 
         let id = Identifier::try_from(msg.identifier)
-            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {e}")))?;
         commitments.insert(id, commit);
     }
 
@@ -609,7 +597,7 @@ fn cmd_frost_sign_interactive(
 
     let signing_package = SigningPackage::new(commitments.clone(), message);
     let our_sig_share = round2::sign(&signing_package, &our_nonces, &kp)
-        .map_err(|e| KeepError::Frost(format!("Sign failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Sign failed: {e}")))?;
 
     let share_bytes = our_sig_share.serialize();
     let share_msg = FrostMessage::signature_share(&session_id, our_id_u16, &share_bytes);
@@ -617,13 +605,13 @@ fn cmd_frost_sign_interactive(
 
     out.newline();
     out.info("Send this signature share to the coordinator:");
-    println!("{}", share_json);
+    println!("{share_json}");
     out.newline();
 
     let mut sig_shares: BTreeMap<Identifier, round2::SignatureShare> = BTreeMap::new();
     sig_shares.insert(our_id, our_sig_share);
 
-    out.info(&format!("Waiting for {} signature share(s):", needed));
+    out.info(&format!("Waiting for {needed} signature share(s):"));
 
     for i in 0..needed {
         print!("[{}/{}] ", i + 1, needed);
@@ -632,8 +620,7 @@ fn cmd_frost_sign_interactive(
         let mut line = String::new();
         stdin.lock().read_line(&mut line).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read input: {}",
-                e
+                "read input: {e}"
             )))
         })?;
 
@@ -644,10 +631,10 @@ fn cmd_frost_sign_interactive(
 
         let payload = msg.payload_bytes()?;
         let sig_share = round2::SignatureShare::deserialize(&payload)
-            .map_err(|e| KeepError::Frost(format!("Invalid signature share: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid signature share: {e}")))?;
 
         let id = Identifier::try_from(msg.identifier)
-            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {}", e)))?;
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier: {e}")))?;
         sig_shares.insert(id, sig_share);
     }
 
@@ -656,11 +643,11 @@ fn cmd_frost_sign_interactive(
 
     let pubkey_pkg = share.pubkey_package()?;
     let signature = frost::aggregate(&signing_package, &sig_shares, &pubkey_pkg)
-        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))?;
 
     let serialized = signature
         .serialize()
-        .map_err(|e| KeepError::Frost(format!("Serialize signature: {}", e)))?;
+        .map_err(|e| KeepError::Frost(format!("Serialize signature: {e}")))?;
     let bytes = serialized.as_slice();
     if bytes.len() != 64 {
         return Err(KeepError::Frost("Invalid signature length".into()));

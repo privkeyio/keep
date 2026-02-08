@@ -6,9 +6,6 @@
 //! This module provides cryptographically secure random number generation that
 //! automatically uses the Nitro Secure Module (NSM) hardware when running inside
 //! an AWS Nitro Enclave, falling back to the OS entropy source otherwise.
-
-#![forbid(unsafe_code)]
-
 use rand::RngCore;
 
 #[cfg(all(target_os = "linux", feature = "enclave"))]

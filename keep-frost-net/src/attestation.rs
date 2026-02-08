@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-#![forbid(unsafe_code)]
-
 use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
@@ -26,7 +23,7 @@ impl ExpectedPcrs {
     pub fn from_hex(pcr0: &str, pcr1: &str, pcr2: &str) -> Result<Self> {
         let parse = |s: &str| -> Result<[u8; 48]> {
             let bytes = hex::decode(s)
-                .map_err(|e| FrostNetError::Attestation(format!("Invalid hex: {}", e)))?;
+                .map_err(|e| FrostNetError::Attestation(format!("Invalid hex: {e}")))?;
             bytes
                 .try_into()
                 .map_err(|_| FrostNetError::Attestation("PCR must be 48 bytes".into()))
@@ -60,7 +57,7 @@ pub fn verify_peer_attestation(
 
     let verified = verifier
         .verify(&attestation.document, &nonce)
-        .map_err(|e| FrostNetError::Attestation(format!("Document verification failed: {}", e)))?;
+        .map_err(|e| FrostNetError::Attestation(format!("Document verification failed: {e}")))?;
 
     if verified.pcrs.get(&0).map(|v: &Vec<u8>| v.as_slice()) != Some(&attestation.pcr0[..]) {
         return Err(FrostNetError::Attestation(
@@ -108,16 +105,14 @@ pub(crate) fn verify_attestation_timestamp_ms(timestamp_ms: u64) -> Result<()> {
     if timestamp_ms < now_ms.saturating_sub(max_age_ms) {
         let age_secs = now_ms.saturating_sub(timestamp_ms) / 1000;
         return Err(FrostNetError::Attestation(format!(
-            "Attestation timestamp too old: {}s (max {}s)",
-            age_secs, ATTESTATION_MAX_AGE_SECS
+            "Attestation timestamp too old: {age_secs}s (max {ATTESTATION_MAX_AGE_SECS}s)"
         )));
     }
 
     if timestamp_ms > now_ms.saturating_add(max_future_ms) {
         let future_secs = timestamp_ms.saturating_sub(now_ms) / 1000;
         return Err(FrostNetError::Attestation(format!(
-            "Attestation timestamp in future: {}s (max {}s)",
-            future_secs, ATTESTATION_MAX_FUTURE_SECS
+            "Attestation timestamp in future: {future_secs}s (max {ATTESTATION_MAX_FUTURE_SECS}s)"
         )));
     }
 
@@ -316,7 +311,7 @@ mod tests {
                 FrostNetError::Attestation(msg) => {
                     assert!(msg.contains("Document verification failed"))
                 }
-                e => panic!("Expected Attestation error, got {:?}", e),
+                e => panic!("Expected Attestation error, got {e:?}"),
             }
         }
 

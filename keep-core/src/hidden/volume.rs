@@ -32,9 +32,6 @@
 //! - Wrong password for hidden volume produces same error as "no hidden volume"
 //! - Both volumes use independent Argon2id key derivation
 //! - Unlock attempts both decryptions to prevent timing attacks
-
-#![forbid(unsafe_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -117,8 +114,7 @@ impl HiddenStorage {
 
         if !(0.0..=1.0).contains(&hidden_ratio) {
             return Err(KeepError::InvalidInput(format!(
-                "hidden_ratio must be between 0.0 and 1.0, got {}",
-                hidden_ratio
+                "hidden_ratio must be between 0.0 and 1.0, got {hidden_ratio}"
             )));
         }
 
@@ -130,8 +126,7 @@ impl HiddenStorage {
 
         if hidden_password.is_some() && hidden_size < MIN_HIDDEN_SIZE {
             return Err(KeepError::InvalidInput(format!(
-                "hidden volume size {} too small, need at least {} bytes",
-                hidden_size, MIN_HIDDEN_SIZE
+                "hidden volume size {hidden_size} too small, need at least {MIN_HIDDEN_SIZE} bytes"
             )));
         }
 
@@ -141,8 +136,7 @@ impl HiddenStorage {
 
         if total_size < required_min {
             return Err(KeepError::InvalidInput(format!(
-                "total size {} too small, need at least {} bytes (header: {}, hidden: {})",
-                total_size, required_min, DATA_START_OFFSET, hidden_size
+                "total size {total_size} too small, need at least {required_min} bytes (header: {DATA_START_OFFSET}, hidden: {hidden_size})"
             )));
         }
 
@@ -915,7 +909,7 @@ mod tests {
             let record = KeyRecord::new(
                 crypto::random_bytes(),
                 KeyType::Nostr,
-                format!("key-{}", i),
+                format!("key-{i}"),
                 vec![i as u8],
             );
             storage.store_key(&record).unwrap();
@@ -952,7 +946,7 @@ mod tests {
                 let record = KeyRecord::new(
                     crypto::random_bytes(),
                     KeyType::Nostr,
-                    format!("outer-{}", i),
+                    format!("outer-{i}"),
                     vec![i as u8],
                 );
                 storage.store_key(&record).unwrap();
@@ -967,7 +961,7 @@ mod tests {
                 let record = KeyRecord::new(
                     crypto::random_bytes(),
                     KeyType::Nostr,
-                    format!("hidden-{}", i),
+                    format!("hidden-{i}"),
                     vec![100 + i as u8],
                 );
                 storage.store_key(&record).unwrap();

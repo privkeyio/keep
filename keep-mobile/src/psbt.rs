@@ -86,7 +86,7 @@ impl PsbtParser {
             "regtest" => Network::Regtest,
             _ => {
                 return Err(KeepMobileError::PsbtError {
-                    msg: format!("Unknown network: {}", network),
+                    msg: format!("Unknown network: {network}"),
                 })
             }
         };
@@ -177,8 +177,7 @@ impl PsbtParser {
                 .taproot_key_spend_signature_hash(i, &prevouts_ref, sighash_type)
                 .map_err(|e| KeepMobileError::PsbtError {
                     msg: format!(
-                        "Sighash computation failed for input {} (key-path, {:?}): {}",
-                        i, sighash_type, e
+                        "Sighash computation failed for input {i} (key-path, {sighash_type:?}): {e}"
                     ),
                 })?;
 
@@ -206,7 +205,7 @@ impl PsbtParser {
 
         if !self.is_taproot_input(index) {
             return Err(KeepMobileError::PsbtError {
-                msg: format!("Input {} is not a taproot input", index),
+                msg: format!("Input {index} is not a taproot input"),
             });
         }
 
@@ -232,8 +231,7 @@ impl PsbtParser {
             .taproot_key_spend_signature_hash(index, &prevouts_ref, sighash_type)
             .map_err(|e| KeepMobileError::PsbtError {
                 msg: format!(
-                    "Sighash computation failed for input {} (key-path, {:?}): {}",
-                    index, sighash_type, e
+                    "Sighash computation failed for input {index} (key-path, {sighash_type:?}): {e}"
                 ),
             })?;
 
@@ -264,7 +262,7 @@ impl PsbtParser {
                 .inputs
                 .get(input_index)
                 .ok_or_else(|| KeepMobileError::PsbtError {
-                    msg: format!("Input index {} out of bounds", input_index),
+                    msg: format!("Input index {input_index} out of bounds"),
                 })?;
 
         if let Some(utxo) = &input.witness_utxo {
@@ -278,7 +276,7 @@ impl PsbtParser {
                 .input
                 .get(input_index)
                 .ok_or_else(|| KeepMobileError::PsbtError {
-                    msg: format!("Missing unsigned_tx input at index {}", input_index),
+                    msg: format!("Missing unsigned_tx input at index {input_index}"),
                 })?;
 
             if non_witness_tx.compute_txid() != tx_input.previous_output.txid {
@@ -299,9 +297,8 @@ impl PsbtParser {
                     .get(vout)
                     .ok_or_else(|| KeepMobileError::PsbtError {
                         msg: format!(
-                            "non_witness_utxo output index {} out of bounds at input {}",
-                            vout, input_index
-                        ),
+                        "non_witness_utxo output index {vout} out of bounds at input {input_index}"
+                    ),
                     })?;
 
             return Ok(prevout.clone());
@@ -309,8 +306,7 @@ impl PsbtParser {
 
         Err(KeepMobileError::PsbtError {
             msg: format!(
-                "Missing prevout for input {} (no witness_utxo or non_witness_utxo)",
-                input_index
+                "Missing prevout for input {input_index} (no witness_utxo or non_witness_utxo)"
             ),
         })
     }
@@ -337,7 +333,7 @@ impl PsbtParser {
             .inputs
             .get(index)
             .ok_or_else(|| KeepMobileError::PsbtError {
-                msg: format!("Input index {} out of bounds", index),
+                msg: format!("Input index {index} out of bounds"),
             })?;
 
         match &input.sighash_type {
@@ -345,7 +341,7 @@ impl PsbtParser {
                 psbt_sighash
                     .taproot_hash_ty()
                     .map_err(|e| KeepMobileError::PsbtError {
-                        msg: format!("Invalid taproot sighash type for input {}: {}", index, e),
+                        msg: format!("Invalid taproot sighash type for input {index}: {e}"),
                     })
             }
             None => Ok(TapSighashType::Default),
