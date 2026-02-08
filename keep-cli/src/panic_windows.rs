@@ -1,3 +1,6 @@
+// SAFETY: Windows API calls for setting file ACLs require unsafe.
+#![allow(unsafe_code)]
+
 use std::fs::File;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
