@@ -61,9 +61,8 @@ impl CreateScreen {
             .size(12)
             .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
-        let can_create = !self.name.is_empty()
-            && !self.threshold.is_empty()
-            && !self.total.is_empty();
+        let can_create =
+            !self.name.is_empty() && !self.threshold.is_empty() && !self.total.is_empty();
 
         let mut content = column![
             header,

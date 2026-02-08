@@ -243,10 +243,7 @@ impl App {
         )
     }
 
-    fn handle_unlock_result(
-        &mut self,
-        result: Result<Vec<ShareEntry>, String>,
-    ) -> Task<Message> {
+    fn handle_unlock_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
@@ -302,9 +299,7 @@ impl App {
                 let total: u16 = match s.total.parse() {
                     Ok(v) if v >= threshold => v,
                     _ => {
-                        s.error = Some(format!(
-                            "Total must be at least {threshold}"
-                        ));
+                        s.error = Some(format!("Total must be at least {threshold}"));
                         return Task::none();
                     }
                 };
@@ -351,10 +346,7 @@ impl App {
         )
     }
 
-    fn handle_create_result(
-        &mut self,
-        result: Result<Vec<ShareEntry>, String>,
-    ) -> Task<Message> {
+    fn handle_create_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
@@ -391,11 +383,7 @@ impl App {
 
                     let result = (|| {
                         let export = keep
-                            .frost_export_share(
-                                &share.group_pubkey,
-                                share.identifier,
-                                &passphrase,
-                            )
+                            .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
                         export.to_bech32().map_err(|e| e.to_string())
                     })();
@@ -410,10 +398,7 @@ impl App {
         )
     }
 
-    fn handle_export_generated(
-        &mut self,
-        result: Result<String, String>,
-    ) -> Task<Message> {
+    fn handle_export_generated(&mut self, result: Result<String, String>) -> Task<Message> {
         match result {
             Ok(bech32) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -451,8 +436,7 @@ impl App {
                         .ok_or_else(|| "Keep not available".to_string())?;
 
                     let result = (|| {
-                        let export =
-                            ShareExport::parse(&data).map_err(|e| e.to_string())?;
+                        let export = ShareExport::parse(&data).map_err(|e| e.to_string())?;
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(|e| e.to_string())?;
                         let shares = keep
@@ -474,10 +458,7 @@ impl App {
         )
     }
 
-    fn handle_import_result(
-        &mut self,
-        result: Result<Vec<ShareEntry>, String>,
-    ) -> Task<Message> {
+    fn handle_import_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));

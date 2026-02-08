@@ -51,8 +51,12 @@ impl ShareListScreen {
         let header = row![
             text("FROST Shares").size(24),
             Space::with_width(Length::Fill),
-            button(text("Create")).on_press(Message::GoToCreate).padding(8),
-            button(text("Import")).on_press(Message::GoToImport).padding(8),
+            button(text("Create"))
+                .on_press(Message::GoToCreate)
+                .padding(8),
+            button(text("Import"))
+                .on_press(Message::GoToImport)
+                .padding(8),
             button(text("Lock")).on_press(Message::Lock).padding(8),
         ]
         .spacing(10)
@@ -72,21 +76,13 @@ impl ShareListScreen {
             let empty = column![
                 text("No shares yet").size(18),
                 Space::with_height(20),
-                button(
-                    text("Create Keyset")
-                        .width(250)
-                        .align_x(Alignment::Center),
-                )
-                .on_press(Message::GoToCreate)
-                .padding(12),
+                button(text("Create Keyset").width(250).align_x(Alignment::Center),)
+                    .on_press(Message::GoToCreate)
+                    .padding(12),
                 Space::with_height(8),
-                button(
-                    text("Import Share")
-                        .width(250)
-                        .align_x(Alignment::Center),
-                )
-                .on_press(Message::GoToImport)
-                .padding(12),
+                button(text("Import Share").width(250).align_x(Alignment::Center),)
+                    .on_press(Message::GoToImport)
+                    .padding(12),
             ]
             .align_x(Alignment::Center)
             .spacing(4);

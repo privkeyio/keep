@@ -29,8 +29,7 @@ impl ImportScreen {
         let back_btn = button(text("< Back")).on_press(Message::GoBack).padding(8);
         let title = text("Import Share").size(24);
 
-        let header = row![back_btn, Space::with_width(10), title]
-            .align_y(Alignment::Center);
+        let header = row![back_btn, Space::with_width(10), title].align_y(Alignment::Center);
 
         let data_input = text_input("Paste kshare1... or JSON here", &self.data)
             .on_input(Message::ImportDataChanged)
