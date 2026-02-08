@@ -47,23 +47,30 @@ impl ExportScreen {
         self.copied = false;
     }
 
-    pub fn set_export(&mut self, bech32: Zeroizing<String>, frames: Vec<String>) {
+    pub fn set_export(&mut self, bech32: Zeroizing<String>, frames: Vec<Zeroizing<String>>) {
         self.loading = false;
-        self.bech32 = Some(bech32.clone());
 
         if let Ok(data) = qr_code::Data::new(&*bech32) {
+            self.bech32 = Some(bech32);
             self.qr_display = Some(QrDisplay::Single(data));
             return;
         }
 
-        let qr_frames: Vec<qr_code::Data> = frames
-            .iter()
-            .filter_map(|f| qr_code::Data::new(f).ok())
-            .collect();
+        let mut qr_frames = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            match qr_code::Data::new(&**f) {
+                Ok(data) => qr_frames.push(data),
+                Err(_) => {
+                    self.error = Some(format!("QR generation failed on frame {}", i + 1));
+                    return;
+                }
+            }
+        }
 
         if qr_frames.is_empty() {
-            self.error = Some("QR generation failed: data too large".into());
+            self.error = Some("QR generation failed: no frames produced".into());
         } else {
+            self.bech32 = Some(bech32);
             self.qr_display = Some(QrDisplay::Animated {
                 frames: qr_frames,
                 current: 0,
@@ -133,11 +140,14 @@ impl ExportScreen {
             } else {
                 "Copy to Clipboard"
             };
+            let copy_msg = if self.copied {
+                None
+            } else {
+                Some(Message::CopyToClipboard(bech32.clone()))
+            };
             content = content.push(
                 row![
-                    button(text(copy_label))
-                        .on_press(Message::CopyToClipboard(bech32.clone()))
-                        .padding(8),
+                    button(text(copy_label)).on_press_maybe(copy_msg).padding(8),
                     button(text("Change Passphrase"))
                         .on_press(Message::ResetExport)
                         .padding(8),

@@ -176,17 +176,61 @@ impl App {
                 Task::none()
             }
             Message::ConfirmStartFresh => {
-                *lock_keep(&self.keep) = None;
-                if self.keep_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&self.keep_path) {
+                let password = match &mut self.screen {
+                    Screen::Unlock(s) => {
+                        if s.password.is_empty() {
+                            s.error = Some("Enter your vault password to confirm deletion".into());
+                            return Task::none();
+                        }
+                        if s.loading {
+                            return Task::none();
+                        }
+                        s.loading = true;
+                        s.error = None;
+                        s.password.clone()
+                    }
+                    _ => return Task::none(),
+                };
+                let path = self.keep_path.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<(), String> {
+                                    let mut keep = Keep::open(&path).map_err(|e| e.to_string())?;
+                                    keep.unlock(&password).map_err(|e| e.to_string())?;
+                                    drop(keep);
+                                    std::fs::remove_dir_all(&path)
+                                        .map_err(|e| format!("Failed to remove vault: {e}"))
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    Err(format!("Internal error: {}", panic_message(&payload)))
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    },
+                    Message::StartFreshResult,
+                )
+            }
+            Message::StartFreshResult(result) => {
+                match result {
+                    Ok(()) => {
+                        *lock_keep(&self.keep) = None;
+                        self.screen = Screen::Unlock(UnlockScreen::new(false));
+                    }
+                    Err(e) => {
                         if let Screen::Unlock(s) = &mut self.screen {
-                            s.error = Some(format!("Failed to remove vault: {e}"));
+                            s.loading = false;
+                            s.error = Some(e);
                             s.start_fresh_confirm = false;
                         }
-                        return Task::none();
                     }
                 }
-                self.screen = Screen::Unlock(UnlockScreen::new(false));
                 Task::none()
             }
 
@@ -332,12 +376,12 @@ impl App {
             self.screen,
             Screen::Create(_) | Screen::Export(_) | Screen::Import(_)
         ) {
-            subs.push(iced::keyboard::listen().map(|event| match event {
+            subs.push(iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
-                } => Message::GoBack,
-                _ => Message::Tick,
+                } => Some(Message::GoBack),
+                _ => None,
             }));
         }
 
@@ -411,7 +455,7 @@ impl App {
                 }
                 s.loading = true;
                 s.error = None;
-                (Zeroizing::new(s.password.to_string()), s.vault_exists)
+                (s.password.clone(), s.vault_exists)
             }
             _ => return Task::none(),
         };
@@ -562,7 +606,12 @@ impl App {
                             .to_bech32()
                             .map(Zeroizing::new)
                             .map_err(|e| e.to_string())?;
-                        let frames = export.to_animated_frames(600).map_err(|e| e.to_string())?;
+                        let frames: Vec<Zeroizing<String>> = export
+                            .to_animated_frames(600)
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(Zeroizing::new)
+                            .collect();
                         Ok(ExportData { bech32, frames })
                     })
                 })

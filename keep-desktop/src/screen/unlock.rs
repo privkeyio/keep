@@ -66,7 +66,12 @@ impl UnlockScreen {
         col = col.push(Space::new().height(10));
 
         if self.loading {
-            col = col.push(text("Unlocking...").size(14));
+            let loading_text = if self.start_fresh_confirm {
+                "Verifying password..."
+            } else {
+                "Unlocking..."
+            };
+            col = col.push(text(loading_text).size(14));
         } else {
             let label = if self.vault_exists {
                 "Unlock"
@@ -91,14 +96,15 @@ impl UnlockScreen {
             col = col.push(Space::new().height(20));
             if self.start_fresh_confirm {
                 col = col.push(
-                    text("This will permanently delete all vault data.")
+                    text("Enter your vault password above to confirm deletion.")
                         .size(13)
                         .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
                 );
+                let can_confirm = !self.password.is_empty() && !self.loading;
                 col = col.push(
                     iced::widget::row![
                         button(text("Confirm Delete").size(13))
-                            .on_press(Message::ConfirmStartFresh)
+                            .on_press_maybe(can_confirm.then_some(Message::ConfirmStartFresh))
                             .padding(6),
                         button(text("Cancel").size(13))
                             .on_press(Message::CancelStartFresh)

@@ -9,7 +9,7 @@ use crate::screen::shares::ShareEntry;
 #[derive(Clone)]
 pub struct ExportData {
     pub bech32: Zeroizing<String>,
-    pub frames: Vec<String>,
+    pub frames: Vec<Zeroizing<String>>,
 }
 
 #[derive(Clone)]
@@ -21,6 +21,7 @@ pub enum Message {
     UnlockResult(Result<Vec<ShareEntry>, String>),
     StartFresh,
     ConfirmStartFresh,
+    StartFreshResult(Result<(), String>),
     CancelStartFresh,
 
     // Navigation
@@ -84,6 +85,7 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::StartFresh => f.write_str("StartFresh"),
             Self::ConfirmStartFresh => f.write_str("ConfirmStartFresh"),
+            Self::StartFreshResult(_) => f.write_str("StartFreshResult(***)"),
             Self::CancelStartFresh => f.write_str("CancelStartFresh"),
             Self::GoToImport => f.write_str("GoToImport"),
             Self::GoToExport(i) => f.debug_tuple("GoToExport").field(i).finish(),
