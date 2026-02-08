@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod create;
 pub mod export;
 pub mod import;
 pub mod shares;
@@ -13,6 +14,7 @@ use crate::message::Message;
 pub enum Screen {
     Unlock(unlock::UnlockScreen),
     ShareList(shares::ShareListScreen),
+    Create(create::CreateScreen),
     Export(export::ExportScreen),
     Import(import::ImportScreen),
 }
@@ -22,6 +24,7 @@ impl Screen {
         match self {
             Screen::Unlock(s) => s.view(),
             Screen::ShareList(s) => s.view(),
+            Screen::Create(s) => s.view(),
             Screen::Export(s) => s.view(),
             Screen::Import(s) => s.view(),
         }

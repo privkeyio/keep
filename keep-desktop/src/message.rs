@@ -12,10 +12,12 @@ pub enum Message {
     ConfirmPasswordChanged(String),
     Unlock,
     UnlockResult(Result<Vec<ShareEntry>, String>),
+    StartFresh,
 
     // Navigation
     GoToImport,
     GoToExport(usize),
+    GoToCreate,
     GoBack,
     Lock,
 
@@ -23,6 +25,13 @@ pub enum Message {
     RequestDelete(usize),
     ConfirmDelete(usize),
     CancelDelete,
+
+    // Create keyset
+    CreateNameChanged(String),
+    CreateThresholdChanged(String),
+    CreateTotalChanged(String),
+    CreateKeyset,
+    CreateResult(Result<Vec<ShareEntry>, String>),
 
     // Export
     ExportPassphraseChanged(String),

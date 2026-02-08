@@ -79,6 +79,19 @@ impl UnlockScreen {
             );
         }
 
+        if self.vault_exists && !self.loading {
+            col = col.push(Space::with_height(20));
+            col = col.push(
+                button(
+                    text("Start Fresh")
+                        .size(13)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                )
+                .on_press(Message::StartFresh)
+                .style(button::text),
+            );
+        }
+
         container(col)
             .center_x(Length::Fill)
             .center_y(Length::Fill)

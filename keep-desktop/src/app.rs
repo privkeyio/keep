@@ -12,6 +12,7 @@ use keep_core::Keep;
 use tracing::error;
 
 use crate::message::Message;
+use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
@@ -55,7 +56,23 @@ impl App {
             }
             Message::Unlock => self.handle_unlock(),
             Message::UnlockResult(result) => self.handle_unlock_result(result),
+            Message::StartFresh => {
+                if self.keep_path.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&self.keep_path) {
+                        if let Screen::Unlock(s) = &mut self.screen {
+                            s.error = Some(format!("Failed to remove vault: {e}"));
+                        }
+                        return Task::none();
+                    }
+                }
+                self.screen = Screen::Unlock(UnlockScreen::new(false));
+                Task::none()
+            }
 
+            Message::GoToCreate => {
+                self.screen = Screen::Create(CreateScreen::new());
+                Task::none()
+            }
             Message::GoToImport => {
                 self.screen = Screen::Import(ImportScreen::new());
                 Task::none()
@@ -99,6 +116,27 @@ impl App {
                 }
                 Task::none()
             }
+
+            Message::CreateNameChanged(n) => {
+                if let Screen::Create(s) = &mut self.screen {
+                    s.name = n;
+                }
+                Task::none()
+            }
+            Message::CreateThresholdChanged(t) => {
+                if let Screen::Create(s) = &mut self.screen {
+                    s.threshold = t;
+                }
+                Task::none()
+            }
+            Message::CreateTotalChanged(t) => {
+                if let Screen::Create(s) = &mut self.screen {
+                    s.total = t;
+                }
+                Task::none()
+            }
+            Message::CreateKeyset => self.handle_create_keyset(),
+            Message::CreateResult(result) => self.handle_create_result(result),
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -249,6 +287,86 @@ impl App {
             }
             None => {}
         }
+    }
+
+    fn handle_create_keyset(&mut self) -> Task<Message> {
+        let (name, threshold, total) = match &mut self.screen {
+            Screen::Create(s) => {
+                let threshold: u16 = match s.threshold.parse() {
+                    Ok(v) if v >= 2 => v,
+                    _ => {
+                        s.error = Some("Threshold must be at least 2".into());
+                        return Task::none();
+                    }
+                };
+                let total: u16 = match s.total.parse() {
+                    Ok(v) if v >= threshold => v,
+                    _ => {
+                        s.error = Some(format!(
+                            "Total must be at least {threshold}"
+                        ));
+                        return Task::none();
+                    }
+                };
+                if s.name.is_empty() {
+                    s.error = Some("Name is required".into());
+                    return Task::none();
+                }
+                s.loading = true;
+                s.error = None;
+                (s.name.clone(), threshold, total)
+            }
+            _ => return Task::none(),
+        };
+
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut keep = keep_arc
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| "Keep not available".to_string())?;
+
+                    let result = (|| {
+                        keep.frost_generate(threshold, total, &name)
+                            .map_err(|e| e.to_string())?;
+                        let shares = keep
+                            .frost_list_shares()
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .map(ShareEntry::from_stored)
+                            .collect();
+                        Ok(shares)
+                    })();
+
+                    *keep_arc.lock().unwrap() = Some(keep);
+                    result
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            Message::CreateResult,
+        )
+    }
+
+    fn handle_create_result(
+        &mut self,
+        result: Result<Vec<ShareEntry>, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(shares) => {
+                self.screen = Screen::ShareList(ShareListScreen::new(shares));
+            }
+            Err(e) => {
+                if let Screen::Create(s) = &mut self.screen {
+                    s.loading = false;
+                    s.error = Some(e);
+                }
+            }
+        }
+        Task::none()
     }
 
     fn handle_generate_export(&mut self) -> Task<Message> {
