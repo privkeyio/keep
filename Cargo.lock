@@ -131,20 +131,9 @@ checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
 name = "android_log-sys"
-version = "0.3.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
-
-[[package]]
-name = "android_logger"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b07e8e73d720a1f2e4b6014766e6039fd2e96a4fa44e2a78d0e1fa2ff49826"
-dependencies = [
- "android_log-sys",
- "env_filter",
- "log",
-]
+checksum = "85965b6739a430150bdd138e2374a98af0c3ee0d030b3bb7fc3bddff58d0102e"
 
 [[package]]
 name = "android_system_properties"
@@ -1816,16 +1805,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_filter"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3361,7 +3340,6 @@ dependencies = [
 name = "keep-mobile"
 version = "0.1.4"
 dependencies = [
- "android_logger",
  "base64 0.22.1",
  "bitcoin",
  "chrono",
@@ -3373,7 +3351,6 @@ dependencies = [
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
- "log",
  "serde",
  "serde_json",
  "sha2",
@@ -3381,6 +3358,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-android",
  "tracing-subscriber",
  "uniffi",
  "url",
@@ -6394,6 +6372,17 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-android"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12612be8f868a09c0ceae7113ff26afe79d81a24473a393cb9120ece162e86c0"
+dependencies = [
+ "android_log-sys",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

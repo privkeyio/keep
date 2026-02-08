@@ -30,10 +30,11 @@ url = "2.5"
 zeroize = { workspace = true }
 subtle = { workspace = true }
 flate2 = "1.1"
-android_logger = "0.14"
-log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tracing = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

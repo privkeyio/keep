@@ -388,9 +388,11 @@ impl DkgSession {
         let vk_bytes = serialized.as_slice();
 
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
-            33 => vk_bytes[1..33].try_into().map_err(|_| KeepMobileError::FrostError {
-                msg: "Failed to extract group pubkey from verifying key".into(),
-            })?,
+            33 => vk_bytes[1..33]
+                .try_into()
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "Failed to extract group pubkey from verifying key".into(),
+                })?,
             len => {
                 return Err(KeepMobileError::FrostError {
                     msg: format!("Invalid group pubkey length: {len}"),

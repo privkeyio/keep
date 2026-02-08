@@ -45,33 +45,23 @@ use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
 
-fn init_android_logging() {
+fn init_logging() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Debug)
-                .with_tag("KeepRust"),
-        );
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+
+        #[cfg(target_os = "android")]
         let _ = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_writer(|| LogWriter))
+            .with(tracing_android::layer("KeepRust").unwrap())
+            .try_init();
+
+        #[cfg(not(target_os = "android"))]
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
             .try_init();
     });
-}
-
-struct LogWriter;
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let s = String::from_utf8_lossy(buf);
-        log::debug!(target: "KeepFrost", "{}", s.trim_end());
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 const MAX_PENDING_REQUESTS: usize = 100;
@@ -164,7 +154,7 @@ struct PendingRequest {
 impl KeepMobile {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SecureStorage>) -> Result<Self, KeepMobileError> {
-        init_android_logging();
+        init_logging();
         keep_frost_net::install_default_crypto_provider();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -711,7 +701,7 @@ impl KeepMobile {
             let run_node = node.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_node.run().await {
-                    log::error!(target: "KeepFrost", "Node run failed: {e}");
+                    tracing::error!("Node run failed: {e}");
                 }
             });
 
@@ -743,12 +733,11 @@ impl KeepMobile {
             });
         }
 
-        let signing_key =
-            frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Invalid signing key: {e}"),
-                }
-            })?;
+        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
+            KeepMobileError::FrostError {
+                msg: format!("Invalid signing key: {e}"),
+            }
+        })?;
         let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
         let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
             msg: format!("Failed to serialize verifying key: {e}"),
@@ -761,12 +750,10 @@ impl KeepMobile {
             }
         })?;
 
-        let signing_share =
-            frost_secp256k1_tr::keys::SigningShare::deserialize(&signing_key_bytes).map_err(
-                |e| KeepMobileError::FrostError {
-                    msg: format!("Failed to create signing share: {e}"),
-                },
-            )?;
+        let signing_share = frost_secp256k1_tr::keys::SigningShare::deserialize(&signing_key_bytes)
+            .map_err(|e| KeepMobileError::FrostError {
+                msg: format!("Failed to create signing share: {e}"),
+            })?;
 
         let verifying_share = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vk_bytes)
             .map_err(|e| KeepMobileError::FrostError {
@@ -783,13 +770,14 @@ impl KeepMobile {
 
         let mut verifying_shares = std::collections::BTreeMap::new();
         verifying_shares.insert(identifier, verifying_share);
-        let pubkey_package =
-            frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
+        let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
 
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
-            33 => vk_bytes[1..33].try_into().map_err(|_| KeepMobileError::FrostError {
-                msg: "Failed to extract group pubkey from verifying key".into(),
-            })?,
+            33 => vk_bytes[1..33]
+                .try_into()
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "Failed to extract group pubkey from verifying key".into(),
+                })?,
             len => {
                 return Err(KeepMobileError::FrostError {
                     msg: format!("Invalid group pubkey length: {len}"),
