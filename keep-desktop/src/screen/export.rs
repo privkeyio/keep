@@ -158,7 +158,11 @@ impl ExportScreen {
         } else {
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
-                .on_submit(Message::GenerateExport)
+                .on_submit_maybe(if self.passphrase.len() >= 8 {
+                    Some(Message::GenerateExport)
+                } else {
+                    None
+                })
                 .secure(true)
                 .padding(10)
                 .width(400);

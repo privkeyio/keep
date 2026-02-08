@@ -83,8 +83,13 @@ impl UnlockScreen {
             } else {
                 "Create"
             };
+            let msg = if self.start_fresh_confirm {
+                Message::ConfirmStartFresh
+            } else {
+                Message::Unlock
+            };
             let btn = button(text(label).width(300).align_x(Alignment::Center))
-                .on_press(Message::Unlock)
+                .on_press(msg)
                 .padding(10);
             col = col.push(btn);
         }

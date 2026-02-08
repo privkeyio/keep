@@ -52,8 +52,8 @@ impl ImportScreen {
         ]
         .spacing(5);
 
-        if !self.data.is_empty() {
-            let trimmed = self.data.trim();
+        let trimmed = self.data.trim();
+        if !trimmed.is_empty() {
             if trimmed.starts_with("kshare1") {
                 content = content.push(
                     text("Encrypted bech32 share detected")
