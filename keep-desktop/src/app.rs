@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,6 +27,25 @@ pub struct App {
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
     keep.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn with_keep_blocking<T: Send + 'static>(
+    keep_arc: &Arc<Mutex<Option<Keep>>>,
+    panic_msg: &'static str,
+    f: impl FnOnce(&mut Keep) -> Result<T, String> + Send + std::panic::UnwindSafe + 'static,
+) -> Result<T, String> {
+    let mut keep = lock_keep(keep_arc)
+        .take()
+        .ok_or_else(|| "Keep not available".to_string())?;
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| f(&mut keep)));
+
+    *lock_keep(keep_arc) = Some(keep);
+
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(panic_msg.to_string()),
+    }
 }
 
 impl App {
@@ -77,7 +94,7 @@ impl App {
                 Task::none()
             }
             Message::Unlock => self.handle_unlock(),
-            Message::UnlockResult(result) => self.handle_unlock_result(result),
+            Message::UnlockResult(result) => self.handle_shares_result(result),
             Message::StartFresh => {
                 if let Screen::Unlock(s) = &mut self.screen {
                     s.start_fresh_confirm = true;
@@ -91,6 +108,7 @@ impl App {
                 Task::none()
             }
             Message::ConfirmStartFresh => {
+                *lock_keep(&self.keep) = None;
                 if self.keep_path.exists() {
                     if let Err(e) = std::fs::remove_dir_all(&self.keep_path) {
                         if let Screen::Unlock(s) = &mut self.screen {
@@ -171,7 +189,7 @@ impl App {
                 Task::none()
             }
             Message::CreateKeyset => self.handle_create_keyset(),
-            Message::CreateResult(result) => self.handle_create_result(result),
+            Message::CreateResult(result) => self.handle_shares_result(result),
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -196,7 +214,7 @@ impl App {
                 Task::none()
             }
             Message::ImportShare => self.handle_import(),
-            Message::ImportResult(result) => self.handle_import_result(result),
+            Message::ImportResult(result) => self.handle_shares_result(result),
         }
     }
 
@@ -206,16 +224,15 @@ impl App {
 
     fn current_shares(&self) -> Vec<ShareEntry> {
         let guard = lock_keep(&self.keep);
-        if let Some(keep) = guard.as_ref() {
-            match keep.frost_list_shares() {
-                Ok(stored) => stored.iter().map(ShareEntry::from_stored).collect(),
-                Err(e) => {
-                    error!("Failed to list shares: {e}");
-                    Vec::new()
-                }
+        let Some(keep) = guard.as_ref() else {
+            return Vec::new();
+        };
+        match keep.frost_list_shares() {
+            Ok(stored) => stored.iter().map(ShareEntry::from_stored).collect(),
+            Err(e) => {
+                error!("Failed to list shares: {e}");
+                Vec::new()
             }
-        } else {
-            Vec::new()
         }
     }
 
@@ -251,25 +268,33 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = if vault_exists {
-                        Keep::open(&path).map_err(|e| e.to_string())?
-                    } else {
-                        Keep::create(&path, &password).map_err(|e| e.to_string())?
-                    };
+                    let result =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
+                            let mut keep = if vault_exists {
+                                Keep::open(&path).map_err(|e| e.to_string())?
+                            } else {
+                                Keep::create(&path, &password).map_err(|e| e.to_string())?
+                            };
 
-                    if vault_exists {
-                        keep.unlock(&password).map_err(|e| e.to_string())?;
+                            if vault_exists {
+                                keep.unlock(&password).map_err(|e| e.to_string())?;
+                            }
+
+                            let shares = keep
+                                .frost_list_shares()
+                                .map_err(|e| e.to_string())?
+                                .iter()
+                                .map(ShareEntry::from_stored)
+                                .collect();
+
+                            *lock_keep(&keep_arc) = Some(keep);
+                            Ok(shares)
+                        }));
+
+                    match result {
+                        Ok(r) => r,
+                        Err(_) => Err("Internal error during unlock".to_string()),
                     }
-
-                    let shares = keep
-                        .frost_list_shares()
-                        .map_err(|e| e.to_string())?
-                        .iter()
-                        .map(ShareEntry::from_stored)
-                        .collect();
-
-                    *lock_keep(&keep_arc) = Some(keep);
-                    Ok(shares)
                 })
                 .await
                 .map_err(|e| e.to_string())?
@@ -278,17 +303,10 @@ impl App {
         )
     }
 
-    fn handle_unlock_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
+    fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
-            Ok(shares) => {
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
-            }
-            Err(e) => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.loading = false;
-                    s.error = Some(e);
-                }
-            }
+            Ok(shares) => self.screen = Screen::ShareList(ShareListScreen::new(shares)),
+            Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
     }
@@ -345,49 +363,26 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = lock_keep(&keep_arc)
-                        .take()
-                        .ok_or_else(|| "Keep not available".to_string())?;
-
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        keep.frost_generate(threshold, total, &name)
-                            .map_err(|e| e.to_string())?;
-                        let shares = keep
-                            .frost_list_shares()
-                            .map_err(|e| e.to_string())?
-                            .iter()
-                            .map(ShareEntry::from_stored)
-                            .collect();
-                        Ok(shares)
-                    }));
-
-                    *lock_keep(&keep_arc) = Some(keep);
-
-                    match result {
-                        Ok(r) => r,
-                        Err(_) => Err("Internal error during keyset creation".to_string()),
-                    }
+                    with_keep_blocking(
+                        &keep_arc,
+                        "Internal error during keyset creation",
+                        move |keep| {
+                            keep.frost_generate(threshold, total, &name)
+                                .map_err(|e| e.to_string())?;
+                            Ok(keep
+                                .frost_list_shares()
+                                .map_err(|e| e.to_string())?
+                                .iter()
+                                .map(ShareEntry::from_stored)
+                                .collect())
+                        },
+                    )
                 })
                 .await
                 .map_err(|e| e.to_string())?
             },
             Message::CreateResult,
         )
-    }
-
-    fn handle_create_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
-        match result {
-            Ok(shares) => {
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
-            }
-            Err(e) => {
-                if let Screen::Create(s) = &mut self.screen {
-                    s.loading = false;
-                    s.error = Some(e);
-                }
-            }
-        }
-        Task::none()
     }
 
     fn handle_generate_export(&mut self) -> Task<Message> {
@@ -404,23 +399,12 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = lock_keep(&keep_arc)
-                        .take()
-                        .ok_or_else(|| "Keep not available".to_string())?;
-
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    with_keep_blocking(&keep_arc, "Internal error during export", move |keep| {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
                         export.to_bech32().map_err(|e| e.to_string())
-                    }));
-
-                    *lock_keep(&keep_arc) = Some(keep);
-
-                    match result {
-                        Ok(r) => r,
-                        Err(_) => Err("Internal error during export".to_string()),
-                    }
+                    })
                 })
                 .await
                 .map_err(|e| e.to_string())?
@@ -436,12 +420,7 @@ impl App {
                     s.set_bech32(bech32);
                 }
             }
-            Err(e) => {
-                if let Screen::Export(s) = &mut self.screen {
-                    s.loading = false;
-                    s.error = Some(e);
-                }
-            }
+            Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
     }
@@ -460,49 +439,22 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let mut keep = lock_keep(&keep_arc)
-                        .take()
-                        .ok_or_else(|| "Keep not available".to_string())?;
-
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let export = ShareExport::parse(&data).map_err(|e| e.to_string())?;
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        let shares = keep
+                        Ok(keep
                             .frost_list_shares()
                             .map_err(|e| e.to_string())?
                             .iter()
                             .map(ShareEntry::from_stored)
-                            .collect();
-                        Ok(shares)
-                    }));
-
-                    *lock_keep(&keep_arc) = Some(keep);
-
-                    match result {
-                        Ok(r) => r,
-                        Err(_) => Err("Internal error during import".to_string()),
-                    }
+                            .collect())
+                    })
                 })
                 .await
                 .map_err(|e| e.to_string())?
             },
             Message::ImportResult,
         )
-    }
-
-    fn handle_import_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
-        match result {
-            Ok(shares) => {
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
-            }
-            Err(e) => {
-                if let Screen::Import(s) = &mut self.screen {
-                    s.loading = false;
-                    s.error = Some(e);
-                }
-            }
-        }
-        Task::none()
     }
 }

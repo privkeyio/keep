@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
@@ -95,11 +93,7 @@ impl ShareListScreen {
         } else {
             let mut list = column![].spacing(5);
             for (i, share) in self.shares.iter().enumerate() {
-                let truncated_pubkey = if share.group_pubkey_hex.len() > 16 {
-                    format!("{}...", &share.group_pubkey_hex[..16])
-                } else {
-                    share.group_pubkey_hex.clone()
-                };
+                let truncated_pubkey = format!("{}...", &share.group_pubkey_hex[..16]);
 
                 let info = column![
                     text(&share.name).size(16),

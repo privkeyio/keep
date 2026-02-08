@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use iced::widget::{button, column, container, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -31,14 +29,9 @@ impl UnlockScreen {
     }
 
     pub fn with_error(error: String) -> Self {
-        Self {
-            password: Zeroizing::new(String::new()),
-            confirm_password: Zeroizing::new(String::new()),
-            error: Some(error),
-            loading: false,
-            vault_exists: false,
-            start_fresh_confirm: false,
-        }
+        let mut s = Self::new(false);
+        s.error = Some(error);
+        s
     }
 
     pub fn view(&self) -> Element<Message> {

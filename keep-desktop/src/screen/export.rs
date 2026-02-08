@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-#![forbid(unsafe_code)]
-
 use iced::widget::{button, column, container, qr_code, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -55,7 +53,7 @@ impl ExportScreen {
             self.share.identifier,
             self.share.threshold,
             self.share.total_shares,
-            &self.share.group_pubkey_hex[..16.min(self.share.group_pubkey_hex.len())]
+            &self.share.group_pubkey_hex[..16]
         ))
         .size(12)
         .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
