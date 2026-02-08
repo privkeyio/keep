@@ -52,6 +52,7 @@ pub mod keyring;
 pub mod keys;
 pub mod migration;
 pub(crate) mod rate_limit;
+mod rotation;
 /// Persistent encrypted storage backend.
 pub mod storage;
 /// Ephemeral time-limited secret vault.

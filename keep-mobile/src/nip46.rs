@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::{validate_relay_url, KeepMobile, KeepMobileError};
+use crate::network::validate_relay_url;
+use crate::{KeepMobile, KeepMobileError};
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
 use keep_nip46::{NetworkFrostSigner, RateLimitConfig, Server, ServerConfig};
 use std::sync::atomic::{AtomicU8, Ordering};
