@@ -32,7 +32,14 @@ pub struct App {
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
-    keep.lock().unwrap_or_else(|e| e.into_inner())
+    match keep.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            let mut guard = e.into_inner();
+            *guard = None;
+            guard
+        }
+    }
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -63,7 +70,7 @@ fn with_keep_blocking<T: Send + 'static>(
         }
         Err(payload) => {
             error!("{}: {}", panic_msg, panic_message(&payload));
-            Err(panic_msg.to_string())
+            Err(format!("{panic_msg}; please lock and re-unlock"))
         }
     }
 }
@@ -237,7 +244,7 @@ impl App {
             Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
-                iced::clipboard::write(t)
+                iced::clipboard::write((*t).clone())
             }
 
             Message::ImportDataChanged(d) => {
@@ -276,9 +283,13 @@ impl App {
         }
         *guard = None;
         drop(guard);
-        self.clipboard_clear_at = None;
+        let clear_clipboard = self.clipboard_clear_at.take().is_some();
         self.screen = Screen::Unlock(UnlockScreen::new(true));
-        Task::none()
+        if clear_clipboard {
+            iced::clipboard::write(String::new())
+        } else {
+            Task::none()
+        }
     }
 
     fn current_shares(&self) -> Vec<ShareEntry> {
@@ -416,14 +427,18 @@ impl App {
                     }
                 };
                 let total: u16 = match s.total.parse() {
-                    Ok(v) if v >= threshold => v,
+                    Ok(v) if v >= threshold && v <= 255 => v,
                     _ => {
-                        s.error = Some(format!("Total must be at least {threshold}"));
+                        s.error = Some(format!("Total must be between {threshold} and 255"));
                         return Task::none();
                     }
                 };
                 if s.name.is_empty() {
                     s.error = Some("Name is required".into());
+                    return Task::none();
+                }
+                if s.name.len() > 64 {
+                    s.error = Some("Name must be 64 characters or fewer".into());
                     return Task::none();
                 }
                 s.loading = true;
@@ -480,7 +495,7 @@ impl App {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        export.to_bech32().map_err(|e| e.to_string())
+                        export.to_bech32().map(Zeroizing::new).map_err(|e| e.to_string())
                     })
                 })
                 .await
@@ -490,7 +505,7 @@ impl App {
         )
     }
 
-    fn handle_export_generated(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_export_generated(&mut self, result: Result<Zeroizing<String>, String>) -> Task<Message> {
         match result {
             Ok(bech32) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -510,7 +525,7 @@ impl App {
                 }
                 s.loading = true;
                 s.error = None;
-                (s.data.clone(), Zeroizing::new(s.passphrase.to_string()))
+                (Zeroizing::new(s.data.to_string()), Zeroizing::new(s.passphrase.to_string()))
             }
             _ => return Task::none(),
         };

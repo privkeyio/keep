@@ -59,13 +59,14 @@ impl CreateScreen {
             .size(12)
             .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
+        let name_valid = !self.name.is_empty() && self.name.len() <= 64;
         let threshold_val: Option<u16> = self.threshold.parse().ok().filter(|&v| v >= 2);
-        let total_val: Option<u16> = self.total.parse().ok();
+        let total_val: Option<u16> = self.total.parse().ok().filter(|&v| v <= 255);
         let total_valid = match (threshold_val, total_val) {
             (Some(t), Some(n)) => n >= t,
             _ => false,
         };
-        let can_create = !self.name.is_empty() && threshold_val.is_some() && total_valid;
+        let can_create = name_valid && threshold_val.is_some() && total_valid;
 
         let mut content = column![
             header,
@@ -77,6 +78,13 @@ impl CreateScreen {
         ]
         .spacing(5);
 
+        if self.name.len() > 64 {
+            content = content.push(
+                text("Name must be 64 characters or fewer")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+            );
+        }
         if !self.threshold.is_empty() && threshold_val.is_none() {
             content = content.push(
                 text("Threshold must be a number >= 2")
@@ -91,11 +99,19 @@ impl CreateScreen {
                     .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
             );
         } else if !self.total.is_empty() && total_val.is_none() {
-            content = content.push(
-                text("Total must be a valid number")
-                    .size(12)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-            );
+            if self.total.parse::<u16>().map_or(false, |v| v > 255) {
+                content = content.push(
+                    text("Total must be 255 or fewer")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                );
+            } else {
+                content = content.push(
+                    text("Total must be a valid number")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                );
+            }
         }
 
         content = content.push(hint);

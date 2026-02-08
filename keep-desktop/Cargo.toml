@@ -16,5 +16,4 @@ dirs = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }

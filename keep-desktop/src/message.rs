@@ -39,11 +39,11 @@ pub enum Message {
     // Export
     ExportPassphraseChanged(Zeroizing<String>),
     GenerateExport,
-    ExportGenerated(Result<String, String>),
-    CopyToClipboard(String),
+    ExportGenerated(Result<Zeroizing<String>, String>),
+    CopyToClipboard(Zeroizing<String>),
 
     // Import
-    ImportDataChanged(String),
+    ImportDataChanged(Zeroizing<String>),
     ImportPassphraseChanged(Zeroizing<String>),
     ImportShare,
     ImportResult(Result<Vec<ShareEntry>, String>),

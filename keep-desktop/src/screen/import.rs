@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 use crate::message::Message;
 
 pub struct ImportScreen {
-    pub data: String,
+    pub data: Zeroizing<String>,
     pub passphrase: Zeroizing<String>,
     pub error: Option<String>,
     pub loading: bool,
@@ -16,7 +16,7 @@ pub struct ImportScreen {
 impl ImportScreen {
     pub fn new() -> Self {
         Self {
-            data: String::new(),
+            data: Zeroizing::new(String::new()),
             passphrase: Zeroizing::new(String::new()),
             error: None,
             loading: false,
@@ -30,7 +30,7 @@ impl ImportScreen {
         let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
 
         let data_input = text_input("Paste kshare1... or JSON here", &self.data)
-            .on_input(Message::ImportDataChanged)
+            .on_input(|s| Message::ImportDataChanged(Zeroizing::new(s)))
             .padding(10)
             .width(Length::Fill);
 

@@ -28,11 +28,11 @@ impl ExportScreen {
         }
     }
 
-    pub fn set_bech32(&mut self, bech32: String) {
+    pub fn set_bech32(&mut self, bech32: Zeroizing<String>) {
         match qr_code::Data::new(&bech32) {
             Ok(data) => {
                 self.qr_data = Some(data);
-                self.bech32 = Some(Zeroizing::new(bech32));
+                self.bech32 = Some(bech32);
                 self.error = None;
             }
             Err(e) => {
@@ -79,7 +79,7 @@ impl ExportScreen {
 
             content = content.push(
                 button(text("Copy to Clipboard"))
-                    .on_press(Message::CopyToClipboard(bech32.to_string()))
+                    .on_press(Message::CopyToClipboard(Zeroizing::new(bech32.to_string())))
                     .padding(8),
             );
         } else {
