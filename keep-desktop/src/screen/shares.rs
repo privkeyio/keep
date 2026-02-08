@@ -123,7 +123,10 @@ impl ShareListScreen {
         } else {
             let mut list = column![].spacing(5);
             for (i, share) in self.shares.iter().enumerate() {
-                let truncated_pubkey = format!("{}...", &share.group_pubkey_hex[..16]);
+                let truncated_pubkey = format!(
+                    "{}...",
+                    &share.group_pubkey_hex[..share.group_pubkey_hex.len().min(16)]
+                );
 
                 let meta = text(format!(
                     "{}-of-{}  |  Share #{}  |  {}",

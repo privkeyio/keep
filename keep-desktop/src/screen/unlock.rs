@@ -78,7 +78,9 @@ impl UnlockScreen {
             };
             col = col.push(text(loading_text).size(14));
         } else {
-            let label = if self.vault_exists {
+            let label = if self.start_fresh_confirm {
+                "Confirm Delete"
+            } else if self.vault_exists {
                 "Unlock"
             } else {
                 "Create"

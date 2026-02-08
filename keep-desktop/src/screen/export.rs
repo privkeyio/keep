@@ -99,7 +99,7 @@ impl ExportScreen {
             self.share.identifier,
             self.share.threshold,
             self.share.total_shares,
-            &self.share.group_pubkey_hex[..16]
+            &self.share.group_pubkey_hex[..self.share.group_pubkey_hex.len().min(16)]
         ))
         .size(12)
         .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
