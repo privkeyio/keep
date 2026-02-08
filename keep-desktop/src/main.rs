@@ -9,13 +9,14 @@ mod message;
 mod screen;
 
 use app::App;
-use iced::Size;
+use iced::{Size, Theme};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
 
     iced::application(App::new, App::update, App::view)
         .title("Keep")
+        .theme(Theme::Dark)
         .subscription(App::subscription)
         .window_size(Size::new(900.0, 600.0))
         .run()

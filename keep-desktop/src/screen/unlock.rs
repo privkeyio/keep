@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use iced::widget::{button, column, container, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -43,7 +44,11 @@ impl UnlockScreen {
 
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
-            .on_submit(Message::Unlock)
+            .on_submit(if self.start_fresh_confirm {
+                Message::ConfirmStartFresh
+            } else {
+                Message::Unlock
+            })
             .secure(true)
             .padding(10)
             .width(300);
@@ -66,15 +71,27 @@ impl UnlockScreen {
         col = col.push(Space::new().height(10));
 
         if self.loading {
-            col = col.push(text("Unlocking...").size(14));
+            let loading_text = if self.start_fresh_confirm {
+                "Verifying password..."
+            } else {
+                "Unlocking..."
+            };
+            col = col.push(text(loading_text).size(14));
         } else {
-            let label = if self.vault_exists {
+            let label = if self.start_fresh_confirm {
+                "Confirm Delete"
+            } else if self.vault_exists {
                 "Unlock"
             } else {
                 "Create"
             };
+            let msg = if self.start_fresh_confirm {
+                Message::ConfirmStartFresh
+            } else {
+                Message::Unlock
+            };
             let btn = button(text(label).width(300).align_x(Alignment::Center))
-                .on_press(Message::Unlock)
+                .on_press(msg)
                 .padding(10);
             col = col.push(btn);
         }
@@ -91,14 +108,15 @@ impl UnlockScreen {
             col = col.push(Space::new().height(20));
             if self.start_fresh_confirm {
                 col = col.push(
-                    text("This will permanently delete all vault data.")
+                    text("Enter your vault password above to confirm deletion.")
                         .size(13)
                         .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
                 );
+                let can_confirm = !self.password.is_empty();
                 col = col.push(
                     iced::widget::row![
                         button(text("Confirm Delete").size(13))
-                            .on_press(Message::ConfirmStartFresh)
+                            .on_press_maybe(can_confirm.then_some(Message::ConfirmStartFresh))
                             .padding(6),
                         button(text("Cancel").size(13))
                             .on_press(Message::CancelStartFresh)
@@ -111,7 +129,7 @@ impl UnlockScreen {
                     button(
                         text("Start Fresh")
                             .size(13)
-                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                     )
                     .on_press(Message::StartFresh)
                     .style(button::text),

@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use std::fmt;
 
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
+
+#[derive(Clone)]
+pub struct ExportData {
+    pub bech32: Zeroizing<String>,
+    pub frames: Vec<Zeroizing<String>>,
+}
 
 #[derive(Clone)]
 pub enum Message {
@@ -15,6 +22,7 @@ pub enum Message {
     UnlockResult(Result<Vec<ShareEntry>, String>),
     StartFresh,
     ConfirmStartFresh,
+    StartFreshResult(Result<(), String>),
     CancelStartFresh,
 
     // Navigation
@@ -25,6 +33,7 @@ pub enum Message {
     Lock,
 
     // Share list
+    ToggleShareDetails(usize),
     RequestDelete(usize),
     ConfirmDelete(ShareIdentity),
     CancelDelete,
@@ -39,8 +48,10 @@ pub enum Message {
     // Export
     ExportPassphraseChanged(Zeroizing<String>),
     GenerateExport,
-    ExportGenerated(Result<Zeroizing<String>, String>),
+    ExportGenerated(Result<ExportData, String>),
+    AdvanceQrFrame,
     CopyToClipboard(Zeroizing<String>),
+    ResetExport,
 
     // Import
     ImportDataChanged(Zeroizing<String>),
@@ -75,12 +86,14 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::StartFresh => f.write_str("StartFresh"),
             Self::ConfirmStartFresh => f.write_str("ConfirmStartFresh"),
+            Self::StartFreshResult(_) => f.write_str("StartFreshResult(***)"),
             Self::CancelStartFresh => f.write_str("CancelStartFresh"),
             Self::GoToImport => f.write_str("GoToImport"),
             Self::GoToExport(i) => f.debug_tuple("GoToExport").field(i).finish(),
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
             Self::Lock => f.write_str("Lock"),
+            Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::RequestDelete(i) => f.debug_tuple("RequestDelete").field(i).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),
@@ -95,6 +108,8 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::GenerateExport => f.write_str("GenerateExport"),
+            Self::AdvanceQrFrame => f.write_str("AdvanceQrFrame"),
+            Self::ResetExport => f.write_str("ResetExport"),
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")

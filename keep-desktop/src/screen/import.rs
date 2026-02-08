@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -48,12 +49,37 @@ impl ImportScreen {
             Space::new().height(20),
             text("Share data").size(14),
             data_input,
-            Space::new().height(10),
-            text("Passphrase").size(14),
-            passphrase_input,
-            Space::new().height(10),
         ]
         .spacing(5);
+
+        let trimmed = self.data.trim();
+        if !trimmed.is_empty() {
+            if trimmed.starts_with("kshare1") {
+                content = content.push(
+                    text("Encrypted bech32 share detected")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.2, 0.6, 0.3)),
+                );
+            } else if trimmed.starts_with('{') {
+                content = content.push(
+                    text("JSON format detected")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.2, 0.6, 0.3)),
+                );
+            } else {
+                content = content.push(
+                    text("Expected kshare1... or JSON format")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                );
+            }
+        }
+
+        content = content
+            .push(Space::new().height(10))
+            .push(text("Passphrase").size(14))
+            .push(passphrase_input)
+            .push(Space::new().height(10));
 
         if self.loading {
             content = content.push(text("Importing...").size(14));

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,7 @@ use keep_core::Keep;
 use tracing::error;
 use zeroize::Zeroizing;
 
-use crate::message::{Message, ShareIdentity};
+use crate::message::{ExportData, Message, ShareIdentity};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
@@ -29,6 +30,7 @@ pub struct App {
     screen: Screen,
     last_activity: Instant,
     clipboard_clear_at: Option<Instant>,
+    copy_feedback_until: Option<Instant>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -42,7 +44,7 @@ fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Optio
     }
 }
 
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -98,6 +100,7 @@ impl App {
                             )),
                             last_activity: Instant::now(),
                             clipboard_clear_at: None,
+                            copy_feedback_until: None,
                         },
                         Task::none(),
                     );
@@ -112,6 +115,7 @@ impl App {
                 screen: Screen::Unlock(UnlockScreen::new(vault_exists)),
                 last_activity: Instant::now(),
                 clipboard_clear_at: None,
+                copy_feedback_until: None,
             },
             Task::none(),
         )
@@ -133,6 +137,14 @@ impl App {
                     if Instant::now() >= clear_at {
                         self.clipboard_clear_at = None;
                         return iced::clipboard::write(String::new());
+                    }
+                }
+                if let Some(until) = self.copy_feedback_until {
+                    if Instant::now() >= until {
+                        self.copy_feedback_until = None;
+                        if let Screen::Export(s) = &mut self.screen {
+                            s.copied = false;
+                        }
                     }
                 }
                 Task::none()
@@ -165,17 +177,61 @@ impl App {
                 Task::none()
             }
             Message::ConfirmStartFresh => {
-                *lock_keep(&self.keep) = None;
-                if self.keep_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&self.keep_path) {
+                let password = match &mut self.screen {
+                    Screen::Unlock(s) => {
+                        if s.password.is_empty() {
+                            s.error = Some("Enter your vault password to confirm deletion".into());
+                            return Task::none();
+                        }
+                        if s.loading {
+                            return Task::none();
+                        }
+                        s.loading = true;
+                        s.error = None;
+                        s.password.clone()
+                    }
+                    _ => return Task::none(),
+                };
+                let path = self.keep_path.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<(), String> {
+                                    let mut keep = Keep::open(&path).map_err(|e| e.to_string())?;
+                                    keep.unlock(&password).map_err(|e| e.to_string())?;
+                                    drop(keep);
+                                    std::fs::remove_dir_all(&path)
+                                        .map_err(|e| format!("Failed to remove vault: {e}"))
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    Err(format!("Internal error: {}", panic_message(&payload)))
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    },
+                    Message::StartFreshResult,
+                )
+            }
+            Message::StartFreshResult(result) => {
+                match result {
+                    Ok(()) => {
+                        *lock_keep(&self.keep) = None;
+                        self.screen = Screen::Unlock(UnlockScreen::new(false));
+                    }
+                    Err(e) => {
                         if let Screen::Unlock(s) = &mut self.screen {
-                            s.error = Some(format!("Failed to remove vault: {e}"));
+                            s.loading = false;
+                            s.error = Some(e);
                             s.start_fresh_confirm = false;
                         }
-                        return Task::none();
                     }
                 }
-                self.screen = Screen::Unlock(UnlockScreen::new(false));
                 Task::none()
             }
 
@@ -195,12 +251,19 @@ impl App {
                 Task::none()
             }
             Message::GoBack => {
+                self.copy_feedback_until = None;
                 let shares = self.current_shares();
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
                 Task::none()
             }
             Message::Lock => self.do_lock(),
 
+            Message::ToggleShareDetails(i) => {
+                if let Screen::ShareList(s) = &mut self.screen {
+                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
+                }
+                Task::none()
+            }
             Message::RequestDelete(i) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = Some(i);
@@ -237,7 +300,20 @@ impl App {
                 Task::none()
             }
             Message::CreateKeyset => self.handle_create_keyset(),
-            Message::CreateResult(result) => self.handle_shares_result(result),
+            Message::CreateResult(result) => match result {
+                Ok(shares) => {
+                    self.screen = Screen::ShareList(ShareListScreen::with_message(
+                        shares,
+                        "Keyset created! Export each share below to distribute to your devices."
+                            .into(),
+                    ));
+                    Task::none()
+                }
+                Err(e) => {
+                    self.screen.set_loading_error(e);
+                    Task::none()
+                }
+            },
 
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
@@ -247,10 +323,27 @@ impl App {
             }
             Message::GenerateExport => self.handle_generate_export(),
             Message::ExportGenerated(result) => self.handle_export_generated(result),
+            Message::AdvanceQrFrame => {
+                if let Screen::Export(s) = &mut self.screen {
+                    s.advance_frame();
+                }
+                Task::none()
+            }
             Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
+                if let Screen::Export(s) = &mut self.screen {
+                    s.copied = true;
+                }
                 iced::clipboard::write(t.to_string())
+            }
+            Message::ResetExport => {
+                self.copy_feedback_until = None;
+                if let Screen::Export(s) = &mut self.screen {
+                    s.reset();
+                }
+                Task::none()
             }
 
             Message::ImportDataChanged(d) => {
@@ -276,10 +369,32 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         if matches!(self.screen, Screen::Unlock(_)) {
-            Subscription::none()
-        } else {
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
+            return Subscription::none();
         }
+        let mut subs = vec![iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)];
+
+        if matches!(
+            self.screen,
+            Screen::Create(_) | Screen::Export(_) | Screen::Import(_)
+        ) {
+            subs.push(iced::keyboard::listen().filter_map(|event| match event {
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                } => Some(Message::GoBack),
+                _ => None,
+            }));
+        }
+
+        if let Screen::Export(s) = &self.screen {
+            if s.is_animated() {
+                subs.push(
+                    iced::time::every(Duration::from_millis(800)).map(|_| Message::AdvanceQrFrame),
+                );
+            }
+        }
+
+        Subscription::batch(subs)
     }
 
     fn do_lock(&mut self) -> Task<Message> {
@@ -315,6 +430,7 @@ impl App {
             s.shares = shares;
             s.delete_confirm = None;
             s.error = None;
+            s.success_message = None;
         }
     }
 
@@ -340,7 +456,7 @@ impl App {
                 }
                 s.loading = true;
                 s.error = None;
-                (Zeroizing::new(s.password.to_string()), s.vault_exists)
+                (s.password.clone(), s.vault_exists)
             }
             _ => return Task::none(),
         };
@@ -469,7 +585,7 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
-                if s.loading || s.passphrase.is_empty() {
+                if s.loading || s.passphrase.len() < 8 {
                     return Task::none();
                 }
                 s.loading = true;
@@ -487,10 +603,17 @@ impl App {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(|e| e.to_string())?;
-                        export
+                        let bech32 = export
                             .to_bech32()
                             .map(Zeroizing::new)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        let frames: Vec<Zeroizing<String>> = export
+                            .to_animated_frames(600)
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(Zeroizing::new)
+                            .collect();
+                        Ok(ExportData { bech32, frames })
                     })
                 })
                 .await
@@ -500,14 +623,11 @@ impl App {
         )
     }
 
-    fn handle_export_generated(
-        &mut self,
-        result: Result<Zeroizing<String>, String>,
-    ) -> Task<Message> {
+    fn handle_export_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
         match result {
-            Ok(bech32) => {
+            Ok(data) => {
                 if let Screen::Export(s) = &mut self.screen {
-                    s.set_bech32(bech32);
+                    s.set_export(data.bech32, data.frames);
                 }
             }
             Err(e) => self.screen.set_loading_error(e),

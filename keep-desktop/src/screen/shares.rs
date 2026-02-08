@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+
+use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, rule, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
@@ -13,6 +15,8 @@ pub struct ShareEntry {
     pub total_shares: u16,
     pub group_pubkey: [u8; 32],
     pub group_pubkey_hex: String,
+    pub created_at: i64,
+    pub sign_count: u64,
 }
 
 impl ShareEntry {
@@ -25,7 +29,15 @@ impl ShareEntry {
             total_shares: m.total_shares,
             group_pubkey: m.group_pubkey,
             group_pubkey_hex: hex::encode(m.group_pubkey),
+            created_at: m.created_at,
+            sign_count: m.sign_count,
         }
+    }
+
+    fn created_display(&self) -> String {
+        DateTime::<Utc>::from_timestamp(self.created_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| self.created_at.to_string())
     }
 }
 
@@ -33,6 +45,8 @@ pub struct ShareListScreen {
     pub shares: Vec<ShareEntry>,
     pub delete_confirm: Option<usize>,
     pub error: Option<String>,
+    pub success_message: Option<String>,
+    pub expanded: Option<usize>,
 }
 
 impl ShareListScreen {
@@ -41,6 +55,15 @@ impl ShareListScreen {
             shares,
             delete_confirm: None,
             error: None,
+            success_message: None,
+            expanded: None,
+        }
+    }
+
+    pub fn with_message(shares: Vec<ShareEntry>, message: String) -> Self {
+        Self {
+            success_message: Some(message),
+            ..Self::new(shares)
         }
     }
 
@@ -60,6 +83,14 @@ impl ShareListScreen {
         .align_y(Alignment::Center);
 
         let mut content = column![header, rule::horizontal(1)].spacing(10);
+
+        if let Some(msg) = &self.success_message {
+            content = content.push(
+                text(msg.as_str())
+                    .size(14)
+                    .color(iced::Color::from_rgb(0.2, 0.6, 0.3)),
+            );
+        }
 
         if let Some(err) = &self.error {
             content = content.push(
@@ -92,18 +123,45 @@ impl ShareListScreen {
         } else {
             let mut list = column![].spacing(5);
             for (i, share) in self.shares.iter().enumerate() {
-                let truncated_pubkey = format!("{}...", &share.group_pubkey_hex[..16]);
+                let truncated_pubkey = format!(
+                    "{}...",
+                    &share.group_pubkey_hex[..share.group_pubkey_hex.len().min(16)]
+                );
 
-                let info = column![
-                    text(&share.name).size(16),
-                    text(format!(
-                        "{}-of-{}  |  Share #{}  |  {}",
-                        share.threshold, share.total_shares, share.identifier, truncated_pubkey
-                    ))
-                    .size(12)
-                    .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
-                ]
-                .spacing(2);
+                let meta = text(format!(
+                    "{}-of-{}  |  Share #{}  |  {}",
+                    share.threshold, share.total_shares, share.identifier, truncated_pubkey
+                ))
+                .size(12)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+
+                let arrow = if self.expanded == Some(i) { "v" } else { ">" };
+                let name_btn = button(text(format!("{arrow} {}", share.name)).size(16))
+                    .on_press(Message::ToggleShareDetails(i))
+                    .style(button::text)
+                    .padding(0);
+
+                let mut info = column![name_btn, meta].spacing(2);
+
+                if self.expanded == Some(i) {
+                    let detail_color = iced::Color::from_rgb(0.6, 0.6, 0.6);
+                    info = info.push(Space::new().height(4));
+                    info = info.push(
+                        text(format!("Group pubkey: {}", share.group_pubkey_hex))
+                            .size(12)
+                            .color(detail_color),
+                    );
+                    info = info.push(
+                        text(format!("Created: {}", share.created_display()))
+                            .size(12)
+                            .color(detail_color),
+                    );
+                    info = info.push(
+                        text(format!("Signatures: {}", share.sign_count))
+                            .size(12)
+                            .color(detail_color),
+                    );
+                }
 
                 let share_row = if self.delete_confirm == Some(i) {
                     row![
