@@ -153,6 +153,22 @@ impl RecoveryConfig {
         })
     }
 
+    pub fn build_with_internal_key(&self, internal_key: &XOnlyPublicKey) -> Result<RecoveryOutput> {
+        self.validate()?;
+        let secp = Secp256k1::new();
+        let tiers = self.build_tier_infos()?;
+        let spend_info = self.build_taproot(&secp, *internal_key, &tiers)?;
+        let address = Address::p2tr_tweaked(spend_info.output_key(), self.network);
+        let descriptor = self.format_descriptor(*internal_key, &tiers);
+
+        Ok(RecoveryOutput {
+            address,
+            spend_info,
+            descriptor,
+            tiers,
+        })
+    }
+
     fn internal_key(&self) -> Result<XOnlyPublicKey> {
         if self.primary.keys.len() == 1 && self.primary.threshold == 1 {
             return parse_xonly(&self.primary.keys[0]);

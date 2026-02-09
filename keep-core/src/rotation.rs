@@ -10,12 +10,13 @@ use fs2::FileExt;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use crate::backend::{RedbBackend, StorageBackend, KEYS_TABLE, SHARES_TABLE};
+use crate::backend::{RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, SHARES_TABLE};
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::storage::{bincode_options, share_id, Header, Storage};
+use crate::wallet::WalletDescriptor;
 
 fn secure_delete(path: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {
@@ -222,6 +223,7 @@ impl Storage {
 
         let keys = self.list_keys()?;
         let shares = self.list_shares()?;
+        let descriptors = self.list_descriptors()?;
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
         let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
@@ -253,7 +255,12 @@ impl Storage {
 
         let result = (|| -> Result<()> {
             let new_data_key = SecretKey::generate()?;
-            self.reencrypt_database(&decrypted_keys, &decrypted_shares, &new_data_key)?;
+            self.reencrypt_database(
+                &decrypted_keys,
+                &decrypted_shares,
+                &descriptors,
+                &new_data_key,
+            )?;
 
             let new_header = self.create_header_with_key(password, &new_data_key)?;
             write_header_atomically(&self.path, &new_header)?;
@@ -261,7 +268,7 @@ impl Storage {
             self.header = new_header;
             self.data_key = Some(new_data_key);
 
-            self.verify_rotation_integrity(&decrypted_keys, &decrypted_shares)?;
+            self.verify_rotation_integrity(&decrypted_keys, &decrypted_shares, &descriptors)?;
 
             Ok(())
         })();
@@ -336,6 +343,7 @@ impl Storage {
         &self,
         keys: &[(KeyRecord, Vec<u8>)],
         shares: &[(StoredShare, Vec<u8>)],
+        descriptors: &[WalletDescriptor],
         new_data_key: &SecretKey,
     ) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -362,6 +370,17 @@ impl Storage {
             backend.put(SHARES_TABLE, &id, &record_encrypted.to_bytes())?;
         }
 
+        for descriptor in descriptors {
+            let serialized = serde_json::to_vec(descriptor)
+                .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+            let encrypted = crypto::encrypt(&serialized, new_data_key)?;
+            backend.put(
+                DESCRIPTORS_TABLE,
+                &descriptor.group_pubkey,
+                &encrypted.to_bytes(),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -369,6 +388,7 @@ impl Storage {
         &self,
         original_keys: &[(KeyRecord, Vec<u8>)],
         original_shares: &[(StoredShare, Vec<u8>)],
+        original_descriptors: &[WalletDescriptor],
     ) -> Result<()> {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -438,6 +458,40 @@ impl Storage {
                 return Err(KeepError::RotationFailed(format!(
                     "share {} content mismatch after rotation",
                     original_stored.metadata.identifier
+                )));
+            }
+        }
+
+        let stored_descriptors = backend.list(DESCRIPTORS_TABLE)?;
+        if stored_descriptors.len() != original_descriptors.len() {
+            return Err(KeepError::RotationFailed(format!(
+                "descriptor count mismatch: expected {}, found {}",
+                original_descriptors.len(),
+                stored_descriptors.len()
+            )));
+        }
+
+        for original in original_descriptors {
+            let encrypted_bytes = backend
+                .get(DESCRIPTORS_TABLE, &original.group_pubkey)?
+                .ok_or_else(|| {
+                    KeepError::RotationFailed(format!(
+                        "descriptor for group {} missing after rotation",
+                        hex::encode(original.group_pubkey)
+                    ))
+                })?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let descriptor: WalletDescriptor = serde_json::from_slice(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+            if descriptor.group_pubkey != original.group_pubkey
+                || descriptor.external_descriptor != original.external_descriptor
+                || descriptor.internal_descriptor != original.internal_descriptor
+            {
+                return Err(KeepError::RotationFailed(format!(
+                    "descriptor for group {} content mismatch after rotation",
+                    hex::encode(original.group_pubkey)
                 )));
             }
         }

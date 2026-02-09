@@ -16,6 +16,12 @@ pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
+pub const MAX_RECOVERY_TIERS: usize = 10;
+pub const MAX_KEYS_PER_TIER: usize = 20;
+pub const MAX_XPUB_LENGTH: usize = 256;
+pub const MAX_FINGERPRINT_LENGTH: usize = 8;
+pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
+pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
@@ -41,6 +47,10 @@ pub enum KfpMessage {
     RefreshRound1(RefreshRound1Payload),
     RefreshRound2(RefreshRound2Payload),
     RefreshComplete(RefreshCompletePayload),
+    DescriptorPropose(DescriptorProposePayload),
+    DescriptorContribute(DescriptorContributePayload),
+    DescriptorFinalize(DescriptorFinalizePayload),
+    DescriptorAck(DescriptorAckPayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -61,6 +71,10 @@ impl KfpMessage {
             KfpMessage::RefreshRound1(_) => "refresh_round1",
             KfpMessage::RefreshRound2(_) => "refresh_round2",
             KfpMessage::RefreshComplete(_) => "refresh_complete",
+            KfpMessage::DescriptorPropose(_) => "descriptor_propose",
+            KfpMessage::DescriptorContribute(_) => "descriptor_contribute",
+            KfpMessage::DescriptorFinalize(_) => "descriptor_finalize",
+            KfpMessage::DescriptorAck(_) => "descriptor_ack",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -80,6 +94,10 @@ impl KfpMessage {
             KfpMessage::RefreshRound1(p) => Some(&p.session_id),
             KfpMessage::RefreshRound2(p) => Some(&p.session_id),
             KfpMessage::RefreshComplete(p) => Some(&p.session_id),
+            KfpMessage::DescriptorPropose(p) => Some(&p.session_id),
+            KfpMessage::DescriptorContribute(p) => Some(&p.session_id),
+            KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
+            KfpMessage::DescriptorAck(p) => Some(&p.session_id),
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -91,6 +109,10 @@ impl KfpMessage {
             KfpMessage::SignRequest(p) => Some(&p.group_pubkey),
             KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
             KfpMessage::RefreshRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorPropose(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorContribute(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorFinalize(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -218,6 +240,61 @@ impl KfpMessage {
                     return Err("share_index must be non-zero");
                 }
             }
+            KfpMessage::DescriptorPropose(p) => {
+                if p.network.is_empty() {
+                    return Err("Network must not be empty");
+                }
+                if p.initiator_xpub.len() > MAX_XPUB_LENGTH {
+                    return Err("Initiator xpub exceeds maximum length");
+                }
+                if p.initiator_fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                    return Err("Initiator fingerprint exceeds maximum length");
+                }
+                if p.policy.recovery_tiers.len() > MAX_RECOVERY_TIERS {
+                    return Err("Too many recovery tiers");
+                }
+                for tier in &p.policy.recovery_tiers {
+                    if tier.key_slots.len() > MAX_KEYS_PER_TIER {
+                        return Err("Too many keys in tier");
+                    }
+                    if tier.threshold == 0 {
+                        return Err("Tier threshold must be non-zero");
+                    }
+                    if tier.threshold as usize > tier.key_slots.len() {
+                        return Err("Tier threshold exceeds number of key slots");
+                    }
+                    for slot in &tier.key_slots {
+                        if let KeySlot::External { xpub, fingerprint } = slot {
+                            if xpub.len() > MAX_XPUB_LENGTH {
+                                return Err("External xpub exceeds maximum length");
+                            }
+                            if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                                return Err("External fingerprint exceeds maximum length");
+                            }
+                        }
+                    }
+                }
+            }
+            KfpMessage::DescriptorContribute(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
+                if p.account_xpub.len() > MAX_XPUB_LENGTH {
+                    return Err("Account xpub exceeds maximum length");
+                }
+                if p.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                    return Err("Fingerprint exceeds maximum length");
+                }
+            }
+            KfpMessage::DescriptorFinalize(p) => {
+                if p.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+                    return Err("External descriptor exceeds maximum length");
+                }
+                if p.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+                    return Err("Internal descriptor exceeds maximum length");
+                }
+            }
+            KfpMessage::DescriptorAck(_) => {}
             _ => {}
         }
         Ok(())
@@ -681,6 +758,142 @@ impl RefreshCompletePayload {
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
         within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WalletPolicy {
+    pub recovery_tiers: Vec<PolicyTier>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PolicyTier {
+    pub threshold: u32,
+    pub key_slots: Vec<KeySlot>,
+    pub timelock_months: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KeySlot {
+    Participant { share_index: u16 },
+    External { xpub: String, fingerprint: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorProposePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub created_at: u64,
+    pub network: String,
+    pub policy: WalletPolicy,
+    pub initiator_xpub: String,
+    pub initiator_fingerprint: String,
+}
+
+impl DescriptorProposePayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        network: &str,
+        policy: WalletPolicy,
+        initiator_xpub: &str,
+        initiator_fingerprint: &str,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            created_at: chrono::Utc::now().timestamp() as u64,
+            network: network.to_string(),
+            policy,
+            initiator_xpub: initiator_xpub.to_string(),
+            initiator_fingerprint: initiator_fingerprint.to_string(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorContributePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub share_index: u16,
+    pub account_xpub: String,
+    pub fingerprint: String,
+}
+
+impl DescriptorContributePayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        account_xpub: &str,
+        fingerprint: &str,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            share_index,
+            account_xpub: account_xpub.to_string(),
+            fingerprint: fingerprint.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorFinalizePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub external_descriptor: String,
+    pub internal_descriptor: String,
+    #[serde(with = "hex_bytes")]
+    pub policy_hash: [u8; 32],
+}
+
+impl DescriptorFinalizePayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        external_descriptor: &str,
+        internal_descriptor: &str,
+        policy_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            external_descriptor: external_descriptor.to_string(),
+            internal_descriptor: internal_descriptor.to_string(),
+            policy_hash,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorAckPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub descriptor_hash: [u8; 32],
+}
+
+impl DescriptorAckPayload {
+    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], descriptor_hash: [u8; 32]) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            descriptor_hash,
+        }
     }
 }
 

@@ -59,6 +59,7 @@
 mod attestation;
 mod audit;
 mod cert_pin;
+mod descriptor_session;
 mod ecdh;
 mod error;
 mod event;
@@ -72,6 +73,10 @@ mod session;
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
+pub use descriptor_session::{
+    derive_descriptor_session_id, DescriptorSession, DescriptorSessionManager,
+    DescriptorSessionState, FinalizedDescriptor, XpubContribution,
+};
 pub use ecdh::{
     aggregate_ecdh_shares, compute_partial_ecdh, derive_ecdh_session_id, EcdhSession,
     EcdhSessionManager, EcdhSessionState,
@@ -82,13 +87,16 @@ pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, Signin
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
-    AnnouncePayload, CommitmentPayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
-    EnclaveAttestation, ErrorPayload, KfpMessage, PingPayload, PongPayload, RefreshCompletePayload,
-    RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload,
-    SignatureCompletePayload, SignatureSharePayload, DEFAULT_REPLAY_WINDOW_SECS, KFP_EVENT_KIND,
+    AnnouncePayload, CommitmentPayload, DescriptorAckPayload, DescriptorContributePayload,
+    DescriptorFinalizePayload, DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload,
+    EcdhSharePayload, EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, PingPayload,
+    PolicyTier, PongPayload, RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload,
+    RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
+    WalletPolicy, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
     KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
-    MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH,
-    MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
+    MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH,
+    MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH,
+    MAX_PARTICIPANTS, MAX_RECOVERY_TIERS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LENGTH,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

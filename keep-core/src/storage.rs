@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, trace};
 
-use crate::backend::{RedbBackend, StorageBackend, KEYS_TABLE, SHARES_TABLE};
+use crate::backend::{RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, SHARES_TABLE};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
+use crate::wallet::WalletDescriptor;
 
 use bincode::Options;
 
@@ -215,6 +216,7 @@ impl Storage {
 
         backend.create_table(KEYS_TABLE)?;
         backend.create_table(SHARES_TABLE)?;
+        backend.create_table(DESCRIPTORS_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -481,6 +483,78 @@ impl Storage {
         } else {
             Err(KeepError::KeyNotFound(format!(
                 "share {identifier} not found"
+            )))
+        }
+    }
+
+    /// Store a wallet descriptor.
+    pub fn store_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
+        debug!(group = %hex::encode(descriptor.group_pubkey), "storing wallet descriptor");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let serialized = serde_json::to_vec(descriptor)
+            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        let encrypted_bytes = encrypted.to_bytes();
+
+        backend.put(
+            DESCRIPTORS_TABLE,
+            &descriptor.group_pubkey,
+            &encrypted_bytes,
+        )?;
+        Ok(())
+    }
+
+    /// Get a wallet descriptor by group public key.
+    pub fn get_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<Option<WalletDescriptor>> {
+        trace!(group = %hex::encode(group_pubkey), "loading wallet descriptor");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let Some(encrypted_bytes) = backend.get(DESCRIPTORS_TABLE, group_pubkey)? else {
+            return Ok(None);
+        };
+
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        let descriptor: WalletDescriptor = serde_json::from_slice(&decrypted_bytes)
+            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+        Ok(Some(descriptor))
+    }
+
+    /// List all stored wallet descriptors.
+    pub fn list_descriptors(&self) -> Result<Vec<WalletDescriptor>> {
+        trace!("listing wallet descriptors");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let entries = backend.list(DESCRIPTORS_TABLE)?;
+        let mut descriptors = Vec::new();
+
+        for (_, encrypted_bytes) in entries {
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let descriptor: WalletDescriptor = serde_json::from_slice(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+            descriptors.push(descriptor);
+        }
+
+        Ok(descriptors)
+    }
+
+    /// Delete a wallet descriptor.
+    pub fn delete_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
+        debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.delete(DESCRIPTORS_TABLE, group_pubkey)? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(format!(
+                "wallet descriptor for group {} not found",
+                hex::encode(group_pubkey)
             )))
         }
     }

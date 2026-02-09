@@ -17,6 +17,8 @@ fn lock_error<T>(_: PoisonError<T>) -> KeepError {
 pub const KEYS_TABLE: &str = "keys";
 /// Table name for FROST shares.
 pub const SHARES_TABLE: &str = "shares";
+/// Table name for wallet descriptors.
+pub const DESCRIPTORS_TABLE: &str = "wallet_descriptors";
 
 /// Trait for pluggable storage backends.
 ///
@@ -72,6 +74,8 @@ pub trait StorageBackend: Send + Sync {
 
 const KEYS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
 const SHARES_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
+const DESCRIPTORS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("wallet_descriptors");
 
 /// Redb-based storage backend (default).
 pub struct RedbBackend {
@@ -134,6 +138,7 @@ impl RedbBackend {
         match name {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
+            DESCRIPTORS_TABLE => Ok(DESCRIPTORS_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::address::AddressDerivation;
 use crate::error::{BitcoinError, Result};
-use bitcoin::Network;
+use crate::recovery::RecoveryConfig;
+use bitcoin::hashes::{hash160, Hash};
+use bitcoin::{Network, XOnlyPublicKey};
 
 pub struct DescriptorExport {
     pub descriptor: String,
@@ -29,6 +31,46 @@ impl DescriptorExport {
             fingerprint: fingerprint.to_string(),
             network,
         })
+    }
+
+    pub fn from_frost_wallet(
+        group_pubkey: &[u8; 32],
+        recovery: Option<&RecoveryConfig>,
+        network: Network,
+    ) -> Result<Self> {
+        let xonly = XOnlyPublicKey::from_slice(group_pubkey)
+            .map_err(|e| BitcoinError::Descriptor(format!("invalid group pubkey: {e}")))?;
+        let fingerprint = Self::pubkey_fingerprint(group_pubkey);
+
+        let descriptor = match recovery {
+            None => {
+                let desc = format!("tr({xonly})");
+                let checksum = compute_checksum(&desc)?;
+                format!("{desc}#{checksum}")
+            }
+            Some(config) => {
+                let output = config.build_with_internal_key(&xonly)?;
+                let checksum = compute_checksum(&output.descriptor)?;
+                format!("{}#{checksum}", output.descriptor)
+            }
+        };
+
+        let checksum = descriptor.split('#').nth(1).unwrap_or("").to_string();
+
+        Ok(Self {
+            descriptor,
+            checksum,
+            fingerprint,
+            network,
+        })
+    }
+
+    pub fn pubkey_fingerprint(pubkey: &[u8; 32]) -> String {
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02;
+        compressed[1..].copy_from_slice(pubkey);
+        let h = hash160::Hash::hash(&compressed);
+        hex::encode(&h[..4])
     }
 
     pub fn external_descriptor(&self) -> &str {
@@ -180,5 +222,80 @@ mod tests {
 
         assert!(json.contains("test-wallet"));
         assert!(json.contains("testnet"));
+    }
+
+    fn test_group_pubkey() -> [u8; 32] {
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let secret = [42u8; 32];
+        let kp = Keypair::from_seckey_slice(&secp, &secret).unwrap();
+        kp.x_only_public_key().0.serialize()
+    }
+
+    fn test_keypair(seed: u8) -> [u8; 32] {
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let mut secret = [seed; 32];
+        secret[0] = seed.wrapping_add(1);
+        let kp = Keypair::from_seckey_slice(&secp, &secret).unwrap();
+        kp.x_only_public_key().0.serialize()
+    }
+
+    #[test]
+    fn test_frost_wallet_simple_descriptor() {
+        let group_pk = test_group_pubkey();
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, None, Network::Testnet).unwrap();
+
+        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
+        let expected_prefix = format!("tr({xonly})#");
+        assert!(export.descriptor.starts_with(&expected_prefix));
+        assert!(export.descriptor.contains("tr("));
+        assert!(!export.descriptor.contains(','));
+    }
+
+    #[test]
+    fn test_frost_wallet_with_recovery() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
+
+        let group_pk = test_group_pubkey();
+        let pk1 = test_keypair(1);
+        let pk2 = test_keypair(2);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Testnet)
+                .unwrap();
+
+        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
+        assert!(export.descriptor.starts_with(&format!("tr({xonly},")));
+        assert!(export.descriptor.contains("csv="));
+        assert!(export.descriptor.contains('#'));
+    }
+
+    #[test]
+    fn test_frost_wallet_descriptor_has_checksum() {
+        let group_pk = test_group_pubkey();
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, None, Network::Testnet).unwrap();
+
+        assert!(export.descriptor.contains('#'));
+        assert_eq!(export.checksum.len(), 8);
+
+        let parts: Vec<&str> = export.descriptor.split('#').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], export.checksum);
     }
 }
