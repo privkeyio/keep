@@ -10,6 +10,12 @@ use crate::message::{Message, ShareIdentity};
 use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
+fn format_timestamp(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct ShareEntry {
     pub name: String,
@@ -42,9 +48,7 @@ impl ShareEntry {
     }
 
     fn created_display(&self) -> String {
-        DateTime::<Utc>::from_timestamp(self.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| self.created_at.to_string())
+        format_timestamp(self.created_at)
     }
 
     pub fn truncated_npub(&self) -> String {
@@ -59,12 +63,9 @@ impl ShareEntry {
     }
 
     fn last_used_display(&self) -> String {
-        match self.last_used {
-            Some(ts) => DateTime::<Utc>::from_timestamp(ts, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| ts.to_string()),
-            None => "Never".into(),
-        }
+        self.last_used
+            .map(format_timestamp)
+            .unwrap_or_else(|| "Never".into())
     }
 }
 
@@ -175,12 +176,8 @@ impl ShareListScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let count = if self.shares.is_empty() {
-            None
-        } else {
-            Some(self.shares.len())
-        };
-        layout::with_sidebar_count(NavItem::Shares, inner.into(), count)
+        let count = (!self.shares.is_empty()).then_some(self.shares.len());
+        layout::with_sidebar(NavItem::Shares, inner.into(), count)
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {

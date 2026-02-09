@@ -55,10 +55,10 @@ impl UnlockScreen {
         let has_password = !self.password.is_empty();
         let submit_msg = if self.start_fresh_confirm {
             has_password.then_some(Message::ConfirmStartFresh)
-        } else if !self.vault_exists {
-            (has_password && !self.confirm_password.is_empty()).then_some(Message::Unlock)
         } else {
-            has_password.then_some(Message::Unlock)
+            let ready =
+                has_password && (self.vault_exists || !self.confirm_password.is_empty());
+            ready.then_some(Message::Unlock)
         };
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))

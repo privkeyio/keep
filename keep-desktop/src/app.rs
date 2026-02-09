@@ -78,8 +78,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
         KeepError::KeyNotFound(_) => "Key not found".into(),
         KeepError::KeyringFull(_) => "Keyring is full".into(),
-        KeepError::Frost(_) => "FROST operation failed".into(),
-        KeepError::FrostErr(_) => "FROST operation failed".into(),
+        KeepError::Frost(_) | KeepError::FrostErr(_) => "FROST operation failed".into(),
         KeepError::PermissionDenied(_) => "Permission denied".into(),
         KeepError::HomeNotFound => "Home directory not found".into(),
         KeepError::UserRejected => "Operation cancelled".into(),
@@ -223,49 +222,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ConfirmStartFresh => {
-                let password = match &mut self.screen {
-                    Screen::Unlock(s) => {
-                        if s.password.is_empty() {
-                            s.error = Some("Enter your vault password to confirm deletion".into());
-                            return Task::none();
-                        }
-                        if s.loading {
-                            return Task::none();
-                        }
-                        s.loading = true;
-                        s.error = None;
-                        s.password.clone()
-                    }
-                    _ => return Task::none(),
-                };
-                let path = self.keep_path.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let result = std::panic::catch_unwind(AssertUnwindSafe(
-                                || -> Result<(), String> {
-                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                                    keep.unlock(&password).map_err(friendly_err)?;
-                                    drop(keep);
-                                    std::fs::remove_dir_all(&path)
-                                        .map_err(|e| format!("Failed to remove vault: {e}"))
-                                },
-                            ));
-                            match result {
-                                Ok(r) => r,
-                                Err(payload) => {
-                                    error!("Panic during start fresh: {:?}", payload.type_id());
-                                    Err("Internal error; please restart the application".into())
-                                }
-                            }
-                        })
-                        .await
-                        .map_err(|_| "Background task failed".to_string())?
-                    },
-                    Message::StartFreshResult,
-                )
-            }
+            Message::ConfirmStartFresh => self.handle_start_fresh(),
             Message::StartFreshResult(result) => {
                 match result {
                     Ok(()) => {
@@ -298,15 +255,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::NavigateShares => {
-                if matches!(self.screen, Screen::ShareList(_)) {
-                    return Task::none();
-                }
-                let shares = self.current_shares();
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
-                Task::none()
-            }
-            Message::GoBack => {
+            Message::NavigateShares | Message::GoBack => {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
@@ -435,26 +384,25 @@ impl App {
 
     pub fn view(&self) -> Element<Message> {
         let screen = self.screen.view();
-        if let Some(toast) = &self.toast {
-            let bg_color = match toast.kind {
-                ToastKind::Success => crate::theme::color::SUCCESS,
-                ToastKind::Error => crate::theme::color::ERROR,
-            };
-            let banner = container(
-                text(&toast.message)
-                    .size(crate::theme::size::BODY)
-                    .color(iced::Color::WHITE),
-            )
-            .padding([crate::theme::space::SM, crate::theme::space::LG])
-            .width(Length::Fill)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(Background::Color(bg_color)),
-                ..Default::default()
-            });
-            column![banner, screen].into()
-        } else {
-            screen
-        }
+        let Some(toast) = &self.toast else {
+            return screen;
+        };
+        let bg_color = match toast.kind {
+            ToastKind::Success => crate::theme::color::SUCCESS,
+            ToastKind::Error => crate::theme::color::ERROR,
+        };
+        let banner = container(
+            text(&toast.message)
+                .size(crate::theme::size::BODY)
+                .color(iced::Color::WHITE),
+        )
+        .padding([crate::theme::space::SM, crate::theme::space::LG])
+        .width(Length::Fill)
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(bg_color)),
+            ..Default::default()
+        });
+        column![banner, screen].into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -588,6 +536,50 @@ impl App {
         )
     }
 
+    fn handle_start_fresh(&mut self) -> Task<Message> {
+        let password = match &mut self.screen {
+            Screen::Unlock(s) => {
+                if s.password.is_empty() {
+                    s.error = Some("Enter your vault password to confirm deletion".into());
+                    return Task::none();
+                }
+                if s.loading {
+                    return Task::none();
+                }
+                s.loading = true;
+                s.error = None;
+                s.password.clone()
+            }
+            _ => return Task::none(),
+        };
+        let path = self.keep_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(
+                        || -> Result<(), String> {
+                            let mut keep = Keep::open(&path).map_err(friendly_err)?;
+                            keep.unlock(&password).map_err(friendly_err)?;
+                            drop(keep);
+                            std::fs::remove_dir_all(&path)
+                                .map_err(|e| format!("Failed to remove vault: {e}"))
+                        },
+                    ));
+                    match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            error!("Panic during start fresh: {:?}", payload.type_id());
+                            Err("Internal error; please restart the application".into())
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::StartFreshResult,
+        )
+    }
+
     fn set_toast(&mut self, message: String, kind: ToastKind) {
         self.toast = Some(Toast { message, kind });
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
@@ -621,20 +613,19 @@ impl App {
     fn handle_delete(&mut self, id: ShareIdentity) {
         let result = {
             let mut guard = lock_keep(&self.keep);
-            guard
-                .as_mut()
-                .map(|keep| keep.frost_delete_share(&id.group_pubkey, id.identifier))
+            let Some(keep) = guard.as_mut() else {
+                return;
+            };
+            keep.frost_delete_share(&id.group_pubkey, id.identifier)
         };
-
         match result {
-            Some(Ok(())) => self.refresh_shares(),
-            Some(Err(e)) => {
+            Ok(()) => self.refresh_shares(),
+            Err(e) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = None;
                 }
                 self.set_toast(friendly_err(e), ToastKind::Error);
             }
-            None => {}
         }
     }
 

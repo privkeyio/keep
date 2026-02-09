@@ -14,11 +14,7 @@ pub enum NavItem {
     Import,
 }
 
-pub fn with_sidebar<'a>(active: NavItem, content: Element<'a, Message>) -> Element<'a, Message> {
-    with_sidebar_count(active, content, None)
-}
-
-pub fn with_sidebar_count<'a>(
+pub fn with_sidebar<'a>(
     active: NavItem,
     content: Element<'a, Message>,
     share_count: Option<usize>,
@@ -39,11 +35,11 @@ pub fn with_sidebar_count<'a>(
         };
         let press = if is_active { None } else { Some(msg) };
         let nav_label: Element<'a, Message> =
-            if item == NavItem::Shares && share_count.is_some_and(|c| c > 0) {
+            if let (NavItem::Shares, Some(count)) = (&item, share_count) {
                 row![
                     text(label).size(theme::size::BODY),
                     Space::new().width(Length::Fill),
-                    text(share_count.unwrap_or(0).to_string())
+                    text(count.to_string())
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_DIM),
                 ]

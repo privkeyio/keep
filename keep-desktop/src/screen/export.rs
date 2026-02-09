@@ -297,6 +297,6 @@ impl ExportScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Shares, inner.into())
+        layout::with_sidebar(NavItem::Shares, inner.into(), None)
     }
 }

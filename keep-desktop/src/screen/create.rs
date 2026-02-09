@@ -99,12 +99,11 @@ impl CreateScreen {
             content = content.push(theme::error_text("Threshold must be between 2 and 255"));
         }
         if !self.total.is_empty() {
-            let total_error = match (total_val, threshold_val) {
-                (Some(n), Some(t)) if n < t => Some("Total must be >= threshold"),
-                (None, _) if self.total.parse::<u16>().is_ok() => {
-                    Some("Total must be 255 or fewer")
+            let total_error = match total_val {
+                None => Some("Total must be a number between 1 and 255"),
+                Some(n) if threshold_val.is_some_and(|t| n < t) => {
+                    Some("Total must be >= threshold")
                 }
-                (None, _) => Some("Total must be a valid number"),
                 _ => None,
             };
             if let Some(msg) = total_error {
@@ -157,6 +156,6 @@ impl CreateScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Create, inner.into())
+        layout::with_sidebar(NavItem::Create, inner.into(), None)
     }
 }
