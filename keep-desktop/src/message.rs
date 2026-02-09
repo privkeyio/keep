@@ -60,6 +60,9 @@ pub enum Message {
     ImportShare,
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
 
+    // Clipboard (public data, no auto-clear)
+    CopyNpub(String),
+
     // Timer
     Tick,
 }
@@ -117,6 +120,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("ImportResult")
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

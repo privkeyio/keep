@@ -25,7 +25,7 @@ const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
-const TOAST_DURATION_SECS: u64 = 3;
+const TOAST_DURATION_SECS: u64 = 5;
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -421,6 +421,8 @@ impl App {
             }
             Message::ImportShare => self.handle_import(),
             Message::ImportResult(result) => self.handle_import_result(result),
+
+            Message::CopyNpub(npub) => iced::clipboard::write(npub),
         }
     }
 

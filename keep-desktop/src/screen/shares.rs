@@ -153,7 +153,12 @@ impl ShareListScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Shares, inner.into())
+        let count = if self.shares.is_empty() {
+            None
+        } else {
+            Some(self.shares.len())
+        };
+        layout::with_sidebar_count(NavItem::Shares, inner.into(), count)
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
@@ -206,10 +211,20 @@ impl ShareListScreen {
         let mut card_content = column![header_info].spacing(theme::space::SM);
 
         if self.expanded == Some(i) {
-            let details = column![
+            let npub_row = row![
                 text(format!("npub: {}", share.npub))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
+                button(text("Copy").size(theme::size::TINY))
+                    .on_press(Message::CopyNpub(share.npub.clone()))
+                    .style(theme::secondary_button)
+                    .padding([2.0, theme::space::SM]),
+            ]
+            .spacing(theme::space::SM)
+            .align_y(Alignment::Center);
+
+            let details = column![
+                npub_row,
                 text(format!("hex: {}", share.group_pubkey_hex))
                     .size(theme::size::TINY)
                     .color(theme::color::TEXT_DIM),
