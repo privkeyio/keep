@@ -58,7 +58,7 @@ pub enum Message {
     ImportDataChanged(Zeroizing<String>),
     ImportPassphraseChanged(Zeroizing<String>),
     ImportShare,
-    ImportResult(Result<Vec<ShareEntry>, String>),
+    ImportResult(Result<(Vec<ShareEntry>, String), String>),
 
     // Timer
     Tick,
@@ -115,7 +115,7 @@ impl fmt::Debug for Message {
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")
-                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::Tick => f.write_str("Tick"),
         }

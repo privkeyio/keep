@@ -122,12 +122,17 @@ impl ExportScreen {
             .size(theme::size::HEADING)
             .color(theme::color::TEXT);
 
+        let truncated_npub = format!(
+            "{}...{}",
+            &self.share.npub[..12],
+            &self.share.npub[self.share.npub.len() - 6..]
+        );
         let info = text(format!(
-            "Share #{} | {}-of-{} | {}...",
+            "Share #{} | {}-of-{} | {}",
             self.share.identifier,
             self.share.threshold,
             self.share.total_shares,
-            &self.share.group_pubkey_hex[..self.share.group_pubkey_hex.len().min(16)]
+            truncated_npub,
         ))
         .size(theme::size::SMALL)
         .color(theme::color::TEXT_MUTED);

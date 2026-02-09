@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
+use keep_core::keys::bytes_to_npub;
 
 use crate::message::{Message, ShareIdentity};
 use crate::screen::layout::{self, NavItem};
@@ -17,6 +18,7 @@ pub struct ShareEntry {
     pub total_shares: u16,
     pub group_pubkey: [u8; 32],
     pub group_pubkey_hex: String,
+    pub npub: String,
     pub created_at: i64,
     pub sign_count: u64,
 }
@@ -31,6 +33,7 @@ impl ShareEntry {
             total_shares: m.total_shares,
             group_pubkey: m.group_pubkey,
             group_pubkey_hex: hex::encode(m.group_pubkey),
+            npub: bytes_to_npub(&m.group_pubkey),
             created_at: m.created_at,
             sign_count: m.sign_count,
         }
@@ -154,10 +157,7 @@ impl ShareListScreen {
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
-        let truncated_pubkey = format!(
-            "{}...",
-            &share.group_pubkey_hex[..share.group_pubkey_hex.len().min(16)]
-        );
+        let truncated_npub = format!("{}...{}", &share.npub[..12], &share.npub[share.npub.len() - 6..]);
 
         let badge = container(
             text(format!("{}-of-{}", share.threshold, share.total_shares))
@@ -171,7 +171,7 @@ impl ShareListScreen {
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
-        let pubkey_text = text(truncated_pubkey)
+        let npub_text = text(truncated_npub)
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
@@ -185,9 +185,21 @@ impl ShareListScreen {
         .style(theme::text_button)
         .padding(0);
 
-        let header_info = column![
+        let export_btn = button(text("Export QR").size(theme::size::SMALL))
+            .on_press(Message::GoToExport(i))
+            .style(theme::primary_button)
+            .padding([theme::space::XS, theme::space::MD]);
+
+        let header_top = row![
             name_btn,
-            row![badge, share_index, pubkey_text].spacing(theme::space::SM).align_y(Alignment::Center),
+            Space::new().width(Length::Fill),
+            export_btn,
+        ]
+        .align_y(Alignment::Center);
+
+        let header_info = column![
+            header_top,
+            row![badge, share_index, npub_text].spacing(theme::space::SM).align_y(Alignment::Center),
         ]
         .spacing(theme::space::XS);
 
@@ -195,9 +207,12 @@ impl ShareListScreen {
 
         if self.expanded == Some(i) {
             let details = column![
-                text(format!("Group pubkey: {}", share.group_pubkey_hex))
+                text(format!("npub: {}", share.npub))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
+                text(format!("hex: {}", share.group_pubkey_hex))
+                    .size(theme::size::TINY)
+                    .color(theme::color::TEXT_DIM),
                 text(format!("Created: {}", share.created_display()))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
@@ -229,10 +244,6 @@ impl ShareListScreen {
             } else {
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("Export QR").size(theme::size::BODY))
-                        .on_press(Message::GoToExport(i))
-                        .style(theme::primary_button)
-                        .padding([theme::space::XS, theme::space::MD]),
                     button(text("Delete").size(theme::size::BODY))
                         .on_press(Message::RequestDelete(share_id))
                         .style(theme::danger_button)

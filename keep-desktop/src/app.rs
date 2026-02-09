@@ -592,11 +592,17 @@ impl App {
         Task::none()
     }
 
-    fn handle_import_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
+    fn handle_import_result(
+        &mut self,
+        result: Result<(Vec<ShareEntry>, String), String>,
+    ) -> Task<Message> {
         match result {
-            Ok(shares) => {
+            Ok((shares, name)) => {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
-                self.set_toast("Share imported successfully".into(), ToastKind::Success);
+                self.set_toast(
+                    format!("Share '{name}' imported successfully"),
+                    ToastKind::Success,
+                );
             }
             Err(e) => self.screen.set_loading_error(e),
         }
@@ -751,9 +757,11 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let export = ShareExport::parse(&data).map_err(friendly_err)?;
+                        let name = format!("imported-{}", export.identifier);
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(friendly_err)?;
-                        collect_shares(keep)
+                        let shares = collect_shares(keep)?;
+                        Ok((shares, name))
                     })
                 })
                 .await
