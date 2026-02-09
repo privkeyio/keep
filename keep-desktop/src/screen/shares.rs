@@ -20,6 +20,7 @@ pub struct ShareEntry {
     pub group_pubkey_hex: String,
     pub npub: String,
     pub created_at: i64,
+    pub last_used: Option<i64>,
     pub sign_count: u64,
 }
 
@@ -35,6 +36,7 @@ impl ShareEntry {
             group_pubkey_hex: hex::encode(m.group_pubkey),
             npub: bytes_to_npub(&m.group_pubkey),
             created_at: m.created_at,
+            last_used: m.last_used,
             sign_count: m.sign_count,
         }
     }
@@ -43,6 +45,15 @@ impl ShareEntry {
         DateTime::<Utc>::from_timestamp(self.created_at, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
             .unwrap_or_else(|| self.created_at.to_string())
+    }
+
+    fn last_used_display(&self) -> String {
+        match self.last_used {
+            Some(ts) => DateTime::<Utc>::from_timestamp(ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| ts.to_string()),
+            None => "Never".into(),
+        }
     }
 }
 
@@ -165,7 +176,7 @@ impl ShareListScreen {
         let truncated_npub = format!(
             "{}...{}",
             &share.npub[..12],
-            &share.npub[share.npub.len() - 6..]
+            &share.npub[share.npub.len() - 8..]
         );
 
         let badge = container(
@@ -231,6 +242,9 @@ impl ShareListScreen {
                     .size(theme::size::TINY)
                     .color(theme::color::TEXT_DIM),
                 text(format!("Created: {}", share.created_display()))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+                text(format!("Last used: {}", share.last_used_display()))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
                 text(format!("Signatures: {}", share.sign_count))

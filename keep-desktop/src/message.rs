@@ -48,6 +48,7 @@ pub enum Message {
 
     // Export
     ExportPassphraseChanged(Zeroizing<String>),
+    ExportConfirmPassphraseChanged(Zeroizing<String>),
     GenerateExport,
     ExportGenerated(Result<ExportData, String>),
     AdvanceQrFrame,
@@ -79,6 +80,9 @@ impl fmt::Debug for Message {
             Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
             Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
             Self::ExportPassphraseChanged(_) => f.write_str("ExportPassphraseChanged(***)"),
+            Self::ExportConfirmPassphraseChanged(_) => {
+                f.write_str("ExportConfirmPassphraseChanged(***)")
+            }
             Self::ImportPassphraseChanged(_) => f.write_str("ImportPassphraseChanged(***)"),
             Self::ImportDataChanged(_) => f.write_str("ImportDataChanged(***)"),
             Self::ExportGenerated(_) => f.write_str("ExportGenerated(***)"),

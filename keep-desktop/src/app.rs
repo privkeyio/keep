@@ -381,6 +381,12 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ExportConfirmPassphraseChanged(p) => {
+                if let Screen::Export(s) = &mut self.screen {
+                    s.confirm_passphrase = p;
+                }
+                Task::none()
+            }
             Message::GenerateExport => self.handle_generate_export(),
             Message::ExportGenerated(result) => self.handle_export_generated(result),
             Message::AdvanceQrFrame => {
@@ -691,6 +697,10 @@ impl App {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
                 if s.loading || s.passphrase.len() < MIN_EXPORT_PASSPHRASE_LEN {
+                    return Task::none();
+                }
+                if *s.passphrase != *s.confirm_passphrase {
+                    s.error = Some("Passphrases do not match".into());
                     return Task::none();
                 }
                 s.loading = true;
