@@ -128,11 +128,7 @@ impl ExportScreen {
             .size(theme::size::HEADING)
             .color(theme::color::TEXT);
 
-        let truncated_npub = format!(
-            "{}...{}",
-            &self.share.npub[..12],
-            &self.share.npub[self.share.npub.len() - 8..]
-        );
+        let truncated_npub = self.share.truncated_npub();
         let info = text(format!(
             "Share #{} | {}-of-{} | {}",
             self.share.identifier, self.share.threshold, self.share.total_shares, truncated_npub,
@@ -263,15 +259,12 @@ impl ExportScreen {
             }
 
             if passphrase_ok {
-                let confirm_input =
-                    text_input("Confirm passphrase", &self.confirm_passphrase)
-                        .on_input(|s| {
-                            Message::ExportConfirmPassphraseChanged(Zeroizing::new(s))
-                        })
-                        .on_submit_maybe(can_generate.then_some(Message::GenerateExport))
-                        .secure(true)
-                        .padding(theme::space::MD)
-                        .width(theme::size::INPUT_WIDTH);
+                let confirm_input = text_input("Confirm passphrase", &self.confirm_passphrase)
+                    .on_input(|s| Message::ExportConfirmPassphraseChanged(Zeroizing::new(s)))
+                    .on_submit_maybe(can_generate.then_some(Message::GenerateExport))
+                    .secure(true)
+                    .padding(theme::space::MD)
+                    .width(theme::size::INPUT_WIDTH);
                 content = content.push(confirm_input);
 
                 if !self.confirm_passphrase.is_empty() && !passphrases_match {

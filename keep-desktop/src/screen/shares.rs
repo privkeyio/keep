@@ -47,6 +47,17 @@ impl ShareEntry {
             .unwrap_or_else(|| self.created_at.to_string())
     }
 
+    pub fn truncated_npub(&self) -> String {
+        let n = &self.npub;
+        let chars: Vec<char> = n.chars().collect();
+        if chars.len() <= 20 {
+            return n.clone();
+        }
+        let prefix: String = chars[..12].iter().collect();
+        let suffix: String = chars[chars.len() - 6..].iter().collect();
+        format!("{prefix}...{suffix}")
+    }
+
     fn last_used_display(&self) -> String {
         match self.last_used {
             Some(ts) => DateTime::<Utc>::from_timestamp(ts, 0)
@@ -173,11 +184,7 @@ impl ShareListScreen {
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
-        let truncated_npub = format!(
-            "{}...{}",
-            &share.npub[..12],
-            &share.npub[share.npub.len() - 8..]
-        );
+        let truncated_npub = share.truncated_npub();
 
         let badge = container(
             text(format!("{}-of-{}", share.threshold, share.total_shares))
