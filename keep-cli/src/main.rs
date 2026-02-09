@@ -120,6 +120,7 @@ fn run(out: &Output) -> Result<()> {
                 &frost_relay,
             )
         }
+        Commands::Wallet { command } => dispatch_wallet(out, &path, command),
         Commands::Audit { command } => dispatch_audit(out, &path, command, hidden),
         Commands::Frost { command } => dispatch_frost(out, &path, &cfg, command),
         Commands::Bitcoin { command } => dispatch_bitcoin(out, &path, command),
@@ -403,6 +404,20 @@ fn dispatch_bitcoin(out: &Output, path: &std::path::Path, command: BitcoinComman
         BitcoinCommands::Analyze { psbt, network } => {
             commands::bitcoin::cmd_bitcoin_analyze(out, &psbt, &network)
         }
+    }
+}
+
+fn dispatch_wallet(out: &Output, path: &std::path::Path, cmd: WalletCommands) -> Result<()> {
+    match cmd {
+        WalletCommands::List => commands::wallet::cmd_wallet_list(out, path),
+        WalletCommands::Show { group } => commands::wallet::cmd_wallet_show(out, path, &group),
+        WalletCommands::Export { group, format } => {
+            commands::wallet::cmd_wallet_export(out, path, &group, &format)
+        }
+        WalletCommands::Descriptor { group, network } => {
+            commands::wallet::cmd_wallet_descriptor(out, path, &group, &network)
+        }
+        WalletCommands::Delete { group } => commands::wallet::cmd_wallet_delete(out, path, &group),
     }
 }
 

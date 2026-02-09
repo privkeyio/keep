@@ -82,6 +82,10 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    Wallet {
+        #[command(subcommand)]
+        command: WalletCommands,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
@@ -138,6 +142,42 @@ pub(crate) enum ConfigCommands {
 pub(crate) enum ExportFormat {
     Json,
     Bech32,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WalletCommands {
+    /// List stored wallet descriptors
+    List,
+    /// Show descriptor for a specific FROST group
+    Show {
+        #[arg(short, long)]
+        group: String,
+    },
+    /// Export descriptor in various formats
+    Export {
+        #[arg(short, long)]
+        group: String,
+        #[arg(long, default_value = "plain")]
+        format: WalletExportFormat,
+    },
+    /// Create a simple descriptor from a FROST group (no recovery tiers)
+    Descriptor {
+        #[arg(short, long, help = "FROST group pubkey hex")]
+        group: String,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+    },
+    /// Delete a stored wallet descriptor
+    Delete {
+        #[arg(short, long)]
+        group: String,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum WalletExportFormat {
+    Plain,
+    Sparrow,
 }
 
 #[derive(Subcommand)]

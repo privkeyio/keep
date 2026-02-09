@@ -6,6 +6,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
+use crate::screen::wallet::WalletEntry;
 
 #[derive(Clone)]
 pub struct ExportData {
@@ -31,6 +32,7 @@ pub enum Message {
     GoToCreate,
     GoBack,
     NavigateShares,
+    NavigateWallets,
     Lock,
 
     // Share list
@@ -63,6 +65,11 @@ pub enum Message {
 
     // Clipboard (public data, no auto-clear)
     CopyNpub(String),
+    CopyDescriptor(String),
+
+    // Wallets
+    ToggleWalletDetails(usize),
+    WalletsLoaded(Result<Vec<WalletEntry>, String>),
 
     // Timer
     Tick,
@@ -101,6 +108,7 @@ impl fmt::Debug for Message {
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
             Self::NavigateShares => f.write_str("NavigateShares"),
+            Self::NavigateWallets => f.write_str("NavigateWallets"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::RequestDelete(id) => f.debug_tuple("RequestDelete").field(id).finish(),
@@ -125,6 +133,12 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
+            Self::CopyDescriptor(d) => f.debug_tuple("CopyDescriptor").field(d).finish(),
+            Self::ToggleWalletDetails(i) => f.debug_tuple("ToggleWalletDetails").field(i).finish(),
+            Self::WalletsLoaded(r) => f
+                .debug_tuple("WalletsLoaded")
+                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
+                .finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }
