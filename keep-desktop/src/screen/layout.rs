@@ -23,14 +23,16 @@ pub fn with_sidebar<'a>(active: NavItem, content: Element<'a, Message>) -> Eleme
 
     let mut nav = column![].spacing(theme::space::XS);
     for (label, msg, item) in nav_items {
-        let style: fn(&iced::Theme, button::Status) -> button::Style = if item == active {
+        let is_active = item == active;
+        let style: fn(&iced::Theme, button::Status) -> button::Style = if is_active {
             theme::nav_button_active
         } else {
             theme::nav_button
         };
+        let press = if is_active { None } else { Some(msg) };
         nav = nav.push(
             button(text(label).size(theme::size::BODY).width(Length::Fill))
-                .on_press(msg)
+                .on_press_maybe(press)
                 .style(style)
                 .padding([theme::space::SM, theme::space::MD])
                 .width(Length::Fill),

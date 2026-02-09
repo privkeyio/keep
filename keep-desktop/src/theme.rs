@@ -39,6 +39,7 @@ pub mod size {
     pub const SMALL: f32 = 12.0;
     pub const TINY: f32 = 11.0;
     pub const SIDEBAR_WIDTH: f32 = 180.0;
+    pub const INPUT_WIDTH: f32 = 400.0;
 }
 
 pub fn card_style(_theme: &Theme) -> container::Style {
@@ -134,6 +135,11 @@ pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered => button::Style {
             background: Some(Background::Color(color::DANGER_HOVER)),
+            ..base
+        },
+        button::Status::Disabled => button::Style {
+            background: Some(Background::Color(color::BORDER)),
+            text_color: color::TEXT_DIM,
             ..base
         },
         _ => base,

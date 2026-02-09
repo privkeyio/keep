@@ -177,8 +177,8 @@ impl ExportScreen {
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
                 .on_submit_maybe(passphrase_ok.then_some(Message::GenerateExport))
                 .secure(true)
-                .padding(10)
-                .width(400);
+                .padding(theme::space::MD)
+                .width(theme::size::INPUT_WIDTH);
 
             content = content.push(passphrase_input);
             if !self.passphrase.is_empty() && !passphrase_ok {

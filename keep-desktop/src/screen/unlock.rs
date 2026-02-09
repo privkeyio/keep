@@ -104,7 +104,9 @@ impl UnlockScreen {
             .on_press(msg)
             .style(style)
             .padding(theme::space::MD);
-            col = col.push(btn);
+            if !self.start_fresh_confirm {
+                col = col.push(btn);
+            }
         }
 
         if let Some(err) = &self.error {
