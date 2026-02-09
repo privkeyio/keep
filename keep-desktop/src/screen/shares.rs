@@ -94,7 +94,7 @@ impl ShareListScreen {
                     text("Import Share")
                         .size(theme::size::HEADING)
                         .color(theme::color::TEXT),
-                    text("Import an existing share from another device")
+                    text("Scan or paste a share exported from another Keep device")
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_MUTED),
                     Space::new().height(theme::space::SM),
@@ -123,6 +123,9 @@ impl ShareListScreen {
                 text("Manage your FROST threshold signing shares")
                     .size(theme::size::BODY)
                     .color(theme::color::TEXT_MUTED),
+                text("Create a keyset to generate shares, then export each share to a different device using QR codes.")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_DIM),
                 Space::new().height(theme::space::LG),
                 cards,
             ]
@@ -156,9 +159,17 @@ impl ShareListScreen {
             &share.group_pubkey_hex[..share.group_pubkey_hex.len().min(16)]
         );
 
-        let badge = text(format!("{}-of-{}", share.threshold, share.total_shares))
-            .size(theme::size::TINY)
-            .color(theme::color::PRIMARY);
+        let badge = container(
+            text(format!("{}-of-{}", share.threshold, share.total_shares))
+                .size(theme::size::TINY)
+                .color(theme::color::PRIMARY),
+        )
+        .style(theme::badge_style)
+        .padding([2.0, theme::space::SM]);
+
+        let share_index = text(format!("#{}", share.identifier))
+            .size(theme::size::SMALL)
+            .color(theme::color::TEXT_MUTED);
 
         let pubkey_text = text(truncated_pubkey)
             .size(theme::size::SMALL)
@@ -174,17 +185,17 @@ impl ShareListScreen {
         .style(theme::text_button)
         .padding(0);
 
-        let header_info = column![name_btn, row![badge, pubkey_text].spacing(theme::space::SM)]
-            .spacing(theme::space::XS);
+        let header_info = column![
+            name_btn,
+            row![badge, share_index, pubkey_text].spacing(theme::space::SM).align_y(Alignment::Center),
+        ]
+        .spacing(theme::space::XS);
 
         let mut card_content = column![header_info].spacing(theme::space::SM);
 
         if self.expanded == Some(i) {
             let details = column![
                 text(format!("Group pubkey: {}", share.group_pubkey_hex))
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_MUTED),
-                text(format!("Share #{}", share.identifier))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
                 text(format!("Created: {}", share.created_display()))

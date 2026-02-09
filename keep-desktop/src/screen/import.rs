@@ -28,10 +28,13 @@ impl ImportScreen {
 
     pub fn view(&self) -> Element<Message> {
         let title = theme::heading("Import Share");
+        let subtitle = text("Paste a share exported from Keep Desktop or Keep Android")
+            .size(theme::size::SMALL)
+            .color(theme::color::TEXT_MUTED);
 
         let data_input = text_input("Paste kshare1... or JSON here", &self.data)
             .on_input(|s| Message::ImportDataChanged(Zeroizing::new(s)))
-            .padding(10)
+            .padding(theme::space::MD)
             .width(Length::Fill);
 
         let trimmed_data = self.data.trim();
@@ -43,12 +46,13 @@ impl ImportScreen {
             .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))
             .on_submit_maybe(can_import.then_some(Message::ImportShare))
             .secure(true)
-            .padding(10)
-            .width(400);
+            .padding(theme::space::MD)
+            .width(theme::size::INPUT_WIDTH);
 
         let mut content = column![
             title,
-            Space::new().height(theme::space::XL),
+            subtitle,
+            Space::new().height(theme::space::LG),
             theme::label("Share data"),
             data_input,
         ]
@@ -62,11 +66,22 @@ impl ImportScreen {
             } else {
                 content = content.push(theme::error_text("Expected kshare1... or JSON format"));
             }
+        } else {
+            content = content.push(
+                text("Accepts kshare1... (bech32) or JSON format")
+                    .size(theme::size::TINY)
+                    .color(theme::color::TEXT_DIM),
+            );
         }
 
         content = content
             .push(Space::new().height(theme::space::MD))
             .push(theme::label("Passphrase"))
+            .push(
+                text("Enter the passphrase used when exporting the share")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+            )
             .push(passphrase_input)
             .push(Space::new().height(theme::space::MD));
 

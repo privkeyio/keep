@@ -24,7 +24,7 @@ use crate::screen::Screen;
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
-pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 12;
+pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 3;
 
 #[derive(Clone)]
@@ -363,7 +363,7 @@ impl App {
                 Ok(shares) => {
                     self.screen = Screen::ShareList(ShareListScreen::new(shares));
                     self.set_toast(
-                        "Keyset created! Export each share below to distribute to your devices."
+                        "Keyset created! Tap a share and use Export QR to send it to your phone."
                             .into(),
                         ToastKind::Success,
                     );
