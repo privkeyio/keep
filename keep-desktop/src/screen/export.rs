@@ -12,7 +12,7 @@ use crate::screen::shares::ShareEntry;
 use crate::theme;
 
 fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
-    let len = passphrase.len();
+    let len = passphrase.chars().count();
     let has_upper = passphrase.chars().any(|c| c.is_ascii_uppercase());
     let has_digit = passphrase.chars().any(|c| c.is_ascii_digit());
     let has_special = passphrase.chars().any(|c| !c.is_ascii_alphanumeric());
@@ -226,7 +226,7 @@ impl ExportScreen {
                     .color(theme::color::TEXT_MUTED),
             );
 
-            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
+            let passphrase_ok = self.passphrase.chars().count() >= MIN_EXPORT_PASSPHRASE_LEN;
             let passphrases_match = *self.passphrase == *self.confirm_passphrase;
             let can_generate = passphrase_ok && passphrases_match;
 

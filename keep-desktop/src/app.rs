@@ -556,15 +556,14 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(
-                        || -> Result<(), String> {
+                    let result =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
                             let mut keep = Keep::open(&path).map_err(friendly_err)?;
                             keep.unlock(&password).map_err(friendly_err)?;
                             drop(keep);
                             std::fs::remove_dir_all(&path)
                                 .map_err(|e| format!("Failed to remove vault: {e}"))
-                        },
-                    ));
+                        }));
                     match result {
                         Ok(r) => r,
                         Err(payload) => {
@@ -688,7 +687,7 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
-                if s.loading || s.passphrase.len() < MIN_EXPORT_PASSPHRASE_LEN {
+                if s.loading || s.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
                     return Task::none();
                 }
                 if *s.passphrase != *s.confirm_passphrase {
