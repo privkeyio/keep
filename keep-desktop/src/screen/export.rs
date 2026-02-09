@@ -5,8 +5,11 @@ use iced::widget::{button, column, container, qr_code, row, text, text_input, Sp
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
+use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::message::Message;
+use crate::screen::layout::{self, NavItem};
 use crate::screen::shares::ShareEntry;
+use crate::theme;
 
 pub enum QrDisplay {
     Single(qr_code::Data),
@@ -90,9 +93,14 @@ impl ExportScreen {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let back_btn = button(text("< Back")).on_press(Message::GoBack).padding(8);
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press(Message::GoBack)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
 
-        let title = text(format!("Export: {}", self.share.name)).size(24);
+        let title = text(format!("Export: {}", self.share.name))
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
 
         let info = text(format!(
             "Share #{} | {}-of-{} | {}...",
@@ -101,28 +109,32 @@ impl ExportScreen {
             self.share.total_shares,
             &self.share.group_pubkey_hex[..self.share.group_pubkey_hex.len().min(16)]
         ))
-        .size(12)
-        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+        .size(theme::size::SMALL)
+        .color(theme::color::TEXT_MUTED);
 
-        let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
+        let header =
+            row![back_btn, Space::new().width(theme::space::SM), title].align_y(Alignment::Center);
 
-        let mut content = column![header, info, Space::new().height(20)].spacing(8);
+        let mut content =
+            column![header, info, Space::new().height(theme::space::XL)].spacing(theme::space::SM);
 
         if let (Some(qr_display), Some(bech32)) = (&self.qr_display, &self.bech32) {
-            match qr_display {
-                QrDisplay::Single(data) => {
-                    let qr_widget = qr_code::QRCode::new(data).cell_size(5);
-                    content = content.push(container(qr_widget).center_x(Length::Fill).padding(10));
-                }
-                QrDisplay::Animated { frames, current } => {
-                    let qr_widget = qr_code::QRCode::new(&frames[*current]).cell_size(5);
-                    content = content.push(container(qr_widget).center_x(Length::Fill).padding(10));
-                    content = content.push(
-                        text(format!("Frame {} of {}", current + 1, frames.len()))
-                            .size(12)
-                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-                    );
-                }
+            let qr_data = match qr_display {
+                QrDisplay::Single(data) => data,
+                QrDisplay::Animated { frames, current } => &frames[*current],
+            };
+            let qr_widget = qr_code::QRCode::new(qr_data).cell_size(5);
+            content = content.push(
+                container(qr_widget)
+                    .center_x(Length::Fill)
+                    .padding(theme::space::MD),
+            );
+            if let QrDisplay::Animated { frames, current } = qr_display {
+                content = content.push(
+                    text(format!("Frame {} of {}", current + 1, frames.len()))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                );
             }
 
             let display = if bech32.len() > 80 {
@@ -132,8 +144,8 @@ impl ExportScreen {
             };
             content = content.push(
                 text(display)
-                    .size(11)
-                    .color(iced::Color::from_rgb(0.55, 0.55, 0.55)),
+                    .size(theme::size::TINY)
+                    .color(theme::color::TEXT_DIM),
             );
 
             let copy_label = if self.copied {
@@ -148,40 +160,43 @@ impl ExportScreen {
             };
             content = content.push(
                 row![
-                    button(text(copy_label)).on_press_maybe(copy_msg).padding(8),
-                    button(text("Change Passphrase"))
+                    button(text(copy_label).size(theme::size::BODY))
+                        .on_press_maybe(copy_msg)
+                        .style(theme::primary_button)
+                        .padding([theme::space::XS, theme::space::MD]),
+                    button(text("Change Passphrase").size(theme::size::BODY))
                         .on_press(Message::ResetExport)
-                        .padding(8),
+                        .style(theme::secondary_button)
+                        .padding([theme::space::XS, theme::space::MD]),
                 ]
-                .spacing(8),
+                .spacing(theme::space::SM),
             );
         } else {
+            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
-                .on_submit_maybe(if self.passphrase.len() >= 8 {
-                    Some(Message::GenerateExport)
-                } else {
-                    None
-                })
+                .on_submit_maybe(passphrase_ok.then_some(Message::GenerateExport))
                 .secure(true)
-                .padding(10)
-                .width(400);
+                .padding(theme::space::MD)
+                .width(theme::size::INPUT_WIDTH);
 
             content = content.push(passphrase_input);
-
-            let passphrase_ok = self.passphrase.len() >= 8;
             if !self.passphrase.is_empty() && !passphrase_ok {
                 content = content.push(
-                    text("Passphrase must be at least 8 characters")
-                        .size(12)
-                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
+                    text(format!(
+                        "Passphrase must be at least {MIN_EXPORT_PASSPHRASE_LEN} characters"
+                    ))
+                    .size(theme::size::BODY)
+                    .color(theme::color::ERROR),
                 );
             }
 
             if self.loading {
-                content = content.push(text("Generating...").size(14));
+                content = content.push(theme::label("Generating..."));
             } else {
-                let mut btn = button(text("Generate QR Code")).padding(10);
+                let mut btn = button(text("Generate QR Code").size(theme::size::BODY))
+                    .style(theme::primary_button)
+                    .padding(theme::space::MD);
                 if passphrase_ok {
                     btn = btn.on_press(Message::GenerateExport);
                 }
@@ -190,17 +205,14 @@ impl ExportScreen {
         }
 
         if let Some(err) = &self.error {
-            content = content.push(
-                text(err.as_str())
-                    .size(14)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-            );
+            content = content.push(theme::error_text(err.as_str()));
         }
 
-        container(content)
-            .padding(20)
+        let inner = container(content)
+            .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        layout::with_sidebar(NavItem::Shares, inner.into())
     }
 }

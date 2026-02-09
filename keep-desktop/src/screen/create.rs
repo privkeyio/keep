@@ -5,6 +5,8 @@ use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
+use crate::screen::layout::{self, NavItem};
+use crate::theme;
 
 pub struct CreateScreen {
     pub name: String,
@@ -26,9 +28,7 @@ impl CreateScreen {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let back_btn = button(text("< Back")).on_press(Message::GoBack).padding(8);
-        let title = text("Create Keyset").size(24);
-        let header = row![back_btn, Space::new().width(10), title].align_y(Alignment::Center);
+        let title = theme::heading("Create Keyset");
 
         let name_input = text_input("Keyset name (e.g. my-keyset)", &self.name)
             .on_input(Message::CreateNameChanged)
@@ -42,23 +42,20 @@ impl CreateScreen {
 
         let total_input = text_input("3", &self.total)
             .on_input(Message::CreateTotalChanged)
-            .on_submit(Message::CreateKeyset)
             .padding(10)
             .width(80);
 
         let threshold_row = row![
-            text("Threshold:").size(14),
+            theme::label("Threshold:"),
             threshold_input,
-            text("of").size(14),
+            theme::label("of"),
             total_input,
-            text("shares").size(14),
+            theme::label("shares"),
         ]
-        .spacing(8)
+        .spacing(theme::space::SM)
         .align_y(Alignment::Center);
 
-        let hint = text("A 2-of-3 keyset means any 2 of 3 devices can sign together.")
-            .size(12)
-            .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+        let hint = theme::muted("A 2-of-3 keyset means any 2 of 3 devices can sign together.");
 
         let name_valid = !self.name.is_empty() && self.name.len() <= 64;
         let threshold_val: Option<u16> = self
@@ -70,31 +67,21 @@ impl CreateScreen {
         let total_valid = matches!((threshold_val, total_val), (Some(t), Some(n)) if n >= t);
         let can_create = name_valid && threshold_val.is_some() && total_valid;
 
-        let error_color = iced::Color::from_rgb(0.8, 0.2, 0.2);
-
         let mut content = column![
-            header,
-            Space::new().height(20),
-            text("Name").size(14),
+            title,
+            Space::new().height(theme::space::XL),
+            theme::label("Name"),
             name_input,
-            Space::new().height(10),
+            Space::new().height(theme::space::MD),
             threshold_row,
         ]
-        .spacing(5);
+        .spacing(theme::space::XS);
 
         if self.name.len() > 64 {
-            content = content.push(
-                text("Name must be 64 characters or fewer")
-                    .size(12)
-                    .color(error_color),
-            );
+            content = content.push(theme::error_text("Name must be 64 characters or fewer"));
         }
         if !self.threshold.is_empty() && threshold_val.is_none() {
-            content = content.push(
-                text("Threshold must be between 2 and 255")
-                    .size(12)
-                    .color(error_color),
-            );
+            content = content.push(theme::error_text("Threshold must be between 2 and 255"));
         }
         if !self.total.is_empty() {
             let total_error = match (total_val, threshold_val) {
@@ -106,17 +93,19 @@ impl CreateScreen {
                 _ => None,
             };
             if let Some(msg) = total_error {
-                content = content.push(text(msg).size(12).color(error_color));
+                content = content.push(theme::error_text(msg));
             }
         }
 
         content = content.push(hint);
-        content = content.push(Space::new().height(10));
+        content = content.push(Space::new().height(theme::space::MD));
 
         if self.loading {
-            content = content.push(text("Generating keyset...").size(14));
+            content = content.push(theme::label("Generating keyset..."));
         } else {
-            let mut btn = button(text("Create Keyset")).padding(10);
+            let mut btn = button(text("Create Keyset").size(theme::size::BODY))
+                .style(theme::primary_button)
+                .padding(theme::space::MD);
             if can_create {
                 btn = btn.on_press(Message::CreateKeyset);
             }
@@ -124,13 +113,14 @@ impl CreateScreen {
         }
 
         if let Some(err) = &self.error {
-            content = content.push(text(err.as_str()).size(14).color(error_color));
+            content = content.push(theme::error_text(err.as_str()));
         }
 
-        container(content)
-            .padding(20)
+        let inner = container(content)
+            .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        layout::with_sidebar(NavItem::Create, inner.into())
     }
 }

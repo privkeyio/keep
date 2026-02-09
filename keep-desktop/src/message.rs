@@ -30,11 +30,12 @@ pub enum Message {
     GoToExport(usize),
     GoToCreate,
     GoBack,
+    NavigateShares,
     Lock,
 
     // Share list
     ToggleShareDetails(usize),
-    RequestDelete(usize),
+    RequestDelete(ShareIdentity),
     ConfirmDelete(ShareIdentity),
     CancelDelete,
 
@@ -63,7 +64,7 @@ pub enum Message {
     Tick,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareIdentity {
     pub group_pubkey: [u8; 32],
     pub identifier: u16,
@@ -92,9 +93,10 @@ impl fmt::Debug for Message {
             Self::GoToExport(i) => f.debug_tuple("GoToExport").field(i).finish(),
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
+            Self::NavigateShares => f.write_str("NavigateShares"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
-            Self::RequestDelete(i) => f.debug_tuple("RequestDelete").field(i).finish(),
+            Self::RequestDelete(id) => f.debug_tuple("RequestDelete").field(id).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),
             Self::CreateNameChanged(n) => f.debug_tuple("CreateNameChanged").field(n).finish(),
