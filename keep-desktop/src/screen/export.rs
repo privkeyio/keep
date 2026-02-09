@@ -15,19 +15,18 @@ fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
     let len = passphrase.len();
     let has_upper = passphrase.chars().any(|c| c.is_ascii_uppercase());
     let has_digit = passphrase.chars().any(|c| c.is_ascii_digit());
-    let has_special = passphrase.chars().any(|c| !c.is_alphanumeric());
-    let variety_bonus: usize = [has_upper, has_digit, has_special]
+    let has_special = passphrase.chars().any(|c| !c.is_ascii_alphanumeric());
+    let variety: usize = [has_upper, has_digit, has_special]
         .iter()
         .filter(|&&b| b)
-        .count()
-        * 3;
-    let score = len + variety_bonus;
+        .count();
+    let score = len + variety * 5;
 
     if score < 20 {
         ("Weak", theme::color::ERROR)
     } else if score < 28 {
         ("Fair", theme::color::TEXT_MUTED)
-    } else if score < 36 {
+    } else if score < 38 {
         ("Good", theme::color::PRIMARY)
     } else {
         ("Strong", theme::color::SUCCESS)

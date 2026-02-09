@@ -43,7 +43,7 @@ pub fn with_sidebar_count<'a>(
                 row![
                     text(label).size(theme::size::BODY),
                     Space::new().width(Length::Fill),
-                    text(share_count.unwrap().to_string())
+                    text(share_count.unwrap_or(0).to_string())
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_DIM),
                 ]

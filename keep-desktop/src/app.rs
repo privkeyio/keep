@@ -378,6 +378,7 @@ impl App {
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
                     s.passphrase = p;
+                    s.confirm_passphrase = Zeroizing::new(String::new());
                 }
                 Task::none()
             }
