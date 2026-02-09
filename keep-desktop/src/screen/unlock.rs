@@ -67,10 +67,15 @@ impl UnlockScreen {
             .padding(theme::space::MD)
             .width(300);
 
-        let mut col = column![title, subtitle, Space::new().height(theme::space::LG), password_input]
-            .align_x(Alignment::Center)
-            .spacing(theme::space::SM)
-            .width(350);
+        let mut col = column![
+            title,
+            subtitle,
+            Space::new().height(theme::space::LG),
+            password_input
+        ]
+        .align_x(Alignment::Center)
+        .spacing(theme::space::SM)
+        .width(350);
 
         if !self.vault_exists {
             let confirm_input = text_input("Confirm password", &self.confirm_password)

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use iced::widget::{button, column, container, text, text_input, Space};
-use iced::{Element, Length};
+use iced::widget::{button, column, container, row, text, text_input, Space};
+use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use crate::message::Message;
@@ -27,7 +27,18 @@ impl ImportScreen {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let title = theme::heading("Import Share");
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press(Message::GoBack)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Import Share")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
         let subtitle = text("Paste a share exported from Keep Desktop or Keep Android")
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
@@ -50,7 +61,7 @@ impl ImportScreen {
             .width(theme::size::INPUT_WIDTH);
 
         let mut content = column![
-            title,
+            header,
             subtitle,
             Space::new().height(theme::space::LG),
             theme::label("Share data"),

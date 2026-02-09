@@ -51,7 +51,10 @@ pub fn with_sidebar_count<'a>(
                 .align_y(iced::Alignment::Center)
                 .into()
             } else {
-                text(label).size(theme::size::BODY).width(Length::Fill).into()
+                text(label)
+                    .size(theme::size::BODY)
+                    .width(Length::Fill)
+                    .into()
             };
         nav = nav.push(
             button(nav_label)

@@ -16,8 +16,11 @@ fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
     let has_upper = passphrase.chars().any(|c| c.is_ascii_uppercase());
     let has_digit = passphrase.chars().any(|c| c.is_ascii_digit());
     let has_special = passphrase.chars().any(|c| !c.is_alphanumeric());
-    let variety_bonus: usize =
-        [has_upper, has_digit, has_special].iter().filter(|&&b| b).count() * 3;
+    let variety_bonus: usize = [has_upper, has_digit, has_special]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+        * 3;
     let score = len + variety_bonus;
 
     if score < 20 {
@@ -129,10 +132,7 @@ impl ExportScreen {
         );
         let info = text(format!(
             "Share #{} | {}-of-{} | {}",
-            self.share.identifier,
-            self.share.threshold,
-            self.share.total_shares,
-            truncated_npub,
+            self.share.identifier, self.share.threshold, self.share.total_shares, truncated_npub,
         ))
         .size(theme::size::SMALL)
         .color(theme::color::TEXT_MUTED);

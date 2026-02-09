@@ -162,7 +162,11 @@ impl ShareListScreen {
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
-        let truncated_npub = format!("{}...{}", &share.npub[..12], &share.npub[share.npub.len() - 6..]);
+        let truncated_npub = format!(
+            "{}...{}",
+            &share.npub[..12],
+            &share.npub[share.npub.len() - 6..]
+        );
 
         let badge = container(
             text(format!("{}-of-{}", share.threshold, share.total_shares))
@@ -195,16 +199,14 @@ impl ShareListScreen {
             .style(theme::primary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
-        let header_top = row![
-            name_btn,
-            Space::new().width(Length::Fill),
-            export_btn,
-        ]
-        .align_y(Alignment::Center);
+        let header_top = row![name_btn, Space::new().width(Length::Fill), export_btn,]
+            .align_y(Alignment::Center);
 
         let header_info = column![
             header_top,
-            row![badge, share_index, npub_text].spacing(theme::space::SM).align_y(Alignment::Center),
+            row![badge, share_index, npub_text]
+                .spacing(theme::space::SM)
+                .align_y(Alignment::Center),
         ]
         .spacing(theme::space::XS);
 
@@ -243,7 +245,9 @@ impl ShareListScreen {
             };
             let actions = if self.delete_confirm.as_ref() == Some(&share_id) {
                 row![
-                    theme::error_text("Delete? This cannot be undone."),
+                    text(format!("Delete '{}'? This cannot be undone.", share.name))
+                        .size(theme::size::BODY)
+                        .color(theme::color::ERROR),
                     Space::new().width(Length::Fill),
                     button(text("Yes").size(theme::size::BODY))
                         .on_press(Message::ConfirmDelete(share_id.clone()))

@@ -28,10 +28,22 @@ impl CreateScreen {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let title = theme::heading("Create Keyset");
-        let subtitle = text("Generate a new FROST threshold signing keyset to distribute across your devices")
-            .size(theme::size::SMALL)
-            .color(theme::color::TEXT_MUTED);
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press(Message::GoBack)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Create Keyset")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
+        let subtitle =
+            text("Generate a new FROST threshold signing keyset to distribute across your devices")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED);
 
         let name_input = text_input("Keyset name (e.g. my-keyset)", &self.name)
             .on_input(Message::CreateNameChanged)
@@ -69,7 +81,7 @@ impl CreateScreen {
         let can_create = name_valid && threshold_val.is_some() && total_valid;
 
         let mut content = column![
-            title,
+            header,
             subtitle,
             Space::new().height(theme::space::LG),
             theme::label("Name"),
