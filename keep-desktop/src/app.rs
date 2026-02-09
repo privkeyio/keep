@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iced::widget::{container, text};
+use iced::widget::{column, container, text};
 use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
@@ -72,7 +72,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::Locked => "Vault is locked".into(),
         KeepError::AlreadyExists(_) => "Vault already exists".into(),
         KeepError::NotFound(_) => "Vault not found".into(),
-        KeepError::InvalidInput(_) => "Invalid input".into(),
+        KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
         KeepError::InvalidNsec => "Invalid secret key format".into(),
         KeepError::InvalidNpub => "Invalid public key format".into(),
         KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
@@ -85,7 +85,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::UserRejected => "Operation cancelled".into(),
         KeepError::Io(_) => "File system error".into(),
         _ => {
-            tracing::debug!("Unmapped keep error: {e}");
+            tracing::warn!("Unmapped keep error: {e}");
             "Operation failed".into()
         }
     }
@@ -306,6 +306,9 @@ impl App {
                 Task::none()
             }
             Message::NavigateShares => {
+                if matches!(self.screen, Screen::ShareList(_)) {
+                    return Task::none();
+                }
                 let shares = self.current_shares();
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
                 Task::none()
@@ -446,7 +449,7 @@ impl App {
                 background: Some(Background::Color(bg_color)),
                 ..Default::default()
             });
-            iced::widget::stack![screen, banner].into()
+            column![banner, screen].into()
         } else {
             screen
         }

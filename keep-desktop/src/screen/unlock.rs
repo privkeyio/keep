@@ -54,7 +54,7 @@ impl UnlockScreen {
         };
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
-            .on_submit_maybe(submit_msg)
+            .on_submit_maybe(submit_msg.clone())
             .secure(true)
             .padding(10)
             .width(300);
@@ -67,7 +67,7 @@ impl UnlockScreen {
         if !self.vault_exists {
             let confirm_input = text_input("Confirm password", &self.confirm_password)
                 .on_input(|s| Message::ConfirmPasswordChanged(Zeroizing::new(s)))
-                .on_submit(Message::Unlock)
+                .on_submit_maybe(submit_msg)
                 .secure(true)
                 .padding(10)
                 .width(300);
