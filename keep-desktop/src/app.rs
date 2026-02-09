@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iced::{Element, Subscription, Task};
+use iced::widget::{column, container, text};
+use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
 use tracing::error;
@@ -23,6 +24,19 @@ use crate::screen::Screen;
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
+const TOAST_DURATION_SECS: u64 = 3;
+
+#[derive(Clone)]
+pub enum ToastKind {
+    Success,
+    Error,
+}
+
+#[derive(Clone)]
+pub struct Toast {
+    pub message: String,
+    pub kind: ToastKind,
+}
 
 pub struct App {
     keep: Arc<Mutex<Option<Keep>>>,
@@ -31,6 +45,8 @@ pub struct App {
     last_activity: Instant,
     clipboard_clear_at: Option<Instant>,
     copy_feedback_until: Option<Instant>,
+    toast: Option<Toast>,
+    toast_dismiss_at: Option<Instant>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -101,6 +117,8 @@ impl App {
                             last_activity: Instant::now(),
                             clipboard_clear_at: None,
                             copy_feedback_until: None,
+                            toast: None,
+                            toast_dismiss_at: None,
                         },
                         Task::none(),
                     );
@@ -116,6 +134,8 @@ impl App {
                 last_activity: Instant::now(),
                 clipboard_clear_at: None,
                 copy_feedback_until: None,
+                toast: None,
+                toast_dismiss_at: None,
             },
             Task::none(),
         )
@@ -145,6 +165,12 @@ impl App {
                         if let Screen::Export(s) = &mut self.screen {
                             s.copied = false;
                         }
+                    }
+                }
+                if let Some(dismiss_at) = self.toast_dismiss_at {
+                    if Instant::now() >= dismiss_at {
+                        self.toast = None;
+                        self.toast_dismiss_at = None;
                     }
                 }
                 Task::none()
@@ -302,11 +328,12 @@ impl App {
             Message::CreateKeyset => self.handle_create_keyset(),
             Message::CreateResult(result) => match result {
                 Ok(shares) => {
-                    self.screen = Screen::ShareList(ShareListScreen::with_message(
-                        shares,
+                    self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                    self.set_toast(
                         "Keyset created! Export each share below to distribute to your devices."
                             .into(),
-                    ));
+                        ToastKind::Success,
+                    );
                     Task::none()
                 }
                 Err(e) => {
@@ -359,12 +386,33 @@ impl App {
                 Task::none()
             }
             Message::ImportShare => self.handle_import(),
-            Message::ImportResult(result) => self.handle_shares_result(result),
+            Message::ImportResult(result) => self.handle_import_result(result),
+
         }
     }
 
     pub fn view(&self) -> Element<Message> {
-        self.screen.view()
+        let screen = self.screen.view();
+        if let Some(toast) = &self.toast {
+            let bg_color = match toast.kind {
+                ToastKind::Success => crate::theme::color::SUCCESS,
+                ToastKind::Error => crate::theme::color::ERROR,
+            };
+            let banner = container(
+                text(&toast.message)
+                    .size(crate::theme::size::BODY)
+                    .color(iced::Color::WHITE),
+            )
+            .padding([crate::theme::space::SM, crate::theme::space::LG])
+            .width(Length::Fill)
+            .style(move |_theme: &iced::Theme| container::Style {
+                background: Some(Background::Color(bg_color)),
+                ..Default::default()
+            });
+            column![banner, screen].into()
+        } else {
+            screen
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -405,6 +453,8 @@ impl App {
         *guard = None;
         drop(guard);
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
+        self.toast = None;
+        self.toast_dismiss_at = None;
         self.screen = Screen::Unlock(UnlockScreen::new(true));
         if clear_clipboard {
             iced::clipboard::write(String::new())
@@ -429,8 +479,6 @@ impl App {
         if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
             s.delete_confirm = None;
-            s.error = None;
-            s.success_message = None;
         }
     }
 
@@ -498,9 +546,25 @@ impl App {
         )
     }
 
+    fn set_toast(&mut self, message: String, kind: ToastKind) {
+        self.toast = Some(Toast { message, kind });
+        self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
+    }
+
     fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => self.screen = Screen::ShareList(ShareListScreen::new(shares)),
+            Err(e) => self.screen.set_loading_error(e),
+        }
+        Task::none()
+    }
+
+    fn handle_import_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
+        match result {
+            Ok(shares) => {
+                self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                self.set_toast("Share imported successfully".into(), ToastKind::Success);
+            }
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
@@ -518,9 +582,9 @@ impl App {
             Some(Ok(())) => self.refresh_shares(),
             Some(Err(e)) => {
                 if let Screen::ShareList(s) = &mut self.screen {
-                    s.error = Some(e.to_string());
                     s.delete_confirm = None;
                 }
+                self.set_toast(e.to_string(), ToastKind::Error);
             }
             None => {}
         }

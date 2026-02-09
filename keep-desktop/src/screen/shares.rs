@@ -46,8 +46,6 @@ impl ShareEntry {
 pub struct ShareListScreen {
     pub shares: Vec<ShareEntry>,
     pub delete_confirm: Option<usize>,
-    pub error: Option<String>,
-    pub success_message: Option<String>,
     pub expanded: Option<usize>,
 }
 
@@ -56,16 +54,7 @@ impl ShareListScreen {
         Self {
             shares,
             delete_confirm: None,
-            error: None,
-            success_message: None,
             expanded: None,
-        }
-    }
-
-    pub fn with_message(shares: Vec<ShareEntry>, message: String) -> Self {
-        Self {
-            success_message: Some(message),
-            ..Self::new(shares)
         }
     }
 
@@ -74,32 +63,71 @@ impl ShareListScreen {
 
         let mut content = column![title].spacing(theme::space::MD);
 
-        if let Some(msg) = &self.success_message {
-            content = content.push(theme::success_text(msg.as_str()));
-        }
-
-        if let Some(err) = &self.error {
-            content = content.push(theme::error_text(err.as_str()));
-        }
-
         if self.shares.is_empty() {
-            let empty = column![
-                text("No shares yet")
-                    .size(theme::size::HEADING)
-                    .color(theme::color::TEXT_MUTED),
-                Space::new().height(theme::space::XL),
-                button(text("Create Keyset").width(250).align_x(Alignment::Center),)
+            let create_card = container(
+                column![
+                    text("Create Keyset")
+                        .size(theme::size::HEADING)
+                        .color(theme::color::TEXT),
+                    text("Generate a new set of threshold signing shares")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                    Space::new().height(theme::space::SM),
+                    button(
+                        text("Create")
+                            .width(Length::Fill)
+                            .align_x(Alignment::Center),
+                    )
                     .on_press(Message::GoToCreate)
                     .style(theme::primary_button)
-                    .padding(theme::space::MD),
-                Space::new().height(theme::space::SM),
-                button(text("Import Share").width(250).align_x(Alignment::Center),)
+                    .padding(theme::space::MD)
+                    .width(Length::Fill),
+                ]
+                .spacing(theme::space::SM),
+            )
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::FillPortion(1));
+
+            let import_card = container(
+                column![
+                    text("Import Share")
+                        .size(theme::size::HEADING)
+                        .color(theme::color::TEXT),
+                    text("Import an existing share from another device")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                    Space::new().height(theme::space::SM),
+                    button(
+                        text("Import")
+                            .width(Length::Fill)
+                            .align_x(Alignment::Center),
+                    )
                     .on_press(Message::GoToImport)
                     .style(theme::secondary_button)
-                    .padding(theme::space::MD),
+                    .padding(theme::space::MD)
+                    .width(Length::Fill),
+                ]
+                .spacing(theme::space::SM),
+            )
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::FillPortion(1));
+
+            let cards = row![create_card, import_card].spacing(theme::space::LG);
+
+            let empty = column![
+                text("Welcome to Keep")
+                    .size(theme::size::TITLE)
+                    .color(theme::color::TEXT),
+                text("Manage your FROST threshold signing shares")
+                    .size(theme::size::BODY)
+                    .color(theme::color::TEXT_MUTED),
+                Space::new().height(theme::space::LG),
+                cards,
             ]
             .align_x(Alignment::Center)
-            .spacing(theme::space::XS);
+            .spacing(theme::space::SM);
 
             content = content.push(
                 container(empty)
