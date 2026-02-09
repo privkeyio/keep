@@ -64,7 +64,7 @@ pub enum Message {
     Tick,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareIdentity {
     pub group_pubkey: [u8; 32],
     pub identifier: u16,

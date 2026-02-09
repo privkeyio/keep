@@ -114,13 +114,11 @@ fn with_keep_blocking<T: Send + 'static>(
             r
         }
         Err(payload) => {
-            let detail = match payload.downcast::<String>() {
-                Ok(s) => *s,
-                Err(payload) => match payload.downcast::<&str>() {
-                    Ok(s) => s.to_string(),
-                    Err(_) => "unknown".to_string(),
-                },
-            };
+            let detail = payload
+                .downcast::<String>()
+                .map(|s| *s)
+                .or_else(|p| p.downcast::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|_| "unknown".to_string());
             error!("{panic_msg}: {detail}");
             Err(format!("{panic_msg}; please re-unlock your vault"))
         }
@@ -181,25 +179,20 @@ impl App {
                 {
                     return self.do_lock();
                 }
-                if let Some(clear_at) = self.clipboard_clear_at {
-                    if Instant::now() >= clear_at {
-                        self.clipboard_clear_at = None;
-                        return iced::clipboard::write(String::new());
+                let now = Instant::now();
+                if self.clipboard_clear_at.is_some_and(|t| now >= t) {
+                    self.clipboard_clear_at = None;
+                    return iced::clipboard::write(String::new());
+                }
+                if self.copy_feedback_until.is_some_and(|t| now >= t) {
+                    self.copy_feedback_until = None;
+                    if let Screen::Export(s) = &mut self.screen {
+                        s.copied = false;
                     }
                 }
-                if let Some(until) = self.copy_feedback_until {
-                    if Instant::now() >= until {
-                        self.copy_feedback_until = None;
-                        if let Screen::Export(s) = &mut self.screen {
-                            s.copied = false;
-                        }
-                    }
-                }
-                if let Some(dismiss_at) = self.toast_dismiss_at {
-                    if Instant::now() >= dismiss_at {
-                        self.toast = None;
-                        self.toast_dismiss_at = None;
-                    }
+                if self.toast_dismiss_at.is_some_and(|t| now >= t) {
+                    self.toast = None;
+                    self.toast_dismiss_at = None;
                 }
                 Task::none()
             }

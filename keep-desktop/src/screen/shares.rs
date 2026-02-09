@@ -200,9 +200,7 @@ impl ShareListScreen {
                 group_pubkey: share.group_pubkey,
                 identifier: share.identifier,
             };
-            let actions = if self.delete_confirm.as_ref().is_some_and(|d| {
-                d.group_pubkey == share.group_pubkey && d.identifier == share.identifier
-            }) {
+            let actions = if self.delete_confirm.as_ref() == Some(&share_id) {
                 row![
                     theme::error_text("Delete? This cannot be undone."),
                     Space::new().width(Length::Fill),

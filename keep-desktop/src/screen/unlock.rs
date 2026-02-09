@@ -44,13 +44,13 @@ impl UnlockScreen {
         .size(theme::size::TITLE)
         .color(theme::color::TEXT);
 
+        let has_password = !self.password.is_empty();
         let submit_msg = if self.start_fresh_confirm {
-            (!self.password.is_empty()).then_some(Message::ConfirmStartFresh)
+            has_password.then_some(Message::ConfirmStartFresh)
         } else if !self.vault_exists {
-            (!self.password.is_empty() && !self.confirm_password.is_empty())
-                .then_some(Message::Unlock)
+            (has_password && !self.confirm_password.is_empty()).then_some(Message::Unlock)
         } else {
-            (!self.password.is_empty()).then_some(Message::Unlock)
+            has_password.then_some(Message::Unlock)
         };
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
@@ -84,18 +84,14 @@ impl UnlockScreen {
             };
             col = col.push(theme::muted(loading_text));
         } else if !self.start_fresh_confirm {
-            let (label, msg): (&str, Message) = if self.vault_exists {
-                ("Unlock", Message::Unlock)
-            } else {
-                ("Create", Message::Unlock)
-            };
+            let label = if self.vault_exists { "Unlock" } else { "Create" };
             let btn = button(
                 text(label)
                     .width(300)
                     .align_x(Alignment::Center)
                     .size(theme::size::BODY),
             )
-            .on_press(msg)
+            .on_press(Message::Unlock)
             .style(theme::primary_button)
             .padding(theme::space::MD);
             col = col.push(btn);
@@ -115,7 +111,7 @@ impl UnlockScreen {
                     row![
                         button(text("Confirm Delete").size(theme::size::SMALL))
                             .on_press_maybe(
-                                (!self.password.is_empty()).then_some(Message::ConfirmStartFresh),
+                                has_password.then_some(Message::ConfirmStartFresh),
                             )
                             .style(theme::danger_button)
                             .padding([theme::space::XS, theme::space::MD]),
