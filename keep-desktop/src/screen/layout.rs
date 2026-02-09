@@ -16,7 +16,7 @@ pub enum NavItem {
 
 pub fn with_sidebar<'a>(active: NavItem, content: Element<'a, Message>) -> Element<'a, Message> {
     let nav_items = [
-        ("Shares", Message::GoBack, NavItem::Shares),
+        ("Shares", Message::NavigateShares, NavItem::Shares),
         ("Create", Message::GoToCreate, NavItem::Create),
         ("Import", Message::GoToImport, NavItem::Import),
     ];

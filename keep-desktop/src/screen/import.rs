@@ -34,14 +34,17 @@ impl ImportScreen {
             .padding(10)
             .width(Length::Fill);
 
+        let trimmed_data = self.data.trim();
+        let recognized_format =
+            trimmed_data.starts_with("kshare1") || trimmed_data.starts_with('{');
+        let can_import = recognized_format && !self.passphrase.is_empty();
+
         let passphrase_input = text_input("Decryption passphrase", &self.passphrase)
             .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))
-            .on_submit(Message::ImportShare)
+            .on_submit_maybe(can_import.then_some(Message::ImportShare))
             .secure(true)
             .padding(10)
             .width(400);
-
-        let can_import = !self.data.is_empty() && !self.passphrase.is_empty();
 
         let mut content = column![
             title,
@@ -51,11 +54,10 @@ impl ImportScreen {
         ]
         .spacing(theme::space::XS);
 
-        let trimmed = self.data.trim();
-        if !trimmed.is_empty() {
-            if trimmed.starts_with("kshare1") {
+        if !trimmed_data.is_empty() {
+            if trimmed_data.starts_with("kshare1") {
                 content = content.push(theme::success_text("Encrypted bech32 share detected"));
-            } else if trimmed.starts_with('{') {
+            } else if trimmed_data.starts_with('{') {
                 content = content.push(theme::success_text("JSON format detected"));
             } else {
                 content = content.push(theme::error_text("Expected kshare1... or JSON format"));

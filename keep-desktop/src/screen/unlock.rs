@@ -44,13 +44,17 @@ impl UnlockScreen {
         .size(theme::size::TITLE)
         .color(theme::color::TEXT);
 
+        let submit_msg = if self.start_fresh_confirm {
+            (!self.password.is_empty()).then_some(Message::ConfirmStartFresh)
+        } else if !self.vault_exists {
+            (!self.password.is_empty() && !self.confirm_password.is_empty())
+                .then_some(Message::Unlock)
+        } else {
+            (!self.password.is_empty()).then_some(Message::Unlock)
+        };
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
-            .on_submit(if self.start_fresh_confirm {
-                Message::ConfirmStartFresh
-            } else {
-                Message::Unlock
-            })
+            .on_submit_maybe(submit_msg)
             .secure(true)
             .padding(10)
             .width(300);
@@ -79,21 +83,11 @@ impl UnlockScreen {
                 "Unlocking..."
             };
             col = col.push(theme::muted(loading_text));
-        } else {
-            let (label, style, msg): (
-                &str,
-                fn(&iced::Theme, button::Status) -> button::Style,
-                Message,
-            ) = if self.start_fresh_confirm {
-                (
-                    "Confirm Delete",
-                    theme::danger_button,
-                    Message::ConfirmStartFresh,
-                )
-            } else if self.vault_exists {
-                ("Unlock", theme::primary_button, Message::Unlock)
+        } else if !self.start_fresh_confirm {
+            let (label, msg): (&str, Message) = if self.vault_exists {
+                ("Unlock", Message::Unlock)
             } else {
-                ("Create", theme::primary_button, Message::Unlock)
+                ("Create", Message::Unlock)
             };
             let btn = button(
                 text(label)
@@ -102,11 +96,9 @@ impl UnlockScreen {
                     .size(theme::size::BODY),
             )
             .on_press(msg)
-            .style(style)
+            .style(theme::primary_button)
             .padding(theme::space::MD);
-            if !self.start_fresh_confirm {
-                col = col.push(btn);
-            }
+            col = col.push(btn);
         }
 
         if let Some(err) = &self.error {

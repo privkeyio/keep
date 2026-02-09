@@ -413,6 +413,7 @@ impl KeepMobile {
         name: String,
         passphrase: String,
     ) -> Result<FrostGenerationResult, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
         let name_result = Self::validate_share_name(&name);
         let key_result = hex::decode(&existing_key).map_err(|_| KeepMobileError::InvalidShare {
             msg: "Invalid hex encoding for existing key".into(),
@@ -436,7 +437,6 @@ impl KeepMobile {
         let dealer = TrustedDealer::new(config);
         let (shares, _) = dealer.split_existing(&secret, &name)?;
 
-        let passphrase = Zeroizing::new(passphrase);
         Self::build_generation_result(&shares, &passphrase)
     }
 
@@ -481,6 +481,7 @@ impl KeepMobile {
         name: String,
         passphrase: String,
     ) -> Result<String, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
         if packages.len() != sender_indices.len() {
             return Err(KeepMobileError::FrostError {
                 msg: "Packages and indices must have same length".into(),

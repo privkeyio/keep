@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iced::widget::{column, container, text};
+use iced::widget::{container, text};
 use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
@@ -72,7 +72,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::Locked => "Vault is locked".into(),
         KeepError::AlreadyExists(_) => "Vault already exists".into(),
         KeepError::NotFound(_) => "Vault not found".into(),
-        KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
+        KeepError::InvalidInput(_) => "Invalid input".into(),
         KeepError::InvalidNsec => "Invalid secret key format".into(),
         KeepError::InvalidNpub => "Invalid public key format".into(),
         KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
@@ -85,7 +85,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::UserRejected => "Operation cancelled".into(),
         KeepError::Io(_) => "File system error".into(),
         _ => {
-            error!("Unmapped error: {e}");
+            tracing::debug!("Unmapped keep error: {e}");
             "Operation failed".into()
         }
     }
@@ -305,6 +305,11 @@ impl App {
                 }
                 Task::none()
             }
+            Message::NavigateShares => {
+                let shares = self.current_shares();
+                self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                Task::none()
+            }
             Message::GoBack => {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
@@ -322,9 +327,9 @@ impl App {
                 }
                 Task::none()
             }
-            Message::RequestDelete(i) => {
+            Message::RequestDelete(id) => {
                 if let Screen::ShareList(s) = &mut self.screen {
-                    s.delete_confirm = Some(i);
+                    s.delete_confirm = Some(id);
                 }
                 Task::none()
             }
@@ -388,14 +393,14 @@ impl App {
                 }
                 Task::none()
             }
-            Message::CopyToClipboard(mut t) => {
+            Message::CopyToClipboard(t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
                 self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
                 if let Screen::Export(s) = &mut self.screen {
                     s.copied = true;
                 }
-                let plain = std::mem::take(&mut *t);
+                let plain = (*t).clone();
                 iced::clipboard::write(plain)
             }
             Message::ResetExport => {
@@ -441,7 +446,7 @@ impl App {
                 background: Some(Background::Color(bg_color)),
                 ..Default::default()
             });
-            column![banner, screen].into()
+            iced::widget::stack![screen, banner].into()
         } else {
             screen
         }

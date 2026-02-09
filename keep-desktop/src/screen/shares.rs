@@ -45,7 +45,7 @@ impl ShareEntry {
 
 pub struct ShareListScreen {
     pub shares: Vec<ShareEntry>,
-    pub delete_confirm: Option<usize>,
+    pub delete_confirm: Option<ShareIdentity>,
     pub expanded: Option<usize>,
 }
 
@@ -196,15 +196,18 @@ impl ShareListScreen {
             ]
             .spacing(theme::space::XS);
 
-            let actions = if self.delete_confirm == Some(i) {
+            let share_id = ShareIdentity {
+                group_pubkey: share.group_pubkey,
+                identifier: share.identifier,
+            };
+            let actions = if self.delete_confirm.as_ref().is_some_and(|d| {
+                d.group_pubkey == share.group_pubkey && d.identifier == share.identifier
+            }) {
                 row![
                     theme::error_text("Delete? This cannot be undone."),
                     Space::new().width(Length::Fill),
                     button(text("Yes").size(theme::size::BODY))
-                        .on_press(Message::ConfirmDelete(ShareIdentity {
-                            group_pubkey: share.group_pubkey,
-                            identifier: share.identifier,
-                        }))
+                        .on_press(Message::ConfirmDelete(share_id.clone()))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("No").size(theme::size::BODY))
@@ -222,7 +225,7 @@ impl ShareListScreen {
                         .style(theme::primary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("Delete").size(theme::size::BODY))
-                        .on_press(Message::RequestDelete(i))
+                        .on_press(Message::RequestDelete(share_id))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]
