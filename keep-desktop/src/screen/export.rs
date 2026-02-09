@@ -140,7 +140,7 @@ impl ExportScreen {
             let display = if bech32.len() > 80 {
                 format!("{}...", &bech32[..80])
             } else {
-                bech32[..].to_owned()
+                bech32.to_string()
             };
             content = content.push(
                 text(display)
@@ -172,20 +172,15 @@ impl ExportScreen {
                 .spacing(theme::space::SM),
             );
         } else {
+            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
-                .on_submit_maybe(if self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN {
-                    Some(Message::GenerateExport)
-                } else {
-                    None
-                })
+                .on_submit_maybe(passphrase_ok.then_some(Message::GenerateExport))
                 .secure(true)
                 .padding(10)
                 .width(400);
 
             content = content.push(passphrase_input);
-
-            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
             if !self.passphrase.is_empty() && !passphrase_ok {
                 content = content.push(
                     text(format!(

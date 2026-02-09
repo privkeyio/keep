@@ -61,9 +61,9 @@ fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Optio
     }
 }
 
-fn user_friendly_error(e: &keep_core::error::KeepError) -> String {
+fn friendly_err(e: keep_core::error::KeepError) -> String {
     use keep_core::error::KeepError;
-    match e {
+    match &e {
         KeepError::InvalidPassword => "Invalid password".into(),
         KeepError::RateLimited(secs) => format!("Too many attempts. Try again in {secs} seconds"),
         KeepError::DecryptionFailed => {
@@ -80,6 +80,10 @@ fn user_friendly_error(e: &keep_core::error::KeepError) -> String {
         KeepError::KeyringFull(_) => "Keyring is full".into(),
         KeepError::Frost(_) => "FROST operation failed".into(),
         KeepError::FrostErr(_) => "FROST operation failed".into(),
+        KeepError::PermissionDenied(_) => "Permission denied".into(),
+        KeepError::HomeNotFound => "Home directory not found".into(),
+        KeepError::UserRejected => "Operation cancelled".into(),
+        KeepError::Io(_) => "File system error".into(),
         _ => {
             error!("Unmapped error: {e}");
             "Operation failed".into()
@@ -87,14 +91,10 @@ fn user_friendly_error(e: &keep_core::error::KeepError) -> String {
     }
 }
 
-fn friendly_err(e: keep_core::error::KeepError) -> String {
-    user_friendly_error(&e)
-}
-
 fn collect_shares(keep: &Keep) -> Result<Vec<ShareEntry>, String> {
     keep.frost_list_shares()
         .map(|stored| stored.iter().map(ShareEntry::from_stored).collect())
-        .map_err(|e| user_friendly_error(&e))
+        .map_err(friendly_err)
 }
 
 fn with_keep_blocking<T: Send + 'static>(
@@ -114,7 +114,14 @@ fn with_keep_blocking<T: Send + 'static>(
             r
         }
         Err(payload) => {
-            error!("{}: {:?}", panic_msg, payload.type_id());
+            let detail = match payload.downcast::<String>() {
+                Ok(s) => *s,
+                Err(payload) => match payload.downcast::<&str>() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => "unknown".to_string(),
+                },
+            };
+            error!("{panic_msg}: {detail}");
             Err(format!("{panic_msg}; please re-unlock your vault"))
         }
     }
@@ -609,7 +616,7 @@ impl App {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = None;
                 }
-                self.set_toast(user_friendly_error(&e), ToastKind::Error);
+                self.set_toast(friendly_err(e), ToastKind::Error);
             }
             None => {}
         }

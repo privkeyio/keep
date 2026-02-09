@@ -80,23 +80,20 @@ impl UnlockScreen {
             };
             col = col.push(theme::muted(loading_text));
         } else {
-            let (label, style): (&str, fn(&iced::Theme, button::Status) -> button::Style) =
-                if self.start_fresh_confirm {
-                    ("Confirm Delete", theme::danger_button)
-                } else {
-                    (
-                        if self.vault_exists {
-                            "Unlock"
-                        } else {
-                            "Create"
-                        },
-                        theme::primary_button,
-                    )
-                };
-            let msg = if self.start_fresh_confirm {
-                Message::ConfirmStartFresh
+            let (label, style, msg): (
+                &str,
+                fn(&iced::Theme, button::Status) -> button::Style,
+                Message,
+            ) = if self.start_fresh_confirm {
+                (
+                    "Confirm Delete",
+                    theme::danger_button,
+                    Message::ConfirmStartFresh,
+                )
+            } else if self.vault_exists {
+                ("Unlock", theme::primary_button, Message::Unlock)
             } else {
-                Message::Unlock
+                ("Create", theme::primary_button, Message::Unlock)
             };
             let btn = button(
                 text(label)
