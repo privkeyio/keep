@@ -14,7 +14,11 @@ pub enum NavItem {
     Import,
 }
 
-pub fn with_sidebar<'a>(active: NavItem, content: Element<'a, Message>) -> Element<'a, Message> {
+pub fn with_sidebar<'a>(
+    active: NavItem,
+    content: Element<'a, Message>,
+    share_count: Option<usize>,
+) -> Element<'a, Message> {
     let nav_items = [
         ("Shares", Message::NavigateShares, NavItem::Shares),
         ("Create", Message::GoToCreate, NavItem::Create),
@@ -30,8 +34,26 @@ pub fn with_sidebar<'a>(active: NavItem, content: Element<'a, Message>) -> Eleme
             theme::nav_button
         };
         let press = if is_active { None } else { Some(msg) };
+        let nav_label: Element<'a, Message> =
+            if let (NavItem::Shares, Some(count)) = (&item, share_count) {
+                row![
+                    text(label).size(theme::size::BODY),
+                    Space::new().width(Length::Fill),
+                    text(count.to_string())
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_DIM),
+                ]
+                .width(Length::Fill)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                text(label)
+                    .size(theme::size::BODY)
+                    .width(Length::Fill)
+                    .into()
+            };
         nav = nav.push(
-            button(text(label).size(theme::size::BODY).width(Length::Fill))
+            button(nav_label)
                 .on_press_maybe(press)
                 .style(style)
                 .padding([theme::space::SM, theme::space::MD])

@@ -213,3 +213,29 @@ pub fn error_text(s: &str) -> text::Text {
 pub fn success_text(s: &str) -> text::Text {
     text(s).size(size::BODY).color(color::SUCCESS)
 }
+
+pub fn warning_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.80, 0.25, 0.25, 0.10))),
+        border: Border {
+            color: color::ERROR,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        text_color: Some(color::ERROR),
+        ..Default::default()
+    }
+}
+
+pub fn badge_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.30, 0.65, 0.45, 0.15))),
+        border: Border {
+            color: color::PRIMARY,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        text_color: Some(color::PRIMARY),
+        ..Default::default()
+    }
+}

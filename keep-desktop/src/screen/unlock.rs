@@ -44,32 +44,44 @@ impl UnlockScreen {
         .size(theme::size::TITLE)
         .color(theme::color::TEXT);
 
+        let subtitle = text(if self.vault_exists {
+            "Enter your password to access your FROST shares"
+        } else {
+            "Set a password to protect your FROST signing shares"
+        })
+        .size(theme::size::SMALL)
+        .color(theme::color::TEXT_MUTED);
+
         let has_password = !self.password.is_empty();
         let submit_msg = if self.start_fresh_confirm {
             has_password.then_some(Message::ConfirmStartFresh)
-        } else if !self.vault_exists {
-            (has_password && !self.confirm_password.is_empty()).then_some(Message::Unlock)
         } else {
-            has_password.then_some(Message::Unlock)
+            let ready = has_password && (self.vault_exists || !self.confirm_password.is_empty());
+            ready.then_some(Message::Unlock)
         };
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
             .on_submit_maybe(submit_msg.clone())
             .secure(true)
-            .padding(10)
+            .padding(theme::space::MD)
             .width(300);
 
-        let mut col = column![title, Space::new().height(theme::space::XL), password_input]
-            .align_x(Alignment::Center)
-            .spacing(theme::space::SM)
-            .width(350);
+        let mut col = column![
+            title,
+            subtitle,
+            Space::new().height(theme::space::LG),
+            password_input
+        ]
+        .align_x(Alignment::Center)
+        .spacing(theme::space::SM)
+        .width(350);
 
         if !self.vault_exists {
             let confirm_input = text_input("Confirm password", &self.confirm_password)
                 .on_input(|s| Message::ConfirmPasswordChanged(Zeroizing::new(s)))
                 .on_submit_maybe(submit_msg)
                 .secure(true)
-                .padding(10)
+                .padding(theme::space::MD)
                 .width(300);
             col = col.push(confirm_input);
         }

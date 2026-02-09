@@ -48,6 +48,7 @@ pub enum Message {
 
     // Export
     ExportPassphraseChanged(Zeroizing<String>),
+    ExportConfirmPassphraseChanged(Zeroizing<String>),
     GenerateExport,
     ExportGenerated(Result<ExportData, String>),
     AdvanceQrFrame,
@@ -58,7 +59,10 @@ pub enum Message {
     ImportDataChanged(Zeroizing<String>),
     ImportPassphraseChanged(Zeroizing<String>),
     ImportShare,
-    ImportResult(Result<Vec<ShareEntry>, String>),
+    ImportResult(Result<(Vec<ShareEntry>, String), String>),
+
+    // Clipboard (public data, no auto-clear)
+    CopyNpub(String),
 
     // Timer
     Tick,
@@ -76,6 +80,9 @@ impl fmt::Debug for Message {
             Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
             Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
             Self::ExportPassphraseChanged(_) => f.write_str("ExportPassphraseChanged(***)"),
+            Self::ExportConfirmPassphraseChanged(_) => {
+                f.write_str("ExportConfirmPassphraseChanged(***)")
+            }
             Self::ImportPassphraseChanged(_) => f.write_str("ImportPassphraseChanged(***)"),
             Self::ImportDataChanged(_) => f.write_str("ImportDataChanged(***)"),
             Self::ExportGenerated(_) => f.write_str("ExportGenerated(***)"),
@@ -115,8 +122,9 @@ impl fmt::Debug for Message {
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")
-                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

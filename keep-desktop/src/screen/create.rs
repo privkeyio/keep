@@ -28,21 +28,36 @@ impl CreateScreen {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let title = theme::heading("Create Keyset");
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press(Message::GoBack)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Create Keyset")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
+        let subtitle =
+            text("Generate a new FROST threshold signing keyset to distribute across your devices")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED);
 
         let name_input = text_input("Keyset name (e.g. my-keyset)", &self.name)
             .on_input(Message::CreateNameChanged)
-            .padding(10)
-            .width(400);
+            .padding(theme::space::MD)
+            .width(theme::size::INPUT_WIDTH);
 
         let threshold_input = text_input("2", &self.threshold)
             .on_input(Message::CreateThresholdChanged)
-            .padding(10)
+            .padding(theme::space::MD)
             .width(80);
 
         let total_input = text_input("3", &self.total)
             .on_input(Message::CreateTotalChanged)
-            .padding(10)
+            .padding(theme::space::MD)
             .width(80);
 
         let threshold_row = row![
@@ -55,8 +70,6 @@ impl CreateScreen {
         .spacing(theme::space::SM)
         .align_y(Alignment::Center);
 
-        let hint = theme::muted("A 2-of-3 keyset means any 2 of 3 devices can sign together.");
-
         let name_valid = !self.name.is_empty() && self.name.len() <= 64;
         let threshold_val: Option<u16> = self
             .threshold
@@ -68,11 +81,13 @@ impl CreateScreen {
         let can_create = name_valid && threshold_val.is_some() && total_valid;
 
         let mut content = column![
-            title,
-            Space::new().height(theme::space::XL),
+            header,
+            subtitle,
+            Space::new().height(theme::space::LG),
             theme::label("Name"),
             name_input,
             Space::new().height(theme::space::MD),
+            theme::label("Signing Threshold"),
             threshold_row,
         ]
         .spacing(theme::space::XS);
@@ -84,12 +99,11 @@ impl CreateScreen {
             content = content.push(theme::error_text("Threshold must be between 2 and 255"));
         }
         if !self.total.is_empty() {
-            let total_error = match (total_val, threshold_val) {
-                (Some(n), Some(t)) if n < t => Some("Total must be >= threshold"),
-                (None, _) if self.total.parse::<u16>().is_ok() => {
-                    Some("Total must be 255 or fewer")
+            let total_error = match total_val {
+                None => Some("Total must be a number between 1 and 255"),
+                Some(n) if threshold_val.is_some_and(|t| n < t) => {
+                    Some("Total must be >= threshold")
                 }
-                (None, _) => Some("Total must be a valid number"),
                 _ => None,
             };
             if let Some(msg) = total_error {
@@ -97,8 +111,29 @@ impl CreateScreen {
             }
         }
 
-        content = content.push(hint);
-        content = content.push(Space::new().height(theme::space::MD));
+        if let (Some(t), Some(n)) = (threshold_val, total_val) {
+            if n >= t {
+                let summary = format!(
+                    "Any {t} of {n} devices can sign together. You'll need to export each share to a separate device."
+                );
+                content = content.push(
+                    container(
+                        text(summary)
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT),
+                    )
+                    .style(theme::badge_style)
+                    .padding(theme::space::MD)
+                    .width(theme::size::INPUT_WIDTH),
+                );
+            }
+        } else {
+            content = content.push(
+                theme::muted("Choose how many devices are needed to sign (threshold) out of the total number of shares."),
+            );
+        }
+
+        content = content.push(Space::new().height(theme::space::SM));
 
         if self.loading {
             content = content.push(theme::label("Generating keyset..."));
@@ -121,6 +156,6 @@ impl CreateScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Create, inner.into())
+        layout::with_sidebar(NavItem::Create, inner.into(), None)
     }
 }

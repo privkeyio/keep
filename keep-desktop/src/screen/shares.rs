@@ -4,10 +4,17 @@
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
+use keep_core::keys::bytes_to_npub;
 
 use crate::message::{Message, ShareIdentity};
 use crate::screen::layout::{self, NavItem};
 use crate::theme;
+
+fn format_timestamp(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct ShareEntry {
@@ -17,7 +24,9 @@ pub struct ShareEntry {
     pub total_shares: u16,
     pub group_pubkey: [u8; 32],
     pub group_pubkey_hex: String,
+    pub npub: String,
     pub created_at: i64,
+    pub last_used: Option<i64>,
     pub sign_count: u64,
 }
 
@@ -31,15 +40,32 @@ impl ShareEntry {
             total_shares: m.total_shares,
             group_pubkey: m.group_pubkey,
             group_pubkey_hex: hex::encode(m.group_pubkey),
+            npub: bytes_to_npub(&m.group_pubkey),
             created_at: m.created_at,
+            last_used: m.last_used,
             sign_count: m.sign_count,
         }
     }
 
     fn created_display(&self) -> String {
-        DateTime::<Utc>::from_timestamp(self.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| self.created_at.to_string())
+        format_timestamp(self.created_at)
+    }
+
+    pub fn truncated_npub(&self) -> String {
+        let n = &self.npub;
+        let chars: Vec<char> = n.chars().collect();
+        if chars.len() <= 20 {
+            return n.clone();
+        }
+        let prefix: String = chars[..12].iter().collect();
+        let suffix: String = chars[chars.len() - 6..].iter().collect();
+        format!("{prefix}...{suffix}")
+    }
+
+    fn last_used_display(&self) -> String {
+        self.last_used
+            .map(format_timestamp)
+            .unwrap_or_else(|| "Never".into())
     }
 }
 
@@ -94,7 +120,7 @@ impl ShareListScreen {
                     text("Import Share")
                         .size(theme::size::HEADING)
                         .color(theme::color::TEXT),
-                    text("Import an existing share from another device")
+                    text("Scan or paste a share exported from another Keep device")
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_MUTED),
                     Space::new().height(theme::space::SM),
@@ -123,6 +149,9 @@ impl ShareListScreen {
                 text("Manage your FROST threshold signing shares")
                     .size(theme::size::BODY)
                     .color(theme::color::TEXT_MUTED),
+                text("Create a keyset to generate shares, then export each share to a different device using QR codes.")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_DIM),
                 Space::new().height(theme::space::LG),
                 cards,
             ]
@@ -147,20 +176,26 @@ impl ShareListScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Shares, inner.into())
+        let count = (!self.shares.is_empty()).then_some(self.shares.len());
+        layout::with_sidebar(NavItem::Shares, inner.into(), count)
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
-        let truncated_pubkey = format!(
-            "{}...",
-            &share.group_pubkey_hex[..share.group_pubkey_hex.len().min(16)]
-        );
+        let truncated_npub = share.truncated_npub();
 
-        let badge = text(format!("{}-of-{}", share.threshold, share.total_shares))
-            .size(theme::size::TINY)
-            .color(theme::color::PRIMARY);
+        let badge = container(
+            text(format!("{}-of-{}", share.threshold, share.total_shares))
+                .size(theme::size::TINY)
+                .color(theme::color::PRIMARY),
+        )
+        .style(theme::badge_style)
+        .padding([2.0, theme::space::SM]);
 
-        let pubkey_text = text(truncated_pubkey)
+        let share_index = text(format!("#{}", share.identifier))
+            .size(theme::size::SMALL)
+            .color(theme::color::TEXT_MUTED);
+
+        let npub_text = text(truncated_npub)
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
@@ -174,20 +209,46 @@ impl ShareListScreen {
         .style(theme::text_button)
         .padding(0);
 
-        let header_info = column![name_btn, row![badge, pubkey_text].spacing(theme::space::SM)]
-            .spacing(theme::space::XS);
+        let export_btn = button(text("Export QR").size(theme::size::SMALL))
+            .on_press(Message::GoToExport(i))
+            .style(theme::primary_button)
+            .padding([theme::space::XS, theme::space::MD]);
+
+        let header_top = row![name_btn, Space::new().width(Length::Fill), export_btn,]
+            .align_y(Alignment::Center);
+
+        let header_info = column![
+            header_top,
+            row![badge, share_index, npub_text]
+                .spacing(theme::space::SM)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(theme::space::XS);
 
         let mut card_content = column![header_info].spacing(theme::space::SM);
 
         if self.expanded == Some(i) {
+            let npub_row = row![
+                text(format!("npub: {}", share.npub))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+                button(text("Copy").size(theme::size::TINY))
+                    .on_press(Message::CopyNpub(share.npub.clone()))
+                    .style(theme::secondary_button)
+                    .padding([2.0, theme::space::SM]),
+            ]
+            .spacing(theme::space::SM)
+            .align_y(Alignment::Center);
+
             let details = column![
-                text(format!("Group pubkey: {}", share.group_pubkey_hex))
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_MUTED),
-                text(format!("Share #{}", share.identifier))
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_MUTED),
+                npub_row,
+                text(format!("hex: {}", share.group_pubkey_hex))
+                    .size(theme::size::TINY)
+                    .color(theme::color::TEXT_DIM),
                 text(format!("Created: {}", share.created_display()))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+                text(format!("Last used: {}", share.last_used_display()))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
                 text(format!("Signatures: {}", share.sign_count))
@@ -202,7 +263,9 @@ impl ShareListScreen {
             };
             let actions = if self.delete_confirm.as_ref() == Some(&share_id) {
                 row![
-                    theme::error_text("Delete? This cannot be undone."),
+                    text(format!("Delete '{}'? This cannot be undone.", share.name))
+                        .size(theme::size::BODY)
+                        .color(theme::color::ERROR),
                     Space::new().width(Length::Fill),
                     button(text("Yes").size(theme::size::BODY))
                         .on_press(Message::ConfirmDelete(share_id.clone()))
@@ -218,10 +281,6 @@ impl ShareListScreen {
             } else {
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("Export QR").size(theme::size::BODY))
-                        .on_press(Message::GoToExport(i))
-                        .style(theme::primary_button)
-                        .padding([theme::space::XS, theme::space::MD]),
                     button(text("Delete").size(theme::size::BODY))
                         .on_press(Message::RequestDelete(share_id))
                         .style(theme::danger_button)

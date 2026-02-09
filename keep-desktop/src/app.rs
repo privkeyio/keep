@@ -24,8 +24,8 @@ use crate::screen::Screen;
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
-pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 12;
-const TOAST_DURATION_SECS: u64 = 3;
+pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
+const TOAST_DURATION_SECS: u64 = 5;
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -78,8 +78,7 @@ fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
         KeepError::KeyNotFound(_) => "Key not found".into(),
         KeepError::KeyringFull(_) => "Keyring is full".into(),
-        KeepError::Frost(_) => "FROST operation failed".into(),
-        KeepError::FrostErr(_) => "FROST operation failed".into(),
+        KeepError::Frost(_) | KeepError::FrostErr(_) => "FROST operation failed".into(),
         KeepError::PermissionDenied(_) => "Permission denied".into(),
         KeepError::HomeNotFound => "Home directory not found".into(),
         KeepError::UserRejected => "Operation cancelled".into(),
@@ -223,49 +222,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ConfirmStartFresh => {
-                let password = match &mut self.screen {
-                    Screen::Unlock(s) => {
-                        if s.password.is_empty() {
-                            s.error = Some("Enter your vault password to confirm deletion".into());
-                            return Task::none();
-                        }
-                        if s.loading {
-                            return Task::none();
-                        }
-                        s.loading = true;
-                        s.error = None;
-                        s.password.clone()
-                    }
-                    _ => return Task::none(),
-                };
-                let path = self.keep_path.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let result = std::panic::catch_unwind(AssertUnwindSafe(
-                                || -> Result<(), String> {
-                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                                    keep.unlock(&password).map_err(friendly_err)?;
-                                    drop(keep);
-                                    std::fs::remove_dir_all(&path)
-                                        .map_err(|e| format!("Failed to remove vault: {e}"))
-                                },
-                            ));
-                            match result {
-                                Ok(r) => r,
-                                Err(payload) => {
-                                    error!("Panic during start fresh: {:?}", payload.type_id());
-                                    Err("Internal error; please restart the application".into())
-                                }
-                            }
-                        })
-                        .await
-                        .map_err(|_| "Background task failed".to_string())?
-                    },
-                    Message::StartFreshResult,
-                )
-            }
+            Message::ConfirmStartFresh => self.handle_start_fresh(),
             Message::StartFreshResult(result) => {
                 match result {
                     Ok(()) => {
@@ -298,15 +255,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::NavigateShares => {
-                if matches!(self.screen, Screen::ShareList(_)) {
-                    return Task::none();
-                }
-                let shares = self.current_shares();
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
-                Task::none()
-            }
-            Message::GoBack => {
+            Message::NavigateShares | Message::GoBack => {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
@@ -363,7 +312,7 @@ impl App {
                 Ok(shares) => {
                     self.screen = Screen::ShareList(ShareListScreen::new(shares));
                     self.set_toast(
-                        "Keyset created! Export each share below to distribute to your devices."
+                        "Keyset created! Tap a share and use Export QR to send it to your phone."
                             .into(),
                         ToastKind::Success,
                     );
@@ -378,6 +327,13 @@ impl App {
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
                     s.passphrase = p;
+                    s.confirm_passphrase = Zeroizing::new(String::new());
+                }
+                Task::none()
+            }
+            Message::ExportConfirmPassphraseChanged(p) => {
+                if let Screen::Export(s) = &mut self.screen {
+                    s.confirm_passphrase = p;
                 }
                 Task::none()
             }
@@ -421,31 +377,32 @@ impl App {
             }
             Message::ImportShare => self.handle_import(),
             Message::ImportResult(result) => self.handle_import_result(result),
+
+            Message::CopyNpub(npub) => iced::clipboard::write(npub),
         }
     }
 
     pub fn view(&self) -> Element<Message> {
         let screen = self.screen.view();
-        if let Some(toast) = &self.toast {
-            let bg_color = match toast.kind {
-                ToastKind::Success => crate::theme::color::SUCCESS,
-                ToastKind::Error => crate::theme::color::ERROR,
-            };
-            let banner = container(
-                text(&toast.message)
-                    .size(crate::theme::size::BODY)
-                    .color(iced::Color::WHITE),
-            )
-            .padding([crate::theme::space::SM, crate::theme::space::LG])
-            .width(Length::Fill)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(Background::Color(bg_color)),
-                ..Default::default()
-            });
-            column![banner, screen].into()
-        } else {
-            screen
-        }
+        let Some(toast) = &self.toast else {
+            return screen;
+        };
+        let bg_color = match toast.kind {
+            ToastKind::Success => crate::theme::color::SUCCESS,
+            ToastKind::Error => crate::theme::color::ERROR,
+        };
+        let banner = container(
+            text(&toast.message)
+                .size(crate::theme::size::BODY)
+                .color(iced::Color::WHITE),
+        )
+        .padding([crate::theme::space::SM, crate::theme::space::LG])
+        .width(Length::Fill)
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(bg_color)),
+            ..Default::default()
+        });
+        column![banner, screen].into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -579,6 +536,49 @@ impl App {
         )
     }
 
+    fn handle_start_fresh(&mut self) -> Task<Message> {
+        let password = match &mut self.screen {
+            Screen::Unlock(s) => {
+                if s.password.is_empty() {
+                    s.error = Some("Enter your vault password to confirm deletion".into());
+                    return Task::none();
+                }
+                if s.loading {
+                    return Task::none();
+                }
+                s.loading = true;
+                s.error = None;
+                s.password.clone()
+            }
+            _ => return Task::none(),
+        };
+        let path = self.keep_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+                            let mut keep = Keep::open(&path).map_err(friendly_err)?;
+                            keep.unlock(&password).map_err(friendly_err)?;
+                            drop(keep);
+                            std::fs::remove_dir_all(&path)
+                                .map_err(|e| format!("Failed to remove vault: {e}"))
+                        }));
+                    match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            error!("Panic during start fresh: {:?}", payload.type_id());
+                            Err("Internal error; please restart the application".into())
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::StartFreshResult,
+        )
+    }
+
     fn set_toast(&mut self, message: String, kind: ToastKind) {
         self.toast = Some(Toast { message, kind });
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
@@ -592,11 +592,17 @@ impl App {
         Task::none()
     }
 
-    fn handle_import_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
+    fn handle_import_result(
+        &mut self,
+        result: Result<(Vec<ShareEntry>, String), String>,
+    ) -> Task<Message> {
         match result {
-            Ok(shares) => {
+            Ok((shares, name)) => {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
-                self.set_toast("Share imported successfully".into(), ToastKind::Success);
+                self.set_toast(
+                    format!("Share '{name}' imported successfully"),
+                    ToastKind::Success,
+                );
             }
             Err(e) => self.screen.set_loading_error(e),
         }
@@ -606,20 +612,19 @@ impl App {
     fn handle_delete(&mut self, id: ShareIdentity) {
         let result = {
             let mut guard = lock_keep(&self.keep);
-            guard
-                .as_mut()
-                .map(|keep| keep.frost_delete_share(&id.group_pubkey, id.identifier))
+            let Some(keep) = guard.as_mut() else {
+                return;
+            };
+            keep.frost_delete_share(&id.group_pubkey, id.identifier)
         };
-
         match result {
-            Some(Ok(())) => self.refresh_shares(),
-            Some(Err(e)) => {
+            Ok(()) => self.refresh_shares(),
+            Err(e) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = None;
                 }
                 self.set_toast(friendly_err(e), ToastKind::Error);
             }
-            None => {}
         }
     }
 
@@ -682,7 +687,11 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
-                if s.loading || s.passphrase.len() < MIN_EXPORT_PASSPHRASE_LEN {
+                if s.loading || s.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
+                    return Task::none();
+                }
+                if *s.passphrase != *s.confirm_passphrase {
+                    s.error = Some("Passphrases do not match".into());
                     return Task::none();
                 }
                 s.loading = true;
@@ -751,9 +760,11 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let export = ShareExport::parse(&data).map_err(friendly_err)?;
+                        let name = format!("imported-{}", export.identifier);
                         keep.frost_import_share(&export, &passphrase)
                             .map_err(friendly_err)?;
-                        collect_shares(keep)
+                        let shares = collect_shares(keep)?;
+                        Ok((shares, name))
                     })
                 })
                 .await

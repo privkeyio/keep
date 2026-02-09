@@ -11,6 +11,28 @@ use crate::screen::layout::{self, NavItem};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
+fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
+    let len = passphrase.chars().count();
+    let has_upper = passphrase.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = passphrase.chars().any(|c| c.is_ascii_digit());
+    let has_special = passphrase.chars().any(|c| !c.is_ascii_alphanumeric());
+    let variety: usize = [has_upper, has_digit, has_special]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    let score = len + variety * 5;
+
+    if score < 20 {
+        ("Weak", theme::color::ERROR)
+    } else if score < 28 {
+        ("Fair", theme::color::TEXT_MUTED)
+    } else if score < 38 {
+        ("Good", theme::color::PRIMARY)
+    } else {
+        ("Strong", theme::color::SUCCESS)
+    }
+}
+
 pub enum QrDisplay {
     Single(qr_code::Data),
     Animated {
@@ -22,6 +44,7 @@ pub enum QrDisplay {
 pub struct ExportScreen {
     pub share: ShareEntry,
     pub passphrase: Zeroizing<String>,
+    pub confirm_passphrase: Zeroizing<String>,
     pub bech32: Option<Zeroizing<String>>,
     pub qr_display: Option<QrDisplay>,
     pub error: Option<String>,
@@ -34,6 +57,7 @@ impl ExportScreen {
         Self {
             share,
             passphrase: Zeroizing::new(String::new()),
+            confirm_passphrase: Zeroizing::new(String::new()),
             bech32: None,
             qr_display: None,
             error: None,
@@ -44,6 +68,7 @@ impl ExportScreen {
 
     pub fn reset(&mut self) {
         self.passphrase = Zeroizing::new(String::new());
+        self.confirm_passphrase = Zeroizing::new(String::new());
         self.bech32 = None;
         self.qr_display = None;
         self.error = None;
@@ -102,12 +127,10 @@ impl ExportScreen {
             .size(theme::size::HEADING)
             .color(theme::color::TEXT);
 
+        let truncated_npub = self.share.truncated_npub();
         let info = text(format!(
-            "Share #{} | {}-of-{} | {}...",
-            self.share.identifier,
-            self.share.threshold,
-            self.share.total_shares,
-            &self.share.group_pubkey_hex[..self.share.group_pubkey_hex.len().min(16)]
+            "Share #{} | {}-of-{} | {}",
+            self.share.identifier, self.share.threshold, self.share.total_shares, truncated_npub,
         ))
         .size(theme::size::SMALL)
         .color(theme::color::TEXT_MUTED);
@@ -119,6 +142,12 @@ impl ExportScreen {
             column![header, info, Space::new().height(theme::space::XL)].spacing(theme::space::SM);
 
         if let (Some(qr_display), Some(bech32)) = (&self.qr_display, &self.bech32) {
+            content = content.push(
+                text("Scan with Keep Android to import this share")
+                    .size(theme::size::BODY)
+                    .color(theme::color::TEXT_MUTED),
+            );
+
             let qr_data = match qr_display {
                 QrDisplay::Single(data) => data,
                 QrDisplay::Animated { frames, current } => &frames[*current],
@@ -171,24 +200,79 @@ impl ExportScreen {
                 ]
                 .spacing(theme::space::SM),
             );
+
+            content = content.push(
+                text("Or copy and paste into Keep Android's import screen")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_DIM),
+            );
+
+            content = content.push(Space::new().height(theme::space::SM));
+            content = content.push(
+                container(
+                    text("Anyone with this export and passphrase can access your signing key share. Do not share it publicly.")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::ERROR),
+                )
+                .style(theme::warning_style)
+                .padding(theme::space::MD)
+                .width(theme::size::INPUT_WIDTH),
+            );
         } else {
-            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
+            content = content.push(theme::label("Passphrase"));
+            content = content.push(
+                text("This passphrase encrypts the share for transport. You'll need it when importing on your phone.")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+            );
+
+            let passphrase_ok = self.passphrase.chars().count() >= MIN_EXPORT_PASSPHRASE_LEN;
+            let passphrases_match = *self.passphrase == *self.confirm_passphrase;
+            let can_generate = passphrase_ok && passphrases_match;
+
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
-                .on_submit_maybe(passphrase_ok.then_some(Message::GenerateExport))
                 .secure(true)
                 .padding(theme::space::MD)
                 .width(theme::size::INPUT_WIDTH);
 
             content = content.push(passphrase_input);
-            if !self.passphrase.is_empty() && !passphrase_ok {
-                content = content.push(
-                    text(format!(
-                        "Passphrase must be at least {MIN_EXPORT_PASSPHRASE_LEN} characters"
-                    ))
-                    .size(theme::size::BODY)
-                    .color(theme::color::ERROR),
-                );
+
+            if !self.passphrase.is_empty() {
+                if !passphrase_ok {
+                    content = content.push(
+                        text(format!(
+                            "Passphrase must be at least {MIN_EXPORT_PASSPHRASE_LEN} characters"
+                        ))
+                        .size(theme::size::BODY)
+                        .color(theme::color::ERROR),
+                    );
+                } else {
+                    let (strength_label, strength_color) = passphrase_strength(&self.passphrase);
+                    content = content.push(
+                        text(format!("Strength: {strength_label}"))
+                            .size(theme::size::SMALL)
+                            .color(strength_color),
+                    );
+                }
+            }
+
+            if passphrase_ok {
+                let confirm_input = text_input("Confirm passphrase", &self.confirm_passphrase)
+                    .on_input(|s| Message::ExportConfirmPassphraseChanged(Zeroizing::new(s)))
+                    .on_submit_maybe(can_generate.then_some(Message::GenerateExport))
+                    .secure(true)
+                    .padding(theme::space::MD)
+                    .width(theme::size::INPUT_WIDTH);
+                content = content.push(confirm_input);
+
+                if !self.confirm_passphrase.is_empty() && !passphrases_match {
+                    content = content.push(
+                        text("Passphrases do not match")
+                            .size(theme::size::BODY)
+                            .color(theme::color::ERROR),
+                    );
+                }
             }
 
             if self.loading {
@@ -197,7 +281,7 @@ impl ExportScreen {
                 let mut btn = button(text("Generate QR Code").size(theme::size::BODY))
                     .style(theme::primary_button)
                     .padding(theme::space::MD);
-                if passphrase_ok {
+                if can_generate {
                     btn = btn.on_press(Message::GenerateExport);
                 }
                 content = content.push(btn);
@@ -213,6 +297,6 @@ impl ExportScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Shares, inner.into())
+        layout::with_sidebar(NavItem::Shares, inner.into(), None)
     }
 }
