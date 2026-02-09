@@ -85,7 +85,11 @@ impl UnlockScreen {
                     ("Confirm Delete", theme::danger_button)
                 } else {
                     (
-                        if self.vault_exists { "Unlock" } else { "Create" },
+                        if self.vault_exists {
+                            "Unlock"
+                        } else {
+                            "Create"
+                        },
                         theme::primary_button,
                     )
                 };

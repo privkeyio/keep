@@ -5,6 +5,7 @@ use iced::widget::{button, column, container, qr_code, row, text, text_input, Sp
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
+use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::message::Message;
 use crate::screen::layout::{self, NavItem};
 use crate::screen::shares::ShareEntry;
@@ -139,7 +140,7 @@ impl ExportScreen {
             let display = if bech32.len() > 80 {
                 format!("{}...", &bech32[..80])
             } else {
-                bech32.to_string()
+                bech32[..].to_owned()
             };
             content = content.push(
                 text(display)
@@ -173,7 +174,7 @@ impl ExportScreen {
         } else {
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
                 .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
-                .on_submit_maybe(if self.passphrase.len() >= 8 {
+                .on_submit_maybe(if self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN {
                     Some(Message::GenerateExport)
                 } else {
                     None
@@ -184,11 +185,15 @@ impl ExportScreen {
 
             content = content.push(passphrase_input);
 
-            let passphrase_ok = self.passphrase.len() >= 8;
+            let passphrase_ok = self.passphrase.len() >= MIN_EXPORT_PASSPHRASE_LEN;
             if !self.passphrase.is_empty() && !passphrase_ok {
-                content = content.push(theme::error_text(
-                    "Passphrase must be at least 8 characters",
-                ));
+                content = content.push(
+                    text(format!(
+                        "Passphrase must be at least {MIN_EXPORT_PASSPHRASE_LEN} characters"
+                    ))
+                    .size(theme::size::BODY)
+                    .color(theme::color::ERROR),
+                );
             }
 
             if self.loading {

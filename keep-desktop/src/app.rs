@@ -24,6 +24,7 @@ use crate::screen::Screen;
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
+pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 12;
 const TOAST_DURATION_SECS: u64 = 3;
 
 #[derive(Clone)]
@@ -60,20 +61,40 @@ fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Optio
     }
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
+fn user_friendly_error(e: &keep_core::error::KeepError) -> String {
+    use keep_core::error::KeepError;
+    match e {
+        KeepError::InvalidPassword => "Invalid password".into(),
+        KeepError::RateLimited(secs) => format!("Too many attempts. Try again in {secs} seconds"),
+        KeepError::DecryptionFailed => {
+            "Decryption failed - wrong password or corrupted data".into()
+        }
+        KeepError::Locked => "Vault is locked".into(),
+        KeepError::AlreadyExists(_) => "Vault already exists".into(),
+        KeepError::NotFound(_) => "Vault not found".into(),
+        KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
+        KeepError::InvalidNsec => "Invalid secret key format".into(),
+        KeepError::InvalidNpub => "Invalid public key format".into(),
+        KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
+        KeepError::KeyNotFound(_) => "Key not found".into(),
+        KeepError::KeyringFull(_) => "Keyring is full".into(),
+        KeepError::Frost(_) => "FROST operation failed".into(),
+        KeepError::FrostErr(_) => "FROST operation failed".into(),
+        _ => {
+            error!("Unmapped error: {e}");
+            "Operation failed".into()
+        }
     }
+}
+
+fn friendly_err(e: keep_core::error::KeepError) -> String {
+    user_friendly_error(&e)
 }
 
 fn collect_shares(keep: &Keep) -> Result<Vec<ShareEntry>, String> {
     keep.frost_list_shares()
         .map(|stored| stored.iter().map(ShareEntry::from_stored).collect())
-        .map_err(|e| e.to_string())
+        .map_err(|e| user_friendly_error(&e))
 }
 
 fn with_keep_blocking<T: Send + 'static>(
@@ -93,7 +114,7 @@ fn with_keep_blocking<T: Send + 'static>(
             r
         }
         Err(payload) => {
-            error!("{}: {}", panic_msg, panic_message(&payload));
+            error!("{}: {:?}", panic_msg, payload.type_id());
             Err(format!("{panic_msg}; please re-unlock your vault"))
         }
     }
@@ -224,22 +245,23 @@ impl App {
                         tokio::task::spawn_blocking(move || {
                             let result = std::panic::catch_unwind(AssertUnwindSafe(
                                 || -> Result<(), String> {
-                                    let mut keep = Keep::open(&path).map_err(|e| e.to_string())?;
-                                    keep.unlock(&password).map_err(|e| e.to_string())?;
+                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
+                                    keep.unlock(&password).map_err(friendly_err)?;
                                     drop(keep);
                                     std::fs::remove_dir_all(&path)
-                                        .map_err(|e| format!("Failed to remove vault: {e}"))
+                                        .map_err(|_| "Failed to remove vault".to_string())
                                 },
                             ));
                             match result {
                                 Ok(r) => r,
                                 Err(payload) => {
-                                    Err(format!("Internal error: {}", panic_message(&payload)))
+                                    error!("Panic during start fresh: {:?}", payload.type_id());
+                                    Err("Internal error; please restart the application".into())
                                 }
                             }
                         })
                         .await
-                        .map_err(|e| e.to_string())?
+                        .map_err(|_| "Background task failed".to_string())?
                     },
                     Message::StartFreshResult,
                 )
@@ -277,6 +299,9 @@ impl App {
                 Task::none()
             }
             Message::GoBack => {
+                if matches!(self.screen, Screen::ShareList(_)) {
+                    return Task::none();
+                }
                 self.copy_feedback_until = None;
                 let shares = self.current_shares();
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
@@ -356,14 +381,15 @@ impl App {
                 }
                 Task::none()
             }
-            Message::CopyToClipboard(t) => {
+            Message::CopyToClipboard(mut t) => {
                 self.clipboard_clear_at =
                     Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
                 self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
                 if let Screen::Export(s) = &mut self.screen {
                     s.copied = true;
                 }
-                iced::clipboard::write(t.to_string())
+                let plain = std::mem::take(&mut *t);
+                iced::clipboard::write(plain)
             }
             Message::ResetExport => {
                 self.copy_feedback_until = None;
@@ -387,7 +413,6 @@ impl App {
             }
             Message::ImportShare => self.handle_import(),
             Message::ImportResult(result) => self.handle_import_result(result),
-
         }
     }
 
@@ -517,13 +542,13 @@ impl App {
                     let result =
                         std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
                             let mut keep = if vault_exists {
-                                Keep::open(&path).map_err(|e| e.to_string())?
+                                Keep::open(&path).map_err(friendly_err)?
                             } else {
-                                Keep::create(&path, &password).map_err(|e| e.to_string())?
+                                Keep::create(&path, &password).map_err(friendly_err)?
                             };
 
                             if vault_exists {
-                                keep.unlock(&password).map_err(|e| e.to_string())?;
+                                keep.unlock(&password).map_err(friendly_err)?;
                             }
 
                             let shares = collect_shares(&keep)?;
@@ -534,13 +559,13 @@ impl App {
                     match result {
                         Ok(r) => r,
                         Err(payload) => {
-                            error!("Panic during unlock: {}", panic_message(&payload));
+                            error!("Panic during unlock: {:?}", payload.type_id());
                             Err("Internal error during unlock".to_string())
                         }
                     }
                 })
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|_| "Background task failed".to_string())?
             },
             Message::UnlockResult,
         )
@@ -584,7 +609,7 @@ impl App {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = None;
                 }
-                self.set_toast(e.to_string(), ToastKind::Error);
+                self.set_toast(user_friendly_error(&e), ToastKind::Error);
             }
             None => {}
         }
@@ -634,13 +659,13 @@ impl App {
                         "Internal error during keyset creation",
                         move |keep| {
                             keep.frost_generate(threshold, total, &name)
-                                .map_err(|e| e.to_string())?;
+                                .map_err(friendly_err)?;
                             collect_shares(keep)
                         },
                     )
                 })
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|_| "Background task failed".to_string())?
             },
             Message::CreateResult,
         )
@@ -649,7 +674,7 @@ impl App {
     fn handle_generate_export(&mut self) -> Task<Message> {
         let (share, passphrase) = match &mut self.screen {
             Screen::Export(s) => {
-                if s.loading || s.passphrase.len() < 8 {
+                if s.loading || s.passphrase.len() < MIN_EXPORT_PASSPHRASE_LEN {
                     return Task::none();
                 }
                 s.loading = true;
@@ -666,14 +691,14 @@ impl App {
                     with_keep_blocking(&keep_arc, "Internal error during export", move |keep| {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(friendly_err)?;
                         let bech32 = export
                             .to_bech32()
                             .map(Zeroizing::new)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(friendly_err)?;
                         let frames: Vec<Zeroizing<String>> = export
                             .to_animated_frames(600)
-                            .map_err(|e| e.to_string())?
+                            .map_err(friendly_err)?
                             .into_iter()
                             .map(Zeroizing::new)
                             .collect();
@@ -681,7 +706,7 @@ impl App {
                     })
                 })
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|_| "Background task failed".to_string())?
             },
             Message::ExportGenerated,
         )
@@ -717,14 +742,14 @@ impl App {
             async move {
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
-                        let export = ShareExport::parse(&data).map_err(|e| e.to_string())?;
+                        let export = ShareExport::parse(&data).map_err(friendly_err)?;
                         keep.frost_import_share(&export, &passphrase)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(friendly_err)?;
                         collect_shares(keep)
                     })
                 })
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|_| "Background task failed".to_string())?
             },
             Message::ImportResult,
         )
