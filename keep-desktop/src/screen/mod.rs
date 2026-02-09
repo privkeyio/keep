@@ -4,6 +4,7 @@
 pub mod create;
 pub mod export;
 pub mod import;
+pub mod layout;
 pub mod shares;
 pub mod unlock;
 

@@ -7,6 +7,7 @@
 mod app;
 mod message;
 mod screen;
+mod theme;
 
 use app::App;
 use iced::{Size, Theme};

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use iced::widget::{button, column, container, text, text_input, Space};
+use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use crate::message::Message;
+use crate::theme;
 
 pub struct UnlockScreen {
     pub password: Zeroizing<String>,
@@ -40,7 +41,8 @@ impl UnlockScreen {
         } else {
             "Create Keep"
         })
-        .size(28);
+        .size(theme::size::TITLE)
+        .color(theme::color::TEXT);
 
         let password_input = text_input("Password", &self.password)
             .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
@@ -53,9 +55,9 @@ impl UnlockScreen {
             .padding(10)
             .width(300);
 
-        let mut col = column![title, Space::new().height(20), password_input,]
+        let mut col = column![title, Space::new().height(theme::space::XL), password_input]
             .align_x(Alignment::Center)
-            .spacing(10)
+            .spacing(theme::space::SM)
             .width(350);
 
         if !self.vault_exists {
@@ -68,7 +70,7 @@ impl UnlockScreen {
             col = col.push(confirm_input);
         }
 
-        col = col.push(Space::new().height(10));
+        col = col.push(Space::new().height(theme::space::SM));
 
         if self.loading {
             let loading_text = if self.start_fresh_confirm {
@@ -76,70 +78,80 @@ impl UnlockScreen {
             } else {
                 "Unlocking..."
             };
-            col = col.push(text(loading_text).size(14));
+            col = col.push(theme::muted(loading_text));
         } else {
-            let label = if self.start_fresh_confirm {
-                "Confirm Delete"
-            } else if self.vault_exists {
-                "Unlock"
-            } else {
-                "Create"
-            };
+            let (label, style): (&str, fn(&iced::Theme, button::Status) -> button::Style) =
+                if self.start_fresh_confirm {
+                    ("Confirm Delete", theme::danger_button)
+                } else {
+                    (
+                        if self.vault_exists { "Unlock" } else { "Create" },
+                        theme::primary_button,
+                    )
+                };
             let msg = if self.start_fresh_confirm {
                 Message::ConfirmStartFresh
             } else {
                 Message::Unlock
             };
-            let btn = button(text(label).width(300).align_x(Alignment::Center))
-                .on_press(msg)
-                .padding(10);
+            let btn = button(
+                text(label)
+                    .width(300)
+                    .align_x(Alignment::Center)
+                    .size(theme::size::BODY),
+            )
+            .on_press(msg)
+            .style(style)
+            .padding(theme::space::MD);
             col = col.push(btn);
         }
 
         if let Some(err) = &self.error {
-            col = col.push(
-                text(err.as_str())
-                    .size(14)
-                    .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-            );
+            col = col.push(theme::error_text(err.as_str()));
         }
 
         if self.vault_exists && !self.loading {
-            col = col.push(Space::new().height(20));
+            col = col.push(Space::new().height(theme::space::XL));
             if self.start_fresh_confirm {
+                col = col.push(theme::error_text(
+                    "Enter your vault password above to confirm deletion.",
+                ));
                 col = col.push(
-                    text("Enter your vault password above to confirm deletion.")
-                        .size(13)
-                        .color(iced::Color::from_rgb(0.8, 0.2, 0.2)),
-                );
-                let can_confirm = !self.password.is_empty();
-                col = col.push(
-                    iced::widget::row![
-                        button(text("Confirm Delete").size(13))
-                            .on_press_maybe(can_confirm.then_some(Message::ConfirmStartFresh))
-                            .padding(6),
-                        button(text("Cancel").size(13))
+                    row![
+                        button(text("Confirm Delete").size(theme::size::SMALL))
+                            .on_press_maybe(
+                                (!self.password.is_empty()).then_some(Message::ConfirmStartFresh),
+                            )
+                            .style(theme::danger_button)
+                            .padding([theme::space::XS, theme::space::MD]),
+                        button(text("Cancel").size(theme::size::SMALL))
                             .on_press(Message::CancelStartFresh)
-                            .padding(6),
+                            .style(theme::secondary_button)
+                            .padding([theme::space::XS, theme::space::MD]),
                     ]
-                    .spacing(10),
+                    .spacing(theme::space::SM),
                 );
             } else {
                 col = col.push(
                     button(
                         text("Start Fresh")
-                            .size(13)
-                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_DIM),
                     )
                     .on_press(Message::StartFresh)
-                    .style(button::text),
+                    .style(theme::text_button),
                 );
             }
         }
 
-        container(col)
+        let card = container(col)
+            .style(theme::card_style)
+            .padding(theme::space::XXXL);
+
+        container(card)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(theme::page_bg)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
