@@ -42,7 +42,6 @@ impl CreateScreen {
 
         let total_input = text_input("3", &self.total)
             .on_input(Message::CreateTotalChanged)
-            .on_submit(Message::CreateKeyset)
             .padding(10)
             .width(80);
 

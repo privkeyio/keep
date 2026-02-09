@@ -84,7 +84,11 @@ impl UnlockScreen {
             };
             col = col.push(theme::muted(loading_text));
         } else if !self.start_fresh_confirm {
-            let label = if self.vault_exists { "Unlock" } else { "Create" };
+            let label = if self.vault_exists {
+                "Unlock"
+            } else {
+                "Create"
+            };
             let btn = button(
                 text(label)
                     .width(300)
@@ -110,9 +114,7 @@ impl UnlockScreen {
                 col = col.push(
                     row![
                         button(text("Confirm Delete").size(theme::size::SMALL))
-                            .on_press_maybe(
-                                has_password.then_some(Message::ConfirmStartFresh),
-                            )
+                            .on_press_maybe(has_password.then_some(Message::ConfirmStartFresh))
                             .style(theme::danger_button)
                             .padding([theme::space::XS, theme::space::MD]),
                         button(text("Cancel").size(theme::size::SMALL))

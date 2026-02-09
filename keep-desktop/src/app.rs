@@ -249,7 +249,7 @@ impl App {
                                     keep.unlock(&password).map_err(friendly_err)?;
                                     drop(keep);
                                     std::fs::remove_dir_all(&path)
-                                        .map_err(|_| "Failed to remove vault".to_string())
+                                        .map_err(|e| format!("Failed to remove vault: {e}"))
                                 },
                             ));
                             match result {
