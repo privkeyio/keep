@@ -1,29 +1,30 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::address::AddressDerivation;
-use crate::error::{BitcoinError, Result};
-use crate::recovery::RecoveryConfig;
+use std::str::FromStr;
+
+use bitcoin::bip32::Xpub;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::{Network, XOnlyPublicKey};
 
-pub fn xpub_to_x_only(xpub: &str, network: Network) -> Result<[u8; 32]> {
-    use bitcoin::bip32::Xpub;
-    use std::str::FromStr;
+use crate::address::AddressDerivation;
+use crate::error::{BitcoinError, Result};
+use crate::recovery::RecoveryConfig;
 
+pub fn xpub_to_x_only(xpub: &str, network: Network) -> Result<[u8; 32]> {
     let parsed =
         Xpub::from_str(xpub).map_err(|e| BitcoinError::Descriptor(format!("invalid xpub: {e}")))?;
 
-    let expected_mainnet = network == Network::Bitcoin;
-    let actual_mainnet = xpub.starts_with("xpub");
-    if expected_mainnet && !actual_mainnet {
-        return Err(BitcoinError::Descriptor(
-            "expected mainnet xpub but got testnet tpub".into(),
-        ));
-    }
-    if !expected_mainnet && actual_mainnet {
-        return Err(BitcoinError::Descriptor(
-            "expected testnet tpub but got mainnet xpub".into(),
-        ));
+    let is_mainnet = network == Network::Bitcoin;
+    let is_mainnet_xpub = xpub.starts_with("xpub");
+    if is_mainnet != is_mainnet_xpub {
+        let (expected, got) = if is_mainnet {
+            ("mainnet xpub", "testnet tpub")
+        } else {
+            ("testnet tpub", "mainnet xpub")
+        };
+        return Err(BitcoinError::Descriptor(format!(
+            "expected {expected} but got {got}"
+        )));
     }
 
     Ok(parsed.to_x_only_pub().serialize())

@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
-    WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
+    KeySlot, WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
+    MAX_XPUB_LENGTH,
 };
 
 const MAX_SESSIONS: usize = 64;
@@ -274,9 +275,8 @@ impl DescriptorSessionManager {
         expected_contributors: HashSet<u16>,
         expected_acks: HashSet<u16>,
     ) -> Result<&mut DescriptorSession> {
-        if self.sessions.contains_key(&session_id) {
-            let session = self.sessions.get(&session_id).unwrap();
-            if !session.is_expired() {
+        if let Some(existing) = self.sessions.get(&session_id) {
+            if !existing.is_expired() {
                 return Err(FrostNetError::Session(
                     "Descriptor session already active".into(),
                 ));
@@ -319,16 +319,7 @@ impl DescriptorSessionManager {
     }
 
     pub fn cleanup_expired(&mut self) {
-        let expired: Vec<[u8; 32]> = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| session.is_expired())
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in expired {
-            self.sessions.remove(&id);
-        }
+        self.sessions.retain(|_, session| !session.is_expired());
     }
 }
 
@@ -346,11 +337,11 @@ fn hash_policy(hasher: &mut Sha256, policy: &WalletPolicy) {
         hasher.update((tier.key_slots.len() as u32).to_le_bytes());
         for slot in &tier.key_slots {
             match slot {
-                crate::protocol::KeySlot::Participant { share_index } => {
+                KeySlot::Participant { share_index } => {
                     hasher.update([0x01]);
                     hasher.update(share_index.to_le_bytes());
                 }
-                crate::protocol::KeySlot::External { xpub, fingerprint } => {
+                KeySlot::External { xpub, fingerprint } => {
                     hasher.update([0x02]);
                     hasher.update((xpub.len() as u32).to_le_bytes());
                     hasher.update(xpub.as_bytes());
@@ -360,6 +351,18 @@ fn hash_policy(hasher: &mut Sha256, policy: &WalletPolicy) {
             }
         }
     }
+}
+
+pub fn participant_indices(policy: &WalletPolicy) -> HashSet<u16> {
+    policy
+        .recovery_tiers
+        .iter()
+        .flat_map(|t| t.key_slots.iter())
+        .filter_map(|s| match s {
+            KeySlot::Participant { share_index } => Some(*share_index),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn derive_policy_hash(policy: &WalletPolicy) -> [u8; 32] {

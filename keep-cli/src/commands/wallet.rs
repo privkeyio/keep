@@ -43,10 +43,11 @@ pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
 
     for desc in &descriptors {
         let group_short = hex::encode(&desc.group_pubkey[..8]);
-        let desc_display = if desc.external_descriptor.chars().count() > 36 {
-            format!("{}...", desc.external_descriptor.chars().take(36).collect::<String>())
+        let ext = &desc.external_descriptor;
+        let desc_display = if ext.len() > 36 {
+            format!("{}...", &ext[..36])
         } else {
-            desc.external_descriptor.clone()
+            ext.clone()
         };
         out.table_row(&[
             (&format!("{group_short}..."), 18, false),
@@ -212,10 +213,7 @@ pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<(
     keep.delete_wallet_descriptor(&group_pubkey)?;
 
     out.newline();
-    out.success(&format!(
-        "Deleted wallet descriptor for group {}",
-        group_hex
-    ));
+    out.success(&format!("Deleted wallet descriptor for group {group_hex}"));
 
     Ok(())
 }

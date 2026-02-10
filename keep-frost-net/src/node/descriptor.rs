@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, FinalizedDescriptor,
+    derive_descriptor_session_id, derive_policy_hash, participant_indices, FinalizedDescriptor,
 };
 use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
@@ -27,16 +27,8 @@ impl KfpNode {
         let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
 
         let our_index = self.share.metadata.identifier;
-
-        let expected_contributors: HashSet<u16> = policy
-            .recovery_tiers
-            .iter()
-            .flat_map(|t| t.key_slots.iter())
-            .filter_map(|s| match s {
-                KeySlot::Participant { share_index } => Some(*share_index),
-                _ => None,
-            })
-            .collect();
+        let expected_contributors = participant_indices(&policy);
+        let we_are_contributor = expected_contributors.contains(&our_index);
 
         let expected_acks: HashSet<u16> = {
             let peers = self.peers.read();
@@ -60,14 +52,6 @@ impl KfpNode {
             )?;
             session.set_initiator(self.keys.public_key());
         }
-
-        let we_are_contributor = policy
-            .recovery_tiers
-            .iter()
-            .flat_map(|t| t.key_slots.iter())
-            .any(
-                |s| matches!(s, KeySlot::Participant { share_index } if *share_index == our_index),
-            );
 
         if we_are_contributor {
             let mut sessions = self.descriptor_sessions.write();
@@ -151,16 +135,9 @@ impl KfpNode {
             "Received descriptor proposal"
         );
 
-        let expected_contributors: HashSet<u16> = payload
-            .policy
-            .recovery_tiers
-            .iter()
-            .flat_map(|t| t.key_slots.iter())
-            .filter_map(|s| match s {
-                KeySlot::Participant { share_index } => Some(*share_index),
-                _ => None,
-            })
-            .collect();
+        let expected_contributors = participant_indices(&payload.policy);
+        let our_index = self.share.metadata.identifier;
+        let we_are_contributor = expected_contributors.contains(&our_index);
 
         {
             let mut sessions = self.descriptor_sessions.write();
@@ -182,16 +159,6 @@ impl KfpNode {
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorProposed {
             session_id: payload.session_id,
         });
-
-        let our_index = self.share.metadata.identifier;
-        let we_are_contributor = payload
-            .policy
-            .recovery_tiers
-            .iter()
-            .flat_map(|t| t.key_slots.iter())
-            .any(
-                |s| matches!(s, KeySlot::Participant { share_index } if *share_index == our_index),
-            );
 
         if !we_are_contributor {
             debug!("We are not a recovery key contributor in this policy");
@@ -279,8 +246,7 @@ impl KfpNode {
             "Received descriptor contribution"
         );
 
-        let all_contributions;
-        {
+        let all_contributions = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
@@ -292,13 +258,13 @@ impl KfpNode {
                 payload.fingerprint,
             )?;
 
-            all_contributions = session.has_all_contributions();
-
             let _ = self.event_tx.send(KfpNodeEvent::DescriptorContributed {
                 session_id: payload.session_id,
                 share_index: payload.share_index,
             });
-        }
+
+            session.has_all_contributions()
+        };
 
         if all_contributions {
             let _ = self.event_tx.send(KfpNodeEvent::DescriptorReady {
@@ -488,16 +454,15 @@ impl KfpNode {
                 .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
         };
 
-        let is_complete;
-        {
+        let is_complete = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             session.add_ack(share_index, payload.descriptor_hash)?;
-            is_complete = session.is_complete();
-        }
+            session.is_complete()
+        };
 
         info!(
             session_id = %hex::encode(payload.session_id),
