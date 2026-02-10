@@ -56,6 +56,9 @@ fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Optio
         Ok(guard) => guard,
         Err(e) => {
             let mut guard = e.into_inner();
+            if let Some(ref mut k) = *guard {
+                k.lock();
+            }
             *guard = None;
             guard
         }
@@ -602,6 +605,11 @@ impl App {
                             let mut keep = Keep::open(&path).map_err(friendly_err)?;
                             keep.unlock(&password).map_err(friendly_err)?;
                             drop(keep);
+                            let meta = std::fs::symlink_metadata(&path)
+                                .map_err(|e| format!("Failed to read vault metadata: {e}"))?;
+                            if meta.file_type().is_symlink() {
+                                return Err("Vault path is a symlink; refusing to delete".into());
+                            }
                             std::fs::remove_dir_all(&path)
                                 .map_err(|e| format!("Failed to remove vault: {e}"))
                         }));

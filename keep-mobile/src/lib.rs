@@ -376,14 +376,14 @@ impl KeepMobile {
             .get_active_share_key()
             .is_some_and(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()));
 
-        self.storage.delete_share_by_key(group_pubkey)?;
-
         if is_active {
+            self.storage.set_active_share_key(None)?;
             self.runtime.block_on(async {
                 *self.node.write().await = None;
             });
-            self.storage.set_active_share_key(None)?;
         }
+
+        self.storage.delete_share_by_key(group_pubkey)?;
 
         Ok(())
     }
@@ -959,7 +959,7 @@ impl KeepMobile {
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
         let key = match self.storage.get_active_share_key() {
             Some(k) => k,
-            None => self.migrate_legacy_share()?,
+            None => self.resolve_active_share()?,
         };
         let data = self.storage.load_share_by_key(key)?;
         let stored: StoredShareData = serde_json::from_slice(&data)
@@ -1001,6 +1001,21 @@ impl KeepMobile {
             last_used: metadata.last_used,
             sign_count: metadata.sign_count,
         })
+    }
+
+    fn resolve_active_share(&self) -> Result<String, KeepMobileError> {
+        let shares = self.storage.list_all_shares();
+        match shares.len() {
+            1 => {
+                let key = hex::encode(&shares[0].group_pubkey);
+                self.storage.set_active_share_key(Some(key.clone()))?;
+                Ok(key)
+            }
+            0 => self.migrate_legacy_share(),
+            _ => Err(KeepMobileError::StorageError {
+                msg: "Multiple shares found, please select one".into(),
+            }),
+        }
     }
 
     fn migrate_legacy_share(&self) -> Result<String, KeepMobileError> {
