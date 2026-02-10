@@ -6,6 +6,29 @@ use crate::recovery::RecoveryConfig;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::{Network, XOnlyPublicKey};
 
+pub fn xpub_to_x_only(xpub: &str, network: Network) -> Result<[u8; 32]> {
+    use bitcoin::bip32::Xpub;
+    use std::str::FromStr;
+
+    let parsed =
+        Xpub::from_str(xpub).map_err(|e| BitcoinError::Descriptor(format!("invalid xpub: {e}")))?;
+
+    let expected_mainnet = network == Network::Bitcoin;
+    let actual_mainnet = xpub.starts_with("xpub");
+    if expected_mainnet && !actual_mainnet {
+        return Err(BitcoinError::Descriptor(
+            "expected mainnet xpub but got testnet tpub".into(),
+        ));
+    }
+    if !expected_mainnet && actual_mainnet {
+        return Err(BitcoinError::Descriptor(
+            "expected testnet tpub but got mainnet xpub".into(),
+        ));
+    }
+
+    Ok(parsed.to_x_only_pub().serialize())
+}
+
 pub struct DescriptorExport {
     pub descriptor: String,
     pub checksum: String,
@@ -283,6 +306,40 @@ mod tests {
         assert!(export.descriptor.starts_with(&format!("tr({xonly},")));
         assert!(export.descriptor.contains("csv="));
         assert!(export.descriptor.contains('#'));
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_testnet() {
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let secret = [42u8; 32];
+
+        let xpriv = Xpriv::new_master(Network::Testnet, &secret).unwrap();
+        let xpub = Xpub::from_priv(&secp, &xpriv);
+        let xpub_str = xpub.to_string();
+
+        let result = xpub_to_x_only(&xpub_str, Network::Testnet).unwrap();
+        let result_xonly = XOnlyPublicKey::from_slice(&result).unwrap();
+
+        assert_eq!(result_xonly, xpub.to_x_only_pub());
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_invalid() {
+        assert!(xpub_to_x_only("not-an-xpub", Network::Testnet).is_err());
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_network_mismatch() {
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let xpriv = Xpriv::new_master(Network::Testnet, &[42u8; 32]).unwrap();
+        let xpub = Xpub::from_priv(&secp, &xpriv);
+        let xpub_str = xpub.to_string();
+
+        assert!(xpub_to_x_only(&xpub_str, Network::Bitcoin).is_err());
     }
 
     #[test]

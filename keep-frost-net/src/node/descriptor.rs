@@ -34,18 +34,15 @@ impl KfpNode {
                 KeySlot::Participant { share_index } => Some(*share_index),
                 _ => None,
             })
-            .filter(|idx| *idx != our_index)
             .collect();
 
         let expected_acks: HashSet<u16> = {
             let peers = self.peers.read();
-            let mut acks: HashSet<u16> = peers
+            peers
                 .get_online_peers()
                 .iter()
                 .map(|p| p.share_index)
-                .collect();
-            acks.insert(our_index);
-            acks
+                .collect()
         };
 
         {

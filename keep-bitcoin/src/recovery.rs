@@ -58,7 +58,45 @@ pub struct TierInfo {
     pub keys: Vec<XOnlyPublicKey>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicyInput {
+    pub primary: PolicyTierInput,
+    pub recovery_tiers: Vec<PolicyTierInput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicyTierInput {
+    pub threshold: u32,
+    pub timelock_months: u32,
+    pub keys: Vec<[u8; 32]>,
+}
+
 impl RecoveryConfig {
+    pub fn from_policy_input(input: &PolicyInput, network: Network) -> Result<Self> {
+        let primary = SpendingTier {
+            keys: input.primary.keys.clone(),
+            threshold: input.primary.threshold,
+        };
+
+        let recovery_tiers = input
+            .recovery_tiers
+            .iter()
+            .map(|tier| RecoveryTier {
+                keys: tier.keys.clone(),
+                threshold: tier.threshold,
+                timelock_months: tier.timelock_months,
+            })
+            .collect();
+
+        let config = Self {
+            primary,
+            recovery_tiers,
+            network,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.primary.keys.is_empty() {
             return Err(BitcoinError::Recovery("primary tier has no keys".into()));
@@ -709,6 +747,91 @@ mod tests {
             network: Network::Testnet,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_from_policy_input_single_tier() {
+        let pk1 = test_keypair(1);
+        let pk2 = test_keypair(2);
+        let pk3 = test_keypair(3);
+
+        let input = PolicyInput {
+            primary: PolicyTierInput {
+                threshold: 1,
+                timelock_months: 0,
+                keys: vec![pk1],
+            },
+            recovery_tiers: vec![PolicyTierInput {
+                threshold: 1,
+                timelock_months: 6,
+                keys: vec![pk2, pk3],
+            }],
+        };
+
+        let config = RecoveryConfig::from_policy_input(&input, Network::Testnet).unwrap();
+        assert_eq!(config.primary.keys.len(), 1);
+        assert_eq!(config.primary.threshold, 1);
+        assert_eq!(config.recovery_tiers.len(), 1);
+        assert_eq!(config.recovery_tiers[0].keys.len(), 2);
+        assert_eq!(config.recovery_tiers[0].threshold, 1);
+        assert_eq!(config.recovery_tiers[0].timelock_months, 6);
+
+        let output = config.build().unwrap();
+        assert!(output.address.to_string().starts_with("tb1p"));
+    }
+
+    #[test]
+    fn test_from_policy_input_multi_tier() {
+        let keys: Vec<[u8; 32]> = (1..=7).map(test_keypair).collect();
+
+        let input = PolicyInput {
+            primary: PolicyTierInput {
+                threshold: 2,
+                timelock_months: 0,
+                keys: vec![keys[0], keys[1], keys[2]],
+            },
+            recovery_tiers: vec![
+                PolicyTierInput {
+                    threshold: 2,
+                    timelock_months: 6,
+                    keys: vec![keys[3], keys[4]],
+                },
+                PolicyTierInput {
+                    threshold: 1,
+                    timelock_months: 12,
+                    keys: vec![keys[5], keys[6]],
+                },
+            ],
+        };
+
+        let config = RecoveryConfig::from_policy_input(&input, Network::Testnet).unwrap();
+        assert_eq!(config.recovery_tiers.len(), 2);
+        assert_eq!(config.recovery_tiers[0].timelock_months, 6);
+        assert_eq!(config.recovery_tiers[1].timelock_months, 12);
+
+        let output = config.build().unwrap();
+        assert_eq!(output.tiers.len(), 3);
+    }
+
+    #[test]
+    fn test_from_policy_input_validates() {
+        let pk1 = test_keypair(1);
+        let pk2 = test_keypair(2);
+
+        let input = PolicyInput {
+            primary: PolicyTierInput {
+                threshold: 5,
+                timelock_months: 0,
+                keys: vec![pk1],
+            },
+            recovery_tiers: vec![PolicyTierInput {
+                threshold: 1,
+                timelock_months: 6,
+                keys: vec![pk2],
+            }],
+        };
+
+        assert!(RecoveryConfig::from_policy_input(&input, Network::Testnet).is_err());
     }
 
     #[test]
