@@ -1005,19 +1005,17 @@ impl KeepMobile {
 
     fn resolve_active_share(&self) -> Result<String, KeepMobileError> {
         let shares = self.storage.list_all_shares();
-        if shares.len() == 1 {
-            let key = hex::encode(&shares[0].group_pubkey);
-            self.storage.set_active_share_key(Some(key.clone()))?;
-            return Ok(key);
-        }
-
-        if shares.len() > 1 {
-            return Err(KeepMobileError::StorageError {
+        match shares.len() {
+            1 => {
+                let key = hex::encode(&shares[0].group_pubkey);
+                self.storage.set_active_share_key(Some(key.clone()))?;
+                Ok(key)
+            }
+            0 => self.migrate_legacy_share(),
+            _ => Err(KeepMobileError::StorageError {
                 msg: "Multiple shares found, please select one".into(),
-            });
+            }),
         }
-
-        self.migrate_legacy_share()
     }
 
     fn migrate_legacy_share(&self) -> Result<String, KeepMobileError> {
