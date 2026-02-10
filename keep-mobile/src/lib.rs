@@ -376,14 +376,14 @@ impl KeepMobile {
             .get_active_share_key()
             .is_some_and(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()));
 
-        self.storage.delete_share_by_key(group_pubkey)?;
-
         if is_active {
+            self.storage.set_active_share_key(None)?;
             self.runtime.block_on(async {
                 *self.node.write().await = None;
             });
-            self.storage.set_active_share_key(None)?;
         }
+
+        self.storage.delete_share_by_key(group_pubkey)?;
 
         Ok(())
     }
@@ -1009,6 +1009,12 @@ impl KeepMobile {
             let key = hex::encode(&shares[0].group_pubkey);
             self.storage.set_active_share_key(Some(key.clone()))?;
             return Ok(key);
+        }
+
+        if shares.len() > 1 {
+            return Err(KeepMobileError::StorageError {
+                msg: "Multiple shares found, please select one".into(),
+            });
         }
 
         self.migrate_legacy_share()
