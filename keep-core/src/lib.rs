@@ -57,6 +57,8 @@ mod rotation;
 pub mod storage;
 /// Ephemeral time-limited secret vault.
 pub mod vault;
+/// Wallet descriptor types for FROST group spending policies.
+pub mod wallet;
 
 use std::path::{Path, PathBuf};
 
@@ -70,6 +72,7 @@ use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, Trus
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 use crate::storage::Storage;
+pub use crate::wallet::WalletDescriptor;
 
 /// The main Keep type for encrypted key management.
 pub struct Keep {
@@ -492,6 +495,41 @@ impl Keep {
                 .with_participants(vec![identifier])
         });
         Ok(())
+    }
+
+    /// Store a finalized wallet descriptor, associated with a FROST group.
+    pub fn store_wallet_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.store_descriptor(descriptor)
+    }
+
+    /// Get the wallet descriptor for a FROST group.
+    pub fn get_wallet_descriptor(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Option<WalletDescriptor>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_descriptor(group_pubkey)
+    }
+
+    /// List all stored wallet descriptors.
+    pub fn list_wallet_descriptors(&self) -> Result<Vec<WalletDescriptor>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_descriptors()
+    }
+
+    /// Delete a wallet descriptor.
+    pub fn delete_wallet_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.delete_descriptor(group_pubkey)
     }
 
     /// Get a FROST share by group public key.

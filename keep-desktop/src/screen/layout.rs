@@ -12,6 +12,7 @@ pub enum NavItem {
     Shares,
     Create,
     Import,
+    Wallets,
 }
 
 pub fn with_sidebar<'a>(
@@ -23,6 +24,7 @@ pub fn with_sidebar<'a>(
         ("Shares", Message::NavigateShares, NavItem::Shares),
         ("Create", Message::GoToCreate, NavItem::Create),
         ("Import", Message::GoToImport, NavItem::Import),
+        ("Wallets", Message::NavigateWallets, NavItem::Wallets),
     ];
 
     let mut nav = column![].spacing(theme::space::XS);

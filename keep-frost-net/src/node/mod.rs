@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+mod descriptor;
 mod ecdh;
 mod signing;
 
@@ -21,6 +22,7 @@ use keep_core::frost::SharePackage;
 
 use crate::attestation::{verify_peer_attestation, ExpectedPcrs};
 use crate::audit::SigningAuditLog;
+use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
@@ -135,6 +137,31 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+    DescriptorProposed {
+        session_id: [u8; 32],
+    },
+    DescriptorContributionNeeded {
+        session_id: [u8; 32],
+        policy: WalletPolicy,
+        network: String,
+        initiator_pubkey: PublicKey,
+    },
+    DescriptorContributed {
+        session_id: [u8; 32],
+        share_index: u16,
+    },
+    DescriptorReady {
+        session_id: [u8; 32],
+    },
+    DescriptorComplete {
+        session_id: [u8; 32],
+        external_descriptor: String,
+        internal_descriptor: String,
+    },
+    DescriptorFailed {
+        session_id: [u8; 32],
+        error: String,
+    },
 }
 
 pub struct KfpNode {
@@ -144,6 +171,7 @@ pub struct KfpNode {
     pub(crate) group_pubkey: [u8; 32],
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
     pub(crate) ecdh_sessions: Arc<RwLock<EcdhSessionManager>>,
+    pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) peers: Arc<RwLock<PeerManager>>,
     pub(crate) policies: Arc<RwLock<HashMap<PublicKey, PeerPolicy>>>,
     pub(crate) hooks: RwLock<Arc<dyn SigningHooks>>,
@@ -241,6 +269,7 @@ impl KfpNode {
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
             ecdh_sessions: Arc::new(RwLock::new(EcdhSessionManager::new())),
+            descriptor_sessions: Arc::new(RwLock::new(DescriptorSessionManager::new())),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
             policies: Arc::new(RwLock::new(HashMap::new())),
             hooks: RwLock::new(Arc::new(NoOpHooks)),
@@ -517,6 +546,8 @@ impl KfpNode {
                 }
                 _ = cleanup_interval.tick() => {
                     self.sessions.write().cleanup_expired();
+                    self.ecdh_sessions.write().cleanup_expired();
+                    self.descriptor_sessions.write().cleanup_expired();
                 }
                 notification = notifications.recv() => {
                     match notification {
@@ -609,6 +640,21 @@ impl KfpNode {
                 if let Some(sid) = msg.session_id() {
                     warn!(session_id = %hex::encode(sid), "Distributed refresh not yet implemented");
                 }
+            }
+            KfpMessage::DescriptorPropose(payload) => {
+                self.handle_descriptor_propose(event.pubkey, payload)
+                    .await?;
+            }
+            KfpMessage::DescriptorContribute(payload) => {
+                self.handle_descriptor_contribute(event.pubkey, payload)
+                    .await?;
+            }
+            KfpMessage::DescriptorFinalize(payload) => {
+                self.handle_descriptor_finalize(event.pubkey, payload)
+                    .await?;
+            }
+            KfpMessage::DescriptorAck(payload) => {
+                self.handle_descriptor_ack(event.pubkey, payload).await?;
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

@@ -7,6 +7,7 @@ pub mod import;
 pub mod layout;
 pub mod shares;
 pub mod unlock;
+pub mod wallet;
 
 use crate::message::Message;
 
@@ -16,6 +17,7 @@ pub enum Screen {
     Create(create::CreateScreen),
     Export(Box<export::ExportScreen>),
     Import(import::ImportScreen),
+    Wallet(wallet::WalletScreen),
 }
 
 impl Screen {
@@ -26,6 +28,7 @@ impl Screen {
             Screen::Create(s) => s.view(),
             Screen::Export(s) => s.view(),
             Screen::Import(s) => s.view(),
+            Screen::Wallet(s) => s.view(),
         }
     }
 
@@ -47,7 +50,7 @@ impl Screen {
                 s.loading = false;
                 s.error = Some(error);
             }
-            Screen::ShareList(_) => {}
+            Screen::ShareList(_) | Screen::Wallet(_) => {}
         }
     }
 }

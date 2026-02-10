@@ -11,6 +11,7 @@ pub mod frost_network;
 pub mod migrate;
 pub mod serve;
 pub mod vault;
+pub mod wallet;
 
 use dialoguer::{theme::ColorfulTheme, Confirm, Password};
 use secrecy::SecretString;

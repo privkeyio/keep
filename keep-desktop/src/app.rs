@@ -19,6 +19,7 @@ use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
+use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
 
 const AUTO_LOCK_SECS: u64 = 300;
@@ -264,6 +265,39 @@ impl App {
                 self.screen = Screen::ShareList(ShareListScreen::new(shares));
                 Task::none()
             }
+            Message::NavigateWallets => {
+                if matches!(self.screen, Screen::Wallet(_)) {
+                    return Task::none();
+                }
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let guard = lock_keep(&keep_arc);
+                            let Some(keep) = guard.as_ref() else {
+                                return Err("Keep not available".to_string());
+                            };
+                            keep.list_wallet_descriptors()
+                                .map(|ds| ds.iter().map(WalletEntry::from_descriptor).collect())
+                                .map_err(friendly_err)
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::WalletsLoaded,
+                )
+            }
+            Message::WalletsLoaded(result) => {
+                match result {
+                    Ok(entries) => {
+                        self.screen = Screen::Wallet(WalletScreen::new(entries));
+                    }
+                    Err(e) => {
+                        self.set_toast(e, ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
             Message::Lock => self.do_lock(),
 
             Message::ToggleShareDetails(i) => {
@@ -379,6 +413,13 @@ impl App {
             Message::ImportResult(result) => self.handle_import_result(result),
 
             Message::CopyNpub(npub) => iced::clipboard::write(npub),
+            Message::CopyDescriptor(desc) => iced::clipboard::write(desc),
+            Message::ToggleWalletDetails(i) => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
+                }
+                Task::none()
+            }
         }
     }
 

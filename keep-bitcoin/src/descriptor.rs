@@ -1,8 +1,34 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::str::FromStr;
+
+use bitcoin::bip32::Xpub;
+use bitcoin::hashes::{hash160, Hash};
+use bitcoin::{Network, XOnlyPublicKey};
+
 use crate::address::AddressDerivation;
 use crate::error::{BitcoinError, Result};
-use bitcoin::Network;
+use crate::recovery::RecoveryConfig;
+
+pub fn xpub_to_x_only(xpub: &str, network: Network) -> Result<[u8; 32]> {
+    let parsed =
+        Xpub::from_str(xpub).map_err(|e| BitcoinError::Descriptor(format!("invalid xpub: {e}")))?;
+
+    let is_mainnet = network == Network::Bitcoin;
+    let is_mainnet_xpub = xpub.starts_with("xpub");
+    if is_mainnet != is_mainnet_xpub {
+        let (expected, got) = if is_mainnet {
+            ("mainnet xpub", "testnet tpub")
+        } else {
+            ("testnet tpub", "mainnet xpub")
+        };
+        return Err(BitcoinError::Descriptor(format!(
+            "expected {expected} but got {got}"
+        )));
+    }
+
+    Ok(parsed.to_x_only_pub().serialize())
+}
 
 pub struct DescriptorExport {
     pub descriptor: String,
@@ -31,6 +57,44 @@ impl DescriptorExport {
         })
     }
 
+    pub fn from_frost_wallet(
+        group_pubkey: &[u8; 32],
+        recovery: Option<&RecoveryConfig>,
+        network: Network,
+    ) -> Result<Self> {
+        let xonly = XOnlyPublicKey::from_slice(group_pubkey)
+            .map_err(|e| BitcoinError::Descriptor(format!("invalid group pubkey: {e}")))?;
+        let fingerprint = Self::pubkey_fingerprint(group_pubkey);
+
+        let (descriptor, checksum) = match recovery {
+            None => {
+                let desc = format!("tr({xonly})");
+                let checksum = compute_checksum(&desc)?;
+                (format!("{desc}#{checksum}"), checksum)
+            }
+            Some(config) => {
+                let output = config.build_with_internal_key(&xonly)?;
+                let checksum = compute_checksum(&output.descriptor)?;
+                (format!("{}#{checksum}", output.descriptor), checksum)
+            }
+        };
+
+        Ok(Self {
+            descriptor,
+            checksum,
+            fingerprint,
+            network,
+        })
+    }
+
+    pub fn pubkey_fingerprint(pubkey: &[u8; 32]) -> String {
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02;
+        compressed[1..].copy_from_slice(pubkey);
+        let h = hash160::Hash::hash(&compressed);
+        hex::encode(&h[..4])
+    }
+
     pub fn external_descriptor(&self) -> &str {
         &self.descriptor
     }
@@ -41,6 +105,10 @@ impl DescriptorExport {
             .split('#')
             .next()
             .unwrap_or(&self.descriptor);
+        if !desc.contains("/0/*)") {
+            let checksum = compute_checksum(desc)?;
+            return Ok(format!("{desc}#{checksum}"));
+        }
         let internal = desc.replace("/0/*)", "/1/*)");
         let checksum = compute_checksum(&internal)?;
         Ok(format!("{internal}#{checksum}"))
@@ -180,5 +248,114 @@ mod tests {
 
         assert!(json.contains("test-wallet"));
         assert!(json.contains("testnet"));
+    }
+
+    fn test_group_pubkey() -> [u8; 32] {
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let secret = [42u8; 32];
+        let kp = Keypair::from_seckey_slice(&secp, &secret).unwrap();
+        kp.x_only_public_key().0.serialize()
+    }
+
+    fn test_keypair(seed: u8) -> [u8; 32] {
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let mut secret = [seed; 32];
+        secret[0] = seed.wrapping_add(1);
+        let kp = Keypair::from_seckey_slice(&secp, &secret).unwrap();
+        kp.x_only_public_key().0.serialize()
+    }
+
+    #[test]
+    fn test_frost_wallet_simple_descriptor() {
+        let group_pk = test_group_pubkey();
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, None, Network::Testnet).unwrap();
+
+        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
+        let expected_prefix = format!("tr({xonly})#");
+        assert!(export.descriptor.starts_with(&expected_prefix));
+        assert!(export.descriptor.contains("tr("));
+        assert!(!export.descriptor.contains(','));
+    }
+
+    #[test]
+    fn test_frost_wallet_with_recovery() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
+
+        let group_pk = test_group_pubkey();
+        let pk1 = test_keypair(1);
+        let pk2 = test_keypair(2);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Testnet)
+                .unwrap();
+
+        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
+        assert!(export.descriptor.starts_with(&format!("tr({xonly},")));
+        assert!(export.descriptor.contains("csv="));
+        assert!(export.descriptor.contains('#'));
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_testnet() {
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let secret = [42u8; 32];
+
+        let xpriv = Xpriv::new_master(Network::Testnet, &secret).unwrap();
+        let xpub = Xpub::from_priv(&secp, &xpriv);
+        let xpub_str = xpub.to_string();
+
+        let result = xpub_to_x_only(&xpub_str, Network::Testnet).unwrap();
+        let result_xonly = XOnlyPublicKey::from_slice(&result).unwrap();
+
+        assert_eq!(result_xonly, xpub.to_x_only_pub());
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_invalid() {
+        assert!(xpub_to_x_only("not-an-xpub", Network::Testnet).is_err());
+    }
+
+    #[test]
+    fn test_xpub_to_x_only_network_mismatch() {
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let xpriv = Xpriv::new_master(Network::Testnet, &[42u8; 32]).unwrap();
+        let xpub = Xpub::from_priv(&secp, &xpriv);
+        let xpub_str = xpub.to_string();
+
+        assert!(xpub_to_x_only(&xpub_str, Network::Bitcoin).is_err());
+    }
+
+    #[test]
+    fn test_frost_wallet_descriptor_has_checksum() {
+        let group_pk = test_group_pubkey();
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, None, Network::Testnet).unwrap();
+
+        assert!(export.descriptor.contains('#'));
+        assert_eq!(export.checksum.len(), 8);
+
+        let parts: Vec<&str> = export.descriptor.split('#').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], export.checksum);
     }
 }

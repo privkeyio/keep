@@ -10,7 +10,8 @@ use tokio::time::timeout;
 use k256::schnorr::SigningKey;
 use keep_core::frost::{ThresholdConfig, TrustedDealer};
 use keep_frost_net::{
-    AnnouncePayload, KfpMessage, KfpNode, SessionManager, SessionState, SignRequestPayload,
+    AnnouncePayload, KeySlot, KfpMessage, KfpNode, KfpNodeEvent, PolicyTier, SessionManager,
+    SessionState, SignRequestPayload, WalletPolicy,
 };
 use nostr_relay_builder::prelude::*;
 
@@ -387,4 +388,178 @@ async fn test_full_signing_flow() {
             panic!("Signing timed out after 60 seconds");
         }
     }
+}
+
+#[tokio::test]
+#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
+async fn test_descriptor_coordination_flow() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-descriptor").unwrap();
+
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 1");
+
+    let mut node2 = KfpNode::new(share2, vec![relay])
+        .await
+        .expect("Failed to create node 2");
+
+    let node1_pubkey = node1.pubkey();
+
+    let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
+
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node1_for_run = Arc::clone(&node1);
+    let node2_for_run = Arc::clone(&node2);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1_for_run.run().await;
+    });
+
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2_for_run.run().await;
+    });
+
+    let mut node1_peers = 0u32;
+    let mut node2_peers = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        loop {
+            tokio::select! {
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => {
+                    node1_peers += 1;
+                }
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => {
+                    node2_peers += 1;
+                }
+            }
+            if node1_peers >= 1 && node2_peers >= 1 {
+                return;
+            }
+        }
+    })
+    .await;
+
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        panic!("Peer discovery timed out: node1={node1_peers}, node2={node2_peers}");
+    }
+
+    let policy = WalletPolicy {
+        recovery_tiers: vec![PolicyTier {
+            threshold: 1,
+            key_slots: vec![
+                KeySlot::Participant { share_index: 1 },
+                KeySlot::Participant { share_index: 2 },
+            ],
+            timelock_months: 6,
+        }],
+    };
+
+    let session_id = node1
+        .request_descriptor(policy, "signet", "xpub_node1", "aabbccdd")
+        .await
+        .expect("request_descriptor failed");
+
+    let contribution_needed = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(KfpNodeEvent::DescriptorContributionNeeded {
+                session_id: sid, ..
+            }) = rx2.recv().await
+            {
+                return sid;
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for DescriptorContributionNeeded on node2");
+
+    assert_eq!(contribution_needed, session_id);
+
+    node2
+        .contribute_descriptor(session_id, &node1_pubkey, "xpub_node2", "11223344")
+        .await
+        .expect("contribute_descriptor failed");
+
+    let ready = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(KfpNodeEvent::DescriptorReady { session_id: sid }) = rx1.recv().await {
+                return sid;
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for DescriptorReady on node1");
+
+    assert_eq!(ready, session_id);
+
+    let external_desc = "tr(deadbeef,{pk(xpub_node1),pk(xpub_node2)})";
+    let internal_desc = "tr(deadbeef,{pk(xpub_node1),pk(xpub_node2)})/1";
+    let policy_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"test-policy");
+        let h: [u8; 32] = hasher.finalize().into();
+        h
+    };
+
+    node1
+        .finalize_descriptor(session_id, external_desc, internal_desc, policy_hash)
+        .await
+        .expect("finalize_descriptor failed");
+
+    let node2_complete = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(KfpNodeEvent::DescriptorComplete {
+                session_id: sid,
+                external_descriptor,
+                internal_descriptor,
+            }) = rx2.recv().await
+            {
+                return (sid, external_descriptor, internal_descriptor);
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for DescriptorComplete on node2");
+
+    assert_eq!(node2_complete.0, session_id);
+    assert_eq!(node2_complete.1, external_desc);
+    assert_eq!(node2_complete.2, internal_desc);
+
+    let node1_complete = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(KfpNodeEvent::DescriptorComplete {
+                session_id: sid,
+                external_descriptor,
+                internal_descriptor,
+            }) = rx1.recv().await
+            {
+                return (sid, external_descriptor, internal_descriptor);
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for DescriptorComplete on node1 (all ACKs)");
+
+    assert_eq!(node1_complete.0, session_id);
+    assert_eq!(node1_complete.1, external_desc);
+    assert_eq!(node1_complete.2, internal_desc);
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
 }

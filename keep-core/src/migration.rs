@@ -9,7 +9,7 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// The current schema version supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
@@ -24,8 +24,22 @@ pub struct Migration {
     pub migrate: MigrationFn,
 }
 
+const DESCRIPTORS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("wallet_descriptors");
+
+fn migrate_v1_to_v2(db: &Database) -> Result<()> {
+    let wtxn = db.begin_write()?;
+    wtxn.open_table(DESCRIPTORS_TABLE_DEF)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
 fn get_migrations() -> Vec<Migration> {
-    vec![]
+    vec![Migration {
+        from_version: 1,
+        to_version: 2,
+        migrate: migrate_v1_to_v2,
+    }]
 }
 
 /// Read the schema version from the database.
