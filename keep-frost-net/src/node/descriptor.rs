@@ -390,28 +390,30 @@ impl KfpNode {
 
         {
             let sessions = self.descriptor_sessions.read();
-            if let Some(session) = sessions.get_session(&payload.session_id) {
-                if let Some(initiator) = session.initiator() {
-                    if *initiator != sender {
-                        let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                            session_id: payload.session_id,
-                            error: "Finalize from non-initiator".into(),
-                        });
-                        return Err(FrostNetError::Session(
-                            "DescriptorFinalize sender is not the session initiator".into(),
-                        ));
-                    }
-                }
-                let expected_hash = derive_policy_hash(session.policy());
-                if payload.policy_hash != expected_hash {
+            let session = sessions
+                .get_session(&payload.session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+
+            if let Some(initiator) = session.initiator() {
+                if *initiator != sender {
                     let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
                         session_id: payload.session_id,
-                        error: "Policy hash mismatch".into(),
+                        error: "Finalize from non-initiator".into(),
                     });
                     return Err(FrostNetError::Session(
-                        "Policy hash does not match proposal".into(),
+                        "DescriptorFinalize sender is not the session initiator".into(),
                     ));
                 }
+            }
+            let expected_hash = derive_policy_hash(session.policy());
+            if payload.policy_hash != expected_hash {
+                let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                    session_id: payload.session_id,
+                    error: "Policy hash mismatch".into(),
+                });
+                return Err(FrostNetError::Session(
+                    "Policy hash does not match proposal".into(),
+                ));
             }
         }
 
