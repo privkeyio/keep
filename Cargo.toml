@@ -97,3 +97,9 @@ anyhow = "1.0"
 
 # Testing
 tempfile = "3.10"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
