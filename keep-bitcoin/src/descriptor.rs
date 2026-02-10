@@ -65,20 +65,18 @@ impl DescriptorExport {
             .map_err(|e| BitcoinError::Descriptor(format!("invalid group pubkey: {e}")))?;
         let fingerprint = Self::pubkey_fingerprint(group_pubkey);
 
-        let descriptor = match recovery {
+        let (descriptor, checksum) = match recovery {
             None => {
                 let desc = format!("tr({xonly})");
                 let checksum = compute_checksum(&desc)?;
-                format!("{desc}#{checksum}")
+                (format!("{desc}#{checksum}"), checksum)
             }
             Some(config) => {
                 let output = config.build_with_internal_key(&xonly)?;
                 let checksum = compute_checksum(&output.descriptor)?;
-                format!("{}#{checksum}", output.descriptor)
+                (format!("{}#{checksum}", output.descriptor), checksum)
             }
         };
-
-        let checksum = descriptor.split('#').nth(1).unwrap_or("").to_string();
 
         Ok(Self {
             descriptor,

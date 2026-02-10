@@ -43,8 +43,8 @@ pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
 
     for desc in &descriptors {
         let group_short = hex::encode(&desc.group_pubkey[..8]);
-        let desc_display = if desc.external_descriptor.len() > 36 {
-            format!("{}...", &desc.external_descriptor[..36])
+        let desc_display = if desc.external_descriptor.chars().count() > 36 {
+            format!("{}...", desc.external_descriptor.chars().take(36).collect::<String>())
         } else {
             desc.external_descriptor.clone()
         };
@@ -121,23 +121,31 @@ pub fn cmd_wallet_export(
             println!("{}", desc.internal_descriptor);
         }
         WalletExportFormat::Sparrow => {
-            let network = crate::commands::bitcoin::parse_network(&desc.network)?;
-            let export = keep_bitcoin::DescriptorExport::from_frost_wallet(
-                &desc.group_pubkey,
-                None,
-                network,
-            )
-            .map_err(|e| KeepError::Runtime(e.to_string()))?;
-
+            let network_str = match desc.network.as_str() {
+                "bitcoin" => "mainnet",
+                other => other,
+            };
             let group_short = hex::encode(&desc.group_pubkey[..8]);
-            let json = export
-                .to_sparrow_json(&format!("frost-{group_short}"))
+            let coin_type = if desc.network == "bitcoin" { 0 } else { 1 };
+
+            let json = serde_json::json!({
+                "name": format!("frost-{group_short}"),
+                "network": network_str,
+                "keystore": {
+                    "type": "bip39",
+                    "derivation": format!("m/86'/{coin_type}'/0'"),
+                },
+                "outputDescriptor": desc.external_descriptor,
+                "changeDescriptor": desc.internal_descriptor,
+            });
+
+            let json_str = serde_json::to_string_pretty(&json)
                 .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
             out.newline();
             out.header("Sparrow Wallet Export");
             out.newline();
-            println!("{json}");
+            println!("{json_str}");
         }
     }
 

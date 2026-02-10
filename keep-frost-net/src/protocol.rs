@@ -250,6 +250,9 @@ impl KfpMessage {
                 if p.initiator_fingerprint.len() > MAX_FINGERPRINT_LENGTH {
                     return Err("Initiator fingerprint exceeds maximum length");
                 }
+                if p.policy.recovery_tiers.is_empty() {
+                    return Err("Policy must have at least one recovery tier");
+                }
                 if p.policy.recovery_tiers.len() > MAX_RECOVERY_TIERS {
                     return Err("Too many recovery tiers");
                 }
@@ -827,6 +830,7 @@ pub struct DescriptorContributePayload {
     pub share_index: u16,
     pub account_xpub: String,
     pub fingerprint: String,
+    pub created_at: u64,
 }
 
 impl DescriptorContributePayload {
@@ -843,7 +847,12 @@ impl DescriptorContributePayload {
             share_index,
             account_xpub: account_xpub.to_string(),
             fingerprint: fingerprint.to_string(),
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -857,6 +866,7 @@ pub struct DescriptorFinalizePayload {
     pub internal_descriptor: String,
     #[serde(with = "hex_bytes")]
     pub policy_hash: [u8; 32],
+    pub created_at: u64,
 }
 
 impl DescriptorFinalizePayload {
@@ -873,7 +883,12 @@ impl DescriptorFinalizePayload {
             external_descriptor: external_descriptor.to_string(),
             internal_descriptor: internal_descriptor.to_string(),
             policy_hash,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -885,6 +900,7 @@ pub struct DescriptorAckPayload {
     pub group_pubkey: [u8; 32],
     #[serde(with = "hex_bytes")]
     pub descriptor_hash: [u8; 32],
+    pub created_at: u64,
 }
 
 impl DescriptorAckPayload {
@@ -893,7 +909,12 @@ impl DescriptorAckPayload {
             session_id,
             group_pubkey,
             descriptor_hash,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 

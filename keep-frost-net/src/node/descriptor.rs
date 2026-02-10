@@ -42,6 +42,7 @@ impl KfpNode {
                 .get_online_peers()
                 .iter()
                 .map(|p| p.share_index)
+                .filter(|idx| *idx != our_index)
                 .collect()
         };
 
@@ -127,7 +128,7 @@ impl KfpNode {
 
     pub(crate) async fn handle_descriptor_propose(
         &self,
-        _sender: PublicKey,
+        sender: PublicKey,
         payload: DescriptorProposePayload,
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
@@ -172,6 +173,7 @@ impl KfpNode {
                 session_id: payload.session_id,
                 policy: payload.policy,
                 network: payload.network,
+                initiator_pubkey: sender,
             });
 
         Ok(())
@@ -225,12 +227,14 @@ impl KfpNode {
 
     pub(crate) async fn handle_descriptor_contribute(
         &self,
-        _sender: PublicKey,
+        sender: PublicKey,
         payload: DescriptorContributePayload,
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
         }
+
+        self.verify_peer_share_index(sender, payload.share_index)?;
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -346,8 +350,13 @@ impl KfpNode {
             "Received finalized descriptor"
         );
 
-        let descriptor_hash: [u8; 32] =
-            Sha256::digest(payload.external_descriptor.as_bytes()).into();
+        let descriptor_hash: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(payload.external_descriptor.as_bytes());
+            hasher.update(payload.internal_descriptor.as_bytes());
+            hasher.update(payload.policy_hash);
+            hasher.finalize().into()
+        };
 
         let ack = DescriptorAckPayload::new(payload.session_id, self.group_pubkey, descriptor_hash);
         let msg = KfpMessage::DescriptorAck(ack);

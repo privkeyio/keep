@@ -144,6 +144,7 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         policy: WalletPolicy,
         network: String,
+        initiator_pubkey: PublicKey,
     },
     DescriptorContributed {
         session_id: [u8; 32],
@@ -545,6 +546,8 @@ impl KfpNode {
                 }
                 _ = cleanup_interval.tick() => {
                     self.sessions.write().cleanup_expired();
+                    self.ecdh_sessions.write().cleanup_expired();
+                    self.descriptor_sessions.write().cleanup_expired();
                 }
                 notification = notifications.recv() => {
                     match notification {

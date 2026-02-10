@@ -138,6 +138,18 @@ impl DescriptorSession {
             ));
         }
 
+        if !self.has_all_contributions() {
+            let missing: Vec<u16> = self
+                .expected_contributors
+                .iter()
+                .filter(|idx| !self.contributions.contains_key(idx))
+                .copied()
+                .collect();
+            return Err(FrostNetError::Session(format!(
+                "Missing contributions from share(s): {missing:?}"
+            )));
+        }
+
         self.descriptor = Some(descriptor);
         self.state = DescriptorSessionState::Finalized;
         Ok(())
@@ -161,6 +173,8 @@ impl DescriptorSession {
 
         let mut hasher = Sha256::new();
         hasher.update(finalized.external.as_bytes());
+        hasher.update(finalized.internal.as_bytes());
+        hasher.update(finalized.policy_hash);
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
         if descriptor_hash != expected_hash {
@@ -332,9 +346,11 @@ mod tests {
         )
     }
 
-    fn descriptor_hash(external: &str) -> [u8; 32] {
+    fn descriptor_hash(external: &str, internal: &str, policy_hash: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(external.as_bytes());
+        hasher.update(internal.as_bytes());
+        hasher.update(policy_hash);
         hasher.finalize().into()
     }
 
@@ -454,14 +470,16 @@ mod tests {
             .unwrap();
 
         let external = "tr(frost_key,{pk(xpub1),pk(xpub2)})";
+        let internal = "tr(frost_key,{pk(xpub1),pk(xpub2)})/1";
+        let policy_hash = [0xAA; 32];
         let finalized = FinalizedDescriptor {
             external: external.into(),
-            internal: "tr(frost_key,{pk(xpub1),pk(xpub2)})/1".into(),
-            policy_hash: [0xAA; 32],
+            internal: internal.into(),
+            policy_hash,
         };
         session.set_finalized(finalized).unwrap();
 
-        let hash = descriptor_hash(external);
+        let hash = descriptor_hash(external, internal, &policy_hash);
 
         session.add_ack(1, hash).unwrap();
         assert!(!session.is_complete());

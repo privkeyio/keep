@@ -488,6 +488,8 @@ impl Storage {
             if descriptor.group_pubkey != original.group_pubkey
                 || descriptor.external_descriptor != original.external_descriptor
                 || descriptor.internal_descriptor != original.internal_descriptor
+                || descriptor.network != original.network
+                || descriptor.created_at != original.created_at
             {
                 return Err(KeepError::RotationFailed(format!(
                     "descriptor for group {} content mismatch after rotation",
