@@ -366,8 +366,8 @@ impl KfpNode {
                 .get_session(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
-            if let Some(initiator) = session.initiator() {
-                if *initiator != sender {
+            match session.initiator() {
+                Some(initiator) if *initiator != sender => {
                     let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
                         session_id: payload.session_id,
                         error: "Finalize from non-initiator".into(),
@@ -376,6 +376,16 @@ impl KfpNode {
                         "DescriptorFinalize sender is not the session initiator".into(),
                     ));
                 }
+                None => {
+                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                        session_id: payload.session_id,
+                        error: "Missing initiator".into(),
+                    });
+                    return Err(FrostNetError::Session(
+                        "DescriptorFinalize missing session initiator".into(),
+                    ));
+                }
+                Some(_) => {}
             }
             let expected_hash = derive_policy_hash(session.policy());
             if payload.policy_hash != expected_hash {

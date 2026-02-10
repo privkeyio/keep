@@ -244,8 +244,14 @@ impl KfpMessage {
                 if p.network.is_empty() {
                     return Err("Network must not be empty");
                 }
+                if p.initiator_xpub.is_empty() {
+                    return Err("Initiator xpub cannot be empty");
+                }
                 if p.initiator_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Initiator xpub exceeds maximum length");
+                }
+                if p.initiator_fingerprint.is_empty() {
+                    return Err("Initiator fingerprint cannot be empty");
                 }
                 if p.initiator_fingerprint.len() > MAX_FINGERPRINT_LENGTH {
                     return Err("Initiator fingerprint exceeds maximum length");
@@ -282,8 +288,14 @@ impl KfpMessage {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
                 }
+                if p.account_xpub.is_empty() {
+                    return Err("Account xpub cannot be empty");
+                }
                 if p.account_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Account xpub exceeds maximum length");
+                }
+                if p.fingerprint.is_empty() {
+                    return Err("Fingerprint cannot be empty");
                 }
                 if p.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
                     return Err("Fingerprint exceeds maximum length");
