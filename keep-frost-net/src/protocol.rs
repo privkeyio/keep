@@ -290,6 +290,12 @@ impl KfpMessage {
                 }
             }
             KfpMessage::DescriptorFinalize(p) => {
+                if p.external_descriptor.is_empty() {
+                    return Err("External descriptor cannot be empty");
+                }
+                if p.internal_descriptor.is_empty() {
+                    return Err("Internal descriptor cannot be empty");
+                }
                 if p.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
                     return Err("External descriptor exceeds maximum length");
                 }

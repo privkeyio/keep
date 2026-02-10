@@ -8,8 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
-    KeySlot, WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
-    MAX_XPUB_LENGTH,
+    KeySlot, WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
 };
 
 const MAX_SESSIONS: usize = 64;

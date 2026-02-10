@@ -118,13 +118,13 @@ pub fn cmd_wallet_export(
             out.field("Internal (change)", &desc.internal_descriptor);
         }
         WalletExportFormat::Sparrow => {
-            let network_str = match desc.network.as_str() {
-                "bitcoin" => "mainnet",
-                other => other,
-            };
+            let is_mainnet = desc.network == "bitcoin" || desc.network == "mainnet";
+            let network_str = if is_mainnet { "mainnet" } else { &desc.network };
             let group_short = hex::encode(&desc.group_pubkey[..8]);
-            let coin_type = if desc.network == "bitcoin" { 0 } else { 1 };
+            let coin_type = if is_mainnet { 0 } else { 1 };
 
+            // keystore.type = "bip39" is required for Sparrow watch-only import
+            // compatibility; Sparrow rejects unknown keystore types
             let json = serde_json::json!({
                 "name": format!("frost-{group_short}"),
                 "network": network_str,
@@ -170,11 +170,13 @@ pub fn cmd_wallet_descriptor(
         .unwrap_or_default()
         .as_secs();
 
+    let canonical_network = net.to_string();
+
     let descriptor = WalletDescriptor {
         group_pubkey,
         external_descriptor: export.descriptor.clone(),
         internal_descriptor: internal.clone(),
-        network: network.to_string(),
+        network: canonical_network.clone(),
         created_at: now,
     };
 
@@ -190,7 +192,7 @@ pub fn cmd_wallet_descriptor(
     out.newline();
     out.success("Wallet descriptor created and stored!");
     out.field("Group", &hex::encode(group_pubkey));
-    out.field("Network", network);
+    out.field("Network", &canonical_network);
     out.field("Fingerprint", &export.fingerprint);
     out.newline();
     out.field("External (receive)", &export.descriptor);
