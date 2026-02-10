@@ -76,33 +76,36 @@ impl KfpNode {
         let msg = KfpMessage::DescriptorPropose(payload);
         let json = msg.to_json()?;
 
-        let peers = self.peers.read();
-        for peer in peers.get_online_peers() {
-            if self.can_receive_from(&peer.pubkey) {
-                let encrypted = nip44::encrypt(
-                    self.keys.secret_key(),
-                    &peer.pubkey,
-                    &json,
-                    nip44::Version::V2,
-                )
-                .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+        let target_peers: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| self.can_receive_from(&p.pubkey))
+                .map(|p| p.pubkey)
+                .collect()
+        };
 
-                let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-                    .tag(Tag::public_key(peer.pubkey))
-                    .tag(Tag::custom(
-                        TagKind::custom("g"),
-                        [hex::encode(self.group_pubkey)],
-                    ))
-                    .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-                    .tag(Tag::custom(TagKind::custom("t"), ["descriptor_propose"]))
-                    .sign_with_keys(&self.keys)
-                    .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+        for pubkey in &target_peers {
+            let encrypted =
+                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
+                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-            }
+            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .tag(Tag::public_key(*pubkey))
+                .tag(Tag::custom(
+                    TagKind::custom("g"),
+                    [hex::encode(self.group_pubkey)],
+                ))
+                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+                .tag(Tag::custom(TagKind::custom("t"), ["descriptor_propose"]))
+                .sign_with_keys(&self.keys)
+                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
         }
 
         let _ = self
@@ -306,33 +309,36 @@ impl KfpNode {
         let msg = KfpMessage::DescriptorFinalize(payload);
         let json = msg.to_json()?;
 
-        let peers = self.peers.read();
-        for peer in peers.get_online_peers() {
-            if self.can_receive_from(&peer.pubkey) {
-                let encrypted = nip44::encrypt(
-                    self.keys.secret_key(),
-                    &peer.pubkey,
-                    &json,
-                    nip44::Version::V2,
-                )
-                .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+        let target_peers: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| self.can_receive_from(&p.pubkey))
+                .map(|p| p.pubkey)
+                .collect()
+        };
 
-                let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-                    .tag(Tag::public_key(peer.pubkey))
-                    .tag(Tag::custom(
-                        TagKind::custom("g"),
-                        [hex::encode(self.group_pubkey)],
-                    ))
-                    .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-                    .tag(Tag::custom(TagKind::custom("t"), ["descriptor_finalize"]))
-                    .sign_with_keys(&self.keys)
-                    .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+        for pubkey in &target_peers {
+            let encrypted =
+                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
+                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-            }
+            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .tag(Tag::public_key(*pubkey))
+                .tag(Tag::custom(
+                    TagKind::custom("g"),
+                    [hex::encode(self.group_pubkey)],
+                ))
+                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+                .tag(Tag::custom(TagKind::custom("t"), ["descriptor_finalize"]))
+                .sign_with_keys(&self.keys)
+                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
         }
 
         info!(session_id = %hex::encode(session_id), "Sent finalized descriptor");
