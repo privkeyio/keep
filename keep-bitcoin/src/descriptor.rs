@@ -104,6 +104,10 @@ impl DescriptorExport {
             .split('#')
             .next()
             .unwrap_or(&self.descriptor);
+        if !desc.contains("/0/*)") {
+            let checksum = compute_checksum(desc)?;
+            return Ok(format!("{desc}#{checksum}"));
+        }
         let internal = desc.replace("/0/*)", "/1/*)");
         let checksum = compute_checksum(&internal)?;
         Ok(format!("{internal}#{checksum}"))

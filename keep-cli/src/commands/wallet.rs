@@ -81,11 +81,9 @@ pub fn cmd_wallet_show(out: &Output, path: &Path, group_hex: &str) -> Result<()>
     out.field("Network", &desc.network);
     out.field("Created", &desc.created_at.to_string());
     out.newline();
-    out.info("External descriptor (receive):");
-    println!("{}", desc.external_descriptor);
+    out.field("External (receive)", &desc.external_descriptor);
     out.newline();
-    out.info("Internal descriptor (change):");
-    println!("{}", desc.internal_descriptor);
+    out.field("Internal (change)", &desc.internal_descriptor);
 
     Ok(())
 }
@@ -114,11 +112,9 @@ pub fn cmd_wallet_export(
             out.newline();
             out.header("Wallet Descriptor Export");
             out.newline();
-            out.info("External descriptor (receive):");
-            println!("{}", desc.external_descriptor);
+            out.field("External (receive)", &desc.external_descriptor);
             out.newline();
-            out.info("Internal descriptor (change):");
-            println!("{}", desc.internal_descriptor);
+            out.field("Internal (change)", &desc.internal_descriptor);
         }
         WalletExportFormat::Sparrow => {
             let network_str = match desc.network.as_str() {
@@ -145,7 +141,7 @@ pub fn cmd_wallet_export(
             out.newline();
             out.header("Sparrow Wallet Export");
             out.newline();
-            println!("{json_str}");
+            out.info(&json_str);
         }
     }
 
@@ -196,11 +192,9 @@ pub fn cmd_wallet_descriptor(
     out.field("Network", network);
     out.field("Fingerprint", &export.fingerprint);
     out.newline();
-    out.info("External descriptor (receive):");
-    println!("{}", export.descriptor);
+    out.field("External (receive)", &export.descriptor);
     out.newline();
-    out.info("Internal descriptor (change):");
-    println!("{internal}");
+    out.field("Internal (change)", &internal);
 
     Ok(())
 }

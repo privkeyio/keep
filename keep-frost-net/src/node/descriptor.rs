@@ -7,7 +7,9 @@ use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
-use crate::descriptor_session::{derive_descriptor_session_id, FinalizedDescriptor};
+use crate::descriptor_session::{
+    derive_descriptor_session_id, derive_policy_hash, FinalizedDescriptor,
+};
 use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
 
@@ -48,7 +50,7 @@ impl KfpNode {
 
         {
             let mut sessions = self.descriptor_sessions.write();
-            sessions.create_session(
+            let session = sessions.create_session(
                 session_id,
                 self.group_pubkey,
                 policy.clone(),
@@ -56,6 +58,7 @@ impl KfpNode {
                 expected_contributors,
                 expected_acks,
             )?;
+            session.set_initiator(self.keys.public_key());
         }
 
         let we_are_contributor = policy
@@ -148,6 +151,34 @@ impl KfpNode {
             "Received descriptor proposal"
         );
 
+        let expected_contributors: HashSet<u16> = payload
+            .policy
+            .recovery_tiers
+            .iter()
+            .flat_map(|t| t.key_slots.iter())
+            .filter_map(|s| match s {
+                KeySlot::Participant { share_index } => Some(*share_index),
+                _ => None,
+            })
+            .collect();
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            match sessions.create_session(
+                payload.session_id,
+                self.group_pubkey,
+                payload.policy.clone(),
+                payload.network.clone(),
+                expected_contributors,
+                HashSet::new(),
+            ) {
+                Ok(session) => session.set_initiator(sender),
+                Err(_) => {
+                    debug!("Descriptor session already exists, ignoring duplicate proposal");
+                }
+            }
+        }
+
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorProposed {
             session_id: payload.session_id,
         });
@@ -232,6 +263,12 @@ impl KfpNode {
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "Descriptor contribution outside replay window".into(),
+            ));
         }
 
         self.verify_peer_share_index(sender, payload.share_index)?;
@@ -345,6 +382,39 @@ impl KfpNode {
             return Ok(());
         }
 
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "Descriptor finalize outside replay window".into(),
+            ));
+        }
+
+        {
+            let sessions = self.descriptor_sessions.read();
+            if let Some(session) = sessions.get_session(&payload.session_id) {
+                if let Some(initiator) = session.initiator() {
+                    if *initiator != sender {
+                        let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                            session_id: payload.session_id,
+                            error: "Finalize from non-initiator".into(),
+                        });
+                        return Err(FrostNetError::Session(
+                            "DescriptorFinalize sender is not the session initiator".into(),
+                        ));
+                    }
+                }
+                let expected_hash = derive_policy_hash(session.policy());
+                if payload.policy_hash != expected_hash {
+                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                        session_id: payload.session_id,
+                        error: "Policy hash mismatch".into(),
+                    });
+                    return Err(FrostNetError::Session(
+                        "Policy hash does not match proposal".into(),
+                    ));
+                }
+            }
+        }
+
         info!(
             session_id = %hex::encode(payload.session_id),
             "Received finalized descriptor"
@@ -400,6 +470,12 @@ impl KfpNode {
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "Descriptor ACK outside replay window".into(),
+            ));
         }
 
         let share_index = {

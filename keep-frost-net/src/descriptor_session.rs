@@ -3,10 +3,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use nostr_sdk::PublicKey;
 use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
-use crate::protocol::{WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS};
+use crate::protocol::{
+    WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
+};
+
+const MAX_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorSessionState {
@@ -34,6 +39,7 @@ pub struct DescriptorSession {
     group_pubkey: [u8; 32],
     policy: WalletPolicy,
     network: String,
+    initiator: Option<PublicKey>,
     contributions: BTreeMap<u16, XpubContribution>,
     expected_contributors: HashSet<u16>,
     descriptor: Option<FinalizedDescriptor>,
@@ -59,6 +65,7 @@ impl DescriptorSession {
             group_pubkey,
             policy,
             network,
+            initiator: None,
             contributions: BTreeMap::new(),
             expected_contributors,
             descriptor: None,
@@ -86,6 +93,14 @@ impl DescriptorSession {
         &self.network
     }
 
+    pub fn initiator(&self) -> Option<&PublicKey> {
+        self.initiator.as_ref()
+    }
+
+    pub fn set_initiator(&mut self, initiator: PublicKey) {
+        self.initiator = Some(initiator);
+    }
+
     pub fn state(&self) -> &DescriptorSessionState {
         &self.state
     }
@@ -108,6 +123,20 @@ impl DescriptorSession {
 
         if self.contributions.contains_key(&share_index) {
             return Err(FrostNetError::Session("Duplicate contribution".into()));
+        }
+
+        if xpub.len() > MAX_XPUB_LENGTH {
+            return Err(FrostNetError::Session("xpub exceeds maximum length".into()));
+        }
+        if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+            return Err(FrostNetError::Session(
+                "fingerprint exceeds maximum length".into(),
+            ));
+        }
+        if !xpub.starts_with("xpub") && !xpub.starts_with("tpub") {
+            return Err(FrostNetError::Session(
+                "xpub must start with 'xpub' or 'tpub'".into(),
+            ));
         }
 
         self.contributions.insert(
@@ -231,6 +260,10 @@ impl DescriptorSessionManager {
         }
     }
 
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &mut self,
@@ -249,6 +282,14 @@ impl DescriptorSessionManager {
                 ));
             }
             self.sessions.remove(&session_id);
+        }
+
+        self.cleanup_expired();
+
+        if self.sessions.len() >= MAX_SESSIONS {
+            return Err(FrostNetError::Session(
+                "Maximum number of descriptor sessions reached".into(),
+            ));
         }
 
         let session = DescriptorSession::new(
@@ -297,17 +338,46 @@ impl Default for DescriptorSessionManager {
     }
 }
 
+fn hash_policy(hasher: &mut Sha256, policy: &WalletPolicy) {
+    hasher.update((policy.recovery_tiers.len() as u32).to_le_bytes());
+    for tier in &policy.recovery_tiers {
+        hasher.update(tier.threshold.to_le_bytes());
+        hasher.update(tier.timelock_months.to_le_bytes());
+        hasher.update((tier.key_slots.len() as u32).to_le_bytes());
+        for slot in &tier.key_slots {
+            match slot {
+                crate::protocol::KeySlot::Participant { share_index } => {
+                    hasher.update([0x01]);
+                    hasher.update(share_index.to_le_bytes());
+                }
+                crate::protocol::KeySlot::External { xpub, fingerprint } => {
+                    hasher.update([0x02]);
+                    hasher.update((xpub.len() as u32).to_le_bytes());
+                    hasher.update(xpub.as_bytes());
+                    hasher.update((fingerprint.len() as u32).to_le_bytes());
+                    hasher.update(fingerprint.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+pub fn derive_policy_hash(policy: &WalletPolicy) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep/descriptor-policy/v1");
+    hash_policy(&mut hasher, policy);
+    hasher.finalize().into()
+}
+
 pub fn derive_descriptor_session_id(
     group_pubkey: &[u8; 32],
     policy: &WalletPolicy,
     created_at: u64,
 ) -> [u8; 32] {
-    let canonical_json =
-        serde_json::to_string(policy).expect("WalletPolicy serialization should not fail");
-
     let mut hasher = Sha256::new();
+    hasher.update(b"keep/descriptor-session/v1");
     hasher.update(group_pubkey);
-    hasher.update(canonical_json.as_bytes());
+    hash_policy(&mut hasher, policy);
     hasher.update(created_at.to_le_bytes());
     hasher.finalize().into()
 }
@@ -316,6 +386,58 @@ pub fn derive_descriptor_session_id(
 mod tests {
     use super::*;
     use crate::protocol::{KeySlot, PolicyTier};
+
+    #[test]
+    fn test_initiator_stored() {
+        let session = test_session();
+        assert!(session.initiator().is_none());
+
+        let mut session = test_session();
+        let keys = nostr_sdk::Keys::generate();
+        session.set_initiator(keys.public_key());
+        assert_eq!(session.initiator(), Some(&keys.public_key()));
+    }
+
+    #[test]
+    fn test_invalid_xpub_prefix_rejected() {
+        let mut session = test_session();
+        let result = session.add_contribution(1, "invalidprefix123".into(), "aabbccdd".into());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("xpub must start with"));
+    }
+
+    #[test]
+    fn test_session_manager_max_sessions() {
+        let mut manager = DescriptorSessionManager::new();
+        let policy = test_policy();
+
+        for i in 0..MAX_SESSIONS {
+            let mut id = [0u8; 32];
+            id[0] = (i & 0xFF) as u8;
+            id[1] = ((i >> 8) & 0xFF) as u8;
+            manager
+                .create_session(
+                    id,
+                    [2u8; 32],
+                    policy.clone(),
+                    "signet".into(),
+                    [1, 2].into(),
+                    [1, 2].into(),
+                )
+                .unwrap();
+        }
+
+        let result = manager.create_session(
+            [0xFF; 32],
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            [1, 2].into(),
+            [1, 2].into(),
+        );
+        assert!(result.is_err());
+    }
 
     fn test_policy() -> WalletPolicy {
         WalletPolicy {
@@ -371,17 +493,17 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1...".into(), "aabbccdd".into())
+            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
         assert!(!session.has_all_contributions());
 
         session
-            .add_contribution(2, "xpub2...".into(), "11223344".into())
+            .add_contribution(2, "xpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
             .unwrap();
         assert!(!session.has_all_contributions());
 
         session
-            .add_contribution(3, "xpub3...".into(), "55667788".into())
+            .add_contribution(3, "xpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
             .unwrap();
         assert!(session.has_all_contributions());
 
@@ -393,10 +515,10 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1...".into(), "aabbccdd".into())
+            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
 
-        let result = session.add_contribution(1, "xpub1-dup...".into(), "aabbccdd".into());
+        let result = session.add_contribution(1, "xpub1dupzzzzzzzzzzzz".into(), "aabbccdd".into());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Duplicate"));
@@ -406,7 +528,7 @@ mod tests {
     fn test_unexpected_contributor_rejected() {
         let mut session = test_session();
 
-        let result = session.add_contribution(99, "xpub99...".into(), "deadbeef".into());
+        let result = session.add_contribution(99, "xpub99zzzzzzzzzzzzzz".into(), "deadbeef".into());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not an expected contributor"));
@@ -417,13 +539,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1...".into(), "aabbccdd".into())
+            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
         session
-            .add_contribution(2, "xpub2...".into(), "11223344".into())
+            .add_contribution(2, "xpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
             .unwrap();
         session
-            .add_contribution(3, "xpub3...".into(), "55667788".into())
+            .add_contribution(3, "xpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
             .unwrap();
 
         let finalized = FinalizedDescriptor {
@@ -570,7 +692,7 @@ mod tests {
         };
         session.set_finalized(finalized).unwrap();
 
-        let result = session.add_contribution(1, "xpub1-new".into(), "aa".into());
+        let result = session.add_contribution(1, "xpub1newzzzzzzzzzzzzz".into(), "aa".into());
         assert!(result.is_err());
     }
 
