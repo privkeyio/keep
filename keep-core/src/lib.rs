@@ -521,7 +521,8 @@ impl Keep {
                         "Group pubkey must be 64 hex characters".into(),
                     ));
                 }
-                write_restricted(&path, k.as_bytes())?;
+                let normalized = k.to_ascii_lowercase();
+                write_restricted(&path, normalized.as_bytes())?;
             }
             None => {
                 if let Err(e) = std::fs::remove_file(&path) {
@@ -1035,8 +1036,8 @@ mod tests {
         let mixed_hex = "0123456789abcdef".repeat(4);
         assert!(is_valid_hex_pubkey(&mixed_hex));
 
-        // is_ascii_hexdigit accepts A-F; in practice only lowercase reaches
-        // this function since hex::encode always produces lowercase.
+        // is_ascii_hexdigit accepts A-F; set_active_share_key normalizes
+        // to lowercase before persisting.
         let upper = "A".repeat(64);
         assert!(is_valid_hex_pubkey(&upper));
 
