@@ -849,11 +849,6 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
     let mut file = opts.open(path)?;
     file.write_all(data)?;
     #[cfg(unix)]
@@ -1031,6 +1026,27 @@ mod tests {
             keep.unlock("newpass").unwrap();
             assert!(keep.keyring().get_by_name("rotatetest").is_some());
         }
+    }
+
+    #[test]
+    fn test_is_valid_hex_pubkey() {
+        let valid = "a".repeat(64);
+        assert!(is_valid_hex_pubkey(&valid));
+
+        let mixed_hex = "0123456789abcdef".repeat(4);
+        assert!(is_valid_hex_pubkey(&mixed_hex));
+
+        // is_ascii_hexdigit accepts A-F; in practice only lowercase reaches
+        // this function since hex::encode always produces lowercase.
+        let upper = "A".repeat(64);
+        assert!(is_valid_hex_pubkey(&upper));
+
+        assert!(!is_valid_hex_pubkey(&"a".repeat(63)));
+        assert!(!is_valid_hex_pubkey(&"a".repeat(65)));
+        assert!(!is_valid_hex_pubkey(""));
+        assert!(!is_valid_hex_pubkey(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
     }
 
     #[test]

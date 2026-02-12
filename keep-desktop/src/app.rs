@@ -709,8 +709,9 @@ impl App {
         let all_same_group = first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
         let new_key = if all_same_group { first } else { None };
 
-        if keep.set_active_share_key(new_key).is_ok() {
-            self.active_share_hex = new_key.map(String::from);
+        match keep.set_active_share_key(new_key) {
+            Ok(()) => self.active_share_hex = new_key.map(String::from),
+            Err(e) => tracing::warn!("Failed to persist active share: {e}"),
         }
     }
 
