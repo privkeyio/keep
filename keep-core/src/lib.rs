@@ -52,6 +52,8 @@ pub mod keyring;
 pub mod keys;
 pub mod migration;
 pub(crate) mod rate_limit;
+/// Relay configuration for FROST shares.
+pub mod relay;
 mod rotation;
 /// Persistent encrypted storage backend.
 pub mod storage;
@@ -71,6 +73,7 @@ use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
+pub use crate::relay::RelayConfig;
 use crate::storage::Storage;
 pub use crate::wallet::WalletDescriptor;
 
@@ -532,6 +535,67 @@ impl Keep {
         self.storage.delete_descriptor(group_pubkey)
     }
 
+    /// Store relay configuration for a FROST share.
+    pub fn store_relay_config(&self, config: &RelayConfig) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let normalize_relays = |urls: &[String], label: &str| -> Result<Vec<String>> {
+            if urls.len() > relay::MAX_RELAYS {
+                return Err(KeepError::InvalidInput(format!(
+                    "Too many {label} relays (max {})",
+                    relay::MAX_RELAYS
+                )));
+            }
+            let normalized = dedup_stable(urls.iter().map(|u| relay::normalize_relay_url(u)));
+            for url in &normalized {
+                relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
+            }
+            Ok(normalized)
+        };
+        let normalized_config = RelayConfig {
+            group_pubkey: config.group_pubkey,
+            frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
+            profile_relays: normalize_relays(&config.profile_relays, "profile")?,
+        };
+        self.storage.store_relay_config(&normalized_config)
+    }
+
+    /// Get relay configuration for a FROST share.
+    pub fn get_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<Option<RelayConfig>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_relay_config(group_pubkey)
+    }
+
+    /// Get relay configuration for a FROST share, returning defaults if none stored.
+    pub fn get_relay_config_or_default(&self, group_pubkey: &[u8; 32]) -> Result<RelayConfig> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        Ok(self
+            .storage
+            .get_relay_config(group_pubkey)?
+            .unwrap_or_else(|| RelayConfig::with_defaults(*group_pubkey)))
+    }
+
+    /// List all stored relay configurations.
+    pub fn list_relay_configs(&self) -> Result<Vec<RelayConfig>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_relay_configs()
+    }
+
+    /// Delete relay configuration for a FROST share.
+    pub fn delete_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.delete_relay_config(group_pubkey)
+    }
+
     /// Get a FROST share by group public key.
     pub fn frost_get_share(&self, group_pubkey: &[u8; 32]) -> Result<frost::SharePackage> {
         if !self.is_unlocked() {
@@ -744,6 +808,11 @@ pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".keep"))
         .ok_or(KeepError::HomeNotFound)
+}
+
+fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.filter(|s| seen.insert(s.clone())).collect()
 }
 
 #[cfg(test)]

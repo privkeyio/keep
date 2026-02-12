@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, trace};
 
-use crate::backend::{RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, SHARES_TABLE};
+use crate::backend::{
+    RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE,
+};
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
+use crate::relay::RelayConfig;
 use crate::wallet::WalletDescriptor;
 
 use bincode::Options;
@@ -217,6 +220,7 @@ impl Storage {
         backend.create_table(KEYS_TABLE)?;
         backend.create_table(SHARES_TABLE)?;
         backend.create_table(DESCRIPTORS_TABLE)?;
+        backend.create_table(RELAY_CONFIGS_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -554,6 +558,74 @@ impl Storage {
         } else {
             Err(KeepError::KeyNotFound(format!(
                 "wallet descriptor for group {} not found",
+                hex::encode(group_pubkey)
+            )))
+        }
+    }
+
+    /// Store a relay configuration.
+    pub fn store_relay_config(&self, config: &RelayConfig) -> Result<()> {
+        debug!(group = %hex::encode(config.group_pubkey), "storing relay config");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let serialized = serde_json::to_vec(config)
+            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        let encrypted_bytes = encrypted.to_bytes();
+
+        backend.put(RELAY_CONFIGS_TABLE, &config.group_pubkey, &encrypted_bytes)?;
+        Ok(())
+    }
+
+    /// Get a relay configuration by group public key.
+    pub fn get_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<Option<RelayConfig>> {
+        trace!(group = %hex::encode(group_pubkey), "loading relay config");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let Some(encrypted_bytes) = backend.get(RELAY_CONFIGS_TABLE, group_pubkey)? else {
+            return Ok(None);
+        };
+
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
+            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+        Ok(Some(config))
+    }
+
+    /// List all stored relay configurations.
+    pub fn list_relay_configs(&self) -> Result<Vec<RelayConfig>> {
+        trace!("listing relay configs");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let entries = backend.list(RELAY_CONFIGS_TABLE)?;
+        let mut configs = Vec::new();
+
+        for (_, encrypted_bytes) in entries {
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+            configs.push(config);
+        }
+
+        Ok(configs)
+    }
+
+    /// Delete a relay configuration.
+    pub fn delete_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<()> {
+        debug!(group = %hex::encode(group_pubkey), "deleting relay config");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.delete(RELAY_CONFIGS_TABLE, group_pubkey)? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(format!(
+                "relay config for group {} not found",
                 hex::encode(group_pubkey)
             )))
         }
