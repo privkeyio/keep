@@ -124,6 +124,15 @@ impl RelayScreen {
                 Message::AddFrostRelay(i),
                 Message::RemoveFrostRelay,
             ));
+            let reset_btn = button(
+                text("Reset to defaults")
+                    .size(theme::size::TINY)
+                    .color(theme::color::TEXT_DIM),
+            )
+            .on_press(Message::ResetFrostRelays(i))
+            .style(theme::text_button)
+            .padding(0);
+            card_content = card_content.push(reset_btn);
             card_content = card_content.push(Space::new().height(theme::space::SM));
             card_content = card_content.push(self.relay_section(
                 i,

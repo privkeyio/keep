@@ -82,6 +82,7 @@ pub enum Message {
     AddProfileRelay(usize),
     RemoveFrostRelay(usize, String),
     RemoveProfileRelay(usize, String),
+    ResetFrostRelays(usize),
     RelaySaved(Result<Vec<RelayShareEntry>, String>),
 
     // Timer
@@ -174,6 +175,7 @@ impl fmt::Debug for Message {
                 .field(i)
                 .field(r)
                 .finish(),
+            Self::ResetFrostRelays(i) => f.debug_tuple("ResetFrostRelays").field(i).finish(),
             Self::RelaySaved(r) => f
                 .debug_tuple("RelaySaved")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))

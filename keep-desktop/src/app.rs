@@ -530,6 +530,18 @@ impl App {
                     config.profile_relays.retain(|r| *r != u);
                 })
             }
+            Message::ResetFrostRelays(share_idx) => {
+                let group_pubkey = match &self.screen {
+                    Screen::Relays(s) => match s.shares.get(share_idx) {
+                        Some(entry) => entry.group_pubkey,
+                        None => return Task::none(),
+                    },
+                    _ => return Task::none(),
+                };
+                self.modify_relay_config(group_pubkey, |config| {
+                    config.frost_relays = keep_core::relay::default_frost_relays();
+                })
+            }
             Message::RelaySaved(result) => {
                 match result {
                     Ok(entries) => {
