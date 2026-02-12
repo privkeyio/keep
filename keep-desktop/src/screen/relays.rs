@@ -225,22 +225,14 @@ impl RelayScreen {
     }
 }
 
-pub fn normalize_relay_url(input: &str) -> String {
+pub fn validate_and_normalize(input: &str) -> Result<String, String> {
     let trimmed = input.trim();
-    let url = if trimmed.contains("://") {
+    let with_scheme = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
         format!("wss://{trimmed}")
     };
-    if url.ends_with('/') {
-        url
-    } else {
-        format!("{url}/")
-    }
-}
-
-pub fn validate_and_normalize(input: &str) -> Result<String, String> {
-    let url = normalize_relay_url(input);
+    let url = relay::normalize_relay_url(&with_scheme);
     relay::validate_relay_url(&url)?;
     Ok(url)
 }

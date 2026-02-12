@@ -53,12 +53,7 @@ pub fn default_frost_relays() -> Vec<String> {
 /// Normalize a relay URL: trim whitespace, lowercase scheme+host, ensure trailing slash.
 pub fn normalize_relay_url(url: &str) -> String {
     let url = url.trim();
-    let url = if url.ends_with('/') {
-        url.to_string()
-    } else {
-        format!("{url}/")
-    };
-    if let Some(idx) = url.find("://") {
+    let result = if let Some(idx) = url.find("://") {
         let scheme = url[..idx].to_lowercase();
         let rest = &url[idx + 3..];
         let host_end = rest.find('/').unwrap_or(rest.len());
@@ -66,7 +61,12 @@ pub fn normalize_relay_url(url: &str) -> String {
         let path = &rest[host_end..];
         format!("{scheme}://{host}{path}")
     } else {
-        url
+        url.to_string()
+    };
+    if result.ends_with('/') {
+        result
+    } else {
+        format!("{result}/")
     }
 }
 
@@ -106,10 +106,9 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         (host_port, "")
     };
     if !port_str.is_empty() {
-        match port_str.parse::<u16>() {
-            Ok(0) => return Err("Invalid port".into()),
-            Ok(_) => {}
-            Err(_) => return Err("Invalid port".into()),
+        let port = port_str.parse::<u16>().map_err(|_| "Invalid port")?;
+        if port == 0 {
+            return Err("Invalid port".into());
         }
     }
 
@@ -117,16 +116,13 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Missing host".into());
     }
 
-    if host.starts_with('[') {
-        if !host.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '[' || c == ']' || c == ':'
-        }) {
-            return Err("Invalid host characters".into());
-        }
-    } else if !host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
+    let valid_host_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c == '.'
+            || c == '-'
+            || (host.starts_with('[') && (c == '[' || c == ']' || c == ':'))
+    };
+    if !host.chars().all(valid_host_char) {
         return Err("Invalid host characters".into());
     }
 
@@ -156,12 +152,12 @@ fn is_internal_host(host: &str) -> bool {
                 || mapped_v4.is_private()
                 || mapped_v4.is_link_local()
                 || mapped_v4.is_unspecified()
-                || is_cgn(mapped_v4);
+                || is_cgn(mapped_v4)
+                || is_special_purpose_v4(mapped_v4);
         }
-        return bare.starts_with("fc")
-            || bare.starts_with("fd")
-            || bare.starts_with("fe80:")
-            || bare.starts_with("fe80%")
+        let segments = addr.segments();
+        return (segments[0] & 0xfe00) == 0xfc00
+            || (segments[0] & 0xffc0) == 0xfe80
             || addr.is_loopback()
             || addr.is_unspecified()
             || addr.is_multicast();
@@ -174,13 +170,18 @@ fn is_internal_host(host: &str) -> bool {
             || addr.is_link_local()
             || addr.is_unspecified()
             || is_cgn(addr)
-            || is_private_172(bare);
+            || is_special_purpose_v4(addr);
     }
 
     // Hostname checks
     const FORBIDDEN: &[&str] = &["localhost"];
 
-    FORBIDDEN.contains(&bare) || bare.ends_with(".local") || bare.ends_with(".localhost")
+    if FORBIDDEN.contains(&bare) || bare.ends_with(".local") || bare.ends_with(".localhost") {
+        return true;
+    }
+
+    // Reject single-label hostnames (no dots) to prevent SSRF to internal names
+    !bare.contains('.')
 }
 
 fn is_cgn(addr: std::net::Ipv4Addr) -> bool {
@@ -188,11 +189,18 @@ fn is_cgn(addr: std::net::Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
-fn is_private_172(host: &str) -> bool {
-    host.strip_prefix("172.")
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|s| s.parse::<u8>().ok())
-        .is_some_and(|octet| (16..=31).contains(&octet))
+fn is_special_purpose_v4(addr: std::net::Ipv4Addr) -> bool {
+    let o = addr.octets();
+    // TEST-NET-1 192.0.2.0/24 (RFC 5737)
+    (o[0] == 192 && o[1] == 0 && o[2] == 2)
+    // TEST-NET-2 198.51.100.0/24 (RFC 5737)
+    || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+    // TEST-NET-3 203.0.113.0/24 (RFC 5737)
+    || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+    // Benchmarking 198.18.0.0/15 (RFC 2544)
+    || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    // Reserved 240.0.0.0/4
+    || o[0] >= 240
 }
 
 #[cfg(test)]
@@ -352,5 +360,45 @@ mod tests {
             normalize_relay_url("  wss://relay.example.com/  "),
             "wss://relay.example.com/"
         );
+    }
+
+    #[test]
+    fn rejects_single_label_hostnames() {
+        assert!(validate_relay_url("wss://intranet/").is_err());
+        assert!(validate_relay_url("wss://fileserver/").is_err());
+        assert!(validate_relay_url("wss://router/").is_err());
+    }
+
+    #[test]
+    fn rejects_special_purpose_ipv4() {
+        // TEST-NET-1
+        assert!(validate_relay_url("wss://192.0.2.1/").is_err());
+        // TEST-NET-2
+        assert!(validate_relay_url("wss://198.51.100.1/").is_err());
+        // TEST-NET-3
+        assert!(validate_relay_url("wss://203.0.113.1/").is_err());
+        // Benchmarking
+        assert!(validate_relay_url("wss://198.18.0.1/").is_err());
+        assert!(validate_relay_url("wss://198.19.255.255/").is_err());
+        // Reserved
+        assert!(validate_relay_url("wss://240.0.0.1/").is_err());
+        assert!(validate_relay_url("wss://255.255.255.255/").is_err());
+    }
+
+    #[test]
+    fn rejects_ipv6_mapped_special_purpose() {
+        assert!(validate_relay_url("wss://[::ffff:192.0.2.1]/").is_err());
+        assert!(validate_relay_url("wss://[::ffff:198.51.100.1]/").is_err());
+        assert!(validate_relay_url("wss://[::ffff:240.0.0.1]/").is_err());
+    }
+
+    #[test]
+    fn allows_nearby_public_ranges() {
+        assert!(validate_relay_url("wss://192.0.3.1/").is_ok());
+        assert!(validate_relay_url("wss://198.51.101.1/").is_ok());
+        assert!(validate_relay_url("wss://203.0.114.1/").is_ok());
+        assert!(validate_relay_url("wss://198.17.0.1/").is_ok());
+        assert!(validate_relay_url("wss://198.20.0.1/").is_ok());
+        assert!(validate_relay_url("wss://239.255.255.255/").is_ok());
     }
 }

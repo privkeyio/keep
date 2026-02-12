@@ -540,35 +540,23 @@ impl Keep {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
-        if config.frost_relays.len() > relay::MAX_RELAYS {
-            return Err(KeepError::InvalidInput(format!(
-                "Too many FROST relays (max {})",
-                relay::MAX_RELAYS
-            )));
-        }
-        if config.profile_relays.len() > relay::MAX_RELAYS {
-            return Err(KeepError::InvalidInput(format!(
-                "Too many profile relays (max {})",
-                relay::MAX_RELAYS
-            )));
-        }
-        let normalized_frost: Vec<String> = config
-            .frost_relays
-            .iter()
-            .map(|u| relay::normalize_relay_url(u))
-            .collect();
-        let normalized_profile: Vec<String> = config
-            .profile_relays
-            .iter()
-            .map(|u| relay::normalize_relay_url(u))
-            .collect();
-        for url in normalized_frost.iter().chain(normalized_profile.iter()) {
-            relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
-        }
+        let normalize_relays = |urls: &[String], label: &str| -> Result<Vec<String>> {
+            if urls.len() > relay::MAX_RELAYS {
+                return Err(KeepError::InvalidInput(format!(
+                    "Too many {label} relays (max {})",
+                    relay::MAX_RELAYS
+                )));
+            }
+            let normalized = dedup_stable(urls.iter().map(|u| relay::normalize_relay_url(u)));
+            for url in &normalized {
+                relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
+            }
+            Ok(normalized)
+        };
         let normalized_config = RelayConfig {
             group_pubkey: config.group_pubkey,
-            frost_relays: normalized_frost,
-            profile_relays: normalized_profile,
+            frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
+            profile_relays: normalize_relays(&config.profile_relays, "profile")?,
         };
         self.storage.store_relay_config(&normalized_config)
     }
@@ -820,6 +808,11 @@ pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".keep"))
         .ok_or(KeepError::HomeNotFound)
+}
+
+fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.filter(|s| seen.insert(s.clone())).collect()
 }
 
 #[cfg(test)]
