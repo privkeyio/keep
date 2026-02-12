@@ -346,6 +346,13 @@ impl App {
                 Task::none()
             }
             Message::SetActiveShare(hex) => {
+                let shares = self.current_shares();
+                let exists = shares.iter().any(|s| s.group_pubkey_hex == hex);
+                if !exists {
+                    self.set_toast("Share not found".into(), ToastKind::Error);
+                    return Task::none();
+                }
+
                 let result = lock_keep(&self.keep)
                     .as_ref()
                     .map(|k| k.set_active_share_key(Some(&hex)));
@@ -698,14 +705,27 @@ impl App {
             return;
         }
 
-        let new_key = if shares.len() == 1 {
-            Some(&shares[0].group_pubkey_hex)
+        let unique_groups: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            shares
+                .iter()
+                .filter_map(|s| {
+                    if seen.insert(s.group_pubkey_hex.as_str()) {
+                        Some(s.group_pubkey_hex.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let new_key = if unique_groups.len() == 1 {
+            Some(unique_groups[0])
         } else {
             None
         };
 
-        let _ = keep.set_active_share_key(new_key.map(String::as_str));
-        self.active_share_hex = new_key.cloned();
+        let _ = keep.set_active_share_key(new_key);
+        self.active_share_hex = new_key.map(String::from);
     }
 
     fn handle_unlock(&mut self) -> Task<Message> {

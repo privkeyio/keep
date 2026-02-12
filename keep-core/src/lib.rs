@@ -506,17 +506,29 @@ impl Keep {
         std::fs::read_to_string(&path)
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter(|s| is_valid_hex_pubkey(s))
     }
 
     /// Set the active share by hex-encoded group pubkey. Pass `None` to clear.
     pub fn set_active_share_key(&self, key: Option<&str>) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
         let path = self.storage.path.join("active_share");
         match key {
-            Some(k) => std::fs::write(&path, k)?,
-            None => {
-                let _ = std::fs::remove_file(&path);
+            Some(k) => {
+                if !is_valid_hex_pubkey(k) {
+                    return Err(KeepError::InvalidInput(
+                        "Group pubkey must be 64 hex characters".into(),
+                    ));
+                }
+                write_restricted(&path, k.as_bytes())?;
             }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
         }
         Ok(())
     }
@@ -822,6 +834,24 @@ impl Keep {
         let audit = self.audit.as_mut().ok_or(KeepError::Locked)?;
         audit.apply_retention(&data_key)
     }
+}
+
+fn is_valid_hex_pubkey(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(data)?;
+    Ok(())
 }
 
 /// Returns the default path to the Keep directory (~/.keep).
