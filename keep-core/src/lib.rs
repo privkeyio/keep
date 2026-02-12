@@ -849,14 +849,13 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    let mut file = opts.open(path)?;
-    file.write_all(data)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(())
+    let mut file = opts.open(path)?;
+    file.write_all(data)
 }
 
 /// Returns the default path to the Keep directory (~/.keep).
