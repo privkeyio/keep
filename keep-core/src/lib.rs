@@ -502,8 +502,7 @@ impl Keep {
 
     /// Get the hex-encoded group pubkey of the active share, if set.
     pub fn get_active_share_key(&self) -> Option<String> {
-        let path = self.storage.path.join("active_share");
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(self.active_share_path())
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| is_valid_hex_pubkey(s))
@@ -514,7 +513,7 @@ impl Keep {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
-        let path = self.storage.path.join("active_share");
+        let path = self.active_share_path();
         match key {
             Some(k) => {
                 if !is_valid_hex_pubkey(k) {
@@ -524,13 +523,19 @@ impl Keep {
                 }
                 write_restricted(&path, k.as_bytes())?;
             }
-            None => match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            },
+            None => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(e.into());
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    fn active_share_path(&self) -> PathBuf {
+        self.storage.path.join("active_share")
     }
 
     /// Store a finalized wallet descriptor, associated with a FROST group.
@@ -851,6 +856,11 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     let mut file = opts.open(path)?;
     file.write_all(data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

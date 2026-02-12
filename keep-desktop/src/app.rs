@@ -705,27 +705,14 @@ impl App {
             return;
         }
 
-        let unique_groups: Vec<&str> = {
-            let mut seen = std::collections::HashSet::new();
-            shares
-                .iter()
-                .filter_map(|s| {
-                    if seen.insert(s.group_pubkey_hex.as_str()) {
-                        Some(s.group_pubkey_hex.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        let new_key = if unique_groups.len() == 1 {
-            Some(unique_groups[0])
-        } else {
-            None
-        };
+        let first = shares.first().map(|s| s.group_pubkey_hex.as_str());
+        let all_same_group =
+            first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
+        let new_key = if all_same_group { first } else { None };
 
-        let _ = keep.set_active_share_key(new_key);
-        self.active_share_hex = new_key.map(String::from);
+        if keep.set_active_share_key(new_key).is_ok() {
+            self.active_share_hex = new_key.map(String::from);
+        }
     }
 
     fn handle_unlock(&mut self) -> Task<Message> {
