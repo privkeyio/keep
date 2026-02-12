@@ -11,7 +11,9 @@ path = "src/main.rs"
 [dependencies]
 keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net" }
+keep-nip46 = { path = "../keep-nip46" }
 iced = { version = "0.14.0", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
+nostr-sdk = { workspace = true }
 hex = { workspace = true }
 dirs = { workspace = true }
 zeroize = { workspace = true }

@@ -14,6 +14,7 @@ pub enum NavItem {
     Import,
     Wallets,
     Relay,
+    Bunker,
 }
 
 enum NavBadge {
@@ -64,6 +65,12 @@ pub fn with_sidebar<'a>(
             NavBadge::None,
         ),
         ("Relay", Message::NavigateRelay, NavItem::Relay, relay_badge),
+        (
+            "Bunker",
+            Message::NavigateBunker,
+            NavItem::Bunker,
+            NavBadge::None,
+        ),
     ];
 
     let mut nav = column![].spacing(theme::space::XS);

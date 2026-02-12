@@ -12,7 +12,7 @@ use keep_core::keyring::Keyring;
 
 use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
-use crate::permissions::{Permission, PermissionManager};
+use crate::permissions::{AppPermission, Permission, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{ApprovalRequest, ServerCallbacks};
 
@@ -480,6 +480,21 @@ impl SignerHandler {
         audit.log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey));
 
         Ok(plaintext)
+    }
+
+    pub async fn list_clients(&self) -> Vec<AppPermission> {
+        let pm = self.permissions.lock().await;
+        pm.list_apps().cloned().collect()
+    }
+
+    pub async fn revoke_client(&self, pubkey: &PublicKey) {
+        let mut pm = self.permissions.lock().await;
+        pm.revoke(pubkey);
+    }
+
+    pub async fn revoke_all_clients(&self) {
+        let mut pm = self.permissions.lock().await;
+        pm.revoke_all();
     }
 
     pub(crate) async fn get_app_name(&self, pubkey: &PublicKey) -> String {

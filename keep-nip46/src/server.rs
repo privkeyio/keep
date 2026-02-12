@@ -341,10 +341,14 @@ impl Server {
         if let Some(cb) = callbacks {
             cb.on_log(LogEvent {
                 app: app_id.to_string(),
-                action: method,
+                action: method.clone(),
                 success,
                 detail: response.error.clone(),
             });
+
+            if method == "connect" && success {
+                cb.on_connect(&app_pubkey.to_hex(), &format!("App {app_id}"));
+            }
         }
 
         let response_json = serde_json::to_string(&response)
@@ -495,6 +499,10 @@ impl Server {
             "ping" => Nip46Response::ok(id, "pong"),
             _ => Nip46Response::error(id, "Unknown method"),
         }
+    }
+
+    pub fn handler(&self) -> Arc<SignerHandler> {
+        self.handler.clone()
     }
 
     #[allow(dead_code)]

@@ -85,9 +85,12 @@ impl PermissionManager {
             .or_insert_with(|| AppPermission::new(pubkey, name));
     }
 
-    #[allow(dead_code)]
     pub fn revoke(&mut self, pubkey: &PublicKey) {
         self.apps.remove(pubkey);
+    }
+
+    pub fn revoke_all(&mut self) {
+        self.apps.clear();
     }
 
     pub fn has_permission(&self, pubkey: &PublicKey, perm: Permission) -> bool {
@@ -127,7 +130,6 @@ impl PermissionManager {
         self.apps.get(pubkey)
     }
 
-    #[allow(dead_code)]
     pub fn list_apps(&self) -> impl Iterator<Item = &AppPermission> {
         self.apps.values()
     }

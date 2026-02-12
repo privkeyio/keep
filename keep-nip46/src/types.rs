@@ -22,6 +22,7 @@ pub struct ApprovalRequest {
 pub trait ServerCallbacks: Send + Sync + 'static {
     fn on_log(&self, event: LogEvent);
     fn request_approval(&self, request: ApprovalRequest) -> bool;
+    fn on_connect(&self, _pubkey: &str, _name: &str) {}
 }
 
 #[derive(Debug, serde::Deserialize)]
