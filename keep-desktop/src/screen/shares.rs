@@ -231,12 +231,8 @@ impl ShareListScreen {
 
         header_buttons = header_buttons.push(export_btn);
 
-        let header_top = row![
-            name_btn,
-            Space::new().width(Length::Fill),
-            header_buttons,
-        ]
-        .align_y(Alignment::Center);
+        let header_top = row![name_btn, Space::new().width(Length::Fill), header_buttons,]
+            .align_y(Alignment::Center);
 
         let mut info_row = row![badge, share_index]
             .spacing(theme::space::SM)

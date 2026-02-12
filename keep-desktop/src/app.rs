@@ -706,8 +706,7 @@ impl App {
         }
 
         let first = shares.first().map(|s| s.group_pubkey_hex.as_str());
-        let all_same_group =
-            first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
+        let all_same_group = first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
         let new_key = if all_same_group { first } else { None };
 
         if keep.set_active_share_key(new_key).is_ok() {
@@ -836,10 +835,8 @@ impl App {
         match result {
             Ok(shares) => {
                 self.resolve_active_share(&shares);
-                self.screen = Screen::ShareList(ShareListScreen::new(
-                    shares,
-                    self.active_share_hex.clone(),
-                ));
+                self.screen =
+                    Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
             }
             Err(e) => self.screen.set_loading_error(e),
         }
@@ -853,10 +850,8 @@ impl App {
         match result {
             Ok((shares, name)) => {
                 self.resolve_active_share(&shares);
-                self.screen = Screen::ShareList(ShareListScreen::new(
-                    shares,
-                    self.active_share_hex.clone(),
-                ));
+                self.screen =
+                    Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
                 self.set_toast(
                     format!("Share '{name}' imported successfully"),
                     ToastKind::Success,
