@@ -621,8 +621,14 @@ impl Storage {
     pub fn delete_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<()> {
         debug!(group = %hex::encode(group_pubkey), "deleting relay config");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let _ = backend.delete(RELAY_CONFIGS_TABLE, group_pubkey)?;
-        Ok(())
+        if backend.delete(RELAY_CONFIGS_TABLE, group_pubkey)? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(format!(
+                "relay config for group {} not found",
+                hex::encode(group_pubkey)
+            )))
+        }
     }
 }
 

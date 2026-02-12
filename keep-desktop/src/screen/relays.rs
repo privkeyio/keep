@@ -80,11 +80,7 @@ impl RelayScreen {
         i: usize,
         entry: &'a RelayShareEntry,
     ) -> Element<'a, Message> {
-        let truncated = if entry.group_hex.len() > 16 {
-            &entry.group_hex[..16]
-        } else {
-            &entry.group_hex
-        };
+        let truncated = &entry.group_hex[..16.min(entry.group_hex.len())];
 
         let arrow = if self.expanded == Some(i) { "v" } else { ">" };
         let name_btn = button(
@@ -117,9 +113,29 @@ impl RelayScreen {
         let mut card_content = column![header_info].spacing(theme::space::SM);
 
         if self.expanded == Some(i) {
-            card_content = card_content.push(self.frost_relay_section(i, entry));
+            card_content = card_content.push(self.relay_section(
+                i,
+                "FROST Coordination Relays",
+                "Used for threshold signing communication between share holders",
+                "No FROST relays configured",
+                &entry.frost_relays,
+                &self.frost_input,
+                Message::FrostRelayInputChanged,
+                Message::AddFrostRelay(i),
+                Message::RemoveFrostRelay,
+            ));
             card_content = card_content.push(Space::new().height(theme::space::SM));
-            card_content = card_content.push(self.profile_relay_section(i, entry));
+            card_content = card_content.push(self.relay_section(
+                i,
+                "Profile / NIP-46 Relays",
+                "Used for profile data and remote signing connections",
+                "No profile relays configured",
+                &entry.profile_relays,
+                &self.profile_input,
+                Message::ProfileRelayInputChanged,
+                Message::AddProfileRelay(i),
+                Message::RemoveProfileRelay,
+            ));
 
             if let Some(ref err) = self.error {
                 card_content = card_content.push(theme::error_text(err));
@@ -133,29 +149,36 @@ impl RelayScreen {
             .into()
     }
 
-    fn frost_relay_section<'a>(
+    fn relay_section<'a>(
         &'a self,
         share_idx: usize,
-        entry: &'a RelayShareEntry,
+        title: &'a str,
+        description: &'a str,
+        empty_label: &'a str,
+        relays: &'a [String],
+        input_value: &'a str,
+        on_input: fn(String) -> Message,
+        on_add: Message,
+        on_remove: impl Fn(usize, String) -> Message,
     ) -> Element<'a, Message> {
         let mut section = column![
-            text("FROST Coordination Relays")
+            text(title)
                 .size(theme::size::BODY)
                 .color(theme::color::TEXT),
-            text("Used for threshold signing communication between share holders")
+            text(description)
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM),
         ]
         .spacing(theme::space::XS);
 
-        if entry.frost_relays.is_empty() {
+        if relays.is_empty() {
             section = section.push(
-                text("No FROST relays configured")
+                text(empty_label)
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
             );
         } else {
-            for relay in &entry.frost_relays {
+            for relay in relays {
                 let display = relay.strip_prefix("wss://").unwrap_or(relay);
                 let relay_row = row![
                     text(display)
@@ -163,7 +186,7 @@ impl RelayScreen {
                         .color(theme::color::TEXT_MUTED),
                     Space::new().width(Length::Fill),
                     button(text("x").size(theme::size::TINY))
-                        .on_press(Message::RemoveFrostRelay(share_idx, relay.clone()))
+                        .on_press(on_remove(share_idx, relay.clone()))
                         .style(theme::danger_button)
                         .padding([2.0, theme::space::SM]),
                 ]
@@ -173,14 +196,14 @@ impl RelayScreen {
             }
         }
 
-        if entry.frost_relays.len() < MAX_RELAYS && self.expanded == Some(share_idx) {
-            let input = text_input("wss://relay.example.com", &self.frost_input)
-                .on_input(Message::FrostRelayInputChanged)
+        if relays.len() < MAX_RELAYS && self.expanded == Some(share_idx) {
+            let input = text_input("wss://relay.example.com", input_value)
+                .on_input(on_input)
                 .padding(theme::space::SM)
                 .width(Length::Fill);
 
             let add_btn = button(text("Add").size(theme::size::SMALL))
-                .on_press(Message::AddFrostRelay(share_idx))
+                .on_press(on_add)
                 .style(theme::primary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 
@@ -189,74 +212,7 @@ impl RelayScreen {
                 .align_y(Alignment::Center);
 
             section = section.push(input_row);
-        } else if entry.frost_relays.len() >= MAX_RELAYS {
-            section = section.push(
-                text(format!("Maximum of {MAX_RELAYS} relays reached"))
-                    .size(theme::size::TINY)
-                    .color(theme::color::TEXT_DIM),
-            );
-        }
-
-        section.into()
-    }
-
-    fn profile_relay_section<'a>(
-        &'a self,
-        share_idx: usize,
-        entry: &'a RelayShareEntry,
-    ) -> Element<'a, Message> {
-        let mut section = column![
-            text("Profile / NIP-46 Relays")
-                .size(theme::size::BODY)
-                .color(theme::color::TEXT),
-            text("Used for profile data and remote signing connections")
-                .size(theme::size::TINY)
-                .color(theme::color::TEXT_DIM),
-        ]
-        .spacing(theme::space::XS);
-
-        if entry.profile_relays.is_empty() {
-            section = section.push(
-                text("No profile relays configured")
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_MUTED),
-            );
-        } else {
-            for relay in &entry.profile_relays {
-                let display = relay.strip_prefix("wss://").unwrap_or(relay);
-                let relay_row = row![
-                    text(display)
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT_MUTED),
-                    Space::new().width(Length::Fill),
-                    button(text("x").size(theme::size::TINY))
-                        .on_press(Message::RemoveProfileRelay(share_idx, relay.clone()))
-                        .style(theme::danger_button)
-                        .padding([2.0, theme::space::SM]),
-                ]
-                .align_y(Alignment::Center)
-                .spacing(theme::space::SM);
-                section = section.push(relay_row);
-            }
-        }
-
-        if entry.profile_relays.len() < MAX_RELAYS && self.expanded == Some(share_idx) {
-            let input = text_input("wss://relay.example.com", &self.profile_input)
-                .on_input(Message::ProfileRelayInputChanged)
-                .padding(theme::space::SM)
-                .width(Length::Fill);
-
-            let add_btn = button(text("Add").size(theme::size::SMALL))
-                .on_press(Message::AddProfileRelay(share_idx))
-                .style(theme::primary_button)
-                .padding([theme::space::XS, theme::space::MD]);
-
-            let input_row = row![input, add_btn]
-                .spacing(theme::space::SM)
-                .align_y(Alignment::Center);
-
-            section = section.push(input_row);
-        } else if entry.profile_relays.len() >= MAX_RELAYS {
+        } else if relays.len() >= MAX_RELAYS {
             section = section.push(
                 text(format!("Maximum of {MAX_RELAYS} relays reached"))
                     .size(theme::size::TINY)
@@ -270,14 +226,12 @@ impl RelayScreen {
 
 pub fn normalize_relay_url(input: &str) -> String {
     let trimmed = input.trim();
-    if trimmed.contains("://") && !trimmed.starts_with("wss://") {
-        return trimmed.to_string();
-    }
-    if trimmed.starts_with("wss://") {
+    let url = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
         format!("wss://{trimmed}")
-    }
+    };
+    if url.ends_with('/') { url } else { format!("{url}/") }
 }
 
 pub fn validate_and_normalize(input: &str) -> Result<String, String> {

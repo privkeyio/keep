@@ -540,6 +540,21 @@ impl Keep {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
+        if config.frost_relays.len() > relay::MAX_RELAYS {
+            return Err(KeepError::InvalidInput(format!(
+                "Too many FROST relays (max {})",
+                relay::MAX_RELAYS
+            )));
+        }
+        if config.profile_relays.len() > relay::MAX_RELAYS {
+            return Err(KeepError::InvalidInput(format!(
+                "Too many profile relays (max {})",
+                relay::MAX_RELAYS
+            )));
+        }
+        for url in config.frost_relays.iter().chain(config.profile_relays.iter()) {
+            relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
+        }
         self.storage.store_relay_config(config)
     }
 
@@ -556,10 +571,10 @@ impl Keep {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
-        match self.storage.get_relay_config(group_pubkey)? {
-            Some(config) => Ok(config),
-            None => Ok(RelayConfig::with_defaults(*group_pubkey)),
-        }
+        Ok(self
+            .storage
+            .get_relay_config(group_pubkey)?
+            .unwrap_or_else(|| RelayConfig::with_defaults(*group_pubkey)))
     }
 
     /// List all stored relay configurations.

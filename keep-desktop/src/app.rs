@@ -508,106 +508,36 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AddFrostRelay(share_idx) => {
-                let (group_pubkey, url) = match &mut self.screen {
-                    Screen::Relays(s) => {
-                        let input = s.frost_input.clone();
-                        match relays::validate_and_normalize(&input) {
-                            Ok(url) => {
-                                if let Some(entry) = s.shares.get(share_idx) {
-                                    if entry.frost_relays.contains(&url) {
-                                        s.error = Some("Relay already added".into());
-                                        return Task::none();
-                                    }
-                                    (entry.group_pubkey, url)
-                                } else {
-                                    return Task::none();
-                                }
-                            }
-                            Err(e) => {
-                                s.error = Some(e);
-                                return Task::none();
-                            }
-                        }
-                    }
-                    _ => return Task::none(),
-                };
-                self.modify_relay_config(group_pubkey, |config| {
-                    config.frost_relays.push(url);
-                })
-            }
-            Message::AddProfileRelay(share_idx) => {
-                let (group_pubkey, url) = match &mut self.screen {
-                    Screen::Relays(s) => {
-                        let input = s.profile_input.clone();
-                        match relays::validate_and_normalize(&input) {
-                            Ok(url) => {
-                                if let Some(entry) = s.shares.get(share_idx) {
-                                    if entry.profile_relays.contains(&url) {
-                                        s.error = Some("Relay already added".into());
-                                        return Task::none();
-                                    }
-                                    (entry.group_pubkey, url)
-                                } else {
-                                    return Task::none();
-                                }
-                            }
-                            Err(e) => {
-                                s.error = Some(e);
-                                return Task::none();
-                            }
-                        }
-                    }
-                    _ => return Task::none(),
-                };
-                self.modify_relay_config(group_pubkey, |config| {
-                    config.profile_relays.push(url);
-                })
-            }
+            Message::AddFrostRelay(share_idx) => self.add_relay(
+                share_idx,
+                |s| &s.frost_input,
+                |e| &e.frost_relays,
+                |config, url| config.frost_relays.push(url),
+            ),
+            Message::AddProfileRelay(share_idx) => self.add_relay(
+                share_idx,
+                |s| &s.profile_input,
+                |e| &e.profile_relays,
+                |config, url| config.profile_relays.push(url),
+            ),
             Message::RemoveFrostRelay(share_idx, url) => {
-                let group_pubkey = match &self.screen {
-                    Screen::Relays(s) => {
-                        if let Some(entry) = s.shares.get(share_idx) {
-                            entry.group_pubkey
-                        } else {
-                            return Task::none();
-                        }
-                    }
-                    _ => return Task::none(),
-                };
-                self.modify_relay_config(group_pubkey, move |config| {
-                    config.frost_relays.retain(|r| *r != url);
+                self.remove_relay(share_idx, url, |config, u| {
+                    config.frost_relays.retain(|r| *r != u);
                 })
             }
             Message::RemoveProfileRelay(share_idx, url) => {
-                let group_pubkey = match &self.screen {
-                    Screen::Relays(s) => {
-                        if let Some(entry) = s.shares.get(share_idx) {
-                            entry.group_pubkey
-                        } else {
-                            return Task::none();
-                        }
-                    }
-                    _ => return Task::none(),
-                };
-                self.modify_relay_config(group_pubkey, move |config| {
-                    config.profile_relays.retain(|r| *r != url);
+                self.remove_relay(share_idx, url, |config, u| {
+                    config.profile_relays.retain(|r| *r != u);
                 })
             }
             Message::RelaySaved(result) => {
                 match result {
                     Ok(entries) => {
                         if let Screen::Relays(s) = &mut self.screen {
-                            let expanded = s.expanded;
-                            let frost_input = std::mem::take(&mut s.frost_input);
-                            let profile_input = std::mem::take(&mut s.profile_input);
                             s.shares = entries;
-                            s.expanded = expanded;
                             s.frost_input.clear();
                             s.profile_input.clear();
                             s.error = None;
-                            let _ = frost_input;
-                            let _ = profile_input;
                         }
                     }
                     Err(e) => {
@@ -1010,6 +940,55 @@ impl App {
             },
             Message::RelaySaved,
         )
+    }
+
+    fn add_relay(
+        &mut self,
+        share_idx: usize,
+        get_input: fn(&RelayScreen) -> &str,
+        get_relays: fn(&RelayShareEntry) -> &[String],
+        push_relay: impl FnOnce(&mut keep_core::RelayConfig, String) + Send + 'static,
+    ) -> Task<Message> {
+        let (group_pubkey, url) = match &mut self.screen {
+            Screen::Relays(s) => {
+                let input = get_input(s).to_owned();
+                match relays::validate_and_normalize(&input) {
+                    Ok(url) => {
+                        if let Some(entry) = s.shares.get(share_idx) {
+                            if get_relays(entry).contains(&url) {
+                                s.error = Some("Relay already added".into());
+                                return Task::none();
+                            }
+                            (entry.group_pubkey, url)
+                        } else {
+                            return Task::none();
+                        }
+                    }
+                    Err(e) => {
+                        s.error = Some(e);
+                        return Task::none();
+                    }
+                }
+            }
+            _ => return Task::none(),
+        };
+        self.modify_relay_config(group_pubkey, |config| push_relay(config, url))
+    }
+
+    fn remove_relay(
+        &self,
+        share_idx: usize,
+        url: String,
+        remove: impl FnOnce(&mut keep_core::RelayConfig, &str) + Send + 'static,
+    ) -> Task<Message> {
+        let group_pubkey = match &self.screen {
+            Screen::Relays(s) => match s.shares.get(share_idx) {
+                Some(entry) => entry.group_pubkey,
+                None => return Task::none(),
+            },
+            _ => return Task::none(),
+        };
+        self.modify_relay_config(group_pubkey, move |config| remove(config, &url))
     }
 
     fn handle_import(&mut self) -> Task<Message> {
