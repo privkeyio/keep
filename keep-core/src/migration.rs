@@ -9,7 +9,7 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// The current schema version supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
@@ -34,12 +34,29 @@ fn migrate_v1_to_v2(db: &Database) -> Result<()> {
     Ok(())
 }
 
+const RELAY_CONFIGS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("relay_configs");
+
+fn migrate_v2_to_v3(db: &Database) -> Result<()> {
+    let wtxn = db.begin_write()?;
+    wtxn.open_table(RELAY_CONFIGS_TABLE_DEF)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
 fn get_migrations() -> Vec<Migration> {
-    vec![Migration {
-        from_version: 1,
-        to_version: 2,
-        migrate: migrate_v1_to_v2,
-    }]
+    vec![
+        Migration {
+            from_version: 1,
+            to_version: 2,
+            migrate: migrate_v1_to_v2,
+        },
+        Migration {
+            from_version: 2,
+            to_version: 3,
+            migrate: migrate_v2_to_v3,
+        },
+    ]
 }
 
 /// Read the schema version from the database.

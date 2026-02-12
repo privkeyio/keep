@@ -10,11 +10,14 @@ use fs2::FileExt;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use crate::backend::{RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, SHARES_TABLE};
+use crate::backend::{
+    RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE,
+};
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
+use crate::relay::RelayConfig;
 use crate::storage::{bincode_options, share_id, Header, Storage};
 use crate::wallet::WalletDescriptor;
 
@@ -224,6 +227,7 @@ impl Storage {
         let keys = self.list_keys()?;
         let shares = self.list_shares()?;
         let descriptors = self.list_descriptors()?;
+        let relay_configs = self.list_relay_configs()?;
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
         let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
@@ -259,6 +263,7 @@ impl Storage {
                 &decrypted_keys,
                 &decrypted_shares,
                 &descriptors,
+                &relay_configs,
                 &new_data_key,
             )?;
 
@@ -268,7 +273,12 @@ impl Storage {
             self.header = new_header;
             self.data_key = Some(new_data_key);
 
-            self.verify_rotation_integrity(&decrypted_keys, &decrypted_shares, &descriptors)?;
+            self.verify_rotation_integrity(
+                &decrypted_keys,
+                &decrypted_shares,
+                &descriptors,
+                &relay_configs,
+            )?;
 
             Ok(())
         })();
@@ -344,6 +354,7 @@ impl Storage {
         keys: &[(KeyRecord, Vec<u8>)],
         shares: &[(StoredShare, Vec<u8>)],
         descriptors: &[WalletDescriptor],
+        relay_configs: &[RelayConfig],
         new_data_key: &SecretKey,
     ) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -381,6 +392,17 @@ impl Storage {
             )?;
         }
 
+        for config in relay_configs {
+            let serialized = serde_json::to_vec(config)
+                .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+            let encrypted = crypto::encrypt(&serialized, new_data_key)?;
+            backend.put(
+                RELAY_CONFIGS_TABLE,
+                &config.group_pubkey,
+                &encrypted.to_bytes(),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -389,6 +411,7 @@ impl Storage {
         original_keys: &[(KeyRecord, Vec<u8>)],
         original_shares: &[(StoredShare, Vec<u8>)],
         original_descriptors: &[WalletDescriptor],
+        original_relay_configs: &[RelayConfig],
     ) -> Result<()> {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -493,6 +516,40 @@ impl Storage {
             {
                 return Err(KeepError::RotationFailed(format!(
                     "descriptor for group {} content mismatch after rotation",
+                    hex::encode(original.group_pubkey)
+                )));
+            }
+        }
+
+        let stored_relay_configs = backend.list(RELAY_CONFIGS_TABLE)?;
+        if stored_relay_configs.len() != original_relay_configs.len() {
+            return Err(KeepError::RotationFailed(format!(
+                "relay config count mismatch: expected {}, found {}",
+                original_relay_configs.len(),
+                stored_relay_configs.len()
+            )));
+        }
+
+        for original in original_relay_configs {
+            let encrypted_bytes = backend
+                .get(RELAY_CONFIGS_TABLE, &original.group_pubkey)?
+                .ok_or_else(|| {
+                    KeepError::RotationFailed(format!(
+                        "relay config for group {} missing after rotation",
+                        hex::encode(original.group_pubkey)
+                    ))
+                })?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+            if config.group_pubkey != original.group_pubkey
+                || config.frost_relays != original.frost_relays
+                || config.profile_relays != original.profile_relays
+            {
+                return Err(KeepError::RotationFailed(format!(
+                    "relay config for group {} content mismatch after rotation",
                     hex::encode(original.group_pubkey)
                 )));
             }

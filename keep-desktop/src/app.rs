@@ -17,6 +17,7 @@ use crate::message::{ExportData, Message, ShareIdentity};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
+use crate::screen::relays::{self, RelayScreen, RelayShareEntry};
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
@@ -98,6 +99,37 @@ fn collect_shares(keep: &Keep) -> Result<Vec<ShareEntry>, String> {
     keep.frost_list_shares()
         .map(|stored| stored.iter().map(ShareEntry::from_stored).collect())
         .map_err(friendly_err)
+}
+
+fn load_relay_entries(keep_arc: &Arc<Mutex<Option<Keep>>>) -> Result<Vec<RelayShareEntry>, String> {
+    let guard = lock_keep(keep_arc);
+    let keep = guard.as_ref().ok_or("Keep not available".to_string())?;
+
+    let shares = keep.frost_list_shares().map_err(friendly_err)?;
+
+    let mut seen_groups: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    for stored in &shares {
+        let gp = stored.metadata.group_pubkey;
+        if !seen_groups.insert(gp) {
+            continue;
+        }
+
+        let config = keep
+            .get_relay_config_or_default(&gp)
+            .map_err(friendly_err)?;
+
+        entries.push(RelayShareEntry {
+            group_pubkey: gp,
+            group_hex: hex::encode(gp),
+            name: stored.metadata.name.clone(),
+            frost_relays: config.frost_relays,
+            profile_relays: config.profile_relays,
+        });
+    }
+
+    Ok(entries)
 }
 
 fn with_keep_blocking<T: Send + 'static>(
@@ -420,6 +452,170 @@ impl App {
             Message::ToggleWalletDetails(i) => {
                 if let Screen::Wallet(s) = &mut self.screen {
                     s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
+                }
+                Task::none()
+            }
+
+            Message::NavigateRelays => {
+                if matches!(self.screen, Screen::Relays(_)) {
+                    return Task::none();
+                }
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || load_relay_entries(&keep_arc))
+                            .await
+                            .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::RelaysLoaded,
+                )
+            }
+            Message::RelaysLoaded(result) => {
+                match result {
+                    Ok(entries) => {
+                        self.screen = Screen::Relays(RelayScreen::new(entries));
+                    }
+                    Err(e) => {
+                        self.set_toast(e, ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleRelayDetails(i) => {
+                if let Screen::Relays(s) = &mut self.screen {
+                    if s.expanded == Some(i) {
+                        s.expanded = None;
+                    } else {
+                        s.expanded = Some(i);
+                        s.frost_input.clear();
+                        s.profile_input.clear();
+                        s.error = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::FrostRelayInputChanged(input) => {
+                if let Screen::Relays(s) = &mut self.screen {
+                    s.frost_input = input;
+                    s.error = None;
+                }
+                Task::none()
+            }
+            Message::ProfileRelayInputChanged(input) => {
+                if let Screen::Relays(s) = &mut self.screen {
+                    s.profile_input = input;
+                    s.error = None;
+                }
+                Task::none()
+            }
+            Message::AddFrostRelay(share_idx) => {
+                let (group_pubkey, url) = match &mut self.screen {
+                    Screen::Relays(s) => {
+                        let input = s.frost_input.clone();
+                        match relays::validate_and_normalize(&input) {
+                            Ok(url) => {
+                                if let Some(entry) = s.shares.get(share_idx) {
+                                    if entry.frost_relays.contains(&url) {
+                                        s.error = Some("Relay already added".into());
+                                        return Task::none();
+                                    }
+                                    (entry.group_pubkey, url)
+                                } else {
+                                    return Task::none();
+                                }
+                            }
+                            Err(e) => {
+                                s.error = Some(e);
+                                return Task::none();
+                            }
+                        }
+                    }
+                    _ => return Task::none(),
+                };
+                self.modify_relay_config(group_pubkey, |config| {
+                    config.frost_relays.push(url);
+                })
+            }
+            Message::AddProfileRelay(share_idx) => {
+                let (group_pubkey, url) = match &mut self.screen {
+                    Screen::Relays(s) => {
+                        let input = s.profile_input.clone();
+                        match relays::validate_and_normalize(&input) {
+                            Ok(url) => {
+                                if let Some(entry) = s.shares.get(share_idx) {
+                                    if entry.profile_relays.contains(&url) {
+                                        s.error = Some("Relay already added".into());
+                                        return Task::none();
+                                    }
+                                    (entry.group_pubkey, url)
+                                } else {
+                                    return Task::none();
+                                }
+                            }
+                            Err(e) => {
+                                s.error = Some(e);
+                                return Task::none();
+                            }
+                        }
+                    }
+                    _ => return Task::none(),
+                };
+                self.modify_relay_config(group_pubkey, |config| {
+                    config.profile_relays.push(url);
+                })
+            }
+            Message::RemoveFrostRelay(share_idx, url) => {
+                let group_pubkey = match &self.screen {
+                    Screen::Relays(s) => {
+                        if let Some(entry) = s.shares.get(share_idx) {
+                            entry.group_pubkey
+                        } else {
+                            return Task::none();
+                        }
+                    }
+                    _ => return Task::none(),
+                };
+                self.modify_relay_config(group_pubkey, move |config| {
+                    config.frost_relays.retain(|r| *r != url);
+                })
+            }
+            Message::RemoveProfileRelay(share_idx, url) => {
+                let group_pubkey = match &self.screen {
+                    Screen::Relays(s) => {
+                        if let Some(entry) = s.shares.get(share_idx) {
+                            entry.group_pubkey
+                        } else {
+                            return Task::none();
+                        }
+                    }
+                    _ => return Task::none(),
+                };
+                self.modify_relay_config(group_pubkey, move |config| {
+                    config.profile_relays.retain(|r| *r != url);
+                })
+            }
+            Message::RelaySaved(result) => {
+                match result {
+                    Ok(entries) => {
+                        if let Screen::Relays(s) = &mut self.screen {
+                            let expanded = s.expanded;
+                            let frost_input = std::mem::take(&mut s.frost_input);
+                            let profile_input = std::mem::take(&mut s.profile_input);
+                            s.shares = entries;
+                            s.expanded = expanded;
+                            s.frost_input.clear();
+                            s.profile_input.clear();
+                            s.error = None;
+                            let _ = frost_input;
+                            let _ = profile_input;
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::Relays(s) = &mut self.screen {
+                            s.error = Some(e.clone());
+                        }
+                        self.set_toast(e, ToastKind::Error);
+                    }
                 }
                 Task::none()
             }
@@ -788,6 +984,32 @@ impl App {
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
+    }
+
+    fn modify_relay_config(
+        &self,
+        group_pubkey: [u8; 32],
+        modify: impl FnOnce(&mut keep_core::RelayConfig) + Send + 'static,
+    ) -> Task<Message> {
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = lock_keep(&keep_arc);
+                    let keep = guard.as_mut().ok_or("Keep not available".to_string())?;
+                    let mut config = keep
+                        .get_relay_config_or_default(&group_pubkey)
+                        .map_err(friendly_err)?;
+                    modify(&mut config);
+                    keep.store_relay_config(&config).map_err(friendly_err)?;
+                    drop(guard);
+                    load_relay_entries(&keep_arc)
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RelaySaved,
+        )
     }
 
     fn handle_import(&mut self) -> Task<Message> {

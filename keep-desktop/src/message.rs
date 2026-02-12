@@ -5,6 +5,7 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
+use crate::screen::relays::RelayShareEntry;
 use crate::screen::shares::ShareEntry;
 use crate::screen::wallet::WalletEntry;
 
@@ -70,6 +71,18 @@ pub enum Message {
     // Wallets
     ToggleWalletDetails(usize),
     WalletsLoaded(Result<Vec<WalletEntry>, String>),
+
+    // Relays
+    NavigateRelays,
+    RelaysLoaded(Result<Vec<RelayShareEntry>, String>),
+    ToggleRelayDetails(usize),
+    FrostRelayInputChanged(String),
+    ProfileRelayInputChanged(String),
+    AddFrostRelay(usize),
+    AddProfileRelay(usize),
+    RemoveFrostRelay(usize, String),
+    RemoveProfileRelay(usize, String),
+    RelaySaved(Result<Vec<RelayShareEntry>, String>),
 
     // Timer
     Tick,
@@ -137,6 +150,32 @@ impl fmt::Debug for Message {
             Self::ToggleWalletDetails(i) => f.debug_tuple("ToggleWalletDetails").field(i).finish(),
             Self::WalletsLoaded(r) => f
                 .debug_tuple("WalletsLoaded")
+                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::NavigateRelays => f.write_str("NavigateRelays"),
+            Self::RelaysLoaded(r) => f
+                .debug_tuple("RelaysLoaded")
+                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::ToggleRelayDetails(i) => f.debug_tuple("ToggleRelayDetails").field(i).finish(),
+            Self::FrostRelayInputChanged(s) => {
+                f.debug_tuple("FrostRelayInputChanged").field(s).finish()
+            }
+            Self::ProfileRelayInputChanged(s) => {
+                f.debug_tuple("ProfileRelayInputChanged").field(s).finish()
+            }
+            Self::AddFrostRelay(i) => f.debug_tuple("AddFrostRelay").field(i).finish(),
+            Self::AddProfileRelay(i) => f.debug_tuple("AddProfileRelay").field(i).finish(),
+            Self::RemoveFrostRelay(i, r) => {
+                f.debug_tuple("RemoveFrostRelay").field(i).field(r).finish()
+            }
+            Self::RemoveProfileRelay(i, r) => f
+                .debug_tuple("RemoveProfileRelay")
+                .field(i)
+                .field(r)
+                .finish(),
+            Self::RelaySaved(r) => f
+                .debug_tuple("RelaySaved")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::Tick => f.write_str("Tick"),

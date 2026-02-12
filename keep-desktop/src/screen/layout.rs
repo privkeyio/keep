@@ -12,6 +12,7 @@ pub enum NavItem {
     Shares,
     Create,
     Import,
+    Relays,
     Wallets,
 }
 
@@ -24,6 +25,7 @@ pub fn with_sidebar<'a>(
         ("Shares", Message::NavigateShares, NavItem::Shares),
         ("Create", Message::GoToCreate, NavItem::Create),
         ("Import", Message::GoToImport, NavItem::Import),
+        ("Relays", Message::NavigateRelays, NavItem::Relays),
         ("Wallets", Message::NavigateWallets, NavItem::Wallets),
     ];
 

@@ -19,6 +19,8 @@ pub const KEYS_TABLE: &str = "keys";
 pub const SHARES_TABLE: &str = "shares";
 /// Table name for wallet descriptors.
 pub const DESCRIPTORS_TABLE: &str = "wallet_descriptors";
+/// Table name for relay configurations.
+pub const RELAY_CONFIGS_TABLE: &str = "relay_configs";
 
 /// Trait for pluggable storage backends.
 ///
@@ -76,6 +78,8 @@ const KEYS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys
 const SHARES_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("shares");
 const DESCRIPTORS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("wallet_descriptors");
+const RELAY_CONFIGS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("relay_configs");
 
 /// Redb-based storage backend (default).
 pub struct RedbBackend {
@@ -139,6 +143,7 @@ impl RedbBackend {
             KEYS_TABLE => Ok(KEYS_TABLE_DEF),
             SHARES_TABLE => Ok(SHARES_TABLE_DEF),
             DESCRIPTORS_TABLE => Ok(DESCRIPTORS_TABLE_DEF),
+            RELAY_CONFIGS_TABLE => Ok(RELAY_CONFIGS_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }

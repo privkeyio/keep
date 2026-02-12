@@ -52,6 +52,8 @@ pub mod keyring;
 pub mod keys;
 pub mod migration;
 pub(crate) mod rate_limit;
+/// Relay configuration for FROST shares.
+pub mod relay;
 mod rotation;
 /// Persistent encrypted storage backend.
 pub mod storage;
@@ -71,6 +73,7 @@ use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
+pub use crate::relay::RelayConfig;
 use crate::storage::Storage;
 pub use crate::wallet::WalletDescriptor;
 
@@ -530,6 +533,49 @@ impl Keep {
             return Err(KeepError::Locked);
         }
         self.storage.delete_descriptor(group_pubkey)
+    }
+
+    /// Store relay configuration for a FROST share.
+    pub fn store_relay_config(&self, config: &RelayConfig) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.store_relay_config(config)
+    }
+
+    /// Get relay configuration for a FROST share.
+    pub fn get_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<Option<RelayConfig>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_relay_config(group_pubkey)
+    }
+
+    /// Get relay configuration for a FROST share, returning defaults if none stored.
+    pub fn get_relay_config_or_default(&self, group_pubkey: &[u8; 32]) -> Result<RelayConfig> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        match self.storage.get_relay_config(group_pubkey)? {
+            Some(config) => Ok(config),
+            None => Ok(RelayConfig::with_defaults(*group_pubkey)),
+        }
+    }
+
+    /// List all stored relay configurations.
+    pub fn list_relay_configs(&self) -> Result<Vec<RelayConfig>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_relay_configs()
+    }
+
+    /// Delete relay configuration for a FROST share.
+    pub fn delete_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.delete_relay_config(group_pubkey)
     }
 
     /// Get a FROST share by group public key.
