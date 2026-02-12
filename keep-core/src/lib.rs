@@ -500,6 +500,27 @@ impl Keep {
         Ok(())
     }
 
+    /// Get the hex-encoded group pubkey of the active share, if set.
+    pub fn get_active_share_key(&self) -> Option<String> {
+        let path = self.storage.path.join("active_share");
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set the active share by hex-encoded group pubkey. Pass `None` to clear.
+    pub fn set_active_share_key(&self, key: Option<&str>) -> Result<()> {
+        let path = self.storage.path.join("active_share");
+        match key {
+            Some(k) => std::fs::write(&path, k)?,
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    }
+
     /// Store a finalized wallet descriptor, associated with a FROST group.
     pub fn store_wallet_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
         if !self.is_unlocked() {

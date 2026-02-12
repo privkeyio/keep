@@ -239,3 +239,34 @@ pub fn badge_style(_theme: &Theme) -> container::Style {
         ..Default::default()
     }
 }
+
+pub fn active_card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color::SURFACE)),
+        border: Border {
+            color: color::PRIMARY,
+            width: 2.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::BLACK,
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 4.0,
+        },
+        text_color: Some(color::TEXT),
+        snap: false,
+    }
+}
+
+pub fn active_badge(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color::PRIMARY)),
+        border: Border {
+            color: color::PRIMARY,
+            width: 0.0,
+            radius: 12.0.into(),
+        },
+        text_color: Some(Color::WHITE),
+        ..Default::default()
+    }
+}

@@ -45,6 +45,7 @@ pub struct App {
     keep: Arc<Mutex<Option<Keep>>>,
     keep_path: PathBuf,
     screen: Screen,
+    active_share_hex: Option<String>,
     last_activity: Instant,
     clipboard_clear_at: Option<Instant>,
     copy_feedback_until: Option<Instant>,
@@ -175,6 +176,7 @@ impl App {
                                 false,
                                 "Cannot determine home directory. Set $HOME and restart.".into(),
                             )),
+                            active_share_hex: None,
                             last_activity: Instant::now(),
                             clipboard_clear_at: None,
                             copy_feedback_until: None,
@@ -192,6 +194,7 @@ impl App {
                 keep: Arc::new(Mutex::new(None)),
                 keep_path,
                 screen: Screen::Unlock(UnlockScreen::new(vault_exists)),
+                active_share_hex: None,
                 last_activity: Instant::now(),
                 clipboard_clear_at: None,
                 copy_feedback_until: None,
@@ -297,7 +300,8 @@ impl App {
                 }
                 self.copy_feedback_until = None;
                 let shares = self.current_shares();
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                self.screen =
+                    Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
                 Task::none()
             }
             Message::NavigateWallets => {
@@ -341,6 +345,23 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SetActiveShare(hex) => {
+                let result = lock_keep(&self.keep)
+                    .as_ref()
+                    .map(|k| k.set_active_share_key(Some(&hex)));
+
+                match result {
+                    Some(Ok(())) => {
+                        self.active_share_hex = Some(hex);
+                        if let Screen::ShareList(s) = &mut self.screen {
+                            s.active_share_hex = self.active_share_hex.clone();
+                        }
+                    }
+                    Some(Err(e)) => self.set_toast(friendly_err(e), ToastKind::Error),
+                    None => {}
+                }
+                Task::none()
+            }
             Message::RequestDelete(id) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.delete_confirm = Some(id);
@@ -379,7 +400,11 @@ impl App {
             Message::CreateKeyset => self.handle_create_keyset(),
             Message::CreateResult(result) => match result {
                 Ok(shares) => {
-                    self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                    self.resolve_active_share(&shares);
+                    self.screen = Screen::ShareList(ShareListScreen::new(
+                        shares,
+                        self.active_share_hex.clone(),
+                    ));
                     self.set_toast(
                         "Keyset created! Tap a share and use Export QR to send it to your phone."
                             .into(),
@@ -625,6 +650,7 @@ impl App {
         *guard = None;
         drop(guard);
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
+        self.active_share_hex = None;
         self.toast = None;
         self.toast_dismiss_at = None;
         self.screen = Screen::Unlock(UnlockScreen::new(true));
@@ -648,10 +674,38 @@ impl App {
 
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
+        self.resolve_active_share(&shares);
         if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
+            s.active_share_hex = self.active_share_hex.clone();
             s.delete_confirm = None;
         }
+    }
+
+    fn resolve_active_share(&mut self, shares: &[ShareEntry]) {
+        let guard = lock_keep(&self.keep);
+        let Some(keep) = guard.as_ref() else {
+            return;
+        };
+
+        let current = keep.get_active_share_key();
+        let still_valid = current
+            .as_ref()
+            .is_some_and(|key| shares.iter().any(|s| s.group_pubkey_hex == *key));
+
+        if still_valid {
+            self.active_share_hex = current;
+            return;
+        }
+
+        let new_key = if shares.len() == 1 {
+            Some(&shares[0].group_pubkey_hex)
+        } else {
+            None
+        };
+
+        let _ = keep.set_active_share_key(new_key.map(String::as_str));
+        self.active_share_hex = new_key.cloned();
     }
 
     fn handle_unlock(&mut self) -> Task<Message> {
@@ -773,7 +827,13 @@ impl App {
 
     fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
-            Ok(shares) => self.screen = Screen::ShareList(ShareListScreen::new(shares)),
+            Ok(shares) => {
+                self.resolve_active_share(&shares);
+                self.screen = Screen::ShareList(ShareListScreen::new(
+                    shares,
+                    self.active_share_hex.clone(),
+                ));
+            }
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
@@ -785,7 +845,11 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok((shares, name)) => {
-                self.screen = Screen::ShareList(ShareListScreen::new(shares));
+                self.resolve_active_share(&shares);
+                self.screen = Screen::ShareList(ShareListScreen::new(
+                    shares,
+                    self.active_share_hex.clone(),
+                ));
                 self.set_toast(
                     format!("Share '{name}' imported successfully"),
                     ToastKind::Success,
