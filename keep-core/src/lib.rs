@@ -552,7 +552,11 @@ impl Keep {
                 relay::MAX_RELAYS
             )));
         }
-        for url in config.frost_relays.iter().chain(config.profile_relays.iter()) {
+        for url in config
+            .frost_relays
+            .iter()
+            .chain(config.profile_relays.iter())
+        {
             relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
         }
         self.storage.store_relay_config(config)

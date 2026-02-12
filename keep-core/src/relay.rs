@@ -148,9 +148,7 @@ fn is_internal_host(host: &str) -> bool {
     // Hostname checks
     const FORBIDDEN: &[&str] = &["localhost"];
 
-    FORBIDDEN.contains(&bare)
-        || bare.ends_with(".local")
-        || bare.ends_with(".localhost")
+    FORBIDDEN.contains(&bare) || bare.ends_with(".local") || bare.ends_with(".localhost")
 }
 
 fn is_cgn(addr: std::net::Ipv4Addr) -> bool {

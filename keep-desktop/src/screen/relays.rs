@@ -231,7 +231,11 @@ pub fn normalize_relay_url(input: &str) -> String {
     } else {
         format!("wss://{trimmed}")
     };
-    if url.ends_with('/') { url } else { format!("{url}/") }
+    if url.ends_with('/') {
+        url
+    } else {
+        format!("{url}/")
+    }
 }
 
 pub fn validate_and_normalize(input: &str) -> Result<String, String> {
