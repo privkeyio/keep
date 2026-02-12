@@ -124,7 +124,8 @@ fn is_internal_host(host: &str) -> bool {
             return mapped_v4.is_loopback()
                 || mapped_v4.is_private()
                 || mapped_v4.is_link_local()
-                || mapped_v4.is_unspecified();
+                || mapped_v4.is_unspecified()
+                || is_cgn(mapped_v4);
         }
         return bare.starts_with("fc")
             || bare.starts_with("fd")
@@ -246,6 +247,12 @@ mod tests {
         // Outside CGN range - should be allowed
         assert!(validate_relay_url("wss://100.63.0.1/").is_ok());
         assert!(validate_relay_url("wss://100.128.0.1/").is_ok());
+    }
+
+    #[test]
+    fn rejects_ipv6_mapped_cgn() {
+        assert!(validate_relay_url("wss://[::ffff:100.64.0.1]/").is_err());
+        assert!(validate_relay_url("wss://[::ffff:100.127.255.255]/").is_err());
     }
 
     #[test]

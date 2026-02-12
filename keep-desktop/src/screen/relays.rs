@@ -149,6 +149,7 @@ impl RelayScreen {
             .into()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn relay_section<'a>(
         &'a self,
         share_idx: usize,
