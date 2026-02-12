@@ -50,6 +50,26 @@ pub fn default_frost_relays() -> Vec<String> {
     ]
 }
 
+/// Normalize a relay URL: trim whitespace, lowercase scheme+host, ensure trailing slash.
+pub fn normalize_relay_url(url: &str) -> String {
+    let url = url.trim();
+    let url = if url.ends_with('/') {
+        url.to_string()
+    } else {
+        format!("{url}/")
+    };
+    if let Some(idx) = url.find("://") {
+        let scheme = url[..idx].to_lowercase();
+        let rest = &url[idx + 3..];
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let host = rest[..host_end].to_lowercase();
+        let path = &rest[host_end..];
+        format!("{scheme}://{host}{path}")
+    } else {
+        url
+    }
+}
+
 /// Validate a relay URL is a valid wss:// URL pointing to a public host.
 pub fn validate_relay_url(url: &str) -> Result<(), String> {
     if url.len() > MAX_RELAY_URL_LENGTH {
@@ -77,7 +97,11 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
             None => return Err("Unclosed IPv6 bracket".into()),
         }
     } else if let Some(colon_pos) = host_port.rfind(':') {
-        (&host_port[..colon_pos], &host_port[colon_pos + 1..])
+        let host = &host_port[..colon_pos];
+        if host.contains(':') {
+            return Err("Invalid unbracketed IPv6 address".into());
+        }
+        (host, &host_port[colon_pos + 1..])
     } else {
         (host_port, "")
     };
@@ -93,9 +117,16 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Missing host".into());
     }
 
-    if !host.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '[' || c == ']' || c == ':'
-    }) {
+    if host.starts_with('[') {
+        if !host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '[' || c == ']' || c == ':'
+        }) {
+            return Err("Invalid host characters".into());
+        }
+    } else if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         return Err("Invalid host characters".into());
     }
 
@@ -270,5 +301,56 @@ mod tests {
     #[test]
     fn unclosed_ipv6_bracket() {
         assert!(validate_relay_url("wss://[::1/").is_err());
+    }
+
+    #[test]
+    fn rejects_unbracketed_ipv6() {
+        assert!(validate_relay_url("wss://::1/").is_err());
+        assert!(validate_relay_url("wss://fc00::1/").is_err());
+        assert!(validate_relay_url("wss://fe80::1/").is_err());
+    }
+
+    #[test]
+    fn normalize_adds_trailing_slash() {
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com"),
+            "wss://relay.example.com/"
+        );
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com/"),
+            "wss://relay.example.com/"
+        );
+    }
+
+    #[test]
+    fn normalize_lowercases_host() {
+        assert_eq!(
+            normalize_relay_url("wss://RELAY.Example.COM/"),
+            "wss://relay.example.com/"
+        );
+        assert_eq!(
+            normalize_relay_url("wss://RELAY.Example.COM:8080/"),
+            "wss://relay.example.com:8080/"
+        );
+    }
+
+    #[test]
+    fn normalize_deduplicates_urls() {
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com"),
+            normalize_relay_url("wss://relay.example.com/")
+        );
+        assert_eq!(
+            normalize_relay_url("wss://Relay.Example.COM/"),
+            normalize_relay_url("wss://relay.example.com/")
+        );
+    }
+
+    #[test]
+    fn normalize_trims_whitespace() {
+        assert_eq!(
+            normalize_relay_url("  wss://relay.example.com/  "),
+            "wss://relay.example.com/"
+        );
     }
 }

@@ -552,14 +552,25 @@ impl Keep {
                 relay::MAX_RELAYS
             )));
         }
-        for url in config
+        let normalized_frost: Vec<String> = config
             .frost_relays
             .iter()
-            .chain(config.profile_relays.iter())
-        {
+            .map(|u| relay::normalize_relay_url(u))
+            .collect();
+        let normalized_profile: Vec<String> = config
+            .profile_relays
+            .iter()
+            .map(|u| relay::normalize_relay_url(u))
+            .collect();
+        for url in normalized_frost.iter().chain(normalized_profile.iter()) {
             relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
         }
-        self.storage.store_relay_config(config)
+        let normalized_config = RelayConfig {
+            group_pubkey: config.group_pubkey,
+            frost_relays: normalized_frost,
+            profile_relays: normalized_profile,
+        };
+        self.storage.store_relay_config(&normalized_config)
     }
 
     /// Get relay configuration for a FROST share.
