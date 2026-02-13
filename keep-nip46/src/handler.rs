@@ -425,6 +425,10 @@ impl SignerHandler {
         if self.request_approval(request).await {
             Ok(())
         } else {
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::UserRejected, app_pubkey)
+                    .with_reason(method),
+            );
             Err(KeepError::UserRejected)
         }
     }

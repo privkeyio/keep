@@ -197,14 +197,12 @@ impl PermissionManager {
     }
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
-        let Some(app) = self.apps.get(pubkey) else {
-            return true;
-        };
-        if app.duration.is_expired(app.connected_at) {
-            return true;
-        }
-        if app.auto_approve_kinds.contains(&kind) {
-            return false;
+        if let Some(app) = self.apps.get(pubkey) {
+            if !app.duration.is_expired(app.connected_at)
+                && app.auto_approve_kinds.contains(&kind)
+            {
+                return false;
+            }
         }
         if self.global_auto_approve.contains(&kind) {
             return false;
@@ -333,7 +331,7 @@ mod tests {
             app.connected_at = Timestamp::from(1);
         }
         assert!(!pm.has_permission(&pubkey, Permission::SIGN_EVENT));
-        assert!(pm.needs_approval(&pubkey, Kind::Reaction));
+        assert!(!pm.needs_approval(&pubkey, Kind::Reaction));
     }
 
     #[test]
