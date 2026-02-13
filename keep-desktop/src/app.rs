@@ -1290,6 +1290,8 @@ impl App {
                     let Some((session, response_tx)) = result else {
                         break;
                     };
+                    // Coordinator is always the first participant in the session.
+                    // Falls back to 0 (invalid) if empty, which rate-limiting handles safely.
                     let from_peer = session.participants.first().copied().unwrap_or(0);
                     let now = Instant::now();
 

@@ -204,7 +204,7 @@ impl EcdhSession {
         self.partial_points.len() >= self.threshold as usize
     }
 
-    pub fn try_complete(&mut self) -> Result<Option<[u8; 32]>> {
+    pub fn try_complete(&mut self) -> Result<Option<Zeroizing<[u8; 32]>>> {
         if !self.has_all_shares() {
             return Ok(None);
         }
@@ -221,9 +221,10 @@ impl EcdhSession {
 
         match aggregate_ecdh_shares(&partial_vec, &self.participants) {
             Ok(shared_secret) => {
-                self.shared_secret = Some(Zeroizing::new(shared_secret));
+                let zeroized = Zeroizing::new(shared_secret);
+                self.shared_secret = Some(zeroized.clone());
                 self.state = EcdhSessionState::Complete;
-                Ok(Some(shared_secret))
+                Ok(Some(zeroized))
             }
             Err(e) => {
                 self.state = EcdhSessionState::Failed;

@@ -63,7 +63,7 @@ impl SignerHandler {
         self
     }
 
-    pub fn with_headless_auto_approve(mut self, auto_approve: bool) -> Self {
+    pub(crate) fn with_headless_auto_approve(mut self, auto_approve: bool) -> Self {
         self.headless_auto_approve = auto_approve;
         self
     }
@@ -511,7 +511,7 @@ mod tests {
 
     fn setup_keyring() -> Arc<Mutex<Keyring>> {
         let mut keyring = Keyring::new();
-        let keypair = NostrKeypair::generate();
+        let keypair = NostrKeypair::generate().unwrap();
         keyring
             .load_key(
                 *keypair.public_bytes(),

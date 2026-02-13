@@ -44,7 +44,7 @@ fn test_import_nsec() {
 
     let mut keep = create_test_keep(&path);
 
-    let keypair = NostrKeypair::generate();
+    let keypair = NostrKeypair::generate().unwrap();
     let nsec = keypair.to_nsec();
     let expected_pubkey = *keypair.public_bytes();
 
@@ -113,7 +113,7 @@ fn test_duplicate_import_fails() {
 
     let mut keep = create_test_keep(&path);
 
-    let keypair = NostrKeypair::generate();
+    let keypair = NostrKeypair::generate().unwrap();
     let nsec = keypair.to_nsec();
 
     keep.import_nsec(&nsec, "first").unwrap();

@@ -506,6 +506,8 @@ fn validate_session_id(
 }
 
 impl SessionManager {
+    const MAX_ACTIVE_SESSIONS: usize = 256;
+
     pub fn new() -> Self {
         Self {
             active_sessions: HashMap::new(),
@@ -559,6 +561,13 @@ impl SessionManager {
             self.active_sessions.remove(&session_id);
         }
 
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session(
+                "Too many active sessions".into(),
+            ));
+        }
+
         let session = NetworkSession::new(session_id, message, threshold, participants)
             .with_timeout(self.session_timeout);
 
@@ -604,6 +613,12 @@ impl SessionManager {
                 return Err(FrostNetError::Session("Session parameters mismatch".into()));
             }
         } else {
+            self.cleanup_expired();
+            if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+                return Err(FrostNetError::Session(
+                    "Too many active sessions".into(),
+                ));
+            }
             let session = NetworkSession::new(session_id, message, threshold, participants)
                 .with_timeout(self.session_timeout);
             self.active_sessions.insert(session_id, session);

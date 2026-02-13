@@ -163,7 +163,7 @@ fn cmd_generate_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     spinner.finish();
 
     let spinner = out.spinner("Generating key...");
-    let keypair = NostrKeypair::generate();
+    let keypair = NostrKeypair::generate()?;
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;
@@ -202,7 +202,7 @@ fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     spinner.finish();
 
     let spinner = out.spinner("Generating key...");
-    let keypair = NostrKeypair::generate();
+    let keypair = NostrKeypair::generate()?;
     let pubkey = *keypair.public_bytes();
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let encrypted = crypto::encrypt(keypair.secret_bytes(), data_key)?;

@@ -58,11 +58,9 @@ fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Resul
 
 fn validate_password_len(password: &str) -> Result<()> {
     if password.len() > MAX_PASSWORD_LEN {
-        return Err(KeepError::InvalidInput(format!(
-            "password too long: {} bytes (max {})",
-            password.len(),
-            MAX_PASSWORD_LEN
-        )));
+        return Err(KeepError::InvalidInput(
+            "password too long (max 4096 bytes)".into(),
+        ));
     }
     Ok(())
 }
