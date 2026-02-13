@@ -23,6 +23,7 @@ pub struct ServerConfig {
     pub max_event_json_size: usize,
     pub audit_log_capacity: usize,
     pub rate_limit: Option<RateLimitConfig>,
+    pub auto_approve: bool,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +32,7 @@ impl Default for ServerConfig {
             max_event_json_size: 64 * 1024,
             audit_log_capacity: 10_000,
             rate_limit: None,
+            auto_approve: false,
         }
     }
 }
@@ -113,7 +115,8 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
-        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone());
+        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
+            .with_auto_approve(config.auto_approve);
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
@@ -219,7 +222,8 @@ impl Server {
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
-            .with_network_frost_signer(network_signer);
+            .with_network_frost_signer(network_signer)
+            .with_auto_approve(config.auto_approve);
         if let Some(ref rl_config) = config.rate_limit {
             handler = handler.with_rate_limit(rl_config.clone());
         }
@@ -429,16 +433,23 @@ impl Server {
                     return Nip46Response::error(id, "Invalid created_at timestamp");
                 }
 
-                let tags: Vec<Tag> = partial
-                    .tags
-                    .into_iter()
-                    .filter_map(|t| Tag::parse(&t).ok())
-                    .collect();
+                let kind_u16: u16 = match partial.kind.try_into() {
+                    Ok(k) => k,
+                    Err(_) => return Nip46Response::error(id, "Event kind out of range"),
+                };
+
+                let mut tags = Vec::with_capacity(partial.tags.len());
+                for t in &partial.tags {
+                    match Tag::parse(t) {
+                        Ok(tag) => tags.push(tag),
+                        Err(_) => return Nip46Response::error(id, "Invalid tag in event"),
+                    }
+                }
 
                 let unsigned = UnsignedEvent::new(
                     user_pubkey,
                     Timestamp::from(partial.created_at as u64),
-                    Kind::from(partial.kind),
+                    Kind::from(kind_u16),
                     tags,
                     &partial.content,
                 );

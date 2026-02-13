@@ -9,7 +9,8 @@ pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&
     url.push_str(&format!("?relay={encoded_relay}"));
 
     if let Some(s) = secret {
-        url.push_str(&format!("&secret={s}"));
+        let encoded_secret = urlencoding::encode(s);
+        url.push_str(&format!("&secret={encoded_secret}"));
     }
 
     url
@@ -58,5 +59,19 @@ mod tests {
         assert_eq!(pubkey, parsed_pk);
         assert_eq!(relays[0], relay);
         assert_eq!(secret, Some("mysecret".into()));
+    }
+
+    #[test]
+    fn test_bunker_url_secret_with_special_chars() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let relay = "wss://relay.damus.io";
+        let secret = "pass&word=special chars+more";
+
+        let url = generate_bunker_url(&pubkey, relay, Some(secret));
+        assert!(!url.contains("pass&word"));
+
+        let (_, _, parsed_secret) = parse_bunker_url(&url).unwrap();
+        assert_eq!(parsed_secret, Some(secret.into()));
     }
 }

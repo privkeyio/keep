@@ -15,10 +15,7 @@ bitflags::bitflags! {
         const NIP44_ENCRYPT  = 0b00010000;
         const NIP44_DECRYPT  = 0b00100000;
 
-        const DEFAULT = Self::GET_PUBLIC_KEY.bits()
-                      | Self::SIGN_EVENT.bits()
-                      | Self::NIP44_ENCRYPT.bits()
-                      | Self::NIP44_DECRYPT.bits();
+        const DEFAULT = Self::GET_PUBLIC_KEY.bits();
 
         const ALL = Self::GET_PUBLIC_KEY.bits()
                   | Self::SIGN_EVENT.bits()
@@ -79,10 +76,31 @@ impl PermissionManager {
         }
     }
 
+    pub const MAX_CONNECTED_APPS: usize = 100;
+
     pub fn connect(&mut self, pubkey: PublicKey, name: String) {
+        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+            return;
+        }
         self.apps
             .entry(pubkey)
             .or_insert_with(|| AppPermission::new(pubkey, name));
+    }
+
+    pub fn connect_with_permissions(
+        &mut self,
+        pubkey: PublicKey,
+        name: String,
+        requested: Permission,
+    ) {
+        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+            return;
+        }
+        self.apps.entry(pubkey).or_insert_with(|| {
+            let mut app = AppPermission::new(pubkey, name);
+            app.permissions = requested & Permission::ALL;
+            app
+        });
     }
 
     pub fn revoke(&mut self, pubkey: &PublicKey) {
@@ -159,6 +177,10 @@ mod tests {
 
         pm.connect(pubkey, "Test App".into());
         assert!(pm.is_connected(&pubkey));
+        assert!(pm.has_permission(&pubkey, Permission::GET_PUBLIC_KEY));
+        assert!(!pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+
+        pm.grant(pubkey, "Test App".into(), Permission::SIGN_EVENT);
         assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
 
         assert!(!pm.needs_approval(&pubkey, Kind::Reaction));
@@ -166,5 +188,34 @@ mod tests {
 
         pm.revoke(&pubkey);
         assert!(!pm.is_connected(&pubkey));
+    }
+
+    #[test]
+    fn test_connect_with_permissions() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+
+        pm.connect_with_permissions(
+            pubkey,
+            "Test App".into(),
+            Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+        );
+        assert!(pm.is_connected(&pubkey));
+        assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+        assert!(!pm.has_permission(&pubkey, Permission::NIP44_ENCRYPT));
+    }
+
+    #[test]
+    fn test_max_connected_apps() {
+        let mut pm = PermissionManager::new();
+        for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
+            let pubkey = Keys::generate().public_key();
+            pm.connect(pubkey, "App".into());
+        }
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+
+        let extra = Keys::generate().public_key();
+        pm.connect(extra, "Extra".into());
+        assert!(!pm.is_connected(&extra));
     }
 }

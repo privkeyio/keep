@@ -60,7 +60,7 @@ impl Nip46Response {
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct PartialEvent {
-    pub kind: u16,
+    pub kind: u32,
     pub content: String,
     #[serde(default)]
     pub tags: Vec<Vec<String>>,

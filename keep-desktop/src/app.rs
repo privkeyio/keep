@@ -153,9 +153,11 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         {
             return false;
         }
-        response_rx
-            .recv_timeout(BUNKER_APPROVAL_TIMEOUT)
-            .unwrap_or(false)
+        tokio::task::block_in_place(|| {
+            response_rx
+                .recv_timeout(BUNKER_APPROVAL_TIMEOUT)
+                .unwrap_or(false)
+        })
     }
 
     fn on_connect(&self, pubkey: &str, name: &str) {
@@ -2148,9 +2150,8 @@ impl App {
     fn sync_bunker_clients(&mut self) {
         if let Some(ref mut bunker) = self.bunker {
             let handler = bunker.handler.clone();
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = rt {
-                let clients: Vec<ConnectedClient> = handle.block_on(async {
+            let clients: Vec<ConnectedClient> = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
                     handler
                         .list_clients()
                         .await
@@ -2160,12 +2161,12 @@ impl App {
                             name: app.name,
                         })
                         .collect()
-                });
-                bunker.clients = clients.clone();
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.clients = clients;
-                    s.revoke_all_confirm = false;
-                }
+                })
+            });
+            bunker.clients = clients.clone();
+            if let Screen::Bunker(s) = &mut self.screen {
+                s.clients = clients;
+                s.revoke_all_confirm = false;
             }
         }
     }

@@ -27,7 +27,7 @@ impl ConnectedClient {
 pub struct PendingApprovalDisplay {
     pub app_name: String,
     pub method: String,
-    pub event_kind: Option<u16>,
+    pub event_kind: Option<u32>,
     pub event_content: Option<String>,
 }
 
@@ -123,7 +123,7 @@ impl BunkerScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Bunker, inner.into(), None)
+        layout::with_sidebar(NavItem::Bunker, inner.into(), None, 0)
     }
 
     fn status_card(&self) -> Element<Message> {
@@ -383,8 +383,9 @@ impl BunkerScreen {
         }
 
         if let Some(ref content) = approval.event_content {
-            let preview = if content.len() > 200 {
-                format!("{}...", &content[..200])
+            let preview = if content.chars().count() > 200 {
+                let truncated: String = content.chars().take(200).collect();
+                format!("{truncated}...")
             } else {
                 content.clone()
             };

@@ -16,6 +16,26 @@ use crate::permissions::{AppPermission, Permission, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{ApprovalRequest, ServerCallbacks};
 
+fn parse_permission_string(perms: &str) -> Permission {
+    let mut result = Permission::empty();
+    for part in perms.split(',') {
+        match part.trim() {
+            "get_public_key" => result |= Permission::GET_PUBLIC_KEY,
+            "sign_event" => result |= Permission::SIGN_EVENT,
+            "nip04_encrypt" => result |= Permission::NIP04_ENCRYPT,
+            "nip04_decrypt" => result |= Permission::NIP04_DECRYPT,
+            "nip44_encrypt" => result |= Permission::NIP44_ENCRYPT,
+            "nip44_decrypt" => result |= Permission::NIP44_DECRYPT,
+            _ => {}
+        }
+    }
+    if result.is_empty() {
+        Permission::DEFAULT
+    } else {
+        result | Permission::GET_PUBLIC_KEY
+    }
+}
+
 pub struct SignerHandler {
     keyring: Arc<Mutex<Keyring>>,
     frost_signer: Option<Arc<Mutex<FrostSigner>>>,
@@ -25,6 +45,8 @@ pub struct SignerHandler {
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     rate_limiters: Mutex<HashMap<PublicKey, RateLimiter>>,
     rate_limit_config: Option<RateLimitConfig>,
+    expected_secret: Option<String>,
+    auto_approve: bool,
     headless_auto_approve: bool,
 }
 
@@ -44,8 +66,20 @@ impl SignerHandler {
             callbacks,
             rate_limiters: Mutex::new(HashMap::new()),
             rate_limit_config: None,
+            expected_secret: None,
+            auto_approve: false,
             headless_auto_approve: false,
         }
+    }
+
+    pub fn with_expected_secret(mut self, secret: String) -> Self {
+        self.expected_secret = Some(secret);
+        self
+    }
+
+    pub fn with_auto_approve(mut self, auto_approve: bool) -> Self {
+        self.auto_approve = auto_approve;
+        self
     }
 
     pub fn with_frost_signer(mut self, signer: FrostSigner) -> Self {
@@ -111,9 +145,37 @@ impl SignerHandler {
         app_pubkey: PublicKey,
         our_pubkey: Option<PublicKey>,
         secret: Option<String>,
-        _permissions: Option<String>,
+        permissions: Option<String>,
     ) -> Result<Option<String>> {
         self.check_rate_limit(&app_pubkey).await?;
+
+        if let Some(ref expected) = self.expected_secret {
+            match &secret {
+                Some(s) if s == expected => {}
+                _ => {
+                    let mut audit = self.audit.lock().await;
+                    audit.log(
+                        AuditEntry::new(AuditAction::Connect, app_pubkey)
+                            .with_success(false)
+                            .with_reason("invalid secret"),
+                    );
+                    return Err(KeepError::PermissionDenied("invalid secret".into()));
+                }
+            }
+        } else if !self.auto_approve {
+            let approved = self
+                .request_approval(ApprovalRequest {
+                    app_pubkey,
+                    app_name: format!("App {}", &app_pubkey.to_hex()[..8]),
+                    method: "connect".into(),
+                    event_kind: None,
+                    event_content: None,
+                })
+                .await;
+            if !approved {
+                return Err(KeepError::UserRejected);
+            }
+        }
 
         if let Some(expected) = our_pubkey {
             let actual = if let Some(ref net_frost) = self.network_frost_signer {
@@ -138,8 +200,13 @@ impl SignerHandler {
 
         let name = format!("App {}", &app_pubkey.to_hex()[..8]);
 
+        let requested_perms = permissions
+            .as_deref()
+            .map(parse_permission_string)
+            .unwrap_or(Permission::DEFAULT);
+
         let mut pm = self.permissions.lock().await;
-        pm.connect(app_pubkey, name.clone());
+        pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms);
 
         let mut audit = self.audit.lock().await;
         audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
@@ -328,7 +395,7 @@ impl SignerHandler {
             );
         }
 
-        let event_kind = kind.as_u16();
+        let event_kind = kind.as_u32();
         let event_id = &signed_event.id.to_hex()[..8];
         debug!(event_kind, event_id, "signed event");
         Ok(signed_event)
@@ -508,7 +575,7 @@ impl SignerHandler {
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
-        if self.headless_auto_approve {
+        if self.auto_approve || self.headless_auto_approve {
             warn!(method = %request.method, "auto-approving in headless mode");
             return true;
         }
@@ -543,7 +610,7 @@ mod tests {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        SignerHandler::new(keyring, permissions, audit, None)
+        SignerHandler::new(keyring, permissions, audit, None).with_auto_approve(true)
     }
 
     #[tokio::test]

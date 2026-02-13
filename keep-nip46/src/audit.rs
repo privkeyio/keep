@@ -47,7 +47,7 @@ pub struct AuditEntry {
     pub action: AuditAction,
     pub app_pubkey: String,
     pub app_name: Option<String>,
-    pub event_kind: Option<u16>,
+    pub event_kind: Option<u32>,
     pub event_id: Option<String>,
     pub success: bool,
     pub reason: Option<String>,
@@ -73,7 +73,7 @@ impl AuditEntry {
     }
 
     pub fn with_event_kind(mut self, kind: Kind) -> Self {
-        self.event_kind = Some(kind.as_u16());
+        self.event_kind = Some(kind.as_u32());
         self
     }
 
