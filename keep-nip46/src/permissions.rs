@@ -28,6 +28,26 @@ bitflags::bitflags! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionDuration {
+    Session,
+    Seconds(u64),
+    Forever,
+}
+
+impl PermissionDuration {
+    pub fn is_expired(&self, connected_at: Timestamp) -> bool {
+        match self {
+            Self::Session | Self::Forever => false,
+            Self::Seconds(secs) => {
+                let now = Timestamp::now().as_secs();
+                let expires = connected_at.as_secs().saturating_add(*secs);
+                now > expires
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPermission {
     pub pubkey: PublicKey,
@@ -37,6 +57,12 @@ pub struct AppPermission {
     pub connected_at: Timestamp,
     pub last_used: Timestamp,
     pub request_count: u64,
+    #[serde(default = "default_duration")]
+    pub duration: PermissionDuration,
+}
+
+fn default_duration() -> PermissionDuration {
+    PermissionDuration::Forever
 }
 
 impl AppPermission {
@@ -49,6 +75,7 @@ impl AppPermission {
             connected_at: Timestamp::now(),
             last_used: Timestamp::now(),
             request_count: 0,
+            duration: PermissionDuration::Forever,
         }
     }
 }
@@ -133,7 +160,12 @@ impl PermissionManager {
     pub fn has_permission(&self, pubkey: &PublicKey, perm: Permission) -> bool {
         self.apps
             .get(pubkey)
-            .map(|app| app.permissions.contains(perm))
+            .map(|app| {
+                if app.duration.is_expired(app.connected_at) {
+                    return false;
+                }
+                app.permissions.contains(perm)
+            })
             .unwrap_or(false)
     }
 
@@ -143,6 +175,12 @@ impl PermissionManager {
     }
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
+        if let Some(app) = self.apps.get(pubkey) {
+            if app.duration.is_expired(app.connected_at) {
+                return true;
+            }
+        }
+
         if self.global_auto_approve.contains(&kind) {
             return false;
         }
@@ -236,5 +274,32 @@ mod tests {
         let extra = Keys::generate().public_key();
         pm.connect(extra, "Extra".into());
         assert!(!pm.is_connected(&extra));
+    }
+
+    #[test]
+    fn test_permission_duration_expiry() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+
+        pm.connect(pubkey, "Test".into());
+        pm.grant(pubkey, "Test".into(), Permission::SIGN_EVENT);
+        assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.duration = PermissionDuration::Seconds(0);
+            app.connected_at = Timestamp::from(1);
+        }
+        assert!(!pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+        assert!(pm.needs_approval(&pubkey, Kind::Reaction));
+    }
+
+    #[test]
+    fn test_permission_duration_forever() {
+        assert!(!PermissionDuration::Forever.is_expired(Timestamp::from(1)));
+    }
+
+    #[test]
+    fn test_permission_duration_session() {
+        assert!(!PermissionDuration::Session.is_expired(Timestamp::from(1)));
     }
 }

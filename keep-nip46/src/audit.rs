@@ -49,6 +49,7 @@ pub struct AuditEntry {
     pub app_name: Option<String>,
     pub event_kind: Option<u16>,
     pub event_id: Option<String>,
+    pub peer_pubkey: Option<String>,
     pub success: bool,
     pub reason: Option<String>,
 }
@@ -62,6 +63,7 @@ impl AuditEntry {
             app_name: None,
             event_kind: None,
             event_id: None,
+            peer_pubkey: None,
             success: true,
             reason: None,
         }
@@ -89,6 +91,11 @@ impl AuditEntry {
 
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_peer_pubkey(mut self, pubkey: PublicKey) -> Self {
+        self.peer_pubkey = Some(pubkey.to_hex());
         self
     }
 }

@@ -432,10 +432,9 @@ impl SignerHandler {
         let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
             .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?;
 
-        self.audit
-            .lock()
-            .await
-            .log(AuditEntry::new(AuditAction::Nip44Encrypt, app_pubkey));
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::Nip44Encrypt, app_pubkey).with_peer_pubkey(recipient),
+        );
 
         Ok(ciphertext)
     }
@@ -459,7 +458,7 @@ impl SignerHandler {
         self.audit
             .lock()
             .await
-            .log(AuditEntry::new(AuditAction::Nip44Decrypt, app_pubkey));
+            .log(AuditEntry::new(AuditAction::Nip44Decrypt, app_pubkey).with_peer_pubkey(sender));
 
         Ok(plaintext)
     }
@@ -478,10 +477,9 @@ impl SignerHandler {
         let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
             .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?;
 
-        self.audit
-            .lock()
-            .await
-            .log(AuditEntry::new(AuditAction::Nip04Encrypt, app_pubkey));
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::Nip04Encrypt, app_pubkey).with_peer_pubkey(recipient),
+        );
 
         Ok(ciphertext)
     }
@@ -505,7 +503,7 @@ impl SignerHandler {
         self.audit
             .lock()
             .await
-            .log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey));
+            .log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey).with_peer_pubkey(sender));
 
         Ok(plaintext)
     }

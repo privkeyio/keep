@@ -18,7 +18,7 @@ pub use bunker::generate_bunker_url;
 pub use error::Result;
 pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;
-pub use permissions::{AppPermission, Permission, PermissionManager};
+pub use permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use server::{Server, ServerConfig};
 pub use types::{ApprovalRequest, LogEvent, ServerCallbacks};

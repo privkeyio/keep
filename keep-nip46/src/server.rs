@@ -302,7 +302,7 @@ impl Server {
         self.running = true;
 
         let bunker_url = self.bunker_url();
-        info!(bunker_url, "listening for NIP-46 requests");
+        debug!(bunker_url, "listening for NIP-46 requests");
 
         Ok(())
     }
