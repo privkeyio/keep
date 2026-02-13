@@ -3382,11 +3382,13 @@ dependencies = [
  "keep-core",
  "keep-frost-net",
  "nostr-sdk",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "urlencoding",
 ]
