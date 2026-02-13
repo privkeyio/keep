@@ -64,6 +64,7 @@ pub struct SessionInfo {
     pub message: Vec<u8>,
     pub threshold: u16,
     pub participants: Vec<u16>,
+    pub requester: u16,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -73,6 +74,7 @@ impl From<&NetworkSession> for SessionInfo {
             message: session.message().to_vec(),
             threshold: session.threshold(),
             participants: session.participants().to_vec(),
+            requester: 0,
         }
     }
 }

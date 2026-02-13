@@ -54,7 +54,7 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
                     result.push('\n');
                 }
                 result.push_str(line);
-                if result.len() >= MAX_CHARS {
+                if result.chars().count() >= MAX_CHARS {
                     let boundary = result
                         .char_indices()
                         .map(|(i, _)| i)
@@ -348,7 +348,7 @@ pub(crate) async fn frost_event_listener(
                 let Some((session, response_tx)) = result else {
                     break;
                 };
-                let from_peer = session.participants.first().copied().unwrap_or(0);
+                let from_peer = session.requester;
                 let now = Instant::now();
 
                 if !check_rate_limit(

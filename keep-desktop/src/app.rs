@@ -191,7 +191,6 @@ fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
     }
 }
 
-
 impl App {
     fn init(keep_path: PathBuf, screen: Screen, relay_urls: Vec<String>) -> Self {
         Self {

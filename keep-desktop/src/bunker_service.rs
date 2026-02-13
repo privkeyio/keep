@@ -9,7 +9,10 @@ use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use crate::app::{lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, CLIPBOARD_CLEAR_SECS, MAX_BUNKER_LOG_ENTRIES};
+use crate::app::{
+    lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, CLIPBOARD_CLEAR_SECS,
+    MAX_BUNKER_LOG_ENTRIES,
+};
 use crate::message::Message;
 use crate::screen::bunker::{
     BunkerScreen, ConnectedClient, LogDisplayEntry, PendingApprovalDisplay,
@@ -259,16 +262,10 @@ impl App {
         }
 
         let keep_arc = self.keep.clone();
-        let relay = match self.bunker_relays.first() {
-            Some(r) => r.clone(),
-            None => return Task::none(),
-        };
-        if self.bunker_relays.len() > 1 {
-            tracing::warn!(
-                count = self.bunker_relays.len(),
-                "multiple bunker relays configured but only the first is used"
-            );
+        if self.bunker_relays.is_empty() {
+            return Task::none();
         }
+        let relay_urls = self.bunker_relays.clone();
 
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
@@ -304,7 +301,7 @@ impl App {
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
                     Arc::new(DesktopCallbacks { tx: event_tx });
 
-                let mut server = keep_nip46::Server::new(keyring, &relay, Some(callbacks))
+                let mut server = keep_nip46::Server::new(keyring, &relay_urls, Some(callbacks))
                     .await
                     .map_err(|e| format!("Failed to start bunker: {e}"))?;
 
