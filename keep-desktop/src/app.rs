@@ -64,18 +64,14 @@ impl SigningHooks for DesktopSigningHooks {
                 request_tx
                     .send((session, response_tx))
                     .await
-                    .map_err(|_| {
-                        keep_frost_net::FrostNetError::Session("Channel closed".into())
-                    })?;
+                    .map_err(|_| keep_frost_net::FrostNetError::Session("Channel closed".into()))?;
 
                 match tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await {
                     Ok(Some(true)) => Ok(()),
                     Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
                         "Request rejected".into(),
                     )),
-                    Ok(None) => {
-                        Err(keep_frost_net::FrostNetError::Session("No response".into()))
-                    }
+                    Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
                     Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
                 }
             })
@@ -749,14 +745,10 @@ impl App {
                     let group_pubkey = share_entry.group_pubkey;
                     let identifier = share_entry.identifier;
                     move || {
-                        with_keep_blocking(
-                            &keep_arc,
-                            "Failed to load share",
-                            move |keep| {
-                                keep.frost_get_share_by_index(&group_pubkey, identifier)
-                                    .map_err(friendly_err)
-                            },
-                        )
+                        with_keep_blocking(&keep_arc, "Failed to load share", move |keep| {
+                            keep.frost_get_share_by_index(&group_pubkey, identifier)
+                                .map_err(friendly_err)
+                        })
                     }
                 })
                 .await

@@ -191,9 +191,7 @@ impl fmt::Debug for Message {
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
             Self::AddRelay => f.write_str("AddRelay"),
             Self::RemoveRelay(i) => f.debug_tuple("RemoveRelay").field(i).finish(),
-            Self::SelectShareForRelay(i) => {
-                f.debug_tuple("SelectShareForRelay").field(i).finish()
-            }
+            Self::SelectShareForRelay(i) => f.debug_tuple("SelectShareForRelay").field(i).finish(),
             Self::ConnectRelay => f.write_str("ConnectRelay"),
             Self::DisconnectRelay => f.write_str("DisconnectRelay"),
             Self::ConnectRelayResult(r) => f

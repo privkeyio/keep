@@ -39,10 +39,30 @@ pub fn with_sidebar<'a>(
     };
 
     let nav_items: Vec<(&str, Message, NavItem, NavBadge)> = vec![
-        ("Shares", Message::NavigateShares, NavItem::Shares, share_badge),
-        ("Create", Message::GoToCreate, NavItem::Create, NavBadge::None),
-        ("Import", Message::GoToImport, NavItem::Import, NavBadge::None),
-        ("Wallets", Message::NavigateWallets, NavItem::Wallets, NavBadge::None),
+        (
+            "Shares",
+            Message::NavigateShares,
+            NavItem::Shares,
+            share_badge,
+        ),
+        (
+            "Create",
+            Message::GoToCreate,
+            NavItem::Create,
+            NavBadge::None,
+        ),
+        (
+            "Import",
+            Message::GoToImport,
+            NavItem::Import,
+            NavBadge::None,
+        ),
+        (
+            "Wallets",
+            Message::NavigateWallets,
+            NavItem::Wallets,
+            NavBadge::None,
+        ),
         ("Relay", Message::NavigateRelay, NavItem::Relay, relay_badge),
     ];
 

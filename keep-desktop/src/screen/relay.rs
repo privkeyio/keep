@@ -90,10 +90,7 @@ impl RelayScreen {
 
         container(text(label).size(theme::size::SMALL).color(color))
             .style(move |_: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color {
-                    a: 0.15,
-                    ..color
-                })),
+                background: Some(iced::Background::Color(iced::Color { a: 0.15, ..color })),
                 border: iced::Border {
                     color,
                     width: 1.0,
@@ -116,15 +113,16 @@ impl RelayScreen {
         let mut share_buttons = row![].spacing(theme::space::SM);
         for (i, share) in self.shares.iter().enumerate() {
             let is_selected = self.selected_share == Some(i);
-            let style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style =
-                if is_selected {
-                    theme::primary_button
-                } else {
-                    theme::secondary_button
-                };
+            let style: fn(
+                &iced::Theme,
+                iced::widget::button::Status,
+            ) -> iced::widget::button::Style = if is_selected {
+                theme::primary_button
+            } else {
+                theme::secondary_button
+            };
             let btn = button(
-                text(format!("{} #{}", share.name, share.identifier))
-                    .size(theme::size::SMALL),
+                text(format!("{} #{}", share.name, share.identifier)).size(theme::size::SMALL),
             )
             .style(style)
             .on_press_maybe((!self.is_active()).then(|| Message::SelectShareForRelay(i)))
@@ -145,12 +143,9 @@ impl RelayScreen {
 
         let mut relay_list = column![].spacing(theme::space::XS);
         for (i, url) in self.relay_urls.iter().enumerate() {
-            let mut relay_row = row![
-                theme::muted(url),
-                Space::new().width(Length::Fill),
-            ]
-            .spacing(theme::space::SM)
-            .align_y(Alignment::Center);
+            let mut relay_row = row![theme::muted(url), Space::new().width(Length::Fill),]
+                .spacing(theme::space::SM)
+                .align_y(Alignment::Center);
 
             if !active {
                 relay_row = relay_row.push(
@@ -167,8 +162,8 @@ impl RelayScreen {
         let mut section = column![theme::label("Relay URLs"), relay_list].spacing(theme::space::SM);
 
         if !active {
-            let can_add = self.relay_url_input.starts_with("wss://")
-                && self.relay_url_input.len() > 6;
+            let can_add =
+                self.relay_url_input.starts_with("wss://") && self.relay_url_input.len() > 6;
             let input_row = row![
                 text_input("wss://relay.example.com", &self.relay_url_input)
                     .on_input(Message::RelayUrlChanged)
@@ -294,10 +289,12 @@ impl RelayScreen {
                 column![
                     row![
                         text(source)
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT_MUTED),
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
                         Space::new().width(Length::Fill),
-                        text(ts).size(theme::size::TINY).color(theme::color::TEXT_DIM),
+                        text(ts)
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
                     ]
                     .align_y(Alignment::Center),
                     text(format!("Message: {}", req.message_preview))
