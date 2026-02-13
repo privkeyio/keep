@@ -6,6 +6,10 @@ rust-version = "1.81"
 description = "Core library for Keep - sovereign key management for Nostr and Bitcoin"
 license = "AGPL-3.0-or-later"
 
+[features]
+default = []
+testing = []
+
 [dependencies]
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -46,3 +50,4 @@ proptest = "1.5"
 [[bench]]
 name = "crypto"
 harness = false
+required-features = ["testing"]

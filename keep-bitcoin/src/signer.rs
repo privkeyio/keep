@@ -142,10 +142,6 @@ impl BitcoinSigner {
         self.psbt_signer.sign(psbt)
     }
 
-    pub fn sign_psbt_unchecked(&self, psbt: &mut Psbt) -> Result<usize> {
-        self.psbt_signer.sign(psbt)
-    }
-
     pub fn x_only_public_key(&self) -> [u8; 32] {
         self.psbt_signer.x_only_public_key().serialize()
     }

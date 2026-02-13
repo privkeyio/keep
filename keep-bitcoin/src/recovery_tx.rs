@@ -128,7 +128,10 @@ impl RecoveryTxBuilder {
         let msg = Message::from_digest_slice(sighash.as_ref())
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        let aux_rand = crate::aux_rand()?;
+        let sig = self
+            .secp
+            .sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
 
         psbt.inputs[0].tap_script_sigs.insert(
             (x_only, leaf_hash),

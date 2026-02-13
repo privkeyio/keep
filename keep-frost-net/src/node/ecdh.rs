@@ -147,7 +147,7 @@ impl KfpNode {
 
             let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
                 session_id: payload.session_id,
-                shared_secret: secret,
+                shared_secret: *secret,
             });
         }
 

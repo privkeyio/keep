@@ -276,7 +276,8 @@ pub struct Argon2Params {
 }
 
 impl Argon2Params {
-    /// Fast parameters for testing only.
+    /// Fast parameters for testing only. Do not use in production.
+    #[cfg(any(test, feature = "testing"))]
     pub const TESTING: Self = Self {
         memory_kib: 1024,
         iterations: 1,

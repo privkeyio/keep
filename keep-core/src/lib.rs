@@ -195,7 +195,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let keypair = NostrKeypair::generate();
+        let keypair = NostrKeypair::generate()?;
         let pubkey = *keypair.public_bytes();
 
         let data_key = self.get_data_key()?;

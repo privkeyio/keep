@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 use frost_secp256k1_tr::Identifier;
 use k256::elliptic_curve::group::GroupEncoding;
 use k256::elliptic_curve::PrimeField;
@@ -119,7 +121,7 @@ pub struct EcdhSession {
     created_at: Instant,
     timeout: Duration,
     partial_points: BTreeMap<Identifier, [u8; 33]>,
-    shared_secret: Option<[u8; 32]>,
+    shared_secret: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl EcdhSession {
@@ -157,6 +159,10 @@ impl EcdhSession {
 
     pub fn participants(&self) -> &[u16] {
         &self.participants
+    }
+
+    pub fn threshold(&self) -> u16 {
+        self.threshold
     }
 
     pub fn state(&self) -> EcdhSessionState {
@@ -202,7 +208,7 @@ impl EcdhSession {
         self.partial_points.len() >= self.threshold as usize
     }
 
-    pub fn try_complete(&mut self) -> Result<Option<[u8; 32]>> {
+    pub fn try_complete(&mut self) -> Result<Option<Zeroizing<[u8; 32]>>> {
         if !self.has_all_shares() {
             return Ok(None);
         }
@@ -219,9 +225,10 @@ impl EcdhSession {
 
         match aggregate_ecdh_shares(&partial_vec, &self.participants) {
             Ok(shared_secret) => {
-                self.shared_secret = Some(shared_secret);
+                let secret = Zeroizing::new(shared_secret);
                 self.state = EcdhSessionState::Complete;
-                Ok(Some(shared_secret))
+                self.shared_secret = Some(secret.clone());
+                Ok(Some(secret))
             }
             Err(e) => {
                 self.state = EcdhSessionState::Failed;
@@ -231,7 +238,7 @@ impl EcdhSession {
     }
 
     pub fn shared_secret(&self) -> Option<&[u8; 32]> {
-        self.shared_secret.as_ref()
+        self.shared_secret.as_deref()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -261,6 +268,8 @@ impl EcdhSessionManager {
         self
     }
 
+    const MAX_ACTIVE_SESSIONS: usize = 256;
+
     pub fn create_session(
         &mut self,
         session_id: [u8; 32],
@@ -268,19 +277,28 @@ impl EcdhSessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut EcdhSession> {
-        if self.active_sessions.contains_key(&session_id) {
-            let session = self.active_sessions.get(&session_id).unwrap();
-            if !session.is_expired() {
+        if let Some(existing) = self.active_sessions.get(&session_id) {
+            if !existing.is_expired() {
                 return Err(FrostNetError::Session("ECDH session already active".into()));
             }
             self.active_sessions.remove(&session_id);
+        }
+
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session(
+                "Too many active ECDH sessions".into(),
+            ));
         }
 
         let session = EcdhSession::new(session_id, recipient_pubkey, threshold, participants)
             .with_timeout(self.session_timeout);
 
         self.active_sessions.insert(session_id, session);
-        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+        Ok(self
+            .active_sessions
+            .get_mut(&session_id)
+            .expect("just inserted"))
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&EcdhSession> {
@@ -299,20 +317,37 @@ impl EcdhSessionManager {
         participants: Vec<u16>,
     ) -> Result<&mut EcdhSession> {
         if let Some(existing) = self.active_sessions.get(&session_id) {
-            if existing.recipient_pubkey() != &recipient_pubkey
+            if existing.is_expired() {
+                self.active_sessions.remove(&session_id);
+            } else if existing.recipient_pubkey() != &recipient_pubkey
+                || existing.threshold() != threshold
                 || existing.participants() != participants
             {
                 return Err(FrostNetError::Session(
                     "ECDH session parameters mismatch".into(),
                 ));
+            } else {
+                return Ok(self
+                    .active_sessions
+                    .get_mut(&session_id)
+                    .expect("just checked"));
             }
-        } else {
-            let session = EcdhSession::new(session_id, recipient_pubkey, threshold, participants)
-                .with_timeout(self.session_timeout);
-            self.active_sessions.insert(session_id, session);
         }
 
-        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session(
+                "Too many active ECDH sessions".into(),
+            ));
+        }
+        let session = EcdhSession::new(session_id, recipient_pubkey, threshold, participants)
+            .with_timeout(self.session_timeout);
+        self.active_sessions.insert(session_id, session);
+
+        Ok(self
+            .active_sessions
+            .get_mut(&session_id)
+            .expect("just inserted"))
     }
 
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {
@@ -320,16 +355,8 @@ impl EcdhSessionManager {
     }
 
     pub fn cleanup_expired(&mut self) {
-        let expired: Vec<[u8; 32]> = self
-            .active_sessions
-            .iter()
-            .filter(|(_, session)| session.is_expired())
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in expired {
-            self.active_sessions.remove(&id);
-        }
+        self.active_sessions
+            .retain(|_, session| !session.is_expired());
     }
 }
 

@@ -70,7 +70,7 @@ proptest! {
     #[test]
     #[ignore]
     fn sign_produces_valid_signature(message in prop::collection::vec(any::<u8>(), 0..1024)) {
-        let kp = NostrKeypair::generate();
+        let kp = NostrKeypair::generate().unwrap();
         let sig = kp.sign(&message).unwrap();
         prop_assert_eq!(sig.len(), 64);
     }
@@ -78,7 +78,7 @@ proptest! {
     #[test]
     #[ignore]
     fn nsec_roundtrip(_ in Just(())) {
-        let kp = NostrKeypair::generate();
+        let kp = NostrKeypair::generate().unwrap();
         let nsec = kp.to_nsec();
         let restored = NostrKeypair::from_nsec(&nsec).unwrap();
         prop_assert_eq!(kp.secret_bytes(), restored.secret_bytes());

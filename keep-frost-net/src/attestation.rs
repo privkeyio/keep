@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use sha2::{Digest, Sha256};
+#[cfg(not(feature = "nitro-attestation"))]
+use subtle::ConstantTimeEq;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::EnclaveAttestation;
@@ -128,7 +130,7 @@ fn verify_pcr(actual: &[u8], index: u32, expected: &[u8; 48]) -> Result<()> {
             actual: format!("invalid length: {}", actual.len()),
         });
     }
-    if actual != expected {
+    if !bool::from(actual.ct_eq(expected)) {
         return Err(FrostNetError::PcrMismatch {
             pcr: index,
             expected: hex::encode(expected),

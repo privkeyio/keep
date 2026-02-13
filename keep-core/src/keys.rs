@@ -27,7 +27,7 @@ pub enum KeyType {
 /// ```
 /// use keep_core::keys::NostrKeypair;
 ///
-/// let keypair = NostrKeypair::generate();
+/// let keypair = NostrKeypair::generate()?;
 /// println!("npub: {}", keypair.to_npub());
 /// println!("nsec: {}", keypair.to_nsec());
 ///
@@ -41,17 +41,19 @@ pub struct NostrKeypair {
 
 impl NostrKeypair {
     /// Generate a new random keypair.
-    pub fn generate() -> Self {
-        loop {
+    pub fn generate() -> Result<Self> {
+        const MAX_RETRIES: usize = 64;
+        for _ in 0..MAX_RETRIES {
             let mut secret_bytes: [u8; 32] = crypto::random_bytes();
             if let Ok(signing_key) = SigningKey::from_bytes(&secret_bytes) {
                 let verifying_key = signing_key.verifying_key();
-                return Self {
+                return Ok(Self {
                     secret_key: MlockedBox::new(&mut secret_bytes),
                     public_key: verifying_key.to_bytes().into(),
-                };
+                });
             }
         }
+        Err(CryptoError::invalid_key("failed to generate valid keypair after 64 attempts").into())
     }
 
     /// Create a keypair from secret bytes. Zeroes the source.
@@ -73,7 +75,7 @@ impl NostrKeypair {
     /// ```
     /// use keep_core::keys::NostrKeypair;
     ///
-    /// let keypair = NostrKeypair::generate();
+    /// let keypair = NostrKeypair::generate()?;
     /// let nsec = keypair.to_nsec();
     ///
     /// let restored = NostrKeypair::from_nsec(&nsec)?;
@@ -211,7 +213,7 @@ impl KeyRecord {
 /// ```
 /// use keep_core::keys::{NostrKeypair, npub_to_bytes};
 ///
-/// let keypair = NostrKeypair::generate();
+/// let keypair = NostrKeypair::generate()?;
 /// let npub = keypair.to_npub();
 /// let bytes = npub_to_bytes(&npub)?;
 /// assert_eq!(&bytes, keypair.public_bytes());
@@ -244,7 +246,7 @@ pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
 /// ```
 /// use keep_core::keys::{NostrKeypair, bytes_to_npub};
 ///
-/// let keypair = NostrKeypair::generate();
+/// let keypair = NostrKeypair::generate().unwrap();
 /// let npub = bytes_to_npub(keypair.public_bytes());
 /// assert!(npub.starts_with("npub1"));
 /// ```
@@ -259,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_keypair_generation() {
-        let kp = NostrKeypair::generate();
+        let kp = NostrKeypair::generate().unwrap();
 
         let nsec = kp.to_nsec();
         let npub = kp.to_npub();
@@ -270,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_nsec_roundtrip() {
-        let kp = NostrKeypair::generate();
+        let kp = NostrKeypair::generate().unwrap();
         let nsec = kp.to_nsec();
 
         let kp2 = NostrKeypair::from_nsec(&nsec).unwrap();
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_sign_verify() {
-        let kp = NostrKeypair::generate();
+        let kp = NostrKeypair::generate().unwrap();
         let message = b"test message";
 
         let sig = kp.sign(message).unwrap();

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 PrivKey LLC
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tamper-evident audit logging with hash chain integrity.
 //!
 //! This module provides encrypted audit logging with cryptographic integrity guarantees.

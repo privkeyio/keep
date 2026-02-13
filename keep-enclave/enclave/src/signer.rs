@@ -250,6 +250,11 @@ impl EnclaveSigner {
             let msg = Message::from_digest_slice(sighash.as_ref())
                 .map_err(|e| EnclaveError::Signing(format!("Message failed: {}", e)))?;
 
+            // Nitro Enclaves have /dev/urandom, but other enclave environments
+            // (e.g., SGX, SEV) may not provide reliable auxiliary randomness.
+            // Using deterministic signing avoids side-channel variance across
+            // heterogeneous enclave deployments at the cost of slightly weaker
+            // protection against differential power analysis.
             let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
             psbt.inputs[i].tap_key_sig = Some(TaprootSignature {

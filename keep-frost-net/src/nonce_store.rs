@@ -88,9 +88,14 @@ impl NonceStore for FileNonceStore {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
@@ -157,11 +162,23 @@ fn rewrite_nonce_file<'a>(
     entries: impl Iterator<Item = &'a [u8; 32]>,
 ) -> std::result::Result<(), std::io::Error> {
     let tmp_path = path.with_extension("tmp");
-    let mut file = File::create(&tmp_path)?;
+
+    let mut file = {
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp_path)?
+    };
+
     for entry in entries {
         writeln!(file, "{}", hex::encode(entry))?;
     }
     file.sync_all()?;
+
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }

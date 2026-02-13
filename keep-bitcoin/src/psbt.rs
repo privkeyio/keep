@@ -27,6 +27,10 @@ pub struct OutputInfo {
     pub is_change: bool,
 }
 
+// NOTE: `Keypair` (from secp256k1) does not implement `Zeroize` and cannot be reliably
+// zeroed. Transient `Keypair` values created during `sign()` may leave stack residue.
+// The canonical secret key is held in `MlockedBox` which provides mlock + madvise +
+// zeroize-on-drop, so the authoritative copy is protected at rest.
 pub struct PsbtSigner {
     secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
@@ -65,9 +69,12 @@ impl PsbtSigner {
         let mut signable_inputs = Vec::new();
 
         for (i, input) in psbt.inputs.iter().enumerate() {
-            if let Some(utxo) = &input.witness_utxo {
-                total_input_sats += utxo.value.to_sat();
-            }
+            let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+                BitcoinError::InvalidPsbt(format!("input {i} missing witness_utxo"))
+            })?;
+            total_input_sats = total_input_sats
+                .checked_add(utxo.value.to_sat())
+                .ok_or_else(|| BitcoinError::InvalidPsbt("input value overflow".into()))?;
 
             if self.should_sign_input(psbt, i)? {
                 signable_inputs.push(i);
@@ -78,7 +85,9 @@ impl PsbtSigner {
         let mut total_output_sats = 0u64;
 
         for (i, output) in psbt.unsigned_tx.output.iter().enumerate() {
-            total_output_sats += output.value.to_sat();
+            total_output_sats = total_output_sats
+                .checked_add(output.value.to_sat())
+                .ok_or_else(|| BitcoinError::InvalidPsbt("output value overflow".into()))?;
 
             let address = Address::from_script(&output.script_pubkey, self.network)
                 .ok()
@@ -94,7 +103,9 @@ impl PsbtSigner {
             });
         }
 
-        let fee_sats = total_input_sats.saturating_sub(total_output_sats);
+        let fee_sats = total_input_sats
+            .checked_sub(total_output_sats)
+            .ok_or_else(|| BitcoinError::InvalidPsbt("outputs exceed inputs".into()))?;
 
         Ok(PsbtAnalysis {
             num_inputs: psbt.inputs.len(),
@@ -177,7 +188,10 @@ impl PsbtSigner {
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
         let keypair = self.keypair()?;
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        let aux_rand = crate::aux_rand()?;
+        let sig = self
+            .secp
+            .sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
 
         let taproot_sig = TaprootSignature {
             signature: sig,
