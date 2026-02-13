@@ -180,9 +180,7 @@ impl App {
                     if let (Some(hex), Some(ref bunker)) = (app_pubkey, &self.bunker) {
                         let handler = bunker.handler.clone();
                         let nip46_duration = match duration_choice {
-                            DurationChoice::JustThisTime => {
-                                keep_nip46::PermissionDuration::Session
-                            }
+                            DurationChoice::JustThisTime => keep_nip46::PermissionDuration::Session,
                             DurationChoice::Minutes(m) => {
                                 keep_nip46::PermissionDuration::Seconds(m * 60)
                             }
@@ -290,7 +288,9 @@ impl App {
             }
             Message::BunkerTogglePermission(client_idx, flag) => {
                 let pubkey_hex = if let Screen::Bunker(s) = &self.screen {
-                    s.clients.get(client_idx).map(|c| (c.pubkey.clone(), c.permissions))
+                    s.clients
+                        .get(client_idx)
+                        .map(|c| (c.pubkey.clone(), c.permissions))
                 } else {
                     None
                 };

@@ -249,10 +249,9 @@ impl fmt::Debug for Message {
                 .field(i)
                 .field(f2)
                 .finish(),
-            Self::BunkerSetApprovalDuration(i) => f
-                .debug_tuple("BunkerSetApprovalDuration")
-                .field(i)
-                .finish(),
+            Self::BunkerSetApprovalDuration(i) => {
+                f.debug_tuple("BunkerSetApprovalDuration").field(i).finish()
+            }
             Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
             Self::Tick => f.write_str("Tick"),
         }

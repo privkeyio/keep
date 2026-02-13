@@ -198,8 +198,7 @@ impl PermissionManager {
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
         if let Some(app) = self.apps.get(pubkey) {
-            if !app.duration.is_expired(app.connected_at)
-                && app.auto_approve_kinds.contains(&kind)
+            if !app.duration.is_expired(app.connected_at) && app.auto_approve_kinds.contains(&kind)
             {
                 return false;
             }
@@ -383,10 +382,7 @@ mod tests {
 
         assert!(pm.needs_approval(&pubkey, Kind::TextNote));
 
-        pm.set_auto_approve_kinds_for_app(
-            &pubkey,
-            HashSet::from([Kind::TextNote, Kind::Reaction]),
-        );
+        pm.set_auto_approve_kinds_for_app(&pubkey, HashSet::from([Kind::TextNote, Kind::Reaction]));
         assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
         assert!(!pm.needs_approval(&pubkey, Kind::Reaction));
         assert!(pm.needs_approval(&pubkey, Kind::from(30023)));

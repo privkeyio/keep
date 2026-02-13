@@ -181,7 +181,15 @@ impl Server {
         }
         let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
-        Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
+        Ok(Self::build(
+            keys,
+            relay_urls,
+            client,
+            handler,
+            callbacks,
+            config,
+            bunker_secret,
+        ))
     }
 
     pub async fn new_frost(
@@ -267,7 +275,15 @@ impl Server {
             .with_auto_approve(config.auto_approve);
         let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
-        Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
+        Ok(Self::build(
+            keys,
+            relay_urls,
+            client,
+            handler,
+            callbacks,
+            config,
+            bunker_secret,
+        ))
     }
 
     pub fn bunker_url(&self) -> String {
@@ -369,7 +385,12 @@ impl Server {
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
 
-        if request.id.len() > 64 || !request.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if request.id.len() > 64
+            || !request
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Err(KeepError::InvalidInput("invalid request ID".into()));
         }
 

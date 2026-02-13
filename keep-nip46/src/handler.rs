@@ -425,10 +425,10 @@ impl SignerHandler {
         if self.request_approval(request).await {
             Ok(())
         } else {
-            self.audit.lock().await.log(
-                AuditEntry::new(AuditAction::UserRejected, app_pubkey)
-                    .with_reason(method),
-            );
+            self.audit
+                .lock()
+                .await
+                .log(AuditEntry::new(AuditAction::UserRejected, app_pubkey).with_reason(method));
             Err(KeepError::UserRejected)
         }
     }
@@ -462,8 +462,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip44_decrypt")
-            .await?;
+        self.require_approval(app_pubkey, "nip44_decrypt").await?;
 
         let secret = self.primary_secret_key().await?;
         let plaintext = nip44::decrypt(&secret, &sender, ciphertext)
@@ -506,8 +505,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip04_decrypt")
-            .await?;
+        self.require_approval(app_pubkey, "nip04_decrypt").await?;
 
         let secret = self.primary_secret_key().await?;
         let plaintext = nip04::decrypt(&secret, &sender, ciphertext)
@@ -526,11 +524,9 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::GET_PUBLIC_KEY)
             .await?;
 
-        self.audit
-            .lock()
-            .await
-            .log(AuditEntry::new(AuditAction::GetPublicKey, app_pubkey)
-                .with_reason("switch_relays"));
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::GetPublicKey, app_pubkey).with_reason("switch_relays"),
+        );
 
         if self.relay_urls.is_empty() {
             Ok(None)
@@ -539,11 +535,7 @@ impl SignerHandler {
         }
     }
 
-    pub async fn update_client_permissions(
-        &self,
-        pubkey: &PublicKey,
-        permissions: Permission,
-    ) {
+    pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {
         let mut pm = self.permissions.lock().await;
         pm.set_permissions(pubkey, permissions);
         drop(pm);
@@ -553,11 +545,7 @@ impl SignerHandler {
         );
     }
 
-    pub async fn update_client_duration(
-        &self,
-        pubkey: &PublicKey,
-        duration: PermissionDuration,
-    ) {
+    pub async fn update_client_duration(&self, pubkey: &PublicKey, duration: PermissionDuration) {
         let mut pm = self.permissions.lock().await;
         pm.set_duration(pubkey, duration);
         drop(pm);
@@ -567,11 +555,7 @@ impl SignerHandler {
         );
     }
 
-    pub async fn update_client_auto_kinds(
-        &self,
-        pubkey: &PublicKey,
-        kinds: HashSet<Kind>,
-    ) {
+    pub async fn update_client_auto_kinds(&self, pubkey: &PublicKey, kinds: HashSet<Kind>) {
         let mut pm = self.permissions.lock().await;
         pm.set_auto_approve_kinds_for_app(pubkey, kinds);
         drop(pm);
@@ -824,8 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_switch_relays_with_urls() {
-        let handler = setup_handler()
-            .with_relay_urls(vec!["wss://relay.example.com".into()]);
+        let handler = setup_handler().with_relay_urls(vec!["wss://relay.example.com".into()]);
         let app_pubkey = Keys::generate().public_key();
         handler
             .handle_connect(app_pubkey, None, None, None)

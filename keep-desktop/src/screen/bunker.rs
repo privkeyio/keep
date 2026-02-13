@@ -3,9 +3,7 @@
 
 use std::collections::VecDeque;
 
-use iced::widget::{
-    button, column, container, qr_code, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
