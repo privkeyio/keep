@@ -584,6 +584,7 @@ impl App {
             | Message::NavigateWallets
             | Message::WalletsLoaded(..)
             | Message::NavigateRelay
+            | Message::NavigateBunker
             | Message::Lock => self.handle_navigation_message(message),
 
             Message::ToggleShareDetails(..)
@@ -624,7 +625,22 @@ impl App {
             | Message::DisconnectRelay
             | Message::ConnectRelayResult(..)
             | Message::ApproveSignRequest(..)
-            | Message::RejectSignRequest(..) => self.handle_relay_message(message),
+            | Message::RejectSignRequest(..)
+            | Message::BunkerRelayInputChanged(..)
+            | Message::BunkerAddRelay
+            | Message::BunkerRemoveRelay(..)
+            | Message::BunkerStart
+            | Message::BunkerStartResult(..)
+            | Message::BunkerStop
+            | Message::BunkerApprove
+            | Message::BunkerReject
+            | Message::BunkerRevokeClient(..)
+            | Message::BunkerConfirmRevokeAll
+            | Message::BunkerCancelRevokeAll
+            | Message::BunkerRevokeAll
+            | Message::BunkerCopyUrl
+            | Message::BunkerRevokeResult(..)
+            | Message::BunkerClientsLoaded(..) => self.handle_relay_message(message),
         }
     }
 

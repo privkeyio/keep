@@ -10,7 +10,7 @@ use keep_nip46::{Server, ServerConfig};
 
 fn setup_keyring() -> (Arc<Mutex<Keyring>>, PublicKey) {
     let mut keyring = Keyring::new();
-    let keypair = NostrKeypair::generate();
+    let keypair = NostrKeypair::generate().unwrap();
     let pubkey_bytes = *keypair.public_bytes();
     keyring
         .load_key(
@@ -52,9 +52,6 @@ async fn test_bunker_e2e_connect_and_sign() {
     assert!(bunker_url.contains("relay="));
 
     let server_pubkey = server.pubkey();
-
-    server.start().await.expect("server start failed");
-
     let server_handler = server.handler();
 
     let server_handle = tokio::spawn(async move {
