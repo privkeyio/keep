@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,11 +98,26 @@ impl PermissionManager {
         if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
             return false;
         }
-        self.apps.entry(pubkey).or_insert_with(|| {
-            let mut app = AppPermission::new(pubkey, name);
-            app.permissions = requested & Permission::ALL;
-            app
-        });
+        match self.apps.entry(pubkey) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let existing = entry.get().permissions;
+                let masked = requested & Permission::ALL;
+                if existing != masked {
+                    let app_id = &pubkey.to_hex()[..8];
+                    warn!(
+                        app_id,
+                        existing = ?existing,
+                        requested = ?masked,
+                        "reconnecting app requested different permissions; keeping existing"
+                    );
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut app = AppPermission::new(pubkey, name);
+                app.permissions = requested & Permission::ALL;
+                entry.insert(app);
+            }
+        }
         true
     }
 

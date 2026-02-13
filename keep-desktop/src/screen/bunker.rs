@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::VecDeque;
+
 use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
@@ -49,7 +51,7 @@ pub struct BunkerScreen {
     pub relays: Vec<String>,
     pub relay_input: String,
     pub clients: Vec<ConnectedClient>,
-    pub log: Vec<LogDisplayEntry>,
+    pub log: VecDeque<LogDisplayEntry>,
     pub pending_approval: Option<PendingApprovalDisplay>,
     pub revoke_all_confirm: bool,
     pub starting: bool,
@@ -65,7 +67,7 @@ impl BunkerScreen {
             relays,
             relay_input: String::new(),
             clients: Vec::new(),
-            log: Vec::new(),
+            log: VecDeque::new(),
             pending_approval: None,
             revoke_all_confirm: false,
             starting: false,
@@ -78,7 +80,7 @@ impl BunkerScreen {
         url: Option<String>,
         relays: Vec<String>,
         clients: Vec<ConnectedClient>,
-        log: Vec<LogDisplayEntry>,
+        log: VecDeque<LogDisplayEntry>,
         pending_approval: Option<PendingApprovalDisplay>,
     ) -> Self {
         let qr_data = url.as_deref().and_then(|u| qr_code::Data::new(u).ok());

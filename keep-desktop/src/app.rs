@@ -177,7 +177,7 @@ struct RunningBunker {
     event_rx: Arc<Mutex<std::sync::mpsc::Receiver<BunkerEvent>>>,
     handle: tokio::task::JoinHandle<()>,
     clients: Vec<ConnectedClient>,
-    log: Vec<LogDisplayEntry>,
+    log: VecDeque<LogDisplayEntry>,
 }
 
 pub struct App {
@@ -1200,6 +1200,8 @@ impl App {
             }
             Message::BunkerCopyUrl => {
                 if let Some(ref bunker) = self.bunker {
+                    self.clipboard_clear_at =
+                        Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
                     return iced::clipboard::write(bunker.url.clone());
                 }
                 Task::none()
@@ -2007,6 +2009,12 @@ impl App {
             Some(r) => r.clone(),
             None => return Task::none(),
         };
+        if self.bunker_relays.len() > 1 {
+            tracing::warn!(
+                count = self.bunker_relays.len(),
+                "multiple bunker relays configured but only the first is used"
+            );
+        }
 
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
@@ -2106,7 +2114,7 @@ impl App {
                     event_rx: Arc::new(Mutex::new(setup.event_rx)),
                     handle: setup.handle,
                     clients: Vec::new(),
-                    log: Vec::new(),
+                    log: VecDeque::new(),
                 });
 
                 if let Screen::Bunker(s) = &mut self.screen {
@@ -2171,14 +2179,14 @@ impl App {
                         success,
                     };
                     if bunker.log.len() >= 1000 {
-                        bunker.log.remove(0);
+                        bunker.log.pop_front();
                     }
-                    bunker.log.push(entry.clone());
+                    bunker.log.push_back(entry.clone());
                     if let Screen::Bunker(s) = &mut self.screen {
                         if s.log.len() >= 1000 {
-                            s.log.remove(0);
+                            s.log.pop_front();
                         }
-                        s.log.push(entry);
+                        s.log.push_back(entry);
                     }
                 }
                 BunkerEvent::Approval {

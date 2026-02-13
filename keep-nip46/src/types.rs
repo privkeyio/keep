@@ -26,6 +26,7 @@ pub trait ServerCallbacks: Send + Sync + 'static {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Nip46Request {
     pub id: String,
     pub method: String,

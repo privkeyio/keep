@@ -45,6 +45,7 @@ pub struct Server {
     running: bool,
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     config: ServerConfig,
+    bunker_secret: Option<String>,
 }
 
 impl Server {
@@ -124,6 +125,15 @@ impl Server {
             handler = handler.with_rate_limit(rl_config.clone());
         }
 
+        let bunker_secret = if config.auto_approve {
+            let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+            handler = handler.with_expected_secret(secret.clone());
+            warn!("headless mode: bunker secret required for authentication");
+            Some(secret)
+        } else {
+            None
+        };
+
         Ok(Self {
             keys,
             relay_url: relay_url.to_string(),
@@ -132,6 +142,7 @@ impl Server {
             running: false,
             callbacks,
             config,
+            bunker_secret,
         })
     }
 
@@ -228,6 +239,15 @@ impl Server {
             handler = handler.with_rate_limit(rl_config.clone());
         }
 
+        let bunker_secret = if config.auto_approve {
+            let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+            handler = handler.with_expected_secret(secret.clone());
+            warn!("headless mode: bunker secret required for authentication");
+            Some(secret)
+        } else {
+            None
+        };
+
         Ok(Self {
             keys,
             relay_url: relay_urls[0].clone(),
@@ -236,11 +256,16 @@ impl Server {
             running: false,
             callbacks,
             config,
+            bunker_secret,
         })
     }
 
     pub fn bunker_url(&self) -> String {
-        generate_bunker_url(&self.keys.public_key(), &self.relay_url, None)
+        generate_bunker_url(
+            &self.keys.public_key(),
+            &self.relay_url,
+            self.bunker_secret.as_deref(),
+        )
     }
 
     pub fn pubkey(&self) -> PublicKey {
@@ -325,6 +350,10 @@ impl Server {
 
         let decrypted = nip44::decrypt(keys.secret_key(), &app_pubkey, &event.content)
             .map_err(|e| CryptoError::decryption(e.to_string()))?;
+
+        if decrypted.len() > max_event_json_size {
+            return Err(KeepError::InvalidInput("NIP-46 request too large".into()));
+        }
 
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
@@ -431,6 +460,11 @@ impl Server {
 
                 if partial.created_at < 0 {
                     return Nip46Response::error(id, "Invalid created_at timestamp");
+                }
+
+                let max_future = Timestamp::now().as_secs() + 86_400;
+                if partial.created_at as u64 > max_future {
+                    return Nip46Response::error(id, "created_at timestamp too far in the future");
                 }
 
                 let mut tags = Vec::with_capacity(partial.tags.len());

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -154,8 +155,12 @@ impl SignerHandler {
         let name = format!("App {app_id}");
 
         if let Some(ref expected) = self.expected_secret {
+            let expected_hash = Sha256::digest(expected.as_bytes());
             let valid = match &secret {
-                Some(s) => s.as_bytes().ct_eq(expected.as_bytes()).into(),
+                Some(s) => {
+                    let provided_hash = Sha256::digest(s.as_bytes());
+                    provided_hash.ct_eq(&expected_hash).into()
+                }
                 None => false,
             };
             if !valid {
@@ -219,7 +224,7 @@ impl SignerHandler {
         audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
         info!(app_id, "app connected");
-        Ok(secret)
+        Ok(None)
     }
 
     pub async fn handle_get_public_key(&self, app_pubkey: PublicKey) -> Result<PublicKey> {
@@ -461,6 +466,19 @@ impl SignerHandler {
             }
         }
 
+        let approved = self
+            .request_approval(ApprovalRequest {
+                app_pubkey,
+                app_name: self.get_app_name(&app_pubkey).await,
+                method: "nip44_decrypt".into(),
+                event_kind: None,
+                event_content: None,
+            })
+            .await;
+        if !approved {
+            return Err(KeepError::UserRejected);
+        }
+
         let plaintext = {
             let keyring = self.keyring.lock().await;
             let slot = keyring
@@ -533,6 +551,19 @@ impl SignerHandler {
                     "operation not permitted".into(),
                 ));
             }
+        }
+
+        let approved = self
+            .request_approval(ApprovalRequest {
+                app_pubkey,
+                app_name: self.get_app_name(&app_pubkey).await,
+                method: "nip04_decrypt".into(),
+                event_kind: None,
+                event_content: None,
+            })
+            .await;
+        if !approved {
+            return Err(KeepError::UserRejected);
         }
 
         let plaintext = {

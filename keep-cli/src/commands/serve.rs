@@ -47,7 +47,9 @@ impl ServerCallbacks for TuiCallbacks {
         if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
             return false;
         }
-        response_rx.recv().unwrap_or(false)
+        response_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or(false)
     }
 }
 

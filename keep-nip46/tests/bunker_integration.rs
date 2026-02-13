@@ -8,6 +8,13 @@ use keep_core::keyring::Keyring;
 use keep_core::keys::{KeyType, NostrKeypair};
 use keep_nip46::{Server, ServerConfig};
 
+fn extract_bunker_secret(bunker_url: &str) -> Option<String> {
+    let url = url::Url::parse(bunker_url).ok()?;
+    url.query_pairs()
+        .find(|(k, _)| k == "secret")
+        .map(|(_, v)| v.to_string())
+}
+
 fn setup_keyring() -> (Arc<Mutex<Keyring>>, PublicKey) {
     let mut keyring = Keyring::new();
     let keypair = NostrKeypair::generate().unwrap();
@@ -50,6 +57,12 @@ async fn test_bunker_e2e_connect_and_sign() {
     let bunker_url = server.bunker_url();
     assert!(bunker_url.starts_with("bunker://"));
     assert!(bunker_url.contains("relay="));
+    assert!(
+        bunker_url.contains("secret="),
+        "headless bunker URL must include secret"
+    );
+
+    let bunker_secret = extract_bunker_secret(&bunker_url).expect("bunker URL must have secret");
 
     let server_pubkey = server.pubkey();
     let server_handler = server.handler();
@@ -67,11 +80,11 @@ async fn test_bunker_e2e_connect_and_sign() {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Send connect request
+    // Send connect request with bunker secret
     let connect_req = serde_json::json!({
         "id": "req-1",
         "method": "connect",
-        "params": [signer_pubkey.to_hex()]
+        "params": [signer_pubkey.to_hex(), bunker_secret]
     });
     let connect_json = serde_json::to_string(&connect_req).unwrap();
 
@@ -240,15 +253,16 @@ async fn test_bunker_permission_scoping() {
     .await
     .unwrap();
 
+    let bunker_secret = extract_bunker_secret(&server.bunker_url());
     let handler = server.handler();
     let app_pubkey = Keys::generate().public_key();
 
-    // Connect requesting only get_public_key
+    // Connect requesting only get_public_key (with bunker secret)
     let result = handler
         .handle_connect(
             app_pubkey,
             Some(signer_pubkey),
-            None,
+            bunker_secret,
             Some("get_public_key".to_string()),
         )
         .await;
