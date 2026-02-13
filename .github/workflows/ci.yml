@@ -62,7 +62,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - run: cargo check --all-targets
+      - run: cargo check --all-targets --features testing
 
   reproducible:
     runs-on: ubuntu-latest
