@@ -301,8 +301,9 @@ impl Server {
 
         self.running = true;
 
-        let bunker_url = self.bunker_url();
-        debug!(bunker_url, "listening for NIP-46 requests");
+        let pubkey = self.keys.public_key().to_hex();
+        let relay = &self.relay_url;
+        debug!(pubkey, relay, "listening for NIP-46 requests");
 
         Ok(())
     }
@@ -369,6 +370,10 @@ impl Server {
 
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
+
+        if request.id.len() > 64 {
+            return Err(KeepError::InvalidInput("request ID too long".into()));
+        }
 
         debug!(method = %request.method, app_id, "NIP-46 request");
 
@@ -558,6 +563,7 @@ impl Server {
 
     #[allow(dead_code)]
     pub async fn stop(&mut self) {
+        self.handler.revoke_session_apps().await;
         self.running = false;
         self.client.disconnect().await;
     }

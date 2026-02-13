@@ -107,7 +107,15 @@ impl PermissionManager {
 
     pub const MAX_CONNECTED_APPS: usize = 100;
 
+    fn evict_expired(&mut self) {
+        self.apps
+            .retain(|_, app| !app.duration.is_expired(app.connected_at));
+    }
+
     pub fn connect(&mut self, pubkey: PublicKey, name: String) -> bool {
+        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+            self.evict_expired();
+        }
         if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
             return false;
         }
@@ -123,6 +131,9 @@ impl PermissionManager {
         name: String,
         requested: Permission,
     ) -> bool {
+        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+            self.evict_expired();
+        }
         if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
             return false;
         }
@@ -155,6 +166,11 @@ impl PermissionManager {
 
     pub fn revoke_all(&mut self) {
         self.apps.clear();
+    }
+
+    pub fn revoke_session_apps(&mut self) {
+        self.apps
+            .retain(|_, app| !matches!(app.duration, PermissionDuration::Session));
     }
 
     pub fn has_permission(&self, pubkey: &PublicKey, perm: Permission) -> bool {

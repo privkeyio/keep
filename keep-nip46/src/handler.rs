@@ -282,10 +282,13 @@ impl SignerHandler {
 
     pub async fn handle_get_public_key(&self, app_pubkey: PublicKey) -> Result<PublicKey> {
         self.check_rate_limit(&app_pubkey).await?;
-        let pm = self.permissions.lock().await;
-        if !pm.has_permission(&app_pubkey, Permission::GET_PUBLIC_KEY) {
-            let mut audit = self.audit.lock().await;
-            audit.log(
+        let has_perm = self
+            .permissions
+            .lock()
+            .await
+            .has_permission(&app_pubkey, Permission::GET_PUBLIC_KEY);
+        if !has_perm {
+            self.audit.lock().await.log(
                 AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
                     .with_success(false)
                     .with_reason("get_public_key not permitted"),
@@ -294,7 +297,6 @@ impl SignerHandler {
                 "operation not permitted".into(),
             ));
         }
-        drop(pm);
 
         let pubkey = self.our_pubkey().await?;
 
@@ -313,21 +315,23 @@ impl SignerHandler {
 
         let kind = unsigned_event.kind;
 
-        let needs_approval = {
+        let (has_perm, needs_approval) = {
             let pm = self.permissions.lock().await;
-            if !pm.has_permission(&app_pubkey, Permission::SIGN_EVENT) {
-                let mut audit = self.audit.lock().await;
-                audit.log(
-                    AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
-                        .with_event_kind(kind)
-                        .with_success(false),
-                );
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-            pm.needs_approval(&app_pubkey, kind)
+            (
+                pm.has_permission(&app_pubkey, Permission::SIGN_EVENT),
+                pm.needs_approval(&app_pubkey, kind),
+            )
         };
+        if !has_perm {
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
+                    .with_event_kind(kind)
+                    .with_success(false),
+            );
+            return Err(KeepError::PermissionDenied(
+                "operation not permitted".into(),
+            ));
+        }
 
         if needs_approval {
             let approved = self
@@ -411,7 +415,7 @@ impl SignerHandler {
             .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?)
     }
 
-    async fn require_decrypt_approval(&self, app_pubkey: PublicKey, method: &str) -> Result<()> {
+    async fn require_approval(&self, app_pubkey: PublicKey, method: &str) -> Result<()> {
         let approved = self
             .request_approval(ApprovalRequest {
                 app_pubkey,
@@ -437,6 +441,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
             .await?;
+        self.require_approval(app_pubkey, "nip44_encrypt").await?;
 
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
@@ -458,7 +463,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
             .await?;
-        self.require_decrypt_approval(app_pubkey, "nip44_decrypt")
+        self.require_approval(app_pubkey, "nip44_decrypt")
             .await?;
 
         let secret = self.primary_secret_key().await?;
@@ -482,6 +487,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
             .await?;
+        self.require_approval(app_pubkey, "nip04_encrypt").await?;
 
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
@@ -503,7 +509,7 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
             .await?;
-        self.require_decrypt_approval(app_pubkey, "nip04_decrypt")
+        self.require_approval(app_pubkey, "nip04_decrypt")
             .await?;
 
         let secret = self.primary_secret_key().await?;
@@ -531,6 +537,11 @@ impl SignerHandler {
     pub async fn revoke_all_clients(&self) {
         let mut pm = self.permissions.lock().await;
         pm.revoke_all();
+    }
+
+    pub async fn revoke_session_apps(&self) {
+        let mut pm = self.permissions.lock().await;
+        pm.revoke_session_apps();
     }
 
     pub(crate) async fn get_app_name(&self, pubkey: &PublicKey) -> String {
