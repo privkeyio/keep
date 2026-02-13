@@ -3259,6 +3259,7 @@ dependencies = [
  "iced",
  "keep-core",
  "keep-frost-net",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "tokio",
