@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 use keep_core::error::{KeepError, Result};
 use keep_core::Keep;
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
-use keep_nip46::{FrostSigner, NetworkFrostSigner, Server};
+use keep_nip46::{FrostSigner, NetworkFrostSigner, Server, ServerConfig};
 
 use crate::output::Output;
 use crate::tui::{ApprovalRequest as TuiApprovalRequest, LogEntry, TuiEvent};
@@ -116,8 +116,17 @@ pub fn cmd_serve(
 
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
 
-            let mut server =
-                Server::new_network_frost(net_signer, transport_key, relay, None).await?;
+            let mut server = Server::new_network_frost_with_config(
+                net_signer,
+                transport_key,
+                &[relay.to_string()],
+                None,
+                ServerConfig {
+                    auto_approve: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
             let bunker_url = server.bunker_url();
             out.field("Bunker URL", &bunker_url);
             out.newline();
@@ -159,12 +168,24 @@ pub fn cmd_serve(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
+        let headless_config = ServerConfig {
+            auto_approve: true,
+            ..Default::default()
+        };
         rt.block_on(async {
             let mut server = if let Some(frost) = frost_signer {
                 let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-                Server::new_frost(frost, transport_key, relay, None).await?
+                Server::new_with_config(
+                    Arc::new(Mutex::new(keep_core::keyring::Keyring::new())),
+                    Some(frost),
+                    Some(transport_key),
+                    relay,
+                    None,
+                    headless_config,
+                )
+                .await?
             } else {
-                Server::new(keyring, relay, None).await?
+                Server::new_with_config(keyring, None, None, relay, None, headless_config).await?
             };
             info!(relay, bunker_url = %server.bunker_url(), "server started");
             out.field("Bunker URL", &server.bunker_url());
@@ -292,7 +313,18 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
 
     if headless {
         rt.block_on(async {
-            let mut server = Server::new(keyring, relay, None).await?;
+            let mut server = Server::new_with_config(
+                keyring,
+                None,
+                None,
+                relay,
+                None,
+                ServerConfig {
+                    auto_approve: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
             info!(relay, bunker_url = %server.bunker_url(), "server started");
             out.field("Bunker URL", &server.bunker_url());
             out.field("Relay", relay);
@@ -391,7 +423,18 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 
     if headless {
         rt.block_on(async {
-            let mut server = Server::new(keyring, relay, None).await?;
+            let mut server = Server::new_with_config(
+                keyring,
+                None,
+                None,
+                relay,
+                None,
+                ServerConfig {
+                    auto_approve: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
             info!(relay, bunker_url = %server.bunker_url(), "hidden server started");
             out.field("Bunker URL", &server.bunker_url());
             out.field("Relay", relay);

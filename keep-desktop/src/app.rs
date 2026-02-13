@@ -51,10 +51,7 @@ const RECONNECT_MAX_MS: u64 = 30_000;
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
-const DEFAULT_BUNKER_RELAYS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://relay.nsec.app",
-];
+const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -140,7 +137,7 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         let display = PendingApprovalDisplay {
             app_name: request.app_name,
             method: request.method,
-            event_kind: request.event_kind.map(|k| k.as_u32()),
+            event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
             event_content: request.event_content,
         };
         if self
@@ -1980,7 +1977,7 @@ impl App {
         let keep_arc = self.keep.clone();
         let relay = self.bunker_relays[0].clone();
 
-        let setup_arc: Arc<Mutex<Option<BunkerSetup>>> = Arc::new(Mutex::new(None));
+        let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
 
         Task::perform(
@@ -2102,13 +2099,11 @@ impl App {
         while let Ok(event) = rx.try_recv() {
             match event {
                 BunkerEvent::Connected { pubkey, name } => {
-                    let client = ConnectedClient { pubkey, name };
-                    if !bunker.clients.iter().any(|c| c.pubkey == client.pubkey) {
+                    if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
+                        let client = ConnectedClient { pubkey, name };
                         bunker.clients.push(client.clone());
                         if let Screen::Bunker(s) = &mut self.screen {
-                            if !s.clients.iter().any(|c| c.pubkey == client.pubkey) {
-                                s.clients.push(client);
-                            }
+                            s.clients.push(client);
                         }
                     }
                 }

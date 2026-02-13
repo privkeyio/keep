@@ -78,13 +78,14 @@ impl PermissionManager {
 
     pub const MAX_CONNECTED_APPS: usize = 100;
 
-    pub fn connect(&mut self, pubkey: PublicKey, name: String) {
+    pub fn connect(&mut self, pubkey: PublicKey, name: String) -> bool {
         if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
-            return;
+            return false;
         }
         self.apps
             .entry(pubkey)
             .or_insert_with(|| AppPermission::new(pubkey, name));
+        true
     }
 
     pub fn connect_with_permissions(
@@ -92,15 +93,16 @@ impl PermissionManager {
         pubkey: PublicKey,
         name: String,
         requested: Permission,
-    ) {
+    ) -> bool {
         if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
-            return;
+            return false;
         }
         self.apps.entry(pubkey).or_insert_with(|| {
             let mut app = AppPermission::new(pubkey, name);
             app.permissions = requested & Permission::ALL;
             app
         });
+        true
     }
 
     pub fn revoke(&mut self, pubkey: &PublicKey) {
@@ -195,11 +197,11 @@ mod tests {
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
 
-        pm.connect_with_permissions(
+        assert!(pm.connect_with_permissions(
             pubkey,
             "Test App".into(),
             Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
-        );
+        ));
         assert!(pm.is_connected(&pubkey));
         assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
         assert!(!pm.has_permission(&pubkey, Permission::NIP44_ENCRYPT));

@@ -19,7 +19,11 @@ impl ConnectedClient {
         if self.pubkey.len() <= 16 {
             return self.pubkey.clone();
         }
-        format!("{}...{}", &self.pubkey[..8], &self.pubkey[self.pubkey.len() - 6..])
+        format!(
+            "{}...{}",
+            &self.pubkey[..8],
+            &self.pubkey[self.pubkey.len() - 6..]
+        )
     }
 }
 
@@ -179,7 +183,9 @@ impl BunkerScreen {
         };
 
         let header = row![
-            text("Bunker").size(theme::size::HEADING).color(theme::color::TEXT),
+            text("Bunker")
+                .size(theme::size::HEADING)
+                .color(theme::color::TEXT),
             Space::new().width(theme::space::SM),
             badge,
             Space::new().width(Length::Fill),
@@ -367,11 +373,12 @@ impl BunkerScreen {
     }
 
     fn approval_card(&self, approval: &PendingApprovalDisplay) -> Element<Message> {
-        let mut details = column![
-            text(format!("{} requests: {}", approval.app_name, approval.method))
-                .size(theme::size::BODY)
-                .color(theme::color::TEXT),
-        ]
+        let mut details = column![text(format!(
+            "{} requests: {}",
+            approval.app_name, approval.method
+        ))
+        .size(theme::size::BODY)
+        .color(theme::color::TEXT),]
         .spacing(theme::space::XS);
 
         if let Some(kind) = approval.event_kind {

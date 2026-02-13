@@ -149,6 +149,9 @@ impl SignerHandler {
     ) -> Result<Option<String>> {
         self.check_rate_limit(&app_pubkey).await?;
 
+        let app_id = &app_pubkey.to_hex()[..8];
+        let name = format!("App {app_id}");
+
         if let Some(ref expected) = self.expected_secret {
             match &secret {
                 Some(s) if s == expected => {}
@@ -166,7 +169,7 @@ impl SignerHandler {
             let approved = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
-                    app_name: format!("App {}", &app_pubkey.to_hex()[..8]),
+                    app_name: name.clone(),
                     method: "connect".into(),
                     event_kind: None,
                     event_content: None,
@@ -198,20 +201,19 @@ impl SignerHandler {
             }
         }
 
-        let name = format!("App {}", &app_pubkey.to_hex()[..8]);
-
         let requested_perms = permissions
             .as_deref()
             .map(parse_permission_string)
             .unwrap_or(Permission::DEFAULT);
 
         let mut pm = self.permissions.lock().await;
-        pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms);
+        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms) {
+            return Err(KeepError::RateLimited(60));
+        }
 
         let mut audit = self.audit.lock().await;
         audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
-        let app_id = &app_pubkey.to_hex()[..8];
         info!(app_id, "app connected");
         Ok(secret)
     }
@@ -395,7 +397,7 @@ impl SignerHandler {
             );
         }
 
-        let event_kind = kind.as_u32();
+        let event_kind = kind.as_u16();
         let event_id = &signed_event.id.to_hex()[..8];
         debug!(event_kind, event_id, "signed event");
         Ok(signed_event)
