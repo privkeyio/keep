@@ -18,6 +18,43 @@ use crate::permissions::{AppPermission, Permission, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{ApprovalRequest, ServerCallbacks};
 
+fn prepare_frost_event(
+    pubkey: PublicKey,
+    unsigned: &UnsignedEvent,
+) -> Result<(UnsignedEvent, EventId)> {
+    let mut frost_event = UnsignedEvent::new(
+        pubkey,
+        unsigned.created_at,
+        unsigned.kind,
+        unsigned.tags.clone(),
+        unsigned.content.clone(),
+    );
+    frost_event.ensure_id();
+    let event_id = frost_event
+        .id
+        .ok_or_else(|| KeepError::Runtime("failed to compute event ID".into()))?;
+    Ok((frost_event, event_id))
+}
+
+fn assemble_signed_event(
+    event_id: EventId,
+    pubkey: PublicKey,
+    frost_event: UnsignedEvent,
+    sig_bytes: &[u8],
+) -> Result<Event> {
+    let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(sig_bytes)
+        .map_err(|e| CryptoError::invalid_signature(e.to_string()))?;
+    Ok(Event::new(
+        event_id,
+        pubkey,
+        frost_event.created_at,
+        frost_event.kind,
+        frost_event.tags,
+        frost_event.content,
+        sig,
+    ))
+}
+
 fn parse_permission_string(perms: &str) -> Permission {
     let mut result = Permission::empty();
     for part in perms.split(',') {
@@ -142,13 +179,42 @@ impl SignerHandler {
         }
     }
 
+    async fn require_permission(&self, app_pubkey: &PublicKey, perm: Permission) -> Result<()> {
+        let pm = self.permissions.lock().await;
+        if pm.has_permission(app_pubkey, perm) {
+            Ok(())
+        } else {
+            Err(KeepError::PermissionDenied(
+                "operation not permitted".into(),
+            ))
+        }
+    }
+
+    async fn our_pubkey(&self) -> Result<PublicKey> {
+        if let Some(ref net_frost) = self.network_frost_signer {
+            Ok(PublicKey::from_slice(net_frost.group_pubkey())
+                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?)
+        } else if let Some(ref frost) = self.frost_signer {
+            let signer = frost.lock().await;
+            Ok(PublicKey::from_slice(signer.group_pubkey())
+                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?)
+        } else {
+            let keyring = self.keyring.lock().await;
+            let slot = keyring
+                .get_primary()
+                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+            Ok(PublicKey::from_slice(&slot.pubkey)
+                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?)
+        }
+    }
+
     pub async fn handle_connect(
         &self,
         app_pubkey: PublicKey,
         our_pubkey: Option<PublicKey>,
         secret: Option<String>,
         permissions: Option<String>,
-    ) -> Result<Option<String>> {
+    ) -> Result<()> {
         self.check_rate_limit(&app_pubkey).await?;
 
         let app_id = &app_pubkey.to_hex()[..8];
@@ -188,21 +254,7 @@ impl SignerHandler {
         }
 
         if let Some(expected) = our_pubkey {
-            let actual = if let Some(ref net_frost) = self.network_frost_signer {
-                PublicKey::from_slice(net_frost.group_pubkey())
-                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
-            } else if let Some(ref frost) = self.frost_signer {
-                let signer = frost.lock().await;
-                PublicKey::from_slice(signer.group_pubkey())
-                    .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
-            } else {
-                let keyring = self.keyring.lock().await;
-                let slot = keyring
-                    .get_primary()
-                    .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-                PublicKey::from_slice(&slot.pubkey)
-                    .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?
-            };
+            let actual = self.our_pubkey().await?;
             if expected != actual {
                 return Err(CryptoError::invalid_key("pubkey mismatch").into());
             }
@@ -224,7 +276,7 @@ impl SignerHandler {
         audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
         info!(app_id, "app connected");
-        Ok(None)
+        Ok(())
     }
 
     pub async fn handle_get_public_key(&self, app_pubkey: PublicKey) -> Result<PublicKey> {
@@ -242,21 +294,7 @@ impl SignerHandler {
         }
         drop(pm);
 
-        let pubkey = if let Some(ref net_frost) = self.network_frost_signer {
-            PublicKey::from_slice(net_frost.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
-        } else if let Some(ref frost) = self.frost_signer {
-            let signer = frost.lock().await;
-            PublicKey::from_slice(signer.group_pubkey())
-                .map_err(|e| CryptoError::invalid_key(format!("FROST pubkey: {e}")))?
-        } else {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-            PublicKey::from_slice(&slot.pubkey)
-                .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?
-        };
+        let pubkey = self.our_pubkey().await?;
 
         let mut audit = self.audit.lock().await;
         audit.log(AuditEntry::new(AuditAction::GetPublicKey, app_pubkey));
@@ -273,7 +311,7 @@ impl SignerHandler {
 
         let kind = unsigned_event.kind;
 
-        {
+        let needs_approval = {
             let pm = self.permissions.lock().await;
             if !pm.has_permission(&app_pubkey, Permission::SIGN_EVENT) {
                 let mut audit = self.audit.lock().await;
@@ -286,10 +324,6 @@ impl SignerHandler {
                     "operation not permitted".into(),
                 ));
             }
-        }
-
-        let needs_approval = {
-            let pm = self.permissions.lock().await;
             pm.needs_approval(&app_pubkey, kind)
         };
 
@@ -318,56 +352,16 @@ impl SignerHandler {
         let signed_event = if let Some(ref net_frost) = self.network_frost_signer {
             let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
-            let mut frost_event = UnsignedEvent::new(
-                pubkey,
-                unsigned_event.created_at,
-                unsigned_event.kind,
-                unsigned_event.tags.clone(),
-                unsigned_event.content.clone(),
-            );
-            frost_event.ensure_id();
-            let event_id = frost_event
-                .id
-                .ok_or_else(|| KeepError::Runtime("failed to compute event ID".into()))?;
+            let (frost_event, event_id) = prepare_frost_event(pubkey, &unsigned_event)?;
             let sig_bytes = net_frost.sign(event_id.as_bytes()).await?;
-            let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
-                .map_err(|e| CryptoError::invalid_signature(e.to_string()))?;
-            Event::new(
-                event_id,
-                pubkey,
-                frost_event.created_at,
-                frost_event.kind,
-                frost_event.tags,
-                frost_event.content,
-                sig,
-            )
+            assemble_signed_event(event_id, pubkey, frost_event, &sig_bytes)?
         } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;
             let pubkey = PublicKey::from_slice(signer.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
-            let mut frost_event = UnsignedEvent::new(
-                pubkey,
-                unsigned_event.created_at,
-                unsigned_event.kind,
-                unsigned_event.tags.clone(),
-                unsigned_event.content.clone(),
-            );
-            frost_event.ensure_id();
-            let event_id = frost_event
-                .id
-                .ok_or_else(|| KeepError::Runtime("failed to compute event ID".into()))?;
+            let (frost_event, event_id) = prepare_frost_event(pubkey, &unsigned_event)?;
             let sig_bytes = signer.sign(event_id.as_bytes())?;
-            let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
-                .map_err(|e| CryptoError::invalid_signature(e.to_string()))?;
-            Event::new(
-                event_id,
-                pubkey,
-                frost_event.created_at,
-                frost_event.kind,
-                frost_event.tags,
-                frost_event.content,
-                sig,
-            )
+            assemble_signed_event(event_id, pubkey, frost_event, &sig_bytes)?
         } else {
             let keyring = self.keyring.lock().await;
             let slot = keyring
@@ -385,26 +379,19 @@ impl SignerHandler {
                 .map_err(|e| CryptoError::invalid_signature(format!("signing: {e}")))?
         };
 
-        {
-            let mut keyring = self.keyring.lock().await;
-            if let Some(slot) = keyring.get_primary_mut() {
-                slot.session_sign_count += 1;
-            }
+        let mut keyring = self.keyring.lock().await;
+        if let Some(slot) = keyring.get_primary_mut() {
+            slot.session_sign_count += 1;
         }
+        drop(keyring);
 
-        {
-            let mut pm = self.permissions.lock().await;
-            pm.record_usage(&app_pubkey);
-        }
+        self.permissions.lock().await.record_usage(&app_pubkey);
 
-        {
-            let mut audit = self.audit.lock().await;
-            audit.log(
-                AuditEntry::new(AuditAction::SignEvent, app_pubkey)
-                    .with_event_kind(kind)
-                    .with_event_id(signed_event.id),
-            );
-        }
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::SignEvent, app_pubkey)
+                .with_event_kind(kind)
+                .with_event_id(signed_event.id),
+        );
 
         let event_kind = kind.as_u16();
         let event_id = &signed_event.id.to_hex()[..8];
@@ -419,32 +406,26 @@ impl SignerHandler {
         plaintext: &str,
     ) -> Result<String> {
         self.check_rate_limit(&app_pubkey).await?;
+        self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
+            .await?;
 
-        {
-            let pm = self.permissions.lock().await;
-            if !pm.has_permission(&app_pubkey, Permission::NIP44_ENCRYPT) {
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-        }
+        let keyring = self.keyring.lock().await;
+        let slot = keyring
+            .get_primary()
+            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
 
-        let ciphertext = {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+        let keypair = slot.to_nostr_keypair()?;
+        let secret = SecretKey::from_slice(keypair.secret_bytes())
+            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
-            let keypair = slot.to_nostr_keypair()?;
-            let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
+        let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
+            .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?;
+        drop(keyring);
 
-            nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
-                .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?
-        };
-
-        let mut audit = self.audit.lock().await;
-        audit.log(AuditEntry::new(AuditAction::Nip44Encrypt, app_pubkey));
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Nip44Encrypt, app_pubkey));
 
         Ok(ciphertext)
     }
@@ -456,15 +437,8 @@ impl SignerHandler {
         ciphertext: &str,
     ) -> Result<String> {
         self.check_rate_limit(&app_pubkey).await?;
-
-        {
-            let pm = self.permissions.lock().await;
-            if !pm.has_permission(&app_pubkey, Permission::NIP44_DECRYPT) {
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-        }
+        self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
+            .await?;
 
         let approved = self
             .request_approval(ApprovalRequest {
@@ -479,22 +453,23 @@ impl SignerHandler {
             return Err(KeepError::UserRejected);
         }
 
-        let plaintext = {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+        let keyring = self.keyring.lock().await;
+        let slot = keyring
+            .get_primary()
+            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
 
-            let keypair = slot.to_nostr_keypair()?;
-            let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
+        let keypair = slot.to_nostr_keypair()?;
+        let secret = SecretKey::from_slice(keypair.secret_bytes())
+            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
-            nip44::decrypt(&secret, &sender, ciphertext)
-                .map_err(|e| CryptoError::decryption(format!("NIP-44: {e}")))?
-        };
+        let plaintext = nip44::decrypt(&secret, &sender, ciphertext)
+            .map_err(|e| CryptoError::decryption(format!("NIP-44: {e}")))?;
+        drop(keyring);
 
-        let mut audit = self.audit.lock().await;
-        audit.log(AuditEntry::new(AuditAction::Nip44Decrypt, app_pubkey));
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Nip44Decrypt, app_pubkey));
 
         Ok(plaintext)
     }
@@ -506,32 +481,26 @@ impl SignerHandler {
         plaintext: &str,
     ) -> Result<String> {
         self.check_rate_limit(&app_pubkey).await?;
+        self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
+            .await?;
 
-        {
-            let pm = self.permissions.lock().await;
-            if !pm.has_permission(&app_pubkey, Permission::NIP04_ENCRYPT) {
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-        }
+        let keyring = self.keyring.lock().await;
+        let slot = keyring
+            .get_primary()
+            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
 
-        let ciphertext = {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+        let keypair = slot.to_nostr_keypair()?;
+        let secret = SecretKey::from_slice(keypair.secret_bytes())
+            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
-            let keypair = slot.to_nostr_keypair()?;
-            let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
+        let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
+            .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?;
+        drop(keyring);
 
-            nip04::encrypt(&secret, &recipient, plaintext)
-                .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?
-        };
-
-        let mut audit = self.audit.lock().await;
-        audit.log(AuditEntry::new(AuditAction::Nip04Encrypt, app_pubkey));
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Nip04Encrypt, app_pubkey));
 
         Ok(ciphertext)
     }
@@ -543,15 +512,8 @@ impl SignerHandler {
         ciphertext: &str,
     ) -> Result<String> {
         self.check_rate_limit(&app_pubkey).await?;
-
-        {
-            let pm = self.permissions.lock().await;
-            if !pm.has_permission(&app_pubkey, Permission::NIP04_DECRYPT) {
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-        }
+        self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
+            .await?;
 
         let approved = self
             .request_approval(ApprovalRequest {
@@ -566,22 +528,23 @@ impl SignerHandler {
             return Err(KeepError::UserRejected);
         }
 
-        let plaintext = {
-            let keyring = self.keyring.lock().await;
-            let slot = keyring
-                .get_primary()
-                .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+        let keyring = self.keyring.lock().await;
+        let slot = keyring
+            .get_primary()
+            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
 
-            let keypair = slot.to_nostr_keypair()?;
-            let secret = SecretKey::from_slice(keypair.secret_bytes())
-                .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
+        let keypair = slot.to_nostr_keypair()?;
+        let secret = SecretKey::from_slice(keypair.secret_bytes())
+            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
 
-            nip04::decrypt(&secret, &sender, ciphertext)
-                .map_err(|e| CryptoError::decryption(format!("NIP-04: {e}")))?
-        };
+        let plaintext = nip04::decrypt(&secret, &sender, ciphertext)
+            .map_err(|e| CryptoError::decryption(format!("NIP-04: {e}")))?;
+        drop(keyring);
 
-        let mut audit = self.audit.lock().await;
-        audit.log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey));
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey));
 
         Ok(plaintext)
     }

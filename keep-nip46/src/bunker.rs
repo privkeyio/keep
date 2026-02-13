@@ -3,14 +3,12 @@
 use nostr_sdk::prelude::*;
 
 pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&str>) -> String {
-    let mut url = format!("bunker://{}", pubkey.to_hex());
-
-    let encoded_relay = urlencoding::encode(relay_url);
-    url.push_str(&format!("?relay={encoded_relay}"));
+    let relay = urlencoding::encode(relay_url);
+    let mut url = format!("bunker://{}?relay={relay}", pubkey.to_hex());
 
     if let Some(s) = secret {
-        let encoded_secret = urlencoding::encode(s);
-        url.push_str(&format!("&secret={encoded_secret}"));
+        let secret = urlencoding::encode(s);
+        url.push_str(&format!("&secret={secret}"));
     }
 
     url

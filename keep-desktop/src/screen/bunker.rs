@@ -208,7 +208,7 @@ impl BunkerScreen {
             .into()
     }
 
-    fn connection_card(&self, url: &str) -> Element<Message> {
+    fn connection_card<'a>(&'a self, url: &'a str) -> Element<'a, Message> {
         let qr: Element<Message> = match self.qr_data {
             Some(ref data) => qr_code::<iced::Theme>(data).cell_size(4).into(),
             None => text("Failed to generate QR code")
@@ -217,7 +217,7 @@ impl BunkerScreen {
                 .into(),
         };
 
-        let url_display = text(url.to_string())
+        let url_display = text(url)
             .size(theme::size::TINY)
             .color(theme::color::TEXT_MUTED);
 

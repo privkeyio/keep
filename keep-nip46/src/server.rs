@@ -48,6 +48,25 @@ pub struct Server {
     bunker_secret: Option<String>,
 }
 
+fn generate_headless_secret() -> String {
+    let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+    warn!("headless mode: bunker secret required for authentication");
+    secret
+}
+
+fn apply_headless_secret(
+    handler: SignerHandler,
+    auto_approve: bool,
+) -> (SignerHandler, Option<String>) {
+    if auto_approve {
+        let secret = generate_headless_secret();
+        let handler = handler.with_expected_secret(secret.clone());
+        (handler, Some(secret))
+    } else {
+        (handler, None)
+    }
+}
+
 impl Server {
     pub async fn new(
         keyring: Arc<Mutex<Keyring>>,
@@ -124,15 +143,7 @@ impl Server {
         if let Some(ref rl_config) = config.rate_limit {
             handler = handler.with_rate_limit(rl_config.clone());
         }
-
-        let bunker_secret = if config.auto_approve {
-            let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
-            handler = handler.with_expected_secret(secret.clone());
-            warn!("headless mode: bunker secret required for authentication");
-            Some(secret)
-        } else {
-            None
-        };
+        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
 
         Ok(Self {
             keys,
@@ -238,15 +249,7 @@ impl Server {
         if let Some(ref rl_config) = config.rate_limit {
             handler = handler.with_rate_limit(rl_config.clone());
         }
-
-        let bunker_secret = if config.auto_approve {
-            let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
-            handler = handler.with_expected_secret(secret.clone());
-            warn!("headless mode: bunker secret required for authentication");
-            Some(secret)
-        } else {
-            None
-        };
+        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
 
         Ok(Self {
             keys,
@@ -428,8 +431,7 @@ impl Server {
                     .handle_connect(app_pubkey, our_pubkey, secret, permissions)
                     .await
                 {
-                    Ok(Some(s)) => Nip46Response::ok(id, &s),
-                    Ok(None) => Nip46Response::ok(id, "ack"),
+                    Ok(()) => Nip46Response::ok(id, "ack"),
                     Err(e) => {
                         warn!(error = %e, "connect failed");
                         Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))

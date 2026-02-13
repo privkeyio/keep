@@ -50,6 +50,7 @@ const RECONNECT_BASE_MS: u64 = 200;
 const RECONNECT_MAX_MS: u64 = 30_000;
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 
 const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
@@ -2079,6 +2080,14 @@ impl App {
         )
     }
 
+    fn set_bunker_error(&mut self, msg: String) {
+        self.set_toast(msg.clone(), ToastKind::Error);
+        if let Screen::Bunker(s) = &mut self.screen {
+            s.starting = false;
+            s.error = Some(msg);
+        }
+    }
+
     fn handle_bunker_start_result(&mut self, result: Result<String, String>) -> Task<Message> {
         match result {
             Ok(url) => {
@@ -2086,12 +2095,9 @@ impl App {
                     Some(arc) => match arc.lock() {
                         Ok(mut guard) => guard.take(),
                         Err(_) => {
-                            let msg = "Internal error: bunker setup state corrupted".to_string();
-                            self.set_toast(msg.clone(), ToastKind::Error);
-                            if let Screen::Bunker(s) = &mut self.screen {
-                                s.starting = false;
-                                s.error = Some(msg);
-                            }
+                            self.set_bunker_error(
+                                "Internal error: bunker setup state corrupted".into(),
+                            );
                             return Task::none();
                         }
                     },
@@ -2099,12 +2105,7 @@ impl App {
                 };
 
                 let Some(setup) = setup else {
-                    let msg = "Internal error: bunker setup missing".to_string();
-                    self.set_toast(msg.clone(), ToastKind::Error);
-                    if let Screen::Bunker(s) = &mut self.screen {
-                        s.starting = false;
-                        s.error = Some(msg);
-                    }
+                    self.set_bunker_error("Internal error: bunker setup missing".into());
                     return Task::none();
                 };
 
@@ -2127,11 +2128,7 @@ impl App {
             }
             Err(e) => {
                 self.bunker_pending_setup = None;
-                self.set_toast(e.clone(), ToastKind::Error);
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.starting = false;
-                    s.error = Some(e);
-                }
+                self.set_bunker_error(e);
             }
         }
         Task::none()
@@ -2178,12 +2175,12 @@ impl App {
                         action,
                         success,
                     };
-                    if bunker.log.len() >= 1000 {
+                    if bunker.log.len() >= MAX_BUNKER_LOG_ENTRIES {
                         bunker.log.pop_front();
                     }
                     bunker.log.push_back(entry.clone());
                     if let Screen::Bunker(s) = &mut self.screen {
-                        if s.log.len() >= 1000 {
+                        if s.log.len() >= MAX_BUNKER_LOG_ENTRIES {
                             s.log.pop_front();
                         }
                         s.log.push_back(entry);

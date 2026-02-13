@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::prelude::*;
@@ -99,7 +100,7 @@ impl PermissionManager {
             return false;
         }
         match self.apps.entry(pubkey) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
+            Entry::Occupied(entry) => {
                 let existing = entry.get().permissions;
                 let masked = requested & Permission::ALL;
                 if existing != masked {
@@ -112,7 +113,7 @@ impl PermissionManager {
                     );
                 }
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 let mut app = AppPermission::new(pubkey, name);
                 app.permissions = requested & Permission::ALL;
                 entry.insert(app);
