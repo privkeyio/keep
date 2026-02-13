@@ -121,10 +121,7 @@ pub fn cmd_serve(
                 transport_key,
                 &[relay.to_string()],
                 None,
-                ServerConfig {
-                    auto_approve: true,
-                    ..Default::default()
-                },
+                ServerConfig::default(),
             )
             .await?;
             let bunker_url = server.bunker_url();

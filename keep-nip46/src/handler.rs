@@ -208,7 +208,9 @@ impl SignerHandler {
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms) {
-            return Err(KeepError::RateLimited(60));
+            return Err(KeepError::CapacityExceeded(
+                "too many connected apps".into(),
+            ));
         }
 
         let mut audit = self.audit.lock().await;

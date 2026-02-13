@@ -21,7 +21,7 @@ pub enum Screen {
     Import(import::ImportScreen),
     Wallet(wallet::WalletScreen),
     Relay(relay::RelayScreen),
-    Bunker(bunker::BunkerScreen),
+    Bunker(Box<bunker::BunkerScreen>),
 }
 
 impl Screen {

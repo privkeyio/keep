@@ -286,11 +286,13 @@ impl BunkerScreen {
                 add_btn = add_btn.on_press(Message::BunkerAddRelay);
             }
 
-            let input = text_input("wss://relay.example.com", &self.relay_input)
+            let mut input = text_input("wss://relay.example.com", &self.relay_input)
                 .on_input(Message::BunkerRelayInputChanged)
-                .on_submit(Message::BunkerAddRelay)
                 .size(theme::size::SMALL)
                 .width(Length::Fill);
+            if can_add {
+                input = input.on_submit(Message::BunkerAddRelay);
+            }
 
             card = card.push(
                 row![input, add_btn]

@@ -124,6 +124,7 @@ pub enum Message {
     BunkerRevokeAll,
     BunkerCopyUrl,
     BunkerRevokeResult(Result<(), String>),
+    BunkerClientsLoaded(Vec<crate::screen::bunker::ConnectedClient>),
 
     // Timer
     Tick,
@@ -234,6 +235,10 @@ impl fmt::Debug for Message {
             Self::BunkerRevokeAll => f.write_str("BunkerRevokeAll"),
             Self::BunkerCopyUrl => f.write_str("BunkerCopyUrl"),
             Self::BunkerRevokeResult(_) => f.write_str("BunkerRevokeResult"),
+            Self::BunkerClientsLoaded(c) => f
+                .debug_tuple("BunkerClientsLoaded")
+                .field(&c.len())
+                .finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

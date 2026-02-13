@@ -783,7 +783,7 @@ impl App {
                 if matches!(self.screen, Screen::Bunker(_)) {
                     return Task::none();
                 }
-                self.screen = Screen::Bunker(self.create_bunker_screen());
+                self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
                 Task::none()
             }
             Message::Lock => self.do_lock(),
@@ -1084,9 +1084,7 @@ impl App {
                 if let Screen::Bunker(s) = &mut self.screen {
                     if i < s.relays.len() {
                         s.relays.remove(i);
-                        if i < self.bunker_relays.len() {
-                            self.bunker_relays.remove(i);
-                        }
+                        self.bunker_relays = s.relays.clone();
                     }
                 }
                 Task::none()
@@ -1142,7 +1140,16 @@ impl App {
                         s.error = Some(e);
                     }
                 }
-                self.sync_bunker_clients();
+                self.sync_bunker_clients()
+            }
+            Message::BunkerClientsLoaded(clients) => {
+                if let Some(ref mut bunker) = self.bunker {
+                    bunker.clients = clients.clone();
+                }
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.clients = clients;
+                    s.revoke_all_confirm = false;
+                }
                 Task::none()
             }
             Message::BunkerConfirmRevokeAll => {
@@ -1975,7 +1982,10 @@ impl App {
         }
 
         let keep_arc = self.keep.clone();
-        let relay = self.bunker_relays[0].clone();
+        let relay = match self.bunker_relays.first() {
+            Some(r) => r.clone(),
+            None => return Task::none(),
+        };
 
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
@@ -1993,15 +2003,14 @@ impl App {
                         .ok_or_else(|| "No signing key available".to_string())?;
 
                     let pubkey = slot.pubkey;
-                    let mut secret = *slot.expose_secret();
+                    let secret = Zeroizing::new(*slot.expose_secret());
                     let key_type = slot.key_type;
                     let name = slot.name.clone();
 
                     let mut new_kr = keep_core::keyring::Keyring::new();
                     new_kr
-                        .load_key(pubkey, secret, key_type, name)
+                        .load_key(pubkey, *secret, key_type, name)
                         .map_err(|e| format!("Failed to prepare keyring: {e}"))?;
-                    zeroize::Zeroize::zeroize(&mut secret);
 
                     Ok::<_, String>(Arc::new(tokio::sync::Mutex::new(new_kr)))
                 })
@@ -2025,7 +2034,11 @@ impl App {
                     }
                 });
 
-                *setup_arc.lock().unwrap() = Some(BunkerSetup {
+                let mut guard = match setup_arc.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                *guard = Some(BunkerSetup {
                     handler,
                     event_rx,
                     handle,
@@ -2142,11 +2155,11 @@ impl App {
         }
     }
 
-    fn sync_bunker_clients(&mut self) {
-        if let Some(ref mut bunker) = self.bunker {
+    fn sync_bunker_clients(&self) -> Task<Message> {
+        if let Some(ref bunker) = self.bunker {
             let handler = bunker.handler.clone();
-            let clients: Vec<ConnectedClient> = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
+            Task::perform(
+                async move {
                     handler
                         .list_clients()
                         .await
@@ -2156,13 +2169,11 @@ impl App {
                             name: app.name,
                         })
                         .collect()
-                })
-            });
-            bunker.clients = clients.clone();
-            if let Screen::Bunker(s) = &mut self.screen {
-                s.clients = clients;
-                s.revoke_all_confirm = false;
-            }
+                },
+                Message::BunkerClientsLoaded,
+            )
+        } else {
+            Task::none()
         }
     }
 }

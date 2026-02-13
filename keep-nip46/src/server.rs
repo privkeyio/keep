@@ -433,17 +433,13 @@ impl Server {
                     return Nip46Response::error(id, "Invalid created_at timestamp");
                 }
 
-                let tags: Vec<Tag> = partial
-                    .tags
-                    .iter()
-                    .filter_map(|t| match Tag::parse(t) {
-                        Ok(tag) => Some(tag),
-                        Err(e) => {
-                            warn!(error = %e, "skipping unparseable tag");
-                            None
-                        }
-                    })
-                    .collect();
+                let mut tags = Vec::with_capacity(partial.tags.len());
+                for t in &partial.tags {
+                    match Tag::parse(t) {
+                        Ok(tag) => tags.push(tag),
+                        Err(_) => return Nip46Response::error(id, "Invalid tag in event"),
+                    }
+                }
 
                 let unsigned = UnsignedEvent::new(
                     user_pubkey,
