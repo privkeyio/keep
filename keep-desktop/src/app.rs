@@ -2069,28 +2069,47 @@ impl App {
     fn handle_bunker_start_result(&mut self, result: Result<String, String>) -> Task<Message> {
         match result {
             Ok(url) => {
-                let setup = self
-                    .bunker_pending_setup
-                    .take()
-                    .and_then(|arc| arc.lock().ok()?.take());
+                let setup = match self.bunker_pending_setup.take() {
+                    Some(arc) => match arc.lock() {
+                        Ok(mut guard) => guard.take(),
+                        Err(_) => {
+                            let msg = "Internal error: bunker setup state corrupted".to_string();
+                            self.set_toast(msg.clone(), ToastKind::Error);
+                            if let Screen::Bunker(s) = &mut self.screen {
+                                s.starting = false;
+                                s.error = Some(msg);
+                            }
+                            return Task::none();
+                        }
+                    },
+                    None => None,
+                };
 
-                if let Some(setup) = setup {
-                    self.bunker = Some(RunningBunker {
-                        url: url.clone(),
-                        handler: setup.handler,
-                        event_rx: Arc::new(Mutex::new(setup.event_rx)),
-                        handle: setup.handle,
-                        clients: Vec::new(),
-                        log: Vec::new(),
-                    });
-
+                let Some(setup) = setup else {
+                    let msg = "Internal error: bunker setup missing".to_string();
+                    self.set_toast(msg.clone(), ToastKind::Error);
                     if let Screen::Bunker(s) = &mut self.screen {
-                        s.running = true;
                         s.starting = false;
-                        s.qr_data = iced::widget::qr_code::Data::new(&url).ok();
-                        s.url = Some(url);
-                        s.error = None;
+                        s.error = Some(msg);
                     }
+                    return Task::none();
+                };
+
+                self.bunker = Some(RunningBunker {
+                    url: url.clone(),
+                    handler: setup.handler,
+                    event_rx: Arc::new(Mutex::new(setup.event_rx)),
+                    handle: setup.handle,
+                    clients: Vec::new(),
+                    log: Vec::new(),
+                });
+
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.running = true;
+                    s.starting = false;
+                    s.qr_data = iced::widget::qr_code::Data::new(&url).ok();
+                    s.url = Some(url);
+                    s.error = None;
                 }
             }
             Err(e) => {
@@ -2161,6 +2180,9 @@ impl App {
                     display,
                     response_tx,
                 } => {
+                    if let Some(prev_tx) = self.bunker_approval_tx.take() {
+                        let _ = prev_tx.send(false);
+                    }
                     self.bunker_pending_approval = Some(display.clone());
                     self.bunker_approval_tx = Some(response_tx);
                     if let Screen::Bunker(s) = &mut self.screen {

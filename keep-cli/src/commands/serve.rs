@@ -116,12 +116,20 @@ pub fn cmd_serve(
 
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
 
+            let frost_config = if headless {
+                ServerConfig {
+                    auto_approve: true,
+                    ..ServerConfig::default()
+                }
+            } else {
+                ServerConfig::default()
+            };
             let mut server = Server::new_network_frost_with_config(
                 net_signer,
                 transport_key,
                 &[relay.to_string()],
                 None,
-                ServerConfig::default(),
+                frost_config,
             )
             .await?;
             let bunker_url = server.bunker_url();
