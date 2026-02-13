@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,13 @@ const TOAST_DURATION_SECS: u64 = 5;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 const MAX_PENDING_REQUESTS: usize = 10;
+const MAX_REQUESTS_PER_PEER: usize = 3;
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const RATE_LIMIT_PER_PEER: usize = 30;
+const RATE_LIMIT_GLOBAL: usize = 100;
+const RECONNECT_BASE_MS: u64 = 200;
+const RECONNECT_MAX_MS: u64 = 30_000;
+const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -106,6 +113,10 @@ pub struct App {
     frost_status: ConnectionStatus,
     frost_peers: Vec<PeerEntry>,
     pending_sign_display: Vec<PendingSignRequest>,
+    frost_reconnect_attempts: u32,
+    frost_reconnect_at: Option<Instant>,
+    frost_last_share: Option<ShareEntry>,
+    frost_last_relay_urls: Option<Vec<String>>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -274,6 +285,10 @@ impl App {
             frost_status: ConnectionStatus::Disconnected,
             frost_peers: Vec::new(),
             pending_sign_display: Vec::new(),
+            frost_reconnect_attempts: 0,
+            frost_reconnect_at: None,
+            frost_last_share: None,
+            frost_last_relay_urls: None,
         }
     }
 
@@ -323,6 +338,11 @@ impl App {
                 if self.toast_dismiss_at.is_some_and(|t| now >= t) {
                     self.toast = None;
                     self.toast_dismiss_at = None;
+                }
+                if self.frost_reconnect_at.is_some_and(|t| now >= t) {
+                    self.frost_reconnect_at = None;
+                    self.drain_frost_events();
+                    return self.handle_reconnect_relay();
                 }
                 self.drain_frost_events();
                 Task::none()
@@ -651,9 +671,26 @@ impl App {
                 Task::none()
             }
             Message::ConnectRelayResult(result) => {
-                let status = match result {
-                    Ok(()) => ConnectionStatus::Connected,
-                    Err(e) => ConnectionStatus::Error(e),
+                let status = match &result {
+                    Ok(()) => {
+                        self.frost_reconnect_attempts = 0;
+                        self.frost_reconnect_at = None;
+                        ConnectionStatus::Connected
+                    }
+                    Err(e) => {
+                        if self.frost_reconnect_attempts < RECONNECT_MAX_ATTEMPTS {
+                            let base = RECONNECT_BASE_MS
+                                .saturating_mul(1u64 << self.frost_reconnect_attempts.min(15))
+                                .min(RECONNECT_MAX_MS);
+                            let jitter =
+                                (base / 5) * (self.frost_reconnect_attempts as u64 % 3) / 2;
+                            let delay_ms = base + jitter;
+                            self.frost_reconnect_at =
+                                Some(Instant::now() + Duration::from_millis(delay_ms));
+                            self.frost_reconnect_attempts += 1;
+                        }
+                        ConnectionStatus::Error(e.clone())
+                    }
                 };
                 self.frost_status = status.clone();
                 if let Some(s) = self.relay_screen_mut() {
@@ -821,6 +858,8 @@ impl App {
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Connecting;
         }
+        self.frost_last_share = Some(share_entry.clone());
+        self.frost_last_relay_urls = Some(relay_urls.clone());
 
         let keep_arc = self.keep.clone();
         let keep_path = self.keep_path.clone();
@@ -940,6 +979,8 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.frost_reconnect_attempts = 0;
+        self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             guard.clear();
         }
@@ -948,6 +989,137 @@ impl App {
             s.peers.clear();
             s.pending_requests.clear();
         }
+    }
+
+    fn handle_reconnect_relay(&mut self) -> Task<Message> {
+        let Some(share_entry) = self.frost_last_share.clone() else {
+            return Task::none();
+        };
+        let Some(relay_urls) = self.frost_last_relay_urls.clone() else {
+            return Task::none();
+        };
+        if lock_keep(&self.keep).is_none() {
+            return Task::none();
+        }
+
+        if let Ok(mut guard) = self.frost_shutdown.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.try_send(());
+            }
+        }
+
+        self.frost_status = ConnectionStatus::Connecting;
+        if let Some(s) = self.relay_screen_mut() {
+            s.status = ConnectionStatus::Connecting;
+        }
+
+        let keep_arc = self.keep.clone();
+        let keep_path = self.keep_path.clone();
+        let frost_events = self.frost_events.clone();
+        let pending_requests = self.pending_sign_requests.clone();
+        let frost_shutdown = self.frost_shutdown.clone();
+
+        Task::perform(
+            async move {
+                let share = tokio::task::spawn_blocking({
+                    let keep_arc = keep_arc.clone();
+                    let group_pubkey = share_entry.group_pubkey;
+                    let identifier = share_entry.identifier;
+                    move || {
+                        with_keep_blocking(&keep_arc, "Failed to load share", move |keep| {
+                            keep.frost_get_share_by_index(&group_pubkey, identifier)
+                                .map_err(friendly_err)
+                        })
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                let nonce_store_path = keep_path.join("frost-nonces");
+                keep_frost_net::install_default_crypto_provider();
+                let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
+                    .await
+                    .map_err(|e| format!("Connection failed: {e}"))?;
+
+                let (request_tx, request_rx) = mpsc::channel(32);
+                let hooks = Arc::new(DesktopSigningHooks { request_tx });
+                node.set_hooks(hooks);
+
+                let event_rx = node.subscribe();
+                let mut connect_rx = node.subscribe();
+                let node = Arc::new(node);
+                let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+                let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
+
+                if let Ok(mut guard) = frost_shutdown.lock() {
+                    *guard = Some(shutdown_tx);
+                }
+
+                let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
+                let run_node = node.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = run_node.run() => {
+                            if let Err(e) = result {
+                                tracing::error!("Node run failed: {e}");
+                                let _ = run_error_tx.send(format!("{e}")).await;
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            tracing::info!("Node shutdown requested");
+                        }
+                    }
+                    drop(listener_shutdown_tx);
+                });
+
+                let listener_events = frost_events.clone();
+                let listener_requests = pending_requests.clone();
+                let listener_node = node.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = Self::frost_event_listener(
+                            event_rx,
+                            request_rx,
+                            listener_events,
+                            listener_requests,
+                            listener_node,
+                        ) => {}
+                        _ = listener_shutdown_rx.recv() => {}
+                    }
+                });
+
+                let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
+                tokio::pin!(connect_timeout);
+                loop {
+                    tokio::select! {
+                        err = run_error_rx.recv() => {
+                            let msg = err.unwrap_or_else(|| "Node stopped unexpectedly".into());
+                            push_frost_event(
+                                &frost_events,
+                                FrostNodeMsg::StatusChanged(ConnectionStatus::Error(msg.clone())),
+                            );
+                            return Err(msg);
+                        }
+                        result = connect_rx.recv() => {
+                            match result {
+                                Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
+                                Ok(_) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    return Err("Node stopped unexpectedly".into());
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
+                        }
+                        _ = &mut connect_timeout => {
+                            break;
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+            Message::ConnectRelayResult,
+        )
     }
 
     fn respond_to_sign_request(&mut self, id: &str, approve: bool) {
@@ -977,6 +1149,10 @@ impl App {
         pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
         node: Arc<KfpNode>,
     ) {
+        let mut global_request_times: VecDeque<Instant> = VecDeque::new();
+        let mut peer_request_times: HashMap<u16, VecDeque<Instant>> = HashMap::new();
+        let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+
         loop {
             tokio::select! {
                 result = event_rx.recv() => {
@@ -1014,10 +1190,40 @@ impl App {
                     let Some((session, response_tx)) = result else {
                         break;
                     };
+                    let from_peer = session.participants.first().copied().unwrap_or(0);
+                    let now = Instant::now();
+
+                    let cutoff = now.checked_sub(window).unwrap_or(now);
+                    while global_request_times.front().is_some_and(|t| *t < cutoff) {
+                        global_request_times.pop_front();
+                    }
+                    if global_request_times.len() >= RATE_LIMIT_GLOBAL {
+                        let _ = response_tx.try_send(false);
+                        continue;
+                    }
+
+                    let peer_times = peer_request_times.entry(from_peer).or_default();
+                    while peer_times.front().is_some_and(|t| *t < cutoff) {
+                        peer_times.pop_front();
+                    }
+                    if peer_times.len() >= RATE_LIMIT_PER_PEER {
+                        let _ = response_tx.try_send(false);
+                        continue;
+                    }
+
+                    if let Ok(guard) = pending_requests.lock() {
+                        let peer_pending = guard.iter().filter(|r| r.info.from_peer == from_peer).count();
+                        if peer_pending >= MAX_REQUESTS_PER_PEER {
+                            drop(guard);
+                            let _ = response_tx.try_send(false);
+                            continue;
+                        }
+                    }
+
                     let req = PendingSignRequest {
                         id: hex::encode(session.session_id),
                         message_preview: sanitize_message_preview(&session.message),
-                        from_peer: session.participants.first().copied().unwrap_or(0),
+                        from_peer,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -1026,6 +1232,8 @@ impl App {
 
                     if let Ok(mut guard) = pending_requests.lock() {
                         if guard.len() < MAX_PENDING_REQUESTS {
+                            global_request_times.push_back(now);
+                            peer_request_times.entry(from_peer).or_default().push_back(now);
                             let entry = PendingRequestEntry {
                                 info: req.clone(),
                                 response_tx,
