@@ -180,7 +180,7 @@ impl SignerHandler {
             self.audit.lock().await.log(
                 AuditEntry::new(AuditAction::PermissionDenied, *app_pubkey)
                     .with_success(false)
-                    .with_reason(&format!("{perm:?} not permitted")),
+                    .with_reason(format!("{perm:?} not permitted")),
             );
             Err(KeepError::PermissionDenied(
                 "operation not permitted".into(),
