@@ -391,6 +391,33 @@ impl SignerHandler {
         Ok(signed_event)
     }
 
+    async fn primary_secret_key(&self) -> Result<SecretKey> {
+        let keyring = self.keyring.lock().await;
+        let slot = keyring
+            .get_primary()
+            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
+        let keypair = slot.to_nostr_keypair()?;
+        Ok(SecretKey::from_slice(keypair.secret_bytes())
+            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?)
+    }
+
+    async fn require_decrypt_approval(&self, app_pubkey: PublicKey, method: &str) -> Result<()> {
+        let approved = self
+            .request_approval(ApprovalRequest {
+                app_pubkey,
+                app_name: self.get_app_name(&app_pubkey).await,
+                method: method.into(),
+                event_kind: None,
+                event_content: None,
+            })
+            .await;
+        if approved {
+            Ok(())
+        } else {
+            Err(KeepError::UserRejected)
+        }
+    }
+
     pub async fn handle_nip44_encrypt(
         &self,
         app_pubkey: PublicKey,
@@ -401,18 +428,9 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
             .await?;
 
-        let keyring = self.keyring.lock().await;
-        let slot = keyring
-            .get_primary()
-            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-
-        let keypair = slot.to_nostr_keypair()?;
-        let secret = SecretKey::from_slice(keypair.secret_bytes())
-            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
-
+        let secret = self.primary_secret_key().await?;
         let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
             .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?;
-        drop(keyring);
 
         self.audit
             .lock()
@@ -431,32 +449,12 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
             .await?;
+        self.require_decrypt_approval(app_pubkey, "nip44_decrypt")
+            .await?;
 
-        let approved = self
-            .request_approval(ApprovalRequest {
-                app_pubkey,
-                app_name: self.get_app_name(&app_pubkey).await,
-                method: "nip44_decrypt".into(),
-                event_kind: None,
-                event_content: None,
-            })
-            .await;
-        if !approved {
-            return Err(KeepError::UserRejected);
-        }
-
-        let keyring = self.keyring.lock().await;
-        let slot = keyring
-            .get_primary()
-            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-
-        let keypair = slot.to_nostr_keypair()?;
-        let secret = SecretKey::from_slice(keypair.secret_bytes())
-            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
-
+        let secret = self.primary_secret_key().await?;
         let plaintext = nip44::decrypt(&secret, &sender, ciphertext)
             .map_err(|e| CryptoError::decryption(format!("NIP-44: {e}")))?;
-        drop(keyring);
 
         self.audit
             .lock()
@@ -476,18 +474,9 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
             .await?;
 
-        let keyring = self.keyring.lock().await;
-        let slot = keyring
-            .get_primary()
-            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-
-        let keypair = slot.to_nostr_keypair()?;
-        let secret = SecretKey::from_slice(keypair.secret_bytes())
-            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
-
+        let secret = self.primary_secret_key().await?;
         let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
             .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?;
-        drop(keyring);
 
         self.audit
             .lock()
@@ -506,32 +495,12 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
             .await?;
+        self.require_decrypt_approval(app_pubkey, "nip04_decrypt")
+            .await?;
 
-        let approved = self
-            .request_approval(ApprovalRequest {
-                app_pubkey,
-                app_name: self.get_app_name(&app_pubkey).await,
-                method: "nip04_decrypt".into(),
-                event_kind: None,
-                event_content: None,
-            })
-            .await;
-        if !approved {
-            return Err(KeepError::UserRejected);
-        }
-
-        let keyring = self.keyring.lock().await;
-        let slot = keyring
-            .get_primary()
-            .ok_or_else(|| KeepError::KeyNotFound("no signing key".into()))?;
-
-        let keypair = slot.to_nostr_keypair()?;
-        let secret = SecretKey::from_slice(keypair.secret_bytes())
-            .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
-
+        let secret = self.primary_secret_key().await?;
         let plaintext = nip04::decrypt(&secret, &sender, ciphertext)
             .map_err(|e| CryptoError::decryption(format!("NIP-04: {e}")))?;
-        drop(keyring);
 
         self.audit
             .lock()

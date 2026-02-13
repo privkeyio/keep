@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod bunker_service;
+mod frost;
 mod message;
 mod screen;
 mod theme;
