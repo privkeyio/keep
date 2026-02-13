@@ -71,7 +71,7 @@ impl AppPermission {
             pubkey,
             name,
             permissions: Permission::DEFAULT,
-            auto_approve_kinds: HashSet::from([Kind::Reaction, Kind::RelayList]),
+            auto_approve_kinds: HashSet::from([Kind::Reaction]),
             connected_at: Timestamp::now(),
             last_used: Timestamp::now(),
             request_count: 0,
@@ -89,7 +89,7 @@ impl PermissionManager {
     pub fn new() -> Self {
         Self {
             apps: HashMap::new(),
-            global_auto_approve: HashSet::from([Kind::Reaction, Kind::RelayList]),
+            global_auto_approve: HashSet::from([Kind::Reaction]),
         }
     }
 
@@ -135,6 +135,7 @@ impl PermissionManager {
         pubkey: PublicKey,
         name: String,
         requested: Permission,
+        auto_kinds: HashSet<Kind>,
     ) -> bool {
         if !self.ensure_capacity(&pubkey) {
             return false;
@@ -156,6 +157,9 @@ impl PermissionManager {
             Entry::Vacant(entry) => {
                 let mut app = AppPermission::new(pubkey, name);
                 app.permissions = requested & Permission::ALL;
+                if !auto_kinds.is_empty() {
+                    app.auto_approve_kinds.extend(auto_kinds);
+                }
                 entry.insert(app);
             }
         }
@@ -193,13 +197,14 @@ impl PermissionManager {
     }
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
-        if let Some(app) = self.apps.get(pubkey) {
-            if app.duration.is_expired(app.connected_at) {
-                return true;
-            }
-            if app.auto_approve_kinds.contains(&kind) {
-                return false;
-            }
+        let Some(app) = self.apps.get(pubkey) else {
+            return true;
+        };
+        if app.duration.is_expired(app.connected_at) {
+            return true;
+        }
+        if app.auto_approve_kinds.contains(&kind) {
+            return false;
         }
         if self.global_auto_approve.contains(&kind) {
             return false;
@@ -225,6 +230,30 @@ impl PermissionManager {
     #[allow(dead_code)]
     pub fn set_auto_approve_kinds(&mut self, kinds: HashSet<Kind>) {
         self.global_auto_approve = kinds;
+    }
+
+    pub fn set_permissions(&mut self, pubkey: &PublicKey, permissions: Permission) {
+        if let Some(app) = self.apps.get_mut(pubkey) {
+            app.permissions = permissions & Permission::ALL;
+            app.last_used = Timestamp::now();
+        }
+    }
+
+    pub fn set_duration(&mut self, pubkey: &PublicKey, duration: PermissionDuration) {
+        if let Some(app) = self.apps.get_mut(pubkey) {
+            app.duration = duration;
+            if matches!(duration, PermissionDuration::Seconds(_)) {
+                app.connected_at = Timestamp::now();
+            }
+            app.last_used = Timestamp::now();
+        }
+    }
+
+    pub fn set_auto_approve_kinds_for_app(&mut self, pubkey: &PublicKey, kinds: HashSet<Kind>) {
+        if let Some(app) = self.apps.get_mut(pubkey) {
+            app.auto_approve_kinds = kinds;
+            app.last_used = Timestamp::now();
+        }
     }
 }
 
@@ -269,6 +298,7 @@ mod tests {
             pubkey,
             "Test App".into(),
             Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            HashSet::new(),
         ));
         assert!(pm.is_connected(&pubkey));
         assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
@@ -314,5 +344,68 @@ mod tests {
     #[test]
     fn test_permission_duration_session() {
         assert!(!PermissionDuration::Session.is_expired(Timestamp::from(1)));
+    }
+
+    #[test]
+    fn test_set_permissions() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "Test".into());
+
+        assert!(pm.has_permission(&pubkey, Permission::GET_PUBLIC_KEY));
+        assert!(!pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+
+        pm.set_permissions(&pubkey, Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+        assert!(pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+
+        pm.set_permissions(&pubkey, Permission::GET_PUBLIC_KEY);
+        assert!(!pm.has_permission(&pubkey, Permission::SIGN_EVENT));
+    }
+
+    #[test]
+    fn test_set_duration() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "Test".into());
+
+        let app = pm.get_app(&pubkey).unwrap();
+        assert!(matches!(app.duration, PermissionDuration::Forever));
+
+        pm.set_duration(&pubkey, PermissionDuration::Seconds(3600));
+        let app = pm.get_app(&pubkey).unwrap();
+        assert!(matches!(app.duration, PermissionDuration::Seconds(3600)));
+    }
+
+    #[test]
+    fn test_set_auto_approve_kinds_for_app() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "Test".into());
+        pm.grant(pubkey, "Test".into(), Permission::SIGN_EVENT);
+
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+
+        pm.set_auto_approve_kinds_for_app(
+            &pubkey,
+            HashSet::from([Kind::TextNote, Kind::Reaction]),
+        );
+        assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
+        assert!(!pm.needs_approval(&pubkey, Kind::Reaction));
+        assert!(pm.needs_approval(&pubkey, Kind::from(30023)));
+    }
+
+    #[test]
+    fn test_connect_with_auto_kinds() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect_with_permissions(
+            pubkey,
+            "Test".into(),
+            Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            HashSet::from([Kind::TextNote]),
+        );
+
+        assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
+        assert!(pm.needs_approval(&pubkey, Kind::from(30023)));
     }
 }

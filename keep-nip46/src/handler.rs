@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -14,7 +14,7 @@ use keep_core::keyring::Keyring;
 
 use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
-use crate::permissions::{AppPermission, Permission, PermissionManager};
+use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{ApprovalRequest, ServerCallbacks};
 
@@ -55,23 +55,32 @@ fn assemble_signed_event(
     ))
 }
 
-fn parse_permission_string(perms: &str) -> Permission {
+fn parse_permission_string(perms: &str) -> (Permission, HashSet<Kind>) {
     let mut result = Permission::empty();
+    let mut auto_kinds = HashSet::new();
     for part in perms.split(',') {
-        match part.trim() {
-            "get_public_key" => result |= Permission::GET_PUBLIC_KEY,
-            "sign_event" => result |= Permission::SIGN_EVENT,
-            "nip04_encrypt" => result |= Permission::NIP04_ENCRYPT,
-            "nip04_decrypt" => result |= Permission::NIP04_DECRYPT,
-            "nip44_encrypt" => result |= Permission::NIP44_ENCRYPT,
-            "nip44_decrypt" => result |= Permission::NIP44_DECRYPT,
-            _ => {}
+        let trimmed = part.trim();
+        if let Some(kind_str) = trimmed.strip_prefix("sign_event:") {
+            result |= Permission::SIGN_EVENT;
+            if let Ok(kind_num) = kind_str.parse::<u16>() {
+                auto_kinds.insert(Kind::from(kind_num));
+            }
+        } else {
+            match trimmed {
+                "get_public_key" => result |= Permission::GET_PUBLIC_KEY,
+                "sign_event" => result |= Permission::SIGN_EVENT,
+                "nip04_encrypt" => result |= Permission::NIP04_ENCRYPT,
+                "nip04_decrypt" => result |= Permission::NIP04_DECRYPT,
+                "nip44_encrypt" => result |= Permission::NIP44_ENCRYPT,
+                "nip44_decrypt" => result |= Permission::NIP44_DECRYPT,
+                _ => {}
+            }
         }
     }
     if result.is_empty() {
-        Permission::DEFAULT
+        (Permission::DEFAULT, auto_kinds)
     } else {
-        result | Permission::GET_PUBLIC_KEY
+        (result | Permission::GET_PUBLIC_KEY, auto_kinds)
     }
 }
 
@@ -86,6 +95,7 @@ pub struct SignerHandler {
     rate_limit_config: Option<RateLimitConfig>,
     expected_secret: Option<String>,
     auto_approve: bool,
+    relay_urls: Vec<String>,
 }
 
 impl SignerHandler {
@@ -106,6 +116,7 @@ impl SignerHandler {
             rate_limit_config: None,
             expected_secret: None,
             auto_approve: false,
+            relay_urls: Vec::new(),
         }
     }
 
@@ -131,6 +142,11 @@ impl SignerHandler {
 
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limit_config = Some(config);
+        self
+    }
+
+    pub fn with_relay_urls(mut self, urls: Vec<String>) -> Self {
+        self.relay_urls = urls;
         self
     }
 
@@ -244,6 +260,7 @@ impl SignerHandler {
                     method: "connect".into(),
                     event_kind: None,
                     event_content: None,
+                    requested_permissions: permissions.clone(),
                 })
                 .await;
             if !approved {
@@ -258,13 +275,13 @@ impl SignerHandler {
             }
         }
 
-        let requested_perms = permissions
+        let (requested_perms, auto_kinds) = permissions
             .as_deref()
             .map(parse_permission_string)
-            .unwrap_or(Permission::DEFAULT);
+            .unwrap_or((Permission::DEFAULT, HashSet::new()));
 
         let mut pm = self.permissions.lock().await;
-        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms) {
+        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
             return Err(KeepError::CapacityExceeded(
                 "too many connected apps".into(),
             ));
@@ -321,6 +338,7 @@ impl SignerHandler {
                     method: "sign_event".into(),
                     event_kind: Some(kind),
                     event_content: Some(unsigned_event.content.clone()),
+                    requested_permissions: None,
                 })
                 .await;
 
@@ -402,6 +420,7 @@ impl SignerHandler {
             method: method.into(),
             event_kind: None,
             event_content: None,
+            requested_permissions: None,
         };
         if self.request_approval(request).await {
             Ok(())
@@ -496,6 +515,66 @@ impl SignerHandler {
             .log(AuditEntry::new(AuditAction::Nip04Decrypt, app_pubkey).with_peer_pubkey(sender));
 
         Ok(plaintext)
+    }
+
+    pub async fn handle_switch_relays(&self, app_pubkey: PublicKey) -> Result<Option<Vec<String>>> {
+        self.check_rate_limit(&app_pubkey).await?;
+        self.require_permission(&app_pubkey, Permission::GET_PUBLIC_KEY)
+            .await?;
+
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::GetPublicKey, app_pubkey)
+                .with_reason("switch_relays"));
+
+        if self.relay_urls.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.relay_urls.clone()))
+        }
+    }
+
+    pub async fn update_client_permissions(
+        &self,
+        pubkey: &PublicKey,
+        permissions: Permission,
+    ) {
+        let mut pm = self.permissions.lock().await;
+        pm.set_permissions(pubkey, permissions);
+        drop(pm);
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
+                .with_reason(format!("permissions={permissions:?}")),
+        );
+    }
+
+    pub async fn update_client_duration(
+        &self,
+        pubkey: &PublicKey,
+        duration: PermissionDuration,
+    ) {
+        let mut pm = self.permissions.lock().await;
+        pm.set_duration(pubkey, duration);
+        drop(pm);
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
+                .with_reason(format!("duration={duration:?}")),
+        );
+    }
+
+    pub async fn update_client_auto_kinds(
+        &self,
+        pubkey: &PublicKey,
+        kinds: HashSet<Kind>,
+    ) {
+        let mut pm = self.permissions.lock().await;
+        pm.set_auto_approve_kinds_for_app(pubkey, kinds);
+        drop(pm);
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
+                .with_reason("auto_approve_kinds updated"),
+        );
     }
 
     pub async fn list_clients(&self) -> Vec<AppPermission> {
@@ -675,5 +754,128 @@ mod tests {
             .unwrap();
         let name = handler.get_app_name(&app_pubkey).await;
         assert!(name.starts_with("App "));
+    }
+
+    #[test]
+    fn test_parse_permission_string_with_kinds() {
+        let (perms, kinds) = parse_permission_string("sign_event:1,sign_event:7,nip44_encrypt");
+        assert!(perms.contains(Permission::SIGN_EVENT));
+        assert!(perms.contains(Permission::NIP44_ENCRYPT));
+        assert!(perms.contains(Permission::GET_PUBLIC_KEY));
+        assert!(kinds.contains(&Kind::TextNote));
+        assert!(kinds.contains(&Kind::Reaction));
+        assert_eq!(kinds.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_permission_string_empty() {
+        let (perms, kinds) = parse_permission_string("");
+        assert_eq!(perms, Permission::DEFAULT);
+        assert!(kinds.is_empty());
+    }
+
+    #[test]
+    fn test_parse_permission_string_basic() {
+        let (perms, kinds) = parse_permission_string("get_public_key,sign_event");
+        assert!(perms.contains(Permission::GET_PUBLIC_KEY));
+        assert!(perms.contains(Permission::SIGN_EVENT));
+        assert!(!perms.contains(Permission::NIP44_ENCRYPT));
+        assert!(kinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_kind_permissions() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+
+        handler
+            .handle_connect(
+                app_pubkey,
+                None,
+                None,
+                Some("sign_event:1,sign_event:7".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let pm = handler.permissions.lock().await;
+        assert!(pm.has_permission(&app_pubkey, Permission::SIGN_EVENT));
+        assert!(!pm.needs_approval(&app_pubkey, Kind::TextNote));
+        assert!(!pm.needs_approval(&app_pubkey, Kind::Reaction));
+        assert!(pm.needs_approval(&app_pubkey, Kind::from(30023)));
+    }
+
+    #[tokio::test]
+    async fn test_switch_relays_empty() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        let result = handler.handle_switch_relays(app_pubkey).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_switch_relays_with_urls() {
+        let handler = setup_handler()
+            .with_relay_urls(vec!["wss://relay.example.com".into()]);
+        let app_pubkey = Keys::generate().public_key();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        let result = handler.handle_switch_relays(app_pubkey).await.unwrap();
+        assert_eq!(result, Some(vec!["wss://relay.example.com".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_update_client_permissions() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        assert!(!handler
+            .permissions
+            .lock()
+            .await
+            .has_permission(&app_pubkey, Permission::SIGN_EVENT));
+
+        handler
+            .update_client_permissions(
+                &app_pubkey,
+                Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            )
+            .await;
+
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .has_permission(&app_pubkey, Permission::SIGN_EVENT));
+    }
+
+    #[tokio::test]
+    async fn test_update_client_duration() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        handler
+            .update_client_duration(&app_pubkey, PermissionDuration::Seconds(3600))
+            .await;
+
+        let pm = handler.permissions.lock().await;
+        let app = pm.get_app(&app_pubkey).unwrap();
+        assert!(matches!(app.duration, PermissionDuration::Seconds(3600)));
     }
 }

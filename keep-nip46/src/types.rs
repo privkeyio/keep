@@ -17,6 +17,7 @@ pub struct ApprovalRequest {
     pub method: String,
     pub event_kind: Option<Kind>,
     pub event_content: Option<String>,
+    pub requested_permissions: Option<String>,
 }
 
 pub trait ServerCallbacks: Send + Sync + 'static {

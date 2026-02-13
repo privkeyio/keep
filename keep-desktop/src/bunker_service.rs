@@ -15,7 +15,8 @@ use crate::app::{
 };
 use crate::message::Message;
 use crate::screen::bunker::{
-    BunkerScreen, ConnectedClient, LogDisplayEntry, PendingApprovalDisplay,
+    BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
+    DURATION_OPTIONS,
 };
 use crate::screen::Screen;
 
@@ -51,10 +52,12 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
     fn request_approval(&self, request: keep_nip46::types::ApprovalRequest) -> bool {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let display = PendingApprovalDisplay {
+            app_pubkey: request.app_pubkey.to_hex(),
             app_name: request.app_name,
             method: request.method,
             event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
             event_content: request.event_content,
+            requested_permissions: request.requested_permissions,
         };
         if self
             .tx
@@ -149,12 +152,52 @@ impl App {
             }
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
+
+                let duration_choice = if let Screen::Bunker(s) = &self.screen {
+                    DURATION_OPTIONS
+                        .get(s.approval_duration)
+                        .map(|(_, d)| *d)
+                        .unwrap_or(DurationChoice::JustThisTime)
+                } else {
+                    DurationChoice::JustThisTime
+                };
+
+                let app_pubkey = self
+                    .bunker_pending_approval
+                    .as_ref()
+                    .map(|a| a.app_pubkey.clone());
+
                 if let Some(tx) = self.bunker_approval_tx.take() {
                     let _ = tx.send(approved);
                 }
                 self.bunker_pending_approval = None;
                 if let Screen::Bunker(s) = &mut self.screen {
                     s.pending_approval = None;
+                    s.approval_duration = 0; // Reset to JustThisTime
+                }
+
+                if approved {
+                    if let (Some(hex), Some(ref bunker)) = (app_pubkey, &self.bunker) {
+                        let handler = bunker.handler.clone();
+                        let nip46_duration = match duration_choice {
+                            DurationChoice::JustThisTime => {
+                                keep_nip46::PermissionDuration::Session
+                            }
+                            DurationChoice::Minutes(m) => {
+                                keep_nip46::PermissionDuration::Seconds(m * 60)
+                            }
+                            DurationChoice::Forever => keep_nip46::PermissionDuration::Forever,
+                        };
+                        return Task::perform(
+                            async move {
+                                if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
+                                    handler.update_client_duration(&pk, nip46_duration).await;
+                                }
+                                Ok::<(), String>(())
+                            },
+                            Message::BunkerPermissionUpdated,
+                        );
+                    }
                 }
                 Task::none()
             }
@@ -228,6 +271,56 @@ impl App {
                     return iced::clipboard::write(bunker.url.clone());
                 }
                 Task::none()
+            }
+            Message::BunkerToggleClient(i) => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.expanded_client = if s.expanded_client == Some(i) {
+                        None
+                    } else {
+                        Some(i)
+                    };
+                }
+                Task::none()
+            }
+            Message::BunkerSetApprovalDuration(i) => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.approval_duration = i;
+                }
+                Task::none()
+            }
+            Message::BunkerTogglePermission(client_idx, flag) => {
+                let pubkey_hex = if let Screen::Bunker(s) = &self.screen {
+                    s.clients.get(client_idx).map(|c| (c.pubkey.clone(), c.permissions))
+                } else {
+                    None
+                };
+                if let (Some((hex, current_perms)), Some(ref bunker)) = (pubkey_hex, &self.bunker) {
+                    let new_perms = current_perms ^ flag;
+                    let handler = bunker.handler.clone();
+                    return Task::perform(
+                        async move {
+                            if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
+                                handler
+                                    .update_client_permissions(
+                                        &pk,
+                                        keep_nip46::Permission::from_bits_truncate(new_perms),
+                                    )
+                                    .await;
+                            }
+                            Ok::<(), String>(())
+                        },
+                        Message::BunkerPermissionUpdated,
+                    );
+                }
+                Task::none()
+            }
+            Message::BunkerPermissionUpdated(result) => {
+                if let Err(e) = result {
+                    if let Screen::Bunker(s) = &mut self.screen {
+                        s.error = Some(e);
+                    }
+                }
+                self.sync_bunker_clients()
             }
             _ => Task::none(),
         }
@@ -411,7 +504,14 @@ impl App {
             match event {
                 BunkerEvent::Connected { pubkey, name } => {
                     if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
-                        let client = ConnectedClient { pubkey, name };
+                        let client = ConnectedClient {
+                            pubkey,
+                            name,
+                            permissions: keep_nip46::Permission::DEFAULT.bits(),
+                            auto_approve_kinds: Vec::new(),
+                            request_count: 0,
+                            duration: "Forever".into(),
+                        };
                         bunker.clients.push(client.clone());
                         if let Screen::Bunker(s) = &mut self.screen {
                             s.clients.push(client);
@@ -465,9 +565,32 @@ impl App {
                         .list_clients()
                         .await
                         .into_iter()
-                        .map(|app| ConnectedClient {
-                            pubkey: app.pubkey.to_hex(),
-                            name: app.name,
+                        .map(|app| {
+                            let duration_str = match app.duration {
+                                keep_nip46::PermissionDuration::Session => "Session".into(),
+                                keep_nip46::PermissionDuration::Seconds(s) => {
+                                    if s < 3600 {
+                                        format!("{}m", s / 60)
+                                    } else if s < 86400 {
+                                        format!("{}h", s / 3600)
+                                    } else {
+                                        format!("{}d", s / 86400)
+                                    }
+                                }
+                                keep_nip46::PermissionDuration::Forever => "Forever".into(),
+                            };
+                            ConnectedClient {
+                                pubkey: app.pubkey.to_hex(),
+                                name: app.name,
+                                permissions: app.permissions.bits(),
+                                auto_approve_kinds: app
+                                    .auto_approve_kinds
+                                    .iter()
+                                    .map(|k| k.as_u16())
+                                    .collect(),
+                                request_count: app.request_count,
+                                duration: duration_str,
+                            }
                         })
                         .collect()
                 },

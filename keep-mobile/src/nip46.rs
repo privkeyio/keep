@@ -36,6 +36,7 @@ pub struct BunkerApprovalRequest {
     pub method: String,
     pub event_kind: Option<u32>,
     pub event_content: Option<String>,
+    pub requested_permissions: Option<String>,
 }
 
 #[uniffi::export(with_foreign)]
@@ -65,6 +66,7 @@ impl ServerCallbacks for CallbackBridge {
             method: request.method,
             event_kind: request.event_kind.map(|k| k.as_u16() as u32),
             event_content: request.event_content,
+            requested_permissions: request.requested_permissions,
         })
     }
 }

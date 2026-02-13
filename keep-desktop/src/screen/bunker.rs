@@ -3,7 +3,9 @@
 
 use std::collections::VecDeque;
 
-use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
+use iced::widget::{
+    button, column, container, qr_code, row, scrollable, text, text_input, Space,
+};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
@@ -14,6 +16,10 @@ use crate::theme;
 pub struct ConnectedClient {
     pub pubkey: String,
     pub name: String,
+    pub permissions: u32,
+    pub auto_approve_kinds: Vec<u16>,
+    pub request_count: u64,
+    pub duration: String,
 }
 
 impl ConnectedClient {
@@ -27,14 +33,39 @@ impl ConnectedClient {
             &self.pubkey[self.pubkey.len() - 6..]
         )
     }
+
+    pub fn permission_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.permissions & 0b00000001 != 0 {
+            labels.push("get_public_key");
+        }
+        if self.permissions & 0b00000010 != 0 {
+            labels.push("sign_event");
+        }
+        if self.permissions & 0b00000100 != 0 {
+            labels.push("nip04_encrypt");
+        }
+        if self.permissions & 0b00001000 != 0 {
+            labels.push("nip04_decrypt");
+        }
+        if self.permissions & 0b00010000 != 0 {
+            labels.push("nip44_encrypt");
+        }
+        if self.permissions & 0b00100000 != 0 {
+            labels.push("nip44_decrypt");
+        }
+        labels
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingApprovalDisplay {
+    pub app_pubkey: String,
     pub app_name: String,
     pub method: String,
     pub event_kind: Option<u32>,
     pub event_content: Option<String>,
+    pub requested_permissions: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +73,22 @@ pub struct LogDisplayEntry {
     pub app: String,
     pub action: String,
     pub success: bool,
+}
+
+pub const DURATION_OPTIONS: &[(&str, DurationChoice)] = &[
+    ("Just this time", DurationChoice::JustThisTime),
+    ("15 minutes", DurationChoice::Minutes(15)),
+    ("1 hour", DurationChoice::Minutes(60)),
+    ("1 day", DurationChoice::Minutes(1440)),
+    ("1 week", DurationChoice::Minutes(10080)),
+    ("Forever", DurationChoice::Forever),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationChoice {
+    JustThisTime,
+    Minutes(u64),
+    Forever,
 }
 
 pub struct BunkerScreen {
@@ -56,6 +103,8 @@ pub struct BunkerScreen {
     pub revoke_all_confirm: bool,
     pub starting: bool,
     pub error: Option<String>,
+    pub expanded_client: Option<usize>,
+    pub approval_duration: usize,
 }
 
 impl BunkerScreen {
@@ -72,6 +121,8 @@ impl BunkerScreen {
             revoke_all_confirm: false,
             starting: false,
             error: None,
+            expanded_client: None,
+            approval_duration: 0, // JustThisTime
         }
     }
 
@@ -96,6 +147,8 @@ impl BunkerScreen {
             revoke_all_confirm: false,
             starting: false,
             error: None,
+            expanded_client: None,
+            approval_duration: 0, // JustThisTime
         }
     }
 
@@ -311,25 +364,127 @@ impl BunkerScreen {
     }
 
     fn clients_card(&self) -> Element<Message> {
-        let mut client_list = column![].spacing(theme::space::XS);
+        let mut client_list = column![].spacing(theme::space::SM);
         for (i, client) in self.clients.iter().enumerate() {
-            client_list = client_list.push(
-                row![
-                    text(&client.name)
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT),
-                    Space::new().width(theme::space::SM),
-                    text(client.truncated_pubkey())
-                        .size(theme::size::TINY)
-                        .color(theme::color::TEXT_DIM),
-                    Space::new().width(Length::Fill),
-                    button(text("Revoke").size(theme::size::TINY))
-                        .on_press(Message::BunkerRevokeClient(i))
-                        .style(theme::danger_button)
-                        .padding([2.0, theme::space::SM]),
-                ]
-                .align_y(Alignment::Center),
-            );
+            let is_expanded = self.expanded_client == Some(i);
+            let perms_summary = client.permission_labels().join(", ");
+
+            let header = row![
+                button(
+                    column![
+                        row![
+                            text(&client.name)
+                                .size(theme::size::SMALL)
+                                .color(theme::color::TEXT),
+                            Space::new().width(theme::space::SM),
+                            text(client.truncated_pubkey())
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_DIM),
+                        ]
+                        .align_y(Alignment::Center),
+                        row![
+                            text(perms_summary)
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_MUTED),
+                            Space::new().width(theme::space::SM),
+                            text(format!("{} req", client.request_count))
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_DIM),
+                            Space::new().width(theme::space::SM),
+                            text(&client.duration)
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_DIM),
+                        ]
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(2.0),
+                )
+                .on_press(Message::BunkerToggleClient(i))
+                .style(theme::text_button)
+                .padding([theme::space::XS, 0.0])
+                .width(Length::Fill),
+                button(text("Revoke").size(theme::size::TINY))
+                    .on_press(Message::BunkerRevokeClient(i))
+                    .style(theme::danger_button)
+                    .padding([2.0, theme::space::SM]),
+            ]
+            .align_y(Alignment::Center);
+
+            if is_expanded {
+                let mut perm_toggles = column![].spacing(theme::space::XS);
+                let perm_flags = [
+                    ("get_public_key", 0b00000001u32),
+                    ("sign_event", 0b00000010),
+                    ("nip04_encrypt", 0b00000100),
+                    ("nip04_decrypt", 0b00001000),
+                    ("nip44_encrypt", 0b00010000),
+                    ("nip44_decrypt", 0b00100000),
+                ];
+                for (label, flag) in perm_flags {
+                    let enabled = client.permissions & flag != 0;
+                    let badge_style = if enabled {
+                        theme::badge_style
+                    } else {
+                        theme::card_style
+                    };
+                    let status_text = if enabled { "Allowed" } else { "Denied" };
+                    let status_color = if enabled {
+                        theme::color::SUCCESS
+                    } else {
+                        theme::color::TEXT_DIM
+                    };
+
+                    perm_toggles = perm_toggles.push(
+                        row![
+                            text(label)
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT)
+                                .width(Length::FillPortion(2)),
+                            container(
+                                text(status_text)
+                                    .size(theme::size::TINY)
+                                    .color(status_color),
+                            )
+                            .style(badge_style)
+                            .padding([2.0, theme::space::SM]),
+                            Space::new().width(theme::space::XS),
+                            button(
+                                text(if enabled { "Deny" } else { "Allow" })
+                                    .size(theme::size::TINY),
+                            )
+                            .on_press(Message::BunkerTogglePermission(i, flag))
+                            .style(if enabled {
+                                theme::secondary_button
+                            } else {
+                                theme::primary_button
+                            })
+                            .padding([2.0, theme::space::SM]),
+                        ]
+                        .align_y(Alignment::Center),
+                    );
+                }
+
+                if !client.auto_approve_kinds.is_empty() {
+                    let kinds_str: Vec<String> = client
+                        .auto_approve_kinds
+                        .iter()
+                        .map(|k| k.to_string())
+                        .collect();
+                    perm_toggles = perm_toggles.push(
+                        text(format!("Auto-approve kinds: {}", kinds_str.join(", ")))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_MUTED),
+                    );
+                }
+
+                let detail = container(perm_toggles)
+                    .padding([theme::space::XS, theme::space::LG])
+                    .width(Length::Fill);
+
+                client_list = client_list.push(column![header, detail].spacing(2.0));
+            } else {
+                client_list = client_list.push(header);
+            }
         }
 
         let actions = if self.revoke_all_confirm {
@@ -385,6 +540,14 @@ impl BunkerScreen {
         .color(theme::color::TEXT),]
         .spacing(theme::space::XS);
 
+        if let Some(ref perms) = approval.requested_permissions {
+            details = details.push(
+                text(format!("Permissions: {perms}"))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+            );
+        }
+
         if let Some(kind) = approval.event_kind {
             details = details.push(
                 text(format!("Kind: {kind}"))
@@ -405,6 +568,30 @@ impl BunkerScreen {
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
             );
+        }
+
+        let mut duration_row = row![
+            text("Remember:")
+                .size(theme::size::TINY)
+                .color(theme::color::TEXT_MUTED),
+            Space::new().width(theme::space::SM),
+        ]
+        .align_y(Alignment::Center);
+
+        for (idx, (label, _)) in DURATION_OPTIONS.iter().enumerate() {
+            let is_selected = self.approval_duration == idx;
+            let style = if is_selected {
+                theme::primary_button
+            } else {
+                theme::secondary_button
+            };
+            duration_row = duration_row.push(
+                button(text(*label).size(theme::size::TINY))
+                    .on_press(Message::BunkerSetApprovalDuration(idx))
+                    .style(style)
+                    .padding([2.0, theme::space::SM]),
+            );
+            duration_row = duration_row.push(Space::new().width(2.0));
         }
 
         let buttons = row![
@@ -435,6 +622,9 @@ impl BunkerScreen {
                     .size(theme::size::HEADING)
                     .color(theme::color::TEXT),
                 details,
+                scrollable(duration_row).direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default(),
+                )),
                 buttons,
             ]
             .spacing(theme::space::MD),

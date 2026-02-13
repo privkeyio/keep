@@ -20,6 +20,7 @@ pub enum AuditAction {
     Nip04Decrypt,
     Nip44Encrypt,
     Nip44Decrypt,
+    PermissionChanged,
     PermissionDenied,
     UserRejected,
 }
@@ -35,6 +36,7 @@ impl std::fmt::Display for AuditAction {
             Self::Nip04Decrypt => write!(f, "nip04_decrypt"),
             Self::Nip44Encrypt => write!(f, "nip44_encrypt"),
             Self::Nip44Decrypt => write!(f, "nip44_decrypt"),
+            Self::PermissionChanged => write!(f, "permission_changed"),
             Self::PermissionDenied => write!(f, "permission_denied"),
             Self::UserRejected => write!(f, "user_rejected"),
         }

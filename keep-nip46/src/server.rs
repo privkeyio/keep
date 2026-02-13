@@ -69,7 +69,9 @@ fn require_relay_urls(relay_urls: &[String]) -> Result<()> {
 fn finalize_handler(
     mut handler: SignerHandler,
     config: &ServerConfig,
+    relay_urls: &[String],
 ) -> (SignerHandler, Option<String>) {
+    handler = handler.with_relay_urls(relay_urls.to_vec());
     if let Some(ref rl_config) = config.rate_limit {
         handler = handler.with_rate_limit(rl_config.clone());
     }
@@ -177,7 +179,7 @@ impl Server {
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
-        let (handler, bunker_secret) = finalize_handler(handler, &config);
+        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
         Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
     }
@@ -263,7 +265,7 @@ impl Server {
         let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)
             .with_auto_approve(config.auto_approve);
-        let (handler, bunker_secret) = finalize_handler(handler, &config);
+        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
         Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
     }
@@ -548,6 +550,17 @@ impl Server {
                     }
                 }
             }
+            "switch_relays" => match handler.handle_switch_relays(app_pubkey).await {
+                Ok(Some(relays)) => match serde_json::to_string(&relays) {
+                    Ok(json) => Nip46Response::ok(id, &json),
+                    Err(_) => Nip46Response::error(id, "Serialization failed"),
+                },
+                Ok(None) => Nip46Response::ok(id, "null"),
+                Err(e) => {
+                    warn!(error = %e, "switch_relays failed");
+                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                }
+            },
             "ping" => Nip46Response::ok(id, "pong"),
             _ => Nip46Response::error(id, "Unknown method"),
         }
