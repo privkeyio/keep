@@ -86,7 +86,7 @@ impl WalletScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Wallets, inner.into(), None)
+        layout::with_sidebar(NavItem::Wallets, inner.into(), None, 0)
     }
 
     fn wallet_card<'a>(&self, i: usize, entry: &WalletEntry) -> Element<'a, Message> {

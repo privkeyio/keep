@@ -179,7 +179,7 @@ impl ShareListScreen {
             .height(Length::Fill);
 
         let count = (!self.shares.is_empty()).then_some(self.shares.len());
-        layout::with_sidebar(NavItem::Shares, inner.into(), count)
+        layout::with_sidebar(NavItem::Shares, inner.into(), count, 0)
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {

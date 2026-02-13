@@ -5,7 +5,6 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
-use crate::screen::relays::RelayShareEntry;
 use crate::screen::shares::ShareEntry;
 use crate::screen::wallet::WalletEntry;
 
@@ -15,7 +14,31 @@ pub struct ExportData {
     pub frames: Vec<Zeroizing<String>>,
 }
 
+#[derive(Clone, Debug)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerEntry {
+    pub share_index: u16,
+    pub name: Option<String>,
+    pub online: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingSignRequest {
+    pub id: String,
+    pub message_preview: String,
+    pub from_peer: u16,
+    pub timestamp: u64,
+}
+
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum Message {
     // Unlock
     PasswordChanged(Zeroizing<String>),
@@ -34,6 +57,7 @@ pub enum Message {
     GoBack,
     NavigateShares,
     NavigateWallets,
+    NavigateRelay,
     Lock,
 
     // Share list
@@ -73,21 +97,29 @@ pub enum Message {
     ToggleWalletDetails(usize),
     WalletsLoaded(Result<Vec<WalletEntry>, String>),
 
-    // Relays
-    NavigateRelays,
-    RelaysLoaded(Result<Vec<RelayShareEntry>, String>),
-    ToggleRelayDetails(usize),
-    FrostRelayInputChanged(String),
-    ProfileRelayInputChanged(String),
-    AddFrostRelay(usize),
-    AddProfileRelay(usize),
-    RemoveFrostRelay(usize, String),
-    RemoveProfileRelay(usize, String),
-    ResetFrostRelays(usize),
-    RelaySaved(Result<Vec<RelayShareEntry>, String>),
+    // Relay / FROST
+    RelayUrlChanged(String),
+    AddRelay,
+    RemoveRelay(usize),
+    SelectShareForRelay(usize),
+    ConnectRelay,
+    DisconnectRelay,
+    ConnectRelayResult(Result<(), String>),
+    ApproveSignRequest(String),
+    RejectSignRequest(String),
+    FrostEvent(FrostNodeMsg),
 
     // Timer
     Tick,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum FrostNodeMsg {
+    PeerUpdate(Vec<PeerEntry>),
+    NewSignRequest(PendingSignRequest),
+    SignRequestRemoved(String),
+    StatusChanged(ConnectionStatus),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +156,7 @@ impl fmt::Debug for Message {
             Self::GoBack => f.write_str("GoBack"),
             Self::NavigateShares => f.write_str("NavigateShares"),
             Self::NavigateWallets => f.write_str("NavigateWallets"),
+            Self::NavigateRelay => f.write_str("NavigateRelay"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::SetActiveShare(k) => f.debug_tuple("SetActiveShare").field(k).finish(),
@@ -155,33 +188,21 @@ impl fmt::Debug for Message {
                 .debug_tuple("WalletsLoaded")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
-            Self::NavigateRelays => f.write_str("NavigateRelays"),
-            Self::RelaysLoaded(r) => f
-                .debug_tuple("RelaysLoaded")
-                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
-                .finish(),
-            Self::ToggleRelayDetails(i) => f.debug_tuple("ToggleRelayDetails").field(i).finish(),
-            Self::FrostRelayInputChanged(s) => {
-                f.debug_tuple("FrostRelayInputChanged").field(s).finish()
+            Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
+            Self::AddRelay => f.write_str("AddRelay"),
+            Self::RemoveRelay(i) => f.debug_tuple("RemoveRelay").field(i).finish(),
+            Self::SelectShareForRelay(i) => {
+                f.debug_tuple("SelectShareForRelay").field(i).finish()
             }
-            Self::ProfileRelayInputChanged(s) => {
-                f.debug_tuple("ProfileRelayInputChanged").field(s).finish()
-            }
-            Self::AddFrostRelay(i) => f.debug_tuple("AddFrostRelay").field(i).finish(),
-            Self::AddProfileRelay(i) => f.debug_tuple("AddProfileRelay").field(i).finish(),
-            Self::RemoveFrostRelay(i, r) => {
-                f.debug_tuple("RemoveFrostRelay").field(i).field(r).finish()
-            }
-            Self::RemoveProfileRelay(i, r) => f
-                .debug_tuple("RemoveProfileRelay")
-                .field(i)
-                .field(r)
+            Self::ConnectRelay => f.write_str("ConnectRelay"),
+            Self::DisconnectRelay => f.write_str("DisconnectRelay"),
+            Self::ConnectRelayResult(r) => f
+                .debug_tuple("ConnectRelayResult")
+                .field(&r.as_ref().map(|_| ()).map_err(|e| e.as_str()))
                 .finish(),
-            Self::ResetFrostRelays(i) => f.debug_tuple("ResetFrostRelays").field(i).finish(),
-            Self::RelaySaved(r) => f
-                .debug_tuple("RelaySaved")
-                .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
-                .finish(),
+            Self::ApproveSignRequest(id) => f.debug_tuple("ApproveSignRequest").field(id).finish(),
+            Self::RejectSignRequest(id) => f.debug_tuple("RejectSignRequest").field(id).finish(),
+            Self::FrostEvent(e) => f.debug_tuple("FrostEvent").field(e).finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

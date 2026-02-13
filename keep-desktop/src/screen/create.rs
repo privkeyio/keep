@@ -156,6 +156,6 @@ impl CreateScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Create, inner.into(), None)
+        layout::with_sidebar(NavItem::Create, inner.into(), None, 0)
     }
 }

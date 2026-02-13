@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -10,14 +11,19 @@ use iced::widget::{column, container, text};
 use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::Keep;
+use keep_frost_net::{KfpNode, KfpNodeEvent, PeerStatus, SessionInfo, SigningHooks};
+use tokio::sync::mpsc;
 use tracing::error;
 use zeroize::Zeroizing;
 
-use crate::message::{ExportData, Message, ShareIdentity};
+use crate::message::{
+    ConnectionStatus, ExportData, FrostNodeMsg, Message, PeerEntry, PendingSignRequest,
+    ShareIdentity,
+};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
-use crate::screen::relays::{self, RelayScreen, RelayShareEntry};
+use crate::screen::relay::RelayScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
@@ -28,6 +34,7 @@ const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
+const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -41,6 +48,48 @@ pub struct Toast {
     pub kind: ToastKind,
 }
 
+struct DesktopSigningHooks {
+    request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
+}
+
+impl SigningHooks for DesktopSigningHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let request_tx = self.request_tx.clone();
+        let session = session.clone();
+
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                request_tx
+                    .send((session, response_tx))
+                    .await
+                    .map_err(|_| {
+                        keep_frost_net::FrostNetError::Session("Channel closed".into())
+                    })?;
+
+                match tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await {
+                    Ok(Some(true)) => Ok(()),
+                    Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
+                        "Request rejected".into(),
+                    )),
+                    Ok(None) => {
+                        Err(keep_frost_net::FrostNetError::Session("No response".into()))
+                    }
+                    Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+                }
+            })
+        })
+    }
+
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+}
+
+struct PendingRequestEntry {
+    info: PendingSignRequest,
+    response_tx: mpsc::Sender<bool>,
+}
+
 pub struct App {
     keep: Arc<Mutex<Option<Keep>>>,
     keep_path: PathBuf,
@@ -51,6 +100,12 @@ pub struct App {
     copy_feedback_until: Option<Instant>,
     toast: Option<Toast>,
     toast_dismiss_at: Option<Instant>,
+    frost_shutdown: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+    frost_events: Arc<std::sync::Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_sign_requests: Arc<std::sync::Mutex<Vec<PendingRequestEntry>>>,
+    relay_urls: Vec<String>,
+    frost_status: ConnectionStatus,
+    frost_peers: Vec<PeerEntry>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -102,37 +157,6 @@ fn collect_shares(keep: &Keep) -> Result<Vec<ShareEntry>, String> {
         .map_err(friendly_err)
 }
 
-fn load_relay_entries(keep_arc: &Arc<Mutex<Option<Keep>>>) -> Result<Vec<RelayShareEntry>, String> {
-    let guard = lock_keep(keep_arc);
-    let keep = guard.as_ref().ok_or("Keep not available".to_string())?;
-
-    let shares = keep.frost_list_shares().map_err(friendly_err)?;
-
-    let mut seen_groups: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut entries = Vec::new();
-
-    for stored in &shares {
-        let gp = stored.metadata.group_pubkey;
-        if !seen_groups.insert(gp) {
-            continue;
-        }
-
-        let config = keep
-            .get_relay_config_or_default(&gp)
-            .map_err(friendly_err)?;
-
-        entries.push(RelayShareEntry {
-            group_pubkey: gp,
-            group_hex: hex::encode(gp),
-            name: stored.metadata.name.clone(),
-            frost_relays: config.frost_relays,
-            profile_relays: config.profile_relays,
-        });
-    }
-
-    Ok(entries)
-}
-
 fn with_keep_blocking<T: Send + 'static>(
     keep_arc: &Arc<Mutex<Option<Keep>>>,
     panic_msg: &'static str,
@@ -161,52 +185,70 @@ fn with_keep_blocking<T: Send + 'static>(
     }
 }
 
+fn relay_config_path(keep_path: &std::path::Path) -> PathBuf {
+    keep_path.join("relays.json")
+}
+
+fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
+    let path = relay_config_path(keep_path);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
+    let path = relay_config_path(keep_path);
+    if let Ok(json) = serde_json::to_string_pretty(urls) {
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::error!("Failed to save relay config to {}: {e}", path.display());
+        }
+    }
+}
+
 impl App {
+    fn init(keep_path: PathBuf, screen: Screen, relay_urls: Vec<String>) -> Self {
+        Self {
+            keep: Arc::new(Mutex::new(None)),
+            keep_path,
+            screen,
+            active_share_hex: None,
+            last_activity: Instant::now(),
+            clipboard_clear_at: None,
+            copy_feedback_until: None,
+            toast: None,
+            toast_dismiss_at: None,
+            frost_shutdown: Arc::new(std::sync::Mutex::new(None)),
+            frost_events: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            pending_sign_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            relay_urls,
+            frost_status: ConnectionStatus::Disconnected,
+            frost_peers: Vec::new(),
+        }
+    }
+
     pub fn new() -> (Self, Task<Message>) {
         let keep_path = match keep_core::default_keep_path() {
             Ok(p) => p,
             Err(_) => match dirs::home_dir() {
                 Some(home) => home.join(".keep"),
                 None => {
-                    return (
-                        Self {
-                            keep: Arc::new(Mutex::new(None)),
-                            keep_path: PathBuf::new(),
-                            screen: Screen::Unlock(UnlockScreen::with_error(
-                                false,
-                                "Cannot determine home directory. Set $HOME and restart.".into(),
-                            )),
-                            active_share_hex: None,
-                            last_activity: Instant::now(),
-                            clipboard_clear_at: None,
-                            copy_feedback_until: None,
-                            toast: None,
-                            toast_dismiss_at: None,
-                        },
-                        Task::none(),
-                    );
+                    let screen = Screen::Unlock(UnlockScreen::with_error(
+                        false,
+                        "Cannot determine home directory. Set $HOME and restart.".into(),
+                    ));
+                    return (Self::init(PathBuf::new(), screen, Vec::new()), Task::none());
                 }
             },
         };
         let vault_exists = keep_path.exists();
-        (
-            Self {
-                keep: Arc::new(Mutex::new(None)),
-                keep_path,
-                screen: Screen::Unlock(UnlockScreen::new(vault_exists)),
-                active_share_hex: None,
-                last_activity: Instant::now(),
-                clipboard_clear_at: None,
-                copy_feedback_until: None,
-                toast: None,
-                toast_dismiss_at: None,
-            },
-            Task::none(),
-        )
+        let relay_urls = load_relay_urls(&keep_path);
+        let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
+        (Self::init(keep_path, screen, relay_urls), Task::none())
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        if !matches!(message, Message::Tick) {
+        if !matches!(message, Message::Tick | Message::FrostEvent(_)) {
             self.last_activity = Instant::now();
         }
 
@@ -232,6 +274,7 @@ impl App {
                     self.toast = None;
                     self.toast_dismiss_at = None;
                 }
+                self.drain_frost_events();
                 Task::none()
             }
 
@@ -333,6 +376,25 @@ impl App {
                         self.set_toast(e, ToastKind::Error);
                     }
                 }
+                Task::none()
+            }
+            Message::NavigateRelay => {
+                if matches!(self.screen, Screen::Relay(_)) {
+                    return Task::none();
+                }
+                let pending = self
+                    .pending_sign_requests
+                    .lock()
+                    .ok()
+                    .map(|g| g.iter().map(|r| r.info.clone()).collect())
+                    .unwrap_or_default();
+                self.screen = Screen::Relay(RelayScreen::new(
+                    self.current_shares(),
+                    self.relay_urls.clone(),
+                    self.frost_status.clone(),
+                    self.frost_peers.clone(),
+                    pending,
+                ));
                 Task::none()
             }
             Message::Lock => self.do_lock(),
@@ -481,109 +543,66 @@ impl App {
                 Task::none()
             }
 
-            Message::NavigateRelays => {
-                if matches!(self.screen, Screen::Relays(_)) {
-                    return Task::none();
+            Message::RelayUrlChanged(url) => {
+                if let Screen::Relay(s) = &mut self.screen {
+                    s.relay_url_input = url;
                 }
-                let keep_arc = self.keep.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || load_relay_entries(&keep_arc))
-                            .await
-                            .map_err(|_| "Background task failed".to_string())?
-                    },
-                    Message::RelaysLoaded,
-                )
+                Task::none()
             }
-            Message::RelaysLoaded(result) => {
-                match result {
-                    Ok(entries) => {
-                        self.screen = Screen::Relays(RelayScreen::new(entries));
-                    }
-                    Err(e) => {
-                        self.set_toast(e, ToastKind::Error);
+            Message::AddRelay => {
+                if let Screen::Relay(s) = &mut self.screen {
+                    let url = s.relay_url_input.trim().to_string();
+                    if url.starts_with("wss://") && !s.relay_urls.contains(&url) {
+                        s.relay_urls.push(url.clone());
+                        self.relay_urls.push(url);
+                        save_relay_urls(&self.keep_path, &self.relay_urls);
+                        s.relay_url_input.clear();
                     }
                 }
                 Task::none()
             }
-            Message::ToggleRelayDetails(i) => {
-                if let Screen::Relays(s) = &mut self.screen {
-                    if s.expanded == Some(i) {
-                        s.expanded = None;
-                    } else {
-                        s.expanded = Some(i);
-                        s.frost_input.clear();
-                        s.profile_input.clear();
-                        s.error = None;
+            Message::RemoveRelay(i) => {
+                if let Screen::Relay(s) = &mut self.screen {
+                    if i < s.relay_urls.len() {
+                        s.relay_urls.remove(i);
+                        self.relay_urls = s.relay_urls.clone();
+                        save_relay_urls(&self.keep_path, &self.relay_urls);
                     }
                 }
                 Task::none()
             }
-            Message::FrostRelayInputChanged(input) => {
-                if let Screen::Relays(s) = &mut self.screen {
-                    s.frost_input = input;
-                    s.error = None;
+            Message::SelectShareForRelay(i) => {
+                if let Screen::Relay(s) = &mut self.screen {
+                    s.selected_share = Some(i);
                 }
                 Task::none()
             }
-            Message::ProfileRelayInputChanged(input) => {
-                if let Screen::Relays(s) = &mut self.screen {
-                    s.profile_input = input;
-                    s.error = None;
-                }
+            Message::ConnectRelay => self.handle_connect_relay(),
+            Message::DisconnectRelay => {
+                self.handle_disconnect_relay();
                 Task::none()
             }
-            Message::AddFrostRelay(share_idx) => self.add_relay(
-                share_idx,
-                |s| &s.frost_input,
-                |e| &e.frost_relays,
-                |config, url| config.frost_relays.push(url),
-            ),
-            Message::AddProfileRelay(share_idx) => self.add_relay(
-                share_idx,
-                |s| &s.profile_input,
-                |e| &e.profile_relays,
-                |config, url| config.profile_relays.push(url),
-            ),
-            Message::RemoveFrostRelay(share_idx, url) => {
-                self.remove_relay(share_idx, url, |config, u| {
-                    config.frost_relays.retain(|r| *r != u);
-                })
-            }
-            Message::RemoveProfileRelay(share_idx, url) => {
-                self.remove_relay(share_idx, url, |config, u| {
-                    config.profile_relays.retain(|r| *r != u);
-                })
-            }
-            Message::ResetFrostRelays(share_idx) => {
-                let group_pubkey = match &self.screen {
-                    Screen::Relays(s) => match s.shares.get(share_idx) {
-                        Some(entry) => entry.group_pubkey,
-                        None => return Task::none(),
-                    },
-                    _ => return Task::none(),
+            Message::ConnectRelayResult(result) => {
+                let status = match result {
+                    Ok(()) => ConnectionStatus::Connected,
+                    Err(e) => ConnectionStatus::Error(e),
                 };
-                self.modify_relay_config(group_pubkey, |config| {
-                    config.frost_relays = keep_core::relay::default_frost_relays();
-                })
-            }
-            Message::RelaySaved(result) => {
-                match result {
-                    Ok(entries) => {
-                        if let Screen::Relays(s) = &mut self.screen {
-                            s.shares = entries;
-                            s.frost_input.clear();
-                            s.profile_input.clear();
-                            s.error = None;
-                        }
-                    }
-                    Err(e) => {
-                        if let Screen::Relays(s) = &mut self.screen {
-                            s.error = Some(e.clone());
-                        }
-                        self.set_toast(e, ToastKind::Error);
-                    }
+                self.frost_status = status.clone();
+                if let Some(s) = self.relay_screen_mut() {
+                    s.status = status;
                 }
+                Task::none()
+            }
+            Message::ApproveSignRequest(id) => {
+                self.respond_to_sign_request(&id, true);
+                Task::none()
+            }
+            Message::RejectSignRequest(id) => {
+                self.respond_to_sign_request(&id, false);
+                Task::none()
+            }
+            Message::FrostEvent(event) => {
+                self.handle_frost_event(event);
                 Task::none()
             }
         }
@@ -642,7 +661,279 @@ impl App {
         Subscription::batch(subs)
     }
 
+    fn drain_frost_events(&mut self) {
+        let events: Vec<FrostNodeMsg> = {
+            let Ok(mut queue) = self.frost_events.lock() else {
+                return;
+            };
+            queue.drain(..).collect()
+        };
+
+        for event in events {
+            self.handle_frost_event(event);
+        }
+    }
+
+    fn relay_screen_mut(&mut self) -> Option<&mut RelayScreen> {
+        if let Screen::Relay(s) = &mut self.screen {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    fn handle_frost_event(&mut self, event: FrostNodeMsg) {
+        match event {
+            FrostNodeMsg::PeerUpdate(peers) => {
+                self.frost_peers = peers.clone();
+                if let Some(s) = self.relay_screen_mut() {
+                    s.peers = peers;
+                }
+            }
+            FrostNodeMsg::NewSignRequest(req) => {
+                if let Some(s) = self.relay_screen_mut() {
+                    s.pending_requests.push(req);
+                }
+            }
+            FrostNodeMsg::SignRequestRemoved(id) => {
+                if let Ok(mut guard) = self.pending_sign_requests.lock() {
+                    guard.retain(|r| r.info.id != id);
+                }
+                if let Some(s) = self.relay_screen_mut() {
+                    s.pending_requests.retain(|r| r.id != id);
+                }
+            }
+            FrostNodeMsg::StatusChanged(status) => {
+                self.frost_status = status.clone();
+                if let Some(s) = self.relay_screen_mut() {
+                    s.status = status;
+                }
+            }
+        }
+    }
+
+    fn handle_connect_relay(&mut self) -> Task<Message> {
+        self.handle_disconnect_relay();
+
+        let (share_entry, relay_urls) = match &self.screen {
+            Screen::Relay(s) => {
+                let Some(idx) = s.selected_share else {
+                    return Task::none();
+                };
+                let Some(share) = s.shares.get(idx) else {
+                    return Task::none();
+                };
+                if s.relay_urls.is_empty() {
+                    return Task::none();
+                }
+                (share.clone(), s.relay_urls.clone())
+            }
+            _ => return Task::none(),
+        };
+
+        self.frost_status = ConnectionStatus::Connecting;
+        if let Some(s) = self.relay_screen_mut() {
+            s.status = ConnectionStatus::Connecting;
+        }
+
+        let keep_arc = self.keep.clone();
+        let keep_path = self.keep_path.clone();
+        let frost_events = self.frost_events.clone();
+        let pending_requests = self.pending_sign_requests.clone();
+        let frost_shutdown = self.frost_shutdown.clone();
+
+        Task::perform(
+            async move {
+                let share = tokio::task::spawn_blocking({
+                    let keep_arc = keep_arc.clone();
+                    let group_pubkey = share_entry.group_pubkey;
+                    let identifier = share_entry.identifier;
+                    move || {
+                        with_keep_blocking(
+                            &keep_arc,
+                            "Failed to load share",
+                            move |keep| {
+                                keep.frost_get_share_by_index(&group_pubkey, identifier)
+                                    .map_err(friendly_err)
+                            },
+                        )
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                let nonce_store_path = keep_path.join("frost-nonces");
+                keep_frost_net::install_default_crypto_provider();
+                let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
+                    .await
+                    .map_err(|e| format!("Connection failed: {e}"))?;
+
+                let (request_tx, request_rx) = mpsc::channel(32);
+                let hooks = Arc::new(DesktopSigningHooks { request_tx });
+                node.set_hooks(hooks);
+
+                let event_rx = node.subscribe();
+                let node = Arc::new(node);
+                let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+                let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
+
+                if let Ok(mut guard) = frost_shutdown.lock() {
+                    *guard = Some(shutdown_tx);
+                }
+
+                let run_node = node.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = run_node.run() => {
+                            if let Err(e) = result {
+                                tracing::error!("Node run failed: {e}");
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            tracing::info!("Node shutdown requested");
+                        }
+                    }
+                    drop(listener_shutdown_tx);
+                });
+
+                let events_clone = frost_events.clone();
+                let pending_clone = pending_requests.clone();
+                let peer_node = node.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = Self::frost_event_listener(
+                            event_rx,
+                            request_rx,
+                            events_clone,
+                            pending_clone,
+                            peer_node,
+                        ) => {}
+                        _ = listener_shutdown_rx.recv() => {}
+                    }
+                });
+
+                Ok(())
+            },
+            Message::ConnectRelayResult,
+        )
+    }
+
+    fn handle_disconnect_relay(&mut self) {
+        if let Ok(mut guard) = self.frost_shutdown.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.try_send(());
+            }
+        }
+        self.frost_status = ConnectionStatus::Disconnected;
+        self.frost_peers.clear();
+        if let Ok(mut guard) = self.pending_sign_requests.lock() {
+            guard.clear();
+        }
+        if let Some(s) = self.relay_screen_mut() {
+            s.status = ConnectionStatus::Disconnected;
+            s.peers.clear();
+            s.pending_requests.clear();
+        }
+    }
+
+    fn respond_to_sign_request(&mut self, id: &str, approve: bool) {
+        let response_tx = {
+            let Ok(mut guard) = self.pending_sign_requests.lock() else {
+                return;
+            };
+            let Some(idx) = guard.iter().position(|r| r.info.id == id) else {
+                return;
+            };
+            let entry = guard.remove(idx);
+            entry.response_tx
+        };
+
+        let _ = response_tx.try_send(approve);
+
+        if let Some(s) = self.relay_screen_mut() {
+            s.pending_requests.retain(|r| r.id != id);
+        }
+    }
+
+    async fn frost_event_listener(
+        mut event_rx: tokio::sync::broadcast::Receiver<KfpNodeEvent>,
+        mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
+        frost_events: Arc<std::sync::Mutex<VecDeque<FrostNodeMsg>>>,
+        pending_requests: Arc<std::sync::Mutex<Vec<PendingRequestEntry>>>,
+        node: Arc<KfpNode>,
+    ) {
+        loop {
+            tokio::select! {
+                result = event_rx.recv() => {
+                    match result {
+                        Ok(KfpNodeEvent::PeerDiscovered { .. })
+                        | Ok(KfpNodeEvent::PeerOffline { .. }) => {
+                            let peers: Vec<PeerEntry> = node
+                                .peer_status()
+                                .into_iter()
+                                .map(|(share_index, status, name)| PeerEntry {
+                                    share_index,
+                                    name,
+                                    online: status == PeerStatus::Online,
+                                })
+                                .collect();
+                            if let Ok(mut q) = frost_events.lock() {
+                                q.push_back(FrostNodeMsg::PeerUpdate(peers));
+                            }
+                        }
+                        Ok(KfpNodeEvent::SignatureComplete { session_id, .. })
+                        | Ok(KfpNodeEvent::SigningFailed { session_id, .. }) => {
+                            let id = hex::encode(session_id);
+                            if let Ok(mut guard) = pending_requests.lock() {
+                                guard.retain(|r| r.info.id != id);
+                            }
+                            if let Ok(mut q) = frost_events.lock() {
+                                q.push_back(FrostNodeMsg::SignRequestRemoved(id));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = request_rx.recv() => {
+                    let Some((session, response_tx)) = result else {
+                        break;
+                    };
+                    let req = PendingSignRequest {
+                        id: hex::encode(session.session_id),
+                        message_preview: hex::encode(
+                            &session.message[..session.message.len().min(16)]
+                        ),
+                        from_peer: 0,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+
+                    if let Ok(mut guard) = pending_requests.lock() {
+                        if guard.len() < 100 {
+                            let entry = PendingRequestEntry {
+                                info: req.clone(),
+                                response_tx,
+                            };
+                            guard.push(entry);
+                            if let Ok(mut q) = frost_events.lock() {
+                                q.push_back(FrostNodeMsg::NewSignRequest(req));
+                            }
+                        } else {
+                            let _ = response_tx.try_send(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn do_lock(&mut self) -> Task<Message> {
+        self.handle_disconnect_relay();
+
         let mut guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_mut() {
             keep.lock();
@@ -989,81 +1280,6 @@ impl App {
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
-    }
-
-    fn modify_relay_config(
-        &self,
-        group_pubkey: [u8; 32],
-        modify: impl FnOnce(&mut keep_core::RelayConfig) + Send + 'static,
-    ) -> Task<Message> {
-        let keep_arc = self.keep.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let mut guard = lock_keep(&keep_arc);
-                    let keep = guard.as_mut().ok_or("Keep not available".to_string())?;
-                    let mut config = keep
-                        .get_relay_config_or_default(&group_pubkey)
-                        .map_err(friendly_err)?;
-                    modify(&mut config);
-                    keep.store_relay_config(&config).map_err(friendly_err)?;
-                    drop(guard);
-                    load_relay_entries(&keep_arc)
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())?
-            },
-            Message::RelaySaved,
-        )
-    }
-
-    fn add_relay(
-        &mut self,
-        share_idx: usize,
-        get_input: fn(&RelayScreen) -> &str,
-        get_relays: fn(&RelayShareEntry) -> &[String],
-        push_relay: impl FnOnce(&mut keep_core::RelayConfig, String) + Send + 'static,
-    ) -> Task<Message> {
-        let (group_pubkey, url) = match &mut self.screen {
-            Screen::Relays(s) => {
-                let input = get_input(s).to_owned();
-                match relays::validate_and_normalize(&input) {
-                    Ok(url) => {
-                        if let Some(entry) = s.shares.get(share_idx) {
-                            if get_relays(entry).contains(&url) {
-                                s.error = Some("Relay already added".into());
-                                return Task::none();
-                            }
-                            (entry.group_pubkey, url)
-                        } else {
-                            return Task::none();
-                        }
-                    }
-                    Err(e) => {
-                        s.error = Some(e);
-                        return Task::none();
-                    }
-                }
-            }
-            _ => return Task::none(),
-        };
-        self.modify_relay_config(group_pubkey, |config| push_relay(config, url))
-    }
-
-    fn remove_relay(
-        &self,
-        share_idx: usize,
-        url: String,
-        remove: impl FnOnce(&mut keep_core::RelayConfig, &str) + Send + 'static,
-    ) -> Task<Message> {
-        let group_pubkey = match &self.screen {
-            Screen::Relays(s) => match s.shares.get(share_idx) {
-                Some(entry) => entry.group_pubkey,
-                None => return Task::none(),
-            },
-            _ => return Task::none(),
-        };
-        self.modify_relay_config(group_pubkey, move |config| remove(config, &url))
     }
 
     fn handle_import(&mut self) -> Task<Message> {

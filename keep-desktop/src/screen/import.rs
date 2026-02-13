@@ -117,6 +117,6 @@ impl ImportScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Import, inner.into(), None)
+        layout::with_sidebar(NavItem::Import, inner.into(), None, 0)
     }
 }

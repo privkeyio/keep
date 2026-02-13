@@ -20,6 +20,7 @@ pub mod color {
     pub const TEXT_DIM: Color = Color::from_rgb(0.40, 0.40, 0.43);
     pub const SUCCESS: Color = Color::from_rgb(0.25, 0.65, 0.35);
     pub const ERROR: Color = Color::from_rgb(0.80, 0.25, 0.25);
+    pub const WARNING: Color = Color::from_rgb(0.85, 0.65, 0.20);
     pub const BORDER: Color = Color::from_rgb(0.25, 0.25, 0.30);
 }
 
@@ -223,6 +224,17 @@ pub fn warning_style(_theme: &Theme) -> container::Style {
             radius: 6.0.into(),
         },
         text_color: Some(color::ERROR),
+        ..Default::default()
+    }
+}
+
+pub fn notification_badge_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color::ERROR)),
+        border: Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
