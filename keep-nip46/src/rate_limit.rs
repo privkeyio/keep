@@ -130,7 +130,7 @@ impl RateLimiter {
         self.requests
             .back()
             .copied()
-            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
     }
 
     pub fn cleanup(&mut self) {

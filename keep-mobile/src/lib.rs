@@ -728,16 +728,22 @@ impl KeepMobile {
         ),
         KeepMobileError,
     > {
-        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(key_bytes).map_err(|e| {
-            KeepMobileError::FrostError {
-                msg: format!("Invalid signing key: {e}"),
-            }
-        })?;
-        let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
-        let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
-            msg: format!("Failed to serialize verifying key: {e}"),
-        })?;
-        let signing_key_bytes = Zeroizing::new(signing_key.serialize());
+        // SigningKey doesn't implement Zeroize; deserialize, extract what we need,
+        // and drop it promptly to minimize the window secret material is on the stack.
+        let (vk, vk_bytes, signing_key_bytes) = {
+            let signing_key =
+                frost_secp256k1_tr::SigningKey::deserialize(key_bytes).map_err(|e| {
+                    KeepMobileError::FrostError {
+                        msg: format!("Invalid signing key: {e}"),
+                    }
+                })?;
+            let vk = frost_secp256k1_tr::VerifyingKey::from(&signing_key);
+            let vk_bytes = vk.serialize().map_err(|e| KeepMobileError::FrostError {
+                msg: format!("Failed to serialize verifying key: {e}"),
+            })?;
+            let skb = Zeroizing::new(signing_key.serialize());
+            (vk, vk_bytes, skb)
+        };
 
         let identifier = frost_secp256k1_tr::Identifier::try_from(1u16).map_err(|e| {
             KeepMobileError::FrostError {

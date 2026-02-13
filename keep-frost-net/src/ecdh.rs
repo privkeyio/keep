@@ -312,29 +312,36 @@ impl EcdhSessionManager {
         participants: Vec<u16>,
     ) -> Result<&mut EcdhSession> {
         if let Some(existing) = self.active_sessions.get(&session_id) {
-            if existing.recipient_pubkey() != &recipient_pubkey
+            if existing.is_expired() {
+                self.active_sessions.remove(&session_id);
+            } else if existing.recipient_pubkey() != &recipient_pubkey
                 || existing.participants() != participants
             {
                 return Err(FrostNetError::Session(
                     "ECDH session parameters mismatch".into(),
                 ));
+            } else {
+                return Ok(self
+                    .active_sessions
+                    .get_mut(&session_id)
+                    .expect("just checked"));
             }
-        } else {
-            self.cleanup_expired();
-            if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
-                return Err(FrostNetError::Session(
-                    "Too many active ECDH sessions".into(),
-                ));
-            }
-            let session = EcdhSession::new(session_id, recipient_pubkey, threshold, participants)
-                .with_timeout(self.session_timeout);
-            self.active_sessions.insert(session_id, session);
         }
+
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session(
+                "Too many active ECDH sessions".into(),
+            ));
+        }
+        let session = EcdhSession::new(session_id, recipient_pubkey, threshold, participants)
+            .with_timeout(self.session_timeout);
+        self.active_sessions.insert(session_id, session);
 
         Ok(self
             .active_sessions
             .get_mut(&session_id)
-            .expect("just inserted or existed"))
+            .expect("just inserted"))
     }
 
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {

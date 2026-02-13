@@ -142,6 +142,7 @@ impl BitcoinSigner {
         self.psbt_signer.sign(psbt)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sign_psbt_unchecked(&self, psbt: &mut Psbt) -> Result<usize> {
         self.psbt_signer.sign(psbt)
     }

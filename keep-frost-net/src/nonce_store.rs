@@ -97,7 +97,11 @@ impl NonceStore for FileNonceStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            if let Err(e) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!(path = ?self.path, error = %e, "Failed to set nonce store permissions");
+            }
         }
 
         file.lock_exclusive()
@@ -168,6 +172,17 @@ fn rewrite_nonce_file<'a>(
         writeln!(file, "{}", hex::encode(entry))?;
     }
     file.sync_all()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(path = ?tmp_path, error = %e, "Failed to set nonce store permissions");
+        }
+    }
+
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }

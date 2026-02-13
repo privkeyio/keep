@@ -69,9 +69,10 @@ impl PsbtSigner {
         let mut signable_inputs = Vec::new();
 
         for (i, input) in psbt.inputs.iter().enumerate() {
-            if let Some(utxo) = &input.witness_utxo {
-                total_input_sats += utxo.value.to_sat();
-            }
+            let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+                BitcoinError::InvalidPsbt(format!("input {i} missing witness_utxo"))
+            })?;
+            total_input_sats += utxo.value.to_sat();
 
             if self.should_sign_input(psbt, i)? {
                 signable_inputs.push(i);

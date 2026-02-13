@@ -493,7 +493,7 @@ impl SignerHandler {
             return callbacks.request_approval(request);
         }
         if self.headless_auto_approve {
-            info!(method = %request.method, "auto-approving in headless mode");
+            warn!(method = %request.method, "auto-approving in headless mode");
             return true;
         }
         warn!(method = %request.method, "denying request: no approval callbacks configured");
