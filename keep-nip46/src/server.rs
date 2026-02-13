@@ -40,6 +40,7 @@ impl Default for ServerConfig {
 pub struct Server {
     keys: Keys,
     relay_url: String,
+    relay_urls: Vec<String>,
     client: Client,
     handler: Arc<SignerHandler>,
     running: bool,
@@ -70,14 +71,14 @@ fn apply_headless_secret(
 impl Server {
     pub async fn new(
         keyring: Arc<Mutex<Keyring>>,
-        relay_url: &str,
+        relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         Self::new_with_config(
             keyring,
             None,
             None,
-            relay_url,
+            relay_urls,
             callbacks,
             ServerConfig::default(),
         )
@@ -88,14 +89,14 @@ impl Server {
         keyring: Arc<Mutex<Keyring>>,
         frost_signer: Option<FrostSigner>,
         transport_secret: Option<[u8; 32]>,
-        relay_url: &str,
+        relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         Self::new_with_config(
             keyring,
             frost_signer,
             transport_secret,
-            relay_url,
+            relay_urls,
             callbacks,
             ServerConfig::default(),
         )
@@ -106,10 +107,14 @@ impl Server {
         keyring: Arc<Mutex<Keyring>>,
         frost_signer: Option<FrostSigner>,
         transport_secret: Option<[u8; 32]>,
-        relay_url: &str,
+        relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
         config: ServerConfig,
     ) -> Result<Self> {
+        if relay_urls.is_empty() {
+            return Err(NetworkError::relay("at least one relay required".to_string()).into());
+        }
+
         let keys = if let Some(secret_bytes) = transport_secret {
             let secret = SecretKey::from_slice(&secret_bytes)
                 .map_err(|e| CryptoError::invalid_key(format!("transport key: {e}")))?;
@@ -128,10 +133,12 @@ impl Server {
 
         let client = Client::new(keys.clone());
 
-        client
-            .add_relay(relay_url)
-            .await
-            .map_err(|e| NetworkError::relay(e.to_string()))?;
+        for relay_url in relay_urls {
+            client
+                .add_relay(relay_url)
+                .await
+                .map_err(|e| NetworkError::relay(e.to_string()))?;
+        }
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
@@ -147,7 +154,8 @@ impl Server {
 
         Ok(Self {
             keys,
-            relay_url: relay_url.to_string(),
+            relay_url: relay_urls[0].clone(),
+            relay_urls: relay_urls.to_vec(),
             client,
             handler: Arc::new(handler),
             running: false,
@@ -160,7 +168,7 @@ impl Server {
     pub async fn new_frost(
         frost_signer: FrostSigner,
         transport_secret: [u8; 32],
-        relay_url: &str,
+        relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         let keyring = Arc::new(Mutex::new(Keyring::new()));
@@ -168,7 +176,7 @@ impl Server {
             keyring,
             Some(frost_signer),
             Some(transport_secret),
-            relay_url,
+            relay_urls,
             callbacks,
         )
         .await
@@ -177,13 +185,13 @@ impl Server {
     pub async fn new_network_frost(
         network_signer: NetworkFrostSigner,
         transport_secret: [u8; 32],
-        relay_url: &str,
+        relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
         Self::new_network_frost_with_config(
             network_signer,
             transport_secret,
-            &[relay_url.to_string()],
+            relay_urls,
             callbacks,
             ServerConfig::default(),
         )
@@ -254,6 +262,7 @@ impl Server {
         Ok(Self {
             keys,
             relay_url: relay_urls[0].clone(),
+            relay_urls: relay_urls.to_vec(),
             client,
             handler: Arc::new(handler),
             running: false,
@@ -266,7 +275,7 @@ impl Server {
     pub fn bunker_url(&self) -> String {
         generate_bunker_url(
             &self.keys.public_key(),
-            &self.relay_url,
+            &self.relay_urls,
             self.bunker_secret.as_deref(),
         )
     }

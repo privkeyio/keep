@@ -95,11 +95,19 @@ impl KfpNode {
             return Ok(());
         }
 
+        let requester = self
+            .peers
+            .read()
+            .get_peer_by_pubkey(&from)
+            .map(|p| p.share_index)
+            .unwrap_or(0);
+
         let session_info = SessionInfo {
             session_id: request.session_id,
             message: request.message.clone(),
             threshold: self.share.metadata.threshold,
             participants: request.participants.clone(),
+            requester,
         };
 
         let hooks = self.hooks.read().clone();

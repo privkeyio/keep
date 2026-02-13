@@ -189,13 +189,21 @@ pub fn cmd_serve(
                     Arc::new(Mutex::new(Keyring::new())),
                     Some(frost),
                     Some(transport_key),
-                    relay,
+                    &[relay.to_string()],
                     None,
                     headless_config,
                 )
                 .await?
             } else {
-                Server::new_with_config(keyring, None, None, relay, None, headless_config).await?
+                Server::new_with_config(
+                    keyring,
+                    None,
+                    None,
+                    &[relay.to_string()],
+                    None,
+                    headless_config,
+                )
+                .await?
             };
             info!(relay, bunker_url = %server.bunker_url(), "server started");
             out.field("Bunker URL", &server.bunker_url());
@@ -210,7 +218,8 @@ pub fn cmd_serve(
     let (bunker_url, npub, keyring_for_tui, transport_key_for_tui) = rt.block_on(async {
         if let Some(ref frost) = frost_signer {
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-            let server = Server::new_frost(frost.clone(), transport_key, relay, None).await?;
+            let server =
+                Server::new_frost(frost.clone(), transport_key, &[relay.to_string()], None).await?;
             Ok::<_, KeepError>((
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
@@ -218,7 +227,7 @@ pub fn cmd_serve(
                 Some(transport_key),
             ))
         } else {
-            let server = Server::new(keyring.clone(), relay, None).await?;
+            let server = Server::new(keyring.clone(), &[relay.to_string()], None).await?;
             Ok::<_, KeepError>((
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
@@ -251,7 +260,9 @@ pub fn cmd_serve(
 
             let mut server =
                 if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
-                    match Server::new_frost(frost, transport_key, &relay_clone, callbacks).await {
+                    match Server::new_frost(frost, transport_key, &[relay_clone.clone()], callbacks)
+                        .await
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tui_tx_clone.send(TuiEvent::Log(
@@ -262,7 +273,7 @@ pub fn cmd_serve(
                         }
                     }
                 } else {
-                    match Server::new(keyring_for_tui, &relay_clone, callbacks).await {
+                    match Server::new(keyring_for_tui, &[relay_clone.clone()], callbacks).await {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tui_tx_clone.send(TuiEvent::Log(
@@ -312,7 +323,7 @@ fn spawn_tui_server(
                 tx: tui_tx_clone.clone(),
             }));
 
-            let mut server = match Server::new(keyring, &relay_clone, callbacks).await {
+            let mut server = match Server::new(keyring, &[relay_clone.clone()], callbacks).await {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tui_tx_clone.send(TuiEvent::Log(
@@ -343,7 +354,7 @@ fn run_headless(out: &Output, keyring: Arc<Mutex<Keyring>>, relay: &str) -> Resu
             keyring,
             None,
             None,
-            relay,
+            &[relay.to_string()],
             None,
             ServerConfig {
                 auto_approve: true,
@@ -365,7 +376,7 @@ fn get_bunker_info(keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<(String,
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     rt.block_on(async {
-        let server = Server::new(keyring, relay, None).await?;
+        let server = Server::new(keyring, &[relay.to_string()], None).await?;
         Ok((
             server.bunker_url(),
             server.pubkey().to_bech32().unwrap_or_default(),

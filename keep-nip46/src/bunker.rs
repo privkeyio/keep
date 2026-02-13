@@ -2,13 +2,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use nostr_sdk::prelude::*;
 
-pub fn generate_bunker_url(pubkey: &PublicKey, relay_url: &str, secret: Option<&str>) -> String {
-    let relay = urlencoding::encode(relay_url);
-    let mut url = format!("bunker://{}?relay={relay}", pubkey.to_hex());
+pub fn generate_bunker_url(
+    pubkey: &PublicKey,
+    relay_urls: &[String],
+    secret: Option<&str>,
+) -> String {
+    let mut url = format!("bunker://{}", pubkey.to_hex());
+
+    for (i, relay_url) in relay_urls.iter().enumerate() {
+        let relay = urlencoding::encode(relay_url);
+        let sep = if i == 0 { '?' } else { '&' };
+        url.push_str(&format!("{sep}relay={relay}"));
+    }
 
     if let Some(s) = secret {
+        let sep = if relay_urls.is_empty() { '?' } else { '&' };
         let secret = urlencoding::encode(s);
-        url.push_str(&format!("&secret={secret}"));
+        url.push_str(&format!("{sep}secret={secret}"));
     }
 
     url
@@ -49,13 +59,30 @@ mod tests {
     fn test_bunker_url_roundtrip() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let relay = "wss://relay.damus.io";
+        let relays = vec!["wss://relay.damus.io".to_string()];
 
-        let url = generate_bunker_url(&pubkey, relay, Some("mysecret"));
-        let (parsed_pk, relays, secret) = parse_bunker_url(&url).unwrap();
+        let url = generate_bunker_url(&pubkey, &relays, Some("mysecret"));
+        let (parsed_pk, parsed_relays, secret) = parse_bunker_url(&url).unwrap();
 
         assert_eq!(pubkey, parsed_pk);
-        assert_eq!(relays[0], relay);
+        assert_eq!(parsed_relays[0], relays[0]);
+        assert_eq!(secret, Some("mysecret".into()));
+    }
+
+    #[test]
+    fn test_bunker_url_multiple_relays() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let relays = vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://relay.primal.net".to_string(),
+        ];
+
+        let url = generate_bunker_url(&pubkey, &relays, Some("mysecret"));
+        let (parsed_pk, parsed_relays, secret) = parse_bunker_url(&url).unwrap();
+
+        assert_eq!(pubkey, parsed_pk);
+        assert_eq!(parsed_relays, relays);
         assert_eq!(secret, Some("mysecret".into()));
     }
 
@@ -63,10 +90,10 @@ mod tests {
     fn test_bunker_url_secret_with_special_chars() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let relay = "wss://relay.damus.io";
+        let relays = vec!["wss://relay.damus.io".to_string()];
         let secret = "pass&word=special chars+more";
 
-        let url = generate_bunker_url(&pubkey, relay, Some(secret));
+        let url = generate_bunker_url(&pubkey, &relays, Some(secret));
         assert!(!url.contains("pass&word"));
 
         let (_, _, parsed_secret) = parse_bunker_url(&url).unwrap();

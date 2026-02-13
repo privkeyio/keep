@@ -37,14 +37,14 @@ async fn test_bunker_e2e_connect_and_sign() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io";
+    let relay_url = "wss://relay.damus.io".to_string();
 
     let (keyring, signer_pubkey) = setup_keyring();
     let mut server = Server::new_with_config(
         keyring,
         None,
         None,
-        relay_url,
+        &[relay_url.clone()],
         None,
         ServerConfig {
             auto_approve: true,
@@ -197,7 +197,7 @@ async fn test_bunker_rejects_without_auto_approve() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io";
+    let relay_url = "wss://relay.damus.io".to_string();
     let (keyring, _signer_pubkey) = setup_keyring();
 
     // auto_approve: false, no callbacks = rejects by default
@@ -205,7 +205,7 @@ async fn test_bunker_rejects_without_auto_approve() {
         keyring,
         None,
         None,
-        relay_url,
+        &[relay_url.clone()],
         None,
         ServerConfig {
             auto_approve: false,
@@ -236,14 +236,14 @@ async fn test_bunker_permission_scoping() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io";
+    let relay_url = "wss://relay.damus.io".to_string();
     let (keyring, signer_pubkey) = setup_keyring();
 
     let server = Server::new_with_config(
         keyring,
         None,
         None,
-        relay_url,
+        &[relay_url.clone()],
         None,
         ServerConfig {
             auto_approve: true,
