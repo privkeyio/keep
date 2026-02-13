@@ -49,26 +49,64 @@ pub struct Server {
     bunker_secret: Option<String>,
 }
 
-fn generate_headless_secret() -> String {
-    let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
-    warn!("headless mode: bunker secret required for authentication");
-    secret
+async fn add_relays(client: &Client, relay_urls: &[String]) -> Result<()> {
+    for relay_url in relay_urls {
+        client
+            .add_relay(relay_url)
+            .await
+            .map_err(|e| NetworkError::relay(e.to_string()))?;
+    }
+    Ok(())
 }
 
-fn apply_headless_secret(
-    handler: SignerHandler,
-    auto_approve: bool,
-) -> (SignerHandler, Option<String>) {
-    if auto_approve {
-        let secret = generate_headless_secret();
-        let handler = handler.with_expected_secret(secret.clone());
-        (handler, Some(secret))
-    } else {
-        (handler, None)
+fn require_relay_urls(relay_urls: &[String]) -> Result<()> {
+    if relay_urls.is_empty() {
+        return Err(NetworkError::relay("at least one relay required".to_string()).into());
     }
+    Ok(())
+}
+
+fn finalize_handler(
+    mut handler: SignerHandler,
+    config: &ServerConfig,
+) -> (SignerHandler, Option<String>) {
+    if let Some(ref rl_config) = config.rate_limit {
+        handler = handler.with_rate_limit(rl_config.clone());
+    }
+    let bunker_secret = if config.auto_approve {
+        let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+        warn!("headless mode: bunker secret required for authentication");
+        handler = handler.with_expected_secret(secret.clone());
+        Some(secret)
+    } else {
+        None
+    };
+    (handler, bunker_secret)
 }
 
 impl Server {
+    fn build(
+        keys: Keys,
+        relay_urls: &[String],
+        client: Client,
+        handler: SignerHandler,
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
+        bunker_secret: Option<String>,
+    ) -> Self {
+        Self {
+            keys,
+            relay_url: relay_urls[0].clone(),
+            relay_urls: relay_urls.to_vec(),
+            client,
+            handler: Arc::new(handler),
+            running: false,
+            callbacks,
+            config,
+            bunker_secret,
+        }
+    }
+
     pub async fn new(
         keyring: Arc<Mutex<Keyring>>,
         relay_urls: &[String],
@@ -111,9 +149,7 @@ impl Server {
         callbacks: Option<Arc<dyn ServerCallbacks>>,
         config: ServerConfig,
     ) -> Result<Self> {
-        if relay_urls.is_empty() {
-            return Err(NetworkError::relay("at least one relay required".to_string()).into());
-        }
+        require_relay_urls(relay_urls)?;
 
         let keys = if let Some(secret_bytes) = transport_secret {
             let secret = SecretKey::from_slice(&secret_bytes)
@@ -132,13 +168,7 @@ impl Server {
         };
 
         let client = Client::new(keys.clone());
-
-        for relay_url in relay_urls {
-            client
-                .add_relay(relay_url)
-                .await
-                .map_err(|e| NetworkError::relay(e.to_string()))?;
-        }
+        add_relays(&client, relay_urls).await?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
@@ -147,22 +177,9 @@ impl Server {
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
-        if let Some(ref rl_config) = config.rate_limit {
-            handler = handler.with_rate_limit(rl_config.clone());
-        }
-        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
+        let (handler, bunker_secret) = finalize_handler(handler, &config);
 
-        Ok(Self {
-            keys,
-            relay_url: relay_urls[0].clone(),
-            relay_urls: relay_urls.to_vec(),
-            client,
-            handler: Arc::new(handler),
-            running: false,
-            callbacks,
-            config,
-            bunker_secret,
-        })
+        Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
     }
 
     pub async fn new_frost(
@@ -224,9 +241,7 @@ impl Server {
         config: ServerConfig,
         proxy: Option<SocketAddr>,
     ) -> Result<Self> {
-        if relay_urls.is_empty() {
-            return Err(NetworkError::relay("at least one relay required".to_string()).into());
-        }
+        require_relay_urls(relay_urls)?;
 
         let secret = SecretKey::from_slice(&transport_secret)
             .map_err(|e| CryptoError::invalid_key(format!("transport key: {e}")))?;
@@ -240,36 +255,17 @@ impl Server {
             }
             None => Client::new(keys.clone()),
         };
-
-        for relay_url in relay_urls {
-            client
-                .add_relay(relay_url)
-                .await
-                .map_err(|e| NetworkError::relay(e.to_string()))?;
-        }
+        add_relays(&client, relay_urls).await?;
 
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
-        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
+        let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)
             .with_auto_approve(config.auto_approve);
-        if let Some(ref rl_config) = config.rate_limit {
-            handler = handler.with_rate_limit(rl_config.clone());
-        }
-        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
+        let (handler, bunker_secret) = finalize_handler(handler, &config);
 
-        Ok(Self {
-            keys,
-            relay_url: relay_urls[0].clone(),
-            relay_urls: relay_urls.to_vec(),
-            client,
-            handler: Arc::new(handler),
-            running: false,
-            callbacks,
-            config,
-            bunker_secret,
-        })
+        Ok(Self::build(keys, relay_urls, client, handler, callbacks, config, bunker_secret))
     }
 
     pub fn bunker_url(&self) -> String {
@@ -371,8 +367,8 @@ impl Server {
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
 
-        if request.id.len() > 64 {
-            return Err(KeepError::InvalidInput("request ID too long".into()));
+        if request.id.len() > 64 || !request.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(KeepError::InvalidInput("invalid request ID".into()));
         }
 
         debug!(method = %request.method, app_id, "NIP-46 request");

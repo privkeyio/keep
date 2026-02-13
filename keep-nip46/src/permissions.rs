@@ -112,11 +112,16 @@ impl PermissionManager {
             .retain(|_, app| !app.duration.is_expired(app.connected_at));
     }
 
-    pub fn connect(&mut self, pubkey: PublicKey, name: String) -> bool {
-        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
-            self.evict_expired();
+    fn ensure_capacity(&mut self, pubkey: &PublicKey) -> bool {
+        if self.apps.len() < Self::MAX_CONNECTED_APPS || self.apps.contains_key(pubkey) {
+            return true;
         }
-        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+        self.evict_expired();
+        self.apps.len() < Self::MAX_CONNECTED_APPS
+    }
+
+    pub fn connect(&mut self, pubkey: PublicKey, name: String) -> bool {
+        if !self.ensure_capacity(&pubkey) {
             return false;
         }
         self.apps
@@ -131,10 +136,7 @@ impl PermissionManager {
         name: String,
         requested: Permission,
     ) -> bool {
-        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
-            self.evict_expired();
-        }
-        if self.apps.len() >= Self::MAX_CONNECTED_APPS && !self.apps.contains_key(&pubkey) {
+        if !self.ensure_capacity(&pubkey) {
             return false;
         }
         match self.apps.entry(pubkey) {
@@ -195,18 +197,13 @@ impl PermissionManager {
             if app.duration.is_expired(app.connected_at) {
                 return true;
             }
-        }
-
-        if self.global_auto_approve.contains(&kind) {
-            return false;
-        }
-
-        if let Some(app) = self.apps.get(pubkey) {
             if app.auto_approve_kinds.contains(&kind) {
                 return false;
             }
         }
-
+        if self.global_auto_approve.contains(&kind) {
+            return false;
+        }
         true
     }
 
