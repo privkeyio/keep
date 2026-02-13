@@ -13,6 +13,7 @@ use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
 use keep_core::Keep;
 use keep_frost_net::{KfpNode, KfpNodeEvent, PeerStatus, SessionInfo, SigningHooks};
+use rand::Rng as _;
 use tokio::sync::mpsc;
 use tracing::error;
 use zeroize::Zeroizing;
@@ -270,6 +271,113 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
             h
         }
     }
+}
+
+async fn spawn_frost_node(
+    keep_arc: Arc<Mutex<Option<Keep>>>,
+    keep_path: PathBuf,
+    share_entry: ShareEntry,
+    relay_urls: Vec<String>,
+    frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
+    frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+) -> Result<(), String> {
+    let share = tokio::task::spawn_blocking({
+        let keep_arc = keep_arc.clone();
+        let group_pubkey = share_entry.group_pubkey;
+        let identifier = share_entry.identifier;
+        move || {
+            with_keep_blocking(&keep_arc, "Failed to load share", move |keep| {
+                keep.frost_get_share_by_index(&group_pubkey, identifier)
+                    .map_err(friendly_err)
+            })
+        }
+    })
+    .await
+    .map_err(|_| "Background task failed".to_string())??;
+
+    let nonce_store_path = keep_path.join("frost-nonces");
+    keep_frost_net::install_default_crypto_provider();
+    let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    let (request_tx, request_rx) = mpsc::channel(32);
+    let hooks = Arc::new(DesktopSigningHooks { request_tx });
+    node.set_hooks(hooks);
+
+    let event_rx = node.subscribe();
+    let mut connect_rx = node.subscribe();
+    let node = Arc::new(node);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
+
+    if let Ok(mut guard) = frost_shutdown.lock() {
+        *guard = Some(shutdown_tx);
+    }
+
+    let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
+    let run_node = node.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = run_node.run() => {
+                if let Err(e) = result {
+                    tracing::error!("Node run failed: {e}");
+                    let _ = run_error_tx.send(format!("{e}")).await;
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Node shutdown requested");
+            }
+        }
+        drop(listener_shutdown_tx);
+    });
+
+    let listener_events = frost_events.clone();
+    let listener_requests = pending_requests.clone();
+    let listener_node = node.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = App::frost_event_listener(
+                event_rx,
+                request_rx,
+                listener_events,
+                listener_requests,
+                listener_node,
+            ) => {}
+            _ = listener_shutdown_rx.recv() => {}
+        }
+    });
+
+    let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(connect_timeout);
+    loop {
+        tokio::select! {
+            err = run_error_rx.recv() => {
+                let msg = err.unwrap_or_else(|| "Node stopped unexpectedly".into());
+                push_frost_event(
+                    &frost_events,
+                    FrostNodeMsg::StatusChanged(ConnectionStatus::Error(msg.clone())),
+                );
+                return Err(msg);
+            }
+            result = connect_rx.recv() => {
+                match result {
+                    Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("Node stopped unexpectedly".into());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = &mut connect_timeout => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl App {
@@ -688,8 +796,7 @@ impl App {
                             let base = RECONNECT_BASE_MS
                                 .saturating_mul(1u64 << self.frost_reconnect_attempts.min(15))
                                 .min(RECONNECT_MAX_MS);
-                            let jitter =
-                                (base / 5) * (self.frost_reconnect_attempts as u64 % 3) / 2;
+                            let jitter = rand::rng().random_range(0..base / 4);
                             let delay_ms = base + jitter;
                             self.frost_reconnect_at =
                                 Some(Instant::now() + Duration::from_millis(delay_ms));
@@ -865,111 +972,16 @@ impl App {
         self.frost_last_share = Some(share_entry.clone());
         self.frost_last_relay_urls = Some(relay_urls.clone());
 
-        let keep_arc = self.keep.clone();
-        let keep_path = self.keep_path.clone();
-        let frost_events = self.frost_events.clone();
-        let pending_requests = self.pending_sign_requests.clone();
-        let frost_shutdown = self.frost_shutdown.clone();
-
         Task::perform(
-            async move {
-                let share = tokio::task::spawn_blocking({
-                    let keep_arc = keep_arc.clone();
-                    let group_pubkey = share_entry.group_pubkey;
-                    let identifier = share_entry.identifier;
-                    move || {
-                        with_keep_blocking(&keep_arc, "Failed to load share", move |keep| {
-                            keep.frost_get_share_by_index(&group_pubkey, identifier)
-                                .map_err(friendly_err)
-                        })
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
-
-                let nonce_store_path = keep_path.join("frost-nonces");
-                keep_frost_net::install_default_crypto_provider();
-                let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
-                    .await
-                    .map_err(|e| format!("Connection failed: {e}"))?;
-
-                let (request_tx, request_rx) = mpsc::channel(32);
-                let hooks = Arc::new(DesktopSigningHooks { request_tx });
-                node.set_hooks(hooks);
-
-                let event_rx = node.subscribe();
-                let mut connect_rx = node.subscribe();
-                let node = Arc::new(node);
-                let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-                let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
-
-                if let Ok(mut guard) = frost_shutdown.lock() {
-                    *guard = Some(shutdown_tx);
-                }
-
-                let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
-                let run_node = node.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        result = run_node.run() => {
-                            if let Err(e) = result {
-                                tracing::error!("Node run failed: {e}");
-                                let _ = run_error_tx.send(format!("{e}")).await;
-                            }
-                        }
-                        _ = shutdown_rx.recv() => {
-                            tracing::info!("Node shutdown requested");
-                        }
-                    }
-                    drop(listener_shutdown_tx);
-                });
-
-                let listener_events = frost_events.clone();
-                let listener_requests = pending_requests.clone();
-                let listener_node = node.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = Self::frost_event_listener(
-                            event_rx,
-                            request_rx,
-                            listener_events,
-                            listener_requests,
-                            listener_node,
-                        ) => {}
-                        _ = listener_shutdown_rx.recv() => {}
-                    }
-                });
-
-                let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
-                tokio::pin!(connect_timeout);
-                loop {
-                    tokio::select! {
-                        err = run_error_rx.recv() => {
-                            let msg = err.unwrap_or_else(|| "Node stopped unexpectedly".into());
-                            push_frost_event(
-                                &frost_events,
-                                FrostNodeMsg::StatusChanged(ConnectionStatus::Error(msg.clone())),
-                            );
-                            return Err(msg);
-                        }
-                        result = connect_rx.recv() => {
-                            match result {
-                                Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
-                                Ok(_) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    return Err("Node stopped unexpectedly".into());
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            }
-                        }
-                        _ = &mut connect_timeout => {
-                            break;
-                        }
-                    }
-                }
-
-                Ok(())
-            },
+            spawn_frost_node(
+                self.keep.clone(),
+                self.keep_path.clone(),
+                share_entry,
+                relay_urls,
+                self.frost_events.clone(),
+                self.pending_sign_requests.clone(),
+                self.frost_shutdown.clone(),
+            ),
             Message::ConnectRelayResult,
         )
     }
@@ -1017,111 +1029,16 @@ impl App {
             s.status = ConnectionStatus::Connecting;
         }
 
-        let keep_arc = self.keep.clone();
-        let keep_path = self.keep_path.clone();
-        let frost_events = self.frost_events.clone();
-        let pending_requests = self.pending_sign_requests.clone();
-        let frost_shutdown = self.frost_shutdown.clone();
-
         Task::perform(
-            async move {
-                let share = tokio::task::spawn_blocking({
-                    let keep_arc = keep_arc.clone();
-                    let group_pubkey = share_entry.group_pubkey;
-                    let identifier = share_entry.identifier;
-                    move || {
-                        with_keep_blocking(&keep_arc, "Failed to load share", move |keep| {
-                            keep.frost_get_share_by_index(&group_pubkey, identifier)
-                                .map_err(friendly_err)
-                        })
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
-
-                let nonce_store_path = keep_path.join("frost-nonces");
-                keep_frost_net::install_default_crypto_provider();
-                let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
-                    .await
-                    .map_err(|e| format!("Connection failed: {e}"))?;
-
-                let (request_tx, request_rx) = mpsc::channel(32);
-                let hooks = Arc::new(DesktopSigningHooks { request_tx });
-                node.set_hooks(hooks);
-
-                let event_rx = node.subscribe();
-                let mut connect_rx = node.subscribe();
-                let node = Arc::new(node);
-                let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-                let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
-
-                if let Ok(mut guard) = frost_shutdown.lock() {
-                    *guard = Some(shutdown_tx);
-                }
-
-                let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
-                let run_node = node.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        result = run_node.run() => {
-                            if let Err(e) = result {
-                                tracing::error!("Node run failed: {e}");
-                                let _ = run_error_tx.send(format!("{e}")).await;
-                            }
-                        }
-                        _ = shutdown_rx.recv() => {
-                            tracing::info!("Node shutdown requested");
-                        }
-                    }
-                    drop(listener_shutdown_tx);
-                });
-
-                let listener_events = frost_events.clone();
-                let listener_requests = pending_requests.clone();
-                let listener_node = node.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = Self::frost_event_listener(
-                            event_rx,
-                            request_rx,
-                            listener_events,
-                            listener_requests,
-                            listener_node,
-                        ) => {}
-                        _ = listener_shutdown_rx.recv() => {}
-                    }
-                });
-
-                let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
-                tokio::pin!(connect_timeout);
-                loop {
-                    tokio::select! {
-                        err = run_error_rx.recv() => {
-                            let msg = err.unwrap_or_else(|| "Node stopped unexpectedly".into());
-                            push_frost_event(
-                                &frost_events,
-                                FrostNodeMsg::StatusChanged(ConnectionStatus::Error(msg.clone())),
-                            );
-                            return Err(msg);
-                        }
-                        result = connect_rx.recv() => {
-                            match result {
-                                Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
-                                Ok(_) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    return Err("Node stopped unexpectedly".into());
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            }
-                        }
-                        _ = &mut connect_timeout => {
-                            break;
-                        }
-                    }
-                }
-
-                Ok(())
-            },
+            spawn_frost_node(
+                self.keep.clone(),
+                self.keep_path.clone(),
+                share_entry,
+                relay_urls,
+                self.frost_events.clone(),
+                self.pending_sign_requests.clone(),
+                self.frost_shutdown.clone(),
+            ),
             Message::ConnectRelayResult,
         )
     }
