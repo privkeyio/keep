@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::Mutex;
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use keep_core::error::{CryptoError, KeepError, Result};
