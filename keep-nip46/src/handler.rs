@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
+use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
 use keep_core::error::{CryptoError, KeepError, Result};
@@ -153,17 +154,18 @@ impl SignerHandler {
         let name = format!("App {app_id}");
 
         if let Some(ref expected) = self.expected_secret {
-            match &secret {
-                Some(s) if s == expected => {}
-                _ => {
-                    let mut audit = self.audit.lock().await;
-                    audit.log(
-                        AuditEntry::new(AuditAction::Connect, app_pubkey)
-                            .with_success(false)
-                            .with_reason("invalid secret"),
-                    );
-                    return Err(KeepError::PermissionDenied("invalid secret".into()));
-                }
+            let valid = match &secret {
+                Some(s) => s.as_bytes().ct_eq(expected.as_bytes()).into(),
+                None => false,
+            };
+            if !valid {
+                let mut audit = self.audit.lock().await;
+                audit.log(
+                    AuditEntry::new(AuditAction::Connect, app_pubkey)
+                        .with_success(false)
+                        .with_reason("invalid secret"),
+                );
+                return Err(KeepError::PermissionDenied("invalid secret".into()));
             }
         } else if !self.auto_approve {
             let approved = self

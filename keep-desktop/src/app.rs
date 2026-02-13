@@ -1084,11 +1084,16 @@ impl App {
             }
             Message::BunkerAddRelay => {
                 if let Screen::Bunker(s) = &mut self.screen {
-                    let relay = s.relay_input.trim().to_string();
-                    if relay.starts_with("wss://")
-                        && !s.relays.contains(&relay)
-                        && s.relays.len() < 5
-                    {
+                    let url = s.relay_input.trim().to_string();
+                    if let Err(e) = validate_relay_url(&url) {
+                        self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
+                        return Task::none();
+                    }
+                    let relay = normalize_relay_url(&url);
+                    if s.relays.contains(&relay) || self.bunker_relays.contains(&relay) {
+                        return Task::none();
+                    }
+                    if s.relays.len() < 5 {
                         s.relays.push(relay.clone());
                         self.bunker_relays.push(relay);
                         s.relay_input.clear();
