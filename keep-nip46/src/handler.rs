@@ -63,6 +63,7 @@ impl SignerHandler {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_headless_auto_approve(mut self, auto_approve: bool) -> Self {
         self.headless_auto_approve = auto_approve;
         self

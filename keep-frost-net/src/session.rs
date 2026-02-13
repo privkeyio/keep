@@ -563,9 +563,7 @@ impl SessionManager {
 
         self.cleanup_expired();
         if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
-            return Err(FrostNetError::Session(
-                "Too many active sessions".into(),
-            ));
+            return Err(FrostNetError::Session("Too many active sessions".into()));
         }
 
         let session = NetworkSession::new(session_id, message, threshold, participants)
@@ -615,16 +613,17 @@ impl SessionManager {
         } else {
             self.cleanup_expired();
             if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
-                return Err(FrostNetError::Session(
-                    "Too many active sessions".into(),
-                ));
+                return Err(FrostNetError::Session("Too many active sessions".into()));
             }
             let session = NetworkSession::new(session_id, message, threshold, participants)
                 .with_timeout(self.session_timeout);
             self.active_sessions.insert(session_id, session);
         }
 
-        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+        Ok(self
+            .active_sessions
+            .get_mut(&session_id)
+            .expect("just inserted"))
     }
 
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {
@@ -645,16 +644,8 @@ impl SessionManager {
     }
 
     pub fn cleanup_expired(&mut self) {
-        let expired: Vec<[u8; 32]> = self
-            .active_sessions
-            .iter()
-            .filter(|(_id, session): &(&[u8; 32], &NetworkSession)| session.is_expired())
-            .map(|(id, _session)| *id)
-            .collect();
-
-        for id in expired {
-            self.active_sessions.remove(&id);
-        }
+        self.active_sessions
+            .retain(|_, session| !session.is_expired());
     }
 
     pub fn active_count(&self) -> usize {
@@ -697,6 +688,11 @@ impl SessionManager {
                 return Err(FrostNetError::Session("Session already active".into()));
             }
             self.active_sessions.remove(&session_id);
+        }
+
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session("Too many active sessions".into()));
         }
 
         let mut session = NetworkSession::from_cached_state(cached)?;

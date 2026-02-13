@@ -27,5 +27,7 @@ fn aux_rand() -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf)
         .map_err(|e| BitcoinError::Signing(format!("failed to get random bytes: {e}")))?;
-    Ok(zeroize::Zeroizing::new(buf))
+    let wrapped = zeroize::Zeroizing::new(buf);
+    zeroize::Zeroize::zeroize(&mut buf);
+    Ok(wrapped)
 }

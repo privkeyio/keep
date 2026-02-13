@@ -72,7 +72,9 @@ impl PsbtSigner {
             let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
                 BitcoinError::InvalidPsbt(format!("input {i} missing witness_utxo"))
             })?;
-            total_input_sats += utxo.value.to_sat();
+            total_input_sats = total_input_sats
+                .checked_add(utxo.value.to_sat())
+                .ok_or_else(|| BitcoinError::InvalidPsbt("input value overflow".into()))?;
 
             if self.should_sign_input(psbt, i)? {
                 signable_inputs.push(i);
@@ -83,7 +85,9 @@ impl PsbtSigner {
         let mut total_output_sats = 0u64;
 
         for (i, output) in psbt.unsigned_tx.output.iter().enumerate() {
-            total_output_sats += output.value.to_sat();
+            total_output_sats = total_output_sats
+                .checked_add(output.value.to_sat())
+                .ok_or_else(|| BitcoinError::InvalidPsbt("output value overflow".into()))?;
 
             let address = Address::from_script(&output.script_pubkey, self.network)
                 .ok()

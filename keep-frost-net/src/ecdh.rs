@@ -161,6 +161,10 @@ impl EcdhSession {
         &self.participants
     }
 
+    pub fn threshold(&self) -> u16 {
+        self.threshold
+    }
+
     pub fn state(&self) -> EcdhSessionState {
         if self.created_at.elapsed() > self.timeout && self.state != EcdhSessionState::Complete {
             return EcdhSessionState::Expired;
@@ -221,10 +225,10 @@ impl EcdhSession {
 
         match aggregate_ecdh_shares(&partial_vec, &self.participants) {
             Ok(shared_secret) => {
-                let zeroized = Zeroizing::new(shared_secret);
-                self.shared_secret = Some(zeroized.clone());
+                let secret = Zeroizing::new(shared_secret);
                 self.state = EcdhSessionState::Complete;
-                Ok(Some(zeroized))
+                self.shared_secret = Some(secret.clone());
+                Ok(Some(secret))
             }
             Err(e) => {
                 self.state = EcdhSessionState::Failed;
@@ -316,6 +320,7 @@ impl EcdhSessionManager {
             if existing.is_expired() {
                 self.active_sessions.remove(&session_id);
             } else if existing.recipient_pubkey() != &recipient_pubkey
+                || existing.threshold() != threshold
                 || existing.participants() != participants
             {
                 return Err(FrostNetError::Session(
@@ -350,16 +355,8 @@ impl EcdhSessionManager {
     }
 
     pub fn cleanup_expired(&mut self) {
-        let expired: Vec<[u8; 32]> = self
-            .active_sessions
-            .iter()
-            .filter(|(_, session)| session.is_expired())
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in expired {
-            self.active_sessions.remove(&id);
-        }
+        self.active_sessions
+            .retain(|_, session| !session.is_expired());
     }
 }
 

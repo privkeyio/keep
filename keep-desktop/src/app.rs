@@ -356,7 +356,7 @@ async fn setup_frost_node(
     });
 
     Ok(FrostNodeSetup {
-        node: node.clone(),
+        node,
         connect_rx,
         run_error_rx,
     })
