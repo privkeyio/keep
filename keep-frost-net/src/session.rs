@@ -604,21 +604,28 @@ impl SessionManager {
         }
 
         if let Some(existing) = self.active_sessions.get(&session_id) {
-            if existing.message() != message
-                || existing.threshold() != threshold
-                || existing.participants() != participants
-            {
-                return Err(FrostNetError::Session("Session parameters mismatch".into()));
+            if !existing.is_expired() {
+                if existing.message() != message
+                    || existing.threshold() != threshold
+                    || existing.participants() != participants
+                {
+                    return Err(FrostNetError::Session("Session parameters mismatch".into()));
+                }
+                return Ok(self
+                    .active_sessions
+                    .get_mut(&session_id)
+                    .expect("just checked"));
             }
-        } else {
-            self.cleanup_expired();
-            if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
-                return Err(FrostNetError::Session("Too many active sessions".into()));
-            }
-            let session = NetworkSession::new(session_id, message, threshold, participants)
-                .with_timeout(self.session_timeout);
-            self.active_sessions.insert(session_id, session);
+            self.active_sessions.remove(&session_id);
         }
+
+        self.cleanup_expired();
+        if self.active_sessions.len() >= Self::MAX_ACTIVE_SESSIONS {
+            return Err(FrostNetError::Session("Too many active sessions".into()));
+        }
+        let session = NetworkSession::new(session_id, message, threshold, participants)
+            .with_timeout(self.session_timeout);
+        self.active_sessions.insert(session_id, session);
 
         Ok(self
             .active_sessions

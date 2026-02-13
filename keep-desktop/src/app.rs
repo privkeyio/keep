@@ -1229,14 +1229,16 @@ impl App {
             return false;
         }
 
-        if let Ok(guard) = pending_requests.lock() {
-            let peer_pending = guard
-                .iter()
-                .filter(|r| r.info.from_peer == from_peer)
-                .count();
-            if peer_pending >= MAX_REQUESTS_PER_PEER {
-                return false;
-            }
+        let guard = match pending_requests.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let peer_pending = guard
+            .iter()
+            .filter(|r| r.info.from_peer == from_peer)
+            .count();
+        if peer_pending >= MAX_REQUESTS_PER_PEER {
+            return false;
         }
 
         true

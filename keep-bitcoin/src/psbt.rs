@@ -103,7 +103,9 @@ impl PsbtSigner {
             });
         }
 
-        let fee_sats = total_input_sats.saturating_sub(total_output_sats);
+        let fee_sats = total_input_sats
+            .checked_sub(total_output_sats)
+            .ok_or_else(|| BitcoinError::InvalidPsbt("outputs exceed inputs".into()))?;
 
         Ok(PsbtAnalysis {
             num_inputs: psbt.inputs.len(),
