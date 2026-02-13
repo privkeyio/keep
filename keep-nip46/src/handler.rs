@@ -86,7 +86,6 @@ pub struct SignerHandler {
     rate_limit_config: Option<RateLimitConfig>,
     expected_secret: Option<String>,
     auto_approve: bool,
-    headless_auto_approve: bool,
 }
 
 impl SignerHandler {
@@ -107,7 +106,6 @@ impl SignerHandler {
             rate_limit_config: None,
             expected_secret: None,
             auto_approve: false,
-            headless_auto_approve: false,
         }
     }
 
@@ -133,12 +131,6 @@ impl SignerHandler {
 
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limit_config = Some(config);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_headless_auto_approve(mut self, auto_approve: bool) -> Self {
-        self.headless_auto_approve = auto_approve;
         self
     }
 
@@ -575,7 +567,7 @@ impl SignerHandler {
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
-        if self.auto_approve || self.headless_auto_approve {
+        if self.auto_approve {
             warn!(method = %request.method, "auto-approving in headless mode");
             return true;
         }

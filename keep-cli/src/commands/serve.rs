@@ -51,7 +51,7 @@ impl ServerCallbacks for TuiCallbacks {
         if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
             return false;
         }
-        response_rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false)
+        tokio::task::block_in_place(|| response_rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false))
     }
 }
 
@@ -94,6 +94,12 @@ pub fn cmd_serve(
         out.field("Bunker Relay", relay);
         out.newline();
 
+        if !headless {
+            return Err(KeepError::Runtime(
+                "FROST network mode requires --headless".into(),
+            ));
+        }
+
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
@@ -120,20 +126,15 @@ pub fn cmd_serve(
 
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
 
-            let frost_config = if headless {
-                ServerConfig {
-                    auto_approve: true,
-                    ..ServerConfig::default()
-                }
-            } else {
-                ServerConfig::default()
-            };
             let mut server = Server::new_network_frost_with_config(
                 net_signer,
                 transport_key,
                 &[relay.to_string()],
                 None,
-                frost_config,
+                ServerConfig {
+                    auto_approve: true,
+                    ..ServerConfig::default()
+                },
             )
             .await?;
             let bunker_url = server.bunker_url();
