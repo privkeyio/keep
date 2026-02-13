@@ -283,6 +283,37 @@ impl Storage {
         Ok(())
     }
 
+    /// Verify a password without changing the unlock state.
+    pub fn verify_password(&self, password: &str) -> Result<()> {
+        let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
+        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
+            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
+        }
+
+        let master_key = crypto::derive_key(
+            password.as_bytes(),
+            &self.header.salt,
+            self.header.argon2_params(),
+        )?;
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
+        let encrypted = EncryptedData {
+            nonce: self.header.nonce,
+            ciphertext: self.header.encrypted_data_key.to_vec(),
+        };
+        match crypto::decrypt(&encrypted, &header_key) {
+            Ok(_) => {
+                rate_limit::record_success(&self.path);
+                Ok(())
+            }
+            Err(e) => {
+                if matches!(e, KeepError::DecryptionFailed) {
+                    rate_limit::record_failure(&self.path, &hmac_key);
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn unlock_inner(&mut self, password: &str) -> Result<()> {
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {

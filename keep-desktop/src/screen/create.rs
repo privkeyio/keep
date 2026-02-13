@@ -27,7 +27,7 @@ impl CreateScreen {
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self, pending_requests: usize) -> Element<Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -156,6 +156,6 @@ impl CreateScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Create, inner.into(), None)
+        layout::with_sidebar(NavItem::Create, inner.into(), None, pending_requests)
     }
 }

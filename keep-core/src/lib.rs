@@ -156,6 +156,11 @@ impl Keep {
         self.load_keys_to_keyring()
     }
 
+    /// Verify a password without changing the unlock state.
+    pub fn verify_password(&self, password: &str) -> Result<()> {
+        self.storage.verify_password(password)
+    }
+
     /// Lock and clear all keys from memory.
     pub fn lock(&mut self) {
         self.audit_event(AuditEventType::VaultLock, |e| e);

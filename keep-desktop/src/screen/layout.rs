@@ -12,53 +12,103 @@ pub enum NavItem {
     Shares,
     Create,
     Import,
-    Relays,
     Wallets,
+    Relay,
+}
+
+enum NavBadge {
+    None,
+    Count(usize),
+    Notification(usize),
 }
 
 pub fn with_sidebar<'a>(
     active: NavItem,
     content: Element<'a, Message>,
     share_count: Option<usize>,
+    pending_requests: usize,
 ) -> Element<'a, Message> {
-    let nav_items = [
-        ("Shares", Message::NavigateShares, NavItem::Shares),
-        ("Create", Message::GoToCreate, NavItem::Create),
-        ("Import", Message::GoToImport, NavItem::Import),
-        ("Relays", Message::NavigateRelays, NavItem::Relays),
-        ("Wallets", Message::NavigateWallets, NavItem::Wallets),
+    let relay_badge = if pending_requests > 0 {
+        NavBadge::Notification(pending_requests)
+    } else {
+        NavBadge::None
+    };
+    let share_badge = match share_count {
+        Some(n) => NavBadge::Count(n),
+        None => NavBadge::None,
+    };
+
+    let nav_items: Vec<(&str, Message, NavItem, NavBadge)> = vec![
+        (
+            "Shares",
+            Message::NavigateShares,
+            NavItem::Shares,
+            share_badge,
+        ),
+        (
+            "Create",
+            Message::GoToCreate,
+            NavItem::Create,
+            NavBadge::None,
+        ),
+        (
+            "Import",
+            Message::GoToImport,
+            NavItem::Import,
+            NavBadge::None,
+        ),
+        (
+            "Wallets",
+            Message::NavigateWallets,
+            NavItem::Wallets,
+            NavBadge::None,
+        ),
+        ("Relay", Message::NavigateRelay, NavItem::Relay, relay_badge),
     ];
 
     let mut nav = column![].spacing(theme::space::XS);
-    for (label, msg, item) in nav_items {
+    for (label, msg, item, badge) in nav_items {
         let is_active = item == active;
         let style: fn(&iced::Theme, button::Status) -> button::Style = if is_active {
             theme::nav_button_active
         } else {
             theme::nav_button
         };
-        let press = if is_active { None } else { Some(msg) };
-        let nav_label: Element<'a, Message> =
-            if let (NavItem::Shares, Some(count)) = (&item, share_count) {
-                row![
-                    text(label).size(theme::size::BODY),
-                    Space::new().width(Length::Fill),
+
+        let nav_label: Element<'a, Message> = match badge {
+            NavBadge::Count(count) => row![
+                text(label).size(theme::size::BODY),
+                Space::new().width(Length::Fill),
+                text(count.to_string())
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_DIM),
+            ]
+            .width(Length::Fill)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            NavBadge::Notification(count) => row![
+                text(label).size(theme::size::BODY),
+                Space::new().width(Length::Fill),
+                container(
                     text(count.to_string())
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT_DIM),
-                ]
+                        .size(theme::size::TINY)
+                        .color(iced::Color::WHITE),
+                )
+                .style(theme::notification_badge_style)
+                .padding([1.0, 6.0]),
+            ]
+            .width(Length::Fill)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            NavBadge::None => text(label)
+                .size(theme::size::BODY)
                 .width(Length::Fill)
-                .align_y(iced::Alignment::Center)
-                .into()
-            } else {
-                text(label)
-                    .size(theme::size::BODY)
-                    .width(Length::Fill)
-                    .into()
-            };
+                .into(),
+        };
+
         nav = nav.push(
             button(nav_label)
-                .on_press_maybe(press)
+                .on_press_maybe((!is_active).then_some(msg))
                 .style(style)
                 .padding([theme::space::SM, theme::space::MD])
                 .width(Length::Fill),
