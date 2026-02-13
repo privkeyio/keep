@@ -9,6 +9,7 @@ use bincode::Options;
 use fs2::FileExt;
 use subtle::ConstantTimeEq;
 use tracing::warn;
+use zeroize::Zeroizing;
 
 use crate::backend::{
     RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE,
@@ -324,12 +325,12 @@ impl Storage {
         &self,
         keys: &[KeyRecord],
         data_key: &SecretKey,
-    ) -> Result<Vec<(KeyRecord, Vec<u8>)>> {
+    ) -> Result<Vec<(KeyRecord, Zeroizing<Vec<u8>>)>> {
         keys.iter()
             .map(|record| {
                 let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
                 let secret = crypto::decrypt(&encrypted, data_key)?;
-                Ok((record.clone(), secret.as_slice()?.to_vec()))
+                Ok((record.clone(), Zeroizing::new(secret.as_slice()?.to_vec())))
             })
             .collect()
     }
@@ -338,21 +339,24 @@ impl Storage {
         &self,
         shares: &[StoredShare],
         data_key: &SecretKey,
-    ) -> Result<Vec<(StoredShare, Vec<u8>)>> {
+    ) -> Result<Vec<(StoredShare, Zeroizing<Vec<u8>>)>> {
         shares
             .iter()
             .map(|stored| {
                 let encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
                 let key_package_bytes = crypto::decrypt(&encrypted, data_key)?;
-                Ok((stored.clone(), key_package_bytes.as_slice()?.to_vec()))
+                Ok((
+                    stored.clone(),
+                    Zeroizing::new(key_package_bytes.as_slice()?.to_vec()),
+                ))
             })
             .collect()
     }
 
     fn reencrypt_database(
         &self,
-        keys: &[(KeyRecord, Vec<u8>)],
-        shares: &[(StoredShare, Vec<u8>)],
+        keys: &[(KeyRecord, Zeroizing<Vec<u8>>)],
+        shares: &[(StoredShare, Zeroizing<Vec<u8>>)],
         descriptors: &[WalletDescriptor],
         relay_configs: &[RelayConfig],
         new_data_key: &SecretKey,
@@ -408,8 +412,8 @@ impl Storage {
 
     fn verify_rotation_integrity(
         &self,
-        original_keys: &[(KeyRecord, Vec<u8>)],
-        original_shares: &[(StoredShare, Vec<u8>)],
+        original_keys: &[(KeyRecord, Zeroizing<Vec<u8>>)],
+        original_shares: &[(StoredShare, Zeroizing<Vec<u8>>)],
         original_descriptors: &[WalletDescriptor],
         original_relay_configs: &[RelayConfig],
     ) -> Result<()> {

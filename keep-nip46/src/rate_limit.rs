@@ -126,6 +126,13 @@ impl RateLimiter {
         self.requests.is_empty()
     }
 
+    pub fn last_used(&self) -> DateTime<Utc> {
+        self.requests
+            .back()
+            .copied()
+            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC)
+    }
+
     pub fn cleanup(&mut self) {
         self.cleanup_at(Utc::now());
     }

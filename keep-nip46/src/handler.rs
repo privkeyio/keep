@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use keep_core::error::{CryptoError, KeepError, Result};
 use keep_core::keyring::Keyring;
@@ -25,6 +25,7 @@ pub struct SignerHandler {
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     rate_limiters: Mutex<HashMap<PublicKey, RateLimiter>>,
     rate_limit_config: Option<RateLimitConfig>,
+    headless_auto_approve: bool,
 }
 
 impl SignerHandler {
@@ -43,6 +44,7 @@ impl SignerHandler {
             callbacks,
             rate_limiters: Mutex::new(HashMap::new()),
             rate_limit_config: None,
+            headless_auto_approve: false,
         }
     }
 
@@ -61,7 +63,12 @@ impl SignerHandler {
         self
     }
 
-    const MAX_RATE_LIMITERS: usize = 10_000;
+    pub fn with_headless_auto_approve(mut self, auto_approve: bool) -> Self {
+        self.headless_auto_approve = auto_approve;
+        self
+    }
+
+    const MAX_RATE_LIMITERS: usize = 1_000;
 
     async fn check_rate_limit(&self, app_pubkey: &PublicKey) -> Result<()> {
         let config = match &self.rate_limit_config {
@@ -77,7 +84,13 @@ impl SignerHandler {
                 !rl.is_empty()
             });
             if limiters.len() >= Self::MAX_RATE_LIMITERS {
-                return Err(KeepError::RateLimited(60));
+                let oldest_key = limiters
+                    .iter()
+                    .min_by_key(|(_, rl)| rl.last_used())
+                    .map(|(k, _)| *k);
+                if let Some(key) = oldest_key {
+                    limiters.remove(&key);
+                }
             }
         }
 
@@ -479,8 +492,12 @@ impl SignerHandler {
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
-        info!(method = %request.method, "auto-approving in headless mode");
-        true
+        if self.headless_auto_approve {
+            info!(method = %request.method, "auto-approving in headless mode");
+            return true;
+        }
+        warn!(method = %request.method, "denying request: no approval callbacks configured");
+        false
     }
 }
 

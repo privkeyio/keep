@@ -94,6 +94,12 @@ impl NonceStore for FileNonceStore {
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+
         file.lock_exclusive()
             .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 

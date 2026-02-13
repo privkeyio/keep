@@ -552,9 +552,8 @@ impl SessionManager {
             }
         }
 
-        if self.active_sessions.contains_key(&session_id) {
-            let session = self.active_sessions.get(&session_id).unwrap();
-            if !session.is_expired() {
+        if let Some(existing) = self.active_sessions.get(&session_id) {
+            if !existing.is_expired() {
                 return Err(FrostNetError::Session("Session already active".into()));
             }
             self.active_sessions.remove(&session_id);
@@ -564,7 +563,10 @@ impl SessionManager {
             .with_timeout(self.session_timeout);
 
         self.active_sessions.insert(session_id, session);
-        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+        Ok(self
+            .active_sessions
+            .get_mut(&session_id)
+            .expect("just inserted"))
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&NetworkSession> {
@@ -675,8 +677,7 @@ impl SessionManager {
             }
         }
 
-        if self.active_sessions.contains_key(&session_id) {
-            let existing = self.active_sessions.get(&session_id).unwrap();
+        if let Some(existing) = self.active_sessions.get(&session_id) {
             if !existing.is_expired() {
                 return Err(FrostNetError::Session("Session already active".into()));
             }
@@ -687,7 +688,10 @@ impl SessionManager {
         session.timeout = self.session_timeout;
 
         self.active_sessions.insert(session_id, session);
-        Ok(self.active_sessions.get_mut(&session_id).unwrap())
+        Ok(self
+            .active_sessions
+            .get_mut(&session_id)
+            .expect("just inserted"))
     }
 
     pub fn cache_and_remove_session(

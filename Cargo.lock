@@ -3156,6 +3156,7 @@ name = "keep-bitcoin"
 version = "0.1.4"
 dependencies = [
  "bitcoin",
+ "getrandom 0.2.17",
  "hex",
  "keep-core",
  "serde",

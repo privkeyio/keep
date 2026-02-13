@@ -273,7 +273,13 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
     }
 }
 
-async fn spawn_frost_node(
+struct FrostNodeSetup {
+    node: Arc<KfpNode>,
+    connect_rx: tokio::sync::broadcast::Receiver<KfpNodeEvent>,
+    run_error_rx: mpsc::Receiver<String>,
+}
+
+async fn setup_frost_node(
     keep_arc: Arc<Mutex<Option<Keep>>>,
     keep_path: PathBuf,
     share_entry: ShareEntry,
@@ -281,7 +287,7 @@ async fn spawn_frost_node(
     frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
     pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
     frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-) -> Result<(), String> {
+) -> Result<FrostNodeSetup, String> {
     let share = tokio::task::spawn_blocking({
         let keep_arc = keep_arc.clone();
         let group_pubkey = share_entry.group_pubkey;
@@ -307,7 +313,7 @@ async fn spawn_frost_node(
     node.set_hooks(hooks);
 
     let event_rx = node.subscribe();
-    let mut connect_rx = node.subscribe();
+    let connect_rx = node.subscribe();
     let node = Arc::new(node);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
@@ -316,7 +322,7 @@ async fn spawn_frost_node(
         *guard = Some(shutdown_tx);
     }
 
-    let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
+    let (run_error_tx, run_error_rx) = mpsc::channel::<String>(1);
     let run_node = node.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -333,8 +339,8 @@ async fn spawn_frost_node(
         drop(listener_shutdown_tx);
     });
 
-    let listener_events = frost_events.clone();
-    let listener_requests = pending_requests.clone();
+    let listener_events = frost_events;
+    let listener_requests = pending_requests;
     let listener_node = node.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -348,6 +354,37 @@ async fn spawn_frost_node(
             _ = listener_shutdown_rx.recv() => {}
         }
     });
+
+    Ok(FrostNodeSetup {
+        node: node.clone(),
+        connect_rx,
+        run_error_rx,
+    })
+}
+
+async fn spawn_frost_node(
+    keep_arc: Arc<Mutex<Option<Keep>>>,
+    keep_path: PathBuf,
+    share_entry: ShareEntry,
+    relay_urls: Vec<String>,
+    frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
+    frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+) -> Result<(), String> {
+    let setup = setup_frost_node(
+        keep_arc,
+        keep_path,
+        share_entry,
+        relay_urls,
+        frost_events.clone(),
+        pending_requests,
+        frost_shutdown,
+    )
+    .await?;
+
+    let _node = setup.node;
+    let mut connect_rx = setup.connect_rx;
+    let mut run_error_rx = setup.run_error_rx;
 
     let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(connect_timeout);
@@ -432,36 +469,101 @@ impl App {
         }
 
         match message {
-            Message::Tick => {
-                if self.last_activity.elapsed() >= Duration::from_secs(AUTO_LOCK_SECS)
-                    && !matches!(self.screen, Screen::Unlock(_))
-                {
-                    return self.do_lock();
-                }
-                let now = Instant::now();
-                if self.clipboard_clear_at.is_some_and(|t| now >= t) {
-                    self.clipboard_clear_at = None;
-                    return iced::clipboard::write(String::new());
-                }
-                if self.copy_feedback_until.is_some_and(|t| now >= t) {
-                    self.copy_feedback_until = None;
-                    if let Screen::Export(s) = &mut self.screen {
-                        s.copied = false;
-                    }
-                }
-                if self.toast_dismiss_at.is_some_and(|t| now >= t) {
-                    self.toast = None;
-                    self.toast_dismiss_at = None;
-                }
-                if self.frost_reconnect_at.is_some_and(|t| now >= t) {
-                    self.frost_reconnect_at = None;
-                    self.drain_frost_events();
-                    return self.handle_reconnect_relay();
-                }
-                self.drain_frost_events();
-                Task::none()
-            }
+            Message::Tick => self.handle_tick(),
 
+            Message::PasswordChanged(..)
+            | Message::ConfirmPasswordChanged(..)
+            | Message::Unlock
+            | Message::UnlockResult(..)
+            | Message::StartFresh
+            | Message::CancelStartFresh
+            | Message::ConfirmStartFresh
+            | Message::StartFreshResult(..) => self.handle_unlock_message(message),
+
+            Message::GoToCreate
+            | Message::GoToImport
+            | Message::GoToExport(..)
+            | Message::NavigateShares
+            | Message::GoBack
+            | Message::NavigateWallets
+            | Message::WalletsLoaded(..)
+            | Message::NavigateRelay
+            | Message::Lock => self.handle_navigation_message(message),
+
+            Message::ToggleShareDetails(..)
+            | Message::SetActiveShare(..)
+            | Message::RequestDelete(..)
+            | Message::ConfirmDelete(..)
+            | Message::CancelDelete => self.handle_share_list_message(message),
+
+            Message::CreateNameChanged(..)
+            | Message::CreateThresholdChanged(..)
+            | Message::CreateTotalChanged(..)
+            | Message::CreateKeyset
+            | Message::CreateResult(..) => self.handle_create_message(message),
+
+            Message::ExportPassphraseChanged(..)
+            | Message::ExportConfirmPassphraseChanged(..)
+            | Message::GenerateExport
+            | Message::ExportGenerated(..)
+            | Message::AdvanceQrFrame
+            | Message::CopyToClipboard(..)
+            | Message::ResetExport => self.handle_export_message(message),
+
+            Message::ImportDataChanged(..)
+            | Message::ImportPassphraseChanged(..)
+            | Message::ImportShare
+            | Message::ImportResult(..) => self.handle_import_message(message),
+
+            Message::CopyNpub(..)
+            | Message::CopyDescriptor(..)
+            | Message::ToggleWalletDetails(..) => self.handle_wallet_message(message),
+
+            Message::RelayUrlChanged(..)
+            | Message::ConnectPasswordChanged(..)
+            | Message::AddRelay
+            | Message::RemoveRelay(..)
+            | Message::SelectShareForRelay(..)
+            | Message::ConnectRelay
+            | Message::DisconnectRelay
+            | Message::ConnectRelayResult(..)
+            | Message::ApproveSignRequest(..)
+            | Message::RejectSignRequest(..) => self.handle_relay_message(message),
+        }
+    }
+
+    fn handle_tick(&mut self) -> Task<Message> {
+        if self.last_activity.elapsed() >= Duration::from_secs(AUTO_LOCK_SECS)
+            && !matches!(self.screen, Screen::Unlock(_))
+        {
+            return self.do_lock();
+        }
+        let now = Instant::now();
+        if self.clipboard_clear_at.is_some_and(|t| now >= t) {
+            self.clipboard_clear_at = None;
+            return iced::clipboard::write(String::new());
+        }
+        if self.copy_feedback_until.is_some_and(|t| now >= t) {
+            self.copy_feedback_until = None;
+            if let Screen::Export(s) = &mut self.screen {
+                s.copied = false;
+            }
+        }
+        if self.toast_dismiss_at.is_some_and(|t| now >= t) {
+            self.toast = None;
+            self.toast_dismiss_at = None;
+        }
+        if self.frost_reconnect_at.is_some_and(|t| now >= t) {
+            self.frost_reconnect_at = None;
+            self.drain_frost_events();
+            return self.handle_reconnect_relay();
+        }
+        self.drain_frost_events();
+        Task::none()
+    }
+
+    fn handle_unlock_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::PasswordChanged(p) => {
                 if let Screen::Unlock(s) = &mut self.screen {
                     s.password = p;
@@ -505,7 +607,12 @@ impl App {
                 }
                 Task::none()
             }
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_navigation_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::GoToCreate => {
                 self.screen = Screen::Create(CreateScreen::new());
                 Task::none()
@@ -576,7 +683,12 @@ impl App {
                 Task::none()
             }
             Message::Lock => self.do_lock(),
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_share_list_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::ToggleShareDetails(i) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
@@ -622,7 +734,12 @@ impl App {
                 }
                 Task::none()
             }
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_create_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::CreateNameChanged(n) => {
                 if let Screen::Create(s) = &mut self.screen {
                     s.name = n;
@@ -657,7 +774,12 @@ impl App {
                     Task::none()
                 }
             },
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_export_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::ExportPassphraseChanged(p) => {
                 if let Screen::Export(s) = &mut self.screen {
                     s.passphrase = p;
@@ -696,7 +818,12 @@ impl App {
                 }
                 Task::none()
             }
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_import_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::ImportDataChanged(d) => {
                 if let Screen::Import(s) = &mut self.screen {
                     s.data = d;
@@ -711,7 +838,12 @@ impl App {
             }
             Message::ImportShare => self.handle_import(),
             Message::ImportResult(result) => self.handle_import_result(result),
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_wallet_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::CopyNpub(npub) => iced::clipboard::write(npub),
             Message::CopyDescriptor(desc) => iced::clipboard::write(desc),
             Message::ToggleWalletDetails(i) => {
@@ -720,7 +852,12 @@ impl App {
                 }
                 Task::none()
             }
+            _ => Task::none(),
+        }
+    }
 
+    fn handle_relay_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::RelayUrlChanged(url) => {
                 if let Screen::Relay(s) = &mut self.screen {
                     s.relay_url_input = url;
@@ -819,6 +956,7 @@ impl App {
                 self.respond_to_sign_request(&id, false);
                 Task::none()
             }
+            _ => Task::none(),
         }
     }
 
@@ -1067,6 +1205,43 @@ impl App {
         }
     }
 
+    fn check_rate_limit(
+        global_times: &mut VecDeque<Instant>,
+        peer_times_map: &mut HashMap<u16, VecDeque<Instant>>,
+        pending_requests: &Mutex<Vec<PendingRequestEntry>>,
+        from_peer: u16,
+        now: Instant,
+        window: Duration,
+    ) -> bool {
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while global_times.front().is_some_and(|t| *t < cutoff) {
+            global_times.pop_front();
+        }
+        if global_times.len() >= RATE_LIMIT_GLOBAL {
+            return false;
+        }
+
+        let peer_times = peer_times_map.entry(from_peer).or_default();
+        while peer_times.front().is_some_and(|t| *t < cutoff) {
+            peer_times.pop_front();
+        }
+        if peer_times.len() >= RATE_LIMIT_PER_PEER {
+            return false;
+        }
+
+        if let Ok(guard) = pending_requests.lock() {
+            let peer_pending = guard
+                .iter()
+                .filter(|r| r.info.from_peer == from_peer)
+                .count();
+            if peer_pending >= MAX_REQUESTS_PER_PEER {
+                return false;
+            }
+        }
+
+        true
+    }
+
     async fn frost_event_listener(
         mut event_rx: tokio::sync::broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
@@ -1118,31 +1293,16 @@ impl App {
                     let from_peer = session.participants.first().copied().unwrap_or(0);
                     let now = Instant::now();
 
-                    let cutoff = now.checked_sub(window).unwrap_or(now);
-                    while global_request_times.front().is_some_and(|t| *t < cutoff) {
-                        global_request_times.pop_front();
-                    }
-                    if global_request_times.len() >= RATE_LIMIT_GLOBAL {
+                    if !Self::check_rate_limit(
+                        &mut global_request_times,
+                        &mut peer_request_times,
+                        &pending_requests,
+                        from_peer,
+                        now,
+                        window,
+                    ) {
                         let _ = response_tx.try_send(false);
                         continue;
-                    }
-
-                    let peer_times = peer_request_times.entry(from_peer).or_default();
-                    while peer_times.front().is_some_and(|t| *t < cutoff) {
-                        peer_times.pop_front();
-                    }
-                    if peer_times.len() >= RATE_LIMIT_PER_PEER {
-                        let _ = response_tx.try_send(false);
-                        continue;
-                    }
-
-                    if let Ok(guard) = pending_requests.lock() {
-                        let peer_pending = guard.iter().filter(|r| r.info.from_peer == from_peer).count();
-                        if peer_pending >= MAX_REQUESTS_PER_PEER {
-                            drop(guard);
-                            let _ = response_tx.try_send(false);
-                            continue;
-                        }
                     }
 
                     let req = PendingSignRequest {

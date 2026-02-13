@@ -22,3 +22,10 @@ pub use recovery_tx::RecoveryTxBuilder;
 pub use signer::BitcoinSigner;
 
 pub use bitcoin::Network;
+
+fn aux_rand() -> Result<[u8; 32]> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| BitcoinError::Signing(format!("failed to get random bytes: {e}")))?;
+    Ok(buf)
+}

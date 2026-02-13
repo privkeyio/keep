@@ -42,7 +42,8 @@ pub struct NostrKeypair {
 impl NostrKeypair {
     /// Generate a new random keypair.
     pub fn generate() -> Self {
-        loop {
+        const MAX_RETRIES: usize = 64;
+        for _ in 0..MAX_RETRIES {
             let mut secret_bytes: [u8; 32] = crypto::random_bytes();
             if let Ok(signing_key) = SigningKey::from_bytes(&secret_bytes) {
                 let verifying_key = signing_key.verifying_key();
@@ -52,6 +53,7 @@ impl NostrKeypair {
                 };
             }
         }
+        panic!("failed to generate valid keypair after {MAX_RETRIES} attempts");
     }
 
     /// Create a keypair from secret bytes. Zeroes the source.

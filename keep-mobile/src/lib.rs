@@ -693,7 +693,42 @@ impl KeepMobile {
             });
         }
 
-        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(&key_bytes).map_err(|e| {
+        let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
+        let (metadata_info, stored) =
+            Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, name)?;
+
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
+        self.storage.store_share_by_key(
+            group_pubkey_hex.clone(),
+            serialized,
+            metadata_info.clone(),
+        )?;
+        self.storage
+            .set_active_share_key(Some(group_pubkey_hex.clone()))?;
+
+        Ok(ShareInfo {
+            name: metadata_info.name,
+            share_index: metadata_info.identifier,
+            threshold: metadata_info.threshold,
+            total_shares: metadata_info.total_shares,
+            group_pubkey: group_pubkey_hex,
+        })
+    }
+
+    fn build_nsec_packages(
+        key_bytes: &[u8],
+    ) -> Result<
+        (
+            frost_secp256k1_tr::keys::KeyPackage,
+            frost_secp256k1_tr::keys::PublicKeyPackage,
+            Vec<u8>,
+        ),
+        KeepMobileError,
+    > {
+        let signing_key = frost_secp256k1_tr::SigningKey::deserialize(key_bytes).map_err(|e| {
             KeepMobileError::FrostError {
                 msg: format!("Invalid signing key: {e}"),
             }
@@ -732,6 +767,15 @@ impl KeepMobile {
         verifying_shares.insert(identifier, verifying_share);
         let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
 
+        Ok((key_package, pubkey_package, vk_bytes))
+    }
+
+    fn build_nsec_share_data(
+        key_package: frost_secp256k1_tr::keys::KeyPackage,
+        pubkey_package: frost_secp256k1_tr::keys::PublicKeyPackage,
+        vk_bytes: Vec<u8>,
+        name: String,
+    ) -> Result<(ShareMetadataInfo, StoredShareData), KeepMobileError> {
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33]
                 .try_into()
@@ -770,25 +814,7 @@ impl KeepMobile {
             })?,
         };
 
-        let serialized = serde_json::to_vec(&stored)
-            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
-
-        let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
-        self.storage.store_share_by_key(
-            group_pubkey_hex.clone(),
-            serialized,
-            metadata_info.clone(),
-        )?;
-        self.storage
-            .set_active_share_key(Some(group_pubkey_hex.clone()))?;
-
-        Ok(ShareInfo {
-            name: metadata_info.name,
-            share_index: metadata_info.identifier,
-            threshold: metadata_info.threshold,
-            total_shares: metadata_info.total_shares,
-            group_pubkey: group_pubkey_hex,
-        })
+        Ok((metadata_info, stored))
     }
 
     fn policy_read_lock(

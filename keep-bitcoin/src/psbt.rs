@@ -27,6 +27,10 @@ pub struct OutputInfo {
     pub is_change: bool,
 }
 
+// NOTE: `Keypair` (from secp256k1) does not implement `Zeroize` and cannot be reliably
+// zeroed. Transient `Keypair` values created during `sign()` may leave stack residue.
+// The canonical secret key is held in `MlockedBox` which provides mlock + madvise +
+// zeroize-on-drop, so the authoritative copy is protected at rest.
 pub struct PsbtSigner {
     secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
@@ -177,7 +181,10 @@ impl PsbtSigner {
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
         let keypair = self.keypair()?;
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        let aux_rand = crate::aux_rand()?;
+        let sig = self
+            .secp
+            .sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
 
         let taproot_sig = TaprootSignature {
             signature: sig,

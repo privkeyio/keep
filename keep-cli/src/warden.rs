@@ -190,6 +190,8 @@ pub async fn check_policy(
     }
 }
 
+const MAX_APPROVAL_TIMEOUT_SECS: u64 = 300;
+
 pub async fn wait_for_approval(
     warden_url: &str,
     token: Option<String>,
@@ -199,7 +201,7 @@ pub async fn wait_for_approval(
     let client = WardenClient::new(warden_url, token)?;
 
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    let timeout = Duration::from_secs(timeout_secs.min(MAX_APPROVAL_TIMEOUT_SECS));
 
     loop {
         if start.elapsed() >= timeout {

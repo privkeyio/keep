@@ -250,6 +250,8 @@ impl EnclaveSigner {
             let msg = Message::from_digest_slice(sighash.as_ref())
                 .map_err(|e| EnclaveError::Signing(format!("Message failed: {}", e)))?;
 
+            // Deterministic signing: enclave environment may lack reliable auxiliary
+            // randomness for side-channel protection, so we skip aux_rand.
             let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
             psbt.inputs[i].tap_key_sig = Some(TaprootSignature {

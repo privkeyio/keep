@@ -21,6 +21,7 @@ use crate::wallet::WalletDescriptor;
 use bincode::Options;
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
+const MAX_PASSWORD_LEN: usize = 4096;
 
 pub(crate) fn bincode_options() -> impl Options {
     bincode::options()
@@ -50,6 +51,17 @@ fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Resul
         return Err(KeepError::InvalidInput(format!(
             "argon2 {} parameter: {} (must be {}-{})",
             name, value, bounds.min, bounds.max
+        )));
+    }
+    Ok(())
+}
+
+fn validate_password_len(password: &str) -> Result<()> {
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "password too long: {} bytes (max {})",
+            password.len(),
+            MAX_PASSWORD_LEN
         )));
     }
     Ok(())
@@ -203,6 +215,8 @@ impl Storage {
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
     ) -> Result<Self> {
+        validate_password_len(password)?;
+
         let mut header = Header::new(params);
         let data_key = SecretKey::generate()?;
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
@@ -285,6 +299,8 @@ impl Storage {
 
     /// Verify a password without changing the unlock state.
     pub fn verify_password(&self, password: &str) -> Result<()> {
+        validate_password_len(password)?;
+
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
@@ -315,6 +331,8 @@ impl Storage {
     }
 
     fn unlock_inner(&mut self, password: &str) -> Result<()> {
+        validate_password_len(password)?;
+
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
             return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
