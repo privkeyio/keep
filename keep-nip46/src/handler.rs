@@ -176,6 +176,12 @@ impl SignerHandler {
         if pm.has_permission(app_pubkey, perm) {
             Ok(())
         } else {
+            drop(pm);
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::PermissionDenied, *app_pubkey)
+                    .with_success(false)
+                    .with_reason(&format!("{perm:?} not permitted")),
+            );
             Err(KeepError::PermissionDenied(
                 "operation not permitted".into(),
             ))
@@ -263,15 +269,19 @@ impl SignerHandler {
                 "too many connected apps".into(),
             ));
         }
+        drop(pm);
 
-        let mut audit = self.audit.lock().await;
-        audit.log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
         info!(app_id, "app connected");
         Ok(())
     }
 
     pub async fn handle_get_public_key(&self, app_pubkey: PublicKey) -> Result<PublicKey> {
+        self.check_rate_limit(&app_pubkey).await?;
         let pm = self.permissions.lock().await;
         if !pm.has_permission(&app_pubkey, Permission::GET_PUBLIC_KEY) {
             let mut audit = self.audit.lock().await;
