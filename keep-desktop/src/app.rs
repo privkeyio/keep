@@ -248,7 +248,13 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
                 }
                 result.push_str(line);
                 if result.len() >= MAX_CHARS {
-                    result.truncate(MAX_CHARS);
+                    let boundary = result
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .take_while(|&i| i <= MAX_CHARS)
+                        .last()
+                        .unwrap_or(0);
+                    result.truncate(boundary);
                     result.push_str("...");
                     return result;
                 }
@@ -837,21 +843,19 @@ impl App {
             _ => return Task::none(),
         };
 
-        let keep_path = self.keep_path.clone();
-        let pw_check = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut tmp = Keep::open(&keep_path).map_err(friendly_err)?;
-            tmp.unlock(&password).map_err(friendly_err)
-        }));
-        match pw_check {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.set_toast(e, ToastKind::Error);
-                return Task::none();
+        let pw_result = {
+            let mut guard = lock_keep(&self.keep);
+            match guard.as_mut() {
+                None => Err("Keep not available".to_string()),
+                Some(keep) => {
+                    keep.lock();
+                    keep.unlock(&password).map_err(friendly_err)
+                }
             }
-            Err(_) => {
-                self.set_toast("Password verification failed".into(), ToastKind::Error);
-                return Task::none();
-            }
+        };
+        if let Err(e) = pw_result {
+            self.set_toast(e, ToastKind::Error);
+            return Task::none();
         }
 
         self.frost_status = ConnectionStatus::Connecting;
