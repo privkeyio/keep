@@ -125,6 +125,10 @@ pub enum Message {
     BunkerCopyUrl,
     BunkerRevokeResult(Result<(), String>),
     BunkerClientsLoaded(Vec<crate::screen::bunker::ConnectedClient>),
+    BunkerToggleClient(usize),
+    BunkerTogglePermission(usize, u32),
+    BunkerSetApprovalDuration(usize),
+    BunkerPermissionUpdated(Result<(), String>),
 
     // Timer
     Tick,
@@ -239,6 +243,16 @@ impl fmt::Debug for Message {
                 .debug_tuple("BunkerClientsLoaded")
                 .field(&c.len())
                 .finish(),
+            Self::BunkerToggleClient(i) => f.debug_tuple("BunkerToggleClient").field(i).finish(),
+            Self::BunkerTogglePermission(i, f2) => f
+                .debug_tuple("BunkerTogglePermission")
+                .field(i)
+                .field(f2)
+                .finish(),
+            Self::BunkerSetApprovalDuration(i) => {
+                f.debug_tuple("BunkerSetApprovalDuration").field(i).finish()
+            }
+            Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
             Self::Tick => f.write_str("Tick"),
         }
     }

@@ -327,7 +327,11 @@ impl App {
             | Message::BunkerRevokeAll
             | Message::BunkerCopyUrl
             | Message::BunkerRevokeResult(..)
-            | Message::BunkerClientsLoaded(..) => self.handle_bunker_message(message),
+            | Message::BunkerClientsLoaded(..)
+            | Message::BunkerToggleClient(..)
+            | Message::BunkerTogglePermission(..)
+            | Message::BunkerSetApprovalDuration(..)
+            | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
         }
     }
 
