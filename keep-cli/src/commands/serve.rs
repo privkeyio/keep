@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nostr_sdk::prelude::ToBech32;
 use secrecy::ExposeSecret;
@@ -12,14 +13,17 @@ use tracing::{debug, info};
 use zeroize::Zeroize;
 
 use keep_core::error::{KeepError, Result};
+use keep_core::keyring::Keyring;
 use keep_core::Keep;
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
-use keep_nip46::{FrostSigner, NetworkFrostSigner, Server};
+use keep_nip46::{FrostSigner, NetworkFrostSigner, Server, ServerConfig};
 
 use crate::output::Output;
 use crate::tui::{ApprovalRequest as TuiApprovalRequest, LogEntry, TuiEvent};
 
 use super::{get_password, is_hidden_vault};
+
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct TuiCallbacks {
     tx: Sender<TuiEvent>,
@@ -47,7 +51,7 @@ impl ServerCallbacks for TuiCallbacks {
         if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
             return false;
         }
-        response_rx.recv().unwrap_or(false)
+        tokio::task::block_in_place(|| response_rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false))
     }
 }
 
@@ -90,6 +94,12 @@ pub fn cmd_serve(
         out.field("Bunker Relay", relay);
         out.newline();
 
+        if !headless {
+            return Err(KeepError::Runtime(
+                "FROST network mode requires --headless".into(),
+            ));
+        }
+
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
@@ -116,8 +126,17 @@ pub fn cmd_serve(
 
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
 
-            let mut server =
-                Server::new_network_frost(net_signer, transport_key, relay, None).await?;
+            let mut server = Server::new_network_frost_with_config(
+                net_signer,
+                transport_key,
+                &[relay.to_string()],
+                None,
+                ServerConfig {
+                    auto_approve: true,
+                    ..ServerConfig::default()
+                },
+            )
+            .await?;
             let bunker_url = server.bunker_url();
             out.field("Bunker URL", &bunker_url);
             out.newline();
@@ -159,12 +178,24 @@ pub fn cmd_serve(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
+        let headless_config = ServerConfig {
+            auto_approve: true,
+            ..Default::default()
+        };
         rt.block_on(async {
             let mut server = if let Some(frost) = frost_signer {
                 let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-                Server::new_frost(frost, transport_key, relay, None).await?
+                Server::new_with_config(
+                    Arc::new(Mutex::new(Keyring::new())),
+                    Some(frost),
+                    Some(transport_key),
+                    relay,
+                    None,
+                    headless_config,
+                )
+                .await?
             } else {
-                Server::new(keyring, relay, None).await?
+                Server::new_with_config(keyring, None, None, relay, None, headless_config).await?
             };
             info!(relay, bunker_url = %server.bunker_url(), "server started");
             out.field("Bunker URL", &server.bunker_url());
@@ -176,7 +207,7 @@ pub fn cmd_serve(
         return Ok(());
     }
 
-    let (bunker_url, npub, keyring_for_tui, _, transport_key_for_tui) = rt.block_on(async {
+    let (bunker_url, npub, keyring_for_tui, transport_key_for_tui) = rt.block_on(async {
         if let Some(ref frost) = frost_signer {
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
             let server = Server::new_frost(frost.clone(), transport_key, relay, None).await?;
@@ -184,7 +215,6 @@ pub fn cmd_serve(
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
                 keyring.clone(),
-                true,
                 Some(transport_key),
             ))
         } else {
@@ -193,7 +223,6 @@ pub fn cmd_serve(
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
                 keyring.clone(),
-                false,
                 None,
             ))
         }
@@ -258,61 +287,12 @@ pub fn cmd_serve(
     Ok(())
 }
 
-fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
-    use keep_core::crypto::{self, EncryptedData};
-    use keep_core::hidden::HiddenStorage;
-    use keep_core::keyring::Keyring;
-
-    debug!(relay, headless, "starting server from outer volume");
-
-    let mut storage = HiddenStorage::open(path)?;
-    let password = get_password("Enter password")?;
-
-    let spinner = out.spinner("Unlocking vault...");
-    storage.unlock_outer(password.expose_secret())?;
-    spinner.finish();
-
-    let data_key = storage.data_key().ok_or(KeepError::Locked)?;
-    let records = storage.list_keys()?;
-
-    let mut keyring = Keyring::new();
-    for record in records {
-        let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
-        let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
-        let mut secret = [0u8; 32];
-        let decrypted = secret_bytes.as_slice()?;
-        secret.copy_from_slice(&decrypted);
-        keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
-        secret.zeroize();
-    }
-
-    let keyring = Arc::new(Mutex::new(keyring));
-    let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
-
-    if headless {
-        rt.block_on(async {
-            let mut server = Server::new(keyring, relay, None).await?;
-            info!(relay, bunker_url = %server.bunker_url(), "server started");
-            out.field("Bunker URL", &server.bunker_url());
-            out.field("Relay", relay);
-            out.newline();
-            out.info("Listening...");
-            server.run().await
-        })?;
-        return Ok(());
-    }
-
-    let (bunker_url, npub) = rt.block_on(async {
-        let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((
-            server.bunker_url(),
-            server.pubkey().to_bech32().unwrap_or_default(),
-        ))
-    })?;
-
-    info!(relay, npub = %npub, "starting TUI");
-
+fn spawn_tui_server(
+    keyring: Arc<Mutex<Keyring>>,
+    relay: &str,
+    bunker_url: String,
+    npub: String,
+) -> Result<()> {
     let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
@@ -355,10 +335,91 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     Ok(())
 }
 
-fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
+fn run_headless(out: &Output, keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<()> {
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    rt.block_on(async {
+        let mut server = Server::new_with_config(
+            keyring,
+            None,
+            None,
+            relay,
+            None,
+            ServerConfig {
+                auto_approve: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        info!(relay, bunker_url = %server.bunker_url(), "server started");
+        out.field("Bunker URL", &server.bunker_url());
+        out.field("Relay", relay);
+        out.newline();
+        out.info("Listening...");
+        server.run().await
+    })?;
+    Ok(())
+}
+
+fn get_bunker_info(keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<(String, String)> {
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    rt.block_on(async {
+        let server = Server::new(keyring, relay, None).await?;
+        Ok((
+            server.bunker_url(),
+            server.pubkey().to_bech32().unwrap_or_default(),
+        ))
+    })
+}
+
+fn unlock_hidden_keyring(
+    storage: &keep_core::hidden::HiddenStorage,
+    data_key: &keep_core::crypto::SecretKey,
+) -> Result<Keyring> {
     use keep_core::crypto::{self, EncryptedData};
+
+    let records = storage.list_keys()?;
+    let mut keyring = Keyring::new();
+    for record in records {
+        let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
+        let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
+        let mut secret = [0u8; 32];
+        let decrypted = secret_bytes.as_slice()?;
+        secret.copy_from_slice(&decrypted);
+        keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
+        secret.zeroize();
+    }
+    Ok(keyring)
+}
+
+fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
     use keep_core::hidden::HiddenStorage;
-    use keep_core::keyring::Keyring;
+
+    debug!(relay, headless, "starting server from outer volume");
+
+    let mut storage = HiddenStorage::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    storage.unlock_outer(password.expose_secret())?;
+    spinner.finish();
+
+    let data_key = storage.data_key().ok_or(KeepError::Locked)?;
+    let keyring = unlock_hidden_keyring(&storage, data_key)?;
+    let keyring = Arc::new(Mutex::new(keyring));
+
+    if headless {
+        return run_headless(out, keyring, relay);
+    }
+
+    let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
+    info!(relay, npub = %npub, "starting TUI");
+    spawn_tui_server(keyring, relay, bunker_url, npub)
+}
+
+fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
+    use keep_core::hidden::HiddenStorage;
 
     debug!(relay, headless, "starting server from hidden volume");
 
@@ -372,84 +433,14 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     out.hidden_label();
 
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
-    let records = storage.list_keys()?;
-
-    let mut keyring = Keyring::new();
-    for record in records {
-        let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
-        let secret_bytes = crypto::decrypt(&encrypted, data_key)?;
-        let mut secret = [0u8; 32];
-        let decrypted = secret_bytes.as_slice()?;
-        secret.copy_from_slice(&decrypted);
-        keyring.load_key(record.pubkey, secret, record.key_type, record.name)?;
-        secret.zeroize();
-    }
-
+    let keyring = unlock_hidden_keyring(&storage, data_key)?;
     let keyring = Arc::new(Mutex::new(keyring));
-    let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
-        rt.block_on(async {
-            let mut server = Server::new(keyring, relay, None).await?;
-            info!(relay, bunker_url = %server.bunker_url(), "hidden server started");
-            out.field("Bunker URL", &server.bunker_url());
-            out.field("Relay", relay);
-            out.newline();
-            out.info("Listening...");
-            server.run().await
-        })?;
-        return Ok(());
+        return run_headless(out, keyring, relay);
     }
 
-    let (bunker_url, npub) = rt.block_on(async {
-        let server = Server::new(keyring.clone(), relay, None).await?;
-        Ok::<_, KeepError>((
-            server.bunker_url(),
-            server.pubkey().to_bech32().unwrap_or_default(),
-        ))
-    })?;
-
+    let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
-
-    let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
-    let tui_tx_clone = tui_tx.clone();
-    let relay_clone = relay.to_string();
-
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tui_tx_clone.send(TuiEvent::Log(
-                    LogEntry::new("system", "runtime error", false).with_detail(&e.to_string()),
-                ));
-                return;
-            }
-        };
-        rt.block_on(async {
-            let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
-                tx: tui_tx_clone.clone(),
-            }));
-
-            let mut server = match Server::new(keyring, &relay_clone, callbacks).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx_clone.send(TuiEvent::Log(
-                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                    ));
-                    return;
-                }
-            };
-
-            if let Err(e) = server.run().await {
-                let _ = tui_tx_clone.send(TuiEvent::Log(
-                    LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                ));
-            }
-        });
-    });
-
-    tui.run()
-        .map_err(|e| KeepError::Runtime(format!("TUI: {e}")))?;
-    Ok(())
+    spawn_tui_server(keyring, relay, bunker_url, npub)
 }

@@ -57,6 +57,7 @@ pub enum Message {
     NavigateShares,
     NavigateWallets,
     NavigateRelay,
+    NavigateBunker,
     Lock,
 
     // Share list
@@ -108,6 +109,23 @@ pub enum Message {
     ApproveSignRequest(String),
     RejectSignRequest(String),
 
+    // Bunker
+    BunkerRelayInputChanged(String),
+    BunkerAddRelay,
+    BunkerRemoveRelay(usize),
+    BunkerStart,
+    BunkerStartResult(Result<String, String>),
+    BunkerStop,
+    BunkerApprove,
+    BunkerReject,
+    BunkerRevokeClient(usize),
+    BunkerConfirmRevokeAll,
+    BunkerCancelRevokeAll,
+    BunkerRevokeAll,
+    BunkerCopyUrl,
+    BunkerRevokeResult(Result<(), String>),
+    BunkerClientsLoaded(Vec<crate::screen::bunker::ConnectedClient>),
+
     // Timer
     Tick,
 }
@@ -155,6 +173,7 @@ impl fmt::Debug for Message {
             Self::NavigateShares => f.write_str("NavigateShares"),
             Self::NavigateWallets => f.write_str("NavigateWallets"),
             Self::NavigateRelay => f.write_str("NavigateRelay"),
+            Self::NavigateBunker => f.write_str("NavigateBunker"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::SetActiveShare(k) => f.debug_tuple("SetActiveShare").field(k).finish(),
@@ -199,6 +218,27 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::ApproveSignRequest(id) => f.debug_tuple("ApproveSignRequest").field(id).finish(),
             Self::RejectSignRequest(id) => f.debug_tuple("RejectSignRequest").field(id).finish(),
+            Self::BunkerRelayInputChanged(_) => f.write_str("BunkerRelayInputChanged"),
+            Self::BunkerAddRelay => f.write_str("BunkerAddRelay"),
+            Self::BunkerRemoveRelay(i) => f.debug_tuple("BunkerRemoveRelay").field(i).finish(),
+            Self::BunkerStart => f.write_str("BunkerStart"),
+            Self::BunkerStartResult(r) => f
+                .debug_tuple("BunkerStartResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::BunkerStop => f.write_str("BunkerStop"),
+            Self::BunkerApprove => f.write_str("BunkerApprove"),
+            Self::BunkerReject => f.write_str("BunkerReject"),
+            Self::BunkerRevokeClient(i) => f.debug_tuple("BunkerRevokeClient").field(i).finish(),
+            Self::BunkerConfirmRevokeAll => f.write_str("BunkerConfirmRevokeAll"),
+            Self::BunkerCancelRevokeAll => f.write_str("BunkerCancelRevokeAll"),
+            Self::BunkerRevokeAll => f.write_str("BunkerRevokeAll"),
+            Self::BunkerCopyUrl => f.write_str("BunkerCopyUrl"),
+            Self::BunkerRevokeResult(_) => f.write_str("BunkerRevokeResult"),
+            Self::BunkerClientsLoaded(c) => f
+                .debug_tuple("BunkerClientsLoaded")
+                .field(&c.len())
+                .finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

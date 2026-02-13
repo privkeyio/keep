@@ -23,6 +23,7 @@ pub struct ServerConfig {
     pub max_event_json_size: usize,
     pub audit_log_capacity: usize,
     pub rate_limit: Option<RateLimitConfig>,
+    pub auto_approve: bool,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +32,7 @@ impl Default for ServerConfig {
             max_event_json_size: 64 * 1024,
             audit_log_capacity: 10_000,
             rate_limit: None,
+            auto_approve: false,
         }
     }
 }
@@ -43,6 +45,26 @@ pub struct Server {
     running: bool,
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     config: ServerConfig,
+    bunker_secret: Option<String>,
+}
+
+fn generate_headless_secret() -> String {
+    let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+    warn!("headless mode: bunker secret required for authentication");
+    secret
+}
+
+fn apply_headless_secret(
+    handler: SignerHandler,
+    auto_approve: bool,
+) -> (SignerHandler, Option<String>) {
+    if auto_approve {
+        let secret = generate_headless_secret();
+        let handler = handler.with_expected_secret(secret.clone());
+        (handler, Some(secret))
+    } else {
+        (handler, None)
+    }
 }
 
 impl Server {
@@ -113,13 +135,15 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
-        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone());
+        let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
+            .with_auto_approve(config.auto_approve);
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
         if let Some(ref rl_config) = config.rate_limit {
             handler = handler.with_rate_limit(rl_config.clone());
         }
+        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
 
         Ok(Self {
             keys,
@@ -129,6 +153,7 @@ impl Server {
             running: false,
             callbacks,
             config,
+            bunker_secret,
         })
     }
 
@@ -219,10 +244,12 @@ impl Server {
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
-            .with_network_frost_signer(network_signer);
+            .with_network_frost_signer(network_signer)
+            .with_auto_approve(config.auto_approve);
         if let Some(ref rl_config) = config.rate_limit {
             handler = handler.with_rate_limit(rl_config.clone());
         }
+        let (handler, bunker_secret) = apply_headless_secret(handler, config.auto_approve);
 
         Ok(Self {
             keys,
@@ -232,11 +259,16 @@ impl Server {
             running: false,
             callbacks,
             config,
+            bunker_secret,
         })
     }
 
     pub fn bunker_url(&self) -> String {
-        generate_bunker_url(&self.keys.public_key(), &self.relay_url, None)
+        generate_bunker_url(
+            &self.keys.public_key(),
+            &self.relay_url,
+            self.bunker_secret.as_deref(),
+        )
     }
 
     pub fn pubkey(&self) -> PublicKey {
@@ -322,6 +354,10 @@ impl Server {
         let decrypted = nip44::decrypt(keys.secret_key(), &app_pubkey, &event.content)
             .map_err(|e| CryptoError::decryption(e.to_string()))?;
 
+        if decrypted.len() > max_event_json_size {
+            return Err(KeepError::InvalidInput("NIP-46 request too large".into()));
+        }
+
         let request: Nip46Request = serde_json::from_str(&decrypted)
             .map_err(|e| StorageError::invalid_format(format!("NIP-46 request: {e}")))?;
 
@@ -341,10 +377,14 @@ impl Server {
         if let Some(cb) = callbacks {
             cb.on_log(LogEvent {
                 app: app_id.to_string(),
-                action: method,
+                action: method.clone(),
                 success,
                 detail: response.error.clone(),
             });
+
+            if method == "connect" && success {
+                cb.on_connect(&app_pubkey.to_hex(), &format!("App {app_id}"));
+            }
         }
 
         let response_json = serde_json::to_string(&response)
@@ -391,8 +431,7 @@ impl Server {
                     .handle_connect(app_pubkey, our_pubkey, secret, permissions)
                     .await
                 {
-                    Ok(Some(s)) => Nip46Response::ok(id, &s),
-                    Ok(None) => Nip46Response::ok(id, "ack"),
+                    Ok(()) => Nip46Response::ok(id, "ack"),
                     Err(e) => {
                         warn!(error = %e, "connect failed");
                         Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
@@ -425,11 +464,18 @@ impl Server {
                     return Nip46Response::error(id, "Invalid created_at timestamp");
                 }
 
-                let tags: Vec<Tag> = partial
-                    .tags
-                    .into_iter()
-                    .filter_map(|t| Tag::parse(&t).ok())
-                    .collect();
+                let max_future = Timestamp::now().as_secs() + 86_400;
+                if partial.created_at as u64 > max_future {
+                    return Nip46Response::error(id, "created_at timestamp too far in the future");
+                }
+
+                let mut tags = Vec::with_capacity(partial.tags.len());
+                for t in &partial.tags {
+                    match Tag::parse(t) {
+                        Ok(tag) => tags.push(tag),
+                        Err(_) => return Nip46Response::error(id, "Invalid tag in event"),
+                    }
+                }
 
                 let unsigned = UnsignedEvent::new(
                     user_pubkey,
@@ -495,6 +541,10 @@ impl Server {
             "ping" => Nip46Response::ok(id, "pong"),
             _ => Nip46Response::error(id, "Unknown method"),
         }
+    }
+
+    pub fn handler(&self) -> Arc<SignerHandler> {
+        self.handler.clone()
     }
 
     #[allow(dead_code)]

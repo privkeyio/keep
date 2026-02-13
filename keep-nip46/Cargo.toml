@@ -9,6 +9,7 @@ license.workspace = true
 keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net" }
 
+hex.workspace = true
 nostr-sdk.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -19,3 +20,9 @@ urlencoding.workspace = true
 url.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+subtle.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+rustls = { version = "0.23", features = ["ring"] }
+tracing-subscriber = "0.3"

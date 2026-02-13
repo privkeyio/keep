@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod bunker;
 pub mod create;
 pub mod export;
 pub mod import;
@@ -20,6 +21,7 @@ pub enum Screen {
     Import(import::ImportScreen),
     Wallet(wallet::WalletScreen),
     Relay(relay::RelayScreen),
+    Bunker(Box<bunker::BunkerScreen>),
 }
 
 impl Screen {
@@ -32,6 +34,7 @@ impl Screen {
             Screen::Import(s) => s.view(pending_requests),
             Screen::Wallet(s) => s.view(pending_requests),
             Screen::Relay(s) => s.view(),
+            Screen::Bunker(s) => s.view(),
         }
     }
 
@@ -51,6 +54,10 @@ impl Screen {
             }
             Screen::Import(s) => {
                 s.loading = false;
+                s.error = Some(error);
+            }
+            Screen::Bunker(s) => {
+                s.starting = false;
                 s.error = Some(error);
             }
             Screen::ShareList(_) | Screen::Wallet(_) | Screen::Relay(_) => {}

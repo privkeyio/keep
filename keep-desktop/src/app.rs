@@ -22,6 +22,9 @@ use crate::message::{
     ConnectionStatus, ExportData, FrostNodeMsg, Message, PeerEntry, PendingSignRequest,
     ShareIdentity,
 };
+use crate::screen::bunker::{
+    BunkerScreen, ConnectedClient, LogDisplayEntry, PendingApprovalDisplay,
+};
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::ImportScreen;
@@ -46,6 +49,10 @@ const RATE_LIMIT_GLOBAL: usize = 100;
 const RECONNECT_BASE_MS: u64 = 200;
 const RECONNECT_MAX_MS: u64 = 30_000;
 const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
+
+const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
 #[derive(Clone)]
 pub enum ToastKind {
@@ -97,6 +104,83 @@ struct PendingRequestEntry {
     response_tx: mpsc::Sender<bool>,
 }
 
+enum BunkerEvent {
+    Log {
+        app: String,
+        action: String,
+        success: bool,
+    },
+    Approval {
+        display: PendingApprovalDisplay,
+        response_tx: std::sync::mpsc::Sender<bool>,
+    },
+    Connected {
+        pubkey: String,
+        name: String,
+    },
+}
+
+struct DesktopCallbacks {
+    tx: std::sync::mpsc::Sender<BunkerEvent>,
+}
+
+impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
+    fn on_log(&self, event: keep_nip46::types::LogEvent) {
+        let _ = self.tx.send(BunkerEvent::Log {
+            app: event.app,
+            action: event.action,
+            success: event.success,
+        });
+    }
+
+    fn request_approval(&self, request: keep_nip46::types::ApprovalRequest) -> bool {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let display = PendingApprovalDisplay {
+            app_name: request.app_name,
+            method: request.method,
+            event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
+            event_content: request.event_content,
+        };
+        if self
+            .tx
+            .send(BunkerEvent::Approval {
+                display,
+                response_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        tokio::task::block_in_place(|| {
+            response_rx
+                .recv_timeout(BUNKER_APPROVAL_TIMEOUT)
+                .unwrap_or(false)
+        })
+    }
+
+    fn on_connect(&self, pubkey: &str, name: &str) {
+        let _ = self.tx.send(BunkerEvent::Connected {
+            pubkey: pubkey.to_string(),
+            name: name.to_string(),
+        });
+    }
+}
+
+struct BunkerSetup {
+    handler: Arc<keep_nip46::SignerHandler>,
+    event_rx: std::sync::mpsc::Receiver<BunkerEvent>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct RunningBunker {
+    url: String,
+    handler: Arc<keep_nip46::SignerHandler>,
+    event_rx: Arc<Mutex<std::sync::mpsc::Receiver<BunkerEvent>>>,
+    handle: tokio::task::JoinHandle<()>,
+    clients: Vec<ConnectedClient>,
+    log: VecDeque<LogDisplayEntry>,
+}
+
 pub struct App {
     keep: Arc<Mutex<Option<Keep>>>,
     keep_path: PathBuf,
@@ -118,6 +202,11 @@ pub struct App {
     frost_reconnect_at: Option<Instant>,
     frost_last_share: Option<ShareEntry>,
     frost_last_relay_urls: Option<Vec<String>>,
+    bunker: Option<RunningBunker>,
+    bunker_relays: Vec<String>,
+    bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
+    bunker_pending_approval: Option<PendingApprovalDisplay>,
+    bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
 }
 
 fn lock_keep(keep: &Arc<Mutex<Option<Keep>>>) -> std::sync::MutexGuard<'_, Option<Keep>> {
@@ -440,6 +529,14 @@ impl App {
             frost_reconnect_at: None,
             frost_last_share: None,
             frost_last_relay_urls: None,
+            bunker: None,
+            bunker_relays: DEFAULT_BUNKER_RELAYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            bunker_approval_tx: None,
+            bunker_pending_approval: None,
+            bunker_pending_setup: None,
         }
     }
 
@@ -488,6 +585,7 @@ impl App {
             | Message::NavigateWallets
             | Message::WalletsLoaded(..)
             | Message::NavigateRelay
+            | Message::NavigateBunker
             | Message::Lock => self.handle_navigation_message(message),
 
             Message::ToggleShareDetails(..)
@@ -528,7 +626,22 @@ impl App {
             | Message::DisconnectRelay
             | Message::ConnectRelayResult(..)
             | Message::ApproveSignRequest(..)
-            | Message::RejectSignRequest(..) => self.handle_relay_message(message),
+            | Message::RejectSignRequest(..)
+            | Message::BunkerRelayInputChanged(..)
+            | Message::BunkerAddRelay
+            | Message::BunkerRemoveRelay(..)
+            | Message::BunkerStart
+            | Message::BunkerStartResult(..)
+            | Message::BunkerStop
+            | Message::BunkerApprove
+            | Message::BunkerReject
+            | Message::BunkerRevokeClient(..)
+            | Message::BunkerConfirmRevokeAll
+            | Message::BunkerCancelRevokeAll
+            | Message::BunkerRevokeAll
+            | Message::BunkerCopyUrl
+            | Message::BunkerRevokeResult(..)
+            | Message::BunkerClientsLoaded(..) => self.handle_relay_message(message),
         }
     }
 
@@ -559,6 +672,7 @@ impl App {
             return self.handle_reconnect_relay();
         }
         self.drain_frost_events();
+        self.poll_bunker_events();
         Task::none()
     }
 
@@ -680,6 +794,13 @@ impl App {
                     self.frost_peers.clone(),
                     self.pending_sign_display.clone(),
                 ));
+                Task::none()
+            }
+            Message::NavigateBunker => {
+                if matches!(self.screen, Screen::Bunker(_)) {
+                    return Task::none();
+                }
+                self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
                 Task::none()
             }
             Message::Lock => self.do_lock(),
@@ -954,6 +1075,136 @@ impl App {
             }
             Message::RejectSignRequest(id) => {
                 self.respond_to_sign_request(&id, false);
+                Task::none()
+            }
+            Message::BunkerRelayInputChanged(input) => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.relay_input = input;
+                }
+                Task::none()
+            }
+            Message::BunkerAddRelay => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    let url = s.relay_input.trim().to_string();
+                    if let Err(e) = validate_relay_url(&url) {
+                        self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
+                        return Task::none();
+                    }
+                    let relay = normalize_relay_url(&url);
+                    if s.relays.contains(&relay) || self.bunker_relays.contains(&relay) {
+                        return Task::none();
+                    }
+                    if s.relays.len() < 5 {
+                        s.relays.push(relay.clone());
+                        self.bunker_relays.push(relay);
+                        s.relay_input.clear();
+                    }
+                }
+                Task::none()
+            }
+            Message::BunkerRemoveRelay(i) => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    if i < s.relays.len() {
+                        s.relays.remove(i);
+                        self.bunker_relays = s.relays.clone();
+                    }
+                }
+                Task::none()
+            }
+            Message::BunkerStart => self.handle_bunker_start(),
+            Message::BunkerStartResult(result) => self.handle_bunker_start_result(result),
+            Message::BunkerStop => {
+                self.stop_bunker();
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.running = false;
+                    s.starting = false;
+                    s.url = None;
+                    s.clients.clear();
+                    s.pending_approval = None;
+                }
+                self.set_toast("Bunker stopped".into(), ToastKind::Success);
+                Task::none()
+            }
+            Message::BunkerApprove | Message::BunkerReject => {
+                let approved = matches!(message, Message::BunkerApprove);
+                if let Some(tx) = self.bunker_approval_tx.take() {
+                    let _ = tx.send(approved);
+                }
+                self.bunker_pending_approval = None;
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.pending_approval = None;
+                }
+                Task::none()
+            }
+            Message::BunkerRevokeClient(i) => {
+                let pubkey_hex = if let Screen::Bunker(s) = &self.screen {
+                    s.clients.get(i).map(|c| c.pubkey.clone())
+                } else {
+                    None
+                };
+                if let (Some(hex), Some(ref bunker)) = (pubkey_hex, &self.bunker) {
+                    let handler = bunker.handler.clone();
+                    return Task::perform(
+                        async move {
+                            if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
+                                handler.revoke_client(&pk).await;
+                            }
+                            Ok::<(), String>(())
+                        },
+                        Message::BunkerRevokeResult,
+                    );
+                }
+                Task::none()
+            }
+            Message::BunkerRevokeResult(result) => {
+                if let Err(e) = result {
+                    if let Screen::Bunker(s) = &mut self.screen {
+                        s.error = Some(e);
+                    }
+                }
+                self.sync_bunker_clients()
+            }
+            Message::BunkerClientsLoaded(clients) => {
+                if let Some(ref mut bunker) = self.bunker {
+                    bunker.clients = clients.clone();
+                }
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.clients = clients;
+                    s.revoke_all_confirm = false;
+                }
+                Task::none()
+            }
+            Message::BunkerConfirmRevokeAll => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.revoke_all_confirm = true;
+                }
+                Task::none()
+            }
+            Message::BunkerCancelRevokeAll => {
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.revoke_all_confirm = false;
+                }
+                Task::none()
+            }
+            Message::BunkerRevokeAll => {
+                if let Some(ref bunker) = self.bunker {
+                    let handler = bunker.handler.clone();
+                    return Task::perform(
+                        async move {
+                            handler.revoke_all_clients().await;
+                            Ok::<(), String>(())
+                        },
+                        Message::BunkerRevokeResult,
+                    );
+                }
+                Task::none()
+            }
+            Message::BunkerCopyUrl => {
+                if let Some(ref bunker) = self.bunker {
+                    self.clipboard_clear_at =
+                        Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                    return iced::clipboard::write(bunker.url.clone());
+                }
                 Task::none()
             }
             _ => Task::none(),
@@ -1343,6 +1594,7 @@ impl App {
 
     fn do_lock(&mut self) -> Task<Message> {
         self.handle_disconnect_relay();
+        self.stop_bunker();
 
         let mut guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_mut() {
@@ -1723,5 +1975,253 @@ impl App {
             },
             Message::ImportResult,
         )
+    }
+
+    fn create_bunker_screen(&self) -> BunkerScreen {
+        if let Some(ref bunker) = self.bunker {
+            BunkerScreen::with_state(
+                true,
+                Some(bunker.url.clone()),
+                self.bunker_relays.clone(),
+                bunker.clients.clone(),
+                bunker.log.clone(),
+                self.bunker_pending_approval.clone(),
+            )
+        } else {
+            BunkerScreen::new(self.bunker_relays.clone())
+        }
+    }
+
+    fn handle_bunker_start(&mut self) -> Task<Message> {
+        if self.bunker.is_some() {
+            return Task::none();
+        }
+
+        if let Screen::Bunker(s) = &mut self.screen {
+            if s.starting || s.relays.is_empty() {
+                return Task::none();
+            }
+            s.starting = true;
+            s.error = None;
+        }
+
+        let keep_arc = self.keep.clone();
+        let relay = match self.bunker_relays.first() {
+            Some(r) => r.clone(),
+            None => return Task::none(),
+        };
+        if self.bunker_relays.len() > 1 {
+            tracing::warn!(
+                count = self.bunker_relays.len(),
+                "multiple bunker relays configured but only the first is used"
+            );
+        }
+
+        let setup_arc = Arc::new(Mutex::new(None));
+        self.bunker_pending_setup = Some(setup_arc.clone());
+
+        Task::perform(
+            async move {
+                let keyring = tokio::task::spawn_blocking(move || {
+                    let guard = lock_keep(&keep_arc);
+                    let keep = guard
+                        .as_ref()
+                        .ok_or_else(|| "Vault is locked".to_string())?;
+                    let kr = keep.keyring();
+                    let slot = kr
+                        .get_primary()
+                        .ok_or_else(|| "No signing key available".to_string())?;
+
+                    let pubkey = slot.pubkey;
+                    let secret = Zeroizing::new(*slot.expose_secret());
+                    let key_type = slot.key_type;
+                    let name = slot.name.clone();
+
+                    let mut new_kr = keep_core::keyring::Keyring::new();
+                    new_kr
+                        .load_key(pubkey, *secret, key_type, name)
+                        .map_err(|e| format!("Failed to prepare keyring: {e}"))?;
+
+                    Ok::<_, String>(Arc::new(tokio::sync::Mutex::new(new_kr)))
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                let (event_tx, event_rx) = std::sync::mpsc::channel();
+                let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
+                    Arc::new(DesktopCallbacks { tx: event_tx });
+
+                let mut server = keep_nip46::Server::new(keyring, &relay, Some(callbacks))
+                    .await
+                    .map_err(|e| format!("Failed to start bunker: {e}"))?;
+
+                let handler = server.handler();
+                let url = server.bunker_url();
+
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = server.run().await {
+                        tracing::error!(error = %e, "bunker server error");
+                    }
+                });
+
+                let mut guard = match setup_arc.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                *guard = Some(BunkerSetup {
+                    handler,
+                    event_rx,
+                    handle,
+                });
+
+                Ok(url)
+            },
+            Message::BunkerStartResult,
+        )
+    }
+
+    fn set_bunker_error(&mut self, msg: String) {
+        self.set_toast(msg.clone(), ToastKind::Error);
+        if let Screen::Bunker(s) = &mut self.screen {
+            s.starting = false;
+            s.error = Some(msg);
+        }
+    }
+
+    fn handle_bunker_start_result(&mut self, result: Result<String, String>) -> Task<Message> {
+        match result {
+            Ok(url) => {
+                let setup = match self.bunker_pending_setup.take() {
+                    Some(arc) => match arc.lock() {
+                        Ok(mut guard) => guard.take(),
+                        Err(_) => {
+                            self.set_bunker_error(
+                                "Internal error: bunker setup state corrupted".into(),
+                            );
+                            return Task::none();
+                        }
+                    },
+                    None => None,
+                };
+
+                let Some(setup) = setup else {
+                    self.set_bunker_error("Internal error: bunker setup missing".into());
+                    return Task::none();
+                };
+
+                self.bunker = Some(RunningBunker {
+                    url: url.clone(),
+                    handler: setup.handler,
+                    event_rx: Arc::new(Mutex::new(setup.event_rx)),
+                    handle: setup.handle,
+                    clients: Vec::new(),
+                    log: VecDeque::new(),
+                });
+
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.running = true;
+                    s.starting = false;
+                    s.qr_data = iced::widget::qr_code::Data::new(&url).ok();
+                    s.url = Some(url);
+                    s.error = None;
+                }
+            }
+            Err(e) => {
+                self.bunker_pending_setup = None;
+                self.set_bunker_error(e);
+            }
+        }
+        Task::none()
+    }
+
+    fn stop_bunker(&mut self) {
+        if let Some(tx) = self.bunker_approval_tx.take() {
+            let _ = tx.send(false);
+        }
+        self.bunker_pending_approval = None;
+
+        if let Some(bunker) = self.bunker.take() {
+            bunker.handle.abort();
+        }
+    }
+
+    fn poll_bunker_events(&mut self) {
+        let Some(ref mut bunker) = self.bunker else {
+            return;
+        };
+
+        let Ok(rx) = bunker.event_rx.lock() else {
+            return;
+        };
+
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                BunkerEvent::Connected { pubkey, name } => {
+                    if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
+                        let client = ConnectedClient { pubkey, name };
+                        bunker.clients.push(client.clone());
+                        if let Screen::Bunker(s) = &mut self.screen {
+                            s.clients.push(client);
+                        }
+                    }
+                }
+                BunkerEvent::Log {
+                    app,
+                    action,
+                    success,
+                } => {
+                    let entry = LogDisplayEntry {
+                        app,
+                        action,
+                        success,
+                    };
+                    if bunker.log.len() >= MAX_BUNKER_LOG_ENTRIES {
+                        bunker.log.pop_front();
+                    }
+                    bunker.log.push_back(entry.clone());
+                    if let Screen::Bunker(s) = &mut self.screen {
+                        if s.log.len() >= MAX_BUNKER_LOG_ENTRIES {
+                            s.log.pop_front();
+                        }
+                        s.log.push_back(entry);
+                    }
+                }
+                BunkerEvent::Approval {
+                    display,
+                    response_tx,
+                } => {
+                    if let Some(prev_tx) = self.bunker_approval_tx.take() {
+                        let _ = prev_tx.send(false);
+                    }
+                    self.bunker_pending_approval = Some(display.clone());
+                    self.bunker_approval_tx = Some(response_tx);
+                    if let Screen::Bunker(s) = &mut self.screen {
+                        s.pending_approval = Some(display);
+                    }
+                }
+            }
+        }
+    }
+
+    fn sync_bunker_clients(&self) -> Task<Message> {
+        if let Some(ref bunker) = self.bunker {
+            let handler = bunker.handler.clone();
+            Task::perform(
+                async move {
+                    handler
+                        .list_clients()
+                        .await
+                        .into_iter()
+                        .map(|app| ConnectedClient {
+                            pubkey: app.pubkey.to_hex(),
+                            name: app.name,
+                        })
+                        .collect()
+                },
+                Message::BunkerClientsLoaded,
+            )
+        } else {
+            Task::none()
+        }
     }
 }

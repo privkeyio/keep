@@ -21,6 +21,7 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
             "Storage error"
         }
         KeepError::HomeNotFound | KeepError::Config(_) => "Configuration error",
+        KeepError::CapacityExceeded(_) => "Capacity exceeded",
         KeepError::PermissionDenied(_) => "Permission denied",
         KeepError::UserRejected => "User rejected",
         KeepError::InvalidInput(_) => "Invalid input",

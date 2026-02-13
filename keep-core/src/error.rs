@@ -536,6 +536,8 @@ pub enum KeepError {
     Serialization(#[from] bincode::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Capacity exceeded: {0}")]
+    CapacityExceeded(String),
     #[error("{0}")]
     Other(String),
 }
