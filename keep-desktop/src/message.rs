@@ -38,7 +38,6 @@ pub struct PendingSignRequest {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub enum Message {
     // Unlock
     PasswordChanged(Zeroizing<String>),
@@ -99,6 +98,7 @@ pub enum Message {
 
     // Relay / FROST
     RelayUrlChanged(String),
+    ConnectPasswordChanged(Zeroizing<String>),
     AddRelay,
     RemoveRelay(usize),
     SelectShareForRelay(usize),
@@ -107,14 +107,12 @@ pub enum Message {
     ConnectRelayResult(Result<(), String>),
     ApproveSignRequest(String),
     RejectSignRequest(String),
-    FrostEvent(FrostNodeMsg),
 
     // Timer
     Tick,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum FrostNodeMsg {
     PeerUpdate(Vec<PeerEntry>),
     NewSignRequest(PendingSignRequest),
@@ -189,6 +187,7 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
+            Self::ConnectPasswordChanged(_) => f.write_str("ConnectPasswordChanged(***)"),
             Self::AddRelay => f.write_str("AddRelay"),
             Self::RemoveRelay(i) => f.debug_tuple("RemoveRelay").field(i).finish(),
             Self::SelectShareForRelay(i) => f.debug_tuple("SelectShareForRelay").field(i).finish(),
@@ -200,7 +199,6 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::ApproveSignRequest(id) => f.debug_tuple("ApproveSignRequest").field(id).finish(),
             Self::RejectSignRequest(id) => f.debug_tuple("RejectSignRequest").field(id).finish(),
-            Self::FrostEvent(e) => f.debug_tuple("FrostEvent").field(e).finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

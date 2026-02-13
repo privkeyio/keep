@@ -3,6 +3,7 @@
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use zeroize::Zeroizing;
 
 use crate::message::{ConnectionStatus, Message, PeerEntry, PendingSignRequest};
 use crate::screen::layout::{self, NavItem};
@@ -14,6 +15,7 @@ pub struct RelayScreen {
     pub relay_urls: Vec<String>,
     pub shares: Vec<ShareEntry>,
     pub selected_share: Option<usize>,
+    pub connect_password: Zeroizing<String>,
     pub status: ConnectionStatus,
     pub peers: Vec<PeerEntry>,
     pub pending_requests: Vec<PendingSignRequest>,
@@ -33,6 +35,7 @@ impl RelayScreen {
             relay_urls,
             shares,
             selected_share: selected,
+            connect_password: Zeroizing::new(String::new()),
             status,
             peers,
             pending_requests,
@@ -190,16 +193,28 @@ impl RelayScreen {
     fn connection_controls(&self) -> Element<Message> {
         match &self.status {
             ConnectionStatus::Disconnected => {
-                let can_connect = self.selected_share.is_some() && !self.relay_urls.is_empty();
-                button(
-                    text("Connect")
-                        .width(Length::Fill)
-                        .align_x(Alignment::Center),
-                )
-                .style(theme::primary_button)
-                .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
-                .padding(theme::space::MD)
-                .width(200)
+                let can_connect = self.selected_share.is_some()
+                    && !self.relay_urls.is_empty()
+                    && !self.connect_password.is_empty();
+                let password_input = text_input("Vault password", &self.connect_password)
+                    .on_input(|s| Message::ConnectPasswordChanged(Zeroizing::new(s)))
+                    .secure(true)
+                    .size(theme::size::SMALL)
+                    .width(200);
+                row![
+                    password_input,
+                    button(
+                        text("Connect")
+                            .width(Length::Fill)
+                            .align_x(Alignment::Center),
+                    )
+                    .style(theme::primary_button)
+                    .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
+                    .padding(theme::space::MD)
+                    .width(200),
+                ]
+                .spacing(theme::space::SM)
+                .align_y(Alignment::Center)
                 .into()
             }
             ConnectionStatus::Connecting => theme::muted("Connecting to relay...").into(),
