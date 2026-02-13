@@ -605,7 +605,13 @@ impl App {
     }
 
     pub fn view(&self) -> Element<Message> {
-        let screen = self.screen.view();
+        let pending_count = self
+            .pending_sign_requests
+            .lock()
+            .ok()
+            .map(|g| g.len())
+            .unwrap_or(0);
+        let screen = self.screen.view(pending_count);
         let Some(toast) = &self.toast else {
             return screen;
         };
@@ -765,6 +771,7 @@ impl App {
                 node.set_hooks(hooks);
 
                 let event_rx = node.subscribe();
+                let mut connect_rx = node.subscribe();
                 let node = Arc::new(node);
                 let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
                 let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
@@ -773,12 +780,14 @@ impl App {
                     *guard = Some(shutdown_tx);
                 }
 
+                let (run_error_tx, mut run_error_rx) = mpsc::channel::<String>(1);
                 let run_node = node.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         result = run_node.run() => {
                             if let Err(e) = result {
                                 tracing::error!("Node run failed: {e}");
+                                let _ = run_error_tx.send(format!("{e}")).await;
                             }
                         }
                         _ = shutdown_rx.recv() => {
@@ -803,6 +812,35 @@ impl App {
                         _ = listener_shutdown_rx.recv() => {}
                     }
                 });
+
+                let connect_timeout = tokio::time::sleep(Duration::from_secs(10));
+                tokio::pin!(connect_timeout);
+                loop {
+                    tokio::select! {
+                        err = run_error_rx.recv() => {
+                            let msg = err.unwrap_or_else(|| "Node stopped unexpectedly".into());
+                            if let Ok(mut q) = frost_events.lock() {
+                                q.push_back(FrostNodeMsg::StatusChanged(
+                                    ConnectionStatus::Error(msg.clone()),
+                                ));
+                            }
+                            return Err(msg);
+                        }
+                        result = connect_rx.recv() => {
+                            match result {
+                                Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
+                                Ok(_) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    return Err("Node stopped unexpectedly".into());
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
+                        }
+                        _ = &mut connect_timeout => {
+                            break;
+                        }
+                    }
+                }
 
                 Ok(())
             },

@@ -86,7 +86,7 @@ impl ShareListScreen {
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self, pending_requests: usize) -> Element<Message> {
         let title = theme::heading("FROST Shares");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -179,7 +179,7 @@ impl ShareListScreen {
             .height(Length::Fill);
 
         let count = (!self.shares.is_empty()).then_some(self.shares.len());
-        layout::with_sidebar(NavItem::Shares, inner.into(), count, 0)
+        layout::with_sidebar(NavItem::Shares, inner.into(), count, pending_requests)
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {

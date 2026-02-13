@@ -23,14 +23,14 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub fn view(&self) -> iced::Element<Message> {
+    pub fn view(&self, pending_requests: usize) -> iced::Element<Message> {
         match self {
             Screen::Unlock(s) => s.view(),
-            Screen::ShareList(s) => s.view(),
-            Screen::Create(s) => s.view(),
-            Screen::Export(s) => s.view(),
-            Screen::Import(s) => s.view(),
-            Screen::Wallet(s) => s.view(),
+            Screen::ShareList(s) => s.view(pending_requests),
+            Screen::Create(s) => s.view(pending_requests),
+            Screen::Export(s) => s.view(pending_requests),
+            Screen::Import(s) => s.view(pending_requests),
+            Screen::Wallet(s) => s.view(pending_requests),
             Screen::Relay(s) => s.view(),
         }
     }
