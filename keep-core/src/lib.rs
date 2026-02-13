@@ -500,6 +500,45 @@ impl Keep {
         Ok(())
     }
 
+    /// Get the hex-encoded group pubkey of the active share, if set.
+    pub fn get_active_share_key(&self) -> Option<String> {
+        std::fs::read_to_string(self.active_share_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_valid_hex_pubkey(s))
+    }
+
+    /// Set the active share by hex-encoded group pubkey. Pass `None` to clear.
+    pub fn set_active_share_key(&self, key: Option<&str>) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let path = self.active_share_path();
+        match key {
+            Some(k) => {
+                if !is_valid_hex_pubkey(k) {
+                    return Err(KeepError::InvalidInput(
+                        "Group pubkey must be 64 hex characters".into(),
+                    ));
+                }
+                let normalized = k.to_ascii_lowercase();
+                write_restricted(&path, normalized.as_bytes())?;
+            }
+            None => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn active_share_path(&self) -> PathBuf {
+        self.storage.path.join("active_share")
+    }
+
     /// Store a finalized wallet descriptor, associated with a FROST group.
     pub fn store_wallet_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
         if !self.is_unlocked() {
@@ -803,6 +842,23 @@ impl Keep {
     }
 }
 
+fn is_valid_hex_pubkey(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(data)
+}
+
 /// Returns the default path to the Keep directory (~/.keep).
 pub fn default_keep_path() -> Result<PathBuf> {
     dirs::home_dir()
@@ -970,6 +1026,27 @@ mod tests {
             keep.unlock("newpass").unwrap();
             assert!(keep.keyring().get_by_name("rotatetest").is_some());
         }
+    }
+
+    #[test]
+    fn test_is_valid_hex_pubkey() {
+        let valid = "a".repeat(64);
+        assert!(is_valid_hex_pubkey(&valid));
+
+        let mixed_hex = "0123456789abcdef".repeat(4);
+        assert!(is_valid_hex_pubkey(&mixed_hex));
+
+        // is_ascii_hexdigit accepts A-F; set_active_share_key normalizes
+        // to lowercase before persisting.
+        let upper = "A".repeat(64);
+        assert!(is_valid_hex_pubkey(&upper));
+
+        assert!(!is_valid_hex_pubkey(&"a".repeat(63)));
+        assert!(!is_valid_hex_pubkey(&"a".repeat(65)));
+        assert!(!is_valid_hex_pubkey(""));
+        assert!(!is_valid_hex_pubkey(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
     }
 
     #[test]

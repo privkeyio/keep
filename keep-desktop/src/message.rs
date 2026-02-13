@@ -38,6 +38,7 @@ pub enum Message {
 
     // Share list
     ToggleShareDetails(usize),
+    SetActiveShare(String),
     RequestDelete(ShareIdentity),
     ConfirmDelete(ShareIdentity),
     CancelDelete,
@@ -125,6 +126,7 @@ impl fmt::Debug for Message {
             Self::NavigateWallets => f.write_str("NavigateWallets"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
+            Self::SetActiveShare(k) => f.debug_tuple("SetActiveShare").field(k).finish(),
             Self::RequestDelete(id) => f.debug_tuple("RequestDelete").field(id).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),

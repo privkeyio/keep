@@ -71,14 +71,16 @@ impl ShareEntry {
 
 pub struct ShareListScreen {
     pub shares: Vec<ShareEntry>,
+    pub active_share_hex: Option<String>,
     pub delete_confirm: Option<ShareIdentity>,
     pub expanded: Option<usize>,
 }
 
 impl ShareListScreen {
-    pub fn new(shares: Vec<ShareEntry>) -> Self {
+    pub fn new(shares: Vec<ShareEntry>, active_share_hex: Option<String>) -> Self {
         Self {
             shares,
+            active_share_hex,
             delete_confirm: None,
             expanded: None,
         }
@@ -181,6 +183,8 @@ impl ShareListScreen {
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
+        let is_active = self.active_share_hex.as_deref() == Some(&share.group_pubkey_hex);
+
         let truncated_npub = share.truncated_npub();
 
         let badge = container(
@@ -209,21 +213,46 @@ impl ShareListScreen {
         .style(theme::text_button)
         .padding(0);
 
+        let mut header_buttons = row![].spacing(theme::space::SM).align_y(Alignment::Center);
+
+        if !is_active {
+            let activate_btn = button(text("Activate").size(theme::size::SMALL))
+                .on_press(Message::SetActiveShare(share.group_pubkey_hex.clone()))
+                .style(theme::secondary_button)
+                .padding([theme::space::XS, theme::space::MD]);
+
+            header_buttons = header_buttons.push(activate_btn);
+        }
+
         let export_btn = button(text("Export QR").size(theme::size::SMALL))
             .on_press(Message::GoToExport(i))
             .style(theme::primary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
-        let header_top = row![name_btn, Space::new().width(Length::Fill), export_btn,]
+        header_buttons = header_buttons.push(export_btn);
+
+        let header_top = row![name_btn, Space::new().width(Length::Fill), header_buttons,]
             .align_y(Alignment::Center);
 
-        let header_info = column![
-            header_top,
-            row![badge, share_index, npub_text]
-                .spacing(theme::space::SM)
-                .align_y(Alignment::Center),
-        ]
-        .spacing(theme::space::XS);
+        let mut info_row = row![badge, share_index]
+            .spacing(theme::space::SM)
+            .align_y(Alignment::Center);
+
+        if is_active {
+            let active_badge_elem = container(
+                text("ACTIVE")
+                    .size(theme::size::TINY)
+                    .color(iced::Color::WHITE),
+            )
+            .style(theme::active_badge)
+            .padding([2.0, theme::space::SM]);
+
+            info_row = info_row.push(active_badge_elem);
+        }
+
+        info_row = info_row.push(npub_text);
+
+        let header_info = column![header_top, info_row].spacing(theme::space::XS);
 
         let mut card_content = column![header_info].spacing(theme::space::SM);
 
@@ -293,8 +322,14 @@ impl ShareListScreen {
             card_content = card_content.push(details).push(actions);
         }
 
+        let card_style = if is_active {
+            theme::active_card_style
+        } else {
+            theme::card_style
+        };
+
         container(card_content)
-            .style(theme::card_style)
+            .style(card_style)
             .padding(theme::space::LG)
             .width(Length::Fill)
             .into()
