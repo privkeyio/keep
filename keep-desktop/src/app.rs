@@ -951,13 +951,10 @@ impl App {
         };
 
         let pw_result = {
-            let mut guard = lock_keep(&self.keep);
-            match guard.as_mut() {
+            let guard = lock_keep(&self.keep);
+            match guard.as_ref() {
                 None => Err("Keep not available".to_string()),
-                Some(keep) => {
-                    keep.lock();
-                    keep.unlock(&password).map_err(friendly_err)
-                }
+                Some(keep) => keep.verify_password(&password).map_err(friendly_err),
             }
         };
         if let Err(e) = pw_result {
@@ -1023,10 +1020,17 @@ impl App {
                 let _ = tx.try_send(());
             }
         }
+        self.frost_peers.clear();
+        self.pending_sign_display.clear();
+        if let Ok(mut guard) = self.pending_sign_requests.lock() {
+            guard.clear();
+        }
 
         self.frost_status = ConnectionStatus::Connecting;
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Connecting;
+            s.peers.clear();
+            s.pending_requests.clear();
         }
 
         Task::perform(
