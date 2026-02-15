@@ -1445,13 +1445,9 @@ impl App {
                         .as_ref()
                         .ok_or_else(|| "Vault is locked".to_string())?;
                     let page_size = SigningAuditScreen::page_size();
-                    let entries = keep
-                        .signing_audit_read_page(offset, page_size, caller.as_deref())
+                    let (entries, callers, count) = keep
+                        .signing_audit_read_page_with_metadata(offset, page_size, caller.as_deref())
                         .map_err(friendly_err)?;
-                    let callers = keep
-                        .signing_audit_distinct_callers()
-                        .map_err(friendly_err)?;
-                    let count = keep.signing_audit_count().map_err(friendly_err)?;
                     let display: Vec<AuditDisplayEntry> =
                         entries.into_iter().map(to_display_entry).collect();
                     let has_more = display.len() == page_size;
@@ -1518,8 +1514,11 @@ impl App {
             Message::AuditChainVerified(result) => {
                 if let Screen::SigningAudit(s) = &mut self.screen {
                     s.chain_status = match result {
-                        Ok(true) => ChainStatus::Valid(s.entry_count),
-                        Ok(false) => ChainStatus::Invalid,
+                        Ok((true, count)) => {
+                            s.entry_count = count;
+                            ChainStatus::Valid(count)
+                        }
+                        Ok((false, _)) => ChainStatus::Invalid,
                         Err(e) => ChainStatus::Error(e),
                     };
                 }
@@ -1543,10 +1542,11 @@ impl App {
                             s.loading = false;
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         if let Screen::SigningAudit(s) = &mut self.screen {
                             s.loading = false;
                         }
+                        self.set_toast(e, ToastKind::Error);
                     }
                 }
                 Task::none()

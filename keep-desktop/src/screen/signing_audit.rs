@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
@@ -9,6 +11,18 @@ use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 const PAGE_SIZE: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerOption {
+    pub full: Option<String>,
+    pub display: String,
+}
+
+impl fmt::Display for CallerOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.display)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AuditDisplayEntry {
@@ -95,7 +109,11 @@ impl SigningAuditScreen {
             }
 
             if self.has_more {
-                let label = if self.loading { "Loading..." } else { "Load more" };
+                let label = if self.loading {
+                    "Loading..."
+                } else {
+                    "Load more"
+                };
                 let load_more = button(
                     text(label)
                         .size(theme::size::SMALL)
@@ -122,12 +140,14 @@ impl SigningAuditScreen {
     fn chain_status_row(&self) -> Element<Message> {
         let (status_text, color) = match &self.chain_status {
             ChainStatus::Verifying => ("Verifying chain...".to_string(), theme::color::TEXT_MUTED),
-            ChainStatus::Valid(count) => {
-                (format!("Chain verified ({count} entries)"), theme::color::SUCCESS)
-            }
-            ChainStatus::Invalid => {
-                ("Tampering detected in audit log".to_string(), theme::color::ERROR)
-            }
+            ChainStatus::Valid(count) => (
+                format!("Chain verified ({count} entries)"),
+                theme::color::SUCCESS,
+            ),
+            ChainStatus::Invalid => (
+                "Tampering detected in audit log".to_string(),
+                theme::color::ERROR,
+            ),
             ChainStatus::Error(e) => (format!("Chain error: {e}"), theme::color::ERROR),
         };
 
@@ -137,29 +157,25 @@ impl SigningAuditScreen {
     }
 
     fn filter_row(&self) -> Element<Message> {
-        let all_label = "All clients".to_string();
-        let mut display_options = vec![all_label.clone()];
+        let all_option = CallerOption {
+            full: None,
+            display: "All clients".to_string(),
+        };
+        let mut options = vec![all_option.clone()];
         for c in &self.callers {
-            display_options.push(truncate_hex(c));
+            options.push(CallerOption {
+                full: Some(c.clone()),
+                display: truncate_hex(c),
+            });
         }
 
-        let selected = self
-            .selected_caller
-            .as_ref()
-            .map(|c| truncate_hex(c))
-            .unwrap_or_else(|| all_label.clone());
+        let selected = match &self.selected_caller {
+            Some(c) => options.iter().find(|o| o.full.as_ref() == Some(c)).cloned(),
+            None => Some(all_option),
+        };
 
-        let callers = self.callers.clone();
-        let picker = pick_list(display_options, Some(selected), move |choice| {
-            if choice == "All clients" {
-                Message::AuditFilterChanged(None)
-            } else {
-                let full = callers
-                    .iter()
-                    .find(|c| truncate_hex(c) == choice)
-                    .cloned();
-                Message::AuditFilterChanged(full)
-            }
+        let picker = pick_list(options, selected, |opt: CallerOption| {
+            Message::AuditFilterChanged(opt.full)
         })
         .text_size(theme::size::SMALL)
         .width(Length::Fixed(250.0));
@@ -267,7 +283,14 @@ fn truncate_hex(s: &str) -> String {
         return s.to_string();
     }
     let prefix: String = s.chars().take(8).collect();
-    let suffix: String = s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix: String = s
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{prefix}...{suffix}")
 }
 

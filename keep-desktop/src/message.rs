@@ -148,7 +148,7 @@ pub enum Message {
     NavigateAudit,
     AuditLoaded(Result<AuditLoadResult, String>),
     AuditPageLoaded(Result<AuditLoadResult, String>),
-    AuditChainVerified(Result<bool, String>),
+    AuditChainVerified(Result<(bool, usize), String>),
     AuditFilterChanged(Option<String>),
     AuditLoadMore,
 
@@ -311,7 +311,10 @@ impl fmt::Debug for Message {
                 .debug_tuple("AuditPageLoaded")
                 .field(&r.as_ref().map(|v| v.entries.len()).map_err(|e| e.as_str()))
                 .finish(),
-            Self::AuditChainVerified(r) => f.debug_tuple("AuditChainVerified").field(r).finish(),
+            Self::AuditChainVerified(r) => f
+                .debug_tuple("AuditChainVerified")
+                .field(&r.as_ref().map(|(v, c)| (*v, *c)).map_err(|e| e.as_str()))
+                .finish(),
             Self::AuditFilterChanged(c) => f.debug_tuple("AuditFilterChanged").field(c).finish(),
             Self::AuditLoadMore => f.write_str("AuditLoadMore"),
             Self::Tick => f.write_str("Tick"),

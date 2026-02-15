@@ -879,31 +879,19 @@ impl Keep {
         Ok(log.last_hash())
     }
 
-    /// Read a page of signing audit entries (newest first).
-    pub fn signing_audit_read_page(
+    /// Read a page of signing audit entries with metadata in a single decryption pass.
+    pub fn signing_audit_read_page_with_metadata(
         &self,
         offset: usize,
         limit: usize,
         caller_filter: Option<&str>,
-    ) -> Result<Vec<SigningAuditEntry>> {
+    ) -> Result<(Vec<SigningAuditEntry>, Vec<String>, usize)> {
         let (log, data_key) = self.signing_audit_with_key()?;
-        log.read_page(&data_key, offset, limit, caller_filter)
+        log.read_page_with_metadata(&data_key, offset, limit, caller_filter)
     }
 
-    /// Get distinct callers from the signing audit log.
-    pub fn signing_audit_distinct_callers(&self) -> Result<Vec<String>> {
-        let (log, data_key) = self.signing_audit_with_key()?;
-        log.distinct_callers(&data_key)
-    }
-
-    /// Get the count of signing audit entries.
-    pub fn signing_audit_count(&self) -> Result<usize> {
-        let (log, data_key) = self.signing_audit_with_key()?;
-        log.count(&data_key)
-    }
-
-    /// Verify the integrity of the signing audit chain.
-    pub fn signing_audit_verify_chain(&self) -> Result<bool> {
+    /// Verify the integrity of the signing audit chain and return the entry count.
+    pub fn signing_audit_verify_chain(&self) -> Result<(bool, usize)> {
         let (log, data_key) = self.signing_audit_with_key()?;
         log.verify_chain(&data_key)
     }

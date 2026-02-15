@@ -761,6 +761,36 @@ impl SigningAuditLog {
         Ok(entries)
     }
 
+    /// Read a page and return metadata (distinct callers, total count) in a single pass.
+    pub fn read_page_with_metadata(
+        &self,
+        data_key: &SecretKey,
+        offset: usize,
+        limit: usize,
+        caller_filter: Option<&str>,
+    ) -> Result<(Vec<SigningAuditEntry>, Vec<String>, usize)> {
+        let all = self.read_all(data_key)?;
+        let count = all.len();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut callers = Vec::new();
+        for entry in all.iter().rev() {
+            if seen.insert(entry.caller.clone()) {
+                callers.push(entry.caller.clone());
+            }
+        }
+
+        let entries = all
+            .into_iter()
+            .rev()
+            .filter(|e| caller_filter.map_or(true, |c| e.caller == c))
+            .skip(offset)
+            .take(limit)
+            .collect();
+
+        Ok((entries, callers, count))
+    }
+
     /// Get distinct callers, most recently active first.
     pub fn distinct_callers(&self, data_key: &SecretKey) -> Result<Vec<String>> {
         let entries = self.read_all(data_key)?;
@@ -779,19 +809,20 @@ impl SigningAuditLog {
         Ok(self.read_all(data_key)?.len())
     }
 
-    /// Verify the hash chain integrity.
-    pub fn verify_chain(&self, data_key: &SecretKey) -> Result<bool> {
+    /// Verify the hash chain integrity and return the entry count.
+    pub fn verify_chain(&self, data_key: &SecretKey) -> Result<(bool, usize)> {
         let entries = self.read_all(data_key)?;
+        let count = entries.len();
         let mut prev_hash = [0u8; 32];
 
         for entry in entries {
             if !entry.verify(&prev_hash) {
-                return Ok(false);
+                return Ok((false, count));
             }
             prev_hash = entry.hash;
         }
 
-        Ok(true)
+        Ok((true, count))
     }
 
     /// Get the last entry's hash.
@@ -1086,7 +1117,7 @@ mod tests {
             log.log(entry, &key).unwrap();
         }
 
-        assert!(log.verify_chain(&key).unwrap());
+        assert!(log.verify_chain(&key).unwrap().0);
     }
 
     #[test]
