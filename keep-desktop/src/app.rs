@@ -25,7 +25,7 @@ use crate::message::{
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
-use crate::screen::import::ImportScreen;
+use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::relay::RelayScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
@@ -643,6 +643,13 @@ impl App {
                 if let Screen::Import(s) = &mut self.screen {
                     let trimmed = d.trim();
                     s.mode = ImportScreen::detect_mode(trimmed);
+                    s.npub_preview = if s.mode == ImportMode::Nsec {
+                        keep_core::keys::NostrKeypair::from_nsec(trimmed)
+                            .ok()
+                            .map(|kp| kp.to_npub())
+                    } else {
+                        None
+                    };
                     s.data = d;
                 }
                 Task::none()
@@ -655,7 +662,7 @@ impl App {
             }
             Message::ImportNameChanged(n) => {
                 if let Screen::Import(s) = &mut self.screen {
-                    if n.len() <= 64 {
+                    if n.chars().count() <= 64 {
                         s.name = n;
                     }
                 }
@@ -1242,9 +1249,6 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok((shares, name)) => {
-                if let Screen::Import(s) = &mut self.screen {
-                    s.data = Zeroizing::new(String::new());
-                }
                 self.set_share_screen(shares);
                 self.set_toast(
                     format!("Key '{name}' imported successfully"),

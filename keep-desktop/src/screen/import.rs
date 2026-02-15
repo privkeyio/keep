@@ -21,6 +21,7 @@ pub struct ImportScreen {
     pub passphrase: Zeroizing<String>,
     pub name: String,
     pub nsec_visible: bool,
+    pub npub_preview: Option<String>,
     pub error: Option<String>,
     pub loading: bool,
     pub mode: ImportMode,
@@ -33,6 +34,7 @@ impl ImportScreen {
             passphrase: Zeroizing::new(String::new()),
             name: "Desktop Key".to_string(),
             nsec_visible: false,
+            npub_preview: None,
             error: None,
             loading: false,
             mode: ImportMode::Unknown,
@@ -100,7 +102,16 @@ impl ImportScreen {
         if !trimmed_data.is_empty() {
             match self.mode {
                 ImportMode::Nsec => {
-                    content = content.push(theme::success_text("Nostr secret key detected"));
+                    if let Some(npub) = &self.npub_preview {
+                        let truncated = format!("{}...{}", &npub[..12], &npub[npub.len() - 8..]);
+                        content = content.push(
+                            text(format!("Public key: {truncated}"))
+                                .size(theme::size::BODY)
+                                .color(theme::color::SUCCESS),
+                        );
+                    } else {
+                        content = content.push(theme::success_text("Nostr secret key detected"));
+                    }
                 }
                 ImportMode::FrostShare => {
                     if trimmed_data.starts_with("kshare1") {
@@ -126,7 +137,7 @@ impl ImportScreen {
 
         match self.mode {
             ImportMode::Nsec => {
-                let can_import = !self.name.trim().is_empty();
+                let can_import = !self.data.trim().is_empty() && !self.name.trim().is_empty();
                 let submit_msg = can_import.then_some(Message::ImportNsec);
 
                 let name_input = text_input("Key name", &self.name)

@@ -251,7 +251,7 @@ impl Keep {
         if name.is_empty() {
             return Err(KeepError::InvalidInput("name cannot be empty".into()));
         }
-        if name.len() > 64 {
+        if name.chars().count() > 64 {
             return Err(KeepError::InvalidInput(
                 "name must be 64 characters or fewer".into(),
             ));
