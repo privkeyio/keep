@@ -124,9 +124,11 @@ impl App {
                                     tracing::error!(error = %e, "bunker server giving up after {RECONNECT_MAX_ATTEMPTS} reconnect attempts");
                                     break;
                                 }
-                                let delay_ms = (RECONNECT_BASE_MS << attempts.min(7)).min(RECONNECT_MAX_MS);
+                                let delay_ms =
+                                    (RECONNECT_BASE_MS << attempts.min(7)).min(RECONNECT_MAX_MS);
                                 tracing::error!(error = %e, attempt = attempts, "bunker server error, reconnecting in {delay_ms}ms");
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
                             }
                         }
                     }

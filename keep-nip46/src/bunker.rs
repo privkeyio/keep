@@ -264,10 +264,7 @@ mod tests {
     fn test_parse_nostrconnect_missing_relay() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let uri = format!(
-            "nostrconnect://{}?secret=abcdef0123456789",
-            pubkey.to_hex()
-        );
+        let uri = format!("nostrconnect://{}?secret=abcdef0123456789", pubkey.to_hex());
 
         assert!(parse_nostrconnect_uri(&uri).is_err());
     }
