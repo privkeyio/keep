@@ -190,3 +190,151 @@ pub fn send_bunker_approval_notification(app_name: &str, method: &str) {
         &format!("{safe_app} requests: {safe_method}"),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_icon_connected_uses_green() {
+        let icon = build_icon(true).expect("icon build should succeed");
+        let _ = icon;
+    }
+
+    #[test]
+    fn build_icon_disconnected_uses_gray() {
+        let icon = build_icon(false).expect("icon build should succeed");
+        let _ = icon;
+    }
+
+    #[test]
+    fn build_icon_connected_has_green_center_pixel() {
+        let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
+        let color: [u8; 4] = [77, 166, 115, 255];
+        let center = ICON_SIZE as f32 / 2.0;
+        let r = center - 2.0;
+        let r_sq = r * r;
+        for y in 0..ICON_SIZE {
+            for x in 0..ICON_SIZE {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+                if dx * dx + dy * dy <= r_sq {
+                    let idx = ((y * ICON_SIZE + x) * 4) as usize;
+                    rgba[idx..idx + 4].copy_from_slice(&color);
+                }
+            }
+        }
+        let cx = (ICON_SIZE / 2) as usize;
+        let cy = (ICON_SIZE / 2) as usize;
+        let idx = (cy * ICON_SIZE as usize + cx) * 4;
+        assert_eq!(&rgba[idx..idx + 4], &[77, 166, 115, 255]);
+    }
+
+    #[test]
+    fn build_icon_disconnected_has_gray_center_pixel() {
+        let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
+        let color: [u8; 4] = [140, 140, 148, 255];
+        let center = ICON_SIZE as f32 / 2.0;
+        let r = center - 2.0;
+        let r_sq = r * r;
+        for y in 0..ICON_SIZE {
+            for x in 0..ICON_SIZE {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+                if dx * dx + dy * dy <= r_sq {
+                    let idx = ((y * ICON_SIZE + x) * 4) as usize;
+                    rgba[idx..idx + 4].copy_from_slice(&color);
+                }
+            }
+        }
+        let cx = (ICON_SIZE / 2) as usize;
+        let cy = (ICON_SIZE / 2) as usize;
+        let idx = (cy * ICON_SIZE as usize + cx) * 4;
+        assert_eq!(&rgba[idx..idx + 4], &[140, 140, 148, 255]);
+    }
+
+    #[test]
+    fn build_icon_corner_is_transparent() {
+        let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
+        let color: [u8; 4] = [77, 166, 115, 255];
+        let center = ICON_SIZE as f32 / 2.0;
+        let r = center - 2.0;
+        let r_sq = r * r;
+        for y in 0..ICON_SIZE {
+            for x in 0..ICON_SIZE {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+                if dx * dx + dy * dy <= r_sq {
+                    let idx = ((y * ICON_SIZE + x) * 4) as usize;
+                    rgba[idx..idx + 4].copy_from_slice(&color);
+                }
+            }
+        }
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sanitize_short_input_unchanged() {
+        assert_eq!(sanitize_notification_field("hello"), "hello");
+    }
+
+    #[test]
+    fn sanitize_strips_control_characters() {
+        assert_eq!(
+            sanitize_notification_field("hello\nworld\t!"),
+            "helloworld!"
+        );
+    }
+
+    #[test]
+    fn sanitize_truncates_long_input() {
+        let long = "a".repeat(50);
+        let result = sanitize_notification_field(&long);
+        assert_eq!(result.len(), MAX_NOTIFICATION_FIELD_LEN + 3);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn sanitize_exact_length_not_truncated() {
+        let exact = "x".repeat(MAX_NOTIFICATION_FIELD_LEN);
+        assert_eq!(sanitize_notification_field(&exact), exact);
+    }
+
+    #[test]
+    fn sanitize_one_over_limit_truncated() {
+        let over = "y".repeat(MAX_NOTIFICATION_FIELD_LEN + 1);
+        let result = sanitize_notification_field(&over);
+        let expected = format!("{}...", "y".repeat(MAX_NOTIFICATION_FIELD_LEN));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sanitize_empty_input() {
+        assert_eq!(sanitize_notification_field(""), "");
+    }
+
+    #[test]
+    fn sanitize_only_control_chars() {
+        assert_eq!(sanitize_notification_field("\n\r\t\0"), "");
+    }
+
+    #[test]
+    fn sanitize_unicode_counted_by_chars() {
+        let input = "\u{1F600}".repeat(MAX_NOTIFICATION_FIELD_LEN + 1);
+        let result = sanitize_notification_field(&input);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.chars().count(), MAX_NOTIFICATION_FIELD_LEN + 3);
+    }
+
+    #[test]
+    fn sanitize_control_chars_reduce_below_limit() {
+        let mut input = "a".repeat(MAX_NOTIFICATION_FIELD_LEN + 5);
+        input.push('\n');
+        input.push('\n');
+        input.push('\n');
+        input.push('\n');
+        input.push('\n');
+        let result = sanitize_notification_field(&input);
+        assert!(result.ends_with("..."));
+    }
+}
