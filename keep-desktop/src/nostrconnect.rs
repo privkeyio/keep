@@ -195,7 +195,7 @@ async fn send_nostrconnect_response(
 
     let response = serde_json::json!({
         "id": hex::encode(keep_core::crypto::random_bytes::<16>()),
-        "result": keys.public_key().to_hex(),
+        "result": request.secret,
     });
     let response_json =
         serde_json::to_string(&response).map_err(|e| format!("serialization: {e}"))?;
