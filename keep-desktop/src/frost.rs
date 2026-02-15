@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -95,10 +96,16 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
 
 pub(crate) struct DesktopSigningHooks {
     pub request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
+    pub kill_switch: Arc<AtomicBool>,
 }
 
 impl SigningHooks for DesktopSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
+        if self.kill_switch.load(Ordering::Acquire) {
+            return Err(keep_frost_net::FrostNetError::Session(
+                "Kill switch active".into(),
+            ));
+        }
         let (response_tx, mut response_rx) = mpsc::channel(1);
         let request_tx = self.request_tx.clone();
         let session = session.clone();
@@ -144,6 +151,7 @@ pub(crate) async fn setup_frost_node(
     relay_urls: Vec<String>,
     ch: FrostChannels,
     net: NetworkConfig,
+    kill_switch: Arc<AtomicBool>,
 ) -> Result<FrostNodeSetup, String> {
     let share = tokio::task::spawn_blocking({
         let keep_arc = keep_arc.clone();
@@ -174,7 +182,10 @@ pub(crate) async fn setup_frost_node(
     .map_err(|e| format!("Connection failed: {e}"))?;
 
     let (request_tx, request_rx) = mpsc::channel(32);
-    let hooks = Arc::new(DesktopSigningHooks { request_tx });
+    let hooks = Arc::new(DesktopSigningHooks {
+        request_tx,
+        kill_switch,
+    });
     node.set_hooks(hooks);
 
     let event_rx = node.subscribe();
@@ -234,9 +245,19 @@ pub(crate) async fn spawn_frost_node(
     relay_urls: Vec<String>,
     ch: FrostChannels,
     net: NetworkConfig,
+    kill_switch: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let frost_events = ch.events.clone();
-    let setup = setup_frost_node(keep_arc, keep_path, share_entry, relay_urls, ch, net).await?;
+    let setup = setup_frost_node(
+        keep_arc,
+        keep_path,
+        share_entry,
+        relay_urls,
+        ch,
+        net,
+        kill_switch,
+    )
+    .await?;
 
     let _node = setup.node;
     let mut connect_rx = setup.connect_rx;
@@ -462,6 +483,13 @@ impl App {
     }
 
     pub(crate) fn handle_connect_relay(&mut self) -> iced::Task<Message> {
+        if self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return iced::Task::none();
+        }
         self.handle_disconnect_relay();
 
         let (share_entry, relay_urls, password) = match &mut self.screen {
@@ -509,6 +537,7 @@ impl App {
                 relay_urls,
                 self.frost_channels(),
                 self.network_config(),
+                self.kill_switch.clone(),
             ),
             Message::ConnectRelayResult,
         )
@@ -526,7 +555,9 @@ impl App {
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
-            guard.clear();
+            for entry in guard.drain(..) {
+                let _ = entry.response_tx.try_send(false);
+            }
         }
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
@@ -536,6 +567,9 @@ impl App {
     }
 
     pub(crate) fn handle_reconnect_relay(&mut self) -> iced::Task<Message> {
+        if self.is_kill_switch_active() {
+            return iced::Task::none();
+        }
         let Some(share_entry) = self.frost_last_share.clone() else {
             return iced::Task::none();
         };
@@ -554,7 +588,9 @@ impl App {
         self.frost_peers.clear();
         self.pending_sign_display.clear();
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
-            guard.clear();
+            for entry in guard.drain(..) {
+                let _ = entry.response_tx.try_send(false);
+            }
         }
 
         self.frost_status = ConnectionStatus::Connecting;
@@ -572,12 +608,20 @@ impl App {
                 relay_urls,
                 self.frost_channels(),
                 self.network_config(),
+                self.kill_switch.clone(),
             ),
             Message::ConnectRelayResult,
         )
     }
 
     pub(crate) fn respond_to_sign_request(&mut self, id: &str, approve: bool) {
+        if approve && self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return;
+        }
         let response_tx = {
             let Ok(mut guard) = self.pending_sign_requests.lock() else {
                 return;

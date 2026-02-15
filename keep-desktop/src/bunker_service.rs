@@ -173,6 +173,13 @@ impl App {
             }
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
+                if approved && self.is_kill_switch_active() {
+                    self.set_toast(
+                        "Kill switch is active - signing blocked".into(),
+                        ToastKind::Error,
+                    );
+                    return Task::none();
+                }
 
                 if self.nostrconnect_pending.is_some() {
                     return if approved {
@@ -370,6 +377,13 @@ impl App {
     }
 
     pub(crate) fn handle_bunker_start(&mut self) -> Task<Message> {
+        if self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return Task::none();
+        }
         if self.bunker.is_some() {
             return Task::none();
         }
@@ -391,6 +405,7 @@ impl App {
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
         let proxy = self.proxy_addr();
+        let kill_switch = self.kill_switch.clone();
 
         Task::perform(
             async move {
@@ -404,6 +419,7 @@ impl App {
 
                 let config = keep_nip46::ServerConfig {
                     rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
+                    kill_switch: Some(kill_switch),
                     ..Default::default()
                 };
                 let mut server = keep_nip46::Server::new_with_config_and_proxy(

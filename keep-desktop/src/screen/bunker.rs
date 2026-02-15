@@ -150,7 +150,7 @@ impl BunkerScreen {
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self, kill_switch_active: bool) -> Element<Message> {
         let title = theme::heading("Nostr Connect");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -180,7 +180,7 @@ impl BunkerScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Bunker, inner.into(), None, 0)
+        layout::with_sidebar_kill_switch(NavItem::Bunker, inner.into(), None, 0, kill_switch_active)
     }
 
     fn status_card(&self) -> Element<Message> {

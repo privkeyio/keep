@@ -25,11 +25,12 @@ enum NavBadge {
     Notification(usize),
 }
 
-pub fn with_sidebar<'a>(
+pub fn with_sidebar_kill_switch<'a>(
     active: NavItem,
     content: Element<'a, Message>,
     share_count: Option<usize>,
     pending_requests: usize,
+    kill_switch_active: bool,
 ) -> Element<'a, Message> {
     let relay_badge = if pending_requests > 0 {
         NavBadge::Notification(pending_requests)
@@ -142,22 +143,40 @@ pub fn with_sidebar<'a>(
         .padding([theme::space::SM, theme::space::MD])
         .width(Length::Fill);
 
-    let sidebar = container(
-        column![
-            text("Keep")
-                .size(theme::size::TITLE)
-                .color(theme::color::TEXT),
-            Space::new().height(theme::space::LG),
-            nav,
-            Space::new().height(Length::Fill),
-            lock_btn,
-        ]
-        .padding(theme::space::LG)
-        .height(Length::Fill),
-    )
-    .style(theme::sidebar_style)
-    .width(theme::size::SIDEBAR_WIDTH)
+    let mut sidebar_col = column![
+        text("Keep")
+            .size(theme::size::TITLE)
+            .color(theme::color::TEXT),
+        Space::new().height(theme::space::LG),
+        nav,
+    ]
+    .padding(theme::space::LG)
     .height(Length::Fill);
+
+    if kill_switch_active {
+        let banner = container(
+            text("SIGNING BLOCKED")
+                .size(theme::size::TINY)
+                .color(iced::Color::WHITE),
+        )
+        .style(theme::kill_switch_banner_style)
+        .padding([theme::space::XS, theme::space::SM])
+        .width(Length::Fill)
+        .center_x(Length::Fill);
+
+        sidebar_col = sidebar_col
+            .push(Space::new().height(theme::space::SM))
+            .push(banner);
+    }
+
+    sidebar_col = sidebar_col
+        .push(Space::new().height(Length::Fill))
+        .push(lock_btn);
+
+    let sidebar = container(sidebar_col)
+        .style(theme::sidebar_style)
+        .width(theme::size::SIDEBAR_WIDTH)
+        .height(Length::Fill);
 
     let main = container(content)
         .style(theme::page_bg)

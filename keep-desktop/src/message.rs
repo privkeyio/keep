@@ -158,6 +158,14 @@ pub enum Message {
     SettingsProxyToggled(bool),
     SettingsProxyPortChanged(String),
 
+    // Kill switch
+    KillSwitchRequestConfirm,
+    KillSwitchCancelConfirm,
+    KillSwitchActivate,
+    KillSwitchPasswordChanged(Zeroizing<String>),
+    KillSwitchDeactivate,
+    KillSwitchDeactivateResult(Result<(), String>),
+
     // Timer
     Tick,
 }
@@ -317,6 +325,15 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::AuditFilterChanged(c) => f.debug_tuple("AuditFilterChanged").field(c).finish(),
             Self::AuditLoadMore => f.write_str("AuditLoadMore"),
+            Self::KillSwitchRequestConfirm => f.write_str("KillSwitchRequestConfirm"),
+            Self::KillSwitchCancelConfirm => f.write_str("KillSwitchCancelConfirm"),
+            Self::KillSwitchActivate => f.write_str("KillSwitchActivate"),
+            Self::KillSwitchPasswordChanged(_) => f.write_str("KillSwitchPasswordChanged(***)"),
+            Self::KillSwitchDeactivate => f.write_str("KillSwitchDeactivate"),
+            Self::KillSwitchDeactivateResult(r) => f
+                .debug_tuple("KillSwitchDeactivateResult")
+                .field(&r.as_ref().map(|_| ()).map_err(|e| e.as_str()))
+                .finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }
