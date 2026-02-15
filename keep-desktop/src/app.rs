@@ -142,7 +142,7 @@ pub(crate) fn lock_keep(
         Err(e) => {
             let mut guard = e.into_inner();
             if let Some(ref mut k) = *guard {
-                k.lock();
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| k.lock()));
             }
             *guard = None;
             guard
@@ -229,12 +229,8 @@ fn relay_config_path(keep_path: &std::path::Path) -> PathBuf {
     keep_path.join("relays.json")
 }
 
-fn short_hex(pubkey_hex: &str) -> &str {
-    pubkey_hex.get(..16).unwrap_or(pubkey_hex)
-}
-
 fn relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
-    keep_path.join(format!("relays-{}.json", short_hex(pubkey_hex)))
+    keep_path.join(format!("relays-{pubkey_hex}.json"))
 }
 
 fn bunker_relay_config_path(keep_path: &std::path::Path) -> PathBuf {
@@ -242,7 +238,7 @@ fn bunker_relay_config_path(keep_path: &std::path::Path) -> PathBuf {
 }
 
 fn bunker_relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
-    keep_path.join(format!("bunker-relays-{}.json", short_hex(pubkey_hex)))
+    keep_path.join(format!("bunker-relays-{pubkey_hex}.json"))
 }
 
 fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
@@ -1124,7 +1120,7 @@ impl App {
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
         self.resolve_active_share(&shares);
-        self.refresh_identities();
+        self.refresh_identities(&shares);
         if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
             s.active_share_hex = self.active_share_hex.clone();
@@ -1134,7 +1130,7 @@ impl App {
 
     fn set_share_screen(&mut self, shares: Vec<ShareEntry>) {
         self.resolve_active_share(&shares);
-        self.refresh_identities();
+        self.refresh_identities(&shares);
         self.screen =
             Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
     }
@@ -1257,12 +1253,12 @@ impl App {
                             let mut keep = Keep::open(&path).map_err(friendly_err)?;
                             keep.unlock(&password).map_err(friendly_err)?;
                             drop(keep);
-                            let canonical = std::fs::canonicalize(&path)
-                                .map_err(|e| format!("Failed to resolve vault path: {e}"))?;
-                            if canonical != path {
+                            let meta = std::fs::symlink_metadata(&path)
+                                .map_err(|e| format!("Failed to read vault metadata: {e}"))?;
+                            if meta.is_symlink() {
                                 return Err("Vault path is a symlink; refusing to delete".into());
                             }
-                            std::fs::remove_dir_all(&canonical)
+                            std::fs::remove_dir_all(&path)
                                 .map_err(|e| format!("Failed to remove vault: {e}"))
                         }));
                     match result {
@@ -1780,9 +1776,8 @@ impl App {
         identities
     }
 
-    fn refresh_identities(&mut self) {
-        let shares = self.current_shares();
-        self.identities = self.collect_identities(&shares);
+    fn refresh_identities(&mut self, shares: &[ShareEntry]) {
+        self.identities = self.collect_identities(shares);
         if self.active_share_hex.is_none() && self.identities.len() == 1 {
             let hex = self.identities[0].pubkey_hex.clone();
             let guard = lock_keep(&self.keep);
@@ -1811,6 +1806,9 @@ impl App {
                 if let Some(current) = &self.active_share_hex {
                     save_relay_urls_for(&self.keep_path, current, &self.relay_urls);
                     save_bunker_relays_for(&self.keep_path, current, &self.bunker_relays);
+                } else {
+                    save_relay_urls(&self.keep_path, &self.relay_urls);
+                    save_bunker_relays(&self.keep_path, &self.bunker_relays);
                 }
 
                 self.handle_disconnect_relay();
@@ -1888,6 +1886,11 @@ impl App {
                     return Task::none();
                 };
 
+                if self.active_share_hex.as_deref() == Some(&pubkey_hex) {
+                    self.set_toast("Cannot delete the active identity".into(), ToastKind::Error);
+                    return Task::none();
+                }
+
                 let result = match &identity.kind {
                     IdentityKind::Frost { .. } => {
                         let shares = self.current_shares();
@@ -1895,6 +1898,8 @@ impl App {
                             .iter()
                             .filter(|s| s.group_pubkey_hex == pubkey_hex)
                             .collect();
+                        let total = group_shares.len();
+                        let mut deleted = 0usize;
                         let mut delete_err = None;
                         for share in &group_shares {
                             let res = {
@@ -1907,10 +1912,14 @@ impl App {
                                 delete_err = Some(e);
                                 break;
                             }
+                            deleted += 1;
                         }
                         if let Some(e) = delete_err {
                             self.refresh_shares();
-                            self.set_toast(friendly_err(e), ToastKind::Error);
+                            self.set_toast(
+                                format!("Deleted {deleted}/{total} shares: {}", friendly_err(e)),
+                                ToastKind::Error,
+                            );
                             false
                         } else {
                             true

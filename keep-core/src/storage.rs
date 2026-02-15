@@ -22,6 +22,7 @@ use crate::wallet::WalletDescriptor;
 use bincode::Options;
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
+const MIN_PASSWORD_LEN: usize = 8;
 const MAX_PASSWORD_LEN: usize = 4096;
 
 pub(crate) fn bincode_options() -> impl Options {
@@ -57,13 +58,22 @@ fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Resul
     Ok(())
 }
 
-fn validate_password_len(password: &str) -> Result<()> {
+fn validate_password_max_len(password: &str) -> Result<()> {
     if password.len() > MAX_PASSWORD_LEN {
         return Err(KeepError::InvalidInput(
             "password too long (max 4096 bytes)".into(),
         ));
     }
     Ok(())
+}
+
+fn validate_new_password(password: &str) -> Result<()> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "password too short (min {MIN_PASSWORD_LEN} characters)"
+        )));
+    }
+    validate_password_max_len(password)
 }
 
 /// Storage file header containing encryption metadata.
@@ -214,7 +224,7 @@ impl Storage {
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
     ) -> Result<Self> {
-        validate_password_len(password)?;
+        validate_new_password(password)?;
 
         let mut header = Header::new(params);
         let data_key = SecretKey::generate()?;
@@ -299,7 +309,7 @@ impl Storage {
 
     /// Verify a password without changing the unlock state.
     pub fn verify_password(&self, password: &str) -> Result<()> {
-        validate_password_len(password)?;
+        validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
@@ -331,7 +341,7 @@ impl Storage {
     }
 
     fn unlock_inner(&mut self, password: &str) -> Result<()> {
-        validate_password_len(password)?;
+        validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
