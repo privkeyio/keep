@@ -1505,6 +1505,7 @@ impl App {
                     Err(e) => {
                         if let Screen::SigningAudit(s) = &mut self.screen {
                             s.loading = false;
+                            tracing::warn!("Audit log load failed: {e}");
                             s.chain_status = ChainStatus::Error(e);
                         }
                     }
@@ -1519,7 +1520,10 @@ impl App {
                             ChainStatus::Valid(count)
                         }
                         Ok((false, _)) => ChainStatus::Invalid,
-                        Err(e) => ChainStatus::Error(e),
+                        Err(e) => {
+                            tracing::warn!("Chain verification failed: {e}");
+                            ChainStatus::Error(e)
+                        }
                     };
                 }
                 Task::none()

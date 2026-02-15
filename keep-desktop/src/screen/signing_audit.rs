@@ -82,20 +82,15 @@ impl SigningAuditScreen {
             content = content.push(self.filter_row());
         }
 
-        if self.loading && self.entries.is_empty() {
+        if self.entries.is_empty() {
+            let label = if self.loading {
+                "Loading..."
+            } else {
+                "No signing history"
+            };
             content = content.push(
                 container(
-                    text("Loading...")
-                        .size(theme::size::BODY)
-                        .color(theme::color::TEXT_MUTED),
-                )
-                .center_x(Length::Fill)
-                .padding(theme::space::XXXL),
-            );
-        } else if self.entries.is_empty() {
-            content = content.push(
-                container(
-                    text("No signing history")
+                    text(label)
                         .size(theme::size::BODY)
                         .color(theme::color::TEXT_MUTED),
                 )
@@ -282,33 +277,24 @@ impl SigningAuditScreen {
 }
 
 fn truncate_hex(s: &str) -> String {
-    if s.chars().count() <= 20 {
+    if s.len() <= 20 || !s.is_ascii() {
         return s.to_string();
     }
-    let prefix: String = s.chars().take(8).collect();
-    let suffix: String = s
-        .chars()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}...{suffix}")
+    format!("{}...{}", &s[..8], &s[s.len() - 6..])
 }
 
 fn format_request_type(rt: &str) -> String {
-    rt.replace('_', " ")
-        .split(' ')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().to_string() + c.as_str(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    match rt {
+        "connect" => "Connect".to_string(),
+        "get_public_key" => "Get Public Key".to_string(),
+        "sign_event" => "Sign Event".to_string(),
+        "nip04_encrypt" => "NIP-04 Encrypt".to_string(),
+        "nip04_decrypt" => "NIP-04 Decrypt".to_string(),
+        "nip44_encrypt" => "NIP-44 Encrypt".to_string(),
+        "nip44_decrypt" => "NIP-44 Decrypt".to_string(),
+        "disconnect" => "Disconnect".to_string(),
+        other => other.replace('_', " "),
+    }
 }
 
 fn format_event_kind(kind: u32) -> String {

@@ -15,6 +15,18 @@ use subtle::ConstantTimeEq;
 use crate::crypto::{self, SecretKey};
 use crate::error::{Result, StorageError};
 
+fn hash_optional_str(data: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(s) => {
+            data.push(1);
+            let len = u32::try_from(s.len()).expect("string too long for hash");
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        None => data.push(0),
+    }
+}
+
 /// Type of audit event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -194,10 +206,10 @@ impl AuditEntry {
         let mut data = Vec::new();
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         data.extend_from_slice(&(self.event_type as u8).to_le_bytes());
-        Self::hash_optional_str(&mut data, self.pubkey.as_deref());
-        Self::hash_optional_str(&mut data, self.key_type.as_deref());
-        Self::hash_optional_str(&mut data, self.message_hash.as_deref());
-        Self::hash_optional_str(&mut data, self.group_pubkey.as_deref());
+        hash_optional_str(&mut data, self.pubkey.as_deref());
+        hash_optional_str(&mut data, self.key_type.as_deref());
+        hash_optional_str(&mut data, self.message_hash.as_deref());
+        hash_optional_str(&mut data, self.group_pubkey.as_deref());
         if let Some(ref p) = self.participants {
             data.push(1);
             let len = u32::try_from(p.len()).expect("participants too long for hash");
@@ -215,21 +227,9 @@ impl AuditEntry {
             data.push(0);
         }
         data.push(self.success as u8);
-        Self::hash_optional_str(&mut data, self.reason.as_deref());
+        hash_optional_str(&mut data, self.reason.as_deref());
         data.extend_from_slice(&self.prev_hash);
         crypto::blake2b_256(&data)
-    }
-
-    fn hash_optional_str(data: &mut Vec<u8>, value: Option<&str>) {
-        match value {
-            Some(s) => {
-                data.push(1);
-                let len = u32::try_from(s.len()).expect("string too long for hash");
-                data.extend_from_slice(&len.to_le_bytes());
-                data.extend_from_slice(s.as_bytes());
-            }
-            None => data.push(0),
-        }
     }
 
     /// Verify this entry's hash chain linkage.
@@ -288,8 +288,7 @@ impl AuditLog {
     }
 
     /// Log an audit entry.
-    pub fn log(&mut self, entry: AuditEntry, data_key: &SecretKey) -> Result<()> {
-        let mut entry = entry;
+    pub fn log(&mut self, mut entry: AuditEntry, data_key: &SecretKey) -> Result<()> {
         entry.prev_hash = self.last_hash;
         entry.hash = entry.compute_hash();
 
@@ -629,28 +628,16 @@ impl SigningAuditEntry {
         let caller_len = u32::try_from(self.caller.len()).expect("caller too long for hash");
         data.extend_from_slice(&caller_len.to_le_bytes());
         data.extend_from_slice(self.caller.as_bytes());
-        Self::hash_optional_str(&mut data, self.caller_name.as_deref());
+        hash_optional_str(&mut data, self.caller_name.as_deref());
         if let Some(kind) = self.event_kind {
             data.push(1);
             data.extend_from_slice(&kind.to_le_bytes());
         } else {
             data.push(0);
         }
-        Self::hash_optional_str(&mut data, self.reason.as_deref());
+        hash_optional_str(&mut data, self.reason.as_deref());
         data.extend_from_slice(&self.prev_hash);
         crypto::blake2b_256(&data)
-    }
-
-    fn hash_optional_str(data: &mut Vec<u8>, value: Option<&str>) {
-        match value {
-            Some(s) => {
-                data.push(1);
-                let len = u32::try_from(s.len()).expect("string too long for hash");
-                data.extend_from_slice(&len.to_le_bytes());
-                data.extend_from_slice(s.as_bytes());
-            }
-            None => data.push(0),
-        }
     }
 
     /// Verify this entry's hash chain linkage.
@@ -699,9 +686,7 @@ impl SigningAuditLog {
 
         let mut filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| {
-                max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max)
-            })
+            .filter(|e| max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max))
             .collect();
 
         if let Some(max) = self.retention.max_entries {
@@ -719,8 +704,7 @@ impl SigningAuditLog {
     }
 
     /// Log a signing audit entry.
-    pub fn log(&mut self, entry: SigningAuditEntry, data_key: &SecretKey) -> Result<()> {
-        let mut entry = entry;
+    pub fn log(&mut self, mut entry: SigningAuditEntry, data_key: &SecretKey) -> Result<()> {
         entry.prev_hash = self.last_hash;
         entry.hash = entry.compute_hash();
 
