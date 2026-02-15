@@ -67,7 +67,7 @@ fn validate_password_max_len(password: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_new_password(password: &str) -> Result<()> {
+pub(crate) fn validate_new_password(password: &str) -> Result<()> {
     if password.len() < MIN_PASSWORD_LEN {
         return Err(KeepError::InvalidInput(format!(
             "password too short (min {MIN_PASSWORD_LEN} bytes)"

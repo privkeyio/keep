@@ -19,7 +19,7 @@ use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::relay::RelayConfig;
-use crate::storage::{bincode_options, share_id, Header, Storage};
+use crate::storage::{bincode_options, share_id, validate_new_password, Header, Storage};
 use crate::wallet::WalletDescriptor;
 
 fn secure_delete(path: &Path) -> std::io::Result<()> {
@@ -119,6 +119,7 @@ impl Storage {
     /// Re-encrypts the data encryption key with a new password-derived key.
     /// Creates a backup of the header before rotation and restores it on failure.
     pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
+        validate_new_password(new_password)?;
         let lock = acquire_rotation_lock(&self.path)?;
 
         if !self.is_unlocked() {

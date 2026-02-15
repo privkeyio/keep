@@ -1094,7 +1094,7 @@ mod tests {
         {
             let mut keep = Keep::open(&path).unwrap();
             keep.unlock("testpass").unwrap();
-            keep.rotate_password("testpass", "newpass").unwrap();
+            keep.rotate_password("testpass", "newpass1").unwrap();
         }
 
         {
@@ -1104,7 +1104,7 @@ mod tests {
 
         {
             let mut keep = Keep::open(&path).unwrap();
-            keep.unlock("newpass").unwrap();
+            keep.unlock("newpass1").unwrap();
             assert!(keep.keyring().get_by_name("rotatetest").is_some());
         }
     }
