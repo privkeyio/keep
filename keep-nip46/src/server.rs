@@ -24,6 +24,7 @@ pub struct ServerConfig {
     pub audit_log_capacity: usize,
     pub rate_limit: Option<RateLimitConfig>,
     pub auto_approve: bool,
+    pub expected_secret: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +34,7 @@ impl Default for ServerConfig {
             audit_log_capacity: 10_000,
             rate_limit: None,
             auto_approve: false,
+            expected_secret: None,
         }
     }
 }
@@ -75,11 +77,14 @@ fn finalize_handler(
     if let Some(ref rl_config) = config.rate_limit {
         handler = handler.with_rate_limit(rl_config.clone());
     }
-    let bunker_secret = if config.auto_approve {
+    let bunker_secret = if config.auto_approve && config.expected_secret.is_none() {
         let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
         warn!("headless mode: bunker secret required for authentication");
         handler = handler.with_expected_secret(secret.clone());
         Some(secret)
+    } else if let Some(ref secret) = config.expected_secret {
+        handler = handler.with_expected_secret(secret.clone());
+        None
     } else {
         None
     };
@@ -336,8 +341,24 @@ impl Server {
         self.keys.public_key()
     }
 
+    pub fn transport_secret(&self) -> SecretKey {
+        self.keys.secret_key().clone()
+    }
+
+    pub async fn send_event(&self, event: &Event) -> Result<()> {
+        self.client
+            .send_event(event)
+            .await
+            .map_err(|e| NetworkError::relay(format!("send event: {e}")))?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+
         info!(relay = %self.relay_url, "connecting to relay");
 
         self.client.connect().await;
@@ -369,7 +390,8 @@ impl Server {
         let callbacks = self.callbacks.clone();
         let max_event_json_size = self.config.max_event_json_size;
 
-        self.client
+        let result = self
+            .client
             .handle_notifications(|notification| {
                 let handler = handler.clone();
                 let keys = keys.clone();
@@ -396,8 +418,10 @@ impl Server {
                     Ok(false)
                 }
             })
-            .await
-            .map_err(|e| NetworkError::relay(format!("notification handler: {e}")))?;
+            .await;
+
+        self.running = false;
+        result.map_err(|e| NetworkError::relay(format!("notification handler: {e}")))?;
 
         Ok(())
     }

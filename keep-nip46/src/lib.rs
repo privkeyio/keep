@@ -14,7 +14,7 @@ pub mod server;
 pub mod types;
 
 pub use audit::{AuditAction, AuditEntry, AuditLog};
-pub use bunker::generate_bunker_url;
+pub use bunker::{generate_bunker_url, parse_nostrconnect_uri, NostrConnectRequest};
 pub use error::Result;
 pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;

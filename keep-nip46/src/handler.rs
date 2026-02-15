@@ -535,6 +535,33 @@ impl SignerHandler {
         }
     }
 
+    pub async fn register_client(
+        &self,
+        app_pubkey: PublicKey,
+        name: String,
+        permissions_str: Option<&str>,
+    ) -> Result<()> {
+        let (requested_perms, auto_kinds) = permissions_str
+            .map(parse_permission_string)
+            .unwrap_or((Permission::DEFAULT, HashSet::new()));
+
+        let mut pm = self.permissions.lock().await;
+        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
+            return Err(KeepError::CapacityExceeded(
+                "too many connected apps".into(),
+            ));
+        }
+        drop(pm);
+
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
+
+        info!(app_id = &app_pubkey.to_hex()[..8], "client registered");
+        Ok(())
+    }
+
     pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {
         let mut pm = self.permissions.lock().await;
         pm.set_permissions(pubkey, permissions);

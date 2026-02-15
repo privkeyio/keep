@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Classes\nostrconnect]
+@="URL:nostrconnect"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\nostrconnect\shell]
+
+[HKEY_CURRENT_USER\Software\Classes\nostrconnect\shell\open]
+
+[HKEY_CURRENT_USER\Software\Classes\nostrconnect\shell\open\command]
+@="\"C:\\Program Files\\Keep\\keep-desktop.exe\" \"%1\""

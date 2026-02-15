@@ -5,8 +5,10 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use keep_nip46::NostrConnectRequest;
 
 use iced::widget::{column, container, text};
 use iced::{Background, Element, Length, Subscription, Task};
@@ -34,6 +36,27 @@ use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditS
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
+
+static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
+
+pub fn set_pending_nostrconnect(request: Option<NostrConnectRequest>) {
+    let cell = PENDING_NOSTRCONNECT.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(mut guard) => *guard = request,
+        Err(e) => {
+            tracing::warn!("nostrconnect mutex poisoned, recovering");
+            *e.into_inner() = request;
+        }
+    }
+}
+
+fn take_pending_nostrconnect() -> Option<NostrConnectRequest> {
+    let cell = PENDING_NOSTRCONNECT.get()?;
+    match cell.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(e) => e.into_inner().take(),
+    }
+}
 
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
@@ -94,6 +117,7 @@ pub struct App {
     pub(crate) bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
+    pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) settings: Settings,
 }
 
@@ -321,6 +345,7 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            nostrconnect_pending: None,
             settings,
         }
     }
@@ -1196,7 +1221,12 @@ impl App {
 
     fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
-            Ok(shares) => self.set_share_screen(shares),
+            Ok(shares) => {
+                self.set_share_screen(shares);
+                if let Some(request) = take_pending_nostrconnect() {
+                    return self.process_pending_nostrconnect(request);
+                }
+            }
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
