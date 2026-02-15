@@ -751,7 +751,7 @@ impl App {
                 Task::none()
             }
             Message::SetActiveShare(hex) => {
-                return self.handle_identity_message(Message::SwitchIdentity(hex));
+                self.handle_identity_message(Message::SwitchIdentity(hex))
             }
             Message::RequestDelete(id) => {
                 if let Screen::ShareList(s) = &mut self.screen {
