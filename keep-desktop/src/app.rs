@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,8 @@ use crate::screen::Screen;
 
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
+const DEFAULT_PROXY_PORT: u16 = 9050;
+const PROXY_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
@@ -219,6 +222,10 @@ pub struct Settings {
     pub auto_lock_secs: u64,
     #[serde(default = "default_clipboard_clear_secs")]
     pub clipboard_clear_secs: u64,
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -229,11 +236,17 @@ fn default_clipboard_clear_secs() -> u64 {
     CLIPBOARD_CLEAR_SECS
 }
 
+fn default_proxy_port() -> u16 {
+    DEFAULT_PROXY_PORT
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_lock_secs: AUTO_LOCK_SECS,
             clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
+            proxy_enabled: false,
+            proxy_port: DEFAULT_PROXY_PORT,
         }
     }
 }
@@ -419,9 +432,10 @@ impl App {
             | Message::BunkerSetApprovalDuration(..)
             | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
 
-            Message::SettingsAutoLockChanged(..) | Message::SettingsClipboardClearChanged(..) => {
-                self.handle_settings_message(message)
-            }
+            Message::SettingsAutoLockChanged(..)
+            | Message::SettingsClipboardClearChanged(..)
+            | Message::SettingsProxyToggled(..)
+            | Message::SettingsProxyPortChanged(..) => self.handle_settings_message(message),
         }
     }
 
@@ -592,6 +606,8 @@ impl App {
                     self.settings.auto_lock_secs,
                     self.settings.clipboard_clear_secs,
                     self.keep_path.display().to_string(),
+                    self.settings.proxy_enabled,
+                    self.settings.proxy_port,
                 ));
                 Task::none()
             }
@@ -1120,6 +1136,36 @@ impl App {
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
     }
 
+    pub(crate) fn proxy_addr(&self) -> Option<SocketAddr> {
+        if self.settings.proxy_enabled && self.settings.proxy_port > 0 {
+            Some(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                self.settings.proxy_port,
+            )))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn frost_channels(&self) -> crate::frost::FrostChannels {
+        crate::frost::FrostChannels {
+            events: self.frost_events.clone(),
+            pending_requests: self.pending_sign_requests.clone(),
+            shutdown: self.frost_shutdown.clone(),
+        }
+    }
+
+    pub(crate) fn network_config(&self) -> crate::frost::NetworkConfig {
+        crate::frost::NetworkConfig {
+            proxy: self.proxy_addr(),
+            session_timeout: if self.settings.proxy_enabled {
+                Some(PROXY_SESSION_TIMEOUT)
+            } else {
+                None
+            },
+        }
+    }
+
     pub(crate) fn start_clipboard_timer(&mut self) {
         self.clipboard_clear_at = if self.settings.clipboard_clear_secs > 0 {
             Some(Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs))
@@ -1376,12 +1422,55 @@ impl App {
                     self.clipboard_clear_at = None;
                 }
             }
+            Message::SettingsProxyToggled(enabled) => {
+                self.settings.proxy_enabled = enabled;
+                let frost_active = matches!(
+                    self.frost_status,
+                    ConnectionStatus::Connected | ConnectionStatus::Connecting
+                );
+                let bunker_active = self.bunker.is_some();
+                save_settings(&self.keep_path, &self.settings);
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_enabled = self.settings.proxy_enabled;
+                }
+                let mut tasks = Vec::new();
+                if frost_active {
+                    tasks.push(self.handle_reconnect_relay());
+                }
+                if bunker_active {
+                    self.stop_bunker();
+                    tasks.push(self.handle_bunker_start());
+                }
+                if !tasks.is_empty() {
+                    let label = if enabled { "enabled" } else { "disabled" };
+                    self.set_toast(
+                        format!("Proxy {label}, reconnecting..."),
+                        ToastKind::Success,
+                    );
+                }
+                return Task::batch(tasks);
+            }
+            Message::SettingsProxyPortChanged(port_str) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_port_input = port_str.clone();
+                }
+                match port_str.parse::<u16>() {
+                    Ok(port) if port > 0 => self.settings.proxy_port = port,
+                    _ => return Task::none(),
+                }
+            }
             _ => return Task::none(),
         }
         save_settings(&self.keep_path, &self.settings);
         if let Screen::Settings(s) = &mut self.screen {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
+            s.proxy_enabled = self.settings.proxy_enabled;
+            s.proxy_port = self.settings.proxy_port;
+            let formatted = self.settings.proxy_port.to_string();
+            if s.proxy_port_input != formatted {
+                s.proxy_port_input = formatted;
+            }
         }
         Task::none()
     }

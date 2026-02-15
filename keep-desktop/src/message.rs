@@ -138,6 +138,8 @@ pub enum Message {
     // Settings
     SettingsAutoLockChanged(u64),
     SettingsClipboardClearChanged(u64),
+    SettingsProxyToggled(bool),
+    SettingsProxyPortChanged(String),
 
     // Timer
     Tick,
@@ -277,6 +279,12 @@ impl fmt::Debug for Message {
                 .debug_tuple("SettingsClipboardClearChanged")
                 .field(v)
                 .finish(),
+            Self::SettingsProxyToggled(v) => {
+                f.debug_tuple("SettingsProxyToggled").field(v).finish()
+            }
+            Self::SettingsProxyPortChanged(v) => {
+                f.debug_tuple("SettingsProxyPortChanged").field(v).finish()
+            }
             Self::Tick => f.write_str("Tick"),
         }
     }
