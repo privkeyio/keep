@@ -89,7 +89,13 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
             "name" => name = Some(sanitize_display_name(&value)),
             "url" => url_param = validate_metadata_url(&value).ok(),
             "image" => image = validate_metadata_url(&value).ok(),
-            "perms" if value.len() <= MAX_PERMS_LEN => perms = Some(value.to_string()),
+            "perms" => {
+                if value.len() <= MAX_PERMS_LEN {
+                    perms = Some(value.to_string());
+                } else {
+                    return Err("perms parameter too long".into());
+                }
+            }
             _ => {}
         }
     }
@@ -235,6 +241,19 @@ mod tests {
 
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.perms.as_deref(), Some("sign_event:1,nip44_encrypt"));
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_perms_too_long() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let long_perms = "sign_event:1,".repeat(100);
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789&perms={}",
+            pubkey.to_hex(),
+            urlencoding::encode(&long_perms),
+        );
+        assert!(parse_nostrconnect_uri(&uri).is_err());
     }
 
     #[test]

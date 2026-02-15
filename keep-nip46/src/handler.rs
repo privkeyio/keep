@@ -244,8 +244,7 @@ impl SignerHandler {
                 None => false,
             };
             if !valid {
-                let mut audit = self.audit.lock().await;
-                audit.log(
+                self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::Connect, app_pubkey)
                         .with_success(false)
                         .with_reason("invalid secret"),
@@ -343,8 +342,7 @@ impl SignerHandler {
                 .await;
 
             if !approved {
-                let mut audit = self.audit.lock().await;
-                audit.log(
+                self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
                         .with_success(false),
@@ -528,11 +526,8 @@ impl SignerHandler {
             AuditEntry::new(AuditAction::GetPublicKey, app_pubkey).with_reason("switch_relays"),
         );
 
-        if self.relay_urls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(self.relay_urls.clone()))
-        }
+        let relays = (!self.relay_urls.is_empty()).then(|| self.relay_urls.clone());
+        Ok(relays)
     }
 
     pub async fn register_client(

@@ -57,12 +57,11 @@ impl App {
         let valid_relays: Vec<String> = request
             .relays
             .iter()
-            .filter(|url| {
-                if let Err(e) = validate_relay_url(url) {
+            .filter(|url| match validate_relay_url(url) {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::warn!(url, "skipping invalid nostrconnect relay: {e}");
                     false
-                } else {
-                    true
                 }
             })
             .map(|url| normalize_relay_url(url))
@@ -150,11 +149,9 @@ impl App {
                                 }
                                 let base_ms =
                                     (RECONNECT_BASE_MS << attempts.min(7)).min(RECONNECT_MAX_MS);
-                                let jitter_ms = rand::Rng::gen_range(
-                                    &mut rand::rng(),
-                                    0..=base_ms / 2,
-                                );
-                                let delay_ms = base_ms + jitter_ms;
+                                let jitter_ms =
+                                    rand::Rng::gen_range(&mut rand::thread_rng(), 0..=base_ms / 2);
+                                let delay_ms = (base_ms + jitter_ms).min(RECONNECT_MAX_MS);
                                 tracing::error!(error = %e, attempt = attempts, "bunker server error, reconnecting in {delay_ms}ms");
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                     .await;
