@@ -46,6 +46,7 @@ pub enum ChainStatus {
 pub struct SigningAuditScreen {
     pub entries: Vec<AuditDisplayEntry>,
     pub chain_status: ChainStatus,
+    pub load_error: Option<String>,
     pub callers: Vec<String>,
     pub selected_caller: Option<String>,
     pub has_more: bool,
@@ -58,6 +59,7 @@ impl SigningAuditScreen {
         Self {
             entries: Vec::new(),
             chain_status: ChainStatus::Verifying,
+            load_error: None,
             callers: Vec::new(),
             selected_caller: None,
             has_more: false,
@@ -85,6 +87,8 @@ impl SigningAuditScreen {
         if self.entries.is_empty() {
             let label = if self.loading {
                 "Loading..."
+            } else if self.load_error.is_some() {
+                "Failed to load signing history"
             } else {
                 "No signing history"
             };

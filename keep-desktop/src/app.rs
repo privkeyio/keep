@@ -1500,13 +1500,14 @@ impl App {
                             s.entry_count = data.count;
                             s.has_more = data.has_more;
                             s.loading = false;
+                            s.load_error = None;
                         }
                     }
                     Err(e) => {
                         if let Screen::SigningAudit(s) = &mut self.screen {
                             s.loading = false;
                             tracing::warn!("Audit log load failed: {e}");
-                            s.chain_status = ChainStatus::Error(e);
+                            s.load_error = Some(e);
                         }
                     }
                 }
