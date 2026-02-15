@@ -28,10 +28,10 @@ use crate::message::{
     PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
-use crate::screen::layout::SidebarState;
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::{ImportMode, ImportScreen};
+use crate::screen::layout::SidebarState;
 use crate::screen::relay::RelayScreen;
 use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
@@ -83,7 +83,10 @@ pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
 fn default_bunker_relays() -> Vec<String> {
-    DEFAULT_BUNKER_RELAYS.iter().map(|s| s.to_string()).collect()
+    DEFAULT_BUNKER_RELAYS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[derive(Clone)]
@@ -272,7 +275,11 @@ fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<
         .unwrap_or_else(default_bunker_relays)
 }
 
-pub(crate) fn save_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[String]) {
+pub(crate) fn save_bunker_relays_for(
+    keep_path: &std::path::Path,
+    pubkey_hex: &str,
+    urls: &[String],
+) {
     let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
     if let Ok(json) = serde_json::to_string_pretty(urls) {
         if let Err(e) = write_private(&path, &json) {
@@ -1698,11 +1705,16 @@ impl App {
 
     fn collect_identities(&self, shares: &[ShareEntry]) -> Vec<Identity> {
         let mut identities: Vec<Identity> = Vec::new();
-        let mut seen_groups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_groups: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         for share in shares {
             if let Some(&idx) = seen_groups.get(&share.group_pubkey_hex) {
-                if let IdentityKind::Frost { ref mut share_count, .. } = identities[idx].kind {
+                if let IdentityKind::Frost {
+                    ref mut share_count,
+                    ..
+                } = identities[idx].kind
+                {
                     *share_count += 1;
                 }
             } else {
@@ -1842,7 +1854,11 @@ impl App {
             Message::ConfirmDeleteIdentity(pubkey_hex) => {
                 self.delete_identity_confirm = None;
 
-                let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex).cloned();
+                let identity = self
+                    .identities
+                    .iter()
+                    .find(|i| i.pubkey_hex == pubkey_hex)
+                    .cloned();
                 let Some(identity) = identity else {
                     self.set_toast("Identity not found".into(), ToastKind::Error);
                     return Task::none();
@@ -1899,14 +1915,15 @@ impl App {
                 };
 
                 if result {
-                    let _ = std::fs::remove_file(relay_config_path_for(&self.keep_path, &pubkey_hex));
-                    let _ = std::fs::remove_file(bunker_relay_config_path_for(&self.keep_path, &pubkey_hex));
+                    let _ =
+                        std::fs::remove_file(relay_config_path_for(&self.keep_path, &pubkey_hex));
+                    let _ = std::fs::remove_file(bunker_relay_config_path_for(
+                        &self.keep_path,
+                        &pubkey_hex,
+                    ));
 
                     self.refresh_shares();
-                    self.set_toast(
-                        format!("'{}' deleted", identity.name),
-                        ToastKind::Success,
-                    );
+                    self.set_toast(format!("'{}' deleted", identity.name), ToastKind::Success);
                 }
 
                 Task::none()

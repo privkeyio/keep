@@ -32,7 +32,11 @@ impl Identity {
         if self.npub.len() <= 20 {
             return self.npub.clone();
         }
-        format!("{}...{}", &self.npub[..12], &self.npub[self.npub.len() - 6..])
+        format!(
+            "{}...{}",
+            &self.npub[..12],
+            &self.npub[self.npub.len() - 6..]
+        )
     }
 }
 

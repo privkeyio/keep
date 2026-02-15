@@ -223,11 +223,9 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
             ]
             .spacing(1.0)
         }
-        None => column![
-            text("No identity")
-                .size(theme::size::SMALL)
-                .color(theme::color::TEXT_MUTED),
-        ],
+        None => column![text("No identity")
+            .size(theme::size::SMALL)
+            .color(theme::color::TEXT_MUTED),],
     };
 
     let arrow = if state.switcher_open { "v" } else { ">" };
@@ -292,16 +290,12 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
         };
 
         let name_col = column![
-            text(&id.name)
-                .size(theme::size::TINY)
-                .color(if is_active {
-                    theme::color::PRIMARY
-                } else {
-                    theme::color::TEXT
-                }),
-            text(kind_tag)
-                .size(9.0)
-                .color(theme::color::TEXT_DIM),
+            text(&id.name).size(theme::size::TINY).color(if is_active {
+                theme::color::PRIMARY
+            } else {
+                theme::color::TEXT
+            }),
+            text(kind_tag).size(9.0).color(theme::color::TEXT_DIM),
         ]
         .spacing(0.0);
 
@@ -343,9 +337,7 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
         list = list.push(switch_btn);
     }
 
-    let identity_list = scrollable(list)
-        .height(Length::Shrink)
-        .width(Length::Fill);
+    let identity_list = scrollable(list).height(Length::Shrink).width(Length::Fill);
 
     column![toggle_btn, identity_list].spacing(2.0).into()
 }
