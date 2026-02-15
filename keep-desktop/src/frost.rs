@@ -462,6 +462,13 @@ impl App {
     }
 
     pub(crate) fn handle_connect_relay(&mut self) -> iced::Task<Message> {
+        if self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return iced::Task::none();
+        }
         self.handle_disconnect_relay();
 
         let (share_entry, relay_urls, password) = match &mut self.screen {
@@ -536,6 +543,9 @@ impl App {
     }
 
     pub(crate) fn handle_reconnect_relay(&mut self) -> iced::Task<Message> {
+        if self.is_kill_switch_active() {
+            return iced::Task::none();
+        }
         let Some(share_entry) = self.frost_last_share.clone() else {
             return iced::Task::none();
         };
@@ -578,6 +588,13 @@ impl App {
     }
 
     pub(crate) fn respond_to_sign_request(&mut self, id: &str, approve: bool) {
+        if approve && self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return;
+        }
         let response_tx = {
             let Ok(mut guard) = self.pending_sign_requests.lock() else {
                 return;

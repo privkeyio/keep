@@ -173,6 +173,13 @@ impl App {
             }
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
+                if approved && self.is_kill_switch_active() {
+                    self.set_toast(
+                        "Kill switch is active - signing blocked".into(),
+                        ToastKind::Error,
+                    );
+                    return Task::none();
+                }
 
                 if self.nostrconnect_pending.is_some() {
                     return if approved {
@@ -370,6 +377,13 @@ impl App {
     }
 
     pub(crate) fn handle_bunker_start(&mut self) -> Task<Message> {
+        if self.is_kill_switch_active() {
+            self.set_toast(
+                "Kill switch is active - signing blocked".into(),
+                ToastKind::Error,
+            );
+            return Task::none();
+        }
         if self.bunker.is_some() {
             return Task::none();
         }

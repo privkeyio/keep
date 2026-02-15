@@ -117,7 +117,7 @@ impl ExportScreen {
         matches!(self.qr_display, Some(QrDisplay::Animated { .. }))
     }
 
-    pub fn view(&self, pending_requests: usize) -> Element<Message> {
+    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -297,6 +297,12 @@ impl ExportScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Shares, inner.into(), None, pending_requests)
+        layout::with_sidebar_kill_switch(
+            NavItem::Shares,
+            inner.into(),
+            None,
+            pending_requests,
+            kill_switch_active,
+        )
     }
 }

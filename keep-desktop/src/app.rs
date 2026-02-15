@@ -263,6 +263,8 @@ pub struct Settings {
     pub proxy_enabled: bool,
     #[serde(default = "default_proxy_port")]
     pub proxy_port: u16,
+    #[serde(default)]
+    pub kill_switch_active: bool,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -284,6 +286,7 @@ impl Default for Settings {
             clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
+            kill_switch_active: false,
         }
     }
 }
@@ -481,6 +484,13 @@ impl App {
             | Message::SettingsClipboardClearChanged(..)
             | Message::SettingsProxyToggled(..)
             | Message::SettingsProxyPortChanged(..) => self.handle_settings_message(message),
+
+            Message::KillSwitchRequestConfirm
+            | Message::KillSwitchCancelConfirm
+            | Message::KillSwitchActivate
+            | Message::KillSwitchPasswordChanged(..)
+            | Message::KillSwitchDeactivate
+            | Message::KillSwitchDeactivateResult(..) => self.handle_kill_switch_message(message),
         }
     }
 
@@ -653,6 +663,7 @@ impl App {
                     self.keep_path.display().to_string(),
                     self.settings.proxy_enabled,
                     self.settings.proxy_port,
+                    self.settings.kill_switch_active,
                 ));
                 Task::none()
             }
@@ -934,7 +945,9 @@ impl App {
 
     pub fn view(&self) -> Element<Message> {
         let pending_count = self.pending_sign_display.len();
-        let screen = self.screen.view(pending_count);
+        let screen = self
+            .screen
+            .view(pending_count, self.settings.kill_switch_active);
         let Some(toast) = &self.toast else {
             return screen;
         };
@@ -1665,5 +1678,96 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    fn handle_kill_switch_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::KillSwitchRequestConfirm | Message::KillSwitchCancelConfirm => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.kill_switch_confirm = matches!(message, Message::KillSwitchRequestConfirm);
+                }
+            }
+            Message::KillSwitchActivate => {
+                self.settings.kill_switch_active = true;
+                save_settings(&self.keep_path, &self.settings);
+
+                self.handle_disconnect_relay();
+                self.stop_bunker();
+
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.kill_switch_confirm = false;
+                    s.kill_switch_active = true;
+                }
+                self.set_toast(
+                    "Kill switch activated - all signing blocked".into(),
+                    ToastKind::Success,
+                );
+            }
+            Message::KillSwitchPasswordChanged(p) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.kill_switch_password = p;
+                }
+            }
+            Message::KillSwitchDeactivate => {
+                let password = if let Screen::Settings(s) = &mut self.screen {
+                    if s.kill_switch_password.is_empty() {
+                        s.kill_switch_error = Some("Password required".into());
+                        return Task::none();
+                    }
+                    s.kill_switch_loading = true;
+                    s.kill_switch_error = None;
+                    s.kill_switch_password.clone()
+                } else {
+                    return Task::none();
+                };
+
+                let keep_arc = self.keep.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let guard = lock_keep(&keep_arc);
+                            match guard.as_ref() {
+                                None => Err("Vault is locked".to_string()),
+                                Some(keep) => keep.verify_password(&password).map_err(friendly_err),
+                            }
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::KillSwitchDeactivateResult,
+                );
+            }
+            Message::KillSwitchDeactivateResult(result) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.kill_switch_loading = false;
+                    s.kill_switch_password = Zeroizing::new(String::new());
+                }
+                match result {
+                    Ok(()) => {
+                        self.settings.kill_switch_active = false;
+                        save_settings(&self.keep_path, &self.settings);
+                        if let Screen::Settings(s) = &mut self.screen {
+                            s.kill_switch_active = false;
+                            s.kill_switch_error = None;
+                        }
+                        self.set_toast(
+                            "Kill switch deactivated - signing re-enabled".into(),
+                            ToastKind::Success,
+                        );
+                    }
+                    Err(e) => {
+                        if let Screen::Settings(s) = &mut self.screen {
+                            s.kill_switch_error = Some(e);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    pub(crate) fn is_kill_switch_active(&self) -> bool {
+        self.settings.kill_switch_active
     }
 }

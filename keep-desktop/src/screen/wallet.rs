@@ -51,7 +51,7 @@ impl WalletScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize) -> Element<Message> {
+    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
         let title = theme::heading("Wallet Descriptors");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -86,7 +86,13 @@ impl WalletScreen {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        layout::with_sidebar(NavItem::Wallets, inner.into(), None, pending_requests)
+        layout::with_sidebar_kill_switch(
+            NavItem::Wallets,
+            inner.into(),
+            None,
+            pending_requests,
+            kill_switch_active,
+        )
     }
 
     fn wallet_card<'a>(&self, i: usize, entry: &WalletEntry) -> Element<'a, Message> {

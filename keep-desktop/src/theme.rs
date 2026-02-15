@@ -274,3 +274,34 @@ pub fn active_badge(_theme: &Theme) -> container::Style {
         ..Default::default()
     }
 }
+
+pub fn kill_switch_card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.80, 0.25, 0.25, 0.10))),
+        border: Border {
+            color: color::DANGER,
+            width: 2.0,
+            radius: 8.0.into(),
+        },
+        text_color: Some(color::TEXT),
+        ..Default::default()
+    }
+}
+
+pub fn kill_switch_badge_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color::DANGER)),
+        border: Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+pub fn kill_switch_banner_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color::DANGER)),
+        ..Default::default()
+    }
+}
