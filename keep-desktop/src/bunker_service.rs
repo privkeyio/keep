@@ -3,16 +3,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use crate::app::{
-    lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, CLIPBOARD_CLEAR_SECS,
-    MAX_BUNKER_LOG_ENTRIES,
-};
+use crate::app::{lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES};
 use crate::message::Message;
 use crate::screen::bunker::{
     BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
@@ -263,12 +259,11 @@ impl App {
                 Task::none()
             }
             Message::BunkerCopyUrl => {
-                if let Some(ref bunker) = self.bunker {
-                    self.clipboard_clear_at =
-                        Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
-                    return iced::clipboard::write(bunker.url.clone());
-                }
-                Task::none()
+                let Some(url) = self.bunker.as_ref().map(|b| b.url.clone()) else {
+                    return Task::none();
+                };
+                self.start_clipboard_timer();
+                iced::clipboard::write(url)
             }
             Message::BunkerToggleClient(i) => {
                 if let Screen::Bunker(s) = &mut self.screen {
