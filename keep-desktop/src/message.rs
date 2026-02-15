@@ -86,8 +86,12 @@ pub enum Message {
     // Import
     ImportDataChanged(Zeroizing<String>),
     ImportPassphraseChanged(Zeroizing<String>),
+    ImportNameChanged(String),
+    ImportToggleVisibility,
     ImportShare,
+    ImportNsec,
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
+    ImportNsecResult(Result<(Vec<ShareEntry>, String), String>),
 
     // Clipboard (public data, no auto-clear)
     CopyNpub(String),
@@ -197,9 +201,16 @@ impl fmt::Debug for Message {
             Self::GenerateExport => f.write_str("GenerateExport"),
             Self::AdvanceQrFrame => f.write_str("AdvanceQrFrame"),
             Self::ResetExport => f.write_str("ResetExport"),
+            Self::ImportNameChanged(n) => f.debug_tuple("ImportNameChanged").field(n).finish(),
+            Self::ImportToggleVisibility => f.write_str("ImportToggleVisibility"),
             Self::ImportShare => f.write_str("ImportShare"),
+            Self::ImportNsec => f.write_str("ImportNsec"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")
+                .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::ImportNsecResult(r) => f
+                .debug_tuple("ImportNsecResult")
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
