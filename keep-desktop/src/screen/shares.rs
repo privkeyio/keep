@@ -51,14 +51,14 @@ impl ShareEntry {
     }
 
     pub fn truncated_npub(&self) -> String {
-        let n = &self.npub;
-        let chars: Vec<char> = n.chars().collect();
-        if chars.len() <= 20 {
-            return n.clone();
+        if self.npub.len() <= 20 {
+            return self.npub.clone();
         }
-        let prefix: String = chars[..12].iter().collect();
-        let suffix: String = chars[chars.len() - 6..].iter().collect();
-        format!("{prefix}...{suffix}")
+        format!(
+            "{}...{}",
+            &self.npub[..12],
+            &self.npub[self.npub.len() - 6..]
+        )
     }
 
     fn last_used_display(&self) -> String {

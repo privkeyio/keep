@@ -942,11 +942,7 @@ impl App {
                 let is_new = !self.relay_urls.contains(&normalized);
                 if is_new {
                     self.relay_urls.push(normalized.clone());
-                    if let Some(ref hex) = self.active_share_hex {
-                        save_relay_urls_for(&self.keep_path, hex, &self.relay_urls);
-                    } else {
-                        save_relay_urls(&self.keep_path, &self.relay_urls);
-                    }
+                    self.save_relay_urls();
                 }
                 if let Screen::Relay(s) = &mut self.screen {
                     if is_new {
@@ -961,11 +957,7 @@ impl App {
                     if i < s.relay_urls.len() {
                         s.relay_urls.remove(i);
                         self.relay_urls = s.relay_urls.clone();
-                        if let Some(ref hex) = self.active_share_hex {
-                            save_relay_urls_for(&self.keep_path, hex, &self.relay_urls);
-                        } else {
-                            save_relay_urls(&self.keep_path, &self.relay_urls);
-                        }
+                        self.save_relay_urls();
                     }
                 }
                 Task::none()
@@ -1293,6 +1285,19 @@ impl App {
         }
     }
 
+    pub(crate) fn save_relay_urls(&self) {
+        match &self.active_share_hex {
+            Some(hex) => save_relay_urls_for(&self.keep_path, hex, &self.relay_urls),
+            None => save_relay_urls(&self.keep_path, &self.relay_urls),
+        }
+    }
+
+    pub(crate) fn save_bunker_relays(&self) {
+        if let Some(ref hex) = self.active_share_hex {
+            save_bunker_relays_for(&self.keep_path, hex, &self.bunker_relays);
+        }
+    }
+
     pub(crate) fn start_clipboard_timer(&mut self) {
         self.clipboard_clear_at = if self.settings.clipboard_clear_secs > 0 {
             Some(Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs))
@@ -1338,7 +1343,7 @@ impl App {
             Ok((shares, name)) => {
                 self.set_share_screen(shares);
                 self.set_toast(
-                    format!("Share '{name}' imported successfully"),
+                    format!("'{name}' imported successfully"),
                     ToastKind::Success,
                 );
             }
@@ -1546,17 +1551,7 @@ impl App {
         &mut self,
         result: Result<(Vec<ShareEntry>, String), String>,
     ) -> Task<Message> {
-        match result {
-            Ok((shares, name)) => {
-                self.set_share_screen(shares);
-                self.set_toast(
-                    format!("Key '{name}' imported successfully"),
-                    ToastKind::Success,
-                );
-            }
-            Err(e) => self.screen.set_loading_error(e),
-        }
-        Task::none()
+        self.handle_import_result(result)
     }
 
     fn load_audit_page(
@@ -1873,8 +1868,8 @@ impl App {
                                 break;
                             }
                         }
-                        self.refresh_shares();
                         if let Some(e) = delete_err {
+                            self.refresh_shares();
                             self.set_toast(friendly_err(e), ToastKind::Error);
                             false
                         } else {

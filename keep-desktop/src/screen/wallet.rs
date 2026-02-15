@@ -33,7 +33,7 @@ impl WalletEntry {
     }
 
     fn truncated_hex(&self) -> &str {
-        &self.group_hex[..16.min(self.group_hex.len())]
+        self.group_hex.get(..16).unwrap_or(&self.group_hex)
     }
 }
 
@@ -87,16 +87,16 @@ impl WalletScreen {
             .into()
     }
 
-    fn wallet_card<'a>(&self, i: usize, entry: &WalletEntry) -> Element<'a, Message> {
+    fn wallet_card<'a>(&self, i: usize, entry: &'a WalletEntry) -> Element<'a, Message> {
         let network_badge = container(
-            text(entry.network.clone())
+            text(&entry.network)
                 .size(theme::size::TINY)
                 .color(theme::color::PRIMARY),
         )
         .style(theme::badge_style)
         .padding([2.0, theme::space::SM]);
 
-        let hex_text = text(entry.truncated_hex().to_owned())
+        let hex_text = text(entry.truncated_hex())
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
@@ -136,7 +136,7 @@ impl WalletScreen {
             .spacing(theme::space::SM)
             .align_y(Alignment::Center);
 
-            let ext_value = text(entry.external_descriptor.clone())
+            let ext_value = text(&entry.external_descriptor)
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM);
 
@@ -152,7 +152,7 @@ impl WalletScreen {
             .spacing(theme::space::SM)
             .align_y(Alignment::Center);
 
-            let int_value = text(entry.internal_descriptor.clone())
+            let int_value = text(&entry.internal_descriptor)
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM);
 

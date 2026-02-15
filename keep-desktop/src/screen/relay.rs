@@ -187,33 +187,35 @@ impl RelayScreen {
             .into()
     }
 
+    fn connect_form(&self) -> Element<Message> {
+        let can_connect = self.selected_share.is_some()
+            && !self.relay_urls.is_empty()
+            && !self.connect_password.is_empty();
+        let password_input = text_input("Vault password", &self.connect_password)
+            .on_input(|s| Message::ConnectPasswordChanged(Zeroizing::new(s)))
+            .secure(true)
+            .size(theme::size::SMALL)
+            .width(200);
+        row![
+            password_input,
+            button(
+                text("Connect")
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center),
+            )
+            .style(theme::primary_button)
+            .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
+            .padding(theme::space::MD)
+            .width(200),
+        ]
+        .spacing(theme::space::SM)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
     fn connection_controls(&self) -> Element<Message> {
         match &self.status {
-            ConnectionStatus::Disconnected => {
-                let can_connect = self.selected_share.is_some()
-                    && !self.relay_urls.is_empty()
-                    && !self.connect_password.is_empty();
-                let password_input = text_input("Vault password", &self.connect_password)
-                    .on_input(|s| Message::ConnectPasswordChanged(Zeroizing::new(s)))
-                    .secure(true)
-                    .size(theme::size::SMALL)
-                    .width(200);
-                row![
-                    password_input,
-                    button(
-                        text("Connect")
-                            .width(Length::Fill)
-                            .align_x(Alignment::Center),
-                    )
-                    .style(theme::primary_button)
-                    .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
-                    .padding(theme::space::MD)
-                    .width(200),
-                ]
-                .spacing(theme::space::SM)
-                .align_y(Alignment::Center)
-                .into()
-            }
+            ConnectionStatus::Disconnected => self.connect_form(),
             ConnectionStatus::Connecting => theme::muted("Connecting to relay...").into(),
             ConnectionStatus::Connected => button(
                 text("Disconnect")
@@ -225,35 +227,9 @@ impl RelayScreen {
             .padding(theme::space::MD)
             .width(200)
             .into(),
-            ConnectionStatus::Error(e) => {
-                let can_connect = self.selected_share.is_some()
-                    && !self.relay_urls.is_empty()
-                    && !self.connect_password.is_empty();
-                let password_input = text_input("Vault password", &self.connect_password)
-                    .on_input(|s| Message::ConnectPasswordChanged(Zeroizing::new(s)))
-                    .secure(true)
-                    .size(theme::size::SMALL)
-                    .width(200);
-                column![
-                    theme::error_text(e),
-                    row![
-                        password_input,
-                        button(
-                            text("Connect")
-                                .width(Length::Fill)
-                                .align_x(Alignment::Center),
-                        )
-                        .style(theme::primary_button)
-                        .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
-                        .padding(theme::space::MD)
-                        .width(200),
-                    ]
-                    .spacing(theme::space::SM)
-                    .align_y(Alignment::Center),
-                ]
+            ConnectionStatus::Error(e) => column![theme::error_text(e), self.connect_form(),]
                 .spacing(theme::space::SM)
-                .into()
-            }
+                .into(),
         }
     }
 
