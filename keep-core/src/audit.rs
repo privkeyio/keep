@@ -511,6 +511,8 @@ pub enum SigningRequestType {
     Nip44Decrypt = 6,
     /// Client disconnection.
     Disconnect = 7,
+    /// Kill switch toggled.
+    KillSwitch = 8,
 }
 
 impl std::fmt::Display for SigningRequestType {
@@ -524,6 +526,7 @@ impl std::fmt::Display for SigningRequestType {
             Self::Nip44Encrypt => write!(f, "nip44_encrypt"),
             Self::Nip44Decrypt => write!(f, "nip44_decrypt"),
             Self::Disconnect => write!(f, "disconnect"),
+            Self::KillSwitch => write!(f, "kill_switch"),
         }
     }
 }

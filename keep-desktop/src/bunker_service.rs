@@ -405,6 +405,7 @@ impl App {
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
         let proxy = self.proxy_addr();
+        let kill_switch = self.kill_switch.clone();
 
         Task::perform(
             async move {
@@ -418,6 +419,7 @@ impl App {
 
                 let config = keep_nip46::ServerConfig {
                     rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
+                    kill_switch: Some(kill_switch),
                     ..Default::default()
                 };
                 let mut server = keep_nip46::Server::new_with_config_and_proxy(

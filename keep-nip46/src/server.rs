@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -25,6 +26,7 @@ pub struct ServerConfig {
     pub rate_limit: Option<RateLimitConfig>,
     pub auto_approve: bool,
     pub expected_secret: Option<String>,
+    pub kill_switch: Option<Arc<AtomicBool>>,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +37,7 @@ impl Default for ServerConfig {
             rate_limit: None,
             auto_approve: false,
             expected_secret: None,
+            kill_switch: None,
         }
     }
 }
@@ -76,6 +79,9 @@ fn finalize_handler(
     handler = handler.with_relay_urls(relay_urls.to_vec());
     if let Some(ref rl_config) = config.rate_limit {
         handler = handler.with_rate_limit(rl_config.clone());
+    }
+    if let Some(ref ks) = config.kill_switch {
+        handler = handler.with_kill_switch(ks.clone());
     }
     let bunker_secret = if config.auto_approve && config.expected_secret.is_none() {
         let secret = hex::encode(keep_core::crypto::random_bytes::<16>());

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -96,6 +97,7 @@ pub struct SignerHandler {
     expected_secret: Option<String>,
     auto_approve: bool,
     relay_urls: Vec<String>,
+    kill_switch: Arc<AtomicBool>,
 }
 
 impl SignerHandler {
@@ -117,6 +119,7 @@ impl SignerHandler {
             expected_secret: None,
             auto_approve: false,
             relay_urls: Vec::new(),
+            kill_switch: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -148,6 +151,25 @@ impl SignerHandler {
     pub fn with_relay_urls(mut self, urls: Vec<String>) -> Self {
         self.relay_urls = urls;
         self
+    }
+
+    pub fn with_kill_switch(mut self, kill_switch: Arc<AtomicBool>) -> Self {
+        self.kill_switch = kill_switch;
+        self
+    }
+
+    pub fn set_kill_switch(&self, active: bool) {
+        self.kill_switch.store(active, Ordering::Release);
+    }
+
+    fn check_kill_switch(&self) -> Result<()> {
+        if self.kill_switch.load(Ordering::Acquire) {
+            Err(KeepError::PermissionDenied(
+                "kill switch active — all signing blocked".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     const MAX_RATE_LIMITERS: usize = 1_000;
@@ -316,6 +338,7 @@ impl SignerHandler {
         app_pubkey: PublicKey,
         unsigned_event: UnsignedEvent,
     ) -> Result<Event> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
 
         let kind = unsigned_event.kind;
@@ -350,6 +373,8 @@ impl SignerHandler {
                 return Err(KeepError::UserRejected);
             }
         }
+
+        self.check_kill_switch()?;
 
         let signed_event = if let Some(ref net_frost) = self.network_frost_signer {
             let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
@@ -437,6 +462,7 @@ impl SignerHandler {
         recipient: PublicKey,
         plaintext: &str,
     ) -> Result<String> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
             .await?;
@@ -457,10 +483,12 @@ impl SignerHandler {
         sender: PublicKey,
         ciphertext: &str,
     ) -> Result<String> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
             .await?;
         self.require_approval(app_pubkey, "nip44_decrypt").await?;
+        self.check_kill_switch()?;
 
         let secret = self.primary_secret_key().await?;
         let plaintext = nip44::decrypt(&secret, &sender, ciphertext)
@@ -480,6 +508,7 @@ impl SignerHandler {
         recipient: PublicKey,
         plaintext: &str,
     ) -> Result<String> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
             .await?;
@@ -500,10 +529,12 @@ impl SignerHandler {
         sender: PublicKey,
         ciphertext: &str,
     ) -> Result<String> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
             .await?;
         self.require_approval(app_pubkey, "nip04_decrypt").await?;
+        self.check_kill_switch()?;
 
         let secret = self.primary_secret_key().await?;
         let plaintext = nip04::decrypt(&secret, &sender, ciphertext)

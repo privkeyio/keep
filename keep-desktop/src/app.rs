@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -119,6 +120,7 @@ pub struct App {
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) settings: Settings,
+    pub(crate) kill_switch: Arc<AtomicBool>,
 }
 
 pub(crate) fn lock_keep(
@@ -225,23 +227,21 @@ fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
 }
 
 fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
+    let parent = path.parent().unwrap_or(path);
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(data.as_bytes())?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        tmp.write_all(data.as_bytes())?;
+        tmp.as_file().sync_all()?;
     }
-    #[cfg(not(unix))]
+    #[cfg(unix)]
     {
-        std::fs::write(path, data)
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    tmp.persist(path).map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
@@ -319,6 +319,7 @@ impl App {
         relay_urls: Vec<String>,
         settings: Settings,
     ) -> Self {
+        let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
         Self {
             keep: Arc::new(Mutex::new(None)),
             keep_path,
@@ -350,6 +351,7 @@ impl App {
             bunker_pending_setup: None,
             nostrconnect_pending: None,
             settings,
+            kill_switch,
         }
     }
 
@@ -1690,7 +1692,9 @@ impl App {
             Message::KillSwitchActivate => {
                 self.settings.kill_switch_active = true;
                 save_settings(&self.keep_path, &self.settings);
+                self.kill_switch.store(true, Ordering::Release);
 
+                self.log_kill_switch_event(true);
                 self.handle_disconnect_relay();
                 self.stop_bunker();
 
@@ -1744,8 +1748,10 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
+                        self.kill_switch.store(false, Ordering::Release);
                         self.settings.kill_switch_active = false;
                         save_settings(&self.keep_path, &self.settings);
+                        self.log_kill_switch_event(false);
                         if let Screen::Settings(s) = &mut self.screen {
                             s.kill_switch_active = false;
                             s.kill_switch_error = None;
@@ -1767,7 +1773,36 @@ impl App {
         Task::none()
     }
 
+    fn log_kill_switch_event(&self, activated: bool) {
+        use keep_core::audit::{SigningAuditEntry, SigningDecision, SigningRequestType};
+        let decision = if activated {
+            SigningDecision::Denied
+        } else {
+            SigningDecision::Approved
+        };
+        let mut guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_mut() {
+            let hash = keep.signing_audit_last_hash().unwrap_or([0u8; 32]);
+            let reason = if activated {
+                "activated"
+            } else {
+                "deactivated"
+            };
+            let entry = SigningAuditEntry::new(
+                SigningRequestType::KillSwitch,
+                decision,
+                false,
+                "desktop".into(),
+                hash,
+            )
+            .with_reason(reason);
+            if let Err(e) = keep.signing_audit_log(entry) {
+                tracing::warn!("Failed to log kill switch event: {e}");
+            }
+        }
+    }
+
     pub(crate) fn is_kill_switch_active(&self) -> bool {
-        self.settings.kill_switch_active
+        self.kill_switch.load(Ordering::Acquire)
     }
 }
