@@ -187,7 +187,7 @@ pub struct KfpNode {
 
 impl KfpNode {
     pub async fn new(share: SharePackage, relays: Vec<String>) -> Result<Self> {
-        Self::with_nonce_store(share, relays, None, None).await
+        Self::with_nonce_store(share, relays, None, None, None).await
     }
 
     pub async fn new_with_proxy(
@@ -195,7 +195,7 @@ impl KfpNode {
         relays: Vec<String>,
         proxy: SocketAddr,
     ) -> Result<Self> {
-        Self::with_nonce_store(share, relays, None, Some(proxy)).await
+        Self::with_nonce_store(share, relays, None, Some(proxy), None).await
     }
 
     pub async fn with_nonce_store_path(
@@ -209,6 +209,7 @@ impl KfpNode {
             relays,
             Some(Arc::new(store) as Arc<dyn NonceStore>),
             None,
+            None,
         )
         .await
     }
@@ -218,6 +219,7 @@ impl KfpNode {
         relays: Vec<String>,
         nonce_store: Option<Arc<dyn NonceStore>>,
         proxy: Option<SocketAddr>,
+        session_timeout: Option<Duration>,
     ) -> Result<Self> {
         let keys = derive_keys_from_share(&share)?;
         let client = match proxy {
@@ -250,7 +252,7 @@ impl KfpNode {
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let session_manager = match nonce_store {
+        let mut session_manager = match nonce_store {
             Some(store) => {
                 info!(
                     consumed_count = store.count(),
@@ -259,6 +261,19 @@ impl KfpNode {
                 SessionManager::new().with_nonce_store(store)
             }
             None => SessionManager::new(),
+        };
+        if let Some(t) = session_timeout {
+            session_manager = session_manager.with_timeout(t);
+        }
+
+        let ecdh_manager = match session_timeout {
+            Some(t) => EcdhSessionManager::new().with_timeout(t),
+            None => EcdhSessionManager::new(),
+        };
+
+        let descriptor_manager = match session_timeout {
+            Some(t) => DescriptorSessionManager::with_timeout(t),
+            None => DescriptorSessionManager::new(),
         };
 
         let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
@@ -270,8 +285,8 @@ impl KfpNode {
             share,
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
-            ecdh_sessions: Arc::new(RwLock::new(EcdhSessionManager::new())),
-            descriptor_sessions: Arc::new(RwLock::new(DescriptorSessionManager::new())),
+            ecdh_sessions: Arc::new(RwLock::new(ecdh_manager)),
+            descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
             policies: Arc::new(RwLock::new(HashMap::new())),
             hooks: RwLock::new(Arc::new(NoOpHooks)),

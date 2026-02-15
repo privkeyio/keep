@@ -147,7 +147,7 @@ impl SettingsScreen {
             .style(btn_style)
             .padding([theme::space::SM, theme::space::MD]);
 
-        let controls = row![text("Port").size(theme::size::BODY), port_input, toggle_btn,]
+        let controls = row![text("Port").size(theme::size::BODY), port_input, toggle_btn]
             .spacing(theme::space::SM)
             .align_y(iced::Alignment::Center);
 

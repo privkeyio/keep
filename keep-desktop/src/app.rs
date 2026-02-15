@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,8 @@ use crate::screen::Screen;
 
 const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
+const DEFAULT_PROXY_PORT: u16 = 9050;
+const PROXY_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
@@ -234,7 +237,7 @@ fn default_clipboard_clear_secs() -> u64 {
 }
 
 fn default_proxy_port() -> u16 {
-    9050
+    DEFAULT_PROXY_PORT
 }
 
 impl Default for Settings {
@@ -243,7 +246,7 @@ impl Default for Settings {
             auto_lock_secs: AUTO_LOCK_SECS,
             clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
             proxy_enabled: false,
-            proxy_port: 9050,
+            proxy_port: DEFAULT_PROXY_PORT,
         }
     }
 }
@@ -1133,14 +1136,33 @@ impl App {
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
     }
 
-    pub(crate) fn proxy_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn proxy_addr(&self) -> Option<SocketAddr> {
         if self.settings.proxy_enabled && self.settings.proxy_port > 0 {
-            Some(std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
                 self.settings.proxy_port,
-            ))
+            )))
         } else {
             None
+        }
+    }
+
+    pub(crate) fn frost_channels(&self) -> crate::frost::FrostChannels {
+        crate::frost::FrostChannels {
+            events: self.frost_events.clone(),
+            pending_requests: self.pending_sign_requests.clone(),
+            shutdown: self.frost_shutdown.clone(),
+        }
+    }
+
+    pub(crate) fn network_config(&self) -> crate::frost::NetworkConfig {
+        crate::frost::NetworkConfig {
+            proxy: self.proxy_addr(),
+            session_timeout: if self.settings.proxy_enabled {
+                Some(PROXY_SESSION_TIMEOUT)
+            } else {
+                None
+            },
         }
     }
 
@@ -1402,29 +1424,39 @@ impl App {
             }
             Message::SettingsProxyToggled(enabled) => {
                 self.settings.proxy_enabled = enabled;
-                let has_active = matches!(
+                let frost_active = matches!(
                     self.frost_status,
                     ConnectionStatus::Connected | ConnectionStatus::Connecting
-                ) || self.bunker.is_some();
-                if has_active {
+                );
+                let bunker_active = self.bunker.is_some();
+                save_settings(&self.keep_path, &self.settings);
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_enabled = self.settings.proxy_enabled;
+                }
+                let mut tasks = Vec::new();
+                if frost_active {
+                    tasks.push(self.handle_reconnect_relay());
+                }
+                if bunker_active {
+                    self.stop_bunker();
+                    tasks.push(self.handle_bunker_start());
+                }
+                if !tasks.is_empty() {
+                    let label = if enabled { "enabled" } else { "disabled" };
                     self.set_toast(
-                        "Reconnect to apply proxy changes".into(),
+                        format!("Proxy {label}, reconnecting..."),
                         ToastKind::Success,
                     );
                 }
+                return Task::batch(tasks);
             }
             Message::SettingsProxyPortChanged(port_str) => {
                 if let Screen::Settings(s) = &mut self.screen {
                     s.proxy_port_input = port_str.clone();
                 }
-                if let Ok(port) = port_str.parse::<u16>() {
-                    if port > 0 {
-                        self.settings.proxy_port = port;
-                    } else {
-                        return Task::none();
-                    }
-                } else {
-                    return Task::none();
+                match port_str.parse::<u16>() {
+                    Ok(port) if port > 0 => self.settings.proxy_port = port,
+                    _ => return Task::none(),
                 }
             }
             _ => return Task::none(),
@@ -1435,7 +1467,10 @@ impl App {
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
             s.proxy_enabled = self.settings.proxy_enabled;
             s.proxy_port = self.settings.proxy_port;
-            s.proxy_port_input = self.settings.proxy_port.to_string();
+            let formatted = self.settings.proxy_port.to_string();
+            if s.proxy_port_input != formatted {
+                s.proxy_port_input = formatted;
+            }
         }
         Task::none()
     }

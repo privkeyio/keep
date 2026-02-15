@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,19 @@ use crate::screen::shares::ShareEntry;
 use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
+
+#[derive(Clone)]
+pub(crate) struct NetworkConfig {
+    pub proxy: Option<SocketAddr>,
+    pub session_timeout: Option<Duration>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FrostChannels {
+    pub events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pub pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
+    pub shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+}
 
 fn push_frost_event(queue: &Mutex<VecDeque<FrostNodeMsg>>, event: FrostNodeMsg) {
     if let Ok(mut q) = queue.lock() {
@@ -128,10 +142,8 @@ pub(crate) async fn setup_frost_node(
     keep_path: std::path::PathBuf,
     share_entry: ShareEntry,
     relay_urls: Vec<String>,
-    frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
-    pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
-    frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    proxy: Option<std::net::SocketAddr>,
+    ch: FrostChannels,
+    net: NetworkConfig,
 ) -> Result<FrostNodeSetup, String> {
     let share = tokio::task::spawn_blocking({
         let keep_arc = keep_arc.clone();
@@ -155,7 +167,8 @@ pub(crate) async fn setup_frost_node(
         share,
         relay_urls,
         Some(Arc::new(nonce_store) as Arc<dyn keep_frost_net::NonceStore>),
-        proxy,
+        net.proxy,
+        net.session_timeout,
     )
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
@@ -170,7 +183,7 @@ pub(crate) async fn setup_frost_node(
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let (listener_shutdown_tx, mut listener_shutdown_rx) = mpsc::channel::<()>(1);
 
-    if let Ok(mut guard) = frost_shutdown.lock() {
+    if let Ok(mut guard) = ch.shutdown.lock() {
         *guard = Some(shutdown_tx);
     }
 
@@ -191,8 +204,8 @@ pub(crate) async fn setup_frost_node(
         drop(listener_shutdown_tx);
     });
 
-    let listener_events = frost_events;
-    let listener_requests = pending_requests;
+    let listener_events = ch.events;
+    let listener_requests = ch.pending_requests;
     let listener_node = node.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -219,22 +232,11 @@ pub(crate) async fn spawn_frost_node(
     keep_path: std::path::PathBuf,
     share_entry: ShareEntry,
     relay_urls: Vec<String>,
-    frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
-    pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
-    frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    proxy: Option<std::net::SocketAddr>,
+    ch: FrostChannels,
+    net: NetworkConfig,
 ) -> Result<(), String> {
-    let setup = setup_frost_node(
-        keep_arc,
-        keep_path,
-        share_entry,
-        relay_urls,
-        frost_events.clone(),
-        pending_requests,
-        frost_shutdown,
-        proxy,
-    )
-    .await?;
+    let frost_events = ch.events.clone();
+    let setup = setup_frost_node(keep_arc, keep_path, share_entry, relay_urls, ch, net).await?;
 
     let _node = setup.node;
     let mut connect_rx = setup.connect_rx;
@@ -505,10 +507,8 @@ impl App {
                 self.keep_path.clone(),
                 share_entry,
                 relay_urls,
-                self.frost_events.clone(),
-                self.pending_sign_requests.clone(),
-                self.frost_shutdown.clone(),
-                self.proxy_addr(),
+                self.frost_channels(),
+                self.network_config(),
             ),
             Message::ConnectRelayResult,
         )
@@ -570,10 +570,8 @@ impl App {
                 self.keep_path.clone(),
                 share_entry,
                 relay_urls,
-                self.frost_events.clone(),
-                self.pending_sign_requests.clone(),
-                self.frost_shutdown.clone(),
-                self.proxy_addr(),
+                self.frost_channels(),
+                self.network_config(),
             ),
             Message::ConnectRelayResult,
         )
