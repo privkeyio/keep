@@ -67,7 +67,9 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 use zeroize::Zeroize;
 
-use crate::audit::{AuditEntry, AuditEventType, AuditLog, RetentionPolicy};
+use crate::audit::{
+    AuditEntry, AuditEventType, AuditLog, RetentionPolicy, SigningAuditEntry, SigningAuditLog,
+};
 use crate::crypto::{Argon2Params, SecretKey};
 use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
@@ -82,6 +84,7 @@ pub struct Keep {
     storage: Storage,
     keyring: Keyring,
     audit: Option<AuditLog>,
+    signing_audit: Option<SigningAuditLog>,
 }
 
 impl Keep {
@@ -112,6 +115,7 @@ impl Keep {
             storage,
             keyring: Keyring::new(),
             audit: None,
+            signing_audit: None,
         })
     }
 
@@ -137,6 +141,7 @@ impl Keep {
             storage,
             keyring: Keyring::new(),
             audit: None,
+            signing_audit: None,
         })
     }
 
@@ -151,6 +156,7 @@ impl Keep {
 
         let data_key = self.get_data_key()?;
         self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
+        self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &data_key)?);
         self.audit_event(AuditEventType::VaultUnlock, |e| e);
         debug!("loading keys to keyring");
         self.load_keys_to_keyring()
@@ -166,6 +172,7 @@ impl Keep {
         self.audit_event(AuditEventType::VaultLock, |e| e);
         self.keyring.clear();
         self.audit = None;
+        self.signing_audit = None;
         self.storage.lock();
     }
 
@@ -786,6 +793,9 @@ impl Keep {
         if let Some(ref mut audit) = self.audit {
             audit.reencrypt(&old_data_key, &new_data_key)?;
         }
+        if let Some(ref mut signing_audit) = self.signing_audit {
+            signing_audit.reencrypt(&old_data_key, &new_data_key)?;
+        }
 
         self.keyring.clear();
         self.load_keys_to_keyring()?;
@@ -854,6 +864,54 @@ impl Keep {
         let data_key = self.get_data_key()?;
         let audit = self.audit.as_mut().ok_or(KeepError::Locked)?;
         audit.apply_retention(&data_key)
+    }
+
+    /// Log a signing audit entry.
+    pub fn signing_audit_log(&mut self, entry: SigningAuditEntry) -> Result<()> {
+        let data_key = self.get_data_key()?;
+        let log = self.signing_audit.as_mut().ok_or(KeepError::Locked)?;
+        log.log(entry, &data_key)
+    }
+
+    /// Get the last hash of the signing audit chain.
+    pub fn signing_audit_last_hash(&self) -> Result<[u8; 32]> {
+        let log = self.signing_audit.as_ref().ok_or(KeepError::Locked)?;
+        Ok(log.last_hash())
+    }
+
+    /// Read a page of signing audit entries (newest first).
+    pub fn signing_audit_read_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        caller_filter: Option<&str>,
+    ) -> Result<Vec<SigningAuditEntry>> {
+        let (log, data_key) = self.signing_audit_with_key()?;
+        log.read_page(&data_key, offset, limit, caller_filter)
+    }
+
+    /// Get distinct callers from the signing audit log.
+    pub fn signing_audit_distinct_callers(&self) -> Result<Vec<String>> {
+        let (log, data_key) = self.signing_audit_with_key()?;
+        log.distinct_callers(&data_key)
+    }
+
+    /// Get the count of signing audit entries.
+    pub fn signing_audit_count(&self) -> Result<usize> {
+        let (log, data_key) = self.signing_audit_with_key()?;
+        log.count(&data_key)
+    }
+
+    /// Verify the integrity of the signing audit chain.
+    pub fn signing_audit_verify_chain(&self) -> Result<bool> {
+        let (log, data_key) = self.signing_audit_with_key()?;
+        log.verify_chain(&data_key)
+    }
+
+    fn signing_audit_with_key(&self) -> Result<(&SigningAuditLog, SecretKey)> {
+        let log = self.signing_audit.as_ref().ok_or(KeepError::Locked)?;
+        let data_key = self.get_data_key()?;
+        Ok((log, data_key))
     }
 }
 
