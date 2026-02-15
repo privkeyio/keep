@@ -38,6 +38,7 @@ pub struct NostrConnectRequest {
 
 const MAX_NOSTRCONNECT_RELAYS: usize = 10;
 const MAX_DISPLAY_NAME_LEN: usize = 50;
+const MAX_PERMS_LEN: usize = 512;
 const MIN_SECRET_LEN: usize = 16;
 
 fn validate_metadata_url(value: &str) -> Result<String, String> {
@@ -88,7 +89,7 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
             "name" => name = Some(sanitize_display_name(&value)),
             "url" => url_param = validate_metadata_url(&value).ok(),
             "image" => image = validate_metadata_url(&value).ok(),
-            "perms" => perms = Some(value.to_string()),
+            "perms" if value.len() <= MAX_PERMS_LEN => perms = Some(value.to_string()),
             _ => {}
         }
     }

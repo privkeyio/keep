@@ -541,6 +541,8 @@ impl SignerHandler {
         name: String,
         permissions_str: Option<&str>,
     ) -> Result<()> {
+        self.check_rate_limit(&app_pubkey).await?;
+
         let (requested_perms, auto_kinds) = permissions_str
             .map(parse_permission_string)
             .unwrap_or((Permission::DEFAULT, HashSet::new()));

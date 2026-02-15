@@ -124,10 +124,6 @@ impl App {
                     .await
                     .map_err(|e| format!("Failed to connect to relays: {e}"))?;
 
-                send_nostrconnect_response(&server, &request)
-                    .await
-                    .map_err(|e| format!("Failed to send connect response: {e}"))?;
-
                 let app_name = request
                     .name
                     .clone()
@@ -136,6 +132,10 @@ impl App {
                     .register_client(request.client_pubkey, app_name, request.perms.as_deref())
                     .await
                     .map_err(|e| format!("Failed to register client: {e}"))?;
+
+                send_nostrconnect_response(&server, &request)
+                    .await
+                    .map_err(|e| format!("Failed to send connect response: {e}"))?;
 
                 let handle = tokio::spawn(async move {
                     let mut attempts = 0u32;
@@ -148,8 +148,13 @@ impl App {
                                     tracing::error!(error = %e, "bunker server giving up after {RECONNECT_MAX_ATTEMPTS} reconnect attempts");
                                     break;
                                 }
-                                let delay_ms =
+                                let base_ms =
                                     (RECONNECT_BASE_MS << attempts.min(7)).min(RECONNECT_MAX_MS);
+                                let jitter_ms = rand::Rng::gen_range(
+                                    &mut rand::rng(),
+                                    0..=base_ms / 2,
+                                );
+                                let delay_ms = base_ms + jitter_ms;
                                 tracing::error!(error = %e, attempt = attempts, "bunker server error, reconnecting in {delay_ms}ms");
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                     .await;
@@ -193,7 +198,7 @@ async fn send_nostrconnect_response(
 
     let response = serde_json::json!({
         "id": hex::encode(keep_core::crypto::random_bytes::<16>()),
-        "result": request.secret,
+        "result": keys.public_key().to_hex(),
     });
     let response_json =
         serde_json::to_string(&response).map_err(|e| format!("serialization: {e}"))?;
