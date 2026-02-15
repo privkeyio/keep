@@ -16,6 +16,31 @@ use crate::screen::bunker::{
 };
 use crate::screen::Screen;
 
+pub(crate) fn extract_keyring(
+    keep: &Arc<Mutex<Option<keep_core::Keep>>>,
+) -> Result<Arc<tokio::sync::Mutex<keep_core::keyring::Keyring>>, String> {
+    let guard = lock_keep(keep);
+    let k = guard
+        .as_ref()
+        .ok_or_else(|| "Vault is locked".to_string())?;
+    let kr = k.keyring();
+    let slot = kr
+        .get_primary()
+        .ok_or_else(|| "No signing key available".to_string())?;
+
+    let pubkey = slot.pubkey;
+    let secret = Zeroizing::new(*slot.expose_secret());
+    let key_type = slot.key_type;
+    let name = slot.name.clone();
+
+    let mut new_kr = keep_core::keyring::Keyring::new();
+    new_kr
+        .load_key(pubkey, *secret, key_type, name)
+        .map_err(|e| format!("Failed to prepare keyring: {e}"))?;
+
+    Ok(Arc::new(tokio::sync::Mutex::new(new_kr)))
+}
+
 pub(crate) enum BunkerEvent {
     Log {
         app: String,
@@ -149,6 +174,14 @@ impl App {
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
 
+                if self.nostrconnect_pending.is_some() {
+                    return if approved {
+                        self.handle_nostrconnect_approve()
+                    } else {
+                        self.handle_nostrconnect_reject()
+                    };
+                }
+
                 let duration_choice = if let Screen::Bunker(s) = &self.screen {
                     DURATION_OPTIONS
                         .get(s.approval_duration)
@@ -169,7 +202,7 @@ impl App {
                 self.bunker_pending_approval = None;
                 if let Screen::Bunker(s) = &mut self.screen {
                     s.pending_approval = None;
-                    s.approval_duration = 0; // Reset to JustThisTime
+                    s.approval_duration = 0;
                 }
 
                 if approved {
@@ -361,39 +394,25 @@ impl App {
 
         Task::perform(
             async move {
-                let keyring = tokio::task::spawn_blocking(move || {
-                    let guard = lock_keep(&keep_arc);
-                    let keep = guard
-                        .as_ref()
-                        .ok_or_else(|| "Vault is locked".to_string())?;
-                    let kr = keep.keyring();
-                    let slot = kr
-                        .get_primary()
-                        .ok_or_else(|| "No signing key available".to_string())?;
-
-                    let pubkey = slot.pubkey;
-                    let secret = Zeroizing::new(*slot.expose_secret());
-                    let key_type = slot.key_type;
-                    let name = slot.name.clone();
-
-                    let mut new_kr = keep_core::keyring::Keyring::new();
-                    new_kr
-                        .load_key(pubkey, *secret, key_type, name)
-                        .map_err(|e| format!("Failed to prepare keyring: {e}"))?;
-
-                    Ok::<_, String>(Arc::new(tokio::sync::Mutex::new(new_kr)))
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
+                let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
+                    .await
+                    .map_err(|_| "Background task failed".to_string())??;
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
                     Arc::new(DesktopCallbacks { tx: event_tx });
 
-                let mut server = keep_nip46::Server::new_with_proxy(
+                let config = keep_nip46::ServerConfig {
+                    rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
+                    ..Default::default()
+                };
+                let mut server = keep_nip46::Server::new_with_config_and_proxy(
                     keyring,
+                    None,
+                    None,
                     &relay_urls,
                     Some(callbacks),
+                    config,
                     proxy,
                 )
                 .await

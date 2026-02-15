@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Keep
+Comment=Nostr key manager and remote signer
+Exec=keep-desktop %u
+Terminal=false
+Type=Application
+Categories=Utility;Security;
+MimeType=x-scheme-handler/nostrconnect;
+StartupNotify=true

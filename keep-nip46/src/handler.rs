@@ -244,8 +244,7 @@ impl SignerHandler {
                 None => false,
             };
             if !valid {
-                let mut audit = self.audit.lock().await;
-                audit.log(
+                self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::Connect, app_pubkey)
                         .with_success(false)
                         .with_reason("invalid secret"),
@@ -343,8 +342,7 @@ impl SignerHandler {
                 .await;
 
             if !approved {
-                let mut audit = self.audit.lock().await;
-                audit.log(
+                self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
                         .with_success(false),
@@ -528,11 +526,37 @@ impl SignerHandler {
             AuditEntry::new(AuditAction::GetPublicKey, app_pubkey).with_reason("switch_relays"),
         );
 
-        if self.relay_urls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(self.relay_urls.clone()))
+        let relays = (!self.relay_urls.is_empty()).then(|| self.relay_urls.clone());
+        Ok(relays)
+    }
+
+    pub async fn register_client(
+        &self,
+        app_pubkey: PublicKey,
+        name: String,
+        permissions_str: Option<&str>,
+    ) -> Result<()> {
+        self.check_rate_limit(&app_pubkey).await?;
+
+        let (requested_perms, auto_kinds) = permissions_str
+            .map(parse_permission_string)
+            .unwrap_or((Permission::DEFAULT, HashSet::new()));
+
+        let mut pm = self.permissions.lock().await;
+        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
+            return Err(KeepError::CapacityExceeded(
+                "too many connected apps".into(),
+            ));
         }
+        drop(pm);
+
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
+
+        info!(app_id = &app_pubkey.to_hex()[..8], "client registered");
+        Ok(())
     }
 
     pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {
@@ -864,5 +888,152 @@ mod tests {
         let pm = handler.permissions.lock().await;
         let app = pm.get_app(&app_pubkey).unwrap();
         assert!(matches!(app.duration, PermissionDuration::Seconds(3600)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_wrong_secret() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_expected_secret("correct_secret_value".into());
+
+        let app_pubkey = Keys::generate().public_key();
+        let result = handler
+            .handle_connect(app_pubkey, None, Some("wrong_secret".into()), None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_missing_secret_when_expected() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_expected_secret("required_secret".into());
+
+        let app_pubkey = Keys::generate().public_key();
+        let result = handler.handle_connect(app_pubkey, None, None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_accepts_correct_secret() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_expected_secret("correct_secret_value".into());
+
+        let app_pubkey = Keys::generate().public_key();
+        let result = handler
+            .handle_connect(app_pubkey, None, Some("correct_secret_value".into()), None)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_blocks_excess_requests() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_auto_approve(true)
+            .with_rate_limit(RateLimitConfig::new(3, 100, 1000));
+
+        let app_pubkey = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        let pk_result1 = handler.handle_get_public_key(app_pubkey).await;
+        assert!(pk_result1.is_ok());
+
+        let pk_result2 = handler.handle_get_public_key(app_pubkey).await;
+        assert!(pk_result2.is_ok());
+
+        let pk_result3 = handler.handle_get_public_key(app_pubkey).await;
+        assert!(
+            pk_result3.is_err(),
+            "should be rate limited after exceeding per-minute limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_per_app_isolation() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_auto_approve(true)
+            .with_rate_limit(RateLimitConfig::new(2, 100, 1000));
+
+        let app1 = Keys::generate().public_key();
+        let app2 = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app1, None, None, None)
+            .await
+            .unwrap();
+        handler
+            .handle_connect(app2, None, None, None)
+            .await
+            .unwrap();
+
+        assert!(handler.handle_get_public_key(app1).await.is_ok());
+        assert!(handler.handle_get_public_key(app2).await.is_ok());
+
+        assert!(handler.handle_get_public_key(app1).await.is_err());
+        assert!(handler.handle_get_public_key(app2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_without_auto_approve_or_callbacks_is_rejected() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+
+        let app_pubkey = Keys::generate().public_key();
+        let result = handler.handle_connect(app_pubkey, None, None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_revoke_client_denies_subsequent_requests() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+        assert!(handler.handle_get_public_key(app_pubkey).await.is_ok());
+
+        handler.revoke_client(&app_pubkey).await;
+        assert!(handler.handle_get_public_key(app_pubkey).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_revoke_all_clients() {
+        let handler = setup_handler();
+        let app1 = Keys::generate().public_key();
+        let app2 = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app1, None, None, None)
+            .await
+            .unwrap();
+        handler
+            .handle_connect(app2, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(handler.list_clients().await.len(), 2);
+
+        handler.revoke_all_clients().await;
+        assert_eq!(handler.list_clients().await.len(), 0);
     }
 }

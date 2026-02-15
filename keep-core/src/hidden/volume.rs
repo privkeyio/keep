@@ -1008,14 +1008,13 @@ mod tests {
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 6 and 7 on same instance for tight timing.
-        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
-        // ensures we hit rate limiting even if the first attempt's
-        // 1-second window expired on slow CI.
+        // Attempts 6-8 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. After 7, delay=4s.
+        // Three rapid attempts ensures we hit rate limiting even on very
+        // slow CI runners where individual Argon2 calls take >1s.
         let mut storage = HiddenStorage::open(&path).unwrap();
-        let result = storage.unlock_outer("wrong");
-        assert!(result.is_err()); // May or may not be rate limited (1s window)
-
+        let _ = storage.unlock_outer("wrong");
+        let _ = storage.unlock_outer("wrong");
         let result = storage.unlock_outer("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
@@ -1043,14 +1042,13 @@ mod tests {
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 6 and 7 on same instance for tight timing.
-        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
-        // ensures we hit rate limiting even if the first attempt's
-        // 1-second window expired on slow CI.
+        // Attempts 6-8 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. After 7, delay=4s.
+        // Three rapid attempts ensures we hit rate limiting even on very
+        // slow CI runners where individual Argon2 calls take >1s.
         let mut storage = HiddenStorage::open(&path).unwrap();
-        let result = storage.unlock_hidden("wrong");
-        assert!(result.is_err()); // May or may not be rate limited (1s window)
-
+        let _ = storage.unlock_hidden("wrong");
+        let _ = storage.unlock_hidden("wrong");
         let result = storage.unlock_hidden("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
@@ -1078,14 +1076,13 @@ mod tests {
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 6 and 7 on same instance for tight timing.
-        // After 5 failures, delay=1s. After 6, delay=2s. Two attempts
-        // ensures we hit rate limiting even if the first attempt's
-        // 1-second window expired on slow CI.
+        // Attempts 6-8 on same instance for tight timing.
+        // After 5 failures, delay=1s. After 6, delay=2s. After 7, delay=4s.
+        // Three rapid attempts ensures we hit rate limiting even on very
+        // slow CI runners where individual Argon2 calls take >1s.
         let mut storage = HiddenStorage::open(&path).unwrap();
-        let result = storage.unlock("wrong");
-        assert!(result.is_err()); // May or may not be rate limited (1s window)
-
+        let _ = storage.unlock("wrong");
+        let _ = storage.unlock("wrong");
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }

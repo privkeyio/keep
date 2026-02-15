@@ -8,6 +8,7 @@ mod app;
 mod bunker_service;
 mod frost;
 mod message;
+mod nostrconnect;
 mod screen;
 mod theme;
 
@@ -15,7 +16,26 @@ use app::App;
 use iced::{Size, Theme};
 
 fn main() -> iced::Result {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt::init();
+
+    // NOTE: On macOS, URL-scheme invocations (application:openURLs:) are not
+    // captured because implementing NSApplicationDelegate requires unsafe code
+    // (forbidden by this crate). Launch with the nostrconnect:// URI as a CLI
+    // argument instead: `keep-desktop "nostrconnect://..."`.
+    let pending_uri = std::env::args()
+        .nth(1)
+        .filter(|arg| arg.starts_with("nostrconnect://"))
+        .and_then(|uri| {
+            keep_nip46::parse_nostrconnect_uri(&uri)
+                .map_err(|e| tracing::warn!("Invalid nostrconnect URI: {e}"))
+                .ok()
+        });
+
+    app::set_pending_nostrconnect(pending_uri);
 
     iced::application(App::new, App::update, App::view)
         .title("Keep")
