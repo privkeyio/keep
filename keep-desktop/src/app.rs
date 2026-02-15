@@ -2591,9 +2591,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_minimize_to_tray_on() {
+    fn default_settings_minimize_to_tray_off() {
         let s = Settings::default();
-        assert!(s.minimize_to_tray);
+        assert!(!s.minimize_to_tray);
         assert!(!s.start_minimized);
     }
 
@@ -2621,7 +2621,7 @@ mod tests {
     fn settings_missing_tray_fields_get_defaults() {
         let json = r#"{"auto_lock_secs":300,"clipboard_clear_secs":30}"#;
         let parsed: Settings = serde_json::from_str(json).unwrap();
-        assert!(parsed.minimize_to_tray);
+        assert!(!parsed.minimize_to_tray);
         assert!(!parsed.start_minimized);
     }
 
