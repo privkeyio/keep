@@ -302,4 +302,212 @@ mod tests {
         );
         assert_eq!(sanitize_display_name("A\u{200B}B"), "AB");
     }
+
+    #[test]
+    fn test_parse_nostrconnect_secret_exact_min_length() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let secret = "a".repeat(MIN_SECRET_LEN);
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
+            pubkey.to_hex(),
+            secret
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.secret, secret);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_secret_one_below_min() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let secret = "a".repeat(MIN_SECRET_LEN - 1);
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
+            pubkey.to_hex(),
+            secret
+        );
+        assert!(parse_nostrconnect_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_secret_exact_max_length() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let secret = "b".repeat(64);
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
+            pubkey.to_hex(),
+            secret
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.secret, secret);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_secret_over_max() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let secret = "c".repeat(65);
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
+            pubkey.to_hex(),
+            secret
+        );
+        assert!(parse_nostrconnect_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_relay_limit() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let relays: Vec<String> = (0..15)
+            .map(|i| format!("relay=wss%3A%2F%2Frelay{i}.example.com"))
+            .collect();
+        let uri = format!(
+            "nostrconnect://{}?{}&secret=abcdef0123456789",
+            pubkey.to_hex(),
+            relays.join("&")
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays.len(), MAX_NOSTRCONNECT_RELAYS);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_rejects_http_url() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789&url=http%3A%2F%2Fexample.com",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert!(req.url.is_none());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_accepts_https_url() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789&url=https%3A%2F%2Fexample.com",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.url.as_deref(), Some("https://example.com/"));
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_rejects_http_image() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789&image=http%3A%2F%2Fexample.com%2Fimg.png",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert!(req.image.is_none());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_ignores_unknown_params() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789&foo=bar&baz=qux",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.secret, "abcdef0123456789");
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_pubkey_wrong_length() {
+        let uri =
+            "nostrconnect://abcdef1234?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789";
+        let err = parse_nostrconnect_uri(uri).unwrap_err();
+        assert!(err.contains("invalid client pubkey"));
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_pubkey_right_length_but_invalid() {
+        let fake_pubkey = "g".repeat(64);
+        let uri = format!(
+            "nostrconnect://{fake_pubkey}?relay=wss%3A%2F%2Frelay.example.com&secret=abcdef0123456789"
+        );
+        let err = parse_nostrconnect_uri(&uri).unwrap_err();
+        assert!(err.contains("invalid client pubkey"));
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_empty_uri() {
+        assert!(parse_nostrconnect_uri("").is_err());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_scheme_only() {
+        assert!(parse_nostrconnect_uri("nostrconnect://").is_err());
+    }
+
+    #[test]
+    fn test_bunker_url_no_secret() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let relays = vec!["wss://relay.damus.io/".to_string()];
+
+        let url = generate_bunker_url(&pubkey, &relays, None);
+        assert!(!url.contains("secret="));
+
+        let (parsed_pk, _, secret) = parse_bunker_url(&url).unwrap();
+        assert_eq!(pubkey, parsed_pk);
+        assert!(secret.is_none());
+    }
+
+    #[test]
+    fn test_bunker_url_no_relays() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let url = generate_bunker_url(&pubkey, &[], Some("mysecret"));
+        assert!(url.contains("?secret="));
+        assert!(!url.contains("relay="));
+    }
+
+    #[test]
+    fn test_sanitize_display_name_bidi_override() {
+        let name = "Admin\u{202E}nimda";
+        let sanitized = sanitize_display_name(name);
+        assert!(!sanitized.contains('\u{202E}'));
+        assert_eq!(sanitized, "Adminnimda");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_empty() {
+        assert_eq!(sanitize_display_name(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_all_control() {
+        assert_eq!(sanitize_display_name("\x00\x01\x02"), "");
+    }
+
+    #[test]
+    fn test_validate_metadata_url_javascript() {
+        assert!(validate_metadata_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn test_validate_metadata_url_data() {
+        assert!(validate_metadata_url("data:text/html,<h1>X</h1>").is_err());
+    }
+
+    #[test]
+    fn test_validate_metadata_url_ftp() {
+        assert!(validate_metadata_url("ftp://example.com/file").is_err());
+    }
+
+    #[test]
+    fn test_validate_metadata_url_valid_https() {
+        let result = validate_metadata_url("https://example.com/image.png");
+        assert!(result.is_ok());
+    }
 }
