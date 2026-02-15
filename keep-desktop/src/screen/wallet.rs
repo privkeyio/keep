@@ -6,7 +6,6 @@ use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -51,7 +50,7 @@ impl WalletScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("Wallet Descriptors");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -81,18 +80,11 @@ impl WalletScreen {
             content = content.push(scrollable(list).height(Length::Fill));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Wallets,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 
     fn wallet_card<'a>(&self, i: usize, entry: &WalletEntry) -> Element<'a, Message> {

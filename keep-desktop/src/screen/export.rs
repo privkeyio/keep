@@ -7,7 +7,6 @@ use zeroize::Zeroizing;
 
 use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
@@ -117,7 +116,7 @@ impl ExportScreen {
         matches!(self.qr_display, Some(QrDisplay::Animated { .. }))
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -292,17 +291,10 @@ impl ExportScreen {
             content = content.push(theme::error_text(err.as_str()));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Shares,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 }

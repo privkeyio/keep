@@ -23,10 +23,12 @@ use zeroize::Zeroizing;
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
 use crate::message::{
-    AuditLoadResult, ConnectionStatus, ExportData, FrostNodeMsg, Message, PeerEntry,
+    AuditLoadResult, ConnectionStatus, ExportData, FrostNodeMsg, Identity, IdentityKind, Message,
+    PeerEntry,
     PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
+use crate::screen::layout::SidebarState;
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::{ImportMode, ImportScreen};
@@ -80,6 +82,10 @@ pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 
 const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
+fn default_bunker_relays() -> Vec<String> {
+    DEFAULT_BUNKER_RELAYS.iter().map(|s| s.to_string()).collect()
+}
+
 #[derive(Clone)]
 pub enum ToastKind {
     Success,
@@ -96,7 +102,10 @@ pub struct App {
     pub(crate) keep: Arc<Mutex<Option<Keep>>>,
     pub(crate) keep_path: PathBuf,
     pub(crate) screen: Screen,
-    active_share_hex: Option<String>,
+    pub(crate) active_share_hex: Option<String>,
+    identities: Vec<Identity>,
+    identity_switcher_open: bool,
+    delete_identity_confirm: Option<String>,
     last_activity: Instant,
     pub(crate) clipboard_clear_at: Option<Instant>,
     copy_feedback_until: Option<Instant>,
@@ -218,12 +227,58 @@ fn relay_config_path(keep_path: &std::path::Path) -> PathBuf {
     keep_path.join("relays.json")
 }
 
+fn short_hex(pubkey_hex: &str) -> &str {
+    pubkey_hex.get(..16).unwrap_or(pubkey_hex)
+}
+
+fn relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
+    keep_path.join(format!("relays-{}.json", short_hex(pubkey_hex)))
+}
+
+fn bunker_relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
+    keep_path.join(format!("bunker-relays-{}.json", short_hex(pubkey_hex)))
+}
+
 fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
     let path = relay_config_path(keep_path);
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn load_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
+    let path = relay_config_path_for(keep_path, pubkey_hex);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| load_relay_urls(keep_path))
+}
+
+fn save_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[String]) {
+    let path = relay_config_path_for(keep_path, pubkey_hex);
+    if let Ok(json) = serde_json::to_string_pretty(urls) {
+        if let Err(e) = write_private(&path, &json) {
+            tracing::error!("Failed to save relay config: {e}");
+        }
+    }
+}
+
+fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
+    let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(default_bunker_relays)
+}
+
+pub(crate) fn save_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[String]) {
+    let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
+    if let Ok(json) = serde_json::to_string_pretty(urls) {
+        if let Err(e) = write_private(&path, &json) {
+            tracing::error!("Failed to save bunker relay config: {e}");
+        }
+    }
 }
 
 fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
@@ -325,6 +380,9 @@ impl App {
             keep_path,
             screen,
             active_share_hex: None,
+            identities: Vec::new(),
+            identity_switcher_open: false,
+            delete_identity_confirm: None,
             last_activity: Instant::now(),
             clipboard_clear_at: None,
             copy_feedback_until: None,
@@ -342,10 +400,7 @@ impl App {
             frost_last_share: None,
             frost_last_relay_urls: None,
             bunker: None,
-            bunker_relays: DEFAULT_BUNKER_RELAYS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            bunker_relays: default_bunker_relays(),
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
@@ -481,6 +536,12 @@ impl App {
             | Message::AuditChainVerified(..)
             | Message::AuditFilterChanged(..)
             | Message::AuditLoadMore => self.handle_audit_message(message),
+
+            Message::ToggleIdentitySwitcher
+            | Message::SwitchIdentity(..)
+            | Message::RequestDeleteIdentity(..)
+            | Message::ConfirmDeleteIdentity(..)
+            | Message::CancelDeleteIdentity => self.handle_identity_message(message),
 
             Message::SettingsAutoLockChanged(..)
             | Message::SettingsClipboardClearChanged(..)
@@ -683,27 +744,7 @@ impl App {
                 Task::none()
             }
             Message::SetActiveShare(hex) => {
-                let shares = self.current_shares();
-                if !shares.iter().any(|s| s.group_pubkey_hex == hex) {
-                    self.set_toast("Share not found".into(), ToastKind::Error);
-                    return Task::none();
-                }
-
-                let result = {
-                    let guard = lock_keep(&self.keep);
-                    guard.as_ref().map(|k| k.set_active_share_key(Some(&hex)))
-                };
-                match result {
-                    Some(Ok(())) => {
-                        self.active_share_hex = Some(hex);
-                        if let Screen::ShareList(s) = &mut self.screen {
-                            s.active_share_hex = self.active_share_hex.clone();
-                        }
-                    }
-                    Some(Err(e)) => self.set_toast(friendly_err(e), ToastKind::Error),
-                    None => {}
-                }
-                Task::none()
+                return self.handle_identity_message(Message::SwitchIdentity(hex));
             }
             Message::RequestDelete(id) => {
                 if let Screen::ShareList(s) = &mut self.screen {
@@ -901,7 +942,11 @@ impl App {
                 let is_new = !self.relay_urls.contains(&normalized);
                 if is_new {
                     self.relay_urls.push(normalized.clone());
-                    save_relay_urls(&self.keep_path, &self.relay_urls);
+                    if let Some(ref hex) = self.active_share_hex {
+                        save_relay_urls_for(&self.keep_path, hex, &self.relay_urls);
+                    } else {
+                        save_relay_urls(&self.keep_path, &self.relay_urls);
+                    }
                 }
                 if let Screen::Relay(s) = &mut self.screen {
                     if is_new {
@@ -916,7 +961,11 @@ impl App {
                     if i < s.relay_urls.len() {
                         s.relay_urls.remove(i);
                         self.relay_urls = s.relay_urls.clone();
-                        save_relay_urls(&self.keep_path, &self.relay_urls);
+                        if let Some(ref hex) = self.active_share_hex {
+                            save_relay_urls_for(&self.keep_path, hex, &self.relay_urls);
+                        } else {
+                            save_relay_urls(&self.keep_path, &self.relay_urls);
+                        }
                     }
                 }
                 Task::none()
@@ -947,9 +996,22 @@ impl App {
 
     pub fn view(&self) -> Element<Message> {
         let pending_count = self.pending_sign_display.len();
-        let screen = self
-            .screen
-            .view(pending_count, self.settings.kill_switch_active);
+        let sidebar_state = SidebarState {
+            identities: &self.identities,
+            active_identity: self.active_share_hex.as_deref(),
+            switcher_open: self.identity_switcher_open,
+            delete_confirm: self.delete_identity_confirm.as_deref(),
+        };
+        let share_count = match &self.screen {
+            Screen::ShareList(s) if !s.shares.is_empty() => Some(s.shares.len()),
+            _ => None,
+        };
+        let screen = self.screen.view(
+            &sidebar_state,
+            share_count,
+            pending_count,
+            self.settings.kill_switch_active,
+        );
         let Some(toast) = &self.toast else {
             return screen;
         };
@@ -1013,6 +1075,9 @@ impl App {
         drop(guard);
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
         self.active_share_hex = None;
+        self.identities.clear();
+        self.identity_switcher_open = false;
+        self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
         self.screen = Screen::Unlock(UnlockScreen::new(true));
@@ -1037,6 +1102,7 @@ impl App {
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
         self.resolve_active_share(&shares);
+        self.refresh_identities();
         if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
             s.active_share_hex = self.active_share_hex.clone();
@@ -1046,6 +1112,7 @@ impl App {
 
     fn set_share_screen(&mut self, shares: Vec<ShareEntry>) {
         self.resolve_active_share(&shares);
+        self.refresh_identities();
         self.screen =
             Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
     }
@@ -1168,12 +1235,12 @@ impl App {
                             let mut keep = Keep::open(&path).map_err(friendly_err)?;
                             keep.unlock(&password).map_err(friendly_err)?;
                             drop(keep);
-                            let meta = std::fs::symlink_metadata(&path)
-                                .map_err(|e| format!("Failed to read vault metadata: {e}"))?;
-                            if meta.file_type().is_symlink() {
+                            let canonical = std::fs::canonicalize(&path)
+                                .map_err(|e| format!("Failed to resolve vault path: {e}"))?;
+                            if canonical != path {
                                 return Err("Vault path is a symlink; refusing to delete".into());
                             }
-                            std::fs::remove_dir_all(&path)
+                            std::fs::remove_dir_all(&canonical)
                                 .map_err(|e| format!("Failed to remove vault: {e}"))
                         }));
                     match result {
@@ -1629,6 +1696,229 @@ impl App {
                     _ => return Task::none(),
                 };
                 Self::load_audit_page(self.keep.clone(), offset, caller, Message::AuditPageLoaded)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn collect_identities(&self, shares: &[ShareEntry]) -> Vec<Identity> {
+        let mut identities: Vec<Identity> = Vec::new();
+        let mut seen_groups: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for share in shares {
+            if let Some(&idx) = seen_groups.get(&share.group_pubkey_hex) {
+                if let IdentityKind::Frost { ref mut share_count, .. } = identities[idx].kind {
+                    *share_count += 1;
+                }
+            } else {
+                seen_groups.insert(share.group_pubkey_hex.clone(), identities.len());
+                identities.push(Identity {
+                    pubkey_hex: share.group_pubkey_hex.clone(),
+                    npub: share.npub.clone(),
+                    name: share.name.clone(),
+                    kind: IdentityKind::Frost {
+                        threshold: share.threshold,
+                        total_shares: share.total_shares,
+                        share_count: 1,
+                    },
+                });
+            }
+        }
+
+        let guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_ref() {
+            if let Ok(keys) = keep.list_keys() {
+                for key in keys {
+                    if key.key_type != keep_core::keys::KeyType::Nostr {
+                        continue;
+                    }
+                    let hex = hex::encode(key.pubkey);
+                    if !seen_groups.contains_key(&hex) {
+                        seen_groups.insert(hex.clone(), identities.len());
+                        identities.push(Identity {
+                            pubkey_hex: hex,
+                            npub: keep_core::keys::bytes_to_npub(&key.pubkey),
+                            name: key.name,
+                            kind: IdentityKind::Nsec,
+                        });
+                    }
+                }
+            }
+        }
+
+        identities
+    }
+
+    fn refresh_identities(&mut self) {
+        let shares = self.current_shares();
+        self.identities = self.collect_identities(&shares);
+        if self.active_share_hex.is_none() && self.identities.len() == 1 {
+            let hex = self.identities[0].pubkey_hex.clone();
+            let guard = lock_keep(&self.keep);
+            if let Some(keep) = guard.as_ref() {
+                let _ = keep.set_active_share_key(Some(&hex));
+            }
+            drop(guard);
+            self.active_share_hex = Some(hex);
+        }
+    }
+
+    fn handle_identity_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::ToggleIdentitySwitcher => {
+                self.identity_switcher_open = !self.identity_switcher_open;
+                if !self.identity_switcher_open {
+                    self.delete_identity_confirm = None;
+                }
+                Task::none()
+            }
+            Message::SwitchIdentity(pubkey_hex) => {
+                if self.active_share_hex.as_deref() == Some(&pubkey_hex) {
+                    return Task::none();
+                }
+
+                if let Some(current) = &self.active_share_hex {
+                    save_relay_urls_for(&self.keep_path, current, &self.relay_urls);
+                    save_bunker_relays_for(&self.keep_path, current, &self.bunker_relays);
+                }
+
+                self.handle_disconnect_relay();
+                self.stop_bunker();
+
+                self.relay_urls = load_relay_urls_for(&self.keep_path, &pubkey_hex);
+                self.bunker_relays = load_bunker_relays_for(&self.keep_path, &pubkey_hex);
+
+                {
+                    let guard = lock_keep(&self.keep);
+                    if let Some(keep) = guard.as_ref() {
+                        let _ = keep.set_active_share_key(Some(&pubkey_hex));
+                    }
+                }
+
+                let is_nsec = self
+                    .identities
+                    .iter()
+                    .any(|i| i.pubkey_hex == pubkey_hex && matches!(i.kind, IdentityKind::Nsec));
+                if is_nsec {
+                    if let Ok(bytes) = hex::decode(&pubkey_hex) {
+                        if let Ok(pubkey_bytes) = <[u8; 32]>::try_from(bytes) {
+                            let mut guard = lock_keep(&self.keep);
+                            if let Some(keep) = guard.as_mut() {
+                                let _ = keep.keyring_mut().set_primary(pubkey_bytes);
+                            }
+                        }
+                    }
+                }
+
+                self.active_share_hex = Some(pubkey_hex);
+                self.identity_switcher_open = false;
+                self.delete_identity_confirm = None;
+
+                let shares = self.current_shares();
+                match &self.screen {
+                    Screen::ShareList(_) => {
+                        self.screen = Screen::ShareList(ShareListScreen::new(
+                            shares,
+                            self.active_share_hex.clone(),
+                        ));
+                    }
+                    Screen::Relay(_) => {
+                        self.screen = Screen::Relay(RelayScreen::new(
+                            shares,
+                            self.relay_urls.clone(),
+                            self.frost_status.clone(),
+                            self.frost_peers.clone(),
+                            self.pending_sign_display.clone(),
+                        ));
+                    }
+                    Screen::Bunker(_) => {
+                        self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
+                    }
+                    _ => {}
+                }
+
+                self.set_toast("Identity switched".into(), ToastKind::Success);
+                Task::none()
+            }
+            Message::RequestDeleteIdentity(pubkey_hex) => {
+                self.delete_identity_confirm = Some(pubkey_hex);
+                Task::none()
+            }
+            Message::ConfirmDeleteIdentity(pubkey_hex) => {
+                self.delete_identity_confirm = None;
+
+                let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex).cloned();
+                let Some(identity) = identity else {
+                    self.set_toast("Identity not found".into(), ToastKind::Error);
+                    return Task::none();
+                };
+
+                let result = match &identity.kind {
+                    IdentityKind::Frost { .. } => {
+                        let shares = self.current_shares();
+                        let group_shares: Vec<_> = shares
+                            .iter()
+                            .filter(|s| s.group_pubkey_hex == pubkey_hex)
+                            .collect();
+                        let mut delete_err = None;
+                        for share in &group_shares {
+                            let res = {
+                                let mut guard = lock_keep(&self.keep);
+                                guard.as_mut().map(|keep| {
+                                    keep.frost_delete_share(&share.group_pubkey, share.identifier)
+                                })
+                            };
+                            if let Some(Err(e)) = res {
+                                delete_err = Some(e);
+                                break;
+                            }
+                        }
+                        self.refresh_shares();
+                        if let Some(e) = delete_err {
+                            self.set_toast(friendly_err(e), ToastKind::Error);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    IdentityKind::Nsec => {
+                        let Ok(bytes) = hex::decode(&pubkey_hex) else {
+                            return Task::none();
+                        };
+                        let Ok(pubkey_bytes) = <[u8; 32]>::try_from(bytes) else {
+                            return Task::none();
+                        };
+                        let delete_result = {
+                            let mut guard = lock_keep(&self.keep);
+                            guard.as_mut().map(|keep| keep.delete_key(&pubkey_bytes))
+                        };
+                        match delete_result {
+                            Some(Ok(())) => true,
+                            Some(Err(e)) => {
+                                self.set_toast(friendly_err(e), ToastKind::Error);
+                                false
+                            }
+                            None => false,
+                        }
+                    }
+                };
+
+                if result {
+                    let _ = std::fs::remove_file(relay_config_path_for(&self.keep_path, &pubkey_hex));
+                    let _ = std::fs::remove_file(bunker_relay_config_path_for(&self.keep_path, &pubkey_hex));
+
+                    self.refresh_shares();
+                    self.set_toast(
+                        format!("'{}' deleted", identity.name),
+                        ToastKind::Success,
+                    );
+                }
+
+                Task::none()
+            }
+            Message::CancelDeleteIdentity => {
+                self.delete_identity_confirm = None;
+                Task::none()
             }
             _ => Task::none(),
         }

@@ -7,7 +7,6 @@ use iced::{Alignment, Element, Length};
 use keep_core::keys::bytes_to_npub;
 
 use crate::message::{Message, ShareIdentity};
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 fn format_timestamp(ts: i64) -> String {
@@ -86,7 +85,7 @@ impl ShareListScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("FROST Shares");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -173,19 +172,11 @@ impl ShareListScreen {
             content = content.push(scrollable(list).height(Length::Fill));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        let count = (!self.shares.is_empty()).then_some(self.shares.len());
-        layout::with_sidebar_kill_switch(
-            NavItem::Shares,
-            inner.into(),
-            count,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 
     fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {

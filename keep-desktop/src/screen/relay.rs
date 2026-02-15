@@ -6,7 +6,6 @@ use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use crate::message::{ConnectionStatus, Message, PeerEntry, PendingSignRequest};
-use crate::screen::layout::{self, NavItem};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
@@ -42,7 +41,7 @@ impl RelayScreen {
         }
     }
 
-    pub fn view(&self, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title_row = row![
             theme::heading("FROST Relay"),
             Space::new().width(Length::Fill),
@@ -74,19 +73,11 @@ impl RelayScreen {
             }
         }
 
-        let inner = container(scrollable(content).height(Length::Fill))
+        container(scrollable(content).height(Length::Fill))
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        let pending_count = self.pending_requests.len();
-        layout::with_sidebar_kill_switch(
-            NavItem::Relay,
-            inner.into(),
-            None,
-            pending_count,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 
     fn status_badge(&self) -> Element<Message> {

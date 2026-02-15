@@ -55,31 +55,28 @@ fn sanitize_message_preview(msg: &[u8]) -> String {
 
     match std::str::from_utf8(msg) {
         Ok(s) => {
-            let cleaned: String = s
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\n')
-                .collect();
             let mut result = String::new();
-            for (i, line) in cleaned.split('\n').enumerate() {
-                if i >= MAX_LINES {
-                    result.push_str("...");
-                    return result;
-                }
-                if i > 0 {
+            let mut char_count = 0usize;
+            let mut line_count = 0usize;
+            for ch in s.chars() {
+                if ch == '\n' {
+                    line_count += 1;
+                    if line_count >= MAX_LINES {
+                        result.push_str("...");
+                        return result;
+                    }
                     result.push('\n');
+                    continue;
                 }
-                result.push_str(line);
-                if result.chars().count() >= MAX_CHARS {
-                    let boundary = result
-                        .char_indices()
-                        .map(|(i, _)| i)
-                        .take_while(|&i| i <= MAX_CHARS)
-                        .last()
-                        .unwrap_or(0);
-                    result.truncate(boundary);
+                if ch.is_control() {
+                    continue;
+                }
+                if char_count >= MAX_CHARS {
                     result.push_str("...");
                     return result;
                 }
+                result.push(ch);
+                char_count += 1;
             }
             result
         }

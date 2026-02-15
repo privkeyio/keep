@@ -144,6 +144,13 @@ impl App {
                         s.relays.push(relay.clone());
                         self.bunker_relays.push(relay);
                         s.relay_input.clear();
+                        if let Some(ref hex) = self.active_share_hex {
+                            crate::app::save_bunker_relays_for(
+                                &self.keep_path,
+                                hex,
+                                &self.bunker_relays,
+                            );
+                        }
                     }
                 }
                 Task::none()
@@ -153,6 +160,13 @@ impl App {
                     if i < s.relays.len() {
                         s.relays.remove(i);
                         self.bunker_relays = s.relays.clone();
+                        if let Some(ref hex) = self.active_share_hex {
+                            crate::app::save_bunker_relays_for(
+                                &self.keep_path,
+                                hex,
+                                &self.bunker_relays,
+                            );
+                        }
                     }
                 }
                 Task::none()
