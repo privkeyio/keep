@@ -9,10 +9,7 @@ use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use crate::app::{
-    lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, CLIPBOARD_CLEAR_SECS,
-    MAX_BUNKER_LOG_ENTRIES,
-};
+use crate::app::{lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES};
 use crate::message::Message;
 use crate::screen::bunker::{
     BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
@@ -264,8 +261,12 @@ impl App {
             }
             Message::BunkerCopyUrl => {
                 if let Some(ref bunker) = self.bunker {
-                    self.clipboard_clear_at =
-                        Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                    if self.settings.clipboard_clear_secs > 0 {
+                        self.clipboard_clear_at = Some(
+                            Instant::now()
+                                + Duration::from_secs(self.settings.clipboard_clear_secs),
+                        );
+                    }
                     return iced::clipboard::write(bunker.url.clone());
                 }
                 Task::none()

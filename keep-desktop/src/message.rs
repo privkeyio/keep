@@ -58,6 +58,7 @@ pub enum Message {
     NavigateWallets,
     NavigateRelay,
     NavigateBunker,
+    NavigateSettings,
     Lock,
 
     // Share list
@@ -134,6 +135,10 @@ pub enum Message {
     BunkerSetApprovalDuration(usize),
     BunkerPermissionUpdated(Result<(), String>),
 
+    // Settings
+    SettingsAutoLockChanged(u64),
+    SettingsClipboardClearChanged(u64),
+
     // Timer
     Tick,
 }
@@ -182,6 +187,7 @@ impl fmt::Debug for Message {
             Self::NavigateWallets => f.write_str("NavigateWallets"),
             Self::NavigateRelay => f.write_str("NavigateRelay"),
             Self::NavigateBunker => f.write_str("NavigateBunker"),
+            Self::NavigateSettings => f.write_str("NavigateSettings"),
             Self::Lock => f.write_str("Lock"),
             Self::ToggleShareDetails(i) => f.debug_tuple("ToggleShareDetails").field(i).finish(),
             Self::SetActiveShare(k) => f.debug_tuple("SetActiveShare").field(k).finish(),
@@ -264,6 +270,13 @@ impl fmt::Debug for Message {
                 f.debug_tuple("BunkerSetApprovalDuration").field(i).finish()
             }
             Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
+            Self::SettingsAutoLockChanged(v) => {
+                f.debug_tuple("SettingsAutoLockChanged").field(v).finish()
+            }
+            Self::SettingsClipboardClearChanged(v) => f
+                .debug_tuple("SettingsClipboardClearChanged")
+                .field(v)
+                .finish(),
             Self::Tick => f.write_str("Tick"),
         }
     }

@@ -27,13 +27,14 @@ use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
 use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::relay::RelayScreen;
+use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
 
 const AUTO_LOCK_SECS: u64 = 300;
-pub(crate) const CLIPBOARD_CLEAR_SECS: u64 = 30;
+const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
@@ -89,6 +90,7 @@ pub struct App {
     pub(crate) bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
+    pub(crate) settings: Settings,
 }
 
 pub(crate) fn lock_keep(
@@ -191,8 +193,59 @@ fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Settings {
+    #[serde(default = "default_auto_lock_secs")]
+    pub auto_lock_secs: u64,
+    #[serde(default = "default_clipboard_clear_secs")]
+    pub clipboard_clear_secs: u64,
+}
+
+fn default_auto_lock_secs() -> u64 {
+    AUTO_LOCK_SECS
+}
+
+fn default_clipboard_clear_secs() -> u64 {
+    CLIPBOARD_CLEAR_SECS
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_lock_secs: AUTO_LOCK_SECS,
+            clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
+        }
+    }
+}
+
+fn settings_path(keep_path: &std::path::Path) -> PathBuf {
+    keep_path.join("settings.json")
+}
+
+fn load_settings(keep_path: &std::path::Path) -> Settings {
+    let path = settings_path(keep_path);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
+    let path = settings_path(keep_path);
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::error!("Failed to save settings to {}: {e}", path.display());
+        }
+    }
+}
+
 impl App {
-    fn init(keep_path: PathBuf, screen: Screen, relay_urls: Vec<String>) -> Self {
+    fn init(
+        keep_path: PathBuf,
+        screen: Screen,
+        relay_urls: Vec<String>,
+        settings: Settings,
+    ) -> Self {
         Self {
             keep: Arc::new(Mutex::new(None)),
             keep_path,
@@ -222,6 +275,7 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            settings,
         }
     }
 
@@ -235,14 +289,21 @@ impl App {
                         false,
                         "Cannot determine home directory. Set $HOME and restart.".into(),
                     ));
-                    return (Self::init(PathBuf::new(), screen, Vec::new()), Task::none());
+                    return (
+                        Self::init(PathBuf::new(), screen, Vec::new(), Settings::default()),
+                        Task::none(),
+                    );
                 }
             },
         };
         let vault_exists = keep_path.exists();
         let relay_urls = load_relay_urls(&keep_path);
+        let settings = load_settings(&keep_path);
         let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
-        (Self::init(keep_path, screen, relay_urls), Task::none())
+        (
+            Self::init(keep_path, screen, relay_urls, settings),
+            Task::none(),
+        )
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -271,6 +332,7 @@ impl App {
             | Message::WalletsLoaded(..)
             | Message::NavigateRelay
             | Message::NavigateBunker
+            | Message::NavigateSettings
             | Message::Lock => self.handle_navigation_message(message),
 
             Message::ToggleShareDetails(..)
@@ -336,11 +398,16 @@ impl App {
             | Message::BunkerTogglePermission(..)
             | Message::BunkerSetApprovalDuration(..)
             | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
+
+            Message::SettingsAutoLockChanged(..) | Message::SettingsClipboardClearChanged(..) => {
+                self.handle_settings_message(message)
+            }
         }
     }
 
     fn handle_tick(&mut self) -> Task<Message> {
-        if self.last_activity.elapsed() >= Duration::from_secs(AUTO_LOCK_SECS)
+        if self.settings.auto_lock_secs > 0
+            && self.last_activity.elapsed() >= Duration::from_secs(self.settings.auto_lock_secs)
             && !matches!(self.screen, Screen::Unlock(_))
         {
             return self.do_lock();
@@ -497,6 +564,17 @@ impl App {
                 self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
                 Task::none()
             }
+            Message::NavigateSettings => {
+                if matches!(self.screen, Screen::Settings(_)) {
+                    return Task::none();
+                }
+                self.screen = Screen::Settings(SettingsScreen::new(
+                    self.settings.auto_lock_secs,
+                    self.settings.clipboard_clear_secs,
+                    self.keep_path.display().to_string(),
+                ));
+                Task::none()
+            }
             Message::Lock => self.do_lock(),
             _ => Task::none(),
         }
@@ -617,8 +695,11 @@ impl App {
                 Task::none()
             }
             Message::CopyToClipboard(t) => {
-                self.clipboard_clear_at =
-                    Some(Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS));
+                if self.settings.clipboard_clear_secs > 0 {
+                    self.clipboard_clear_at = Some(
+                        Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs),
+                    );
+                }
                 self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
                 if let Screen::Export(s) = &mut self.screen {
                     s.copied = true;
@@ -1256,6 +1337,24 @@ impl App {
                 );
             }
             Err(e) => self.screen.set_loading_error(e),
+        }
+        Task::none()
+    }
+
+    fn handle_settings_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::SettingsAutoLockChanged(secs) => {
+                self.settings.auto_lock_secs = secs;
+            }
+            Message::SettingsClipboardClearChanged(secs) => {
+                self.settings.clipboard_clear_secs = secs;
+            }
+            _ => return Task::none(),
+        }
+        save_settings(&self.keep_path, &self.settings);
+        if let Screen::Settings(s) = &mut self.screen {
+            s.auto_lock_secs = self.settings.auto_lock_secs;
+            s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
         }
         Task::none()
     }
