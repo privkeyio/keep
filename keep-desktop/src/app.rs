@@ -24,8 +24,7 @@ use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
 use crate::message::{
     AuditLoadResult, ConnectionStatus, ExportData, FrostNodeMsg, Identity, IdentityKind, Message,
-    PeerEntry,
-    PendingSignRequest, ShareIdentity,
+    PeerEntry, PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::create::CreateScreen;
@@ -283,7 +282,10 @@ fn save_bunker_relays(keep_path: &std::path::Path, urls: &[String]) {
     let path = bunker_relay_config_path(keep_path);
     if let Ok(json) = serde_json::to_string_pretty(urls) {
         if let Err(e) = write_private(&path, &json) {
-            tracing::error!("Failed to save bunker relay config to {}: {e}", path.display());
+            tracing::error!(
+                "Failed to save bunker relay config to {}: {e}",
+                path.display()
+            );
         }
     }
 }
