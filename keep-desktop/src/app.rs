@@ -1237,6 +1237,7 @@ impl App {
     fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
+                self.reconcile_kill_switch();
                 self.set_share_screen(shares);
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
@@ -1245,6 +1246,21 @@ impl App {
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
+    }
+
+    fn reconcile_kill_switch(&mut self) {
+        let vault_state = {
+            let guard = lock_keep(&self.keep);
+            match guard.as_ref().and_then(|k| k.get_kill_switch().ok()) {
+                Some(state) => state,
+                None => return,
+            }
+        };
+        self.kill_switch.store(vault_state, Ordering::Release);
+        if self.settings.kill_switch_active != vault_state {
+            self.settings.kill_switch_active = vault_state;
+            save_settings(&self.keep_path, &self.settings);
+        }
     }
 
     fn handle_import_result(
@@ -1690,6 +1706,16 @@ impl App {
                 }
             }
             Message::KillSwitchActivate => {
+                let vault_err = {
+                    let mut guard = lock_keep(&self.keep);
+                    guard
+                        .as_mut()
+                        .and_then(|keep| keep.set_kill_switch(true).err())
+                };
+                if let Some(e) = vault_err {
+                    self.set_toast(friendly_err(e), ToastKind::Error);
+                    return Task::none();
+                }
                 self.settings.kill_switch_active = true;
                 save_settings(&self.keep_path, &self.settings);
                 self.kill_switch.store(true, Ordering::Release);
@@ -1748,6 +1774,17 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
+                        {
+                            let mut guard = lock_keep(&self.keep);
+                            if let Some(keep) = guard.as_mut() {
+                                if let Err(e) = keep.set_kill_switch(false) {
+                                    if let Screen::Settings(s) = &mut self.screen {
+                                        s.kill_switch_error = Some(friendly_err(e));
+                                    }
+                                    return Task::none();
+                                }
+                            }
+                        }
                         self.kill_switch.store(false, Ordering::Release);
                         self.settings.kill_switch_active = false;
                         save_settings(&self.keep_path, &self.settings);

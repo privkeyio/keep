@@ -657,6 +657,22 @@ impl Keep {
         self.storage.delete_relay_config(group_pubkey)
     }
 
+    /// Get the kill switch state from the vault.
+    pub fn get_kill_switch(&self) -> Result<bool> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_kill_switch()
+    }
+
+    /// Set the kill switch state in the vault.
+    pub fn set_kill_switch(&self, active: bool) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.set_kill_switch(active)
+    }
+
     /// Get a FROST share by group public key.
     pub fn frost_get_share(&self, group_pubkey: &[u8; 32]) -> Result<frost::SharePackage> {
         if !self.is_unlocked() {

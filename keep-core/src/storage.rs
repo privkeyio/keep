@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, trace};
 
 use crate::backend::{
-    RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE,
+    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE,
+    SHARES_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -233,6 +234,7 @@ impl Storage {
         backend.create_table(SHARES_TABLE)?;
         backend.create_table(DESCRIPTORS_TABLE)?;
         backend.create_table(RELAY_CONFIGS_TABLE)?;
+        backend.create_table(CONFIG_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -676,6 +678,34 @@ impl Storage {
                 hex::encode(group_pubkey)
             )))
         }
+    }
+
+    /// Get the kill switch state from the vault.
+    pub fn get_kill_switch(&self) -> Result<bool> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let Some(encrypted_bytes) = backend.get(CONFIG_TABLE, b"kill_switch")? else {
+            return Ok(false);
+        };
+
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let bytes = decrypted.as_slice()?;
+        Ok(bytes.first().copied() == Some(1))
+    }
+
+    /// Set the kill switch state in the vault.
+    pub fn set_kill_switch(&self, active: bool) -> Result<()> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let value = if active { [1u8] } else { [0u8] };
+        let encrypted = crypto::encrypt(&value, data_key)?;
+        let encrypted_bytes = encrypted.to_bytes();
+
+        backend.put(CONFIG_TABLE, b"kill_switch", &encrypted_bytes)?;
+        Ok(())
     }
 }
 
