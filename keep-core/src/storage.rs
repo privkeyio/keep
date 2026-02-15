@@ -809,6 +809,17 @@ mod tests {
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
 
+        // Bump failure count higher so the delay (4s) won't expire during test
+        // execution. Without this, the 1s delay at exactly 5 failures can expire
+        // on slow CI (Windows) between record_failure and check_rate_limit.
+        {
+            let storage = Storage::open(&path).unwrap();
+            let hmac_key = rate_limit::derive_hmac_key(&storage.header.salt);
+            for _ in 0..2 {
+                rate_limit::record_failure(&path, &hmac_key);
+            }
+        }
+
         let mut storage = Storage::open(&path).unwrap();
         let result = storage.unlock("wrongpass");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
