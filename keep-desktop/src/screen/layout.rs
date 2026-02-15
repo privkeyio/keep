@@ -15,6 +15,7 @@ pub enum NavItem {
     Wallets,
     Relay,
     Bunker,
+    Audit,
     Settings,
 }
 
@@ -70,6 +71,12 @@ pub fn with_sidebar<'a>(
             "Bunker",
             Message::NavigateBunker,
             NavItem::Bunker,
+            NavBadge::None,
+        ),
+        (
+            "Audit",
+            Message::NavigateAudit,
+            NavItem::Audit,
             NavBadge::None,
         ),
         (

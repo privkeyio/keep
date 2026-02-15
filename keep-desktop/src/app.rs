@@ -20,8 +20,8 @@ use zeroize::Zeroizing;
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
 use crate::message::{
-    ConnectionStatus, ExportData, FrostNodeMsg, Message, PeerEntry, PendingSignRequest,
-    ShareIdentity,
+    AuditLoadResult, ConnectionStatus, ExportData, FrostNodeMsg, Message, PeerEntry,
+    PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::create::CreateScreen;
@@ -30,6 +30,7 @@ use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::relay::RelayScreen;
 use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
+use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
@@ -138,6 +139,18 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
             tracing::warn!("Unmapped keep error: {e}");
             "Operation failed".into()
         }
+    }
+}
+
+fn to_display_entry(e: keep_core::audit::SigningAuditEntry) -> AuditDisplayEntry {
+    AuditDisplayEntry {
+        timestamp: e.timestamp,
+        request_type: e.request_type.to_string(),
+        decision: e.decision.to_string(),
+        was_automatic: e.was_automatic,
+        caller: e.caller,
+        caller_name: e.caller_name,
+        event_kind: e.event_kind,
     }
 }
 
@@ -431,6 +444,13 @@ impl App {
             | Message::BunkerTogglePermission(..)
             | Message::BunkerSetApprovalDuration(..)
             | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
+
+            Message::NavigateAudit
+            | Message::AuditLoaded(..)
+            | Message::AuditPageLoaded(..)
+            | Message::AuditChainVerified(..)
+            | Message::AuditFilterChanged(..)
+            | Message::AuditLoadMore => self.handle_audit_message(message),
 
             Message::SettingsAutoLockChanged(..)
             | Message::SettingsClipboardClearChanged(..)
@@ -1409,6 +1429,148 @@ impl App {
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
+    }
+
+    fn load_audit_page(
+        keep_arc: Arc<Mutex<Option<Keep>>>,
+        offset: usize,
+        caller: Option<String>,
+        on_done: fn(Result<AuditLoadResult, String>) -> Message,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let guard = lock_keep(&keep_arc);
+                    let keep = guard
+                        .as_ref()
+                        .ok_or_else(|| "Vault is locked".to_string())?;
+                    let page_size = SigningAuditScreen::page_size();
+                    let (entries, callers, count) = keep
+                        .signing_audit_read_page_with_metadata(offset, page_size, caller.as_deref())
+                        .map_err(friendly_err)?;
+                    let display: Vec<AuditDisplayEntry> =
+                        entries.into_iter().map(to_display_entry).collect();
+                    let has_more = display.len() == page_size;
+                    Ok(AuditLoadResult {
+                        entries: display,
+                        callers,
+                        count,
+                        has_more,
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            on_done,
+        )
+    }
+
+    fn handle_audit_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::NavigateAudit => {
+                if matches!(self.screen, Screen::SigningAudit(_)) {
+                    return Task::none();
+                }
+                self.screen = Screen::SigningAudit(SigningAuditScreen::new());
+                let load_task =
+                    Self::load_audit_page(self.keep.clone(), 0, None, Message::AuditLoaded);
+                let keep_arc = self.keep.clone();
+                let verify_task = Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let guard = lock_keep(&keep_arc);
+                            let keep = guard
+                                .as_ref()
+                                .ok_or_else(|| "Vault is locked".to_string())?;
+                            keep.signing_audit_verify_chain().map_err(friendly_err)
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::AuditChainVerified,
+                );
+                Task::batch([load_task, verify_task])
+            }
+            Message::AuditLoaded(result) => {
+                match result {
+                    Ok(data) => {
+                        if let Screen::SigningAudit(s) = &mut self.screen {
+                            s.entries = data.entries;
+                            s.callers = data.callers;
+                            s.entry_count = data.count;
+                            s.has_more = data.has_more;
+                            s.loading = false;
+                            s.load_error = None;
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::SigningAudit(s) = &mut self.screen {
+                            s.loading = false;
+                            tracing::warn!("Audit log load failed: {e}");
+                            s.load_error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::AuditChainVerified(result) => {
+                if let Screen::SigningAudit(s) = &mut self.screen {
+                    s.chain_status = match result {
+                        Ok((true, count)) => {
+                            s.entry_count = count;
+                            ChainStatus::Valid(count)
+                        }
+                        Ok((false, _)) => ChainStatus::Invalid,
+                        Err(e) => {
+                            tracing::warn!("Chain verification failed: {e}");
+                            ChainStatus::Error(e)
+                        }
+                    };
+                }
+                Task::none()
+            }
+            Message::AuditFilterChanged(caller) => {
+                if let Screen::SigningAudit(s) = &mut self.screen {
+                    s.selected_caller = caller.clone();
+                    s.entries.clear();
+                    s.loading = true;
+                    s.has_more = false;
+                }
+                Self::load_audit_page(self.keep.clone(), 0, caller, Message::AuditLoaded)
+            }
+            Message::AuditPageLoaded(result) => {
+                match result {
+                    Ok(data) => {
+                        if let Screen::SigningAudit(s) = &mut self.screen {
+                            s.entries.extend(data.entries);
+                            s.has_more = data.has_more;
+                            s.loading = false;
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::SigningAudit(s) = &mut self.screen {
+                            s.loading = false;
+                        }
+                        self.set_toast(e, ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::AuditLoadMore => {
+                let (offset, caller) = match &mut self.screen {
+                    Screen::SigningAudit(s) => {
+                        if s.loading || !s.has_more {
+                            return Task::none();
+                        }
+                        s.loading = true;
+                        (s.entries.len(), s.selected_caller.clone())
+                    }
+                    _ => return Task::none(),
+                };
+                Self::load_audit_page(self.keep.clone(), offset, caller, Message::AuditPageLoaded)
+            }
+            _ => Task::none(),
+        }
     }
 
     fn handle_settings_message(&mut self, message: Message) -> Task<Message> {

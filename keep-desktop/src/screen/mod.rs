@@ -9,6 +9,7 @@ pub mod layout;
 pub mod relay;
 pub mod settings;
 pub mod shares;
+pub mod signing_audit;
 pub mod unlock;
 pub mod wallet;
 
@@ -23,6 +24,7 @@ pub enum Screen {
     Wallet(wallet::WalletScreen),
     Relay(relay::RelayScreen),
     Bunker(Box<bunker::BunkerScreen>),
+    SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
 }
 
@@ -37,6 +39,7 @@ impl Screen {
             Screen::Wallet(s) => s.view(pending_requests),
             Screen::Relay(s) => s.view(),
             Screen::Bunker(s) => s.view(),
+            Screen::SigningAudit(s) => s.view(pending_requests),
             Screen::Settings(s) => s.view(),
         }
     }
@@ -63,7 +66,11 @@ impl Screen {
                 s.starting = false;
                 s.error = Some(error);
             }
-            Screen::ShareList(_) | Screen::Wallet(_) | Screen::Relay(_) | Screen::Settings(_) => {}
+            Screen::ShareList(_)
+            | Screen::Wallet(_)
+            | Screen::Relay(_)
+            | Screen::SigningAudit(_)
+            | Screen::Settings(_) => {}
         }
     }
 }

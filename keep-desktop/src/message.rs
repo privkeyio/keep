@@ -6,7 +6,16 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
+use crate::screen::signing_audit::AuditDisplayEntry;
 use crate::screen::wallet::WalletEntry;
+
+#[derive(Clone)]
+pub struct AuditLoadResult {
+    pub entries: Vec<AuditDisplayEntry>,
+    pub callers: Vec<String>,
+    pub count: usize,
+    pub has_more: bool,
+}
 
 #[derive(Clone)]
 pub struct ExportData {
@@ -134,6 +143,14 @@ pub enum Message {
     BunkerTogglePermission(usize, u32),
     BunkerSetApprovalDuration(usize),
     BunkerPermissionUpdated(Result<(), String>),
+
+    // Signing Audit
+    NavigateAudit,
+    AuditLoaded(Result<AuditLoadResult, String>),
+    AuditPageLoaded(Result<AuditLoadResult, String>),
+    AuditChainVerified(Result<(bool, usize), String>),
+    AuditFilterChanged(Option<String>),
+    AuditLoadMore,
 
     // Settings
     SettingsAutoLockChanged(u64),
@@ -285,6 +302,21 @@ impl fmt::Debug for Message {
             Self::SettingsProxyPortChanged(v) => {
                 f.debug_tuple("SettingsProxyPortChanged").field(v).finish()
             }
+            Self::NavigateAudit => f.write_str("NavigateAudit"),
+            Self::AuditLoaded(r) => f
+                .debug_tuple("AuditLoaded")
+                .field(&r.as_ref().map(|v| v.entries.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::AuditPageLoaded(r) => f
+                .debug_tuple("AuditPageLoaded")
+                .field(&r.as_ref().map(|v| v.entries.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::AuditChainVerified(r) => f
+                .debug_tuple("AuditChainVerified")
+                .field(&r.as_ref().map(|(v, c)| (*v, *c)).map_err(|e| e.as_str()))
+                .finish(),
+            Self::AuditFilterChanged(c) => f.debug_tuple("AuditFilterChanged").field(c).finish(),
+            Self::AuditLoadMore => f.write_str("AuditLoadMore"),
             Self::Tick => f.write_str("Tick"),
         }
     }
