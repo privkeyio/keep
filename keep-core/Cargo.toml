@@ -47,6 +47,14 @@ tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 
+[[test]]
+name = "integration_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "property_tests"
+required-features = ["testing"]
+
 [[bench]]
 name = "crypto"
 harness = false
