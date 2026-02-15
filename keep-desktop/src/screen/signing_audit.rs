@@ -32,7 +32,7 @@ pub struct AuditDisplayEntry {
     pub was_automatic: bool,
     pub caller: String,
     pub caller_name: Option<String>,
-    pub event_kind: Option<u16>,
+    pub event_kind: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,10 @@ impl SigningAuditScreen {
                 "Tampering detected in audit log".to_string(),
                 theme::color::ERROR,
             ),
-            ChainStatus::Error(e) => (format!("Chain error: {e}"), theme::color::ERROR),
+            ChainStatus::Error(_) => (
+                "Unable to verify chain integrity".to_string(),
+                theme::color::ERROR,
+            ),
         };
 
         row![text(status_text).size(theme::size::SMALL).color(color)]
@@ -308,7 +311,7 @@ fn format_request_type(rt: &str) -> String {
         .join(" ")
 }
 
-fn format_event_kind(kind: u16) -> String {
+fn format_event_kind(kind: u32) -> String {
     let name = match kind {
         0 => "User Metadata",
         1 => "Short Text Note",

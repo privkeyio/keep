@@ -4,6 +4,8 @@
 //! Tamper-evident audit logging with hash chain integrity.
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -198,7 +200,8 @@ impl AuditEntry {
         Self::hash_optional_str(&mut data, self.group_pubkey.as_deref());
         if let Some(ref p) = self.participants {
             data.push(1);
-            data.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            let len = u32::try_from(p.len()).expect("participants too long for hash");
+            data.extend_from_slice(&len.to_le_bytes());
             for id in p {
                 data.extend_from_slice(&id.to_le_bytes());
             }
@@ -221,7 +224,8 @@ impl AuditEntry {
         match value {
             Some(s) => {
                 data.push(1);
-                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                let len = u32::try_from(s.len()).expect("string too long for hash");
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(s.as_bytes());
             }
             None => data.push(0),
@@ -295,10 +299,11 @@ impl AuditLog {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let line = format!("{}\n", STANDARD.encode(encrypted.to_bytes()));
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
 
@@ -338,7 +343,7 @@ impl AuditLog {
 
         let mut filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| max_age_secs.map_or(true, |max| now - e.timestamp <= max))
+            .filter(|e| max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max))
             .collect();
 
         if let Some(max) = self.retention.max_entries {
@@ -444,13 +449,11 @@ impl AuditLog {
         entries: &[AuditEntry],
         data_key: &SecretKey,
     ) -> Result<[u8; 32]> {
-        let mut file = File::create(temp_path)?;
-
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        opts.mode(0o600);
+        let mut file = opts.open(temp_path)?;
 
         let mut prev_hash = [0u8; 32];
         for entry in entries {
@@ -561,7 +564,7 @@ pub struct SigningAuditEntry {
     /// Human-readable caller name.
     pub caller_name: Option<String>,
     /// Nostr event kind.
-    pub event_kind: Option<u16>,
+    pub event_kind: Option<u32>,
     /// Reason for the decision.
     pub reason: Option<String>,
     /// Previous entry hash.
@@ -600,7 +603,7 @@ impl SigningAuditEntry {
     }
 
     /// Set the event kind.
-    pub fn with_event_kind(mut self, kind: u16) -> Self {
+    pub fn with_event_kind(mut self, kind: u32) -> Self {
         self.event_kind = Some(kind);
         self
     }
@@ -623,7 +626,8 @@ impl SigningAuditEntry {
         data.push(self.request_type as u8);
         data.push(self.decision as u8);
         data.push(self.was_automatic as u8);
-        data.extend_from_slice(&(self.caller.len() as u32).to_le_bytes());
+        let caller_len = u32::try_from(self.caller.len()).expect("caller too long for hash");
+        data.extend_from_slice(&caller_len.to_le_bytes());
         data.extend_from_slice(self.caller.as_bytes());
         Self::hash_optional_str(&mut data, self.caller_name.as_deref());
         if let Some(kind) = self.event_kind {
@@ -641,7 +645,8 @@ impl SigningAuditEntry {
         match value {
             Some(s) => {
                 data.push(1);
-                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                let len = u32::try_from(s.len()).expect("string too long for hash");
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(s.as_bytes());
             }
             None => data.push(0),
@@ -694,7 +699,9 @@ impl SigningAuditLog {
 
         let mut filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| max_age_secs.map_or(true, |max| now - e.timestamp <= max))
+            .filter(|e| {
+                max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max)
+            })
             .collect();
 
         if let Some(max) = self.retention.max_entries {
@@ -723,10 +730,11 @@ impl SigningAuditLog {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let line = format!("{}\n", STANDARD.encode(encrypted.to_bytes()));
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
 
@@ -928,13 +936,11 @@ impl SigningAuditLog {
         entries: &[SigningAuditEntry],
         data_key: &SecretKey,
     ) -> Result<[u8; 32]> {
-        let mut file = File::create(temp_path)?;
-
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        opts.mode(0o600);
+        let mut file = opts.open(temp_path)?;
 
         let mut prev_hash = [0u8; 32];
         for entry in entries {
