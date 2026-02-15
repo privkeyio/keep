@@ -270,12 +270,20 @@ fn save_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[St
     }
 }
 
+fn load_bunker_relays(keep_path: &std::path::Path) -> Vec<String> {
+    let path = bunker_relay_config_path(keep_path);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(default_bunker_relays)
+}
+
 fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
     let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(default_bunker_relays)
+        .unwrap_or_else(|| load_bunker_relays(keep_path))
 }
 
 fn save_bunker_relays(keep_path: &std::path::Path, urls: &[String]) {
