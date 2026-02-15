@@ -184,10 +184,30 @@ fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data.as_bytes())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+    }
+}
+
 fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
     let path = relay_config_path(keep_path);
     if let Ok(json) = serde_json::to_string_pretty(urls) {
-        if let Err(e) = std::fs::write(&path, json) {
+        if let Err(e) = write_private(&path, &json) {
             tracing::error!("Failed to save relay config to {}: {e}", path.display());
         }
     }
@@ -233,7 +253,7 @@ fn load_settings(keep_path: &std::path::Path) -> Settings {
 fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
     let path = settings_path(keep_path);
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        if let Err(e) = std::fs::write(&path, json) {
+        if let Err(e) = write_private(&path, &json) {
             tracing::error!("Failed to save settings to {}: {e}", path.display());
         }
     }
