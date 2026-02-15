@@ -351,7 +351,7 @@ pub struct Settings {
     pub proxy_port: u16,
     #[serde(default)]
     pub kill_switch_active: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub minimize_to_tray: bool,
     #[serde(default)]
     pub start_minimized: bool,
@@ -369,10 +369,6 @@ fn default_proxy_port() -> u16 {
     DEFAULT_PROXY_PORT
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -381,7 +377,7 @@ impl Default for Settings {
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
             kill_switch_active: false,
-            minimize_to_tray: true,
+            minimize_to_tray: false,
             start_minimized: false,
         }
     }
@@ -391,12 +387,21 @@ fn settings_path(keep_path: &std::path::Path) -> PathBuf {
     keep_path.join("settings.json")
 }
 
-fn load_settings(keep_path: &std::path::Path) -> Settings {
+fn load_settings(keep_path: &std::path::Path) -> (Settings, bool) {
     let path = settings_path(keep_path);
-    std::fs::read_to_string(&path)
+    let Some(contents) = std::fs::read_to_string(&path).ok() else {
+        return (Settings::default(), false);
+    };
+    let settings: Settings = serde_json::from_str(&contents).unwrap_or_default();
+    let migrated = serde_json::from_str::<serde_json::Value>(&contents)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .map(|v| v.get("minimize_to_tray").is_none())
+        .unwrap_or(false);
+    if migrated {
+        save_settings(keep_path, &settings);
+        tracing::info!("Settings migrated: minimize_to_tray now defaults to off");
+    }
+    (settings, migrated)
 }
 
 fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
@@ -481,10 +486,16 @@ impl App {
         };
         let vault_exists = keep_path.exists();
         let relay_urls = load_relay_urls(&keep_path);
-        let settings = load_settings(&keep_path);
+        let (settings, tray_migrated) = load_settings(&keep_path);
         let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
         let start_minimized = settings.start_minimized;
-        let app = Self::init(keep_path, screen, relay_urls, settings);
+        let mut app = Self::init(keep_path, screen, relay_urls, settings);
+        if tray_migrated {
+            app.set_toast(
+                "New option: enable minimize-to-tray in Settings".into(),
+                ToastKind::Success,
+            );
+        }
         let task = if start_minimized && app.tray.is_some() {
             iced::window::oldest()
                 .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
@@ -2076,6 +2087,7 @@ impl App {
                 if !v && !self.window_visible {
                     self.window_visible = true;
                     save_settings(&self.keep_path, &self.settings);
+                    self.sync_settings_screen();
                     return iced::window::oldest().and_then(|id| {
                         Task::batch([
                             iced::window::set_mode(id, iced::window::Mode::Windowed),
@@ -2090,6 +2102,11 @@ impl App {
             _ => return Task::none(),
         }
         save_settings(&self.keep_path, &self.settings);
+        self.sync_settings_screen();
+        Task::none()
+    }
+
+    fn sync_settings_screen(&mut self) {
         if let Screen::Settings(s) = &mut self.screen {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
@@ -2102,7 +2119,6 @@ impl App {
                 s.proxy_port_input = formatted;
             }
         }
-        Task::none()
     }
 
     fn handle_kill_switch_message(&mut self, message: Message) -> Task<Message> {
