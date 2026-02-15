@@ -357,6 +357,7 @@ impl App {
 
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
+        let proxy = self.proxy_addr();
 
         Task::perform(
             async move {
@@ -389,9 +390,10 @@ impl App {
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
                     Arc::new(DesktopCallbacks { tx: event_tx });
 
-                let mut server = keep_nip46::Server::new(keyring, &relay_urls, Some(callbacks))
-                    .await
-                    .map_err(|e| format!("Failed to start bunker: {e}"))?;
+                let mut server =
+                    keep_nip46::Server::new_with_proxy(keyring, &relay_urls, Some(callbacks), proxy)
+                        .await
+                        .map_err(|e| format!("Failed to start bunker: {e}"))?;
 
                 let handler = server.handler();
                 let url = server.bunker_url();

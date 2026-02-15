@@ -114,13 +114,23 @@ impl Server {
         relay_urls: &[String],
         callbacks: Option<Arc<dyn ServerCallbacks>>,
     ) -> Result<Self> {
-        Self::new_with_config(
+        Self::new_with_proxy(keyring, relay_urls, callbacks, None).await
+    }
+
+    pub async fn new_with_proxy(
+        keyring: Arc<Mutex<Keyring>>,
+        relay_urls: &[String],
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
+        Self::new_with_config_and_proxy(
             keyring,
             None,
             None,
             relay_urls,
             callbacks,
             ServerConfig::default(),
+            proxy,
         )
         .await
     }
@@ -151,6 +161,27 @@ impl Server {
         callbacks: Option<Arc<dyn ServerCallbacks>>,
         config: ServerConfig,
     ) -> Result<Self> {
+        Self::new_with_config_and_proxy(
+            keyring,
+            frost_signer,
+            transport_secret,
+            relay_urls,
+            callbacks,
+            config,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_config_and_proxy(
+        keyring: Arc<Mutex<Keyring>>,
+        frost_signer: Option<FrostSigner>,
+        transport_secret: Option<[u8; 32]>,
+        relay_urls: &[String],
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         require_relay_urls(relay_urls)?;
 
         let keys = if let Some(secret_bytes) = transport_secret {
@@ -169,7 +200,14 @@ impl Server {
             Keys::new(secret)
         };
 
-        let client = Client::new(keys.clone());
+        let client = match proxy {
+            Some(addr) => {
+                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
+                let opts = ClientOptions::new().connection(connection);
+                Client::builder().signer(keys.clone()).opts(opts).build()
+            }
+            None => Client::new(keys.clone()),
+        };
         add_relays(&client, relay_urls).await?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));

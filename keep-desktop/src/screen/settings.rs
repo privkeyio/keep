@@ -13,6 +13,7 @@ pub struct SettingsScreen {
     pub clipboard_clear_secs: u64,
     pub vault_path: String,
     pub proxy_enabled: bool,
+    pub proxy_port: u16,
     pub proxy_port_input: String,
 }
 
@@ -29,6 +30,7 @@ impl SettingsScreen {
             clipboard_clear_secs,
             vault_path,
             proxy_enabled,
+            proxy_port,
             proxy_port_input: proxy_port.to_string(),
         }
     }
@@ -158,15 +160,12 @@ impl SettingsScreen {
         ]
         .spacing(theme::space::SM);
 
-        if self.proxy_enabled {
-            let port_display = self.proxy_port_input.parse::<u16>().unwrap_or(0);
-            if port_display > 0 {
-                col = col.push(
-                    text(format!("Proxy active on port {port_display}"))
-                        .size(theme::size::BODY)
-                        .color(theme::color::SUCCESS),
-                );
-            }
+        if self.proxy_enabled && self.proxy_port > 0 {
+            col = col.push(
+                text(format!("Proxy active on port {}", self.proxy_port))
+                    .size(theme::size::BODY)
+                    .color(theme::color::SUCCESS),
+            );
         }
 
         container(col)

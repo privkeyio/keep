@@ -1402,15 +1402,28 @@ impl App {
             }
             Message::SettingsProxyToggled(enabled) => {
                 self.settings.proxy_enabled = enabled;
+                let has_active = matches!(
+                    self.frost_status,
+                    ConnectionStatus::Connected | ConnectionStatus::Connecting
+                ) || self.bunker.is_some();
+                if has_active {
+                    self.set_toast(
+                        "Reconnect to apply proxy changes".into(),
+                        ToastKind::Success,
+                    );
+                }
             }
             Message::SettingsProxyPortChanged(port_str) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_port_input = port_str.clone();
+                }
                 if let Ok(port) = port_str.parse::<u16>() {
                     if port > 0 {
                         self.settings.proxy_port = port;
+                    } else {
+                        return Task::none();
                     }
-                }
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.proxy_port_input = port_str;
+                } else {
                     return Task::none();
                 }
             }
@@ -1421,6 +1434,7 @@ impl App {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
             s.proxy_enabled = self.settings.proxy_enabled;
+            s.proxy_port = self.settings.proxy_port;
             s.proxy_port_input = self.settings.proxy_port.to_string();
         }
         Task::none()
