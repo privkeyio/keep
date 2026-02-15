@@ -7,6 +7,8 @@ use iced::Task;
 use keep_nip46::NostrConnectRequest;
 use nostr_sdk::prelude::*;
 
+use keep_core::relay::{normalize_relay_url, validate_relay_url};
+
 use crate::app::{App, ToastKind, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS};
 use crate::bunker_service::{extract_keyring, BunkerSetup, DesktopCallbacks};
 use crate::message::Message;
@@ -52,9 +54,31 @@ impl App {
             return Task::none();
         }
 
-        self.bunker_relays = request.relays.clone();
+        let valid_relays: Vec<String> = request
+            .relays
+            .iter()
+            .filter(|url| {
+                if let Err(e) = validate_relay_url(url) {
+                    tracing::warn!(url, "skipping invalid nostrconnect relay: {e}");
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|url| normalize_relay_url(url))
+            .collect();
+
+        if valid_relays.is_empty() {
+            if let Screen::Bunker(s) = &mut self.screen {
+                s.starting = false;
+                s.error = Some("No valid relay URLs in nostrconnect request".into());
+            }
+            return Task::none();
+        }
+
+        self.bunker_relays = valid_relays.clone();
         if let Screen::Bunker(s) = &mut self.screen {
-            s.relays = request.relays.clone();
+            s.relays = valid_relays.clone();
             s.starting = true;
             s.error = None;
         }
@@ -74,7 +98,7 @@ impl App {
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
                     Arc::new(DesktopCallbacks { tx: event_tx });
 
-                let relay_urls = request.relays.clone();
+                let relay_urls = valid_relays;
                 let config = keep_nip46::ServerConfig {
                     rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
                     expected_secret: Some(request.secret.clone()),

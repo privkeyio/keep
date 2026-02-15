@@ -22,6 +22,10 @@ fn main() -> iced::Result {
 
     tracing_subscriber::fmt::init();
 
+    // NOTE: On macOS, URL-scheme invocations (application:openURLs:) are not
+    // captured because implementing NSApplicationDelegate requires unsafe code
+    // (forbidden by this crate). Launch with the nostrconnect:// URI as a CLI
+    // argument instead: `keep-desktop "nostrconnect://..."`.
     let pending_uri = std::env::args()
         .nth(1)
         .filter(|arg| arg.starts_with("nostrconnect://"))
