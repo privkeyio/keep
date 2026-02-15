@@ -649,12 +649,15 @@ impl App {
         self.poll_bunker_events();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
-        let tasks: Vec<_> = tray_events.into_iter().map(|event| match event {
-            TrayEvent::ShowWindow => self.handle_tray_show(),
-            TrayEvent::ToggleBunker => self.handle_tray_toggle_bunker(),
-            TrayEvent::Lock => self.do_lock(),
-            TrayEvent::Quit => self.handle_tray_quit(),
-        }).collect();
+        let tasks: Vec<_> = tray_events
+            .into_iter()
+            .map(|event| match event {
+                TrayEvent::ShowWindow => self.handle_tray_show(),
+                TrayEvent::ToggleBunker => self.handle_tray_toggle_bunker(),
+                TrayEvent::Lock => self.do_lock(),
+                TrayEvent::Quit => self.handle_tray_quit(),
+            })
+            .collect();
         Task::batch(tasks)
     }
 

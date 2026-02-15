@@ -54,7 +54,11 @@ impl TrayState {
 
         let status_item = MenuItem::new("Keep - Disconnected", false, None);
         let open_item = MenuItem::new("Open Keep", true, None);
-        let bunker_label = if bunker_running { "Stop Bunker" } else { "Start Bunker" };
+        let bunker_label = if bunker_running {
+            "Stop Bunker"
+        } else {
+            "Start Bunker"
+        };
         let toggle_bunker_item = MenuItem::new(bunker_label, true, None);
         let lock_item = MenuItem::new("Lock", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
@@ -168,7 +172,10 @@ const MAX_NOTIFICATION_FIELD_LEN: usize = 40;
 fn sanitize_notification_field(input: &str) -> String {
     let without_control: String = input.chars().filter(|c| !c.is_control()).collect();
     if without_control.chars().count() > MAX_NOTIFICATION_FIELD_LEN {
-        let truncated: String = without_control.chars().take(MAX_NOTIFICATION_FIELD_LEN).collect();
+        let truncated: String = without_control
+            .chars()
+            .take(MAX_NOTIFICATION_FIELD_LEN)
+            .collect();
         format!("{truncated}...")
     } else {
         without_control
