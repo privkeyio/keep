@@ -937,9 +937,12 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Returns the default path to the Keep directory (~/.keep).
+/// Override with the `KEEP_HOME` environment variable.
 pub fn default_keep_path() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|p| p.join(".keep"))
+    std::env::var("KEEP_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".keep")))
         .ok_or(KeepError::HomeNotFound)
 }
 
