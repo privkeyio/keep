@@ -25,7 +25,7 @@ use crate::message::{
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
-use crate::screen::import::ImportScreen;
+use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::relay::RelayScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::unlock::UnlockScreen;
@@ -295,8 +295,12 @@ impl App {
 
             Message::ImportDataChanged(..)
             | Message::ImportPassphraseChanged(..)
+            | Message::ImportNameChanged(..)
+            | Message::ImportToggleVisibility
             | Message::ImportShare
-            | Message::ImportResult(..) => self.handle_import_message(message),
+            | Message::ImportNsec
+            | Message::ImportResult(..)
+            | Message::ImportNsecResult(..) => self.handle_import_message(message),
 
             Message::CopyNpub(..)
             | Message::CopyDescriptor(..)
@@ -637,6 +641,15 @@ impl App {
         match message {
             Message::ImportDataChanged(d) => {
                 if let Screen::Import(s) = &mut self.screen {
+                    let trimmed = d.trim();
+                    s.mode = ImportScreen::detect_mode(trimmed);
+                    s.npub_preview = if s.mode == ImportMode::Nsec {
+                        keep_core::keys::NostrKeypair::from_nsec(trimmed)
+                            .ok()
+                            .map(|kp| kp.to_npub())
+                    } else {
+                        None
+                    };
                     s.data = d;
                 }
                 Task::none()
@@ -647,8 +660,24 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ImportNameChanged(n) => {
+                if let Screen::Import(s) = &mut self.screen {
+                    if n.chars().count() <= 64 {
+                        s.name = n;
+                    }
+                }
+                Task::none()
+            }
+            Message::ImportToggleVisibility => {
+                if let Screen::Import(s) = &mut self.screen {
+                    s.nsec_visible = !s.nsec_visible;
+                }
+                Task::none()
+            }
             Message::ImportShare => self.handle_import(),
+            Message::ImportNsec => self.handle_import_nsec(),
             Message::ImportResult(result) => self.handle_import_result(result),
+            Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
             _ => Task::none(),
         }
     }
@@ -1182,5 +1211,52 @@ impl App {
             },
             Message::ImportResult,
         )
+    }
+
+    fn handle_import_nsec(&mut self) -> Task<Message> {
+        let (data, name) = match &mut self.screen {
+            Screen::Import(s) => {
+                if s.loading || s.data.is_empty() || s.name.trim().is_empty() {
+                    return Task::none();
+                }
+                s.loading = true;
+                s.error = None;
+                (s.data.clone(), s.name.clone())
+            }
+            _ => return Task::none(),
+        };
+
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
+                        keep.import_nsec(data.trim(), &name).map_err(friendly_err)?;
+                        let shares = collect_shares(keep)?;
+                        Ok((shares, name))
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::ImportNsecResult,
+        )
+    }
+
+    fn handle_import_nsec_result(
+        &mut self,
+        result: Result<(Vec<ShareEntry>, String), String>,
+    ) -> Task<Message> {
+        match result {
+            Ok((shares, name)) => {
+                self.set_share_screen(shares);
+                self.set_toast(
+                    format!("Key '{name}' imported successfully"),
+                    ToastKind::Success,
+                );
+            }
+            Err(e) => self.screen.set_loading_error(e),
+        }
+        Task::none()
     }
 }
