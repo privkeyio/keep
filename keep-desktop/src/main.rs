@@ -11,6 +11,7 @@ mod message;
 mod nostrconnect;
 mod screen;
 mod theme;
+mod tray;
 
 use app::App;
 use iced::{Size, Theme};
@@ -42,5 +43,6 @@ fn main() -> iced::Result {
         .theme(Theme::Dark)
         .subscription(App::subscription)
         .window_size(Size::new(900.0, 600.0))
+        .exit_on_close_request(false)
         .run()
 }

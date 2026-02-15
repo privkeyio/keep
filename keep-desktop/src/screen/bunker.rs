@@ -119,7 +119,7 @@ impl BunkerScreen {
             starting: false,
             error: None,
             expanded_client: None,
-            approval_duration: 0, // JustThisTime
+            approval_duration: 0,
         }
     }
 
@@ -145,7 +145,7 @@ impl BunkerScreen {
             starting: false,
             error: None,
             expanded_client: None,
-            approval_duration: 0, // JustThisTime
+            approval_duration: 0,
         }
     }
 

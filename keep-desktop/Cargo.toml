@@ -13,6 +13,8 @@ keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net" }
 keep-nip46 = { path = "../keep-nip46" }
 iced = { version = "0.14.0", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
+tray-icon = "0.21"
+notify-rust = "4"
 nostr-sdk = { workspace = true }
 hex = { workspace = true }
 dirs = { workspace = true }

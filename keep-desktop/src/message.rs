@@ -195,6 +195,11 @@ pub enum Message {
     SettingsClipboardClearChanged(u64),
     SettingsProxyToggled(bool),
     SettingsProxyPortChanged(String),
+    SettingsMinimizeToTrayToggled(bool),
+    SettingsStartMinimizedToggled(bool),
+
+    // Window
+    WindowCloseRequested(iced::window::Id),
 
     // Kill switch
     KillSwitchRequestConfirm,
@@ -381,6 +386,15 @@ impl fmt::Debug for Message {
                 .debug_tuple("KillSwitchDeactivateResult")
                 .field(&r.as_ref().map(|_| ()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::SettingsMinimizeToTrayToggled(v) => f
+                .debug_tuple("SettingsMinimizeToTrayToggled")
+                .field(v)
+                .finish(),
+            Self::SettingsStartMinimizedToggled(v) => f
+                .debug_tuple("SettingsStartMinimizedToggled")
+                .field(v)
+                .finish(),
+            Self::WindowCloseRequested(_) => f.write_str("WindowCloseRequested"),
             Self::Tick => f.write_str("Tick"),
         }
     }

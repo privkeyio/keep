@@ -530,17 +530,22 @@ impl App {
     }
 
     pub(crate) fn poll_bunker_events(&mut self) {
-        let Some(ref mut bunker) = self.bunker else {
-            return;
+        let events: Vec<BunkerEvent> = {
+            let Some(ref bunker) = self.bunker else {
+                return;
+            };
+            let Ok(rx) = bunker.event_rx.lock() else {
+                return;
+            };
+            rx.try_iter().collect()
         };
 
-        let Ok(rx) = bunker.event_rx.lock() else {
-            return;
-        };
-
-        while let Ok(event) = rx.try_recv() {
+        for event in events {
             match event {
                 BunkerEvent::Connected { pubkey, name } => {
+                    let Some(ref mut bunker) = self.bunker else {
+                        continue;
+                    };
                     if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
                         let client = ConnectedClient {
                             pubkey,
@@ -561,6 +566,9 @@ impl App {
                     action,
                     success,
                 } => {
+                    let Some(ref mut bunker) = self.bunker else {
+                        continue;
+                    };
                     let entry = LogDisplayEntry {
                         app,
                         action,
@@ -584,6 +592,7 @@ impl App {
                     if let Some(prev_tx) = self.bunker_approval_tx.take() {
                         let _ = prev_tx.send(false);
                     }
+                    self.notify_bunker_approval(&display);
                     self.bunker_pending_approval = Some(display.clone());
                     self.bunker_approval_tx = Some(response_tx);
                     if let Screen::Bunker(s) = &mut self.screen {
