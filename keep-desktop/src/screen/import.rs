@@ -102,8 +102,8 @@ impl ImportScreen {
             match self.mode {
                 ImportMode::Nsec => {
                     if let Some(npub) = &self.npub_preview {
-                        let truncated = if npub.len() >= 20 {
-                            format!("{}...{}", &npub[..12], &npub[npub.len() - 8..])
+                        let truncated = if npub.len() > 20 {
+                            format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
                         } else {
                             npub.clone()
                         };

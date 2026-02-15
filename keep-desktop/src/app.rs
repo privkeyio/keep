@@ -238,6 +238,10 @@ fn relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathB
     keep_path.join(format!("relays-{}.json", short_hex(pubkey_hex)))
 }
 
+fn bunker_relay_config_path(keep_path: &std::path::Path) -> PathBuf {
+    keep_path.join("bunker-relays.json")
+}
+
 fn bunker_relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
     keep_path.join(format!("bunker-relays-{}.json", short_hex(pubkey_hex)))
 }
@@ -273,6 +277,15 @@ fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(default_bunker_relays)
+}
+
+fn save_bunker_relays(keep_path: &std::path::Path, urls: &[String]) {
+    let path = bunker_relay_config_path(keep_path);
+    if let Ok(json) = serde_json::to_string_pretty(urls) {
+        if let Err(e) = write_private(&path, &json) {
+            tracing::error!("Failed to save bunker relay config to {}: {e}", path.display());
+        }
+    }
 }
 
 pub(crate) fn save_bunker_relays_for(
@@ -1300,8 +1313,9 @@ impl App {
     }
 
     pub(crate) fn save_bunker_relays(&self) {
-        if let Some(ref hex) = self.active_share_hex {
-            save_bunker_relays_for(&self.keep_path, hex, &self.bunker_relays);
+        match &self.active_share_hex {
+            Some(hex) => save_bunker_relays_for(&self.keep_path, hex, &self.bunker_relays),
+            None => save_bunker_relays(&self.keep_path, &self.bunker_relays),
         }
     }
 
