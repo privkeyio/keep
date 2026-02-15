@@ -219,6 +219,10 @@ pub struct Settings {
     pub auto_lock_secs: u64,
     #[serde(default = "default_clipboard_clear_secs")]
     pub clipboard_clear_secs: u64,
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -229,11 +233,17 @@ fn default_clipboard_clear_secs() -> u64 {
     CLIPBOARD_CLEAR_SECS
 }
 
+fn default_proxy_port() -> u16 {
+    9050
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_lock_secs: AUTO_LOCK_SECS,
             clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
+            proxy_enabled: false,
+            proxy_port: 9050,
         }
     }
 }
@@ -419,9 +429,10 @@ impl App {
             | Message::BunkerSetApprovalDuration(..)
             | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
 
-            Message::SettingsAutoLockChanged(..) | Message::SettingsClipboardClearChanged(..) => {
-                self.handle_settings_message(message)
-            }
+            Message::SettingsAutoLockChanged(..)
+            | Message::SettingsClipboardClearChanged(..)
+            | Message::SettingsProxyToggled(..)
+            | Message::SettingsProxyPortChanged(..) => self.handle_settings_message(message),
         }
     }
 
@@ -592,6 +603,8 @@ impl App {
                     self.settings.auto_lock_secs,
                     self.settings.clipboard_clear_secs,
                     self.keep_path.display().to_string(),
+                    self.settings.proxy_enabled,
+                    self.settings.proxy_port,
                 ));
                 Task::none()
             }
@@ -1120,6 +1133,17 @@ impl App {
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
     }
 
+    pub(crate) fn proxy_addr(&self) -> Option<std::net::SocketAddr> {
+        if self.settings.proxy_enabled && self.settings.proxy_port > 0 {
+            Some(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                self.settings.proxy_port,
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn start_clipboard_timer(&mut self) {
         self.clipboard_clear_at = if self.settings.clipboard_clear_secs > 0 {
             Some(Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs))
@@ -1376,12 +1400,28 @@ impl App {
                     self.clipboard_clear_at = None;
                 }
             }
+            Message::SettingsProxyToggled(enabled) => {
+                self.settings.proxy_enabled = enabled;
+            }
+            Message::SettingsProxyPortChanged(port_str) => {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    if port > 0 {
+                        self.settings.proxy_port = port;
+                    }
+                }
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_port_input = port_str;
+                    return Task::none();
+                }
+            }
             _ => return Task::none(),
         }
         save_settings(&self.keep_path, &self.settings);
         if let Screen::Settings(s) = &mut self.screen {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
+            s.proxy_enabled = self.settings.proxy_enabled;
+            s.proxy_port_input = self.settings.proxy_port.to_string();
         }
         Task::none()
     }

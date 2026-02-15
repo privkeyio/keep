@@ -131,6 +131,7 @@ pub(crate) async fn setup_frost_node(
     frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
     pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
     frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    proxy: Option<std::net::SocketAddr>,
 ) -> Result<FrostNodeSetup, String> {
     let share = tokio::task::spawn_blocking({
         let keep_arc = keep_arc.clone();
@@ -148,9 +149,16 @@ pub(crate) async fn setup_frost_node(
 
     let nonce_store_path = keep_path.join("frost-nonces");
     keep_frost_net::install_default_crypto_provider();
-    let node = KfpNode::with_nonce_store_path(share, relay_urls, &nonce_store_path)
-        .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+    let nonce_store = keep_frost_net::FileNonceStore::new(&nonce_store_path)
+        .map_err(|e| format!("Failed to create nonce store: {e}"))?;
+    let node = KfpNode::with_nonce_store(
+        share,
+        relay_urls,
+        Some(Arc::new(nonce_store) as Arc<dyn keep_frost_net::NonceStore>),
+        proxy,
+    )
+    .await
+    .map_err(|e| format!("Connection failed: {e}"))?;
 
     let (request_tx, request_rx) = mpsc::channel(32);
     let hooks = Arc::new(DesktopSigningHooks { request_tx });
@@ -214,6 +222,7 @@ pub(crate) async fn spawn_frost_node(
     frost_events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
     pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
     frost_shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    proxy: Option<std::net::SocketAddr>,
 ) -> Result<(), String> {
     let setup = setup_frost_node(
         keep_arc,
@@ -223,6 +232,7 @@ pub(crate) async fn spawn_frost_node(
         frost_events.clone(),
         pending_requests,
         frost_shutdown,
+        proxy,
     )
     .await?;
 
@@ -498,6 +508,7 @@ impl App {
                 self.frost_events.clone(),
                 self.pending_sign_requests.clone(),
                 self.frost_shutdown.clone(),
+                self.proxy_addr(),
             ),
             Message::ConnectRelayResult,
         )
@@ -562,6 +573,7 @@ impl App {
                 self.frost_events.clone(),
                 self.pending_sign_requests.clone(),
                 self.frost_shutdown.clone(),
+                self.proxy_addr(),
             ),
             Message::ConnectRelayResult,
         )
