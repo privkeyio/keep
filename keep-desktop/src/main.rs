@@ -16,6 +16,10 @@ use app::App;
 use iced::{Size, Theme};
 
 fn main() -> iced::Result {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt::init();
 
     let pending_uri = std::env::args()
