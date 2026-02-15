@@ -134,6 +134,7 @@ pub struct App {
     pub(crate) settings: Settings,
     pub(crate) kill_switch: Arc<AtomicBool>,
     pub(crate) tray: Option<TrayState>,
+    pub(crate) has_tray: bool,
     pub(crate) window_visible: bool,
     tray_last_connected: bool,
     tray_last_bunker: bool,
@@ -458,6 +459,7 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             nostrconnect_pending: None,
+            has_tray: tray.is_some(),
             window_visible: tray.is_none() || !settings.start_minimized,
             tray_last_connected: false,
             tray_last_bunker: false,
@@ -496,7 +498,7 @@ impl App {
                 ToastKind::Success,
             );
         }
-        let task = if start_minimized && app.tray.is_some() {
+        let task = if start_minimized && app.has_tray {
             iced::window::oldest()
                 .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
         } else {
@@ -2267,7 +2269,7 @@ impl App {
     }
 
     fn handle_window_close(&mut self, id: iced::window::Id) -> Task<Message> {
-        if self.settings.minimize_to_tray && self.tray.is_some() {
+        if self.settings.minimize_to_tray && self.has_tray {
             self.window_visible = false;
             iced::window::set_mode(id, iced::window::Mode::Hidden)
         } else {
@@ -2372,6 +2374,7 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            has_tray,
             window_visible: !has_tray || !settings.start_minimized,
             tray_last_connected: false,
             tray_last_bunker: false,
@@ -2394,16 +2397,16 @@ mod tests {
     fn window_close_with_minimize_to_tray_hides_window() {
         let mut settings = default_settings();
         settings.minimize_to_tray = true;
-        let mut app = App::test_new(settings, false);
+        let mut app = App::test_new(settings, true);
         app.window_visible = true;
 
         assert!(app.settings.minimize_to_tray);
-        assert!(app.tray.is_none());
+        assert!(app.has_tray);
 
         let fake_id = iced::window::Id::unique();
         let _task = app.handle_window_close(fake_id);
 
-        assert!(app.window_visible);
+        assert!(!app.window_visible);
     }
 
     #[test]
@@ -2626,12 +2629,12 @@ mod tests {
     }
 
     #[test]
-    fn window_close_minimize_to_tray_with_tray_none_exits() {
+    fn window_close_minimize_to_tray_with_no_tray_exits() {
         let mut settings = default_settings();
         settings.minimize_to_tray = true;
         let mut app = App::test_new(settings, false);
         app.window_visible = true;
-        assert!(app.tray.is_none());
+        assert!(!app.has_tray);
 
         let fake_id = iced::window::Id::unique();
         let _task = app.handle_window_close(fake_id);
