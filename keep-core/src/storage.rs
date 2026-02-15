@@ -70,7 +70,7 @@ fn validate_password_max_len(password: &str) -> Result<()> {
 fn validate_new_password(password: &str) -> Result<()> {
     if password.len() < MIN_PASSWORD_LEN {
         return Err(KeepError::InvalidInput(format!(
-            "password too short (min {MIN_PASSWORD_LEN} characters)"
+            "password too short (min {MIN_PASSWORD_LEN} bytes)"
         )));
     }
     validate_password_max_len(password)
@@ -761,10 +761,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-keep");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         let mut storage = Storage::open(&path).unwrap();
-        let result = storage.unlock("wrong");
+        let result = storage.unlock("wrongpass");
         assert!(result.is_err());
     }
 
@@ -801,16 +801,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-limit");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         for _ in 0..5 {
             let mut storage = Storage::open(&path).unwrap();
-            let result = storage.unlock("wrong");
+            let result = storage.unlock("wrongpass");
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
 
         let mut storage = Storage::open(&path).unwrap();
-        let result = storage.unlock("wrong");
+        let result = storage.unlock("wrongpass");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
 
@@ -819,21 +819,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-limit-reset");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         for _ in 0..4 {
             let mut storage = Storage::open(&path).unwrap();
-            let _ = storage.unlock("wrong");
+            let _ = storage.unlock("wrongpass");
         }
 
         {
             let mut storage = Storage::open(&path).unwrap();
-            storage.unlock("correct").unwrap();
+            storage.unlock("correctpass").unwrap();
         }
 
         for _ in 0..4 {
             let mut storage = Storage::open(&path).unwrap();
-            let result = storage.unlock("wrong");
+            let result = storage.unlock("wrongpass");
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
     }

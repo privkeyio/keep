@@ -1803,13 +1803,8 @@ impl App {
                     return Task::none();
                 }
 
-                if let Some(current) = &self.active_share_hex {
-                    save_relay_urls_for(&self.keep_path, current, &self.relay_urls);
-                    save_bunker_relays_for(&self.keep_path, current, &self.bunker_relays);
-                } else {
-                    save_relay_urls(&self.keep_path, &self.relay_urls);
-                    save_bunker_relays(&self.keep_path, &self.bunker_relays);
-                }
+                self.save_relay_urls();
+                self.save_bunker_relays();
 
                 self.handle_disconnect_relay();
                 self.stop_bunker();
@@ -1900,7 +1895,7 @@ impl App {
                             .collect();
                         let total = group_shares.len();
                         let mut deleted = 0usize;
-                        let mut delete_err = None;
+                        let mut delete_err: Option<String> = None;
                         for share in &group_shares {
                             let res = {
                                 let mut guard = lock_keep(&self.keep);
@@ -1908,16 +1903,22 @@ impl App {
                                     keep.frost_delete_share(&share.group_pubkey, share.identifier)
                                 })
                             };
-                            if let Some(Err(e)) = res {
-                                delete_err = Some(e);
-                                break;
+                            match res {
+                                Some(Ok(())) => deleted += 1,
+                                Some(Err(e)) => {
+                                    delete_err = Some(friendly_err(e));
+                                    break;
+                                }
+                                None => {
+                                    delete_err = Some("Vault is locked".into());
+                                    break;
+                                }
                             }
-                            deleted += 1;
                         }
-                        if let Some(e) = delete_err {
+                        if let Some(err_msg) = delete_err {
                             self.refresh_shares();
                             self.set_toast(
-                                format!("Deleted {deleted}/{total} shares: {}", friendly_err(e)),
+                                format!("Deleted {deleted}/{total} shares: {err_msg}"),
                                 ToastKind::Error,
                             );
                             false

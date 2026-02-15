@@ -7,6 +7,23 @@ use iced::{Element, Length};
 use crate::message::{Identity, IdentityKind, Message};
 use crate::theme;
 
+fn identity_color(pubkey_hex: &str) -> iced::Color {
+    let bytes: Vec<u8> = (0..6.min(pubkey_hex.len()))
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&pubkey_hex[i..i + 2], 16).ok())
+        .collect();
+    let r = *bytes.first().unwrap_or(&128);
+    let g = *bytes.get(1).unwrap_or(&128);
+    let b = *bytes.get(2).unwrap_or(&128);
+    let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    let boost = if lum < 100.0 { 0.3 } else { 0.0 };
+    iced::Color::from_rgb(
+        (r as f32 / 255.0 + boost).min(1.0),
+        (g as f32 / 255.0 + boost).min(1.0),
+        (b as f32 / 255.0 + boost).min(1.0),
+    )
+}
+
 #[derive(PartialEq)]
 pub enum NavItem {
     Shares,
@@ -299,16 +316,11 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
         ]
         .spacing(0.0);
 
+        let dot_color = identity_color(&id.pubkey_hex);
         let mut item_row = row![].align_y(iced::Alignment::Center).width(Length::Fill);
 
-        if is_active {
-            item_row = item_row.push(
-                text("*")
-                    .size(theme::size::TINY)
-                    .color(theme::color::PRIMARY),
-            );
-            item_row = item_row.push(Space::new().width(2.0));
-        }
+        item_row = item_row.push(text("\u{25CF}").size(theme::size::TINY).color(dot_color));
+        item_row = item_row.push(Space::new().width(4.0));
 
         item_row = item_row.push(name_col);
         item_row = item_row.push(Space::new().width(Length::Fill));

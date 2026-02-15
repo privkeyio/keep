@@ -575,7 +575,7 @@ mod tests {
         let path = dir.path().join("test-rotate-pw");
 
         {
-            let storage = Storage::create(&path, "oldpass", Argon2Params::TESTING).unwrap();
+            let storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
             let pubkey: [u8; 32] = crypto::random_bytes();
             let secret: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
             let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
@@ -590,17 +590,17 @@ mod tests {
 
         {
             let mut storage = Storage::open(&path).unwrap();
-            storage.rotate_password("oldpass", "newpass").unwrap();
+            storage.rotate_password("oldpass1", "newpass1").unwrap();
         }
 
         {
             let mut storage = Storage::open(&path).unwrap();
-            assert!(storage.unlock("oldpass").is_err());
+            assert!(storage.unlock("oldpass1").is_err());
         }
 
         {
             let mut storage = Storage::open(&path).unwrap();
-            storage.unlock("newpass").unwrap();
+            storage.unlock("newpass1").unwrap();
             let keys = storage.list_keys().unwrap();
             assert_eq!(keys.len(), 1);
             assert_eq!(keys[0].name, "test");
