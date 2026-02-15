@@ -1209,7 +1209,7 @@ impl App {
     fn handle_import_nsec(&mut self) -> Task<Message> {
         let (data, name) = match &mut self.screen {
             Screen::Import(s) => {
-                if s.loading || s.data.is_empty() || s.name.is_empty() {
+                if s.loading || s.data.is_empty() || s.name.trim().is_empty() {
                     return Task::none();
                 }
                 s.loading = true;
@@ -1242,6 +1242,9 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok((shares, name)) => {
+                if let Screen::Import(s) = &mut self.screen {
+                    s.data = Zeroizing::new(String::new());
+                }
                 self.set_share_screen(shares);
                 self.set_toast(
                     format!("Key '{name}' imported successfully"),

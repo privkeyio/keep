@@ -126,12 +126,12 @@ impl ImportScreen {
 
         match self.mode {
             ImportMode::Nsec => {
-                let can_import = trimmed_data.starts_with("nsec1") && !self.name.is_empty();
+                let can_import = !self.name.trim().is_empty();
                 let submit_msg = can_import.then_some(Message::ImportNsec);
 
                 let name_input = text_input("Key name", &self.name)
                     .on_input(Message::ImportNameChanged)
-                    .on_submit_maybe(submit_msg.clone())
+                    .on_submit_maybe(submit_msg)
                     .padding(theme::space::MD)
                     .width(theme::size::INPUT_WIDTH);
 
