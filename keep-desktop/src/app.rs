@@ -695,11 +695,7 @@ impl App {
                 Task::none()
             }
             Message::CopyToClipboard(t) => {
-                if self.settings.clipboard_clear_secs > 0 {
-                    self.clipboard_clear_at = Some(
-                        Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs),
-                    );
-                }
+                self.start_clipboard_timer();
                 self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
                 if let Screen::Export(s) = &mut self.screen {
                     s.copied = true;
@@ -1104,6 +1100,14 @@ impl App {
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
     }
 
+    pub(crate) fn start_clipboard_timer(&mut self) {
+        self.clipboard_clear_at = if self.settings.clipboard_clear_secs > 0 {
+            Some(Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs))
+        } else {
+            None
+        };
+    }
+
     fn handle_shares_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => self.set_share_screen(shares),
@@ -1348,6 +1352,9 @@ impl App {
             }
             Message::SettingsClipboardClearChanged(secs) => {
                 self.settings.clipboard_clear_secs = secs;
+                if secs == 0 {
+                    self.clipboard_clear_at = None;
+                }
             }
             _ => return Task::none(),
         }

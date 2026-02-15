@@ -3,7 +3,6 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
@@ -260,16 +259,11 @@ impl App {
                 Task::none()
             }
             Message::BunkerCopyUrl => {
-                if let Some(ref bunker) = self.bunker {
-                    if self.settings.clipboard_clear_secs > 0 {
-                        self.clipboard_clear_at = Some(
-                            Instant::now()
-                                + Duration::from_secs(self.settings.clipboard_clear_secs),
-                        );
-                    }
-                    return iced::clipboard::write(bunker.url.clone());
-                }
-                Task::none()
+                let Some(url) = self.bunker.as_ref().map(|b| b.url.clone()) else {
+                    return Task::none();
+                };
+                self.start_clipboard_timer();
+                iced::clipboard::write(url)
             }
             Message::BunkerToggleClient(i) => {
                 if let Screen::Bunker(s) = &mut self.screen {
