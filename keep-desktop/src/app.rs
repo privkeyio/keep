@@ -453,7 +453,7 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             nostrconnect_pending: None,
-            window_visible: !settings.start_minimized,
+            window_visible: tray.is_none() || !settings.start_minimized,
             tray_last_connected: false,
             tray_last_bunker: false,
             settings,
@@ -485,7 +485,7 @@ impl App {
         let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
         let start_minimized = settings.start_minimized;
         let app = Self::init(keep_path, screen, relay_urls, settings);
-        let task = if start_minimized {
+        let task = if start_minimized && app.tray.is_some() {
             iced::window::oldest()
                 .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
         } else {
@@ -649,16 +649,12 @@ impl App {
         self.poll_bunker_events();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
-        let mut tasks = Vec::new();
-        for event in tray_events {
-            let task = match event {
-                TrayEvent::ShowWindow => self.handle_tray_show(),
-                TrayEvent::ToggleBunker => self.handle_tray_toggle_bunker(),
-                TrayEvent::Lock => self.do_lock(),
-                TrayEvent::Quit => self.handle_tray_quit(),
-            };
-            tasks.push(task);
-        }
+        let tasks: Vec<_> = tray_events.into_iter().map(|event| match event {
+            TrayEvent::ShowWindow => self.handle_tray_show(),
+            TrayEvent::ToggleBunker => self.handle_tray_toggle_bunker(),
+            TrayEvent::Lock => self.do_lock(),
+            TrayEvent::Quit => self.handle_tray_quit(),
+        }).collect();
         Task::batch(tasks)
     }
 
@@ -2278,11 +2274,10 @@ impl App {
     fn handle_tray_toggle_bunker(&mut self) -> Task<Message> {
         if self.bunker.is_some() {
             self.handle_bunker_stop()
+        } else if lock_keep(&self.keep).is_none() {
+            self.set_toast("Vault is locked".into(), ToastKind::Error);
+            self.handle_tray_show()
         } else {
-            if lock_keep(&self.keep).is_none() {
-                self.set_toast("Vault is locked".into(), ToastKind::Error);
-                return self.handle_tray_show();
-            }
             self.handle_bunker_start()
         }
     }
@@ -2310,10 +2305,10 @@ impl App {
     }
 
     fn poll_tray_events(&self) -> Vec<crate::tray::TrayEvent> {
-        match self.tray.as_ref() {
-            Some(tray) => tray.event_rx.try_iter().collect(),
-            None => Vec::new(),
-        }
+        self.tray
+            .as_ref()
+            .map(|tray| tray.event_rx.try_iter().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn notify_sign_request(&self, _req: &PendingSignRequest) {

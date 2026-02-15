@@ -3,7 +3,7 @@
 
 use std::sync::mpsc;
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Debug, Clone)]
@@ -54,33 +54,27 @@ impl TrayState {
 
         let status_item = MenuItem::new("Keep - Disconnected", false, None);
         let open_item = MenuItem::new("Open Keep", true, None);
-        let toggle_bunker_item = MenuItem::new(
-            if bunker_running {
-                "Stop Bunker"
-            } else {
-                "Start Bunker"
-            },
-            true,
-            None,
-        );
+        let bunker_label = if bunker_running { "Stop Bunker" } else { "Start Bunker" };
+        let toggle_bunker_item = MenuItem::new(bunker_label, true, None);
         let lock_item = MenuItem::new("Lock", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
 
+        let sep1 = PredefinedMenuItem::separator();
+        let sep2 = PredefinedMenuItem::separator();
         let menu = Menu::new();
-        menu.append(&status_item)
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&open_item)
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&toggle_bunker_item)
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&lock_item)
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| format!("menu append failed: {e}"))?;
-        menu.append(&quit_item)
-            .map_err(|e| format!("menu append failed: {e}"))?;
+        let items: [&dyn IsMenuItem; 7] = [
+            &status_item,
+            &sep1,
+            &open_item,
+            &toggle_bunker_item,
+            &lock_item,
+            &sep2,
+            &quit_item,
+        ];
+        for item in items {
+            menu.append(item)
+                .map_err(|e| format!("menu append failed: {e}"))?;
+        }
 
         let open_id = open_item.id().clone();
         let toggle_id = toggle_bunker_item.id().clone();
@@ -172,15 +166,12 @@ pub fn send_sign_request_notification() {
 const MAX_NOTIFICATION_FIELD_LEN: usize = 40;
 
 fn sanitize_notification_field(input: &str) -> String {
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NOTIFICATION_FIELD_LEN)
-        .collect();
-    if input.chars().count() > MAX_NOTIFICATION_FIELD_LEN {
-        format!("{cleaned}...")
+    let without_control: String = input.chars().filter(|c| !c.is_control()).collect();
+    if without_control.chars().count() > MAX_NOTIFICATION_FIELD_LEN {
+        let truncated: String = without_control.chars().take(MAX_NOTIFICATION_FIELD_LEN).collect();
+        format!("{truncated}...")
     } else {
-        cleaned
+        without_control
     }
 }
 
