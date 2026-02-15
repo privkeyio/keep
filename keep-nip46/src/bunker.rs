@@ -99,7 +99,7 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
 
     let secret = secret.ok_or("secret is required")?;
     let secret_len = secret.chars().count();
-    if secret_len < MIN_SECRET_LEN || secret_len > 64 {
+    if !(MIN_SECRET_LEN..=64).contains(&secret_len) {
         return Err(format!("secret must be {MIN_SECRET_LEN}-64 characters"));
     }
 
