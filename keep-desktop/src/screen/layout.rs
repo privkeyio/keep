@@ -10,7 +10,11 @@ use crate::theme;
 fn identity_color(pubkey_hex: &str) -> iced::Color {
     let bytes: Vec<u8> = (0..6.min(pubkey_hex.len()))
         .step_by(2)
-        .filter_map(|i| pubkey_hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .filter_map(|i| {
+            pubkey_hex
+                .get(i..i + 2)
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+        })
         .collect();
     let r = *bytes.first().unwrap_or(&128);
     let g = *bytes.get(1).unwrap_or(&128);
@@ -349,7 +353,8 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
         list = list.push(switch_btn);
     }
 
-    let identity_list = scrollable(list).height(Length::Shrink).width(Length::Fill);
+    let identity_list =
+        container(scrollable(list).height(Length::Fill).width(Length::Fill)).max_height(200.0);
 
     column![toggle_btn, identity_list].spacing(2.0).into()
 }
