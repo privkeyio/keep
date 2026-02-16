@@ -307,6 +307,26 @@ impl Keep {
         self.storage.list_keys()
     }
 
+    /// Export a stored nsec key as NIP-49 ncryptsec.
+    pub fn export_ncryptsec(&mut self, pubkey: &[u8; 32], password: &str) -> Result<String> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let slot = self
+            .keyring
+            .get(pubkey)
+            .ok_or_else(|| KeepError::KeyNotFound(hex::encode(pubkey)))?;
+
+        if slot.key_type != KeyType::Nostr {
+            return Err(KeepError::InvalidInput("not a Nostr key".into()));
+        }
+
+        let result = keys::nip49::encrypt(slot.expose_secret(), password, None)?;
+        self.audit_event(AuditEventType::KeyExport, |e| e.with_pubkey(pubkey));
+        Ok(result)
+    }
+
     /// Delete a key.
     pub fn delete_key(&mut self, pubkey: &[u8; 32]) -> Result<()> {
         let id = crypto::blake2b_256(pubkey);
