@@ -31,33 +31,28 @@ pub(crate) async fn verify_relay_certificates(
     certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
     keep_path: &std::path::Path,
 ) -> Result<(), String> {
-    for url in relay_urls {
-        if url.starts_with("wss://") {
-            let mut pins = certificate_pins
-                .lock()
-                .map_err(|_| "Pin lock poisoned".to_string())?
-                .clone();
-            keep_frost_net::verify_relay_certificate(url, &mut pins)
-                .await
-                .map_err(|e| format!("{e}"))?;
-            let mut guard = certificate_pins
-                .lock()
-                .map_err(|_| "Pin lock poisoned".to_string())?;
-            for (hostname, hash) in pins.pins() {
-                if guard.get_pin(hostname).is_none() {
-                    guard.add_pin(hostname.clone(), *hash);
-                }
+    for url in relay_urls.iter().filter(|u| u.starts_with("wss://")) {
+        let mut pins = certificate_pins
+            .lock()
+            .map_err(|_| "Pin lock poisoned".to_string())?
+            .clone();
+        keep_frost_net::verify_relay_certificate(url, &mut pins)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let mut guard = certificate_pins
+            .lock()
+            .map_err(|_| "Pin lock poisoned".to_string())?;
+        for (hostname, hash) in pins.pins() {
+            if guard.get_pin(hostname).is_none() {
+                guard.add_pin(hostname.clone(), *hash);
             }
-            drop(guard);
-            crate::app::save_cert_pins_pub(keep_path, certificate_pins);
         }
+        crate::app::save_cert_pins(keep_path, &guard);
     }
     Ok(())
 }
 
 pub(crate) fn parse_pin_mismatch(error: &str) -> Option<crate::message::PinMismatchInfo> {
-    // Match the format from FrostNetError::CertificatePinMismatch Display:
-    // "Certificate pin mismatch for {hostname}: expected {expected}, got {actual}"
     let rest = error.strip_prefix("Certificate pin mismatch for ")?;
     let (hostname, rest) = rest.split_once(": expected ")?;
     let (expected, rest) = rest.split_once(", got ")?;

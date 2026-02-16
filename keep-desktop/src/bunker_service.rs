@@ -518,6 +518,8 @@ impl App {
                 if let Some(mismatch) = crate::frost::parse_pin_mismatch(&e) {
                     self.pin_mismatch = Some(mismatch);
                     self.bunker_cert_pin_failed = true;
+                } else {
+                    self.bunker_cert_pin_failed = false;
                 }
                 self.set_bunker_error(e);
             }

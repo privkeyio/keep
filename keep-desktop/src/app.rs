@@ -266,25 +266,14 @@ fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::CertificatePin
         serde_json::from_str(&contents).unwrap_or_default();
     let mut pins = keep_frost_net::CertificatePinSet::new();
     for (hostname, hex_hash) in map {
-        if let Ok(bytes) = hex::decode(&hex_hash) {
-            if let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                pins.add_pin(hostname, hash);
-            }
-        }
+        let Ok(bytes) = hex::decode(&hex_hash) else { continue };
+        let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else { continue };
+        pins.add_pin(hostname, hash);
     }
     pins
 }
 
-pub(crate) fn save_cert_pins_pub(
-    keep_path: &std::path::Path,
-    pins_mutex: &Mutex<keep_frost_net::CertificatePinSet>,
-) {
-    if let Ok(pins) = pins_mutex.lock() {
-        save_cert_pins(keep_path, &pins);
-    }
-}
-
-fn save_cert_pins(keep_path: &std::path::Path, pins: &keep_frost_net::CertificatePinSet) {
+pub(crate) fn save_cert_pins(keep_path: &std::path::Path, pins: &keep_frost_net::CertificatePinSet) {
     let path = cert_pins_path(keep_path);
     let map: std::collections::HashMap<&String, String> = pins
         .pins()
@@ -1335,7 +1324,7 @@ impl App {
             return screen;
         };
         let bg_color = match toast.kind {
-            ToastKind::Success => crate::theme::color::SUCCESS,
+            ToastKind::Success => theme::color::SUCCESS,
             ToastKind::Error => theme::color::ERROR,
         };
         let banner = container(
@@ -1412,6 +1401,8 @@ impl App {
         self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
+        self.pin_mismatch = None;
+        self.bunker_cert_pin_failed = false;
         self.screen = Screen::Unlock(UnlockScreen::new(true));
         if clear_clipboard {
             iced::clipboard::write(String::new())
@@ -2542,32 +2533,23 @@ impl App {
                 self.pin_mismatch = None;
             }
             Message::CertPinMismatchClearAndRetry => {
-                let hostname = self.pin_mismatch.as_ref().map(|m| m.hostname.clone());
-                self.pin_mismatch = None;
-                if let Some(hostname) = hostname {
-                    if let Ok(mut pins) = self.certificate_pins.lock() {
-                        pins.remove_pin(&hostname);
-                        save_cert_pins(&self.keep_path, &pins);
-                    }
-                    self.sync_cert_pins_to_screen();
-                    let frost_active = matches!(
-                        self.frost_status,
-                        ConnectionStatus::Error(_)
-                    );
-                    let bunker_err = self.bunker.is_none()
-                        && self.bunker_cert_pin_failed;
-                    let mut tasks = Vec::new();
-                    if frost_active {
-                        tasks.push(self.handle_reconnect_relay());
-                    }
-                    if bunker_err {
-                        self.bunker_cert_pin_failed = false;
-                        tasks.push(self.handle_bunker_start());
-                    }
-                    if !tasks.is_empty() {
-                        return Task::batch(tasks);
-                    }
+                let Some(mismatch) = self.pin_mismatch.take() else {
+                    return Task::none();
+                };
+                if let Ok(mut pins) = self.certificate_pins.lock() {
+                    pins.remove_pin(&mismatch.hostname);
+                    save_cert_pins(&self.keep_path, &pins);
                 }
+                self.sync_cert_pins_to_screen();
+                let mut tasks = Vec::new();
+                if matches!(self.frost_status, ConnectionStatus::Error(_)) {
+                    tasks.push(self.handle_reconnect_relay());
+                }
+                if self.bunker.is_none() && self.bunker_cert_pin_failed {
+                    self.bunker_cert_pin_failed = false;
+                    tasks.push(self.handle_bunker_start());
+                }
+                return Task::batch(tasks);
             }
             _ => {}
         }
@@ -2583,7 +2565,7 @@ impl App {
             .iter()
             .map(|(host, hash)| (host.clone(), hex::encode(hash)))
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort();
         entries
     }
 
