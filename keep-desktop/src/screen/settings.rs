@@ -23,6 +23,7 @@ pub struct SettingsScreen {
     pub minimize_to_tray: bool,
     pub start_minimized: bool,
     pub has_tray: bool,
+    pub certificate_pins: Vec<(String, String)>,
 }
 
 fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
@@ -49,6 +50,7 @@ impl SettingsScreen {
         minimize_to_tray: bool,
         start_minimized: bool,
         has_tray: bool,
+        certificate_pins: Vec<(String, String)>,
     ) -> Self {
         Self {
             auto_lock_secs,
@@ -65,6 +67,7 @@ impl SettingsScreen {
             minimize_to_tray,
             start_minimized,
             has_tray,
+            certificate_pins,
         }
     }
 
@@ -75,6 +78,7 @@ impl SettingsScreen {
         let auto_lock_card = self.auto_lock_card();
         let clipboard_card = self.clipboard_card();
         let proxy_card = self.proxy_card();
+        let cert_pins_card = self.cert_pins_card();
         let info_card = self.info_card();
 
         let mut content = column![title, kill_switch_card, auto_lock_card, clipboard_card,]
@@ -86,7 +90,7 @@ impl SettingsScreen {
             content = content.push(self.tray_card());
         }
 
-        content = content.push(proxy_card).push(info_card);
+        content = content.push(proxy_card).push(cert_pins_card).push(info_card);
 
         scrollable(content)
             .width(Length::Fill)
@@ -333,6 +337,63 @@ impl SettingsScreen {
                     .size(theme::size::BODY)
                     .color(theme::color::SUCCESS),
             );
+        }
+
+        container(col)
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn cert_pins_card(&self) -> Element<Message> {
+        let mut col = column![
+            theme::label("TLS certificate pinning"),
+            theme::muted("Pins are set on first connection to each relay (TOFU)"),
+        ]
+        .spacing(theme::space::SM);
+
+        if self.certificate_pins.is_empty() {
+            col = col.push(
+                text("No pinned certificates")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+            );
+        } else {
+            for (hostname, hash) in &self.certificate_pins {
+                let truncated = match hash.get(..16) {
+                    Some(prefix) => format!("{prefix}..."),
+                    None => hash.clone(),
+                };
+
+                let clear_btn = button(text("Clear").size(theme::size::TINY))
+                    .on_press(Message::CertPinClear(hostname.clone()))
+                    .style(theme::secondary_button)
+                    .padding([theme::space::XS, theme::space::SM]);
+
+                let pin_row = row![
+                    column![
+                        text(hostname).size(theme::size::BODY),
+                        text(truncated)
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
+                    ]
+                    .spacing(2),
+                    iced::widget::Space::new().width(Length::Fill),
+                    clear_btn,
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(theme::space::SM);
+
+                col = col.push(pin_row);
+            }
+
+            let clear_all_btn = button(text("Clear All Pins").size(theme::size::SMALL))
+                .on_press(Message::CertPinClearAll)
+                .style(theme::danger_button)
+                .padding([theme::space::SM, theme::space::MD]);
+
+            col = col.push(clear_all_btn);
         }
 
         container(col)

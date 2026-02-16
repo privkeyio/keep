@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use keep_nip46::NostrConnectRequest;
 
-use iced::widget::{column, container, text};
+use iced::widget::{button, column, container, row, text};
 use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
@@ -39,6 +39,7 @@ use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditS
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
+use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
@@ -140,6 +141,9 @@ pub struct App {
     tray_last_connected: bool,
     tray_last_bunker: bool,
     scanner_rx: Option<tokio::sync::mpsc::Receiver<crate::screen::scanner::CameraEvent>>,
+    pub(crate) certificate_pins: Arc<Mutex<keep_frost_net::CertificatePinSet>>,
+    pub(crate) pin_mismatch: Option<crate::message::PinMismatchInfo>,
+    pub(crate) bunker_cert_pin_failed: bool,
 }
 
 pub(crate) fn lock_keep(
@@ -247,6 +251,51 @@ fn bunker_relay_config_path(keep_path: &std::path::Path) -> PathBuf {
 
 fn bunker_relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
     keep_path.join(format!("bunker-relays-{pubkey_hex}.json"))
+}
+
+fn cert_pins_path(keep_path: &std::path::Path) -> PathBuf {
+    keep_path.join("cert-pins.json")
+}
+
+fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::CertificatePinSet {
+    let path = cert_pins_path(keep_path);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return keep_frost_net::CertificatePinSet::new();
+    };
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&contents).unwrap_or_default();
+    let mut pins = keep_frost_net::CertificatePinSet::new();
+    for (hostname, hex_hash) in map {
+        if let Ok(bytes) = hex::decode(&hex_hash) {
+            if let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                pins.add_pin(hostname, hash);
+            }
+        }
+    }
+    pins
+}
+
+pub(crate) fn save_cert_pins_pub(
+    keep_path: &std::path::Path,
+    pins_mutex: &Mutex<keep_frost_net::CertificatePinSet>,
+) {
+    if let Ok(pins) = pins_mutex.lock() {
+        save_cert_pins(keep_path, &pins);
+    }
+}
+
+fn save_cert_pins(keep_path: &std::path::Path, pins: &keep_frost_net::CertificatePinSet) {
+    let path = cert_pins_path(keep_path);
+    let map: std::collections::HashMap<&String, String> = pins
+        .pins()
+        .iter()
+        .map(|(k, v)| (k, hex::encode(v)))
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = write_private(&path, &json) {
+            tracing::error!("Failed to save certificate pins: {e}");
+        }
+    }
 }
 
 fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
@@ -427,6 +476,7 @@ impl App {
         settings: Settings,
     ) -> Self {
         let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
+        let certificate_pins = Arc::new(Mutex::new(load_cert_pins(&keep_path)));
         let tray = match TrayState::new(false) {
             Ok(t) => Some(t),
             Err(e) => {
@@ -474,6 +524,9 @@ impl App {
             settings,
             kill_switch,
             tray,
+            certificate_pins,
+            pin_mismatch: None,
+            bunker_cert_pin_failed: false,
         }
     }
 
@@ -648,6 +701,11 @@ impl App {
             | Message::KillSwitchPasswordChanged(..)
             | Message::KillSwitchDeactivate
             | Message::KillSwitchDeactivateResult(..) => self.handle_kill_switch_message(message),
+
+            Message::CertPinClear(..)
+            | Message::CertPinClearAll
+            | Message::CertPinMismatchDismiss
+            | Message::CertPinMismatchClearAndRetry => self.handle_cert_pin_message(message),
 
             Message::WindowCloseRequested(id) => self.handle_window_close(id),
         }
@@ -840,6 +898,7 @@ impl App {
                     self.settings.minimize_to_tray,
                     self.settings.start_minimized,
                     self.has_tray,
+                    self.cert_pin_display_entries(),
                 ));
                 Task::none()
             }
@@ -1233,19 +1292,58 @@ impl App {
             pending_count,
             self.settings.kill_switch_active,
         );
+        let screen = if let Some(ref mismatch) = self.pin_mismatch {
+            let warning = container(
+                column![
+                    text("Certificate Pin Mismatch")
+                        .size(theme::size::HEADING)
+                        .color(theme::color::ERROR),
+                    text(format!(
+                        "The certificate for {} has changed. This could indicate a security issue or a legitimate certificate rotation.",
+                        mismatch.hostname
+                    ))
+                    .size(theme::size::BODY),
+                    text(format!(
+                        "Expected: {}...  Actual: {}...",
+                        mismatch.expected.get(..16).unwrap_or(&mismatch.expected),
+                        mismatch.actual.get(..16).unwrap_or(&mismatch.actual),
+                    ))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+                    row![
+                        button(text("Clear Pin & Retry").size(theme::size::SMALL))
+                            .on_press(Message::CertPinMismatchClearAndRetry)
+                            .style(theme::danger_button)
+                            .padding([theme::space::SM, theme::space::MD]),
+                        button(text("Dismiss").size(theme::size::SMALL))
+                            .on_press(Message::CertPinMismatchDismiss)
+                            .style(theme::secondary_button)
+                            .padding([theme::space::SM, theme::space::MD]),
+                    ]
+                    .spacing(theme::space::SM),
+                ]
+                .spacing(theme::space::SM),
+            )
+            .style(theme::warning_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill);
+            column![warning, screen].into()
+        } else {
+            screen
+        };
         let Some(toast) = &self.toast else {
             return screen;
         };
         let bg_color = match toast.kind {
             ToastKind::Success => crate::theme::color::SUCCESS,
-            ToastKind::Error => crate::theme::color::ERROR,
+            ToastKind::Error => theme::color::ERROR,
         };
         let banner = container(
             text(&toast.message)
-                .size(crate::theme::size::BODY)
+                .size(theme::size::BODY)
                 .color(iced::Color::WHITE),
         )
-        .padding([crate::theme::space::SM, crate::theme::space::LG])
+        .padding([theme::space::SM, theme::space::LG])
         .width(Length::Fill)
         .style(move |_theme: &iced::Theme| container::Style {
             background: Some(Background::Color(bg_color)),
@@ -1524,6 +1622,8 @@ impl App {
             } else {
                 None
             },
+            certificate_pins: self.certificate_pins.clone(),
+            keep_path: self.keep_path.clone(),
         }
     }
 
@@ -2417,6 +2517,83 @@ impl App {
         }
     }
 
+    fn handle_cert_pin_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::CertPinClear(hostname) => {
+                if let Ok(mut pins) = self.certificate_pins.lock() {
+                    pins.remove_pin(&hostname);
+                    save_cert_pins(&self.keep_path, &pins);
+                }
+                self.sync_cert_pins_to_screen();
+                self.set_toast(
+                    format!("Cleared pin for {hostname}"),
+                    ToastKind::Success,
+                );
+            }
+            Message::CertPinClearAll => {
+                if let Ok(mut pins) = self.certificate_pins.lock() {
+                    *pins = keep_frost_net::CertificatePinSet::new();
+                    save_cert_pins(&self.keep_path, &pins);
+                }
+                self.sync_cert_pins_to_screen();
+                self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
+            }
+            Message::CertPinMismatchDismiss => {
+                self.pin_mismatch = None;
+            }
+            Message::CertPinMismatchClearAndRetry => {
+                let hostname = self.pin_mismatch.as_ref().map(|m| m.hostname.clone());
+                self.pin_mismatch = None;
+                if let Some(hostname) = hostname {
+                    if let Ok(mut pins) = self.certificate_pins.lock() {
+                        pins.remove_pin(&hostname);
+                        save_cert_pins(&self.keep_path, &pins);
+                    }
+                    self.sync_cert_pins_to_screen();
+                    let frost_active = matches!(
+                        self.frost_status,
+                        ConnectionStatus::Error(_)
+                    );
+                    let bunker_err = self.bunker.is_none()
+                        && self.bunker_cert_pin_failed;
+                    let mut tasks = Vec::new();
+                    if frost_active {
+                        tasks.push(self.handle_reconnect_relay());
+                    }
+                    if bunker_err {
+                        self.bunker_cert_pin_failed = false;
+                        tasks.push(self.handle_bunker_start());
+                    }
+                    if !tasks.is_empty() {
+                        return Task::batch(tasks);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    pub(crate) fn cert_pin_display_entries(&self) -> Vec<(String, String)> {
+        let Ok(pins) = self.certificate_pins.lock() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<(String, String)> = pins
+            .pins()
+            .iter()
+            .map(|(host, hash)| (host.clone(), hex::encode(hash)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    fn sync_cert_pins_to_screen(&mut self) {
+        let entries = self.cert_pin_display_entries();
+        if let Screen::Settings(s) = &mut self.screen {
+            s.certificate_pins = entries;
+        }
+    }
+
     fn handle_kill_switch_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::KillSwitchRequestConfirm | Message::KillSwitchCancelConfirm => {
@@ -2683,6 +2860,9 @@ impl App {
             settings,
             kill_switch,
             tray: None,
+            certificate_pins: Arc::new(Mutex::new(keep_frost_net::CertificatePinSet::new())),
+            pin_mismatch: None,
+            bunker_cert_pin_failed: false,
         }
     }
 }

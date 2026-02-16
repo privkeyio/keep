@@ -55,6 +55,13 @@ pub struct ExportData {
 }
 
 #[derive(Clone, Debug)]
+pub struct PinMismatchInfo {
+    pub hostname: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Clone, Debug)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -213,6 +220,12 @@ pub enum Message {
     SettingsProxyPortChanged(String),
     SettingsMinimizeToTrayToggled(bool),
     SettingsStartMinimizedToggled(bool),
+
+    // Certificate pinning
+    CertPinClear(String),
+    CertPinClearAll,
+    CertPinMismatchDismiss,
+    CertPinMismatchClearAndRetry,
 
     // Window
     WindowCloseRequested(iced::window::Id),
@@ -431,6 +444,10 @@ impl fmt::Debug for Message {
             Self::ScannerRetry => f.write_str("ScannerRetry"),
             Self::ScannerPoll => f.write_str("ScannerPoll"),
             Self::Tick => f.write_str("Tick"),
+            Self::CertPinClear(h) => f.debug_tuple("CertPinClear").field(h).finish(),
+            Self::CertPinClearAll => f.write_str("CertPinClearAll"),
+            Self::CertPinMismatchDismiss => f.write_str("CertPinMismatchDismiss"),
+            Self::CertPinMismatchClearAndRetry => f.write_str("CertPinMismatchClearAndRetry"),
         }
     }
 }

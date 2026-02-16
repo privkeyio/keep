@@ -399,9 +399,18 @@ impl App {
         self.bunker_pending_setup = Some(setup_arc.clone());
         let proxy = self.proxy_addr();
         let kill_switch = self.kill_switch.clone();
+        let cert_pins = self.certificate_pins.clone();
+        let cert_pins_path = self.keep_path.clone();
 
         Task::perform(
             async move {
+                crate::frost::verify_relay_certificates(
+                    &relay_urls,
+                    &cert_pins,
+                    &cert_pins_path,
+                )
+                .await?;
+
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
                     .map_err(|_| "Background task failed".to_string())??;
@@ -506,6 +515,10 @@ impl App {
             }
             Err(e) => {
                 self.bunker_pending_setup = None;
+                if let Some(mismatch) = crate::frost::parse_pin_mismatch(&e) {
+                    self.pin_mismatch = Some(mismatch);
+                    self.bunker_cert_pin_failed = true;
+                }
                 self.set_bunker_error(e);
             }
         }

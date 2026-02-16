@@ -26,10 +26,58 @@ use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 
+pub(crate) async fn verify_relay_certificates(
+    relay_urls: &[String],
+    certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
+    keep_path: &std::path::Path,
+) -> Result<(), String> {
+    for url in relay_urls {
+        if url.starts_with("wss://") {
+            let mut pins = certificate_pins
+                .lock()
+                .map_err(|_| "Pin lock poisoned".to_string())?
+                .clone();
+            keep_frost_net::verify_relay_certificate(url, &mut pins)
+                .await
+                .map_err(|e| format!("{e}"))?;
+            let mut guard = certificate_pins
+                .lock()
+                .map_err(|_| "Pin lock poisoned".to_string())?;
+            for (hostname, hash) in pins.pins() {
+                if guard.get_pin(hostname).is_none() {
+                    guard.add_pin(hostname.clone(), *hash);
+                }
+            }
+            drop(guard);
+            crate::app::save_cert_pins_pub(keep_path, certificate_pins);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_pin_mismatch(error: &str) -> Option<crate::message::PinMismatchInfo> {
+    // Match the format from FrostNetError::CertificatePinMismatch Display:
+    // "Certificate pin mismatch for {hostname}: expected {expected}, got {actual}"
+    let rest = error.strip_prefix("Certificate pin mismatch for ")?;
+    let (hostname, rest) = rest.split_once(": expected ")?;
+    let (expected, rest) = rest.split_once(", got ")?;
+    let actual = rest.trim();
+    if hostname.is_empty() || expected.is_empty() || actual.is_empty() {
+        return None;
+    }
+    Some(crate::message::PinMismatchInfo {
+        hostname: hostname.to_string(),
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct NetworkConfig {
     pub proxy: Option<SocketAddr>,
     pub session_timeout: Option<Duration>,
+    pub certificate_pins: Arc<Mutex<keep_frost_net::CertificatePinSet>>,
+    pub keep_path: std::path::PathBuf,
 }
 
 #[derive(Clone)]
@@ -166,6 +214,9 @@ pub(crate) async fn setup_frost_node(
 
     let nonce_store_path = keep_path.join("frost-nonces");
     keep_frost_net::install_default_crypto_provider();
+
+    verify_relay_certificates(&relay_urls, &net.certificate_pins, &net.keep_path).await?;
+
     let nonce_store = keep_frost_net::FileNonceStore::new(&nonce_store_path)
         .map_err(|e| format!("Failed to create nonce store: {e}"))?;
     let node = KfpNode::with_nonce_store(
@@ -650,7 +701,10 @@ impl App {
                 ConnectionStatus::Connected
             }
             Err(e) => {
-                if self.frost_reconnect_attempts < RECONNECT_MAX_ATTEMPTS {
+                if let Some(mismatch) = parse_pin_mismatch(e) {
+                    self.pin_mismatch = Some(mismatch);
+                    self.frost_reconnect_at = None;
+                } else if self.frost_reconnect_attempts < RECONNECT_MAX_ATTEMPTS {
                     let base = RECONNECT_BASE_MS
                         .saturating_mul(1u64 << self.frost_reconnect_attempts.min(15))
                         .min(RECONNECT_MAX_MS);
