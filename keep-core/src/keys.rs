@@ -311,8 +311,8 @@ pub mod nip49 {
 
     /// Decrypt an ncryptsec string with a password, returning the secret key.
     pub fn decrypt(ncryptsec: &str, password: &str) -> Result<Zeroizing<[u8; 32]>> {
-        let (hrp, data) =
-            bech32::decode(ncryptsec).map_err(|_| KeepError::InvalidInput("invalid bech32".into()))?;
+        let (hrp, data) = bech32::decode(ncryptsec)
+            .map_err(|_| KeepError::InvalidInput("invalid bech32".into()))?;
 
         if hrp.as_str() != "ncryptsec" {
             return Err(KeepError::InvalidInput("not an ncryptsec string".into()));

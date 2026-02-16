@@ -1838,10 +1838,7 @@ impl App {
     fn handle_ncryptsec_export_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::GoToExportNcryptsec(pubkey_hex) => {
-                let identity = self
-                    .identities
-                    .iter()
-                    .find(|i| i.pubkey_hex == pubkey_hex);
+                let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex);
                 if let Some(id) = identity {
                     self.screen = Screen::ExportNcryptsec(Box::new(ExportNcryptsecScreen::new(
                         id.pubkey_hex.clone(),

@@ -83,8 +83,8 @@ impl ImportScreen {
         )
         .on_input(|s| Message::ImportDataChanged(Zeroizing::new(s)))
         .secure(is_secret && !self.nsec_visible)
-            .padding(theme::space::MD)
-            .width(Length::Fill);
+        .padding(theme::space::MD)
+        .width(Length::Fill);
 
         let data_row = if is_secret {
             let toggle_label = if self.nsec_visible { "Hide" } else { "Show" };
@@ -129,8 +129,9 @@ impl ImportScreen {
                     }
                 }
                 ImportMode::Ncryptsec => {
-                    content = content
-                        .push(theme::success_text("Encrypted secret key detected (NIP-49)"));
+                    content = content.push(theme::success_text(
+                        "Encrypted secret key detected (NIP-49)",
+                    ));
                 }
                 ImportMode::FrostShare => {
                     if trimmed_data.starts_with("kshare1") {
@@ -191,8 +192,7 @@ impl ImportScreen {
             ImportMode::Ncryptsec => {
                 let has_password = !self.passphrase.is_empty();
                 let has_name = !self.name.trim().is_empty();
-                let can_import =
-                    !self.data.trim().is_empty() && has_password && has_name;
+                let can_import = !self.data.trim().is_empty() && has_password && has_name;
 
                 let password_input = text_input("Decryption password", &self.passphrase)
                     .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))

@@ -87,7 +87,11 @@ impl ExportNcryptsecScreen {
             .color(theme::color::TEXT);
 
         let truncated_npub = if self.npub.len() > 20 {
-            format!("{}...{}", &self.npub[..12], &self.npub[self.npub.len() - 6..])
+            format!(
+                "{}...{}",
+                &self.npub[..12],
+                &self.npub[self.npub.len() - 6..]
+            )
         } else {
             self.npub.clone()
         };
@@ -129,7 +133,11 @@ impl ExportNcryptsecScreen {
                     .color(theme::color::TEXT_DIM),
             );
 
-            let copy_label = if self.copied { "Copied!" } else { "Copy to Clipboard" };
+            let copy_label = if self.copied {
+                "Copied!"
+            } else {
+                "Copy to Clipboard"
+            };
             let copy_msg = (!self.copied).then(|| Message::CopyToClipboard(ncryptsec.clone()));
             content = content.push(
                 row![

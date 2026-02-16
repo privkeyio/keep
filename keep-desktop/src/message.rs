@@ -293,9 +293,7 @@ impl fmt::Debug for Message {
             Self::GenerateExport => f.write_str("GenerateExport"),
             Self::AdvanceQrFrame => f.write_str("AdvanceQrFrame"),
             Self::ResetExport => f.write_str("ResetExport"),
-            Self::GoToExportNcryptsec(k) => {
-                f.debug_tuple("GoToExportNcryptsec").field(k).finish()
-            }
+            Self::GoToExportNcryptsec(k) => f.debug_tuple("GoToExportNcryptsec").field(k).finish(),
             Self::ExportNcryptsecPasswordChanged(_) => {
                 f.write_str("ExportNcryptsecPasswordChanged(***)")
             }
