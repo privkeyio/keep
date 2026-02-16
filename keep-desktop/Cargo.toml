@@ -12,7 +12,7 @@ path = "src/main.rs"
 keep-core = { path = "../keep-core" }
 keep-frost-net = { path = "../keep-frost-net" }
 keep-nip46 = { path = "../keep-nip46" }
-iced = { version = "0.14.0", features = ["tokio", "qr_code", "lazy", "tiny-skia"] }
+iced = { version = "0.14.0", features = ["tokio", "qr_code", "lazy", "tiny-skia", "image"] }
 tray-icon = "0.21"
 notify-rust = "4"
 nostr-sdk = { workspace = true }
@@ -28,3 +28,6 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
 tempfile = "3"
+nokhwa = { version = "0.10", features = ["input-native"] }
+rqrr = "0.9"
+image = "0.25"

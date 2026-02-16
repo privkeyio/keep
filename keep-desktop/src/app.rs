@@ -138,6 +138,7 @@ pub struct App {
     pub(crate) window_visible: bool,
     tray_last_connected: bool,
     tray_last_bunker: bool,
+    scanner_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::screen::scanner::CameraEvent>>,
 }
 
 pub(crate) fn lock_keep(
@@ -468,6 +469,7 @@ impl App {
                 || !settings.minimize_to_tray,
             tray_last_connected: false,
             tray_last_bunker: false,
+            scanner_rx: None,
             settings,
             kill_switch,
             tray,
@@ -569,6 +571,11 @@ impl App {
             | Message::ImportNsec
             | Message::ImportResult(..)
             | Message::ImportNsecResult(..) => self.handle_import_message(message),
+
+            Message::ScannerOpen
+            | Message::ScannerClose
+            | Message::ScannerRetry
+            | Message::ScannerPoll => self.handle_scanner_message(message),
 
             Message::CopyNpub(..)
             | Message::CopyDescriptor(..)
@@ -749,6 +756,7 @@ impl App {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
+                self.stop_scanner();
                 self.copy_feedback_until = None;
                 self.set_share_screen(self.current_shares());
                 Task::none()
@@ -987,6 +995,107 @@ impl App {
         }
     }
 
+    fn handle_scanner_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::ScannerOpen | Message::ScannerRetry => {
+                self.stop_scanner();
+                self.open_scanner();
+                Task::none()
+            }
+            Message::ScannerClose => {
+                self.stop_scanner();
+                self.screen = Screen::Import(ImportScreen::new());
+                Task::none()
+            }
+            Message::ScannerPoll => {
+                self.drain_scanner_events();
+                Task::none()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn open_scanner(&mut self) {
+        use crate::screen::scanner::{self, ScannerScreen};
+
+        let scanner = ScannerScreen::new();
+        let active = scanner.camera_active.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        scanner::start_camera(active, tx);
+        self.scanner_rx = Some(rx);
+        self.screen = Screen::Scanner(scanner);
+    }
+
+    fn stop_scanner(&mut self) {
+        if let Screen::Scanner(s) = &self.screen {
+            s.stop_camera();
+        }
+        self.scanner_rx = None;
+    }
+
+    fn drain_scanner_events(&mut self) {
+        use crate::screen::scanner::CameraEvent;
+
+        let rx = match &mut self.scanner_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let mut last_frame: Option<CameraEvent> = None;
+        let mut events: Vec<CameraEvent> = Vec::new();
+
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                CameraEvent::Frame { .. } => last_frame = Some(event),
+                _ => events.push(event),
+            }
+        }
+
+        for event in events {
+            self.apply_scanner_event(event);
+        }
+        if let Some(frame) = last_frame {
+            self.apply_scanner_event(frame);
+        }
+    }
+
+    fn apply_scanner_event(&mut self, event: crate::screen::scanner::CameraEvent) {
+        use crate::screen::scanner::{CameraEvent, ScannerStatus};
+
+        if let Screen::Scanner(s) = &mut self.screen {
+            match event {
+                CameraEvent::Ready => {
+                    s.status = ScannerStatus::Scanning;
+                }
+                CameraEvent::Frame {
+                    rgba,
+                    width,
+                    height,
+                    decoded,
+                } => {
+                    s.frame_rgba = Some(rgba);
+                    s.frame_width = width;
+                    s.frame_height = height;
+
+                    if let Some(content) = decoded {
+                        if let Some(result) = s.process_qr_content(&content) {
+                            s.stop_camera();
+                            self.scanner_rx = None;
+                            let mut import = ImportScreen::new();
+                            let mode = ImportScreen::detect_mode(result.trim());
+                            import.mode = mode;
+                            import.data = Zeroizing::new(result);
+                            self.screen = Screen::Import(import);
+                        }
+                    }
+                }
+                CameraEvent::Error(e) => {
+                    s.status = ScannerStatus::Error(e);
+                }
+            }
+        }
+    }
+
     fn handle_wallet_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::CopyNpub(npub) => iced::clipboard::write(npub),
@@ -1130,7 +1239,7 @@ impl App {
 
         if matches!(
             self.screen,
-            Screen::Create(_) | Screen::Export(_) | Screen::Import(_)
+            Screen::Create(_) | Screen::Export(_) | Screen::Import(_) | Screen::Scanner(_)
         ) {
             subs.push(iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed {
@@ -1139,6 +1248,12 @@ impl App {
                 } => Some(Message::GoBack),
                 _ => None,
             }));
+        }
+
+        if matches!(self.screen, Screen::Scanner(_)) {
+            subs.push(
+                iced::time::every(Duration::from_millis(33)).map(|_| Message::ScannerPoll),
+            );
         }
 
         if let Screen::Export(s) = &self.screen {
@@ -2399,6 +2514,7 @@ impl App {
             window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
             tray_last_connected: false,
             tray_last_bunker: false,
+            scanner_rx: None,
             settings,
             kill_switch,
             tray: None,

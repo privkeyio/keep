@@ -63,9 +63,14 @@ impl ImportScreen {
         let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
             .align_y(Alignment::Center);
 
-        let subtitle = text("Paste a FROST share or Nostr secret key")
+        let subtitle = text("Paste a FROST share or Nostr secret key, or scan a QR code")
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
+
+        let scan_btn = button(text("Scan QR Code").size(theme::size::BODY))
+            .on_press(Message::ScannerOpen)
+            .style(theme::secondary_button)
+            .padding([theme::space::XS, theme::space::MD]);
 
         let is_nsec = self.mode == ImportMode::Nsec;
 
@@ -91,6 +96,7 @@ impl ImportScreen {
         let mut content = column![
             header,
             subtitle,
+            scan_btn,
             Space::new().height(theme::space::LG),
             theme::label("Data"),
             data_row,

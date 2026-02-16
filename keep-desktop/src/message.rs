@@ -134,6 +134,12 @@ pub enum Message {
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
     ImportNsecResult(Result<(Vec<ShareEntry>, String), String>),
 
+    // Scanner
+    ScannerOpen,
+    ScannerClose,
+    ScannerRetry,
+    ScannerPoll,
+
     // Clipboard (public data, no auto-clear)
     CopyNpub(String),
     CopyDescriptor(String),
@@ -395,6 +401,10 @@ impl fmt::Debug for Message {
                 .field(v)
                 .finish(),
             Self::WindowCloseRequested(_) => f.write_str("WindowCloseRequested"),
+            Self::ScannerOpen => f.write_str("ScannerOpen"),
+            Self::ScannerClose => f.write_str("ScannerClose"),
+            Self::ScannerRetry => f.write_str("ScannerRetry"),
+            Self::ScannerPoll => f.write_str("ScannerPoll"),
             Self::Tick => f.write_str("Tick"),
         }
     }
