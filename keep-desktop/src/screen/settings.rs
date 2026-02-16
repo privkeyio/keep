@@ -20,9 +20,25 @@ pub struct SettingsScreen {
     pub kill_switch_password: Zeroizing<String>,
     pub kill_switch_loading: bool,
     pub kill_switch_error: Option<String>,
+    pub minimize_to_tray: bool,
+    pub start_minimized: bool,
+    pub has_tray: bool,
+}
+
+fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
+    let (label, style): (&str, fn(&iced::Theme, button::Status) -> button::Style) = if active {
+        ("On", theme::primary_button)
+    } else {
+        ("Off", theme::secondary_button)
+    };
+    button(text(label).size(theme::size::SMALL))
+        .on_press(message)
+        .style(style)
+        .padding([theme::space::SM, theme::space::MD])
 }
 
 impl SettingsScreen {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auto_lock_secs: u64,
         clipboard_clear_secs: u64,
@@ -30,6 +46,9 @@ impl SettingsScreen {
         proxy_enabled: bool,
         proxy_port: u16,
         kill_switch_active: bool,
+        minimize_to_tray: bool,
+        start_minimized: bool,
+        has_tray: bool,
     ) -> Self {
         Self {
             auto_lock_secs,
@@ -43,6 +62,9 @@ impl SettingsScreen {
             kill_switch_password: Zeroizing::new(String::new()),
             kill_switch_loading: false,
             kill_switch_error: None,
+            minimize_to_tray,
+            start_minimized,
+            has_tray,
         }
     }
 
@@ -55,17 +77,16 @@ impl SettingsScreen {
         let proxy_card = self.proxy_card();
         let info_card = self.info_card();
 
-        let content = column![
-            title,
-            kill_switch_card,
-            auto_lock_card,
-            clipboard_card,
-            proxy_card,
-            info_card,
-        ]
-        .spacing(theme::space::MD)
-        .padding(theme::space::LG)
-        .width(Length::Fill);
+        let mut content = column![title, kill_switch_card, auto_lock_card, clipboard_card,]
+            .spacing(theme::space::MD)
+            .padding(theme::space::LG)
+            .width(Length::Fill);
+
+        if self.has_tray {
+            content = content.push(self.tray_card());
+        }
+
+        content = content.push(proxy_card).push(info_card);
 
         scrollable(content)
             .width(Length::Fill)
@@ -238,6 +259,34 @@ impl SettingsScreen {
                 theme::label("Clipboard auto-clear"),
                 theme::muted("Clear clipboard after copying sensitive data"),
                 buttons,
+            ]
+            .spacing(theme::space::SM),
+        )
+        .style(theme::card_style)
+        .padding(theme::space::LG)
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn tray_card(&self) -> Element<Message> {
+        let minimize_btn = toggle_button(
+            self.minimize_to_tray,
+            Message::SettingsMinimizeToTrayToggled(!self.minimize_to_tray),
+        );
+        let start_btn = toggle_button(
+            self.start_minimized,
+            Message::SettingsStartMinimizedToggled(!self.start_minimized),
+        );
+
+        container(
+            column![
+                theme::label("System tray"),
+                row![theme::muted("Minimize to tray on close"), minimize_btn]
+                    .spacing(theme::space::SM)
+                    .align_y(iced::Alignment::Center),
+                row![theme::muted("Start minimized to tray"), start_btn]
+                    .spacing(theme::space::SM)
+                    .align_y(iced::Alignment::Center),
             ]
             .spacing(theme::space::SM),
         )

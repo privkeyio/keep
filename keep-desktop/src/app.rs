@@ -38,6 +38,7 @@ use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditS
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{WalletEntry, WalletScreen};
 use crate::screen::Screen;
+use crate::tray::{TrayEvent, TrayState};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
 
@@ -132,6 +133,11 @@ pub struct App {
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) settings: Settings,
     pub(crate) kill_switch: Arc<AtomicBool>,
+    pub(crate) tray: Option<TrayState>,
+    pub(crate) has_tray: bool,
+    pub(crate) window_visible: bool,
+    tray_last_connected: bool,
+    tray_last_bunker: bool,
 }
 
 pub(crate) fn lock_keep(
@@ -346,6 +352,12 @@ pub struct Settings {
     pub proxy_port: u16,
     #[serde(default)]
     pub kill_switch_active: bool,
+    #[serde(default)]
+    pub minimize_to_tray: bool,
+    #[serde(default)]
+    pub start_minimized: bool,
+    #[serde(default)]
+    pub bunker_auto_start: bool,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -368,6 +380,9 @@ impl Default for Settings {
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
             kill_switch_active: false,
+            minimize_to_tray: false,
+            start_minimized: false,
+            bunker_auto_start: false,
         }
     }
 }
@@ -376,15 +391,24 @@ fn settings_path(keep_path: &std::path::Path) -> PathBuf {
     keep_path.join("settings.json")
 }
 
-fn load_settings(keep_path: &std::path::Path) -> Settings {
+fn load_settings(keep_path: &std::path::Path) -> (Settings, bool) {
     let path = settings_path(keep_path);
-    std::fs::read_to_string(&path)
+    let Some(contents) = std::fs::read_to_string(&path).ok() else {
+        return (Settings::default(), false);
+    };
+    let settings: Settings = serde_json::from_str(&contents).unwrap_or_default();
+    let migrated = serde_json::from_str::<serde_json::Value>(&contents)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .map(|v| v.get("minimize_to_tray").is_none())
+        .unwrap_or(false);
+    if migrated {
+        save_settings(keep_path, &settings);
+        tracing::info!("Settings migrated: minimize_to_tray now defaults to off");
+    }
+    (settings, migrated)
 }
 
-fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
+pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
     let path = settings_path(keep_path);
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         if let Err(e) = write_private(&path, &json) {
@@ -401,6 +425,13 @@ impl App {
         settings: Settings,
     ) -> Self {
         let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
+        let tray = match TrayState::new(false) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("Failed to create tray icon: {e}");
+                None
+            }
+        };
         Self {
             keep: Arc::new(Mutex::new(None)),
             keep_path,
@@ -431,8 +462,15 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             nostrconnect_pending: None,
+            has_tray: tray.is_some(),
+            window_visible: tray.is_none()
+                || !settings.start_minimized
+                || !settings.minimize_to_tray,
+            tray_last_connected: false,
+            tray_last_bunker: false,
             settings,
             kill_switch,
+            tray,
         }
     }
 
@@ -455,12 +493,23 @@ impl App {
         };
         let vault_exists = keep_path.exists();
         let relay_urls = load_relay_urls(&keep_path);
-        let settings = load_settings(&keep_path);
+        let (settings, tray_migrated) = load_settings(&keep_path);
         let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
-        (
-            Self::init(keep_path, screen, relay_urls, settings),
-            Task::none(),
-        )
+        let start_minimized = settings.start_minimized;
+        let mut app = Self::init(keep_path, screen, relay_urls, settings);
+        if tray_migrated {
+            app.set_toast(
+                "New option: enable minimize-to-tray in Settings".into(),
+                ToastKind::Success,
+            );
+        }
+        let task = if start_minimized && app.has_tray && app.settings.minimize_to_tray {
+            iced::window::oldest()
+                .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
+        } else {
+            Task::none()
+        };
+        (app, task)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -572,7 +621,9 @@ impl App {
             Message::SettingsAutoLockChanged(..)
             | Message::SettingsClipboardClearChanged(..)
             | Message::SettingsProxyToggled(..)
-            | Message::SettingsProxyPortChanged(..) => self.handle_settings_message(message),
+            | Message::SettingsProxyPortChanged(..)
+            | Message::SettingsMinimizeToTrayToggled(..)
+            | Message::SettingsStartMinimizedToggled(..) => self.handle_settings_message(message),
 
             Message::KillSwitchRequestConfirm
             | Message::KillSwitchCancelConfirm
@@ -580,6 +631,8 @@ impl App {
             | Message::KillSwitchPasswordChanged(..)
             | Message::KillSwitchDeactivate
             | Message::KillSwitchDeactivateResult(..) => self.handle_kill_switch_message(message),
+
+            Message::WindowCloseRequested(id) => self.handle_window_close(id),
         }
     }
 
@@ -612,7 +665,18 @@ impl App {
         }
         self.drain_frost_events();
         self.poll_bunker_events();
-        Task::none()
+        self.sync_tray_status();
+        let tray_events = self.poll_tray_events();
+        let tasks: Vec<_> = tray_events
+            .into_iter()
+            .map(|event| match event {
+                TrayEvent::ShowWindow => self.handle_tray_show(),
+                TrayEvent::ToggleBunker => self.handle_tray_toggle_bunker(),
+                TrayEvent::Lock => self.do_lock(),
+                TrayEvent::Quit => self.handle_tray_quit(),
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     fn handle_unlock_message(&mut self, message: Message) -> Task<Message> {
@@ -753,6 +817,9 @@ impl App {
                     self.settings.proxy_enabled,
                     self.settings.proxy_port,
                     self.settings.kill_switch_active,
+                    self.settings.minimize_to_tray,
+                    self.settings.start_minimized,
+                    self.has_tray,
                 ));
                 Task::none()
             }
@@ -1052,10 +1119,14 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![
+            iced::window::close_requests().map(Message::WindowCloseRequested),
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
+        ];
+
         if matches!(self.screen, Screen::Unlock(_)) {
-            return Subscription::none();
+            return Subscription::batch(subs);
         }
-        let mut subs = vec![iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)];
 
         if matches!(
             self.screen,
@@ -1341,6 +1412,9 @@ impl App {
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }
+                if self.settings.bunker_auto_start && !self.settings.kill_switch_active {
+                    return self.handle_bunker_start();
+                }
             }
             Err(e) => self.screen.set_loading_error(e),
         }
@@ -1380,6 +1454,11 @@ impl App {
     }
 
     fn handle_delete(&mut self, id: ShareIdentity) {
+        let group_hex = hex::encode(id.group_pubkey);
+        if self.active_share_hex.as_deref() == Some(group_hex.as_str()) {
+            self.handle_disconnect_relay();
+            self.stop_bunker();
+        }
         let result = {
             let mut guard = lock_keep(&self.keep);
             let Some(keep) = guard.as_mut() else {
@@ -1881,9 +1960,10 @@ impl App {
                     return Task::none();
                 };
 
-                if self.active_share_hex.as_deref() == Some(&pubkey_hex) {
-                    self.set_toast("Cannot delete the active identity".into(), ToastKind::Error);
-                    return Task::none();
+                let is_active = self.active_share_hex.as_deref() == Some(&pubkey_hex);
+                if is_active {
+                    self.handle_disconnect_relay();
+                    self.stop_bunker();
                 }
 
                 let result = match &identity.kind {
@@ -2018,20 +2098,43 @@ impl App {
                     _ => return Task::none(),
                 }
             }
+            Message::SettingsMinimizeToTrayToggled(v) => {
+                self.settings.minimize_to_tray = v;
+                if !v && !self.window_visible {
+                    self.window_visible = true;
+                    save_settings(&self.keep_path, &self.settings);
+                    self.sync_settings_screen();
+                    return iced::window::oldest().and_then(|id| {
+                        Task::batch([
+                            iced::window::set_mode(id, iced::window::Mode::Windowed),
+                            iced::window::gain_focus(id),
+                        ])
+                    });
+                }
+            }
+            Message::SettingsStartMinimizedToggled(v) => {
+                self.settings.start_minimized = v;
+            }
             _ => return Task::none(),
         }
         save_settings(&self.keep_path, &self.settings);
+        self.sync_settings_screen();
+        Task::none()
+    }
+
+    fn sync_settings_screen(&mut self) {
         if let Screen::Settings(s) = &mut self.screen {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
             s.proxy_enabled = self.settings.proxy_enabled;
             s.proxy_port = self.settings.proxy_port;
+            s.minimize_to_tray = self.settings.minimize_to_tray;
+            s.start_minimized = self.settings.start_minimized;
             let formatted = self.settings.proxy_port.to_string();
             if s.proxy_port_input != formatted {
                 s.proxy_port_input = formatted;
             }
         }
-        Task::none()
     }
 
     fn handle_kill_switch_message(&mut self, message: Message) -> Task<Message> {
@@ -2177,5 +2280,398 @@ impl App {
 
     pub(crate) fn is_kill_switch_active(&self) -> bool {
         self.kill_switch.load(Ordering::Acquire)
+    }
+
+    fn handle_window_close(&mut self, id: iced::window::Id) -> Task<Message> {
+        if self.settings.minimize_to_tray && self.has_tray {
+            self.window_visible = false;
+            iced::window::set_mode(id, iced::window::Mode::Hidden)
+        } else {
+            self.handle_disconnect_relay();
+            self.stop_bunker();
+            iced::exit()
+        }
+    }
+
+    fn handle_tray_show(&mut self) -> Task<Message> {
+        if self.window_visible {
+            return iced::window::oldest().and_then(iced::window::gain_focus);
+        }
+        self.window_visible = true;
+        iced::window::oldest().and_then(|id| {
+            Task::batch([
+                iced::window::set_mode(id, iced::window::Mode::Windowed),
+                iced::window::gain_focus(id),
+            ])
+        })
+    }
+
+    fn handle_tray_toggle_bunker(&mut self) -> Task<Message> {
+        if self.bunker.is_some() {
+            self.handle_bunker_stop()
+        } else if lock_keep(&self.keep).is_none() {
+            self.set_toast("Vault is locked".into(), ToastKind::Error);
+            self.handle_tray_show()
+        } else {
+            self.handle_bunker_start()
+        }
+    }
+
+    fn handle_tray_quit(&mut self) -> Task<Message> {
+        self.handle_disconnect_relay();
+        self.stop_bunker();
+        iced::exit()
+    }
+
+    fn sync_tray_status(&mut self) {
+        let Some(ref tray) = self.tray else {
+            return;
+        };
+        let connected = matches!(self.frost_status, ConnectionStatus::Connected);
+        if connected != self.tray_last_connected {
+            tray.update_status(connected);
+            self.tray_last_connected = connected;
+        }
+        let bunker_running = self.bunker.is_some();
+        if bunker_running != self.tray_last_bunker {
+            tray.update_bunker_label(bunker_running);
+            self.tray_last_bunker = bunker_running;
+        }
+    }
+
+    fn poll_tray_events(&self) -> Vec<crate::tray::TrayEvent> {
+        self.tray
+            .as_ref()
+            .map(|tray| tray.event_rx.try_iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn notify_sign_request(&self, _req: &PendingSignRequest) {
+        if !self.window_visible {
+            let tx = self.tray.as_ref().map(|t| &t.event_tx);
+            crate::tray::send_sign_request_notification(tx);
+        }
+    }
+
+    pub(crate) fn notify_bunker_approval(&self, display: &PendingApprovalDisplay) {
+        if !self.window_visible {
+            let tx = self.tray.as_ref().map(|t| &t.event_tx);
+            crate::tray::send_bunker_approval_notification(&display.app_name, &display.method, tx);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_new(settings: Settings, has_tray: bool) -> Self {
+        let keep_path = PathBuf::from("/tmp/keep-test-nonexistent");
+        let screen = Screen::Unlock(crate::screen::unlock::UnlockScreen::new(false));
+        let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
+        Self {
+            keep: Arc::new(Mutex::new(None)),
+            keep_path,
+            screen,
+            active_share_hex: None,
+            identities: Vec::new(),
+            identity_switcher_open: false,
+            delete_identity_confirm: None,
+            last_activity: Instant::now(),
+            clipboard_clear_at: None,
+            copy_feedback_until: None,
+            toast: None,
+            toast_dismiss_at: None,
+            frost_shutdown: Arc::new(Mutex::new(None)),
+            frost_events: Arc::new(Mutex::new(VecDeque::new())),
+            pending_sign_requests: Arc::new(Mutex::new(Vec::new())),
+            relay_urls: Vec::new(),
+            frost_status: ConnectionStatus::Disconnected,
+            frost_peers: Vec::new(),
+            pending_sign_display: Vec::new(),
+            frost_reconnect_attempts: 0,
+            frost_reconnect_at: None,
+            frost_last_share: None,
+            frost_last_relay_urls: None,
+            bunker: None,
+            bunker_relays: Vec::new(),
+            bunker_approval_tx: None,
+            bunker_pending_approval: None,
+            bunker_pending_setup: None,
+            nostrconnect_pending: None,
+            has_tray,
+            window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
+            tray_last_connected: false,
+            tray_last_bunker: false,
+            settings,
+            kill_switch,
+            tray: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::bunker::PendingApprovalDisplay;
+
+    fn default_settings() -> Settings {
+        Settings::default()
+    }
+
+    #[test]
+    fn window_close_with_minimize_to_tray_hides_window() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = true;
+        let mut app = App::test_new(settings, true);
+        app.window_visible = true;
+
+        assert!(app.settings.minimize_to_tray);
+        assert!(app.has_tray);
+
+        let fake_id = iced::window::Id::unique();
+        let _task = app.handle_window_close(fake_id);
+
+        assert!(!app.window_visible);
+    }
+
+    #[test]
+    fn window_close_without_minimize_to_tray_exits() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = false;
+        let mut app = App::test_new(settings, false);
+        app.window_visible = true;
+
+        let fake_id = iced::window::Id::unique();
+        let _task = app.handle_window_close(fake_id);
+
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn start_minimized_sets_window_hidden_when_tray_present() {
+        let mut settings = default_settings();
+        settings.start_minimized = true;
+        settings.minimize_to_tray = true;
+        let app = App::test_new(settings, true);
+        assert!(!app.window_visible);
+    }
+
+    #[test]
+    fn start_minimized_without_minimize_to_tray_keeps_window_visible() {
+        let mut settings = default_settings();
+        settings.start_minimized = true;
+        settings.minimize_to_tray = false;
+        let app = App::test_new(settings, true);
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn start_minimized_without_tray_keeps_window_visible() {
+        let mut settings = default_settings();
+        settings.start_minimized = true;
+        let app = App::test_new(settings, false);
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn start_not_minimized_window_visible() {
+        let settings = default_settings();
+        let app = App::test_new(settings, true);
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn tray_show_when_hidden_sets_visible() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = false;
+        let _task = app.handle_tray_show();
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn tray_show_when_already_visible_stays_visible() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+        let _task = app.handle_tray_show();
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn disable_minimize_to_tray_while_hidden_reappears_window() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = true;
+        let mut app = App::test_new(settings, true);
+        app.window_visible = false;
+
+        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(false));
+
+        assert!(app.window_visible);
+        assert!(!app.settings.minimize_to_tray);
+    }
+
+    #[test]
+    fn disable_minimize_to_tray_while_visible_no_change() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = true;
+        let mut app = App::test_new(settings, true);
+        app.window_visible = true;
+
+        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(false));
+
+        assert!(app.window_visible);
+        assert!(!app.settings.minimize_to_tray);
+    }
+
+    #[test]
+    fn enable_minimize_to_tray_setting() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = false;
+        let mut app = App::test_new(settings, true);
+        app.window_visible = true;
+
+        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(true));
+
+        assert!(app.settings.minimize_to_tray);
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn enable_start_minimized_setting() {
+        let mut settings = default_settings();
+        settings.start_minimized = false;
+        let mut app = App::test_new(settings, true);
+
+        let _task = app.handle_settings_message(Message::SettingsStartMinimizedToggled(true));
+
+        assert!(app.settings.start_minimized);
+    }
+
+    #[test]
+    fn disable_start_minimized_setting() {
+        let mut settings = default_settings();
+        settings.start_minimized = true;
+        let mut app = App::test_new(settings, true);
+
+        let _task = app.handle_settings_message(Message::SettingsStartMinimizedToggled(false));
+
+        assert!(!app.settings.start_minimized);
+    }
+
+    #[test]
+    fn poll_tray_events_with_no_tray_returns_empty() {
+        let app = App::test_new(default_settings(), false);
+        let events = app.poll_tray_events();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn sync_tray_status_no_tray_does_not_panic() {
+        let mut app = App::test_new(default_settings(), false);
+        app.sync_tray_status();
+    }
+
+    #[test]
+    fn sync_tray_connected_status_tracks_state() {
+        let mut app = App::test_new(default_settings(), false);
+        assert!(!app.tray_last_connected);
+
+        app.frost_status = ConnectionStatus::Connected;
+        app.sync_tray_status();
+        assert!(!app.tray_last_connected);
+    }
+
+    #[test]
+    fn notify_sign_request_only_when_hidden() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+
+        let req = PendingSignRequest {
+            id: "test".into(),
+            message_preview: "preview".into(),
+            from_peer: 1,
+            timestamp: 0,
+        };
+        app.notify_sign_request(&req);
+    }
+
+    #[test]
+    fn notify_bunker_approval_only_when_hidden() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+
+        let display = PendingApprovalDisplay {
+            app_pubkey: "abc123".into(),
+            app_name: "TestApp".into(),
+            method: "sign_event".into(),
+            event_kind: None,
+            event_content: None,
+            requested_permissions: None,
+        };
+        app.notify_bunker_approval(&display);
+    }
+
+    #[test]
+    fn tray_quit_disconnects_and_stops_bunker() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+        let _task = app.handle_tray_quit();
+    }
+
+    #[test]
+    fn tray_toggle_bunker_locked_shows_error() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = false;
+        let _task = app.handle_tray_toggle_bunker();
+        assert!(app.toast.is_some());
+        let toast = app.toast.as_ref().unwrap();
+        assert_eq!(toast.message, "Vault is locked");
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn default_settings_minimize_to_tray_off() {
+        let s = Settings::default();
+        assert!(!s.minimize_to_tray);
+        assert!(!s.start_minimized);
+    }
+
+    #[test]
+    fn settings_serialize_deserialize_roundtrip() {
+        let s = Settings {
+            auto_lock_secs: 60,
+            clipboard_clear_secs: 10,
+            proxy_enabled: true,
+            proxy_port: 9051,
+            kill_switch_active: false,
+            minimize_to_tray: false,
+            start_minimized: true,
+            bunker_auto_start: false,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.auto_lock_secs, 60);
+        assert_eq!(parsed.clipboard_clear_secs, 10);
+        assert!(parsed.proxy_enabled);
+        assert_eq!(parsed.proxy_port, 9051);
+        assert!(!parsed.minimize_to_tray);
+        assert!(parsed.start_minimized);
+    }
+
+    #[test]
+    fn settings_missing_tray_fields_get_defaults() {
+        let json = r#"{"auto_lock_secs":300,"clipboard_clear_secs":30}"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert!(!parsed.minimize_to_tray);
+        assert!(!parsed.start_minimized);
+    }
+
+    #[test]
+    fn window_close_minimize_to_tray_with_no_tray_exits() {
+        let mut settings = default_settings();
+        settings.minimize_to_tray = true;
+        let mut app = App::test_new(settings, false);
+        app.window_visible = true;
+        assert!(!app.has_tray);
+
+        let fake_id = iced::window::Id::unique();
+        let _task = app.handle_window_close(fake_id);
+        assert!(app.window_visible);
     }
 }

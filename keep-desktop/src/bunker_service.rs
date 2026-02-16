@@ -8,7 +8,9 @@ use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use crate::app::{lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES};
+use crate::app::{
+    lock_keep, save_settings, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES,
+};
 use crate::message::Message;
 use crate::screen::bunker::{
     BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
@@ -161,18 +163,7 @@ impl App {
             }
             Message::BunkerStart => self.handle_bunker_start(),
             Message::BunkerStartResult(result) => self.handle_bunker_start_result(result),
-            Message::BunkerStop => {
-                self.stop_bunker();
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.running = false;
-                    s.starting = false;
-                    s.url = None;
-                    s.clients.clear();
-                    s.pending_approval = None;
-                }
-                self.set_toast("Bunker stopped".into(), ToastKind::Success);
-                Task::none()
-            }
+            Message::BunkerStop => self.handle_bunker_stop(),
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
                 if approved && self.is_kill_switch_active() {
@@ -502,6 +493,9 @@ impl App {
                     log: VecDeque::new(),
                 });
 
+                self.settings.bunker_auto_start = true;
+                save_settings(&self.keep_path, &self.settings);
+
                 if let Screen::Bunker(s) = &mut self.screen {
                     s.running = true;
                     s.starting = false;
@@ -529,18 +523,38 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_bunker_stop(&mut self) -> Task<Message> {
+        self.stop_bunker();
+        self.settings.bunker_auto_start = false;
+        save_settings(&self.keep_path, &self.settings);
+        if let Screen::Bunker(s) = &mut self.screen {
+            s.running = false;
+            s.starting = false;
+            s.url = None;
+            s.clients.clear();
+            s.pending_approval = None;
+        }
+        self.set_toast("Bunker stopped".into(), ToastKind::Success);
+        Task::none()
+    }
+
     pub(crate) fn poll_bunker_events(&mut self) {
-        let Some(ref mut bunker) = self.bunker else {
-            return;
+        let events: Vec<BunkerEvent> = {
+            let Some(ref bunker) = self.bunker else {
+                return;
+            };
+            let Ok(rx) = bunker.event_rx.lock() else {
+                return;
+            };
+            rx.try_iter().collect()
         };
 
-        let Ok(rx) = bunker.event_rx.lock() else {
-            return;
-        };
-
-        while let Ok(event) = rx.try_recv() {
+        for event in events {
             match event {
                 BunkerEvent::Connected { pubkey, name } => {
+                    let Some(ref mut bunker) = self.bunker else {
+                        continue;
+                    };
                     if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
                         let client = ConnectedClient {
                             pubkey,
@@ -561,6 +575,9 @@ impl App {
                     action,
                     success,
                 } => {
+                    let Some(ref mut bunker) = self.bunker else {
+                        continue;
+                    };
                     let entry = LogDisplayEntry {
                         app,
                         action,
@@ -584,6 +601,7 @@ impl App {
                     if let Some(prev_tx) = self.bunker_approval_tx.take() {
                         let _ = prev_tx.send(false);
                     }
+                    self.notify_bunker_approval(&display);
                     self.bunker_pending_approval = Some(display.clone());
                     self.bunker_approval_tx = Some(response_tx);
                     if let Screen::Bunker(s) = &mut self.screen {

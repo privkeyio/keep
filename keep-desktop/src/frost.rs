@@ -456,6 +456,7 @@ impl App {
                 }
             }
             FrostNodeMsg::NewSignRequest(req) => {
+                self.notify_sign_request(&req);
                 self.pending_sign_display.push(req.clone());
                 if let Some(s) = self.relay_screen_mut() {
                     s.pending_requests.push(req);
