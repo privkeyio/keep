@@ -498,7 +498,7 @@ impl App {
                 ToastKind::Success,
             );
         }
-        let task = if start_minimized && app.has_tray {
+        let task = if start_minimized && app.has_tray && app.settings.minimize_to_tray {
             iced::window::oldest()
                 .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
         } else {
@@ -814,7 +814,7 @@ impl App {
                     self.settings.kill_switch_active,
                     self.settings.minimize_to_tray,
                     self.settings.start_minimized,
-                    self.tray.is_some(),
+                    self.has_tray,
                 ));
                 Task::none()
             }
@@ -2375,7 +2375,7 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             has_tray,
-            window_visible: !has_tray || !settings.start_minimized,
+            window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
             tray_last_connected: false,
             tray_last_bunker: false,
             settings,
@@ -2426,8 +2426,18 @@ mod tests {
     fn start_minimized_sets_window_hidden_when_tray_present() {
         let mut settings = default_settings();
         settings.start_minimized = true;
+        settings.minimize_to_tray = true;
         let app = App::test_new(settings, true);
         assert!(!app.window_visible);
+    }
+
+    #[test]
+    fn start_minimized_without_minimize_to_tray_keeps_window_visible() {
+        let mut settings = default_settings();
+        settings.start_minimized = true;
+        settings.minimize_to_tray = false;
+        let app = App::test_new(settings, true);
+        assert!(app.window_visible);
     }
 
     #[test]

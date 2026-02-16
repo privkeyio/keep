@@ -161,18 +161,7 @@ impl App {
             }
             Message::BunkerStart => self.handle_bunker_start(),
             Message::BunkerStartResult(result) => self.handle_bunker_start_result(result),
-            Message::BunkerStop => {
-                self.stop_bunker();
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.running = false;
-                    s.starting = false;
-                    s.url = None;
-                    s.clients.clear();
-                    s.pending_approval = None;
-                }
-                self.set_toast("Bunker stopped".into(), ToastKind::Success);
-                Task::none()
-            }
+            Message::BunkerStop => self.handle_bunker_stop(),
             Message::BunkerApprove | Message::BunkerReject => {
                 let approved = matches!(message, Message::BunkerApprove);
                 if approved && self.is_kill_switch_active() {
@@ -527,6 +516,19 @@ impl App {
         if let Some(bunker) = self.bunker.take() {
             bunker.handle.abort();
         }
+    }
+
+    pub(crate) fn handle_bunker_stop(&mut self) -> Task<Message> {
+        self.stop_bunker();
+        if let Screen::Bunker(s) = &mut self.screen {
+            s.running = false;
+            s.starting = false;
+            s.url = None;
+            s.clients.clear();
+            s.pending_approval = None;
+        }
+        self.set_toast("Bunker stopped".into(), ToastKind::Success);
+        Task::none()
     }
 
     pub(crate) fn poll_bunker_events(&mut self) {

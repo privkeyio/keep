@@ -85,25 +85,29 @@ impl TrayState {
         let lock_id = lock_item.id().clone();
         let quit_id = quit_item.id().clone();
 
-        std::thread::spawn(move || {
-            let rx = MenuEvent::receiver();
-            while let Ok(event) = rx.recv() {
-                let tray_event = if event.id == open_id {
-                    TrayEvent::ShowWindow
-                } else if event.id == toggle_id {
-                    TrayEvent::ToggleBunker
-                } else if event.id == lock_id {
-                    TrayEvent::Lock
-                } else if event.id == quit_id {
-                    TrayEvent::Quit
-                } else {
-                    continue;
-                };
-                if event_tx.send(tray_event).is_err() {
-                    break;
+        std::thread::Builder::new()
+            .name("tray-events".into())
+            .spawn(move || {
+                let rx = MenuEvent::receiver();
+                while let Ok(event) = rx.recv() {
+                    let tray_event = if event.id == open_id {
+                        TrayEvent::ShowWindow
+                    } else if event.id == toggle_id {
+                        TrayEvent::ToggleBunker
+                    } else if event.id == lock_id {
+                        TrayEvent::Lock
+                    } else if event.id == quit_id {
+                        TrayEvent::Quit
+                    } else {
+                        continue;
+                    };
+                    if event_tx.send(tray_event).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+                tracing::debug!("Tray event listener thread exiting");
+            })
+            .map_err(|e| format!("failed to spawn tray event thread: {e}"))?;
 
         let icon_connected = build_icon(true)?;
         let icon_disconnected = build_icon(false)?;
@@ -170,7 +174,10 @@ pub fn send_sign_request_notification() {
 const MAX_NOTIFICATION_FIELD_LEN: usize = 40;
 
 fn sanitize_notification_field(input: &str) -> String {
-    let without_control: String = input.chars().filter(|c| !c.is_control()).collect();
+    let without_control: String = input
+        .chars()
+        .filter(|c| !c.is_control() && *c != '<' && *c != '>')
+        .collect();
     if without_control.chars().count() > MAX_NOTIFICATION_FIELD_LEN {
         let truncated: String = without_control
             .chars()
@@ -240,6 +247,14 @@ mod tests {
         let result = sanitize_notification_field(&over);
         let expected = format!("{}...", "y".repeat(MAX_NOTIFICATION_FIELD_LEN));
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sanitize_strips_html_markup() {
+        assert_eq!(
+            sanitize_notification_field("<b>Legit App</b>"),
+            "bLegit App/b"
+        );
     }
 
     #[test]
