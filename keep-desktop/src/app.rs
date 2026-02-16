@@ -1242,27 +1242,11 @@ impl App {
                 Task::none()
             }
             Message::WalletThresholdChanged(encoded) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    if let Some((idx_str, val)) = encoded.split_once(':') {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if let Some(tier) = s.tiers.get_mut(idx) {
-                                tier.threshold = val.to_string();
-                            }
-                        }
-                    }
-                }
+                self.update_tier_field(&encoded, |tier, val| tier.threshold = val);
                 Task::none()
             }
             Message::WalletTimelockChanged(encoded) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    if let Some((idx_str, val)) = encoded.split_once(':') {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if let Some(tier) = s.tiers.get_mut(idx) {
-                                tier.timelock_months = val.to_string();
-                            }
-                        }
-                    }
-                }
+                self.update_tier_field(&encoded, |tier, val| tier.timelock_months = val);
                 Task::none()
             }
             Message::WalletAddTier => {
@@ -1300,10 +1284,8 @@ impl App {
                     let session_id = s.setup.as_ref().and_then(|st| st.session_id);
                     s.setup = None;
                     if let Some(sid) = session_id {
-                        if let Ok(guard) = self.frost_node.lock() {
-                            if let Some(node) = guard.as_ref() {
-                                node.cancel_descriptor_session(&sid);
-                            }
+                        if let Some(node) = self.get_frost_node() {
+                            node.cancel_descriptor_session(&sid);
                         }
                     }
                 }
@@ -1316,6 +1298,18 @@ impl App {
                 Task::none()
             }
             _ => Task::none(),
+        }
+    }
+
+    fn update_tier_field(&mut self, encoded: &str, f: impl FnOnce(&mut TierConfig, String)) {
+        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+            if let Some((idx_str, val)) = encoded.split_once(':') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(tier) = s.tiers.get_mut(idx) {
+                        f(tier, val.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -1350,10 +1344,9 @@ impl App {
                         }
                     };
 
-                    let mut key_slots = Vec::new();
-                    for i in 1..=share.total_shares {
-                        key_slots.push(KeySlot::Participant { share_index: i });
-                    }
+                    let key_slots = (1..=share.total_shares)
+                        .map(|i| KeySlot::Participant { share_index: i })
+                        .collect();
 
                     tiers.push(PolicyTier {
                         threshold,
@@ -1379,19 +1372,14 @@ impl App {
             return Task::none();
         }
 
-        let node = match self.frost_node.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        };
-        let Some(node) = node else {
+        let Some(node) = self.get_frost_node() else {
             if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
                 s.error = Some("Relay node not available".into());
             }
             return Task::none();
         };
 
-        let expected_contributors = keep_frost_net::participant_indices(&policy);
-        let expected_total = expected_contributors.len();
+        let expected_total = keep_frost_net::participant_indices(&policy).len();
 
         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
             s.phase = SetupPhase::Coordinating(DescriptorProgress::WaitingContributions {
@@ -1401,52 +1389,17 @@ impl App {
         }
 
         let keep_arc = self.keep.clone();
-        let group_pubkey = share.group_pubkey;
-        let identifier = share.identifier;
         let net = network.clone();
 
         Task::perform(
             async move {
-                let (xpub_str, fingerprint_str) = tokio::task::spawn_blocking({
-                    let keep_arc = keep_arc.clone();
-                    let net = net.clone();
-                    move || {
-                        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
-                            let share_pkg = keep
-                                .frost_get_share_by_index(&group_pubkey, identifier)
-                                .map_err(friendly_err)?;
-                            let key_package = share_pkg.key_package().map_err(friendly_err)?;
-                            let signing_share = key_package.signing_share();
-                            let signing_bytes: zeroize::Zeroizing<[u8; 32]> =
-                                zeroize::Zeroizing::new(
-                                    signing_share
-                                        .serialize()
-                                        .as_slice()
-                                        .try_into()
-                                        .map_err(|_| "Invalid signing share length".to_string())?,
-                                );
-                            let bitcoin_network = match net.as_str() {
-                                "bitcoin" => bitcoin::Network::Bitcoin,
-                                "testnet" => bitcoin::Network::Testnet,
-                                "signet" => bitcoin::Network::Signet,
-                                "regtest" => bitcoin::Network::Regtest,
-                                _ => bitcoin::Network::Signet,
-                            };
-                            let derivation = keep_bitcoin::AddressDerivation::new(
-                                &*signing_bytes,
-                                bitcoin_network,
-                            )
-                            .map_err(|e| format!("{e}"))?;
-                            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
-                            let fingerprint = derivation
-                                .master_fingerprint()
-                                .map_err(|e| format!("{e}"))?;
-                            Ok((xpub.to_string(), fingerprint.to_string()))
-                        })
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
+                let (xpub_str, fingerprint_str) = crate::frost::derive_xpub(
+                    keep_arc,
+                    share.group_pubkey,
+                    share.identifier,
+                    net.clone(),
+                )
+                .await?;
 
                 let session_id = node
                     .request_descriptor(policy, &net, &xpub_str, &fingerprint_str)

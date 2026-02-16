@@ -56,6 +56,7 @@ impl Default for TierConfig {
 #[derive(Debug, Clone)]
 pub enum DescriptorProgress {
     WaitingContributions { received: usize, expected: usize },
+    Contributed,
     Finalizing,
     WaitingAcks { received: usize, expected: usize },
     Complete,
@@ -255,9 +256,16 @@ impl WalletScreen {
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::SM]);
 
+        let max_threshold = setup
+            .selected_share
+            .and_then(|i| setup.shares.get(i))
+            .map(|s| s.total_shares as u32)
+            .unwrap_or(0);
         let can_begin = setup.selected_share.is_some()
             && setup.tiers.iter().all(|t| {
-                t.threshold.parse::<u32>().is_ok_and(|v| v >= 1)
+                t.threshold
+                    .parse::<u32>()
+                    .is_ok_and(|v| v >= 1 && v <= max_threshold)
                     && t.timelock_months.parse::<u32>().is_ok_and(|v| v > 0)
             });
 
@@ -313,6 +321,7 @@ impl WalletScreen {
                 format!("Waiting for contributions ({received}/{expected})"),
                 theme::color::WARNING,
             ),
+            DescriptorProgress::Contributed => ("Contribution sent".into(), theme::color::PRIMARY),
             DescriptorProgress::Finalizing => {
                 ("Finalizing descriptor...".into(), theme::color::PRIMARY)
             }
@@ -340,6 +349,7 @@ impl WalletScreen {
             DescriptorProgress::WaitingContributions { .. } => {
                 "Peers need to contribute their extended public keys."
             }
+            DescriptorProgress::Contributed => "Waiting for the initiator to finalize.",
             DescriptorProgress::Finalizing => "Building the final wallet descriptor.",
             DescriptorProgress::WaitingAcks { .. } => {
                 "Peers are verifying and acknowledging the descriptor."

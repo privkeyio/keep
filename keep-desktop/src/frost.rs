@@ -22,7 +22,7 @@ use crate::app::{
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
 use crate::screen::relay::RelayScreen;
 use crate::screen::shares::ShareEntry;
-use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState};
+use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState, WalletEntry};
 use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
@@ -65,6 +65,50 @@ pub(crate) async fn verify_relay_certificates(
         }
     }
     Ok(())
+}
+
+fn parse_bitcoin_network(net: &str) -> Result<bitcoin::Network, String> {
+    match net {
+        "bitcoin" => Ok(bitcoin::Network::Bitcoin),
+        "testnet" => Ok(bitcoin::Network::Testnet),
+        "signet" => Ok(bitcoin::Network::Signet),
+        "regtest" => Ok(bitcoin::Network::Regtest),
+        _ => Err(format!("Unknown network: {net}")),
+    }
+}
+
+pub(crate) async fn derive_xpub(
+    keep_arc: Arc<Mutex<Option<Keep>>>,
+    group_pubkey: [u8; 32],
+    identifier: u16,
+    network: String,
+) -> Result<(String, String), String> {
+    tokio::task::spawn_blocking(move || {
+        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
+            let share_pkg = keep
+                .frost_get_share_by_index(&group_pubkey, identifier)
+                .map_err(friendly_err)?;
+            let key_package = share_pkg.key_package().map_err(friendly_err)?;
+            let signing_share = key_package.signing_share();
+            let signing_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+                signing_share
+                    .serialize()
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "Invalid signing share length".to_string())?,
+            );
+            let bitcoin_network = parse_bitcoin_network(&network)?;
+            let derivation = keep_bitcoin::AddressDerivation::new(&*signing_bytes, bitcoin_network)
+                .map_err(|e| format!("{e}"))?;
+            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
+            let fingerprint = derivation
+                .master_fingerprint()
+                .map_err(|e| format!("{e}"))?;
+            Ok((xpub.to_string(), fingerprint.to_string()))
+        })
+    })
+    .await
+    .map_err(|_| "Background task failed".to_string())?
 }
 
 #[derive(Clone)]
@@ -553,6 +597,10 @@ impl App {
         }
     }
 
+    pub(crate) fn get_frost_node(&self) -> Option<Arc<KfpNode>> {
+        self.frost_node.lock().ok()?.clone()
+    }
+
     fn update_wallet_setup(&mut self, session_id: &[u8; 32], f: impl FnOnce(&mut SetupState)) {
         if let Screen::Wallet(ws) = &mut self.screen {
             if let Some(setup) = &mut ws.setup {
@@ -651,61 +699,16 @@ impl App {
             Some(s) => s.clone(),
             None => return iced::Task::none(),
         };
-
-        let node = match self.frost_node.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        };
-        let Some(node) = node else {
+        let Some(node) = self.get_frost_node() else {
             return iced::Task::none();
         };
 
         let keep_arc = self.keep.clone();
-        let net = network.clone();
 
         iced::Task::perform(
             async move {
-                let (xpub_str, fingerprint_str) = tokio::task::spawn_blocking({
-                    let keep_arc = keep_arc.clone();
-                    let net = net.clone();
-                    let group_pubkey = share.group_pubkey;
-                    let identifier = share.identifier;
-                    move || {
-                        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
-                            let share_pkg = keep
-                                .frost_get_share_by_index(&group_pubkey, identifier)
-                                .map_err(friendly_err)?;
-                            let key_package = share_pkg.key_package().map_err(friendly_err)?;
-                            let signing_share = key_package.signing_share();
-                            let signing_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-                                signing_share
-                                    .serialize()
-                                    .as_slice()
-                                    .try_into()
-                                    .map_err(|_| "Invalid signing share length".to_string())?,
-                            );
-                            let bitcoin_network = match net.as_str() {
-                                "bitcoin" => bitcoin::Network::Bitcoin,
-                                "testnet" => bitcoin::Network::Testnet,
-                                "signet" => bitcoin::Network::Signet,
-                                "regtest" => bitcoin::Network::Regtest,
-                                _ => bitcoin::Network::Signet,
-                            };
-                            let derivation = keep_bitcoin::AddressDerivation::new(
-                                &*signing_bytes,
-                                bitcoin_network,
-                            )
-                            .map_err(|e| format!("{e}"))?;
-                            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
-                            let fingerprint = derivation
-                                .master_fingerprint()
-                                .map_err(|e| format!("{e}"))?;
-                            Ok((xpub.to_string(), fingerprint.to_string()))
-                        })
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
+                let (xpub_str, fingerprint_str) =
+                    derive_xpub(keep_arc, share.group_pubkey, share.identifier, network).await?;
 
                 node.contribute_descriptor(
                     session_id,
@@ -722,10 +725,7 @@ impl App {
                 if let Err(e) = result {
                     Message::WalletDescriptorProgress(DescriptorProgress::Failed(e))
                 } else {
-                    Message::WalletDescriptorProgress(DescriptorProgress::WaitingContributions {
-                        received: 0,
-                        expected: 0,
-                    })
+                    Message::WalletDescriptorProgress(DescriptorProgress::Contributed)
                 }
             },
         )
@@ -901,23 +901,25 @@ impl App {
         external_descriptor: String,
         internal_descriptor: String,
     ) {
-        let Screen::Wallet(ws) = &self.screen else {
-            return;
+        let (group_pubkey, network) = {
+            let Screen::Wallet(ws) = &self.screen else {
+                return;
+            };
+            let Some(setup) = ws.setup.as_ref() else {
+                return;
+            };
+            if setup.session_id.as_ref() != Some(&session_id) {
+                return;
+            }
+            let Some(group_pubkey) = setup
+                .selected_share
+                .and_then(|i| setup.shares.get(i))
+                .map(|sh| sh.group_pubkey)
+            else {
+                return;
+            };
+            (group_pubkey, setup.network.clone())
         };
-        let Some(setup) = ws.setup.as_ref() else {
-            return;
-        };
-        if setup.session_id.as_ref() != Some(&session_id) {
-            return;
-        }
-        let Some(group_pubkey) = setup
-            .selected_share
-            .and_then(|i| setup.shares.get(i))
-            .map(|sh| sh.group_pubkey)
-        else {
-            return;
-        };
-        let network = setup.network.clone();
 
         let created_at = chrono::Utc::now().timestamp().max(0) as u64;
         let descriptor = keep_core::WalletDescriptor {
@@ -938,27 +940,26 @@ impl App {
             }
         };
 
-        if let Screen::Wallet(ws) = &mut self.screen {
-            if let Some(setup) = &mut ws.setup {
-                if setup.session_id.as_ref() == Some(&session_id) {
-                    match store_result {
-                        Ok(()) => {
-                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
-                            let entry = crate::screen::wallet::WalletEntry {
-                                group_pubkey,
-                                group_hex: hex::encode(group_pubkey),
-                                external_descriptor,
-                                internal_descriptor,
-                                network,
-                                created_at,
-                            };
-                            ws.descriptors.push(entry);
-                        }
-                        Err(e) => {
-                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
-                        }
-                    }
-                }
+        let Screen::Wallet(ws) = &mut self.screen else {
+            return;
+        };
+        let Some(setup) = &mut ws.setup else {
+            return;
+        };
+        match store_result {
+            Ok(()) => {
+                setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
+                ws.descriptors.push(WalletEntry {
+                    group_pubkey,
+                    group_hex: hex::encode(group_pubkey),
+                    external_descriptor,
+                    internal_descriptor,
+                    network,
+                    created_at,
+                });
+            }
+            Err(e) => {
+                setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
             }
         }
     }

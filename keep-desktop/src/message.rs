@@ -280,7 +280,7 @@ pub enum Message {
     Tick,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum FrostNodeMsg {
     PeerUpdate(Vec<PeerEntry>),
     NewSignRequest(PendingSignRequest),
@@ -308,6 +308,44 @@ pub enum FrostNodeMsg {
         session_id: [u8; 32],
         error: String,
     },
+}
+
+impl fmt::Debug for FrostNodeMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PeerUpdate(peers) => f.debug_tuple("PeerUpdate").field(&peers.len()).finish(),
+            Self::NewSignRequest(_) => f.write_str("NewSignRequest"),
+            Self::SignRequestRemoved(id) => f.debug_tuple("SignRequestRemoved").field(id).finish(),
+            Self::StatusChanged(s) => f.debug_tuple("StatusChanged").field(s).finish(),
+            Self::DescriptorContributionNeeded { session_id, .. } => f
+                .debug_struct("DescriptorContributionNeeded")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorContributed {
+                session_id,
+                share_index,
+            } => f
+                .debug_struct("DescriptorContributed")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .finish(),
+            Self::DescriptorReady { session_id } => f
+                .debug_struct("DescriptorReady")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorComplete { session_id, .. } => f
+                .debug_struct("DescriptorComplete")
+                .field("session_id", &hex::encode(session_id))
+                .field("external_descriptor", &"***")
+                .field("internal_descriptor", &"***")
+                .finish(),
+            Self::DescriptorFailed { session_id, error } => f
+                .debug_struct("DescriptorFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
