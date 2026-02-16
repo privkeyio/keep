@@ -7,7 +7,6 @@ use iced::widget::{button, column, container, pick_list, row, scrollable, text, 
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 const PAGE_SIZE: usize = 50;
@@ -72,7 +71,7 @@ impl SigningAuditScreen {
         PAGE_SIZE
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("Signing History");
         let subtitle = theme::muted("View past signing requests and decisions");
 
@@ -133,13 +132,7 @@ impl SigningAuditScreen {
 
         let inner = scrollable(padded).width(Length::Fill).height(Length::Fill);
 
-        layout::with_sidebar_kill_switch(
-            NavItem::Audit,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+        inner.into()
     }
 
     fn chain_status_row(&self) -> Element<Message> {

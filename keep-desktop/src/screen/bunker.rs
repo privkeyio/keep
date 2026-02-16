@@ -7,7 +7,6 @@ use iced::widget::{button, column, container, qr_code, row, scrollable, text, te
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -74,7 +73,7 @@ pub struct LogDisplayEntry {
 }
 
 pub const DURATION_OPTIONS: &[(&str, DurationChoice)] = &[
-    ("Just this time", DurationChoice::JustThisTime),
+    ("This session", DurationChoice::JustThisTime),
     ("15 minutes", DurationChoice::Minutes(15)),
     ("1 hour", DurationChoice::Minutes(60)),
     ("1 day", DurationChoice::Minutes(1440)),
@@ -150,7 +149,7 @@ impl BunkerScreen {
         }
     }
 
-    pub fn view(&self, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("Nostr Connect");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -175,12 +174,11 @@ impl BunkerScreen {
             content = content.push(self.log_card());
         }
 
-        let inner = container(scrollable(content).height(Length::Fill))
+        container(scrollable(content).height(Length::Fill))
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(NavItem::Bunker, inner.into(), None, 0, kill_switch_active)
+            .height(Length::Fill)
+            .into()
     }
 
     fn status_card(&self) -> Element<Message> {

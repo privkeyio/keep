@@ -6,7 +6,6 @@ use iced::{Element, Length};
 use zeroize::Zeroizing;
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 pub struct SettingsScreen {
@@ -47,7 +46,7 @@ impl SettingsScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("Settings");
 
         let kill_switch_card = self.kill_switch_card();
@@ -68,15 +67,10 @@ impl SettingsScreen {
         .padding(theme::space::LG)
         .width(Length::Fill);
 
-        let inner = scrollable(content).width(Length::Fill).height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Settings,
-            inner.into(),
-            None,
-            pending_requests,
-            self.kill_switch_active,
-        )
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn kill_switch_card(&self) -> Element<Message> {

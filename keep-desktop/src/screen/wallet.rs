@@ -6,7 +6,6 @@ use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -34,7 +33,7 @@ impl WalletEntry {
     }
 
     fn truncated_hex(&self) -> &str {
-        &self.group_hex[..16.min(self.group_hex.len())]
+        self.group_hex.get(..16).unwrap_or(&self.group_hex)
     }
 }
 
@@ -51,7 +50,7 @@ impl WalletScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let title = theme::heading("Wallet Descriptors");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -81,30 +80,23 @@ impl WalletScreen {
             content = content.push(scrollable(list).height(Length::Fill));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Wallets,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 
-    fn wallet_card<'a>(&self, i: usize, entry: &WalletEntry) -> Element<'a, Message> {
+    fn wallet_card<'a>(&self, i: usize, entry: &'a WalletEntry) -> Element<'a, Message> {
         let network_badge = container(
-            text(entry.network.clone())
+            text(&entry.network)
                 .size(theme::size::TINY)
                 .color(theme::color::PRIMARY),
         )
         .style(theme::badge_style)
         .padding([2.0, theme::space::SM]);
 
-        let hex_text = text(entry.truncated_hex().to_owned())
+        let hex_text = text(entry.truncated_hex())
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
@@ -144,7 +136,7 @@ impl WalletScreen {
             .spacing(theme::space::SM)
             .align_y(Alignment::Center);
 
-            let ext_value = text(entry.external_descriptor.clone())
+            let ext_value = text(&entry.external_descriptor)
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM);
 
@@ -160,7 +152,7 @@ impl WalletScreen {
             .spacing(theme::space::SM)
             .align_y(Alignment::Center);
 
-            let int_value = text(entry.internal_descriptor.clone())
+            let int_value = text(&entry.internal_descriptor)
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM);
 

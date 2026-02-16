@@ -5,7 +5,6 @@ use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 pub struct CreateScreen {
@@ -27,7 +26,7 @@ impl CreateScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -151,17 +150,10 @@ impl CreateScreen {
             content = content.push(theme::error_text(err.as_str()));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Create,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 }

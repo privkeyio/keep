@@ -937,9 +937,13 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Returns the default path to the Keep directory (~/.keep).
+/// Override with the `KEEP_HOME` environment variable.
 pub fn default_keep_path() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|p| p.join(".keep"))
+    std::env::var("KEEP_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".keep")))
         .ok_or(KeepError::HomeNotFound)
 }
 
@@ -1090,7 +1094,7 @@ mod tests {
         {
             let mut keep = Keep::open(&path).unwrap();
             keep.unlock("testpass").unwrap();
-            keep.rotate_password("testpass", "newpass").unwrap();
+            keep.rotate_password("testpass", "newpass1").unwrap();
         }
 
         {
@@ -1100,7 +1104,7 @@ mod tests {
 
         {
             let mut keep = Keep::open(&path).unwrap();
-            keep.unlock("newpass").unwrap();
+            keep.unlock("newpass1").unwrap();
             assert!(keep.keyring().get_by_name("rotatetest").is_some());
         }
     }
@@ -1150,5 +1154,31 @@ mod tests {
             let slot = keep.keyring().get(&pubkey).unwrap();
             assert_eq!(slot.name, "dektest");
         }
+    }
+
+    #[test]
+    fn test_default_keep_path_from_env() {
+        temp_env::with_var("KEEP_HOME", Some("/tmp/my-keep"), || {
+            let p = default_keep_path().unwrap();
+            assert_eq!(p, PathBuf::from("/tmp/my-keep"));
+        });
+    }
+
+    #[test]
+    fn test_default_keep_path_empty_env_falls_back() {
+        temp_env::with_var("KEEP_HOME", Some(""), || {
+            let p = default_keep_path().unwrap();
+            let expected = dirs::home_dir().unwrap().join(".keep");
+            assert_eq!(p, expected);
+        });
+    }
+
+    #[test]
+    fn test_default_keep_path_blank_env_falls_back() {
+        temp_env::with_var("KEEP_HOME", Some("   "), || {
+            let p = default_keep_path().unwrap();
+            let expected = dirs::home_dir().unwrap().join(".keep");
+            assert_eq!(p, expected);
+        });
     }
 }

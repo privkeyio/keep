@@ -6,7 +6,6 @@ use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use crate::message::Message;
-use crate::screen::layout::{self, NavItem};
 use crate::theme;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,7 +50,7 @@ impl ImportScreen {
         }
     }
 
-    pub fn view(&self, pending_requests: usize, kill_switch_active: bool) -> Element<Message> {
+    pub fn view_content(&self) -> Element<Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -103,7 +102,11 @@ impl ImportScreen {
             match self.mode {
                 ImportMode::Nsec => {
                     if let Some(npub) = &self.npub_preview {
-                        let truncated = format!("{}...{}", &npub[..12], &npub[npub.len() - 8..]);
+                        let truncated = if npub.len() > 20 {
+                            format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
+                        } else {
+                            npub.clone()
+                        };
                         content = content.push(
                             text(format!("Public key: {truncated}"))
                                 .size(theme::size::BODY)
@@ -208,17 +211,10 @@ impl ImportScreen {
             content = content.push(theme::error_text(err.as_str()));
         }
 
-        let inner = container(content)
+        container(content)
             .padding(theme::space::XL)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        layout::with_sidebar_kill_switch(
-            NavItem::Import,
-            inner.into(),
-            None,
-            pending_requests,
-            kill_switch_active,
-        )
+            .height(Length::Fill)
+            .into()
     }
 }

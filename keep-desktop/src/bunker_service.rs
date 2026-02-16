@@ -144,6 +144,7 @@ impl App {
                         s.relays.push(relay.clone());
                         self.bunker_relays.push(relay);
                         s.relay_input.clear();
+                        self.save_bunker_relays();
                     }
                 }
                 Task::none()
@@ -153,6 +154,7 @@ impl App {
                     if i < s.relays.len() {
                         s.relays.remove(i);
                         self.bunker_relays = s.relays.clone();
+                        self.save_bunker_relays();
                     }
                 }
                 Task::none()
@@ -593,47 +595,46 @@ impl App {
     }
 
     pub(crate) fn sync_bunker_clients(&self) -> Task<Message> {
-        if let Some(ref bunker) = self.bunker {
-            let handler = bunker.handler.clone();
-            Task::perform(
-                async move {
-                    handler
-                        .list_clients()
-                        .await
-                        .into_iter()
-                        .map(|app| {
-                            let duration_str = match app.duration {
-                                keep_nip46::PermissionDuration::Session => "Session".into(),
-                                keep_nip46::PermissionDuration::Seconds(s) => {
-                                    if s < 3600 {
-                                        format!("{}m", s / 60)
-                                    } else if s < 86400 {
-                                        format!("{}h", s / 3600)
-                                    } else {
-                                        format!("{}d", s / 86400)
-                                    }
-                                }
-                                keep_nip46::PermissionDuration::Forever => "Forever".into(),
-                            };
-                            ConnectedClient {
-                                pubkey: app.pubkey.to_hex(),
-                                name: app.name,
-                                permissions: app.permissions.bits(),
-                                auto_approve_kinds: app
-                                    .auto_approve_kinds
-                                    .iter()
-                                    .map(|k| k.as_u16())
-                                    .collect(),
-                                request_count: app.request_count,
-                                duration: duration_str,
+        let Some(ref bunker) = self.bunker else {
+            return Task::none();
+        };
+        let handler = bunker.handler.clone();
+        Task::perform(
+            async move {
+                handler
+                    .list_clients()
+                    .await
+                    .into_iter()
+                    .map(|app| {
+                        let duration_str = match app.duration {
+                            keep_nip46::PermissionDuration::Session => "Session".into(),
+                            keep_nip46::PermissionDuration::Seconds(s) if s < 3600 => {
+                                format!("{}m", s / 60)
                             }
-                        })
-                        .collect()
-                },
-                Message::BunkerClientsLoaded,
-            )
-        } else {
-            Task::none()
-        }
+                            keep_nip46::PermissionDuration::Seconds(s) if s < 86400 => {
+                                format!("{}h", s / 3600)
+                            }
+                            keep_nip46::PermissionDuration::Seconds(s) => {
+                                format!("{}d", s / 86400)
+                            }
+                            keep_nip46::PermissionDuration::Forever => "Forever".into(),
+                        };
+                        ConnectedClient {
+                            pubkey: app.pubkey.to_hex(),
+                            name: app.name,
+                            permissions: app.permissions.bits(),
+                            auto_approve_kinds: app
+                                .auto_approve_kinds
+                                .iter()
+                                .map(|k| k.as_u16())
+                                .collect(),
+                            request_count: app.request_count,
+                            duration: duration_str,
+                        }
+                    })
+                    .collect()
+            },
+            Message::BunkerClientsLoaded,
+        )
     }
 }

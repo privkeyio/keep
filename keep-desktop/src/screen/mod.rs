@@ -14,6 +14,7 @@ pub mod unlock;
 pub mod wallet;
 
 use crate::message::Message;
+use layout::{NavItem, SidebarState};
 
 pub enum Screen {
     Unlock(unlock::UnlockScreen),
@@ -29,23 +30,33 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub fn view(
-        &self,
+    pub fn view<'a>(
+        &'a self,
+        sidebar_state: &SidebarState<'a>,
+        share_count: Option<usize>,
         pending_requests: usize,
         kill_switch_active: bool,
-    ) -> iced::Element<Message> {
-        match self {
-            Screen::Unlock(s) => s.view(),
-            Screen::ShareList(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Create(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Export(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Import(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Wallet(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Relay(s) => s.view(kill_switch_active),
-            Screen::Bunker(s) => s.view(kill_switch_active),
-            Screen::SigningAudit(s) => s.view(pending_requests, kill_switch_active),
-            Screen::Settings(s) => s.view(pending_requests),
-        }
+    ) -> iced::Element<'a, Message> {
+        let (nav, content, count) = match self {
+            Screen::Unlock(s) => return s.view(),
+            Screen::ShareList(s) => (NavItem::Shares, s.view_content(), share_count),
+            Screen::Create(s) => (NavItem::Create, s.view_content(), None),
+            Screen::Export(s) => (NavItem::Shares, s.view_content(), None),
+            Screen::Import(s) => (NavItem::Import, s.view_content(), None),
+            Screen::Wallet(s) => (NavItem::Wallets, s.view_content(), None),
+            Screen::Relay(s) => (NavItem::Relay, s.view_content(), None),
+            Screen::Bunker(s) => (NavItem::Bunker, s.view_content(), None),
+            Screen::SigningAudit(s) => (NavItem::Audit, s.view_content(), None),
+            Screen::Settings(s) => (NavItem::Settings, s.view_content(), None),
+        };
+        layout::with_sidebar(
+            nav,
+            content,
+            sidebar_state,
+            count,
+            pending_requests,
+            kill_switch_active,
+        )
     }
 
     pub fn set_loading_error(&mut self, error: String) {

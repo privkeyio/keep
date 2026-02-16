@@ -22,6 +22,7 @@ use crate::wallet::WalletDescriptor;
 use bincode::Options;
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
+const MIN_PASSWORD_LEN: usize = 8;
 const MAX_PASSWORD_LEN: usize = 4096;
 
 pub(crate) fn bincode_options() -> impl Options {
@@ -57,13 +58,22 @@ fn validate_argon2_param(value: u32, bounds: &Argon2Bounds, name: &str) -> Resul
     Ok(())
 }
 
-fn validate_password_len(password: &str) -> Result<()> {
+fn validate_password_max_len(password: &str) -> Result<()> {
     if password.len() > MAX_PASSWORD_LEN {
         return Err(KeepError::InvalidInput(
             "password too long (max 4096 bytes)".into(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_new_password(password: &str) -> Result<()> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "password too short (min {MIN_PASSWORD_LEN} bytes)"
+        )));
+    }
+    validate_password_max_len(password)
 }
 
 /// Storage file header containing encryption metadata.
@@ -214,7 +224,7 @@ impl Storage {
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
     ) -> Result<Self> {
-        validate_password_len(password)?;
+        validate_new_password(password)?;
 
         let mut header = Header::new(params);
         let data_key = SecretKey::generate()?;
@@ -299,7 +309,7 @@ impl Storage {
 
     /// Verify a password without changing the unlock state.
     pub fn verify_password(&self, password: &str) -> Result<()> {
-        validate_password_len(password)?;
+        validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
@@ -331,7 +341,7 @@ impl Storage {
     }
 
     fn unlock_inner(&mut self, password: &str) -> Result<()> {
-        validate_password_len(password)?;
+        validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
         if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
@@ -751,10 +761,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-keep");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         let mut storage = Storage::open(&path).unwrap();
-        let result = storage.unlock("wrong");
+        let result = storage.unlock("wrongpass");
         assert!(result.is_err());
     }
 
@@ -791,16 +801,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-limit");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         for _ in 0..5 {
             let mut storage = Storage::open(&path).unwrap();
-            let result = storage.unlock("wrong");
+            let result = storage.unlock("wrongpass");
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
 
         let mut storage = Storage::open(&path).unwrap();
-        let result = storage.unlock("wrong");
+        let result = storage.unlock("wrongpass");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
     }
 
@@ -809,21 +819,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-rate-limit-reset");
 
-        Storage::create(&path, "correct", Argon2Params::TESTING).unwrap();
+        Storage::create(&path, "correctpass", Argon2Params::TESTING).unwrap();
 
         for _ in 0..4 {
             let mut storage = Storage::open(&path).unwrap();
-            let _ = storage.unlock("wrong");
+            let _ = storage.unlock("wrongpass");
         }
 
         {
             let mut storage = Storage::open(&path).unwrap();
-            storage.unlock("correct").unwrap();
+            storage.unlock("correctpass").unwrap();
         }
 
         for _ in 0..4 {
             let mut storage = Storage::open(&path).unwrap();
-            let result = storage.unlock("wrong");
+            let result = storage.unlock("wrongpass");
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
     }

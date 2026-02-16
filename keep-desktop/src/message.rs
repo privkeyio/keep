@@ -9,6 +9,37 @@ use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
 use crate::screen::wallet::WalletEntry;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum IdentityKind {
+    Frost {
+        threshold: u16,
+        total_shares: u16,
+        share_count: usize,
+    },
+    Nsec,
+}
+
+#[derive(Clone, Debug)]
+pub struct Identity {
+    pub pubkey_hex: String,
+    pub npub: String,
+    pub name: String,
+    pub kind: IdentityKind,
+}
+
+impl Identity {
+    pub fn truncated_npub(&self) -> String {
+        if self.npub.len() <= 20 {
+            return self.npub.clone();
+        }
+        format!(
+            "{}...{}",
+            &self.npub[..12],
+            &self.npub[self.npub.len() - 6..]
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditLoadResult {
     pub entries: Vec<AuditDisplayEntry>,
@@ -151,6 +182,13 @@ pub enum Message {
     AuditChainVerified(Result<(bool, usize), String>),
     AuditFilterChanged(Option<String>),
     AuditLoadMore,
+
+    // Identity
+    ToggleIdentitySwitcher,
+    SwitchIdentity(String),
+    RequestDeleteIdentity(String),
+    ConfirmDeleteIdentity(String),
+    CancelDeleteIdentity,
 
     // Settings
     SettingsAutoLockChanged(u64),
@@ -297,6 +335,15 @@ impl fmt::Debug for Message {
                 f.debug_tuple("BunkerSetApprovalDuration").field(i).finish()
             }
             Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
+            Self::ToggleIdentitySwitcher => f.write_str("ToggleIdentitySwitcher"),
+            Self::SwitchIdentity(k) => f.debug_tuple("SwitchIdentity").field(k).finish(),
+            Self::RequestDeleteIdentity(k) => {
+                f.debug_tuple("RequestDeleteIdentity").field(k).finish()
+            }
+            Self::ConfirmDeleteIdentity(k) => {
+                f.debug_tuple("ConfirmDeleteIdentity").field(k).finish()
+            }
+            Self::CancelDeleteIdentity => f.write_str("CancelDeleteIdentity"),
             Self::SettingsAutoLockChanged(v) => {
                 f.debug_tuple("SettingsAutoLockChanged").field(v).finish()
             }
