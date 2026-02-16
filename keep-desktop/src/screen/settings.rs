@@ -38,6 +38,7 @@ fn toggle_button(active: bool, message: Message) -> button::Button<'static, Mess
 }
 
 impl SettingsScreen {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auto_lock_secs: u64,
         clipboard_clear_secs: u64,
@@ -76,15 +77,10 @@ impl SettingsScreen {
         let proxy_card = self.proxy_card();
         let info_card = self.info_card();
 
-        let mut content = column![
-            title,
-            kill_switch_card,
-            auto_lock_card,
-            clipboard_card,
-        ]
-        .spacing(theme::space::MD)
-        .padding(theme::space::LG)
-        .width(Length::Fill);
+        let mut content = column![title, kill_switch_card, auto_lock_card, clipboard_card,]
+            .spacing(theme::space::MD)
+            .padding(theme::space::LG)
+            .width(Length::Fill);
 
         if self.has_tray {
             content = content.push(self.tray_card());

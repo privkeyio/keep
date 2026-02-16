@@ -356,6 +356,8 @@ pub struct Settings {
     pub minimize_to_tray: bool,
     #[serde(default)]
     pub start_minimized: bool,
+    #[serde(default)]
+    pub bunker_auto_start: bool,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -380,6 +382,7 @@ impl Default for Settings {
             kill_switch_active: false,
             minimize_to_tray: false,
             start_minimized: false,
+            bunker_auto_start: false,
         }
     }
 }
@@ -405,7 +408,7 @@ fn load_settings(keep_path: &std::path::Path) -> (Settings, bool) {
     (settings, migrated)
 }
 
-fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
+pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
     let path = settings_path(keep_path);
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         if let Err(e) = write_private(&path, &json) {
@@ -460,7 +463,9 @@ impl App {
             bunker_pending_setup: None,
             nostrconnect_pending: None,
             has_tray: tray.is_some(),
-            window_visible: tray.is_none() || !settings.start_minimized,
+            window_visible: tray.is_none()
+                || !settings.start_minimized
+                || !settings.minimize_to_tray,
             tray_last_connected: false,
             tray_last_bunker: false,
             settings,
@@ -1407,6 +1412,9 @@ impl App {
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }
+                if self.settings.bunker_auto_start && !self.settings.kill_switch_active {
+                    return self.handle_bunker_start();
+                }
             }
             Err(e) => self.screen.set_loading_error(e),
         }
@@ -1446,6 +1454,11 @@ impl App {
     }
 
     fn handle_delete(&mut self, id: ShareIdentity) {
+        let group_hex = hex::encode(id.group_pubkey);
+        if self.active_share_hex.as_deref() == Some(group_hex.as_str()) {
+            self.handle_disconnect_relay();
+            self.stop_bunker();
+        }
         let result = {
             let mut guard = lock_keep(&self.keep);
             let Some(keep) = guard.as_mut() else {
@@ -1947,9 +1960,10 @@ impl App {
                     return Task::none();
                 };
 
-                if self.active_share_hex.as_deref() == Some(&pubkey_hex) {
-                    self.set_toast("Cannot delete the active identity".into(), ToastKind::Error);
-                    return Task::none();
+                let is_active = self.active_share_hex.as_deref() == Some(&pubkey_hex);
+                if is_active {
+                    self.handle_disconnect_relay();
+                    self.stop_bunker();
                 }
 
                 let result = match &identity.kind {
@@ -2334,13 +2348,15 @@ impl App {
 
     pub(crate) fn notify_sign_request(&self, _req: &PendingSignRequest) {
         if !self.window_visible {
-            crate::tray::send_sign_request_notification();
+            let tx = self.tray.as_ref().map(|t| &t.event_tx);
+            crate::tray::send_sign_request_notification(tx);
         }
     }
 
     pub(crate) fn notify_bunker_approval(&self, display: &PendingApprovalDisplay) {
         if !self.window_visible {
-            crate::tray::send_bunker_approval_notification(&display.app_name, &display.method);
+            let tx = self.tray.as_ref().map(|t| &t.event_tx);
+            crate::tray::send_bunker_approval_notification(&display.app_name, &display.method, tx);
         }
     }
 
@@ -2348,11 +2364,15 @@ impl App {
     fn test_new(settings: Settings, has_tray: bool) -> Self {
         let keep_path = PathBuf::from("/tmp/keep-test-nonexistent");
         let screen = Screen::Unlock(crate::screen::unlock::UnlockScreen::new(false));
+        let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
         Self {
             keep: Arc::new(Mutex::new(None)),
             keep_path,
             screen,
             active_share_hex: None,
+            identities: Vec::new(),
+            identity_switcher_open: false,
+            delete_identity_confirm: None,
             last_activity: Instant::now(),
             clipboard_clear_at: None,
             copy_feedback_until: None,
@@ -2374,11 +2394,13 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            nostrconnect_pending: None,
             has_tray,
             window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
             tray_last_connected: false,
             tray_last_bunker: false,
             settings,
+            kill_switch,
             tray: None,
         }
     }
@@ -2617,8 +2639,10 @@ mod tests {
             clipboard_clear_secs: 10,
             proxy_enabled: true,
             proxy_port: 9051,
+            kill_switch_active: false,
             minimize_to_tray: false,
             start_minimized: true,
+            bunker_auto_start: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();

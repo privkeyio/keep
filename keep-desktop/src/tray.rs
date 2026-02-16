@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::mpsc;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -17,6 +19,7 @@ pub enum TrayEvent {
 pub struct TrayState {
     _tray: TrayIcon,
     pub event_rx: mpsc::Receiver<TrayEvent>,
+    pub event_tx: mpsc::Sender<TrayEvent>,
     toggle_bunker_item: MenuItem,
     status_item: MenuItem,
     icon_connected: Icon,
@@ -85,6 +88,7 @@ impl TrayState {
         let lock_id = lock_item.id().clone();
         let quit_id = quit_item.id().clone();
 
+        let notif_tx = event_tx.clone();
         std::thread::Builder::new()
             .name("tray-events".into())
             .spawn(move || {
@@ -122,6 +126,7 @@ impl TrayState {
         Ok(Self {
             _tray: tray,
             event_rx,
+            event_tx: notif_tx,
             toggle_bunker_item,
             status_item,
             icon_connected,
@@ -155,19 +160,72 @@ impl TrayState {
     }
 }
 
-fn send_notification(summary: &str, body: &str) {
-    let _ = notify_rust::Notification::new()
+const MAX_NOTIFICATIONS_PER_WINDOW: usize = 10;
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+static NOTIFICATION_RATE: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+
+fn check_rate_limit() -> bool {
+    let mut guard = match NOTIFICATION_RATE.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let now = Instant::now();
+    let (start, count) = guard.get_or_insert((now, 0));
+    if now.duration_since(*start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+        *start = now;
+        *count = 1;
+        return true;
+    }
+    if *count >= MAX_NOTIFICATIONS_PER_WINDOW {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn send_notification(summary: &str, body: &str, show_tx: Option<&mpsc::Sender<TrayEvent>>) {
+    if !check_rate_limit() {
+        return;
+    }
+    let mut notification = notify_rust::Notification::new();
+    notification
         .appname("Keep")
         .summary(summary)
         .body(body)
-        .timeout(notify_rust::Timeout::Milliseconds(10_000))
-        .show();
+        .timeout(notify_rust::Timeout::Milliseconds(10_000));
+
+    #[cfg(target_os = "linux")]
+    notification.action("show", "Open Keep");
+
+    let result = notification.show();
+
+    #[cfg(target_os = "linux")]
+    if let (Ok(handle), Some(tx)) = (result, show_tx) {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("notif-action".into())
+            .spawn(move || {
+                handle.wait_for_action(|action| {
+                    if action == "show" || action == "default" {
+                        let _ = tx.send(TrayEvent::ShowWindow);
+                    }
+                });
+            })
+            .ok();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (result, show_tx);
+    }
 }
 
-pub fn send_sign_request_notification() {
+pub fn send_sign_request_notification(show_tx: Option<&mpsc::Sender<TrayEvent>>) {
     send_notification(
         "Signing Request",
         "A new signing request requires your approval",
+        show_tx,
     );
 }
 
@@ -176,7 +234,7 @@ const MAX_NOTIFICATION_FIELD_LEN: usize = 40;
 fn sanitize_notification_field(input: &str) -> String {
     let without_control: String = input
         .chars()
-        .filter(|c| !c.is_control() && *c != '<' && *c != '>')
+        .filter(|c| !c.is_control() && *c != '<' && *c != '>' && *c != '&')
         .collect();
     if without_control.chars().count() > MAX_NOTIFICATION_FIELD_LEN {
         let truncated: String = without_control
@@ -189,12 +247,17 @@ fn sanitize_notification_field(input: &str) -> String {
     }
 }
 
-pub fn send_bunker_approval_notification(app_name: &str, method: &str) {
+pub fn send_bunker_approval_notification(
+    app_name: &str,
+    method: &str,
+    show_tx: Option<&mpsc::Sender<TrayEvent>>,
+) {
     let safe_app = sanitize_notification_field(app_name);
     let safe_method = sanitize_notification_field(method);
     send_notification(
         "Bunker Approval Required",
         &format!("{safe_app} requests: {safe_method}"),
+        show_tx,
     );
 }
 
@@ -258,6 +321,11 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_ampersand() {
+        assert_eq!(sanitize_notification_field("A&B"), "AB");
+    }
+
+    #[test]
     fn sanitize_empty_input() {
         assert_eq!(sanitize_notification_field(""), "");
     }
@@ -285,5 +353,26 @@ mod tests {
         input.push('\n');
         let result = sanitize_notification_field(&input);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn rate_limit_allows_within_window() {
+        *NOTIFICATION_RATE.lock().unwrap() = None;
+        for _ in 0..MAX_NOTIFICATIONS_PER_WINDOW {
+            assert!(check_rate_limit());
+        }
+    }
+
+    #[test]
+    fn rate_limit_blocks_over_limit() {
+        *NOTIFICATION_RATE.lock().unwrap() = Some((Instant::now(), MAX_NOTIFICATIONS_PER_WINDOW));
+        assert!(!check_rate_limit());
+    }
+
+    #[test]
+    fn rate_limit_resets_after_window() {
+        let old = Instant::now() - std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS + 1);
+        *NOTIFICATION_RATE.lock().unwrap() = Some((old, MAX_NOTIFICATIONS_PER_WINDOW));
+        assert!(check_rate_limit());
     }
 }

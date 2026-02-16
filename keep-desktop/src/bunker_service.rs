@@ -8,7 +8,9 @@ use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use crate::app::{lock_keep, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES};
+use crate::app::{
+    lock_keep, save_settings, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES,
+};
 use crate::message::Message;
 use crate::screen::bunker::{
     BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
@@ -491,6 +493,9 @@ impl App {
                     log: VecDeque::new(),
                 });
 
+                self.settings.bunker_auto_start = true;
+                save_settings(&self.keep_path, &self.settings);
+
                 if let Screen::Bunker(s) = &mut self.screen {
                     s.running = true;
                     s.starting = false;
@@ -520,6 +525,8 @@ impl App {
 
     pub(crate) fn handle_bunker_stop(&mut self) -> Task<Message> {
         self.stop_bunker();
+        self.settings.bunker_auto_start = false;
+        save_settings(&self.keep_path, &self.settings);
         if let Screen::Bunker(s) = &mut self.screen {
             s.running = false;
             s.starting = false;
