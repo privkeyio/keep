@@ -37,7 +37,9 @@ use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
 use crate::screen::unlock::UnlockScreen;
-use crate::screen::wallet::{WalletEntry, WalletScreen};
+use crate::screen::wallet::{
+    DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry, WalletScreen,
+};
 use crate::screen::Screen;
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
@@ -125,6 +127,7 @@ pub struct App {
     pub(crate) pending_sign_display: Vec<PendingSignRequest>,
     pub(crate) frost_reconnect_attempts: u32,
     pub(crate) frost_reconnect_at: Option<Instant>,
+    pub(crate) frost_node: Arc<Mutex<Option<Arc<keep_frost_net::KfpNode>>>>,
     pub(crate) frost_last_share: Option<ShareEntry>,
     pub(crate) frost_last_relay_urls: Option<Vec<String>>,
     pub(crate) bunker: Option<RunningBunker>,
@@ -503,6 +506,7 @@ impl App {
             pending_sign_display: Vec::new(),
             frost_reconnect_attempts: 0,
             frost_reconnect_at: None,
+            frost_node: Arc::new(Mutex::new(None)),
             frost_last_share: None,
             frost_last_relay_urls: None,
             bunker: None,
@@ -640,7 +644,18 @@ impl App {
 
             Message::CopyNpub(..)
             | Message::CopyDescriptor(..)
-            | Message::ToggleWalletDetails(..) => self.handle_wallet_message(message),
+            | Message::ToggleWalletDetails(..)
+            | Message::WalletStartSetup
+            | Message::WalletSelectShare(..)
+            | Message::WalletNetworkChanged(..)
+            | Message::WalletThresholdChanged(..)
+            | Message::WalletTimelockChanged(..)
+            | Message::WalletAddTier
+            | Message::WalletRemoveTier(..)
+            | Message::WalletBeginCoordination
+            | Message::WalletCancelSetup
+            | Message::WalletSessionStarted(..)
+            | Message::WalletDescriptorProgress(..) => self.handle_wallet_message(message),
 
             Message::RelayUrlChanged(..)
             | Message::ConnectPasswordChanged(..)
@@ -738,14 +753,15 @@ impl App {
         }
         if self.frost_reconnect_at.is_some_and(|t| now >= t) {
             self.frost_reconnect_at = None;
-            self.drain_frost_events();
-            return self.handle_reconnect_relay();
+            let frost_task = self.drain_frost_events();
+            let reconnect_task = self.handle_reconnect_relay();
+            return Task::batch([frost_task, reconnect_task]);
         }
-        self.drain_frost_events();
+        let frost_task = self.drain_frost_events();
         self.poll_bunker_events();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
-        let tasks: Vec<_> = tray_events
+        let mut tasks: Vec<_> = tray_events
             .into_iter()
             .map(|event| match event {
                 TrayEvent::ShowWindow => self.handle_tray_show(),
@@ -754,6 +770,7 @@ impl App {
                 TrayEvent::Quit => self.handle_tray_quit(),
             })
             .collect();
+        tasks.push(frost_task);
         Task::batch(tasks)
     }
 
@@ -1193,8 +1210,253 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WalletStartSetup => {
+                let shares = self.current_shares();
+                let selected = if shares.len() == 1 { Some(0) } else { None };
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.setup = Some(SetupState {
+                        shares,
+                        selected_share: selected,
+                        network: "signet".into(),
+                        tiers: vec![TierConfig::default()],
+                        phase: SetupPhase::Configure,
+                        error: None,
+                        session_id: None,
+                    });
+                }
+                Task::none()
+            }
+            Message::WalletSelectShare(i) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    s.selected_share = Some(i);
+                }
+                Task::none()
+            }
+            Message::WalletNetworkChanged(n) => {
+                const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
+                if VALID_NETWORKS.contains(&n.as_str()) {
+                    if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                        s.network = n;
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletThresholdChanged(encoded) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    if let Some((idx_str, val)) = encoded.split_once(':') {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if let Some(tier) = s.tiers.get_mut(idx) {
+                                tier.threshold = val.to_string();
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletTimelockChanged(encoded) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    if let Some((idx_str, val)) = encoded.split_once(':') {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if let Some(tier) = s.tiers.get_mut(idx) {
+                                tier.timelock_months = val.to_string();
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletAddTier => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    if s.tiers.len() < 5 {
+                        s.tiers.push(TierConfig::default());
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletRemoveTier(i) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    if s.tiers.len() > 1 && i < s.tiers.len() {
+                        s.tiers.remove(i);
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
+            Message::WalletSessionStarted(result) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    match result {
+                        Ok(session_id) => s.session_id = Some(session_id),
+                        Err(e) => {
+                            s.phase =
+                                SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
+                            s.error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletCancelSetup => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    let session_id = s.setup.as_ref().and_then(|st| st.session_id);
+                    s.setup = None;
+                    if let Some(sid) = session_id {
+                        if let Ok(guard) = self.frost_node.lock() {
+                            if let Some(node) = guard.as_ref() {
+                                node.cancel_descriptor_session(&sid);
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletDescriptorProgress(progress) => {
+                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                    s.phase = SetupPhase::Coordinating(progress);
+                }
+                Task::none()
+            }
             _ => Task::none(),
         }
+    }
+
+    fn begin_descriptor_coordination(&mut self) -> Task<Message> {
+        use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
+
+        let (share, network, policy) = match &mut self.screen {
+            Screen::Wallet(WalletScreen { setup: Some(s), .. }) => {
+                let Some(idx) = s.selected_share else {
+                    s.error = Some("Select a share".into());
+                    return Task::none();
+                };
+                let Some(share) = s.shares.get(idx).cloned() else {
+                    s.error = Some("Invalid share selection".into());
+                    return Task::none();
+                };
+
+                let mut tiers = Vec::new();
+                for tier_cfg in &s.tiers {
+                    let threshold: u32 = match tier_cfg.threshold.parse() {
+                        Ok(v) if v >= 1 && v <= share.total_shares as u32 => v,
+                        _ => {
+                            s.error = Some("Invalid threshold value".into());
+                            return Task::none();
+                        }
+                    };
+                    let timelock_months: u32 = match tier_cfg.timelock_months.parse() {
+                        Ok(v) if v > 0 => v,
+                        _ => {
+                            s.error = Some("Invalid timelock value".into());
+                            return Task::none();
+                        }
+                    };
+
+                    let mut key_slots = Vec::new();
+                    for i in 1..=share.total_shares {
+                        key_slots.push(KeySlot::Participant { share_index: i });
+                    }
+
+                    tiers.push(PolicyTier {
+                        threshold,
+                        key_slots,
+                        timelock_months,
+                    });
+                }
+
+                let policy = WalletPolicy {
+                    recovery_tiers: tiers,
+                };
+
+                s.error = None;
+                (share, s.network.clone(), policy)
+            }
+            _ => return Task::none(),
+        };
+
+        if !matches!(self.frost_status, ConnectionStatus::Connected) {
+            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                s.error = Some("Connect to relay first".into());
+            }
+            return Task::none();
+        }
+
+        let node = match self.frost_node.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(node) = node else {
+            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                s.error = Some("Relay node not available".into());
+            }
+            return Task::none();
+        };
+
+        let expected_contributors = keep_frost_net::participant_indices(&policy);
+        let expected_total = expected_contributors.len();
+
+        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+            s.phase = SetupPhase::Coordinating(DescriptorProgress::WaitingContributions {
+                received: 1,
+                expected: expected_total,
+            });
+        }
+
+        let keep_arc = self.keep.clone();
+        let group_pubkey = share.group_pubkey;
+        let identifier = share.identifier;
+        let net = network.clone();
+
+        Task::perform(
+            async move {
+                let (xpub_str, fingerprint_str) = tokio::task::spawn_blocking({
+                    let keep_arc = keep_arc.clone();
+                    let net = net.clone();
+                    move || {
+                        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
+                            let share_pkg = keep
+                                .frost_get_share_by_index(&group_pubkey, identifier)
+                                .map_err(friendly_err)?;
+                            let key_package = share_pkg.key_package().map_err(friendly_err)?;
+                            let signing_share = key_package.signing_share();
+                            let signing_bytes: zeroize::Zeroizing<[u8; 32]> =
+                                zeroize::Zeroizing::new(
+                                    signing_share
+                                        .serialize()
+                                        .as_slice()
+                                        .try_into()
+                                        .map_err(|_| "Invalid signing share length".to_string())?,
+                                );
+                            let bitcoin_network = match net.as_str() {
+                                "bitcoin" => bitcoin::Network::Bitcoin,
+                                "testnet" => bitcoin::Network::Testnet,
+                                "signet" => bitcoin::Network::Signet,
+                                "regtest" => bitcoin::Network::Regtest,
+                                _ => bitcoin::Network::Signet,
+                            };
+                            let derivation = keep_bitcoin::AddressDerivation::new(
+                                &*signing_bytes,
+                                bitcoin_network,
+                            )
+                            .map_err(|e| format!("{e}"))?;
+                            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
+                            let fingerprint = derivation
+                                .master_fingerprint()
+                                .map_err(|e| format!("{e}"))?;
+                            Ok((xpub.to_string(), fingerprint.to_string()))
+                        })
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                let session_id = node
+                    .request_descriptor(policy, &net, &xpub_str, &fingerprint_str)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+
+                Ok::<[u8; 32], String>(session_id)
+            },
+            Message::WalletSessionStarted,
+        )
     }
 
     fn handle_relay_message(&mut self, message: Message) -> Task<Message> {
@@ -2895,6 +3157,7 @@ impl App {
             pending_sign_display: Vec::new(),
             frost_reconnect_attempts: 0,
             frost_reconnect_at: None,
+            frost_node: Arc::new(Mutex::new(None)),
             frost_last_share: None,
             frost_last_relay_urls: None,
             bunker: None,

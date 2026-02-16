@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
-use crate::screen::wallet::WalletEntry;
+use crate::screen::wallet::{DescriptorProgress, WalletEntry};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum IdentityKind {
@@ -189,7 +189,17 @@ pub enum Message {
     // Wallets
     ToggleWalletDetails(usize),
     WalletsLoaded(Result<Vec<WalletEntry>, String>),
-
+    WalletStartSetup,
+    WalletSelectShare(usize),
+    WalletNetworkChanged(String),
+    WalletThresholdChanged(String),
+    WalletTimelockChanged(String),
+    WalletAddTier,
+    WalletRemoveTier(usize),
+    WalletBeginCoordination,
+    WalletCancelSetup,
+    WalletSessionStarted(Result<[u8; 32], String>),
+    WalletDescriptorProgress(DescriptorProgress),
     // Relay / FROST
     RelayUrlChanged(String),
     ConnectPasswordChanged(Zeroizing<String>),
@@ -276,6 +286,28 @@ pub enum FrostNodeMsg {
     NewSignRequest(PendingSignRequest),
     SignRequestRemoved(String),
     StatusChanged(ConnectionStatus),
+    DescriptorContributionNeeded {
+        session_id: [u8; 32],
+        policy: keep_frost_net::WalletPolicy,
+        network: String,
+        initiator_pubkey: nostr_sdk::PublicKey,
+    },
+    DescriptorContributed {
+        session_id: [u8; 32],
+        share_index: u16,
+    },
+    DescriptorReady {
+        session_id: [u8; 32],
+    },
+    DescriptorComplete {
+        session_id: [u8; 32],
+        external_descriptor: String,
+        internal_descriptor: String,
+    },
+    DescriptorFailed {
+        session_id: [u8; 32],
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,12 +394,32 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
-            Self::CopyDescriptor(d) => f.debug_tuple("CopyDescriptor").field(d).finish(),
+            Self::CopyDescriptor(_) => f.write_str("CopyDescriptor(***)"),
             Self::ToggleWalletDetails(i) => f.debug_tuple("ToggleWalletDetails").field(i).finish(),
             Self::WalletsLoaded(r) => f
                 .debug_tuple("WalletsLoaded")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::WalletStartSetup => f.write_str("WalletStartSetup"),
+            Self::WalletSelectShare(i) => f.debug_tuple("WalletSelectShare").field(i).finish(),
+            Self::WalletNetworkChanged(n) => {
+                f.debug_tuple("WalletNetworkChanged").field(n).finish()
+            }
+            Self::WalletThresholdChanged(t) => {
+                f.debug_tuple("WalletThresholdChanged").field(t).finish()
+            }
+            Self::WalletTimelockChanged(t) => {
+                f.debug_tuple("WalletTimelockChanged").field(t).finish()
+            }
+            Self::WalletAddTier => f.write_str("WalletAddTier"),
+            Self::WalletRemoveTier(i) => f.debug_tuple("WalletRemoveTier").field(i).finish(),
+            Self::WalletBeginCoordination => f.write_str("WalletBeginCoordination"),
+            Self::WalletCancelSetup => f.write_str("WalletCancelSetup"),
+            Self::WalletSessionStarted(r) => f
+                .debug_tuple("WalletSessionStarted")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::WalletDescriptorProgress(_) => f.write_str("WalletDescriptorProgress"),
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
             Self::ConnectPasswordChanged(_) => f.write_str("ConnectPasswordChanged(***)"),
             Self::AddRelay => f.write_str("AddRelay"),

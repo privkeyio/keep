@@ -4143,12 +4143,14 @@ dependencies = [
 name = "keep-desktop"
 version = "0.1.5"
 dependencies = [
+ "bitcoin",
  "chrono",
  "dirs 5.0.1",
  "gtk",
  "hex",
  "iced",
  "image",
+ "keep-bitcoin",
  "keep-core",
  "keep-frost-net",
  "keep-nip46",

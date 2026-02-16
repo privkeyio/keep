@@ -22,6 +22,7 @@ use crate::app::{
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
 use crate::screen::relay::RelayScreen;
 use crate::screen::shares::ShareEntry;
+use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState};
 use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
@@ -288,6 +289,7 @@ pub(crate) async fn spawn_frost_node(
     ch: FrostChannels,
     net: NetworkConfig,
     kill_switch: Arc<AtomicBool>,
+    node_out: Arc<Mutex<Option<Arc<KfpNode>>>>,
 ) -> Result<(), crate::message::ConnectionError> {
     let frost_events = ch.events.clone();
     let setup = setup_frost_node(
@@ -301,7 +303,7 @@ pub(crate) async fn spawn_frost_node(
     )
     .await?;
 
-    let _node = setup.node;
+    let node = setup.node;
     let mut connect_rx = setup.connect_rx;
     let mut run_error_rx = setup.run_error_rx;
 
@@ -333,6 +335,9 @@ pub(crate) async fn spawn_frost_node(
         }
     }
 
+    if let Ok(mut guard) = node_out.lock() {
+        *guard = Some(node);
+    }
     Ok(())
 }
 
@@ -414,6 +419,60 @@ pub(crate) async fn frost_event_listener(
                             FrostNodeMsg::SignRequestRemoved(id),
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorContributionNeeded {
+                        session_id,
+                        policy,
+                        network,
+                        initiator_pubkey,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorContributionNeeded {
+                                session_id,
+                                policy,
+                                network,
+                                initiator_pubkey,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorContributed {
+                        session_id,
+                        share_index,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorContributed {
+                                session_id,
+                                share_index,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorReady { session_id },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorComplete {
+                        session_id,
+                        external_descriptor,
+                        internal_descriptor,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorComplete {
+                                session_id,
+                                external_descriptor,
+                                internal_descriptor,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorFailed { session_id, error },
+                        );
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -471,17 +530,19 @@ pub(crate) async fn frost_event_listener(
 }
 
 impl App {
-    pub(crate) fn drain_frost_events(&mut self) {
+    pub(crate) fn drain_frost_events(&mut self) -> iced::Task<Message> {
         let events: Vec<FrostNodeMsg> = {
             let Ok(mut queue) = self.frost_events.lock() else {
-                return;
+                return iced::Task::none();
             };
             queue.drain(..).collect()
         };
 
-        for event in events {
-            self.handle_frost_event(event);
-        }
+        let tasks: Vec<iced::Task<Message>> = events
+            .into_iter()
+            .map(|event| self.handle_frost_event(event))
+            .collect();
+        iced::Task::batch(tasks)
     }
 
     pub(crate) fn relay_screen_mut(&mut self) -> Option<&mut RelayScreen> {
@@ -492,7 +553,17 @@ impl App {
         }
     }
 
-    fn handle_frost_event(&mut self, event: FrostNodeMsg) {
+    fn update_wallet_setup(&mut self, session_id: &[u8; 32], f: impl FnOnce(&mut SetupState)) {
+        if let Screen::Wallet(ws) = &mut self.screen {
+            if let Some(setup) = &mut ws.setup {
+                if setup.session_id.as_ref() == Some(session_id) {
+                    f(setup);
+                }
+            }
+        }
+    }
+
+    fn handle_frost_event(&mut self, event: FrostNodeMsg) -> iced::Task<Message> {
         match event {
             FrostNodeMsg::PeerUpdate(peers) => {
                 self.frost_peers = peers.clone();
@@ -522,7 +593,142 @@ impl App {
                     s.status = status;
                 }
             }
+            FrostNodeMsg::DescriptorContributionNeeded {
+                session_id,
+                network,
+                initiator_pubkey,
+                ..
+            } => {
+                return self.handle_descriptor_contribution_needed(
+                    session_id,
+                    network,
+                    initiator_pubkey,
+                );
+            }
+            FrostNodeMsg::DescriptorReady { session_id } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
+                });
+            }
+            FrostNodeMsg::DescriptorContributed { session_id, .. } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    if let SetupPhase::Coordinating(DescriptorProgress::WaitingContributions {
+                        ref mut received,
+                        ..
+                    }) = setup.phase
+                    {
+                        *received += 1;
+                    }
+                });
+            }
+            FrostNodeMsg::DescriptorComplete {
+                session_id,
+                external_descriptor,
+                internal_descriptor,
+            } => {
+                self.handle_descriptor_complete(
+                    session_id,
+                    external_descriptor,
+                    internal_descriptor,
+                );
+            }
+            FrostNodeMsg::DescriptorFailed { session_id, error } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
+                });
+            }
         }
+        iced::Task::none()
+    }
+
+    fn handle_descriptor_contribution_needed(
+        &mut self,
+        session_id: [u8; 32],
+        network: String,
+        initiator_pubkey: nostr_sdk::PublicKey,
+    ) -> iced::Task<Message> {
+        let share = match &self.frost_last_share {
+            Some(s) => s.clone(),
+            None => return iced::Task::none(),
+        };
+
+        let node = match self.frost_node.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(node) = node else {
+            return iced::Task::none();
+        };
+
+        let keep_arc = self.keep.clone();
+        let net = network.clone();
+
+        iced::Task::perform(
+            async move {
+                let (xpub_str, fingerprint_str) = tokio::task::spawn_blocking({
+                    let keep_arc = keep_arc.clone();
+                    let net = net.clone();
+                    let group_pubkey = share.group_pubkey;
+                    let identifier = share.identifier;
+                    move || {
+                        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
+                            let share_pkg = keep
+                                .frost_get_share_by_index(&group_pubkey, identifier)
+                                .map_err(friendly_err)?;
+                            let key_package = share_pkg.key_package().map_err(friendly_err)?;
+                            let signing_share = key_package.signing_share();
+                            let signing_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+                                signing_share
+                                    .serialize()
+                                    .as_slice()
+                                    .try_into()
+                                    .map_err(|_| "Invalid signing share length".to_string())?,
+                            );
+                            let bitcoin_network = match net.as_str() {
+                                "bitcoin" => bitcoin::Network::Bitcoin,
+                                "testnet" => bitcoin::Network::Testnet,
+                                "signet" => bitcoin::Network::Signet,
+                                "regtest" => bitcoin::Network::Regtest,
+                                _ => bitcoin::Network::Signet,
+                            };
+                            let derivation = keep_bitcoin::AddressDerivation::new(
+                                &*signing_bytes,
+                                bitcoin_network,
+                            )
+                            .map_err(|e| format!("{e}"))?;
+                            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
+                            let fingerprint = derivation
+                                .master_fingerprint()
+                                .map_err(|e| format!("{e}"))?;
+                            Ok((xpub.to_string(), fingerprint.to_string()))
+                        })
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                node.contribute_descriptor(
+                    session_id,
+                    &initiator_pubkey,
+                    &xpub_str,
+                    &fingerprint_str,
+                )
+                .await
+                .map_err(|e| format!("{e}"))?;
+
+                Ok::<(), String>(())
+            },
+            move |result| {
+                if let Err(e) = result {
+                    Message::WalletDescriptorProgress(DescriptorProgress::Failed(e))
+                } else {
+                    Message::WalletDescriptorProgress(DescriptorProgress::WaitingContributions {
+                        received: 0,
+                        expected: 0,
+                    })
+                }
+            },
+        )
     }
 
     pub(crate) fn handle_connect_relay(&mut self) -> iced::Task<Message> {
@@ -581,6 +787,7 @@ impl App {
                 self.frost_channels(),
                 self.network_config(),
                 self.kill_switch.clone(),
+                self.frost_node.clone(),
             ),
             Message::ConnectRelayResult,
         )
@@ -597,6 +804,9 @@ impl App {
         self.pending_sign_display.clear();
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
+        if let Ok(mut guard) = self.frost_node.lock() {
+            *guard = None;
+        }
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
@@ -652,6 +862,7 @@ impl App {
                 self.frost_channels(),
                 self.network_config(),
                 self.kill_switch.clone(),
+                self.frost_node.clone(),
             ),
             Message::ConnectRelayResult,
         )
@@ -681,6 +892,74 @@ impl App {
         self.pending_sign_display.retain(|r| r.id != id);
         if let Some(s) = self.relay_screen_mut() {
             s.pending_requests.retain(|r| r.id != id);
+        }
+    }
+
+    fn handle_descriptor_complete(
+        &mut self,
+        session_id: [u8; 32],
+        external_descriptor: String,
+        internal_descriptor: String,
+    ) {
+        let Screen::Wallet(ws) = &self.screen else {
+            return;
+        };
+        let Some(setup) = ws.setup.as_ref() else {
+            return;
+        };
+        if setup.session_id.as_ref() != Some(&session_id) {
+            return;
+        }
+        let Some(group_pubkey) = setup
+            .selected_share
+            .and_then(|i| setup.shares.get(i))
+            .map(|sh| sh.group_pubkey)
+        else {
+            return;
+        };
+        let network = setup.network.clone();
+
+        let created_at = chrono::Utc::now().timestamp().max(0) as u64;
+        let descriptor = keep_core::WalletDescriptor {
+            group_pubkey,
+            external_descriptor: external_descriptor.clone(),
+            internal_descriptor: internal_descriptor.clone(),
+            network: network.clone(),
+            created_at,
+        };
+
+        let store_result = {
+            let guard = lock_keep(&self.keep);
+            match guard.as_ref() {
+                Some(keep) => keep
+                    .store_wallet_descriptor(&descriptor)
+                    .map_err(friendly_err),
+                None => Err("Keep not available".to_string()),
+            }
+        };
+
+        if let Screen::Wallet(ws) = &mut self.screen {
+            if let Some(setup) = &mut ws.setup {
+                if setup.session_id.as_ref() == Some(&session_id) {
+                    match store_result {
+                        Ok(()) => {
+                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
+                            let entry = crate::screen::wallet::WalletEntry {
+                                group_pubkey,
+                                group_hex: hex::encode(group_pubkey),
+                                external_descriptor,
+                                internal_descriptor,
+                                network,
+                                created_at,
+                            };
+                            ws.descriptors.push(entry);
+                        }
+                        Err(e) => {
+                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
+                        }
+                    }
+                }
+            }
         }
     }
 

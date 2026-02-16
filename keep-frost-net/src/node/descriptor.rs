@@ -502,4 +502,8 @@ impl KfpNode {
 
         Ok(())
     }
+
+    pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
+        self.descriptor_sessions.write().remove_session(session_id);
+    }
 }
