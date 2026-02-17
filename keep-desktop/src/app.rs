@@ -1274,25 +1274,25 @@ impl App {
             }
             Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
             Message::WalletSessionStarted(result) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    match result {
-                        Ok(session_id) => {
+                match result {
+                    Ok((session_id, group_pubkey, network)) => {
+                        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                            &mut self.screen
+                        {
                             s.session_id = Some(session_id);
-                            if let Some(group_pubkey) = s
-                                .selected_share
-                                .and_then(|i| s.shares.get(i))
-                                .map(|sh| sh.group_pubkey)
-                            {
-                                self.active_coordinations.insert(
-                                    session_id,
-                                    ActiveCoordination {
-                                        group_pubkey,
-                                        network: s.network.clone(),
-                                    },
-                                );
-                            }
                         }
-                        Err(e) => {
+                        self.active_coordinations.insert(
+                            session_id,
+                            ActiveCoordination {
+                                group_pubkey,
+                                network,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                            &mut self.screen
+                        {
                             s.phase =
                                 SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
                             s.error = Some(e);
@@ -1413,6 +1413,7 @@ impl App {
 
         let keep_arc = self.keep.clone();
         let net = network.clone();
+        let group_pubkey = share.group_pubkey;
 
         Task::perform(
             async move {
@@ -1429,7 +1430,7 @@ impl App {
                     .await
                     .map_err(|e| format!("{e}"))?;
 
-                Ok::<[u8; 32], String>(session_id)
+                Ok::<([u8; 32], [u8; 32], String), String>((session_id, group_pubkey, net))
             },
             Message::WalletSessionStarted,
         )

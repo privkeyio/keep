@@ -15,7 +15,8 @@ use zeroize::Zeroizing;
 use keep_core::Keep;
 
 use crate::app::{
-    friendly_err, lock_keep, with_keep_blocking, App, ToastKind, MAX_PENDING_REQUESTS,
+    friendly_err, lock_keep, with_keep_blocking, ActiveCoordination, App, ToastKind,
+    MAX_PENDING_REQUESTS,
     MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS,
     RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
 };
@@ -703,6 +704,14 @@ impl App {
         let Some(node) = self.get_frost_node() else {
             return iced::Task::none();
         };
+
+        self.active_coordinations.insert(
+            session_id,
+            ActiveCoordination {
+                group_pubkey: share.group_pubkey,
+                network: network.clone(),
+            },
+        );
 
         let keep_arc = self.keep.clone();
 

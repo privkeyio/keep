@@ -198,7 +198,7 @@ pub enum Message {
     WalletRemoveTier(usize),
     WalletBeginCoordination,
     WalletCancelSetup,
-    WalletSessionStarted(Result<[u8; 32], String>),
+    WalletSessionStarted(Result<([u8; 32], [u8; 32], String), String>),
     WalletDescriptorProgress(DescriptorProgress),
     // Relay / FROST
     RelayUrlChanged(String),
