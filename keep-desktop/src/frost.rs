@@ -91,9 +91,9 @@ pub(crate) async fn derive_xpub(
                 .map_err(friendly_err)?;
             let key_package = share_pkg.key_package().map_err(friendly_err)?;
             let signing_share = key_package.signing_share();
+            let serialized = Zeroizing::new(signing_share.serialize());
             let signing_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-                signing_share
-                    .serialize()
+                serialized
                     .as_slice()
                     .try_into()
                     .map_err(|_| "Invalid signing share length".to_string())?,

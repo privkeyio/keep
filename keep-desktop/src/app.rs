@@ -1280,14 +1280,14 @@ impl App {
                             &mut self.screen
                         {
                             s.session_id = Some(session_id);
+                            self.active_coordinations.insert(
+                                session_id,
+                                ActiveCoordination {
+                                    group_pubkey,
+                                    network,
+                                },
+                            );
                         }
-                        self.active_coordinations.insert(
-                            session_id,
-                            ActiveCoordination {
-                                group_pubkey,
-                                network,
-                            },
-                        );
                     }
                     Err(e) => {
                         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
