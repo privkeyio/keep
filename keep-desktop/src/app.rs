@@ -266,14 +266,21 @@ fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::CertificatePin
         serde_json::from_str(&contents).unwrap_or_default();
     let mut pins = keep_frost_net::CertificatePinSet::new();
     for (hostname, hex_hash) in map {
-        let Ok(bytes) = hex::decode(&hex_hash) else { continue };
-        let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else { continue };
+        let Ok(bytes) = hex::decode(&hex_hash) else {
+            continue;
+        };
+        let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+            continue;
+        };
         pins.add_pin(hostname, hash);
     }
     pins
 }
 
-pub(crate) fn save_cert_pins(keep_path: &std::path::Path, pins: &keep_frost_net::CertificatePinSet) {
+pub(crate) fn save_cert_pins(
+    keep_path: &std::path::Path,
+    pins: &keep_frost_net::CertificatePinSet,
+) {
     let path = cert_pins_path(keep_path);
     let map: std::collections::HashMap<&String, String> = pins
         .pins()
@@ -2516,10 +2523,7 @@ impl App {
                     save_cert_pins(&self.keep_path, &pins);
                 }
                 self.sync_cert_pins_to_screen();
-                self.set_toast(
-                    format!("Cleared pin for {hostname}"),
-                    ToastKind::Success,
-                );
+                self.set_toast(format!("Cleared pin for {hostname}"), ToastKind::Success);
             }
             Message::CertPinClearAll => {
                 if let Ok(mut pins) = self.certificate_pins.lock() {

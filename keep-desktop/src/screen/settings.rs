@@ -90,7 +90,10 @@ impl SettingsScreen {
             content = content.push(self.tray_card());
         }
 
-        content = content.push(proxy_card).push(cert_pins_card).push(info_card);
+        content = content
+            .push(proxy_card)
+            .push(cert_pins_card)
+            .push(info_card);
 
         scrollable(content)
             .width(Length::Fill)

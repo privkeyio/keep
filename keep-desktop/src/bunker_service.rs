@@ -404,12 +404,8 @@ impl App {
 
         Task::perform(
             async move {
-                crate::frost::verify_relay_certificates(
-                    &relay_urls,
-                    &cert_pins,
-                    &cert_pins_path,
-                )
-                .await?;
+                crate::frost::verify_relay_certificates(&relay_urls, &cert_pins, &cert_pins_path)
+                    .await?;
 
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
