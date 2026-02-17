@@ -83,9 +83,7 @@ impl ScannerScreen {
                     let frames: Option<Vec<String>> = (0..total)
                         .map(|i| self.collected_frames.get(&i).cloned())
                         .collect();
-                    let Some(frames) = frames else {
-                        return None;
-                    };
+                    let frames = frames?;
                     match keep_core::frost::ShareExport::from_animated_frames(&frames) {
                         Ok(export) => {
                             return export.to_bech32().or_else(|_| export.to_json()).ok();
