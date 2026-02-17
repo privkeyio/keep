@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -105,6 +105,11 @@ pub struct Toast {
     pub kind: ToastKind,
 }
 
+pub(crate) struct ActiveCoordination {
+    pub group_pubkey: [u8; 32],
+    pub network: String,
+}
+
 pub struct App {
     pub(crate) keep: Arc<Mutex<Option<Keep>>>,
     pub(crate) keep_path: PathBuf,
@@ -148,6 +153,7 @@ pub struct App {
     pub(crate) pin_mismatch: Option<crate::message::PinMismatchInfo>,
     pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
+    pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
 }
 
 pub(crate) fn lock_keep(
@@ -522,6 +528,7 @@ impl App {
             tray_last_connected: false,
             tray_last_bunker: false,
             scanner_rx: None,
+            active_coordinations: HashMap::new(),
             settings,
             kill_switch,
             tray,
@@ -1269,7 +1276,22 @@ impl App {
             Message::WalletSessionStarted(result) => {
                 if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
                     match result {
-                        Ok(session_id) => s.session_id = Some(session_id),
+                        Ok(session_id) => {
+                            s.session_id = Some(session_id);
+                            if let Some(group_pubkey) = s
+                                .selected_share
+                                .and_then(|i| s.shares.get(i))
+                                .map(|sh| sh.group_pubkey)
+                            {
+                                self.active_coordinations.insert(
+                                    session_id,
+                                    ActiveCoordination {
+                                        group_pubkey,
+                                        network: s.network.clone(),
+                                    },
+                                );
+                            }
+                        }
                         Err(e) => {
                             s.phase =
                                 SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
@@ -1284,6 +1306,7 @@ impl App {
                     let session_id = s.setup.as_ref().and_then(|st| st.session_id);
                     s.setup = None;
                     if let Some(sid) = session_id {
+                        self.active_coordinations.remove(&sid);
                         if let Some(node) = self.get_frost_node() {
                             node.cancel_descriptor_session(&sid);
                         }
@@ -3124,6 +3147,7 @@ impl App {
             tray_last_connected: false,
             tray_last_bunker: false,
             scanner_rx: None,
+            active_coordinations: HashMap::new(),
             settings,
             kill_switch,
             tray: None,

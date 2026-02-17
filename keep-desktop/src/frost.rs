@@ -681,6 +681,7 @@ impl App {
                 );
             }
             FrostNodeMsg::DescriptorFailed { session_id, error } => {
+                self.active_coordinations.remove(&session_id);
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
                 });
@@ -901,25 +902,11 @@ impl App {
         external_descriptor: String,
         internal_descriptor: String,
     ) {
-        let (group_pubkey, network) = {
-            let Screen::Wallet(ws) = &self.screen else {
-                return;
-            };
-            let Some(setup) = ws.setup.as_ref() else {
-                return;
-            };
-            if setup.session_id.as_ref() != Some(&session_id) {
-                return;
-            }
-            let Some(group_pubkey) = setup
-                .selected_share
-                .and_then(|i| setup.shares.get(i))
-                .map(|sh| sh.group_pubkey)
-            else {
-                return;
-            };
-            (group_pubkey, setup.network.clone())
+        let Some(coord) = self.active_coordinations.remove(&session_id) else {
+            return;
         };
+        let group_pubkey = coord.group_pubkey;
+        let network = coord.network;
 
         let created_at = chrono::Utc::now().timestamp().max(0) as u64;
         let descriptor = keep_core::WalletDescriptor {
@@ -940,15 +927,21 @@ impl App {
             }
         };
 
-        let Screen::Wallet(ws) = &mut self.screen else {
-            return;
-        };
-        let Some(setup) = &mut ws.setup else {
-            return;
-        };
-        match store_result {
-            Ok(()) => {
-                setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
+        if let Screen::Wallet(ws) = &mut self.screen {
+            if let Some(setup) = &mut ws.setup {
+                if setup.session_id.as_ref() == Some(&session_id) {
+                    match &store_result {
+                        Ok(()) => {
+                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
+                        }
+                        Err(e) => {
+                            setup.phase =
+                                SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
+                        }
+                    }
+                }
+            }
+            if store_result.is_ok() {
                 ws.descriptors.push(WalletEntry {
                     group_pubkey,
                     group_hex: hex::encode(group_pubkey),
@@ -957,9 +950,6 @@ impl App {
                     network,
                     created_at,
                 });
-            }
-            Err(e) => {
-                setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
             }
         }
     }
