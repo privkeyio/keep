@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-namespace keep_mobile {};
+namespace keep_mobile {
+    [Throws=KeepMobileError]
+    ParsedBunkerUrl parse_bunker_url(string url);
+};
 
 [Error]
 interface KeepMobileError {
@@ -220,6 +223,12 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void clear_certificate_pin(string hostname);
+};
+
+dictionary ParsedBunkerUrl {
+    string pubkey;
+    sequence<string> relays;
+    string? secret;
 };
 
 enum BunkerStatus {
