@@ -61,7 +61,15 @@ impl ScannerScreen {
             ) {
                 let idx = f as usize;
                 let total = t as usize;
-                self.total_expected = Some(total);
+                match self.total_expected {
+                    None => self.total_expected = Some(total),
+                    Some(existing) if existing != total => {
+                        self.collected_frames.clear();
+                        self.total_expected = Some(total);
+                        self.status = ScannerStatus::CollectingFrames { got: 0, total };
+                    }
+                    _ => {}
+                }
                 self.collected_frames.insert(idx, trimmed.to_string());
                 self.status = ScannerStatus::CollectingFrames {
                     got: self.collected_frames.len(),

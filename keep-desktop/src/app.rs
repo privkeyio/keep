@@ -1082,7 +1082,15 @@ impl App {
                             s.stop_camera();
                             self.scanner_rx = None;
                             let mut import = ImportScreen::new();
-                            let mode = ImportScreen::detect_mode(result.trim());
+                            let trimmed = result.trim();
+                            let mode = ImportScreen::detect_mode(trimmed);
+                            import.npub_preview = if mode == ImportMode::Nsec {
+                                keep_core::keys::NostrKeypair::from_nsec(trimmed)
+                                    .ok()
+                                    .map(|kp| kp.to_npub())
+                            } else {
+                                None
+                            };
                             import.mode = mode;
                             import.data = Zeroizing::new(result);
                             self.screen = Screen::Import(import);
