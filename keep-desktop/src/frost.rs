@@ -16,9 +16,9 @@ use keep_core::Keep;
 
 use crate::app::{
     friendly_err, lock_keep, with_keep_blocking, ActiveCoordination, App, ToastKind,
-    MAX_PENDING_REQUESTS,
-    MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS,
-    RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
+    MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER,
+    RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS,
+    SIGNING_RESPONSE_TIMEOUT,
 };
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
 use crate::screen::relay::RelayScreen;
