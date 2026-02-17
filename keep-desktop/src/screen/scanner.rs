@@ -61,6 +61,9 @@ impl ScannerScreen {
             ) {
                 let idx = f as usize;
                 let total = t as usize;
+                if idx >= total {
+                    return None;
+                }
                 match self.total_expected {
                     None => self.total_expected = Some(total),
                     Some(existing) if existing != total => {
@@ -174,10 +177,7 @@ impl ScannerScreen {
     }
 }
 
-pub fn start_camera(
-    active: Arc<AtomicBool>,
-    tx: tokio::sync::mpsc::UnboundedSender<CameraEvent>,
-) {
+pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSender<CameraEvent>) {
     std::thread::spawn(move || {
         use nokhwa::pixel_format::RgbFormat;
         use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};

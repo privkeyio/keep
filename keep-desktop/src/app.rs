@@ -1259,9 +1259,7 @@ impl App {
         }
 
         if matches!(self.screen, Screen::Scanner(_)) {
-            subs.push(
-                iced::time::every(Duration::from_millis(33)).map(|_| Message::ScannerPoll),
-            );
+            subs.push(iced::time::every(Duration::from_millis(33)).map(|_| Message::ScannerPoll));
         }
 
         if let Screen::Export(s) = &self.screen {
