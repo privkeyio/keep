@@ -288,7 +288,6 @@ pub enum FrostNodeMsg {
     StatusChanged(ConnectionStatus),
     DescriptorContributionNeeded {
         session_id: [u8; 32],
-        policy: keep_frost_net::WalletPolicy,
         network: String,
         initiator_pubkey: nostr_sdk::PublicKey,
     },

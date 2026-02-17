@@ -98,7 +98,7 @@ pub(crate) async fn derive_xpub(
                     .map_err(|_| "Invalid signing share length".to_string())?,
             );
             let bitcoin_network = parse_bitcoin_network(&network)?;
-            let derivation = keep_bitcoin::AddressDerivation::new(&*signing_bytes, bitcoin_network)
+            let derivation = keep_bitcoin::AddressDerivation::new(&signing_bytes, bitcoin_network)
                 .map_err(|e| format!("{e}"))?;
             let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
             let fingerprint = derivation
@@ -325,6 +325,7 @@ pub(crate) async fn setup_frost_node(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_frost_node(
     keep_arc: Arc<Mutex<Option<Keep>>>,
     keep_path: std::path::PathBuf,
@@ -465,15 +466,14 @@ pub(crate) async fn frost_event_listener(
                     }
                     Ok(KfpNodeEvent::DescriptorContributionNeeded {
                         session_id,
-                        policy,
                         network,
                         initiator_pubkey,
+                        ..
                     }) => {
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorContributionNeeded {
                                 session_id,
-                                policy,
                                 network,
                                 initiator_pubkey,
                             },
