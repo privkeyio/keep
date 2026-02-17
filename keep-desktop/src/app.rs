@@ -1819,9 +1819,8 @@ impl App {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let mut secret = keep_core::keys::nip49::decrypt(data.trim(), &password)
                             .map_err(friendly_err)?;
-                        let keypair =
-                            keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret)
-                                .map_err(friendly_err)?;
+                        let keypair = keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret)
+                            .map_err(friendly_err)?;
                         let nsec = zeroize::Zeroizing::new(keypair.to_nsec());
                         keep.import_nsec(&nsec, &name).map_err(friendly_err)?;
                         let shares = collect_shares(keep)?;
@@ -1864,10 +1863,11 @@ impl App {
             Message::GenerateNcryptsec => {
                 let (pubkey_hex, password) = match &mut self.screen {
                     Screen::ExportNcryptsec(s) => {
-                        if s.loading
-                            || s.password.chars().count() < MIN_EXPORT_PASSPHRASE_LEN
-                            || *s.password != *s.confirm_password
-                        {
+                        if s.loading || s.password.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
+                            return Task::none();
+                        }
+                        if *s.password != *s.confirm_password {
+                            s.error = Some("Passphrases do not match".into());
                             return Task::none();
                         }
                         s.loading = true;
