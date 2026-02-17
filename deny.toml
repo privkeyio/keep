@@ -27,6 +27,7 @@ allow = [
     "OpenSSL",
     "BSL-1.0",
     "NCSA",
+    "IJG",
 ]
 
 [bans]
