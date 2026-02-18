@@ -202,9 +202,7 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
         let _ = tx.send(CameraEvent::Ready);
 
         let hints = rxing::DecodeHints {
-            PossibleFormats: Some(
-                [rxing::BarcodeFormat::QR_CODE].into_iter().collect(),
-            ),
+            PossibleFormats: Some([rxing::BarcodeFormat::QR_CODE].into_iter().collect()),
             TryHarder: Some(true),
             ..Default::default()
         };
@@ -228,9 +226,8 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
             let dynamic = ::image::DynamicImage::from(rgb_image);
 
             let luma = dynamic.to_luma8();
-            let source = rxing::BufferedImageLuminanceSource::new(
-                ::image::DynamicImage::from(luma),
-            );
+            let source =
+                rxing::BufferedImageLuminanceSource::new(::image::DynamicImage::from(luma));
             let binarizer = rxing::common::HybridBinarizer::new(source);
             let mut bitmap = rxing::BinaryBitmap::new(binarizer);
             let decoded = rxing::MultiFormatReader::default()
