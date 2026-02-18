@@ -29,7 +29,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn truncated_npub(&self) -> String {
-        if self.npub.len() <= 20 {
+        if !self.npub.is_ascii() || self.npub.len() <= 20 {
             return self.npub.clone();
         }
         format!(
@@ -133,6 +133,12 @@ pub enum Message {
     ImportNsec,
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
     ImportNsecResult(Result<(Vec<ShareEntry>, String), String>),
+
+    // Scanner
+    ScannerOpen,
+    ScannerClose,
+    ScannerRetry,
+    ScannerPoll,
 
     // Clipboard (public data, no auto-clear)
     CopyNpub(String),
@@ -395,6 +401,10 @@ impl fmt::Debug for Message {
                 .field(v)
                 .finish(),
             Self::WindowCloseRequested(_) => f.write_str("WindowCloseRequested"),
+            Self::ScannerOpen => f.write_str("ScannerOpen"),
+            Self::ScannerClose => f.write_str("ScannerClose"),
+            Self::ScannerRetry => f.write_str("ScannerRetry"),
+            Self::ScannerPoll => f.write_str("ScannerPoll"),
             Self::Tick => f.write_str("Tick"),
         }
     }

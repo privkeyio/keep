@@ -20,7 +20,8 @@ pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
 pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
 pub use error::KeepMobileError;
 pub use nip46::{
-    BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent, BunkerStatus,
+    parse_bunker_url, BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent,
+    BunkerStatus, ParsedBunkerUrl,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};

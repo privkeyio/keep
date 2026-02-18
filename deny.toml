@@ -5,6 +5,7 @@ all-features = true
 [advisories]
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained but stable; used in keep-core" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk3 bindings unmaintained; no migration path for tray-icon ecosystem" },
 ]
 unmaintained = "workspace"
 
@@ -26,6 +27,8 @@ allow = [
     "CDLA-Permissive-2.0",
     "OpenSSL",
     "BSL-1.0",
+    "NCSA",
+    "IJG",
 ]
 
 [bans]

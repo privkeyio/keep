@@ -139,13 +139,20 @@ pub fn parse_bunker_url(
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "relay" => {
-                if relays.len() < MAX_RELAYS && validate_relay_url(&value).is_ok() {
-                    relays.push(normalize_relay_url(&value));
+                if relays.len() >= MAX_RELAYS {
+                    continue;
                 }
+                validate_relay_url(&value)
+                    .map_err(|e| format!("Invalid relay URL '{value}': {e}"))?;
+                relays.push(normalize_relay_url(&value));
             }
             "secret" => secret = Some(value.to_string()),
             _ => {}
         }
+    }
+
+    if relays.is_empty() {
+        return Err("No relay URLs found in bunker URL".into());
     }
 
     Ok((pubkey, relays, secret))
@@ -490,6 +497,48 @@ mod tests {
         let url = generate_bunker_url(&pubkey, &[], Some("mysecret"));
         assert!(url.contains("?secret="));
         assert!(!url.contains("relay="));
+    }
+
+    #[test]
+    fn test_parse_bunker_url_percent_encoded_relays() {
+        let url = "bunker://bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de?relay=wss%3A%2F%2Frelay.damus.io&relay=wss%3A%2F%2Frelay.nsec.app";
+        let (pubkey, relays, secret) = parse_bunker_url(url).unwrap();
+        assert_eq!(
+            pubkey.to_hex(),
+            "bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de"
+        );
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0], "wss://relay.damus.io/");
+        assert_eq!(relays[1], "wss://relay.nsec.app/");
+        assert!(secret.is_none());
+    }
+
+    #[test]
+    fn test_parse_bunker_url_unencoded_relays() {
+        let url = "bunker://bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de?relay=wss://relay.damus.io&relay=wss://relay.nsec.app";
+        let (_, relays, _) = parse_bunker_url(url).unwrap();
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0], "wss://relay.damus.io/");
+        assert_eq!(relays[1], "wss://relay.nsec.app/");
+    }
+
+    #[test]
+    fn test_parse_bunker_url_rejects_ws_relay() {
+        let keys = Keys::generate();
+        let url = format!(
+            "bunker://{}?relay=ws%3A%2F%2Frelay.example.com",
+            keys.public_key().to_hex()
+        );
+        let err = parse_bunker_url(&url).unwrap_err();
+        assert!(err.contains("Must use wss://"));
+    }
+
+    #[test]
+    fn test_parse_bunker_url_rejects_no_relays() {
+        let keys = Keys::generate();
+        let url = format!("bunker://{}?secret=abc123", keys.public_key().to_hex());
+        let err = parse_bunker_url(&url).unwrap_err();
+        assert!(err.contains("No relay URLs found"));
     }
 
     #[test]

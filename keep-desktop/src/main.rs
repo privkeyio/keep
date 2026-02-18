@@ -23,6 +23,9 @@ fn main() -> iced::Result {
 
     tracing_subscriber::fmt::init();
 
+    #[cfg(target_os = "linux")]
+    gtk::init().expect("Failed to initialize GTK");
+
     // NOTE: On macOS, URL-scheme invocations (application:openURLs:) are not
     // captured because implementing NSApplicationDelegate requires unsafe code
     // (forbidden by this crate). Launch with the nostrconnect:// URI as a CLI

@@ -165,13 +165,8 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 static NOTIFICATION_RATE: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
 
-fn check_rate_limit() -> bool {
-    let mut guard = match NOTIFICATION_RATE.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let now = Instant::now();
-    let (start, count) = guard.get_or_insert((now, 0));
+fn check_rate_limit_inner(state: &mut Option<(Instant, usize)>, now: Instant) -> bool {
+    let (start, count) = state.get_or_insert((now, 0));
     if now.duration_since(*start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
         *start = now;
         *count = 1;
@@ -182,6 +177,14 @@ fn check_rate_limit() -> bool {
     }
     *count += 1;
     true
+}
+
+fn check_rate_limit() -> bool {
+    let mut guard = match NOTIFICATION_RATE.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    check_rate_limit_inner(&mut guard, Instant::now())
 }
 
 fn send_notification(summary: &str, body: &str, show_tx: Option<&mpsc::Sender<TrayEvent>>) {
@@ -357,22 +360,24 @@ mod tests {
 
     #[test]
     fn rate_limit_allows_within_window() {
-        *NOTIFICATION_RATE.lock().unwrap() = None;
+        let mut state = None;
+        let now = Instant::now();
         for _ in 0..MAX_NOTIFICATIONS_PER_WINDOW {
-            assert!(check_rate_limit());
+            assert!(check_rate_limit_inner(&mut state, now));
         }
     }
 
     #[test]
     fn rate_limit_blocks_over_limit() {
-        *NOTIFICATION_RATE.lock().unwrap() = Some((Instant::now(), MAX_NOTIFICATIONS_PER_WINDOW));
-        assert!(!check_rate_limit());
+        let now = Instant::now();
+        let mut state = Some((now, MAX_NOTIFICATIONS_PER_WINDOW));
+        assert!(!check_rate_limit_inner(&mut state, now));
     }
 
     #[test]
     fn rate_limit_resets_after_window() {
         let old = Instant::now() - std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS + 1);
-        *NOTIFICATION_RATE.lock().unwrap() = Some((old, MAX_NOTIFICATIONS_PER_WINDOW));
-        assert!(check_rate_limit());
+        let mut state = Some((old, MAX_NOTIFICATIONS_PER_WINDOW));
+        assert!(check_rate_limit_inner(&mut state, Instant::now()));
     }
 }

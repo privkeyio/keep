@@ -39,6 +39,24 @@ pub struct BunkerApprovalRequest {
     pub requested_permissions: Option<String>,
 }
 
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ParsedBunkerUrl {
+    pub pubkey: String,
+    pub relays: Vec<String>,
+    pub secret: Option<String>,
+}
+
+#[uniffi::export]
+pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
+    let (pubkey, relays, secret) = keep_nip46::parse_bunker_url(url)
+        .map_err(|e| KeepMobileError::InvalidRelayUrl { msg: e })?;
+    Ok(ParsedBunkerUrl {
+        pubkey: pubkey.to_hex(),
+        relays,
+        secret,
+    })
+}
+
 #[uniffi::export(with_foreign)]
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);

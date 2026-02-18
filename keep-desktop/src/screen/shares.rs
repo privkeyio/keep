@@ -51,7 +51,7 @@ impl ShareEntry {
     }
 
     pub fn truncated_npub(&self) -> String {
-        if self.npub.len() <= 20 {
+        if !self.npub.is_ascii() || self.npub.len() <= 20 {
             return self.npub.clone();
         }
         format!(

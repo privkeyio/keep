@@ -352,6 +352,13 @@ impl SettingsScreen {
                     theme::muted(env!("CARGO_PKG_VERSION")),
                 ]
                 .spacing(theme::space::XS),
+                column![
+                    theme::label("Third-party notices"),
+                    theme::muted(
+                        "This software is based in part on the work of the Independent JPEG Group.",
+                    ),
+                ]
+                .spacing(theme::space::XS),
             ]
             .spacing(theme::space::MD),
         )
