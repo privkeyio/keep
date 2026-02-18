@@ -58,7 +58,9 @@ impl ScannerScreen {
     pub fn process_qr_content(&mut self, content: &str) -> Option<String> {
         let trimmed = content.trim();
 
-        if is_valid_bech32_payload("kshare1", trimmed) || is_valid_bech32_payload("nsec1", trimmed)
+        if is_valid_bech32_payload("kshare1", trimmed)
+            || is_valid_bech32_payload("nsec1", trimmed)
+            || is_valid_bech32_payload("ncryptsec1", trimmed)
         {
             return Some(trimmed.to_string());
         }
@@ -189,7 +191,7 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::Sender<Camer
         let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
             nokhwa::utils::CameraFormat::new(
                 Resolution::new(640, 480),
-                nokhwa::utils::FrameFormat::RAWRGB,
+                nokhwa::utils::FrameFormat::MJPEG,
                 30,
             ),
         ));
