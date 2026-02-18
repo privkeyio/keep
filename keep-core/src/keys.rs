@@ -5,6 +5,7 @@
 use bech32::{Bech32, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::crypto::{self, MlockedBox};
 use crate::error::{CryptoError, KeepError, Result};
@@ -52,6 +53,7 @@ impl NostrKeypair {
                     public_key: verifying_key.to_bytes().into(),
                 });
             }
+            secret_bytes.zeroize();
         }
         Err(CryptoError::invalid_key("failed to generate valid keypair after 64 attempts").into())
     }
@@ -87,18 +89,21 @@ impl NostrKeypair {
     ///
     /// Returns [`KeepError::InvalidNsec`] if the string is not a valid nsec.
     pub fn from_nsec(nsec: &str) -> Result<Self> {
-        let (hrp, data) = bech32::decode(nsec).map_err(|_| KeepError::InvalidNsec)?;
+        let (hrp, mut data) = bech32::decode(nsec).map_err(|_| KeepError::InvalidNsec)?;
 
         if hrp.as_str() != "nsec" {
+            data.zeroize();
             return Err(KeepError::InvalidNsec);
         }
 
         if data.len() != 32 {
+            data.zeroize();
             return Err(KeepError::InvalidNsec);
         }
 
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&data);
+        data.zeroize();
         Self::from_secret_bytes(&mut secret)
     }
 
@@ -273,6 +278,11 @@ pub mod nip49 {
 
     /// Encrypt a secret key with a password, returning an ncryptsec string.
     pub fn encrypt(secret_key: &[u8; 32], password: &str, log_n: Option<u8>) -> Result<String> {
+        if password.is_empty() {
+            return Err(KeepError::InvalidInput(
+                "ncryptsec password must not be empty".into(),
+            ));
+        }
         let log_n = log_n.unwrap_or(DEFAULT_LOG_N);
         if log_n > MAX_LOG_N {
             return Err(KeepError::InvalidInput(format!(
@@ -285,7 +295,7 @@ pub mod nip49 {
         let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
 
         let nonce: [u8; 24] = entropy::random_bytes();
-        let key_security_byte: u8 = 0x00;
+        let key_security_byte: u8 = 0x02;
 
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
         let payload = Payload {
@@ -311,14 +321,16 @@ pub mod nip49 {
 
     /// Decrypt an ncryptsec string with a password, returning the secret key.
     pub fn decrypt(ncryptsec: &str, password: &str) -> Result<Zeroizing<[u8; 32]>> {
-        let (hrp, data) = bech32::decode(ncryptsec)
+        let (hrp, mut data) = bech32::decode(ncryptsec)
             .map_err(|_| KeepError::InvalidInput("invalid bech32".into()))?;
 
         if hrp.as_str() != "ncryptsec" {
+            data.zeroize();
             return Err(KeepError::InvalidInput("not an ncryptsec string".into()));
         }
 
         if data.len() != 91 {
+            data.zeroize();
             return Err(KeepError::InvalidInput(format!(
                 "invalid ncryptsec length: expected 91, got {}",
                 data.len()
@@ -327,6 +339,7 @@ pub mod nip49 {
 
         let version = data[0];
         if version != VERSION {
+            data.zeroize();
             return Err(KeepError::InvalidInput(format!(
                 "unsupported ncryptsec version: {version}"
             )));
@@ -334,6 +347,7 @@ pub mod nip49 {
 
         let log_n = data[1];
         if log_n > MAX_LOG_N {
+            data.zeroize();
             return Err(KeepError::InvalidInput(format!(
                 "ncryptsec log_n too large: {log_n} (max {MAX_LOG_N})"
             )));
@@ -345,14 +359,15 @@ pub mod nip49 {
             .try_into()
             .map_err(|_| CryptoError::decryption("invalid nonce"))?;
         let key_security_byte = data[42];
-        let ciphertext = &data[43..];
+        let ciphertext = data[43..].to_vec();
+        data.zeroize();
 
         let password_nfkc = Zeroizing::new(password.nfkc().collect::<String>());
         let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
 
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
         let payload = Payload {
-            msg: ciphertext,
+            msg: &ciphertext,
             aad: &[key_security_byte],
         };
         let mut plaintext = cipher

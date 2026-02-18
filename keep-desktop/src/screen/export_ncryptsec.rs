@@ -5,10 +5,9 @@ use iced::widget::{button, column, container, qr_code, row, text, text_input, Sp
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
+use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::message::Message;
 use crate::theme;
-
-const MIN_PASSWORD_LEN: usize = 15;
 
 fn password_strength(password: &str) -> (&'static str, iced::Color) {
     let len = password.chars().count();
@@ -172,7 +171,7 @@ impl ExportNcryptsecScreen {
                     .color(theme::color::TEXT_MUTED),
             );
 
-            let password_ok = self.password.chars().count() >= MIN_PASSWORD_LEN;
+            let password_ok = self.password.chars().count() >= MIN_EXPORT_PASSPHRASE_LEN;
             let passwords_match = *self.password == *self.confirm_password;
             let can_generate = password_ok && passwords_match;
 
@@ -188,7 +187,7 @@ impl ExportNcryptsecScreen {
                 if !password_ok {
                     content = content.push(
                         text(format!(
-                            "Password must be at least {MIN_PASSWORD_LEN} characters"
+                            "Password must be at least {MIN_EXPORT_PASSPHRASE_LEN} characters"
                         ))
                         .size(theme::size::BODY)
                         .color(theme::color::ERROR),

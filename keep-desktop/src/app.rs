@@ -1819,10 +1819,8 @@ impl App {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let mut secret = keep_core::keys::nip49::decrypt(data.trim(), &password)
                             .map_err(friendly_err)?;
-                        let keypair = keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret)
+                        keep.import_secret_bytes(&mut secret, &name)
                             .map_err(friendly_err)?;
-                        let nsec = zeroize::Zeroizing::new(keypair.to_nsec());
-                        keep.import_nsec(&nsec, &name).map_err(friendly_err)?;
                         let shares = collect_shares(keep)?;
                         Ok((shares, name))
                     })
