@@ -138,7 +138,7 @@ pub struct App {
     pub(crate) window_visible: bool,
     tray_last_connected: bool,
     tray_last_bunker: bool,
-    scanner_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::screen::scanner::CameraEvent>>,
+    scanner_rx: Option<tokio::sync::mpsc::Receiver<crate::screen::scanner::CameraEvent>>,
 }
 
 pub(crate) fn lock_keep(
@@ -1020,7 +1020,7 @@ impl App {
 
         let scanner = ScannerScreen::new();
         let active = scanner.camera_active.clone();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(3);
         scanner::start_camera(active, tx);
         self.scanner_rx = Some(rx);
         self.screen = Screen::Scanner(scanner);
@@ -1073,9 +1073,8 @@ impl App {
                     height,
                     decoded,
                 } => {
-                    s.frame_rgba = Some(rgba);
-                    s.frame_width = width;
-                    s.frame_height = height;
+                    s.frame_handle =
+                        Some(iced::widget::image::Handle::from_rgba(width, height, rgba));
 
                     if let Some(content) = decoded {
                         if let Some(result) = s.process_qr_content(&content) {
@@ -1274,6 +1273,7 @@ impl App {
     }
 
     fn do_lock(&mut self) -> Task<Message> {
+        self.stop_scanner();
         self.handle_disconnect_relay();
         self.stop_bunker();
 

@@ -29,8 +29,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn truncated_npub(&self) -> String {
-        debug_assert!(self.npub.is_ascii(), "npub must be ASCII (bech32)");
-        if self.npub.len() <= 20 {
+        if !self.npub.is_ascii() || self.npub.len() <= 20 {
             return self.npub.clone();
         }
         format!(

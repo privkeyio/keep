@@ -108,8 +108,7 @@ impl ImportScreen {
             match self.mode {
                 ImportMode::Nsec => {
                     if let Some(npub) = &self.npub_preview {
-                        debug_assert!(npub.is_ascii(), "npub must be ASCII (bech32)");
-                        let truncated = if npub.len() > 20 {
+                        let truncated = if npub.is_ascii() && npub.len() > 20 {
                             format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
                         } else {
                             npub.clone()

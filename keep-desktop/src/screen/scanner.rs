@@ -11,10 +11,20 @@ use iced::{Alignment, Element, Length};
 use crate::message::Message;
 use crate::theme;
 
+const MAX_SHARE_LENGTH: usize = 8192;
+const BECH32_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+fn is_valid_bech32_payload(prefix: &str, data: &str) -> bool {
+    data.len() <= MAX_SHARE_LENGTH
+        && data.starts_with(prefix)
+        && data[prefix.len()..]
+            .bytes()
+            .all(|b| BECH32_CHARSET.contains(&b))
+        && data.len() > prefix.len()
+}
+
 pub struct ScannerScreen {
-    pub frame_rgba: Option<Vec<u8>>,
-    pub frame_width: u32,
-    pub frame_height: u32,
+    pub frame_handle: Option<iced_image::Handle>,
     pub collected_frames: HashMap<usize, String>,
     pub total_expected: Option<usize>,
     pub status: ScannerStatus,
@@ -33,9 +43,7 @@ pub enum ScannerStatus {
 impl ScannerScreen {
     pub fn new() -> Self {
         Self {
-            frame_rgba: None,
-            frame_width: 0,
-            frame_height: 0,
+            frame_handle: None,
             collected_frames: HashMap::new(),
             total_expected: None,
             status: ScannerStatus::Initializing,
@@ -50,7 +58,8 @@ impl ScannerScreen {
     pub fn process_qr_content(&mut self, content: &str) -> Option<String> {
         let trimmed = content.trim();
 
-        if trimmed.starts_with("kshare1") || trimmed.starts_with("nsec1") {
+        if is_valid_bech32_payload("kshare1", trimmed) || is_valid_bech32_payload("nsec1", trimmed)
+        {
             return Some(trimmed.to_string());
         }
 
@@ -61,8 +70,8 @@ impl ScannerScreen {
                 parsed.get("d").and_then(|v| v.as_str()),
             ) {
                 const MAX_ANIMATED_FRAMES: usize = 100;
-                let idx = f as usize;
-                let total = t as usize;
+                let idx = usize::try_from(f).ok()?;
+                let total = usize::try_from(t).ok()?;
                 if total == 0 || total > MAX_ANIMATED_FRAMES || idx >= total {
                     return None;
                 }
@@ -142,22 +151,15 @@ impl ScannerScreen {
         let mut content = column![header, Space::new().height(theme::space::MD), status,]
             .spacing(theme::space::XS);
 
-        if let Some(rgba) = &self.frame_rgba {
-            if self.frame_width > 0 && self.frame_height > 0 {
-                let handle = iced_image::Handle::from_rgba(
-                    self.frame_width,
-                    self.frame_height,
-                    rgba.clone(),
-                );
-                let img = iced_image::Image::new(handle)
-                    .width(Length::Fixed(480.0))
-                    .height(Length::Fixed(360.0));
-                content = content.push(
-                    container(img)
-                        .center_x(Length::Fill)
-                        .padding(theme::space::SM),
-                );
-            }
+        if let Some(handle) = &self.frame_handle {
+            let img = iced_image::Image::new(handle.clone())
+                .width(Length::Fixed(480.0))
+                .height(Length::Fixed(360.0));
+            content = content.push(
+                container(img)
+                    .center_x(Length::Fill)
+                    .padding(theme::space::SM),
+            );
         }
 
         if matches!(self.status, ScannerStatus::Error(_)) {
@@ -177,29 +179,34 @@ impl ScannerScreen {
     }
 }
 
-pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSender<CameraEvent>) {
+pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::Sender<CameraEvent>) {
     std::thread::spawn(move || {
         use nokhwa::pixel_format::RgbFormat;
-        use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+        use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
         use nokhwa::Camera;
         use rxing::Reader;
 
-        let requested =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+            nokhwa::utils::CameraFormat::new(
+                Resolution::new(640, 480),
+                nokhwa::utils::FrameFormat::RAWRGB,
+                30,
+            ),
+        ));
         let mut camera = match Camera::new(CameraIndex::Index(0), requested) {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(CameraEvent::Error(format!("Camera open failed: {e}")));
+                let _ = tx.try_send(CameraEvent::Error(format!("Camera open failed: {e}")));
                 return;
             }
         };
 
         if let Err(e) = camera.open_stream() {
-            let _ = tx.send(CameraEvent::Error(format!("Camera stream failed: {e}")));
+            let _ = tx.try_send(CameraEvent::Error(format!("Camera stream failed: {e}")));
             return;
         }
 
-        let _ = tx.send(CameraEvent::Ready);
+        let _ = tx.try_send(CameraEvent::Ready);
 
         let hints = rxing::DecodeHints {
             PossibleFormats: Some([rxing::BarcodeFormat::QR_CODE].into_iter().collect()),
@@ -241,7 +248,7 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
                 .flat_map(|p| [p[0], p[1], p[2], 255])
                 .collect();
 
-            let _ = tx.send(CameraEvent::Frame {
+            let _ = tx.try_send(CameraEvent::Frame {
                 rgba,
                 width: w,
                 height: h,
