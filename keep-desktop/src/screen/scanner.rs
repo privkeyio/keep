@@ -26,6 +26,7 @@ pub enum ScannerStatus {
     Initializing,
     Scanning,
     CollectingFrames { got: usize, total: usize },
+    Unrecognized(String),
     Error(String),
 }
 
@@ -43,7 +44,7 @@ impl ScannerScreen {
     }
 
     pub fn stop_camera(&self) {
-        self.camera_active.store(false, Ordering::Relaxed);
+        self.camera_active.store(false, Ordering::Release);
     }
 
     pub fn process_qr_content(&mut self, content: &str) -> Option<String> {
@@ -59,9 +60,10 @@ impl ScannerScreen {
                 parsed.get("t").and_then(|v| v.as_u64()),
                 parsed.get("d").and_then(|v| v.as_str()),
             ) {
+                const MAX_ANIMATED_FRAMES: usize = 100;
                 let idx = f as usize;
                 let total = t as usize;
-                if idx >= total {
+                if total == 0 || total > MAX_ANIMATED_FRAMES || idx >= total {
                     return None;
                 }
                 match self.total_expected {
@@ -85,9 +87,7 @@ impl ScannerScreen {
                         .collect();
                     let frames = frames?;
                     match keep_core::frost::ShareExport::from_animated_frames(&frames) {
-                        Ok(export) => {
-                            return export.to_bech32().or_else(|_| export.to_json()).ok();
-                        }
+                        Ok(export) => return export.to_bech32().or_else(|_| export.to_json()).ok(),
                         Err(_) => {
                             self.collected_frames.clear();
                             self.total_expected = None;
@@ -103,6 +103,7 @@ impl ScannerScreen {
             }
         }
 
+        self.status = ScannerStatus::Unrecognized(content.chars().take(40).collect());
         None
     }
 
@@ -120,7 +121,7 @@ impl ScannerScreen {
             row![back_btn, Space::new().width(theme::space::SM), title].align_y(Alignment::Center);
 
         let status_color = match &self.status {
-            ScannerStatus::Error(_) => theme::color::ERROR,
+            ScannerStatus::Error(_) | ScannerStatus::Unrecognized(_) => theme::color::ERROR,
             _ => theme::color::TEXT_MUTED,
         };
 
@@ -130,6 +131,7 @@ impl ScannerScreen {
             ScannerStatus::CollectingFrames { got, total } => {
                 format!("Scanning animated QR: frame {got} of {total}")
             }
+            ScannerStatus::Unrecognized(s) => format!("Unrecognized QR: {s}..."),
             ScannerStatus::Error(e) => format!("Error: {e}"),
         };
 
@@ -180,6 +182,7 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
         use nokhwa::pixel_format::RgbFormat;
         use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
         use nokhwa::Camera;
+        use rxing::Reader;
 
         let requested =
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
@@ -198,7 +201,15 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
 
         let _ = tx.send(CameraEvent::Ready);
 
-        while active.load(Ordering::Relaxed) {
+        let hints = rxing::DecodeHints {
+            PossibleFormats: Some(
+                [rxing::BarcodeFormat::QR_CODE].into_iter().collect(),
+            ),
+            TryHarder: Some(true),
+            ..Default::default()
+        };
+
+        while active.load(Ordering::Acquire) {
             let buffer = match camera.frame() {
                 Ok(b) => b,
                 Err(_) => {
@@ -215,12 +226,17 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::UnboundedSen
             let (w, h) = (rgb_image.width(), rgb_image.height());
 
             let dynamic = ::image::DynamicImage::from(rgb_image);
-            let gray = dynamic.to_luma8();
-            let mut prepared = rqrr::PreparedImage::prepare(gray);
-            let grids = prepared.detect_grids();
-            let decoded = grids
-                .into_iter()
-                .find_map(|g| g.decode().ok().map(|(_, content)| content));
+
+            let luma = dynamic.to_luma8();
+            let source = rxing::BufferedImageLuminanceSource::new(
+                ::image::DynamicImage::from(luma),
+            );
+            let binarizer = rxing::common::HybridBinarizer::new(source);
+            let mut bitmap = rxing::BinaryBitmap::new(binarizer);
+            let decoded = rxing::MultiFormatReader::default()
+                .decode_with_hints(&mut bitmap, &hints)
+                .ok()
+                .map(|r| r.getText().to_string());
 
             let rgba: Vec<u8> = dynamic
                 .into_rgb8()

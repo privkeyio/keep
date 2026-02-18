@@ -251,6 +251,7 @@ dictionary BunkerApprovalRequest {
     string method;
     u32? event_kind;
     string? event_content;
+    string? requested_permissions;
 };
 
 [Trait, WithForeign]
