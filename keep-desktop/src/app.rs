@@ -2543,12 +2543,19 @@ impl App {
     fn handle_cert_pin_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::CertPinClear(hostname) => {
-                if let Ok(mut pins) = self.certificate_pins.lock() {
+                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     pins.remove_pin(&hostname);
                     save_cert_pins(&self.keep_path, &pins);
+                    true
+                } else {
+                    false
+                };
+                if ok {
+                    self.sync_cert_pins_to_screen();
+                    self.set_toast(format!("Cleared pin for {hostname}"), ToastKind::Success);
+                } else {
+                    self.set_toast("Failed to clear pin".into(), ToastKind::Error);
                 }
-                self.sync_cert_pins_to_screen();
-                self.set_toast(format!("Cleared pin for {hostname}"), ToastKind::Success);
             }
             Message::CertPinClearAllRequest => {
                 if let Screen::Settings(s) = &mut self.screen {
@@ -2561,15 +2568,22 @@ impl App {
                 }
             }
             Message::CertPinClearAllConfirm => {
-                if let Ok(mut pins) = self.certificate_pins.lock() {
+                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     *pins = keep_frost_net::CertificatePinSet::new();
                     save_cert_pins(&self.keep_path, &pins);
+                    true
+                } else {
+                    false
+                };
+                if ok {
+                    self.sync_cert_pins_to_screen();
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.clear_all_pins_confirm = false;
+                    }
+                    self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
+                } else {
+                    self.set_toast("Failed to clear pins".into(), ToastKind::Error);
                 }
-                self.sync_cert_pins_to_screen();
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.clear_all_pins_confirm = false;
-                }
-                self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
             }
             Message::CertPinMismatchDismiss => {
                 self.pin_mismatch = None;

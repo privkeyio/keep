@@ -400,12 +400,12 @@ impl App {
         let proxy = self.proxy_addr();
         let kill_switch = self.kill_switch.clone();
         let cert_pins = self.certificate_pins.clone();
-        let cert_pins_path = self.keep_path.clone();
+        let keep_path = self.keep_path.clone();
 
         Task::perform(
             async move {
                 use crate::message::ConnectionError;
-                crate::frost::verify_relay_certificates(&relay_urls, &cert_pins, &cert_pins_path)
+                crate::frost::verify_relay_certificates(&relay_urls, &cert_pins, &keep_path)
                     .await?;
 
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))

@@ -58,8 +58,9 @@ pub(crate) async fn verify_relay_certificates(
             if guard.get_pin(&hostname).is_none() {
                 guard.add_pin(hostname, hash);
             }
-            crate::app::save_cert_pins(keep_path, &guard);
+            let pins_snapshot = guard.clone();
             drop(guard);
+            crate::app::save_cert_pins(keep_path, &pins_snapshot);
         }
     }
     Ok(())
