@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use keep_bitcoin::recovery::{RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier};
+use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
 use nostr_sdk::PublicKey;
 use sha2::{Digest, Sha256};
 
@@ -21,7 +24,7 @@ pub enum DescriptorSessionState {
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct XpubContribution {
     pub account_xpub: String,
     pub fingerprint: String,
@@ -196,6 +199,10 @@ impl DescriptorSession {
             return Err(FrostNetError::Session(format!(
                 "Share {share_index} not an expected ACK sender"
             )));
+        }
+
+        if self.acks.contains(&share_index) {
+            return Ok(());
         }
 
         let finalized = self
@@ -387,6 +394,65 @@ pub fn derive_descriptor_session_id(
     hash_policy(&mut hasher, policy);
     hasher.update(created_at.to_le_bytes());
     hasher.finalize().into()
+}
+
+fn parse_network(network_str: &str) -> Result<Network> {
+    Network::from_str(network_str)
+        .map_err(|_| FrostNetError::Session(format!("unknown network: {network_str}")))
+}
+
+pub fn reconstruct_descriptor(
+    group_pubkey: &[u8; 32],
+    policy: &WalletPolicy,
+    contributions: &BTreeMap<u16, XpubContribution>,
+    network_str: &str,
+) -> Result<(String, String)> {
+    let network = parse_network(network_str)?;
+
+    let config = if policy.recovery_tiers.is_empty() {
+        None
+    } else {
+        let mut recovery_tiers = Vec::with_capacity(policy.recovery_tiers.len());
+        for tier in &policy.recovery_tiers {
+            let mut keys = Vec::with_capacity(tier.key_slots.len());
+            for slot in &tier.key_slots {
+                let xpub = match slot {
+                    KeySlot::Participant { share_index } => {
+                        let contrib = contributions.get(share_index).ok_or_else(|| {
+                            FrostNetError::Session(format!(
+                                "missing xpub contribution for share {share_index}"
+                            ))
+                        })?;
+                        &contrib.account_xpub
+                    }
+                    KeySlot::External { xpub, .. } => xpub,
+                };
+                let x_only = xpub_to_x_only(xpub, network)
+                    .map_err(|e| FrostNetError::Session(format!("xpub conversion failed: {e}")))?;
+                keys.push(x_only);
+            }
+            recovery_tiers.push(BitcoinRecoveryTier {
+                keys,
+                threshold: tier.threshold,
+                timelock_months: tier.timelock_months,
+            });
+        }
+        Some(RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![*group_pubkey],
+                threshold: 1,
+            },
+            recovery_tiers,
+            network,
+        })
+    };
+
+    let export = DescriptorExport::from_frost_wallet(group_pubkey, config.as_ref(), network)
+        .map_err(|e| FrostNetError::Session(format!("descriptor construction failed: {e}")))?;
+    let internal = export
+        .internal_descriptor()
+        .map_err(|e| FrostNetError::Session(format!("internal descriptor failed: {e}")))?;
+    Ok((export.external_descriptor().to_string(), internal))
 }
 
 #[cfg(test)]

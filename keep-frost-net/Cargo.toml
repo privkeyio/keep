@@ -11,6 +11,7 @@ default = ["nitro-attestation"]
 nitro-attestation = ["dep:keep-enclave-host"]
 
 [dependencies]
+keep-bitcoin = { path = "../keep-bitcoin" }
 keep-core = { path = "../keep-core" }
 keep-enclave-host = { path = "../keep-enclave/host", optional = true }
 
@@ -42,6 +43,7 @@ hmac = "0.12"
 subtle = "2.5"
 
 [dev-dependencies]
+bitcoin = "0.32"
 tempfile = "3.10"
 tokio-test = "0.4"
 nostr-relay-builder = "0.44"

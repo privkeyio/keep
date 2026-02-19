@@ -315,6 +315,17 @@ impl KfpMessage {
                 if p.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
                     return Err("Internal descriptor exceeds maximum length");
                 }
+                if p.contributions.len() > MAX_PARTICIPANTS {
+                    return Err("Too many contributions in finalize payload");
+                }
+                for contrib in p.contributions.values() {
+                    if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
+                        return Err("Contribution xpub exceeds maximum length");
+                    }
+                    if contrib.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                        return Err("Contribution fingerprint exceeds maximum length");
+                    }
+                }
             }
             KfpMessage::DescriptorAck(_) => {}
             _ => {}
@@ -885,6 +896,7 @@ pub struct DescriptorFinalizePayload {
     pub internal_descriptor: String,
     #[serde(with = "hex_bytes")]
     pub policy_hash: [u8; 32],
+    pub contributions: std::collections::BTreeMap<u16, crate::descriptor_session::XpubContribution>,
     pub created_at: u64,
 }
 
@@ -895,6 +907,7 @@ impl DescriptorFinalizePayload {
         external_descriptor: &str,
         internal_descriptor: &str,
         policy_hash: [u8; 32],
+        contributions: std::collections::BTreeMap<u16, crate::descriptor_session::XpubContribution>,
     ) -> Self {
         Self {
             session_id,
@@ -902,6 +915,7 @@ impl DescriptorFinalizePayload {
             external_descriptor: external_descriptor.to_string(),
             internal_descriptor: internal_descriptor.to_string(),
             policy_hash,
+            contributions,
             created_at: chrono::Utc::now().timestamp() as u64,
         }
     }

@@ -393,7 +393,14 @@ async fn test_full_signing_flow() {
 #[tokio::test]
 #[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
 async fn test_descriptor_coordination_flow() {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    use keep_bitcoin::recovery::{
+        RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier,
+    };
+    use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
+    use keep_frost_net::{derive_policy_hash, XpubContribution};
 
     let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
     let relay = mock_relay.url().await.to_string();
@@ -414,6 +421,18 @@ async fn test_descriptor_coordination_flow() {
         .expect("Failed to create node 2");
 
     let node1_pubkey = node1.pubkey();
+    let group_pubkey = *node1.group_pubkey();
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let xpriv1 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[1u8; 32]).unwrap();
+    let xpub1 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv1);
+    let xpub1_str = xpub1.to_string();
+    let fp1 = "aabbccdd";
+
+    let xpriv2 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[2u8; 32]).unwrap();
+    let xpub2 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv2);
+    let xpub2_str = xpub2.to_string();
+    let fp2 = "11223344";
 
     let mut rx1 = node1.subscribe();
     let mut rx2 = node2.subscribe();
@@ -471,7 +490,7 @@ async fn test_descriptor_coordination_flow() {
     };
 
     let session_id = node1
-        .request_descriptor(policy, "signet", "xpub_node1", "aabbccdd")
+        .request_descriptor(policy.clone(), "signet", &xpub1_str, fp1)
         .await
         .expect("request_descriptor failed");
 
@@ -491,7 +510,7 @@ async fn test_descriptor_coordination_flow() {
     assert_eq!(contribution_needed, session_id);
 
     node2
-        .contribute_descriptor(session_id, &node1_pubkey, "xpub_node2", "11223344")
+        .contribute_descriptor(session_id, &node1_pubkey, &xpub2_str, fp2)
         .await
         .expect("contribute_descriptor failed");
 
@@ -507,18 +526,50 @@ async fn test_descriptor_coordination_flow() {
 
     assert_eq!(ready, session_id);
 
-    let external_desc = "tr(deadbeef,{pk(xpub_node1),pk(xpub_node2)})";
-    let internal_desc = "tr(deadbeef,{pk(xpub_node1),pk(xpub_node2)})/1";
-    let policy_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"test-policy");
-        let h: [u8; 32] = hasher.finalize().into();
-        h
+    let policy_hash = derive_policy_hash(&policy);
+
+    let mut contributions = BTreeMap::new();
+    contributions.insert(
+        1,
+        XpubContribution {
+            account_xpub: xpub1_str.clone(),
+            fingerprint: fp1.to_string(),
+        },
+    );
+    contributions.insert(
+        2,
+        XpubContribution {
+            account_xpub: xpub2_str.clone(),
+            fingerprint: fp2.to_string(),
+        },
+    );
+
+    let key1 = xpub_to_x_only(&xpub1_str, Network::Signet).unwrap();
+    let key2 = xpub_to_x_only(&xpub2_str, Network::Signet).unwrap();
+
+    let recovery_config = RecoveryConfig {
+        primary: SpendingTier {
+            keys: vec![group_pubkey],
+            threshold: 1,
+        },
+        recovery_tiers: vec![BitcoinRecoveryTier {
+            keys: vec![key1, key2],
+            threshold: 1,
+            timelock_months: 6,
+        }],
+        network: Network::Signet,
     };
 
+    let export =
+        DescriptorExport::from_frost_wallet(&group_pubkey, Some(&recovery_config), Network::Signet)
+            .expect("descriptor export failed");
+    let external_desc = export.external_descriptor().to_string();
+    let internal_desc = export
+        .internal_descriptor()
+        .expect("internal descriptor failed");
+
     node1
-        .finalize_descriptor(session_id, external_desc, internal_desc, policy_hash)
+        .finalize_descriptor(session_id, &external_desc, &internal_desc, policy_hash)
         .await
         .expect("finalize_descriptor failed");
 

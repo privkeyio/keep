@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, participant_indices, FinalizedDescriptor,
+    derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
+    FinalizedDescriptor,
 };
 use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
@@ -151,6 +152,11 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
+        let initiator_share_index = {
+            let peers = self.peers.read();
+            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
+        };
+
         {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
@@ -161,7 +167,19 @@ impl KfpNode {
                 expected_contributors,
                 HashSet::new(),
             ) {
-                Ok(session) => session.set_initiator(sender),
+                Ok(session) => {
+                    session.set_initiator(sender);
+
+                    if let Some(idx) = initiator_share_index {
+                        if let Err(e) = session.add_contribution(
+                            idx,
+                            payload.initiator_xpub.clone(),
+                            payload.initiator_fingerprint.clone(),
+                        ) {
+                            debug!("Failed to store initiator contribution: {e}");
+                        }
+                    }
+                }
                 Err(_) => {
                     debug!("Descriptor session already exists, ignoring duplicate proposal");
                 }
@@ -294,7 +312,7 @@ impl KfpNode {
         internal_descriptor: &str,
         policy_hash: [u8; 32],
     ) -> Result<()> {
-        {
+        let contributions = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&session_id)
@@ -305,7 +323,9 @@ impl KfpNode {
                 internal: internal_descriptor.to_string(),
                 policy_hash,
             })?;
-        }
+
+            session.contributions().clone()
+        };
 
         let payload = DescriptorFinalizePayload::new(
             session_id,
@@ -313,6 +333,7 @@ impl KfpNode {
             external_descriptor,
             internal_descriptor,
             policy_hash,
+            contributions,
         );
 
         let msg = KfpMessage::DescriptorFinalize(payload);
@@ -369,7 +390,18 @@ impl KfpNode {
             ));
         }
 
-        {
+        if payload.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+            return Err(FrostNetError::Session(
+                "External descriptor exceeds maximum length".into(),
+            ));
+        }
+        if payload.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+            return Err(FrostNetError::Session(
+                "Internal descriptor exceeds maximum length".into(),
+            ));
+        }
+
+        let (expected_external, expected_internal) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -396,6 +428,7 @@ impl KfpNode {
                 }
                 Some(_) => {}
             }
+
             let expected_hash = derive_policy_hash(session.policy());
             if payload.policy_hash != expected_hash {
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -406,6 +439,25 @@ impl KfpNode {
                     "Policy hash does not match proposal".into(),
                 ));
             }
+
+            reconstruct_descriptor(
+                session.group_pubkey(),
+                session.policy(),
+                &payload.contributions,
+                session.network(),
+            )?
+        };
+
+        if payload.external_descriptor != expected_external
+            || payload.internal_descriptor != expected_internal
+        {
+            let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                session_id: payload.session_id,
+                error: "Descriptor mismatch: independent reconstruction differs".into(),
+            });
+            return Err(FrostNetError::Session(
+                "Finalized descriptor does not match independent reconstruction".into(),
+            ));
         }
 
         info!(
