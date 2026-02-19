@@ -162,7 +162,18 @@ impl KfpNode {
                 expected_contributors,
                 HashSet::new(),
             ) {
-                Ok(session) => session.set_initiator(sender),
+                Ok(session) => {
+                    session.set_initiator(sender);
+
+                    let peers = self.peers.read();
+                    if let Some(peer) = peers.get_peer_by_pubkey(&sender) {
+                        let _ = session.add_contribution(
+                            peer.share_index,
+                            payload.initiator_xpub.clone(),
+                            payload.initiator_fingerprint.clone(),
+                        );
+                    }
+                }
                 Err(_) => {
                     debug!("Descriptor session already exists, ignoring duplicate proposal");
                 }
@@ -367,6 +378,17 @@ impl KfpNode {
         if !payload.is_within_replay_window(self.replay_window_secs) {
             return Err(FrostNetError::ReplayDetected(
                 "Descriptor finalize outside replay window".into(),
+            ));
+        }
+
+        if payload.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+            return Err(FrostNetError::Session(
+                "External descriptor exceeds maximum length".into(),
+            ));
+        }
+        if payload.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+            return Err(FrostNetError::Session(
+                "Internal descriptor exceeds maximum length".into(),
             ));
         }
 

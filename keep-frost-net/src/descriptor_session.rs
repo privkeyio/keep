@@ -201,6 +201,10 @@ impl DescriptorSession {
             )));
         }
 
+        if self.acks.contains(&share_index) {
+            return Ok(());
+        }
+
         let finalized = self
             .descriptor
             .as_ref()

@@ -44,7 +44,6 @@ subtle = "2.5"
 
 [dev-dependencies]
 bitcoin = "0.32"
-keep-bitcoin = { path = "../keep-bitcoin" }
 tempfile = "3.10"
 tokio-test = "0.4"
 nostr-relay-builder = "0.44"
