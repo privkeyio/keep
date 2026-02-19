@@ -157,7 +157,7 @@ impl ImportScreen {
 
         match self.mode {
             ImportMode::Nsec => {
-                let can_import = !self.data.trim().is_empty() && !self.name.trim().is_empty();
+                let can_import = !trimmed_data.is_empty() && !self.name.trim().is_empty();
                 let submit_msg = can_import.then_some(Message::ImportNsec);
 
                 let name_input = text_input("Key name", &self.name)
@@ -180,19 +180,18 @@ impl ImportScreen {
                 if self.loading {
                     content = content.push(theme::label("Importing..."));
                 } else {
-                    let mut btn = button(text("Import").size(theme::size::BODY))
-                        .style(theme::primary_button)
-                        .padding(theme::space::MD);
-                    if can_import {
-                        btn = btn.on_press(Message::ImportNsec);
-                    }
-                    content = content.push(btn);
+                    content = content.push(
+                        button(text("Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportNsec))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
                 }
             }
             ImportMode::Ncryptsec => {
                 let has_password = !self.passphrase.is_empty();
                 let has_name = !self.name.trim().is_empty();
-                let can_import = !self.data.trim().is_empty() && has_password && has_name;
+                let can_import = !trimmed_data.is_empty() && has_password && has_name;
 
                 let password_input = text_input("Decryption password", &self.passphrase)
                     .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))
@@ -231,13 +230,12 @@ impl ImportScreen {
                 if self.loading {
                     content = content.push(theme::label("Decrypting..."));
                 } else {
-                    let mut btn = button(text("Decrypt & Import").size(theme::size::BODY))
-                        .style(theme::primary_button)
-                        .padding(theme::space::MD);
-                    if can_import {
-                        btn = btn.on_press(Message::ImportNcryptsec);
-                    }
-                    content = content.push(btn);
+                    content = content.push(
+                        button(text("Decrypt & Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportNcryptsec))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
                 }
             }
             _ => {
@@ -264,13 +262,12 @@ impl ImportScreen {
                 if self.loading {
                     content = content.push(theme::label("Importing..."));
                 } else {
-                    let mut btn = button(text("Import").size(theme::size::BODY))
-                        .style(theme::primary_button)
-                        .padding(theme::space::MD);
-                    if can_import {
-                        btn = btn.on_press(Message::ImportShare);
-                    }
-                    content = content.push(btn);
+                    content = content.push(
+                        button(text("Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportShare))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
                 }
             }
         }

@@ -1865,7 +1865,7 @@ impl App {
                             return Task::none();
                         }
                         if *s.password != *s.confirm_password {
-                            s.error = Some("Passphrases do not match".into());
+                            s.error = Some("Passwords do not match".into());
                             return Task::none();
                         }
                         s.loading = true;

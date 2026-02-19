@@ -295,7 +295,7 @@ pub mod nip49 {
         let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
 
         let nonce: [u8; 24] = entropy::random_bytes();
-        let key_security_byte: u8 = 0x02;
+        let key_security_byte: u8 = 0x01;
 
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
         let payload = Payload {
@@ -315,8 +315,8 @@ pub mod nip49 {
         concat.extend_from_slice(&ciphertext);
 
         let hrp = Hrp::parse("ncryptsec").unwrap();
-        Ok(bech32::encode::<Bech32>(hrp, &concat)
-            .map_err(|_| CryptoError::encryption("bech32 encoding failed"))?)
+        bech32::encode::<Bech32>(hrp, &concat)
+            .map_err(|_| CryptoError::encryption("bech32 encoding failed").into())
     }
 
     /// Decrypt an ncryptsec string with a password, returning the secret key.
@@ -352,12 +352,8 @@ pub mod nip49 {
                 "ncryptsec log_n too large: {log_n} (max {MAX_LOG_N})"
             )));
         }
-        let salt: [u8; 16] = data[2..18]
-            .try_into()
-            .map_err(|_| CryptoError::decryption("invalid salt"))?;
-        let nonce: [u8; 24] = data[18..42]
-            .try_into()
-            .map_err(|_| CryptoError::decryption("invalid nonce"))?;
+        let salt: [u8; 16] = data[2..18].try_into().expect("length checked");
+        let nonce: [u8; 24] = data[18..42].try_into().expect("length checked");
         let key_security_byte = data[42];
         let ciphertext = data[43..].to_vec();
         data.zeroize();

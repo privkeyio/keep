@@ -223,13 +223,12 @@ impl ExportNcryptsecScreen {
             if self.loading {
                 content = content.push(theme::label("Encrypting..."));
             } else {
-                let mut btn = button(text("Encrypt Key").size(theme::size::BODY))
-                    .style(theme::primary_button)
-                    .padding(theme::space::MD);
-                if can_generate {
-                    btn = btn.on_press(Message::GenerateNcryptsec);
-                }
-                content = content.push(btn);
+                content = content.push(
+                    button(text("Encrypt Key").size(theme::size::BODY))
+                        .on_press_maybe(can_generate.then_some(Message::GenerateNcryptsec))
+                        .style(theme::primary_button)
+                        .padding(theme::space::MD),
+                );
             }
         }
 
