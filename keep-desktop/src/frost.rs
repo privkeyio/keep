@@ -602,7 +602,11 @@ impl App {
         self.frost_node.lock().ok()?.clone()
     }
 
-    fn update_wallet_setup(&mut self, session_id: &[u8; 32], f: impl FnOnce(&mut SetupState)) {
+    pub(crate) fn update_wallet_setup(
+        &mut self,
+        session_id: &[u8; 32],
+        f: impl FnOnce(&mut SetupState),
+    ) {
         if let Screen::Wallet(ws) = &mut self.screen {
             if let Some(setup) = &mut ws.setup {
                 if setup.session_id.as_ref() == Some(session_id) {
@@ -731,12 +735,12 @@ impl App {
 
                 Ok::<(), String>(())
             },
-            move |result| {
-                if let Err(e) = result {
-                    Message::WalletDescriptorProgress(DescriptorProgress::Failed(e))
-                } else {
-                    Message::WalletDescriptorProgress(DescriptorProgress::Contributed)
-                }
+            move |result| match result {
+                Ok(()) => Message::WalletDescriptorProgress(DescriptorProgress::Contributed, None),
+                Err(e) => Message::WalletDescriptorProgress(
+                    DescriptorProgress::Failed(e),
+                    Some(session_id),
+                ),
             },
         )
     }

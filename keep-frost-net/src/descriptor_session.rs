@@ -306,11 +306,13 @@ impl DescriptorSessionManager {
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&DescriptorSession> {
-        self.sessions.get(session_id)
+        self.sessions.get(session_id).filter(|s| !s.is_expired())
     }
 
     pub fn get_session_mut(&mut self, session_id: &[u8; 32]) -> Option<&mut DescriptorSession> {
-        self.sessions.get_mut(session_id)
+        self.sessions
+            .get_mut(session_id)
+            .filter(|s| !s.is_expired())
     }
 
     pub fn remove_session(&mut self, session_id: &[u8; 32]) {

@@ -196,7 +196,7 @@ impl WalletScreen {
         }
 
         let network_label = theme::label("Network");
-        let network_options = ["signet", "testnet", "bitcoin"];
+        let network_options = ["signet", "testnet", "regtest", "bitcoin"];
         let mut network_row = row![].spacing(theme::space::SM);
         for net in &network_options {
             let style = if setup.network == *net {

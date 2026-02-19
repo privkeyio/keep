@@ -22,6 +22,7 @@ pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
+pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
@@ -241,8 +242,8 @@ impl KfpMessage {
                 }
             }
             KfpMessage::DescriptorPropose(p) => {
-                if p.network.is_empty() {
-                    return Err("Network must not be empty");
+                if !VALID_NETWORKS.contains(&p.network.as_str()) {
+                    return Err("Invalid network value");
                 }
                 if p.initiator_xpub.is_empty() {
                     return Err("Initiator xpub cannot be empty");

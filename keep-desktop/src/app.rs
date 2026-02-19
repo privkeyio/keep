@@ -1314,8 +1314,16 @@ impl App {
                 }
                 Task::none()
             }
-            Message::WalletDescriptorProgress(progress) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+            Message::WalletDescriptorProgress(progress, session_id) => {
+                if let Some(sid) = session_id {
+                    if matches!(progress, DescriptorProgress::Failed(_)) {
+                        self.active_coordinations.remove(&sid);
+                    }
+                    self.update_wallet_setup(&sid, |setup| {
+                        setup.phase = SetupPhase::Coordinating(progress);
+                    });
+                } else if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen
+                {
                     s.phase = SetupPhase::Coordinating(progress);
                 }
                 Task::none()

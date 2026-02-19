@@ -199,7 +199,7 @@ pub enum Message {
     WalletBeginCoordination,
     WalletCancelSetup,
     WalletSessionStarted(Result<([u8; 32], [u8; 32], String), String>),
-    WalletDescriptorProgress(DescriptorProgress),
+    WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     // Relay / FROST
     RelayUrlChanged(String),
     ConnectPasswordChanged(Zeroizing<String>),
@@ -456,7 +456,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("WalletSessionStarted")
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),
-            Self::WalletDescriptorProgress(_) => f.write_str("WalletDescriptorProgress"),
+            Self::WalletDescriptorProgress(..) => f.write_str("WalletDescriptorProgress"),
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
             Self::ConnectPasswordChanged(_) => f.write_str("ConnectPasswordChanged(***)"),
             Self::AddRelay => f.write_str("AddRelay"),
