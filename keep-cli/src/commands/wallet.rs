@@ -449,53 +449,58 @@ pub fn cmd_wallet_propose(
         out.field("Session", &hex::encode(&session_id[..8]));
         out.newline();
 
-        let spinner = out.spinner(&format!(
-            "Waiting for contributions (0/{remaining_contributions})..."
-        ));
-        let timeout = Duration::from_secs(keep_frost_net::DESCRIPTOR_SESSION_TIMEOUT_SECS);
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        let mut received = 0usize;
-        let mut ready = false;
-        while tokio::time::Instant::now() < deadline {
-            let remaining = deadline - tokio::time::Instant::now();
-            match tokio::time::timeout(remaining, event_rx.recv()).await {
-                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorContributed {
-                    session_id: sid,
-                    share_index,
-                })) if sid == session_id => {
-                    received += 1;
-                    out.info(&format!(
-                        "  Share {share_index} contributed ({received}/{remaining_contributions})"
-                    ));
-                }
-                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorReady { session_id: sid }))
-                    if sid == session_id =>
-                {
-                    ready = true;
-                    break;
-                }
-                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed { error, .. })) => {
-                    spinner.finish();
-                    node.cancel_descriptor_session(&session_id);
-                    node_handle.abort();
-                    return Err(KeepError::Frost(format!(
-                        "Descriptor session failed: {error}"
-                    )));
-                }
-                Ok(Err(_)) => break,
-                Err(_) => break,
-                _ => {}
-            }
-        }
-        spinner.finish();
-
-        if !ready {
-            node.cancel_descriptor_session(&session_id);
-            node_handle.abort();
-            return Err(KeepError::Frost(
-                "Timed out waiting for all contributions".into(),
+        if remaining_contributions > 0 {
+            let spinner = out.spinner(&format!(
+                "Waiting for contributions (0/{remaining_contributions})..."
             ));
+            let timeout = Duration::from_secs(keep_frost_net::DESCRIPTOR_SESSION_TIMEOUT_SECS);
+            let deadline = tokio::time::Instant::now() + timeout;
+
+            let mut received = 0usize;
+            let mut ready = false;
+            while tokio::time::Instant::now() < deadline {
+                let remaining = deadline - tokio::time::Instant::now();
+                match tokio::time::timeout(remaining, event_rx.recv()).await {
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorContributed {
+                        session_id: sid,
+                        share_index,
+                    })) if sid == session_id => {
+                        received += 1;
+                        out.info(&format!(
+                            "  Share {share_index} contributed ({received}/{remaining_contributions})"
+                        ));
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorReady { session_id: sid }))
+                        if sid == session_id =>
+                    {
+                        ready = true;
+                        break;
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
+                        session_id: sid,
+                        error,
+                    })) if sid == session_id => {
+                        spinner.finish();
+                        node.cancel_descriptor_session(&session_id);
+                        node_handle.abort();
+                        return Err(KeepError::Frost(format!(
+                            "Descriptor session failed: {error}"
+                        )));
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            spinner.finish();
+
+            if !ready {
+                node.cancel_descriptor_session(&session_id);
+                node_handle.abort();
+                return Err(KeepError::Frost(
+                    "Timed out waiting for all contributions".into(),
+                ));
+            }
         }
 
         out.success("All contributions received!");
@@ -508,7 +513,8 @@ pub fn cmd_wallet_propose(
         spinner.finish();
 
         let spinner = out.spinner("Waiting for ACKs...");
-        let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let ack_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS);
 
         let mut external_descriptor = String::new();
         let mut internal_descriptor = String::new();
@@ -527,7 +533,10 @@ pub fn cmd_wallet_propose(
                     complete = true;
                     break;
                 }
-                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed { error, .. })) => {
+                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
+                    session_id: sid,
+                    error,
+                })) if sid == session_id => {
                     spinner.finish();
                     node.cancel_descriptor_session(&session_id);
                     node_handle.abort();

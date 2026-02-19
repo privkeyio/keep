@@ -21,6 +21,7 @@ pub const MAX_KEYS_PER_TIER: usize = 20;
 pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
+pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 

@@ -110,33 +110,37 @@ pub fn cmd_frost_network_serve(
                             continue;
                         }
                         tracing::info!(session, "descriptor contribution requested, auto-contributing");
-                        let derive_node = event_node.clone();
+                        let contribute_node = event_node.clone();
                         let net = network.clone();
-                        let derived = tokio::task::spawn_blocking(move || {
-                            derive_node.derive_account_xpub(&net)
-                        })
-                        .await;
-                        match derived {
-                            Ok(Ok((xpub, fingerprint))) => {
-                                if let Err(e) = event_node
-                                    .contribute_descriptor(
-                                        session_id,
-                                        &initiator_pubkey,
-                                        &xpub,
-                                        &fingerprint,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(session, error = %e, "failed to contribute descriptor");
+                        tokio::spawn(async move {
+                            let session = hex::encode(&session_id[..8]);
+                            let derived = tokio::task::spawn_blocking({
+                                let node = contribute_node.clone();
+                                move || node.derive_account_xpub(&net)
+                            })
+                            .await;
+                            match derived {
+                                Ok(Ok((xpub, fingerprint))) => {
+                                    if let Err(e) = contribute_node
+                                        .contribute_descriptor(
+                                            session_id,
+                                            &initiator_pubkey,
+                                            &xpub,
+                                            &fingerprint,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(session, error = %e, "failed to contribute descriptor");
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::error!(session, error = %e, "failed to derive xpub for contribution");
+                                }
+                                Err(e) => {
+                                    tracing::error!(session, error = %e, "failed to derive xpub for contribution");
                                 }
                             }
-                            Ok(Err(e)) => {
-                                tracing::error!(session, error = %e, "failed to derive xpub for contribution");
-                            }
-                            Err(e) => {
-                                tracing::error!(session, error = %e, "failed to derive xpub for contribution");
-                            }
-                        }
+                        });
                     }
                     Ok(keep_frost_net::KfpNodeEvent::DescriptorComplete {
                         session_id,
