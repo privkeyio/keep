@@ -411,7 +411,7 @@ impl App {
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
                     .map_err(|_| ConnectionError::Other("Background task failed".to_string()))?
-                    .map_err(|e| ConnectionError::Other(e))?;
+                    .map_err(ConnectionError::Other)?;
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =

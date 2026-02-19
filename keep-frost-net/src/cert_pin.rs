@@ -120,8 +120,7 @@ pub async fn verify_relay_certificate(
         }
         Ok((spki_hash, None))
     } else {
-        let new_pin = (hostname, spki_hash);
-        Ok((spki_hash, Some(new_pin)))
+        Ok((spki_hash, Some((hostname, spki_hash))))
     }
 }
 
@@ -181,21 +180,21 @@ fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let first = data[0];
-    match first.cmp(&0x80) {
-        std::cmp::Ordering::Less => Some((1, first as usize)),
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => {
-            let num_bytes = (first & 0x7F) as usize;
-            if num_bytes > 4 || num_bytes + 1 > data.len() {
-                return None;
-            }
-            let mut len = 0usize;
-            for i in 0..num_bytes {
-                len = len.checked_shl(8)?.checked_add(data[1 + i] as usize)?;
-            }
-            Some((1 + num_bytes, len))
-        }
+    if first < 0x80 {
+        return Some((1, first as usize));
     }
+    if first == 0x80 {
+        return None;
+    }
+    let num_bytes = (first & 0x7F) as usize;
+    if num_bytes > 4 || num_bytes + 1 > data.len() {
+        return None;
+    }
+    let mut len = 0usize;
+    for i in 0..num_bytes {
+        len = len.checked_shl(8)?.checked_add(data[1 + i] as usize)?;
+    }
+    Some((1 + num_bytes, len))
 }
 
 #[cfg(test)]

@@ -366,9 +366,10 @@ impl SettingsScreen {
             );
         } else {
             for (hostname, hash) in &self.certificate_pins {
-                let truncated = match hash.get(..16) {
-                    Some(prefix) => format!("{prefix}..."),
-                    None => hash.clone(),
+                let truncated = if hash.len() > 16 {
+                    format!("{}...", &hash[..16])
+                } else {
+                    hash.clone()
                 };
 
                 let clear_btn = button(text("Clear").size(theme::size::TINY))

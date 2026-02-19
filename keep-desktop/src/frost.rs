@@ -59,6 +59,7 @@ pub(crate) async fn verify_relay_certificates(
                 guard.add_pin(hostname, hash);
             }
             crate::app::save_cert_pins(keep_path, &guard);
+            drop(guard);
         }
     }
     Ok(())
@@ -692,10 +693,10 @@ impl App {
                 self.frost_reconnect_at = None;
                 ConnectionStatus::Connected
             }
-            Err(crate::message::ConnectionError::PinMismatch(mismatch)) => {
+            Err(e @ crate::message::ConnectionError::PinMismatch(mismatch)) => {
                 self.pin_mismatch = Some(mismatch.clone());
                 self.frost_reconnect_at = None;
-                ConnectionStatus::Error(format!("{}", result.as_ref().unwrap_err()))
+                ConnectionStatus::Error(e.to_string())
             }
             Err(e) => {
                 if self.frost_reconnect_attempts < RECONNECT_MAX_ATTEMPTS {

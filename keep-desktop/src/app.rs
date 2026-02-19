@@ -2612,7 +2612,7 @@ impl App {
             .iter()
             .map(|(host, hash)| (host.clone(), hex::encode(hash)))
             .collect();
-        entries.sort();
+        entries.sort_unstable();
         entries
     }
 
