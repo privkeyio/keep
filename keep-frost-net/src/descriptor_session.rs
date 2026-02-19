@@ -427,9 +427,8 @@ pub fn reconstruct_descriptor(
                     }
                     KeySlot::External { xpub, .. } => xpub,
                 };
-                let x_only = xpub_to_x_only(xpub, network).map_err(|e| {
-                    FrostNetError::Session(format!("xpub conversion failed: {e}"))
-                })?;
+                let x_only = xpub_to_x_only(xpub, network)
+                    .map_err(|e| FrostNetError::Session(format!("xpub conversion failed: {e}")))?;
                 keys.push(x_only);
             }
             recovery_tiers.push(BitcoinRecoveryTier {
@@ -448,10 +447,8 @@ pub fn reconstruct_descriptor(
         })
     };
 
-    let export =
-        DescriptorExport::from_frost_wallet(group_pubkey, config.as_ref(), network).map_err(
-            |e| FrostNetError::Session(format!("descriptor construction failed: {e}")),
-        )?;
+    let export = DescriptorExport::from_frost_wallet(group_pubkey, config.as_ref(), network)
+        .map_err(|e| FrostNetError::Session(format!("descriptor construction failed: {e}")))?;
     let internal = export
         .internal_descriptor()
         .map_err(|e| FrostNetError::Session(format!("internal descriptor failed: {e}")))?;

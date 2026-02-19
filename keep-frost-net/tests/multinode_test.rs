@@ -396,7 +396,9 @@ async fn test_descriptor_coordination_flow() {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use keep_bitcoin::recovery::{RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier};
+    use keep_bitcoin::recovery::{
+        RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier,
+    };
     use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
     use keep_frost_net::{derive_policy_hash, XpubContribution};
 
@@ -422,14 +424,12 @@ async fn test_descriptor_coordination_flow() {
     let group_pubkey = *node1.group_pubkey();
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let xpriv1 =
-        bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[1u8; 32]).unwrap();
+    let xpriv1 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[1u8; 32]).unwrap();
     let xpub1 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv1);
     let xpub1_str = xpub1.to_string();
     let fp1 = "aabbccdd";
 
-    let xpriv2 =
-        bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[2u8; 32]).unwrap();
+    let xpriv2 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[2u8; 32]).unwrap();
     let xpub2 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv2);
     let xpub2_str = xpub2.to_string();
     let fp2 = "11223344";
@@ -564,7 +564,9 @@ async fn test_descriptor_coordination_flow() {
         DescriptorExport::from_frost_wallet(&group_pubkey, Some(&recovery_config), Network::Signet)
             .expect("descriptor export failed");
     let external_desc = export.external_descriptor().to_string();
-    let internal_desc = export.internal_descriptor().expect("internal descriptor failed");
+    let internal_desc = export
+        .internal_descriptor()
+        .expect("internal descriptor failed");
 
     node1
         .finalize_descriptor(session_id, &external_desc, &internal_desc, policy_hash)
