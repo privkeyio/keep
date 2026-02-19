@@ -62,9 +62,11 @@ pub fn cmd_frost_network_serve(
     rt.block_on(async {
         out.info("Starting FROST coordination node...");
 
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = std::sync::Arc::new(
+            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?,
+        );
 
         let npub = node.pubkey().to_bech32().unwrap_or_default();
         out.field("Node pubkey", &npub);
@@ -72,6 +74,7 @@ pub fn cmd_frost_network_serve(
         out.info("Listening for FROST messages... (Ctrl+C to stop)");
 
         let mut event_rx = node.subscribe();
+        let event_node = node.clone();
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
@@ -90,6 +93,53 @@ pub fn cmd_frost_network_serve(
                     Ok(keep_frost_net::KfpNodeEvent::SigningFailed { session_id, error }) => {
                         let session = hex::encode(&session_id[..8]);
                         tracing::error!(session, error, "signing failed");
+                    }
+                    Ok(keep_frost_net::KfpNodeEvent::DescriptorContributionNeeded {
+                        session_id,
+                        network,
+                        initiator_pubkey,
+                        ..
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::info!(session, "descriptor contribution requested, auto-contributing");
+                        match event_node.derive_account_xpub(&network) {
+                            Ok((xpub, fingerprint)) => {
+                                if let Err(e) = event_node
+                                    .contribute_descriptor(
+                                        session_id,
+                                        &initiator_pubkey,
+                                        &xpub,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(session, error = %e, "failed to contribute descriptor");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(session, error = %e, "failed to derive xpub for contribution");
+                            }
+                        }
+                    }
+                    Ok(keep_frost_net::KfpNodeEvent::DescriptorComplete {
+                        session_id,
+                        external_descriptor,
+                        ..
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        let desc_short = if external_descriptor.len() > 40 {
+                            format!("{}...", &external_descriptor[..40])
+                        } else {
+                            external_descriptor
+                        };
+                        tracing::info!(session, descriptor = desc_short, "descriptor complete");
+                    }
+                    Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
+                        session_id,
+                        error,
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::error!(session, error, "descriptor session failed");
                     }
                     Err(_) => break,
                     _ => {}

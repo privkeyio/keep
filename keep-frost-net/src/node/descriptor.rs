@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+use zeroize::Zeroize;
 
 use crate::descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
@@ -205,6 +206,44 @@ impl KfpNode {
             });
 
         Ok(())
+    }
+
+    pub fn derive_account_xpub(&self, network: &str) -> Result<(String, String)> {
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
+        let signing_share = key_package.signing_share();
+        let mut signing_share_bytes: [u8; 32] = signing_share
+            .serialize()
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+
+        let net = match network {
+            "bitcoin" | "mainnet" => keep_bitcoin::Network::Bitcoin,
+            "testnet" => keep_bitcoin::Network::Testnet,
+            "signet" => keep_bitcoin::Network::Signet,
+            "regtest" => keep_bitcoin::Network::Regtest,
+            _ => {
+                return Err(FrostNetError::Session(format!(
+                    "unknown network: {network}"
+                )))
+            }
+        };
+
+        let derivation = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net)
+            .map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
+        signing_share_bytes.zeroize();
+
+        let xpub = derivation
+            .account_xpub(0)
+            .map_err(|e| FrostNetError::Crypto(format!("account xpub: {e}")))?;
+        let fingerprint = derivation
+            .master_fingerprint()
+            .map_err(|e| FrostNetError::Crypto(format!("fingerprint: {e}")))?;
+
+        Ok((xpub.to_string(), fingerprint.to_string()))
     }
 
     pub async fn contribute_descriptor(
@@ -562,6 +601,27 @@ impl KfpNode {
         }
 
         Ok(())
+    }
+
+    pub async fn build_and_finalize_descriptor(&self, session_id: [u8; 32]) -> Result<()> {
+        let (external, internal, policy_hash) = {
+            let sessions = self.descriptor_sessions.read();
+            let session = sessions
+                .get_session(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+
+            let policy_hash = derive_policy_hash(session.policy());
+            let (external, internal) = reconstruct_descriptor(
+                session.group_pubkey(),
+                session.policy(),
+                session.contributions(),
+                session.network(),
+            )?;
+            (external, internal, policy_hash)
+        };
+
+        self.finalize_descriptor(session_id, &external, &internal, policy_hash)
+            .await
     }
 
     pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
