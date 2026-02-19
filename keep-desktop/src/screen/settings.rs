@@ -24,6 +24,7 @@ pub struct SettingsScreen {
     pub start_minimized: bool,
     pub has_tray: bool,
     pub certificate_pins: Vec<(String, String)>,
+    pub clear_all_pins_confirm: bool,
 }
 
 fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
@@ -68,6 +69,7 @@ impl SettingsScreen {
             start_minimized,
             has_tray,
             certificate_pins,
+            clear_all_pins_confirm: false,
         }
     }
 
@@ -391,12 +393,31 @@ impl SettingsScreen {
                 col = col.push(pin_row);
             }
 
-            let clear_all_btn = button(text("Clear All Pins").size(theme::size::SMALL))
-                .on_press(Message::CertPinClearAll)
-                .style(theme::danger_button)
-                .padding([theme::space::SM, theme::space::MD]);
-
-            col = col.push(clear_all_btn);
+            if self.clear_all_pins_confirm {
+                let confirm_row = row![
+                    text("Clear all pins?")
+                        .size(theme::size::BODY)
+                        .color(theme::color::ERROR),
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Yes").size(theme::size::BODY))
+                        .on_press(Message::CertPinClearAllConfirm)
+                        .style(theme::danger_button)
+                        .padding([theme::space::XS, theme::space::MD]),
+                    button(text("No").size(theme::size::BODY))
+                        .on_press(Message::CertPinClearAllCancel)
+                        .style(theme::secondary_button)
+                        .padding([theme::space::XS, theme::space::MD]),
+                ]
+                .spacing(theme::space::SM)
+                .align_y(iced::Alignment::Center);
+                col = col.push(confirm_row);
+            } else {
+                let clear_all_btn = button(text("Clear All Pins").size(theme::size::SMALL))
+                    .on_press(Message::CertPinClearAllRequest)
+                    .style(theme::danger_button)
+                    .padding([theme::space::SM, theme::space::MD]);
+                col = col.push(clear_all_btn);
+            }
         }
 
         container(col)

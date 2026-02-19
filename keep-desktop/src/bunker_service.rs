@@ -404,12 +404,14 @@ impl App {
 
         Task::perform(
             async move {
+                use crate::message::ConnectionError;
                 crate::frost::verify_relay_certificates(&relay_urls, &cert_pins, &cert_pins_path)
                     .await?;
 
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
-                    .map_err(|_| "Background task failed".to_string())??;
+                    .map_err(|_| ConnectionError::Other("Background task failed".to_string()))?
+                    .map_err(|e| ConnectionError::Other(e))?;
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
@@ -430,7 +432,7 @@ impl App {
                     proxy,
                 )
                 .await
-                .map_err(|e| format!("Failed to start bunker: {e}"))?;
+                .map_err(|e| ConnectionError::Other(format!("Failed to start bunker: {e}")))?;
 
                 let handler = server.handler();
                 let url = server.bunker_url();
@@ -467,7 +469,7 @@ impl App {
 
     pub(crate) fn handle_bunker_start_result(
         &mut self,
-        result: Result<String, String>,
+        result: Result<String, crate::message::ConnectionError>,
     ) -> Task<Message> {
         match result {
             Ok(url) => {
@@ -509,15 +511,20 @@ impl App {
                     s.error = None;
                 }
             }
+            Err(crate::message::ConnectionError::PinMismatch(mismatch)) => {
+                self.bunker_pending_setup = None;
+                let msg = format!(
+                    "Certificate pin mismatch for {}: expected {}, got {}",
+                    mismatch.hostname, mismatch.expected, mismatch.actual
+                );
+                self.pin_mismatch = Some(mismatch);
+                self.bunker_cert_pin_failed = true;
+                self.set_bunker_error(msg);
+            }
             Err(e) => {
                 self.bunker_pending_setup = None;
-                if let Some(mismatch) = crate::frost::parse_pin_mismatch(&e) {
-                    self.pin_mismatch = Some(mismatch);
-                    self.bunker_cert_pin_failed = true;
-                } else {
-                    self.bunker_cert_pin_failed = false;
-                }
-                self.set_bunker_error(e);
+                self.bunker_cert_pin_failed = false;
+                self.set_bunker_error(format!("{e}"));
             }
         }
         Task::none()

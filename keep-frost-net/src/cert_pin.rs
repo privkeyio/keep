@@ -51,10 +51,17 @@ impl CertificatePinSet {
 
 pub async fn verify_relay_certificate(
     relay_url: &str,
-    pins: &mut CertificatePinSet,
-) -> Result<SpkiHash> {
+    pins: &CertificatePinSet,
+) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
     let url = url::Url::parse(relay_url)
         .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {e}")))?;
+
+    if url.scheme() != "wss" {
+        return Err(FrostNetError::Transport(format!(
+            "Expected wss:// scheme, got {}://",
+            url.scheme()
+        )));
+    }
 
     let hostname = url
         .host_str()
@@ -111,11 +118,11 @@ pub async fn verify_relay_certificate(
                 actual: hex::encode(spki_hash),
             });
         }
+        Ok((spki_hash, None))
     } else {
-        pins.add_pin(hostname, spki_hash);
+        let new_pin = (hostname, spki_hash);
+        Ok((spki_hash, Some(new_pin)))
     }
-
-    Ok(spki_hash)
 }
 
 fn hash_spki(spki_der: &[u8]) -> SpkiHash {

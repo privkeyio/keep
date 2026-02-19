@@ -143,6 +143,7 @@ pub struct App {
     scanner_rx: Option<tokio::sync::mpsc::Receiver<crate::screen::scanner::CameraEvent>>,
     pub(crate) certificate_pins: Arc<Mutex<keep_frost_net::CertificatePinSet>>,
     pub(crate) pin_mismatch: Option<crate::message::PinMismatchInfo>,
+    pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
 }
 
@@ -522,6 +523,7 @@ impl App {
             tray,
             certificate_pins,
             pin_mismatch: None,
+            pin_mismatch_confirm: false,
             bunker_cert_pin_failed: false,
         }
     }
@@ -699,9 +701,12 @@ impl App {
             | Message::KillSwitchDeactivateResult(..) => self.handle_kill_switch_message(message),
 
             Message::CertPinClear(..)
-            | Message::CertPinClearAll
+            | Message::CertPinClearAllRequest
+            | Message::CertPinClearAllConfirm
+            | Message::CertPinClearAllCancel
             | Message::CertPinMismatchDismiss
-            | Message::CertPinMismatchClearAndRetry => self.handle_cert_pin_message(message),
+            | Message::CertPinMismatchClearAndRetry
+            | Message::CertPinMismatchConfirmClear => self.handle_cert_pin_message(message),
 
             Message::WindowCloseRequested(id) => self.handle_window_close(id),
         }
@@ -1306,17 +1311,36 @@ impl App {
                     ))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
-                    row![
-                        button(text("Clear Pin & Retry").size(theme::size::SMALL))
-                            .on_press(Message::CertPinMismatchClearAndRetry)
-                            .style(theme::danger_button)
-                            .padding([theme::space::SM, theme::space::MD]),
-                        button(text("Dismiss").size(theme::size::SMALL))
-                            .on_press(Message::CertPinMismatchDismiss)
-                            .style(theme::secondary_button)
-                            .padding([theme::space::SM, theme::space::MD]),
-                    ]
-                    .spacing(theme::space::SM),
+                    if self.pin_mismatch_confirm {
+                        row![
+                            text("Clear pin and reconnect?")
+                                .size(theme::size::BODY)
+                                .color(theme::color::ERROR),
+                            iced::widget::Space::new().width(Length::Fill),
+                            button(text("Yes, Clear").size(theme::size::SMALL))
+                                .on_press(Message::CertPinMismatchConfirmClear)
+                                .style(theme::danger_button)
+                                .padding([theme::space::SM, theme::space::MD]),
+                            button(text("Cancel").size(theme::size::SMALL))
+                                .on_press(Message::CertPinMismatchDismiss)
+                                .style(theme::secondary_button)
+                                .padding([theme::space::SM, theme::space::MD]),
+                        ]
+                        .spacing(theme::space::SM)
+                        .align_y(iced::Alignment::Center)
+                    } else {
+                        row![
+                            button(text("Clear Pin & Retry").size(theme::size::SMALL))
+                                .on_press(Message::CertPinMismatchClearAndRetry)
+                                .style(theme::danger_button)
+                                .padding([theme::space::SM, theme::space::MD]),
+                            button(text("Dismiss").size(theme::size::SMALL))
+                                .on_press(Message::CertPinMismatchDismiss)
+                                .style(theme::secondary_button)
+                                .padding([theme::space::SM, theme::space::MD]),
+                        ]
+                        .spacing(theme::space::SM)
+                    },
                 ]
                 .spacing(theme::space::SM),
             )
@@ -1409,6 +1433,7 @@ impl App {
         self.toast = None;
         self.toast_dismiss_at = None;
         self.pin_mismatch = None;
+        self.pin_mismatch_confirm = false;
         self.bunker_cert_pin_failed = false;
         self.screen = Screen::Unlock(UnlockScreen::new(true));
         if clear_clipboard {
@@ -2525,18 +2550,36 @@ impl App {
                 self.sync_cert_pins_to_screen();
                 self.set_toast(format!("Cleared pin for {hostname}"), ToastKind::Success);
             }
-            Message::CertPinClearAll => {
+            Message::CertPinClearAllRequest => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.clear_all_pins_confirm = true;
+                }
+            }
+            Message::CertPinClearAllCancel => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.clear_all_pins_confirm = false;
+                }
+            }
+            Message::CertPinClearAllConfirm => {
                 if let Ok(mut pins) = self.certificate_pins.lock() {
                     *pins = keep_frost_net::CertificatePinSet::new();
                     save_cert_pins(&self.keep_path, &pins);
                 }
                 self.sync_cert_pins_to_screen();
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.clear_all_pins_confirm = false;
+                }
                 self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
             }
             Message::CertPinMismatchDismiss => {
                 self.pin_mismatch = None;
+                self.pin_mismatch_confirm = false;
             }
             Message::CertPinMismatchClearAndRetry => {
+                self.pin_mismatch_confirm = true;
+            }
+            Message::CertPinMismatchConfirmClear => {
+                self.pin_mismatch_confirm = false;
                 let Some(mismatch) = self.pin_mismatch.take() else {
                     return Task::none();
                 };
@@ -2848,6 +2891,7 @@ impl App {
             tray: None,
             certificate_pins: Arc::new(Mutex::new(keep_frost_net::CertificatePinSet::new())),
             pin_mismatch: None,
+            pin_mismatch_confirm: false,
             bunker_cert_pin_failed: false,
         }
     }

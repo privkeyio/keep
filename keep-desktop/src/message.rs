@@ -62,6 +62,31 @@ pub struct PinMismatchInfo {
 }
 
 #[derive(Clone, Debug)]
+pub enum ConnectionError {
+    PinMismatch(PinMismatchInfo),
+    Other(String),
+}
+
+impl From<String> for ConnectionError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PinMismatch(info) => write!(
+                f,
+                "Certificate pin mismatch for {}: expected {}, got {}",
+                info.hostname, info.expected, info.actual
+            ),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -173,7 +198,7 @@ pub enum Message {
     SelectShareForRelay(usize),
     ConnectRelay,
     DisconnectRelay,
-    ConnectRelayResult(Result<(), String>),
+    ConnectRelayResult(Result<(), ConnectionError>),
     ApproveSignRequest(String),
     RejectSignRequest(String),
 
@@ -182,7 +207,7 @@ pub enum Message {
     BunkerAddRelay,
     BunkerRemoveRelay(usize),
     BunkerStart,
-    BunkerStartResult(Result<String, String>),
+    BunkerStartResult(Result<String, ConnectionError>),
     BunkerStop,
     BunkerApprove,
     BunkerReject,
@@ -223,9 +248,12 @@ pub enum Message {
 
     // Certificate pinning
     CertPinClear(String),
-    CertPinClearAll,
+    CertPinClearAllRequest,
+    CertPinClearAllConfirm,
+    CertPinClearAllCancel,
     CertPinMismatchDismiss,
     CertPinMismatchClearAndRetry,
+    CertPinMismatchConfirmClear,
 
     // Window
     WindowCloseRequested(iced::window::Id),
@@ -349,7 +377,7 @@ impl fmt::Debug for Message {
             Self::DisconnectRelay => f.write_str("DisconnectRelay"),
             Self::ConnectRelayResult(r) => f
                 .debug_tuple("ConnectRelayResult")
-                .field(&r.as_ref().map(|_| ()).map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| format!("{e}")))
                 .finish(),
             Self::ApproveSignRequest(id) => f.debug_tuple("ApproveSignRequest").field(id).finish(),
             Self::RejectSignRequest(id) => f.debug_tuple("RejectSignRequest").field(id).finish(),
@@ -359,7 +387,7 @@ impl fmt::Debug for Message {
             Self::BunkerStart => f.write_str("BunkerStart"),
             Self::BunkerStartResult(r) => f
                 .debug_tuple("BunkerStartResult")
-                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| format!("{e}")))
                 .finish(),
             Self::BunkerStop => f.write_str("BunkerStop"),
             Self::BunkerApprove => f.write_str("BunkerApprove"),
@@ -445,9 +473,12 @@ impl fmt::Debug for Message {
             Self::ScannerPoll => f.write_str("ScannerPoll"),
             Self::Tick => f.write_str("Tick"),
             Self::CertPinClear(h) => f.debug_tuple("CertPinClear").field(h).finish(),
-            Self::CertPinClearAll => f.write_str("CertPinClearAll"),
+            Self::CertPinClearAllRequest => f.write_str("CertPinClearAllRequest"),
+            Self::CertPinClearAllConfirm => f.write_str("CertPinClearAllConfirm"),
+            Self::CertPinClearAllCancel => f.write_str("CertPinClearAllCancel"),
             Self::CertPinMismatchDismiss => f.write_str("CertPinMismatchDismiss"),
             Self::CertPinMismatchClearAndRetry => f.write_str("CertPinMismatchClearAndRetry"),
+            Self::CertPinMismatchConfirmClear => f.write_str("CertPinMismatchConfirmClear"),
         }
     }
 }
