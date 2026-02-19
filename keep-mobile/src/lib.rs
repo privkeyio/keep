@@ -97,16 +97,18 @@ struct StoredShareData {
 
 #[uniffi::export(with_foreign)]
 pub trait DescriptorCallbacks: Send + Sync {
-    fn on_proposed(&self, session_id: String);
-    fn on_contribution_needed(&self, proposal: DescriptorProposal);
-    fn on_contributed(&self, session_id: String, share_index: u16);
+    fn on_proposed(&self, session_id: String) -> Result<(), KeepMobileError>;
+    fn on_contribution_needed(&self, proposal: DescriptorProposal)
+        -> Result<(), KeepMobileError>;
+    fn on_contributed(&self, session_id: String, share_index: u16)
+        -> Result<(), KeepMobileError>;
     fn on_complete(
         &self,
         session_id: String,
         external_descriptor: String,
         internal_descriptor: String,
-    );
-    fn on_failed(&self, session_id: String, error: String);
+    ) -> Result<(), KeepMobileError>;
+    fn on_failed(&self, session_id: String, error: String) -> Result<(), KeepMobileError>;
 }
 
 struct MobileSigningHooks {
@@ -687,7 +689,7 @@ impl KeepMobile {
                     .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })
             }
             "raw" => Ok(desc.external_descriptor),
-            _ => Err(KeepMobileError::Serialization {
+            _ => Err(KeepMobileError::NotSupported {
                 msg: format!("Unknown export format: {format}"),
             }),
         }
@@ -1244,16 +1246,30 @@ impl KeepMobile {
                             network,
                             initiator_pubkey,
                         }) => {
-                            if let Ok(mut nets) = desc.networks.lock() {
-                                nets.insert(session_id, network.clone());
-                            }
-                            if let Ok(mut p) = desc.pending.lock() {
-                                p.retain(|_, c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT);
-                                p.insert(session_id, PendingContribution {
-                                    network: network.clone(),
-                                    initiator_pubkey,
-                                    created_at: std::time::Instant::now(),
-                                });
+                            let nets_ok = match desc.networks.lock() {
+                                Ok(mut nets) => {
+                                    nets.insert(session_id, network.clone());
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!("Descriptor networks lock poisoned: {e}");
+                                    false
+                                }
+                            };
+                            if nets_ok {
+                                match desc.pending.lock() {
+                                    Ok(mut p) => {
+                                        p.retain(|_, c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT);
+                                        p.insert(session_id, PendingContribution {
+                                            network: network.clone(),
+                                            initiator_pubkey,
+                                            created_at: std::time::Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Pending contributions lock poisoned: {e}");
+                                    }
+                                }
                             }
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {
                                 let tiers = policy.recovery_tiers.iter().map(|t| {
@@ -1262,16 +1278,20 @@ impl KeepMobile {
                                         timelock_months: t.timelock_months,
                                     }
                                 }).collect();
-                                cb.on_contribution_needed(DescriptorProposal {
+                                if let Err(e) = cb.on_contribution_needed(DescriptorProposal {
                                     session_id: hex::encode(session_id),
                                     network,
                                     tiers,
-                                });
+                                }) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
                             }
                         }
                         Ok(KfpNodeEvent::DescriptorProposed { session_id }) => {
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {
-                                cb.on_proposed(hex::encode(session_id));
+                                if let Err(e) = cb.on_proposed(hex::encode(session_id)) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
                             }
                         }
                         Ok(KfpNodeEvent::DescriptorContributed {
@@ -1279,7 +1299,9 @@ impl KeepMobile {
                             share_index,
                         }) => {
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {
-                                cb.on_contributed(hex::encode(session_id), share_index);
+                                if let Err(e) = cb.on_contributed(hex::encode(session_id), share_index) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
                             }
                         }
                         Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
@@ -1287,7 +1309,9 @@ impl KeepMobile {
                                 tracing::error!("Failed to finalize descriptor: {e}");
                                 clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
                                 if let Some(cb) = desc.callbacks.read().await.as_ref() {
-                                    cb.on_failed(hex::encode(session_id), e.to_string());
+                                    if let Err(e2) = cb.on_failed(hex::encode(session_id), e.to_string()) {
+                                        tracing::error!("Descriptor callback error: {e2}");
+                                    }
                                 }
                             }
                         }
@@ -1304,10 +1328,12 @@ impl KeepMobile {
                                 _ => {
                                     tracing::error!("Missing network for descriptor session");
                                     if let Some(cb) = desc.callbacks.read().await.as_ref() {
-                                        cb.on_failed(
+                                        if let Err(e) = cb.on_failed(
                                             hex::encode(session_id),
                                             "Missing network for descriptor session".into(),
-                                        );
+                                        ) {
+                                            tracing::error!("Descriptor callback error: {e}");
+                                        }
                                     }
                                     continue;
                                 }
@@ -1326,7 +1352,9 @@ impl KeepMobile {
                         Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
                             clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {
-                                cb.on_failed(hex::encode(session_id), error);
+                                if let Err(e) = cb.on_failed(hex::encode(session_id), error) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
                             }
                         }
                         Ok(_) => {}
@@ -1389,20 +1417,24 @@ impl KeepMobile {
         if let Err(e) = persistence::persist_descriptor(storage, &info) {
             tracing::error!("Failed to persist descriptor: {e}");
             if let Some(cb) = cbs.read().await.as_ref() {
-                cb.on_failed(
+                if let Err(e2) = cb.on_failed(
                     hex::encode(session_id),
                     format!("Failed to persist descriptor: {e}"),
-                );
+                ) {
+                    tracing::error!("Descriptor callback error: {e2}");
+                }
             }
             return;
         }
 
         if let Some(cb) = cbs.read().await.as_ref() {
-            cb.on_complete(
+            if let Err(e) = cb.on_complete(
                 hex::encode(session_id),
                 external_descriptor,
                 internal_descriptor,
-            );
+            ) {
+                tracing::error!("Descriptor callback error: {e}");
+            }
         }
     }
 

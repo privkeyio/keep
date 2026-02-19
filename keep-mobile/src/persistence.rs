@@ -305,7 +305,7 @@ pub(crate) fn delete_descriptor(
     storage: &Arc<dyn SecureStorage>,
     group_pubkey_hex: &str,
 ) -> Result<(), KeepMobileError> {
-    let _ = storage.delete_share_by_key(descriptor_key(group_pubkey_hex));
+    storage.delete_share_by_key(descriptor_key(group_pubkey_hex))?;
 
     let mut index = load_descriptor_index(storage);
     if let Some(pos) = index.iter().position(|k| k == group_pubkey_hex) {

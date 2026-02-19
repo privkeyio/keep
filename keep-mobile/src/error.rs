@@ -107,3 +107,11 @@ impl From<keep_core::error::KeepError> for KeepMobileError {
         KeepMobileError::FrostError { msg: e.to_string() }
     }
 }
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for KeepMobileError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        KeepMobileError::FrostError {
+            msg: format!("Callback error: {e}"),
+        }
+    }
+}
