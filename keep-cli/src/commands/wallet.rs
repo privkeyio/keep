@@ -286,8 +286,12 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    // Key slots use sequential indices 1..=key_count. The protocol validates
-    // that these indices correspond to actual shares on the receiving end.
+    // Key slots use sequential indices 1..=key_count, assuming participants are
+    // indexed 1..=total_shares contiguously. Non-contiguous groups (e.g. shares
+    // {1, 3, 5}) will fail at descriptor reconstruction when looking up
+    // contributions by index. The key_count <= total_shares check above guards
+    // the upper bound; protocol-level validation catches invalid indices on
+    // the receiving end.
     let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count)
         .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
         .collect();
@@ -378,13 +382,13 @@ pub fn cmd_wallet_propose(
     }
     out.newline();
 
-    let expected_contributions = keep_frost_net::participant_indices(&policy).len();
+    let contributor_indices = keep_frost_net::participant_indices(&policy);
     let our_index = share.metadata.identifier;
-    let we_contribute = keep_frost_net::participant_indices(&policy).contains(&our_index);
+    let we_contribute = contributor_indices.contains(&our_index);
     let remaining_contributions = if we_contribute {
-        expected_contributions.saturating_sub(1)
+        contributor_indices.len().saturating_sub(1)
     } else {
-        expected_contributions
+        contributor_indices.len()
     };
 
     let rt =
@@ -457,8 +461,9 @@ pub fn cmd_wallet_propose(
             let remaining = deadline - tokio::time::Instant::now();
             match tokio::time::timeout(remaining, event_rx.recv()).await {
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorContributed {
-                    share_index, ..
-                })) => {
+                    session_id: sid,
+                    share_index,
+                })) if sid == session_id => {
                     received += 1;
                     out.info(&format!(
                         "  Share {share_index} contributed ({received}/{remaining_contributions})"

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
@@ -214,11 +214,10 @@ impl KfpNode {
             .key_package()
             .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
         let signing_share = key_package.signing_share();
-        let mut signing_share_bytes: [u8; 32] = signing_share
-            .serialize()
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+        let signing_share_bytes = Zeroizing::new(
+            <[u8; 32]>::try_from(signing_share.serialize().as_slice())
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
 
         let net = match network {
             "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -226,17 +225,14 @@ impl KfpNode {
             "signet" => keep_bitcoin::Network::Signet,
             "regtest" => keep_bitcoin::Network::Regtest,
             _ => {
-                signing_share_bytes.zeroize();
                 return Err(FrostNetError::Session(format!(
                     "unknown network: {network}"
                 )));
             }
         };
 
-        let result = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net);
-        signing_share_bytes.zeroize();
-        let derivation =
-            result.map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
+        let derivation = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net)
+            .map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
 
         let xpub = derivation
             .account_xpub(0)
