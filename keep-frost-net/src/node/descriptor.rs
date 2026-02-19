@@ -312,7 +312,7 @@ impl KfpNode {
         internal_descriptor: &str,
         policy_hash: [u8; 32],
     ) -> Result<()> {
-        {
+        let contributions = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&session_id)
@@ -323,7 +323,9 @@ impl KfpNode {
                 internal: internal_descriptor.to_string(),
                 policy_hash,
             })?;
-        }
+
+            session.contributions().clone()
+        };
 
         let payload = DescriptorFinalizePayload::new(
             session_id,
@@ -331,6 +333,7 @@ impl KfpNode {
             external_descriptor,
             internal_descriptor,
             policy_hash,
+            contributions,
         );
 
         let msg = KfpMessage::DescriptorFinalize(payload);
@@ -440,7 +443,7 @@ impl KfpNode {
             reconstruct_descriptor(
                 session.group_pubkey(),
                 session.policy(),
-                session.contributions(),
+                &payload.contributions,
                 session.network(),
             )?
         };

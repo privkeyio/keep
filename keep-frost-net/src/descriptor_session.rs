@@ -24,7 +24,7 @@ pub enum DescriptorSessionState {
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct XpubContribution {
     pub account_xpub: String,
     pub fingerprint: String,
