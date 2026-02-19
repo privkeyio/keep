@@ -4260,6 +4260,7 @@ dependencies = [
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
+ "nostr-sdk",
  "serde",
  "serde_json",
  "sha2",

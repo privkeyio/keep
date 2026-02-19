@@ -28,8 +28,9 @@ pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, PeerInfo, PeerStatus,
-    SignRequest, SignRequestMetadata, ThresholdConfig,
+    DescriptorProposal, DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, PeerInfo,
+    PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
+    WalletDescriptorInfo,
 };
 
 use keep_core::frost::{
@@ -39,6 +40,7 @@ use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use network::{constant_time_eq, convert_peer_status, parse_loopback_proxy, validate_hex_pubkey};
 use policy::{PolicyBundle, PolicyEvaluator};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -76,6 +78,9 @@ const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
 const CERT_PINS_STORAGE_KEY: &str = "__keep_cert_pins_v1";
+const DESCRIPTOR_INDEX_KEY: &str = "__keep_descriptor_index_v1";
+const DESCRIPTOR_KEY_PREFIX: &str = "__keep_descriptor_";
+const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
 pub struct CertificatePin {
@@ -88,6 +93,20 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Vec<u8>,
     pubkey_package_bytes: Vec<u8>,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait DescriptorCallbacks: Send + Sync {
+    fn on_proposed(&self, session_id: String) -> Result<(), KeepMobileError>;
+    fn on_contribution_needed(&self, proposal: DescriptorProposal) -> Result<(), KeepMobileError>;
+    fn on_contributed(&self, session_id: String, share_index: u16) -> Result<(), KeepMobileError>;
+    fn on_complete(
+        &self,
+        session_id: String,
+        external_descriptor: String,
+        internal_descriptor: String,
+    ) -> Result<(), KeepMobileError>;
+    fn on_failed(&self, session_id: String, error: String) -> Result<(), KeepMobileError>;
 }
 
 struct MobileSigningHooks {
@@ -145,11 +164,29 @@ pub struct KeepMobile {
     pub(crate) runtime: tokio::runtime::Runtime,
     policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
     velocity: Arc<std::sync::Mutex<VelocityTracker>>,
+    descriptor_callbacks: Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
+    descriptor_networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
+    pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
 }
 
 struct PendingRequest {
     info: SignRequest,
     response_tx: mpsc::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct PendingContribution {
+    network: String,
+    initiator_pubkey: nostr_sdk::PublicKey,
+    created_at: std::time::Instant,
+}
+
+struct DescriptorContext {
+    callbacks: Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
+    storage: Arc<dyn SecureStorage>,
+    node: Arc<KfpNode>,
+    networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
+    pending: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
 }
 
 #[uniffi::export]
@@ -196,6 +233,9 @@ impl KeepMobile {
             runtime,
             policy,
             velocity,
+            descriptor_callbacks: Arc::new(RwLock::new(None)),
+            descriptor_networks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -622,6 +662,235 @@ impl KeepMobile {
         pins.remove_pin(&hostname);
         persistence::persist_cert_pins(&self.storage, &pins)
     }
+
+    pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
+        persistence::load_descriptors(&self.storage)
+    }
+
+    pub fn wallet_descriptor_export(
+        &self,
+        group_pubkey: String,
+        format: String,
+    ) -> Result<String, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
+
+        match format.as_str() {
+            "sparrow" => {
+                let json = serde_json::json!({
+                    "descriptor": desc.external_descriptor,
+                    "internal_descriptor": desc.internal_descriptor,
+                    "network": desc.network,
+                });
+                serde_json::to_string_pretty(&json)
+                    .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })
+            }
+            "raw" => Ok(desc.external_descriptor),
+            _ => Err(KeepMobileError::NotSupported {
+                msg: format!("Unknown export format: {format}"),
+            }),
+        }
+    }
+
+    pub fn wallet_descriptor_delete(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        persistence::delete_descriptor(&self.storage, &group_pubkey)
+    }
+
+    pub fn wallet_descriptor_set_callbacks(&self, callbacks: Arc<dyn DescriptorCallbacks>) {
+        self.runtime.block_on(async {
+            *self.descriptor_callbacks.write().await = Some(callbacks);
+        });
+    }
+
+    pub fn wallet_descriptor_propose(
+        &self,
+        network: String,
+        tiers: Vec<RecoveryTierConfig>,
+    ) -> Result<String, KeepMobileError> {
+        if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
+            return Err(KeepMobileError::NetworkError {
+                msg: format!("Invalid network: {network}"),
+            });
+        }
+
+        self.runtime.block_on(async {
+            let node_guard = self.node.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+
+            let share_info = self
+                .storage
+                .get_share_metadata()
+                .ok_or(KeepMobileError::NotInitialized)?;
+
+            let policy = build_wallet_policy(&tiers, share_info.total_shares)?;
+
+            let (xpub, fingerprint) = node
+                .derive_account_xpub(&network)
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+
+            validate_xpub_network(&xpub, &network)?;
+
+            let session_id = node
+                .request_descriptor(policy, &network, &xpub, &fingerprint)
+                .await
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+
+            self.descriptor_networks
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "Descriptor networks lock poisoned".into(),
+                })?
+                .insert(session_id, network);
+
+            Ok(hex::encode(session_id))
+        })
+    }
+
+    pub fn wallet_descriptor_cancel(&self, session_id: String) -> Result<(), KeepMobileError> {
+        let id = parse_session_id(&session_id)?;
+        clear_descriptor_state(&self.descriptor_networks, &self.pending_contributions, &id);
+
+        self.runtime.block_on(async {
+            let node_guard = self.node.read().await;
+            if let Some(node) = node_guard.as_ref() {
+                node.cancel_descriptor_session(&id);
+            }
+        });
+        Ok(())
+    }
+
+    pub fn wallet_descriptor_approve_contribution(
+        &self,
+        session_id: String,
+    ) -> Result<(), KeepMobileError> {
+        let id = parse_session_id(&session_id)?;
+
+        let pending = {
+            let guard =
+                self.pending_contributions
+                    .lock()
+                    .map_err(|_| KeepMobileError::StorageError {
+                        msg: "Pending contributions lock poisoned".into(),
+                    })?;
+            guard
+                .get(&id)
+                .filter(|c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT)
+                .cloned()
+                .ok_or(KeepMobileError::Timeout)?
+        };
+
+        self.runtime.block_on(async {
+            let node_guard = self.node.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+
+            let (xpub, fingerprint) = node
+                .derive_account_xpub(&pending.network)
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+
+            validate_xpub_network(&xpub, &pending.network)?;
+
+            node.contribute_descriptor(id, &pending.initiator_pubkey, &xpub, &fingerprint)
+                .await
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+
+            Ok::<(), KeepMobileError>(())
+        })?;
+
+        self.pending_contributions
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Pending contributions lock poisoned".into(),
+            })?
+            .remove(&id);
+
+        Ok(())
+    }
+}
+
+fn clear_descriptor_state(
+    nets: &std::sync::Mutex<HashMap<[u8; 32], String>>,
+    pending: &std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>,
+    session_id: &[u8; 32],
+) {
+    if let Ok(mut n) = nets.lock() {
+        n.remove(session_id);
+    }
+    if let Ok(mut p) = pending.lock() {
+        p.remove(session_id);
+    }
+}
+
+fn parse_session_id(hex: &str) -> Result<[u8; 32], KeepMobileError> {
+    let bytes = hex::decode(hex).map_err(|_| KeepMobileError::InvalidSession)?;
+    bytes
+        .try_into()
+        .map_err(|_| KeepMobileError::InvalidSession)
+}
+
+fn validate_xpub_network(xpub: &str, network: &str) -> Result<(), KeepMobileError> {
+    let expected_prefix = match network {
+        "bitcoin" => "xpub",
+        "testnet" | "signet" | "regtest" => "tpub",
+        _ => return Ok(()),
+    };
+    if !xpub.starts_with(expected_prefix) {
+        return Err(KeepMobileError::FrostError {
+            msg: format!("xpub prefix mismatch: expected {expected_prefix}* for network {network}"),
+        });
+    }
+    Ok(())
+}
+
+fn build_wallet_policy(
+    tiers: &[RecoveryTierConfig],
+    total_shares: u16,
+) -> Result<keep_frost_net::WalletPolicy, KeepMobileError> {
+    use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
+
+    if tiers.is_empty() {
+        return Err(KeepMobileError::FrostError {
+            msg: "At least one recovery tier is required".into(),
+        });
+    }
+
+    for tier in tiers {
+        if tier.threshold == 0 {
+            return Err(KeepMobileError::FrostError {
+                msg: "Recovery tier threshold must be > 0".into(),
+            });
+        }
+        if tier.threshold > u32::from(total_shares) {
+            return Err(KeepMobileError::FrostError {
+                msg: format!(
+                    "Recovery tier threshold {} exceeds total shares {}",
+                    tier.threshold, total_shares
+                ),
+            });
+        }
+        if tier.timelock_months == 0 {
+            return Err(KeepMobileError::FrostError {
+                msg: "Recovery tier timelock_months must be > 0".into(),
+            });
+        }
+    }
+
+    let recovery_tiers = tiers
+        .iter()
+        .map(|tier| {
+            let key_slots = (1..=total_shares)
+                .map(|i| KeySlot::Participant { share_index: i })
+                .collect();
+            PolicyTier {
+                threshold: tier.threshold,
+                key_slots,
+                timelock_months: tier.timelock_months,
+            }
+        })
+        .collect();
+
+    Ok(WalletPolicy { recovery_tiers })
 }
 
 impl KeepMobile {
@@ -661,8 +930,15 @@ impl KeepMobile {
             let event_rx = node.subscribe();
             let node = Arc::new(node);
             let pending = self.pending_requests.clone();
+            let desc_ctx = DescriptorContext {
+                callbacks: self.descriptor_callbacks.clone(),
+                storage: self.storage.clone(),
+                node: node.clone(),
+                networks: self.descriptor_networks.clone(),
+                pending: self.pending_contributions.clone(),
+            };
             tokio::spawn(async move {
-                Self::event_listener(event_rx, request_rx, pending).await;
+                Self::event_listener(event_rx, request_rx, pending, desc_ctx).await;
             });
 
             let run_node = node.clone();
@@ -951,6 +1227,7 @@ impl KeepMobile {
         mut event_rx: broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
         pending: Arc<Mutex<Vec<PendingRequest>>>,
+        desc: DescriptorContext,
     ) {
         loop {
             tokio::select! {
@@ -960,6 +1237,123 @@ impl KeepMobile {
                         | Ok(KfpNodeEvent::SigningFailed { session_id, .. }) => {
                             let id = hex::encode(session_id);
                             pending.lock().await.retain(|r| r.info.id != id);
+                        }
+                        Ok(KfpNodeEvent::DescriptorContributionNeeded {
+                            session_id,
+                            policy,
+                            network,
+                            initiator_pubkey,
+                        }) => {
+                            let nets_ok = match desc.networks.lock() {
+                                Ok(mut nets) => {
+                                    nets.insert(session_id, network.clone());
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!("Descriptor networks lock poisoned: {e}");
+                                    false
+                                }
+                            };
+                            if nets_ok {
+                                match desc.pending.lock() {
+                                    Ok(mut p) => {
+                                        p.retain(|_, c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT);
+                                        p.insert(session_id, PendingContribution {
+                                            network: network.clone(),
+                                            initiator_pubkey,
+                                            created_at: std::time::Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Pending contributions lock poisoned: {e}");
+                                    }
+                                }
+                            }
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                let tiers = policy.recovery_tiers.iter().map(|t| {
+                                    RecoveryTierConfig {
+                                        threshold: t.threshold,
+                                        timelock_months: t.timelock_months,
+                                    }
+                                }).collect();
+                                if let Err(e) = cb.on_contribution_needed(DescriptorProposal {
+                                    session_id: hex::encode(session_id),
+                                    network,
+                                    tiers,
+                                }) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
+                        }
+                        Ok(KfpNodeEvent::DescriptorProposed { session_id }) => {
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                if let Err(e) = cb.on_proposed(hex::encode(session_id)) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
+                        }
+                        Ok(KfpNodeEvent::DescriptorContributed {
+                            session_id,
+                            share_index,
+                        }) => {
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                if let Err(e) = cb.on_contributed(hex::encode(session_id), share_index) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
+                        }
+                        Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
+                            if let Err(e) = desc.node.build_and_finalize_descriptor(session_id).await {
+                                tracing::error!("Failed to finalize descriptor: {e}");
+                                clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
+                                if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                    if let Err(e2) = cb.on_failed(hex::encode(session_id), e.to_string()) {
+                                        tracing::error!("Descriptor callback error: {e2}");
+                                    }
+                                }
+                            }
+                        }
+                        Ok(KfpNodeEvent::DescriptorComplete {
+                            session_id,
+                            external_descriptor,
+                            internal_descriptor,
+                        }) => {
+                            if let Ok(mut p) = desc.pending.lock() {
+                                p.remove(&session_id);
+                            }
+                            let network = match desc.networks.lock().ok().and_then(|mut n| n.remove(&session_id)) {
+                                Some(n) if !n.is_empty() => n,
+                                _ => {
+                                    tracing::error!("Missing network for descriptor session");
+                                    if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                        if let Err(e) = cb.on_failed(
+                                            hex::encode(session_id),
+                                            "Missing network for descriptor session".into(),
+                                        ) {
+                                            tracing::error!("Descriptor callback error: {e}");
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
+                            Self::handle_descriptor_complete(
+                                &desc.storage,
+                                &desc.callbacks,
+                                &desc.node,
+                                network,
+                                session_id,
+                                external_descriptor,
+                                internal_descriptor,
+                            )
+                            .await;
+                        }
+                        Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
+                            clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                if let Err(e) = cb.on_failed(hex::encode(session_id), error) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -991,6 +1385,53 @@ impl KeepMobile {
                         response_tx,
                     });
                 }
+            }
+        }
+    }
+
+    async fn handle_descriptor_complete(
+        storage: &Arc<dyn SecureStorage>,
+        cbs: &Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
+        node: &Arc<KfpNode>,
+        network: String,
+        session_id: [u8; 32],
+        external_descriptor: String,
+        internal_descriptor: String,
+    ) {
+        let group_pubkey = hex::encode(node.group_pubkey());
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let info = WalletDescriptorInfo {
+            group_pubkey,
+            external_descriptor: external_descriptor.clone(),
+            internal_descriptor: internal_descriptor.clone(),
+            network,
+            created_at,
+        };
+
+        if let Err(e) = persistence::persist_descriptor(storage, &info) {
+            tracing::error!("Failed to persist descriptor: {e}");
+            if let Some(cb) = cbs.read().await.as_ref() {
+                if let Err(e2) = cb.on_failed(
+                    hex::encode(session_id),
+                    format!("Failed to persist descriptor: {e}"),
+                ) {
+                    tracing::error!("Descriptor callback error: {e2}");
+                }
+            }
+            return;
+        }
+
+        if let Some(cb) = cbs.read().await.as_ref() {
+            if let Err(e) = cb.on_complete(
+                hex::encode(session_id),
+                external_descriptor,
+                internal_descriptor,
+            ) {
+                tracing::error!("Descriptor callback error: {e}");
             }
         }
     }

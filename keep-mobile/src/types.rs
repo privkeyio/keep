@@ -72,3 +72,37 @@ pub struct DkgConfig {
     pub our_index: u16,
     pub relays: Vec<String>,
 }
+
+#[derive(uniffi::Record, Clone)]
+pub struct WalletDescriptorInfo {
+    pub group_pubkey: String,
+    pub external_descriptor: String,
+    pub internal_descriptor: String,
+    pub network: String,
+    pub created_at: u64,
+}
+
+impl std::fmt::Debug for WalletDescriptorInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletDescriptorInfo")
+            .field("group_pubkey", &self.group_pubkey)
+            .field("external_descriptor", &"[redacted]")
+            .field("internal_descriptor", &"[redacted]")
+            .field("network", &self.network)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct RecoveryTierConfig {
+    pub threshold: u32,
+    pub timelock_months: u32,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct DescriptorProposal {
+    pub session_id: String,
+    pub network: String,
+    pub tiers: Vec<RecoveryTierConfig>,
+}
