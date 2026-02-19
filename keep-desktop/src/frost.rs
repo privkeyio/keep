@@ -15,13 +15,15 @@ use zeroize::Zeroizing;
 use keep_core::Keep;
 
 use crate::app::{
-    friendly_err, lock_keep, with_keep_blocking, App, ToastKind, MAX_PENDING_REQUESTS,
-    MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS,
-    RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
+    friendly_err, lock_keep, with_keep_blocking, ActiveCoordination, App, ToastKind,
+    MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER,
+    RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS,
+    SIGNING_RESPONSE_TIMEOUT,
 };
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
 use crate::screen::relay::RelayScreen;
 use crate::screen::shares::ShareEntry;
+use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState, WalletEntry};
 use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
@@ -64,6 +66,44 @@ pub(crate) async fn verify_relay_certificates(
         }
     }
     Ok(())
+}
+
+fn parse_bitcoin_network(net: &str) -> Result<bitcoin::Network, String> {
+    net.parse::<bitcoin::Network>().map_err(|e| format!("{e}"))
+}
+
+pub(crate) async fn derive_xpub(
+    keep_arc: Arc<Mutex<Option<Keep>>>,
+    group_pubkey: [u8; 32],
+    identifier: u16,
+    network: String,
+) -> Result<(String, String), String> {
+    tokio::task::spawn_blocking(move || {
+        with_keep_blocking(&keep_arc, "Failed to derive xpub", move |keep| {
+            let share_pkg = keep
+                .frost_get_share_by_index(&group_pubkey, identifier)
+                .map_err(friendly_err)?;
+            let key_package = share_pkg.key_package().map_err(friendly_err)?;
+            let signing_share = key_package.signing_share();
+            let serialized = Zeroizing::new(signing_share.serialize());
+            let signing_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+                serialized
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "Invalid signing share length".to_string())?,
+            );
+            let bitcoin_network = parse_bitcoin_network(&network)?;
+            let derivation = keep_bitcoin::AddressDerivation::new(&signing_bytes, bitcoin_network)
+                .map_err(|e| format!("{e}"))?;
+            let xpub = derivation.account_xpub(0).map_err(|e| format!("{e}"))?;
+            let fingerprint = derivation
+                .master_fingerprint()
+                .map_err(|e| format!("{e}"))?;
+            Ok((xpub.to_string(), fingerprint.to_string()))
+        })
+    })
+    .await
+    .map_err(|_| "Background task failed".to_string())?
 }
 
 #[derive(Clone)]
@@ -280,6 +320,7 @@ pub(crate) async fn setup_frost_node(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_frost_node(
     keep_arc: Arc<Mutex<Option<Keep>>>,
     keep_path: std::path::PathBuf,
@@ -288,6 +329,7 @@ pub(crate) async fn spawn_frost_node(
     ch: FrostChannels,
     net: NetworkConfig,
     kill_switch: Arc<AtomicBool>,
+    node_out: Arc<Mutex<Option<Arc<KfpNode>>>>,
 ) -> Result<(), crate::message::ConnectionError> {
     let frost_events = ch.events.clone();
     let setup = setup_frost_node(
@@ -301,7 +343,7 @@ pub(crate) async fn spawn_frost_node(
     )
     .await?;
 
-    let _node = setup.node;
+    let node = setup.node;
     let mut connect_rx = setup.connect_rx;
     let mut run_error_rx = setup.run_error_rx;
 
@@ -333,6 +375,14 @@ pub(crate) async fn spawn_frost_node(
         }
     }
 
+    match node_out.lock() {
+        Ok(mut guard) => *guard = Some(node),
+        Err(_) => {
+            return Err(crate::message::ConnectionError::Other(
+                "Node mutex poisoned".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -414,6 +464,59 @@ pub(crate) async fn frost_event_listener(
                             FrostNodeMsg::SignRequestRemoved(id),
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorContributionNeeded {
+                        session_id,
+                        network,
+                        initiator_pubkey,
+                        ..
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorContributionNeeded {
+                                session_id,
+                                network,
+                                initiator_pubkey,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorContributed {
+                        session_id,
+                        share_index,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorContributed {
+                                session_id,
+                                share_index,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorReady { session_id },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorComplete {
+                        session_id,
+                        external_descriptor,
+                        internal_descriptor,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorComplete {
+                                session_id,
+                                external_descriptor,
+                                internal_descriptor,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorFailed { session_id, error },
+                        );
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -471,17 +574,19 @@ pub(crate) async fn frost_event_listener(
 }
 
 impl App {
-    pub(crate) fn drain_frost_events(&mut self) {
+    pub(crate) fn drain_frost_events(&mut self) -> iced::Task<Message> {
         let events: Vec<FrostNodeMsg> = {
             let Ok(mut queue) = self.frost_events.lock() else {
-                return;
+                return iced::Task::none();
             };
             queue.drain(..).collect()
         };
 
-        for event in events {
-            self.handle_frost_event(event);
-        }
+        let tasks: Vec<iced::Task<Message>> = events
+            .into_iter()
+            .map(|event| self.handle_frost_event(event))
+            .collect();
+        iced::Task::batch(tasks)
     }
 
     pub(crate) fn relay_screen_mut(&mut self) -> Option<&mut RelayScreen> {
@@ -492,7 +597,27 @@ impl App {
         }
     }
 
-    fn handle_frost_event(&mut self, event: FrostNodeMsg) {
+    pub(crate) fn get_frost_node(&self) -> Option<Arc<KfpNode>> {
+        self.frost_node.lock().ok()?.clone()
+    }
+
+    pub(crate) fn update_wallet_setup(
+        &mut self,
+        session_id: &[u8; 32],
+        f: impl FnOnce(&mut SetupState),
+    ) {
+        if let Screen::Wallet(ws) = &mut self.screen {
+            if let Some(setup) = &mut ws.setup {
+                let matches =
+                    setup.session_id.as_ref() == Some(session_id) || setup.session_id.is_none();
+                if matches {
+                    f(setup);
+                }
+            }
+        }
+    }
+
+    fn handle_frost_event(&mut self, event: FrostNodeMsg) -> iced::Task<Message> {
         match event {
             FrostNodeMsg::PeerUpdate(peers) => {
                 self.frost_peers = peers.clone();
@@ -522,7 +647,106 @@ impl App {
                     s.status = status;
                 }
             }
+            FrostNodeMsg::DescriptorContributionNeeded {
+                session_id,
+                network,
+                initiator_pubkey,
+            } => {
+                return self.handle_descriptor_contribution_needed(
+                    session_id,
+                    network,
+                    initiator_pubkey,
+                );
+            }
+            FrostNodeMsg::DescriptorReady { session_id } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
+                });
+            }
+            FrostNodeMsg::DescriptorContributed { session_id, .. } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    if let SetupPhase::Coordinating(DescriptorProgress::WaitingContributions {
+                        ref mut received,
+                        ..
+                    }) = setup.phase
+                    {
+                        *received += 1;
+                    }
+                });
+            }
+            FrostNodeMsg::DescriptorComplete {
+                session_id,
+                external_descriptor,
+                internal_descriptor,
+            } => {
+                self.handle_descriptor_complete(
+                    session_id,
+                    external_descriptor,
+                    internal_descriptor,
+                );
+            }
+            FrostNodeMsg::DescriptorFailed { session_id, error } => {
+                self.active_coordinations.remove(&session_id);
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
+                });
+            }
         }
+        iced::Task::none()
+    }
+
+    fn handle_descriptor_contribution_needed(
+        &mut self,
+        session_id: [u8; 32],
+        network: String,
+        initiator_pubkey: nostr_sdk::PublicKey,
+    ) -> iced::Task<Message> {
+        let share = match &self.frost_last_share {
+            Some(s) => s.clone(),
+            None => return iced::Task::none(),
+        };
+        let Some(node) = self.get_frost_node() else {
+            return iced::Task::none();
+        };
+
+        if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
+            return iced::Task::none();
+        }
+
+        self.active_coordinations.insert(
+            session_id,
+            ActiveCoordination {
+                group_pubkey: share.group_pubkey,
+                network: network.clone(),
+            },
+        );
+
+        let keep_arc = self.keep.clone();
+
+        iced::Task::perform(
+            async move {
+                let (xpub_str, fingerprint_str) =
+                    derive_xpub(keep_arc, share.group_pubkey, share.identifier, network).await?;
+
+                node.contribute_descriptor(
+                    session_id,
+                    &initiator_pubkey,
+                    &xpub_str,
+                    &fingerprint_str,
+                )
+                .await
+                .map_err(|e| format!("{e}"))?;
+
+                Ok::<(), String>(())
+            },
+            move |result| match result {
+                Ok(()) => Message::WalletDescriptorProgress(DescriptorProgress::Contributed, None),
+                Err(e) => Message::WalletDescriptorProgress(
+                    DescriptorProgress::Failed(e),
+                    Some(session_id),
+                ),
+            },
+        )
     }
 
     pub(crate) fn handle_connect_relay(&mut self) -> iced::Task<Message> {
@@ -581,6 +805,7 @@ impl App {
                 self.frost_channels(),
                 self.network_config(),
                 self.kill_switch.clone(),
+                self.frost_node.clone(),
             ),
             Message::ConnectRelayResult,
         )
@@ -597,6 +822,9 @@ impl App {
         self.pending_sign_display.clear();
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
+        if let Ok(mut guard) = self.frost_node.lock() {
+            *guard = None;
+        }
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
@@ -652,6 +880,7 @@ impl App {
                 self.frost_channels(),
                 self.network_config(),
                 self.kill_switch.clone(),
+                self.frost_node.clone(),
             ),
             Message::ConnectRelayResult,
         )
@@ -681,6 +910,59 @@ impl App {
         self.pending_sign_display.retain(|r| r.id != id);
         if let Some(s) = self.relay_screen_mut() {
             s.pending_requests.retain(|r| r.id != id);
+        }
+    }
+
+    fn handle_descriptor_complete(
+        &mut self,
+        session_id: [u8; 32],
+        external_descriptor: String,
+        internal_descriptor: String,
+    ) {
+        let Some(coord) = self.active_coordinations.remove(&session_id) else {
+            return;
+        };
+        let group_pubkey = coord.group_pubkey;
+        let network = coord.network;
+
+        let created_at = chrono::Utc::now().timestamp().max(0) as u64;
+        let descriptor = keep_core::WalletDescriptor {
+            group_pubkey,
+            external_descriptor: external_descriptor.clone(),
+            internal_descriptor: internal_descriptor.clone(),
+            network: network.clone(),
+            created_at,
+        };
+
+        let store_result = {
+            let guard = lock_keep(&self.keep);
+            match guard.as_ref() {
+                Some(keep) => keep
+                    .store_wallet_descriptor(&descriptor)
+                    .map_err(friendly_err),
+                None => Err("Keep not available".to_string()),
+            }
+        };
+
+        let progress = match &store_result {
+            Ok(()) => DescriptorProgress::Complete,
+            Err(e) => DescriptorProgress::Failed(e.clone()),
+        };
+        self.update_wallet_setup(&session_id, |setup| {
+            setup.phase = SetupPhase::Coordinating(progress);
+        });
+
+        if store_result.is_ok() {
+            if let Screen::Wallet(ws) = &mut self.screen {
+                ws.descriptors.push(WalletEntry {
+                    group_pubkey,
+                    group_hex: hex::encode(group_pubkey),
+                    external_descriptor,
+                    internal_descriptor,
+                    network,
+                    created_at,
+                });
+            }
         }
     }
 

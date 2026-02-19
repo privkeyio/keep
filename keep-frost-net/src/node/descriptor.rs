@@ -131,6 +131,15 @@ impl KfpNode {
             ));
         }
 
+        {
+            let peers = self.peers.read();
+            if peers.get_peer_by_pubkey(&sender).is_none() {
+                return Err(FrostNetError::UntrustedPeer(format!(
+                    "Descriptor proposal from unknown peer: {sender}"
+                )));
+            }
+        }
+
         info!(
             session_id = %hex::encode(payload.session_id),
             network = %payload.network,
@@ -501,5 +510,9 @@ impl KfpNode {
         }
 
         Ok(())
+    }
+
+    pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
+        self.descriptor_sessions.write().remove_session(session_id);
     }
 }
