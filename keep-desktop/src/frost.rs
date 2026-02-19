@@ -26,10 +26,52 @@ use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 
+pub(crate) async fn verify_relay_certificates(
+    relay_urls: &[String],
+    certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
+    keep_path: &std::path::Path,
+) -> Result<(), crate::message::ConnectionError> {
+    use crate::message::ConnectionError;
+    for url in relay_urls.iter().filter(|u| u.starts_with("wss://")) {
+        let pins_snapshot = certificate_pins
+            .lock()
+            .map_err(|_| ConnectionError::Other("Pin lock poisoned".to_string()))?
+            .clone();
+        let (_hash, new_pin) = keep_frost_net::verify_relay_certificate(url, &pins_snapshot)
+            .await
+            .map_err(|e| match e {
+                keep_frost_net::FrostNetError::CertificatePinMismatch {
+                    hostname,
+                    expected,
+                    actual,
+                } => ConnectionError::PinMismatch(crate::message::PinMismatchInfo {
+                    hostname,
+                    expected,
+                    actual,
+                }),
+                other => ConnectionError::Other(format!("{other}")),
+            })?;
+        if let Some((hostname, hash)) = new_pin {
+            let mut guard = certificate_pins
+                .lock()
+                .map_err(|_| ConnectionError::Other("Pin lock poisoned".to_string()))?;
+            if guard.get_pin(&hostname).is_none() {
+                guard.add_pin(hostname, hash);
+            }
+            let pins_snapshot = guard.clone();
+            drop(guard);
+            crate::app::save_cert_pins(keep_path, &pins_snapshot);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct NetworkConfig {
     pub proxy: Option<SocketAddr>,
     pub session_timeout: Option<Duration>,
+    pub certificate_pins: Arc<Mutex<keep_frost_net::CertificatePinSet>>,
+    pub keep_path: std::path::PathBuf,
 }
 
 #[derive(Clone)]
@@ -149,7 +191,7 @@ pub(crate) async fn setup_frost_node(
     ch: FrostChannels,
     net: NetworkConfig,
     kill_switch: Arc<AtomicBool>,
-) -> Result<FrostNodeSetup, String> {
+) -> Result<FrostNodeSetup, crate::message::ConnectionError> {
     let share = tokio::task::spawn_blocking({
         let keep_arc = keep_arc.clone();
         let group_pubkey = share_entry.group_pubkey;
@@ -166,6 +208,9 @@ pub(crate) async fn setup_frost_node(
 
     let nonce_store_path = keep_path.join("frost-nonces");
     keep_frost_net::install_default_crypto_provider();
+
+    verify_relay_certificates(&relay_urls, &net.certificate_pins, &net.keep_path).await?;
+
     let nonce_store = keep_frost_net::FileNonceStore::new(&nonce_store_path)
         .map_err(|e| format!("Failed to create nonce store: {e}"))?;
     let node = KfpNode::with_nonce_store(
@@ -243,7 +288,7 @@ pub(crate) async fn spawn_frost_node(
     ch: FrostChannels,
     net: NetworkConfig,
     kill_switch: Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<(), crate::message::ConnectionError> {
     let frost_events = ch.events.clone();
     let setup = setup_frost_node(
         keep_arc,
@@ -270,14 +315,14 @@ pub(crate) async fn spawn_frost_node(
                     &frost_events,
                     FrostNodeMsg::StatusChanged(ConnectionStatus::Error(msg.clone())),
                 );
-                return Err(msg);
+                return Err(crate::message::ConnectionError::Other(msg));
             }
             result = connect_rx.recv() => {
                 match result {
                     Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err("Node stopped unexpectedly".into());
+                        return Err(crate::message::ConnectionError::Other("Node stopped unexpectedly".into()));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 }
@@ -641,13 +686,18 @@ impl App {
 
     pub(crate) fn handle_connect_relay_result(
         &mut self,
-        result: Result<(), String>,
+        result: Result<(), crate::message::ConnectionError>,
     ) -> iced::Task<Message> {
         let status = match &result {
             Ok(()) => {
                 self.frost_reconnect_attempts = 0;
                 self.frost_reconnect_at = None;
                 ConnectionStatus::Connected
+            }
+            Err(e @ crate::message::ConnectionError::PinMismatch(mismatch)) => {
+                self.pin_mismatch = Some(mismatch.clone());
+                self.frost_reconnect_at = None;
+                ConnectionStatus::Error(e.to_string())
             }
             Err(e) => {
                 if self.frost_reconnect_attempts < RECONNECT_MAX_ATTEMPTS {
@@ -660,7 +710,7 @@ impl App {
                         Some(Instant::now() + Duration::from_millis(delay_ms));
                     self.frost_reconnect_attempts += 1;
                 }
-                ConnectionStatus::Error(e.clone())
+                ConnectionStatus::Error(format!("{e}"))
             }
         };
         self.frost_status = status.clone();
