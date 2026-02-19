@@ -650,7 +650,6 @@ impl App {
                 session_id,
                 network,
                 initiator_pubkey,
-                ..
             } => {
                 return self.handle_descriptor_contribution_needed(
                     session_id,
@@ -940,21 +939,16 @@ impl App {
             }
         };
 
-        if let Screen::Wallet(ws) = &mut self.screen {
-            if let Some(setup) = &mut ws.setup {
-                if setup.session_id.as_ref() == Some(&session_id) {
-                    match &store_result {
-                        Ok(()) => {
-                            setup.phase = SetupPhase::Coordinating(DescriptorProgress::Complete);
-                        }
-                        Err(e) => {
-                            setup.phase =
-                                SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
-                        }
-                    }
-                }
-            }
-            if store_result.is_ok() {
+        let progress = match &store_result {
+            Ok(()) => DescriptorProgress::Complete,
+            Err(e) => DescriptorProgress::Failed(e.clone()),
+        };
+        self.update_wallet_setup(&session_id, |setup| {
+            setup.phase = SetupPhase::Coordinating(progress);
+        });
+
+        if store_result.is_ok() {
+            if let Screen::Wallet(ws) = &mut self.screen {
                 ws.descriptors.push(WalletEntry {
                     group_pubkey,
                     group_hex: hex::encode(group_pubkey),

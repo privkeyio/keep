@@ -1240,8 +1240,7 @@ impl App {
                 Task::none()
             }
             Message::WalletNetworkChanged(n) => {
-                const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
-                if VALID_NETWORKS.contains(&n.as_str()) {
+                if keep_frost_net::VALID_NETWORKS.contains(&n.as_str()) {
                     if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
                         s.network = n;
                     }
@@ -1276,17 +1275,17 @@ impl App {
             Message::WalletSessionStarted(result) => {
                 match result {
                     Ok((session_id, group_pubkey, network)) => {
+                        self.active_coordinations.insert(
+                            session_id,
+                            ActiveCoordination {
+                                group_pubkey,
+                                network,
+                            },
+                        );
                         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
                             &mut self.screen
                         {
                             s.session_id = Some(session_id);
-                            self.active_coordinations.insert(
-                                session_id,
-                                ActiveCoordination {
-                                    group_pubkey,
-                                    network,
-                                },
-                            );
                         }
                     }
                     Err(e) => {

@@ -323,24 +323,37 @@ impl WalletScreen {
         let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
             .align_y(Alignment::Center);
 
-        let (status_text, status_color) = match progress {
+        let (status_text, status_color, hint) = match progress {
             DescriptorProgress::WaitingContributions { received, expected } => (
                 format!("Waiting for contributions ({received}/{expected})"),
                 theme::color::WARNING,
+                "Peers need to contribute their extended public keys.",
             ),
-            DescriptorProgress::Contributed => ("Contribution sent".into(), theme::color::PRIMARY),
-            DescriptorProgress::Finalizing => {
-                ("Finalizing descriptor...".into(), theme::color::PRIMARY)
-            }
+            DescriptorProgress::Contributed => (
+                "Contribution sent".into(),
+                theme::color::PRIMARY,
+                "Waiting for the initiator to finalize.",
+            ),
+            DescriptorProgress::Finalizing => (
+                "Finalizing descriptor...".into(),
+                theme::color::PRIMARY,
+                "Building the final wallet descriptor.",
+            ),
             DescriptorProgress::WaitingAcks { received, expected } => (
                 format!("Waiting for acknowledgements ({received}/{expected})"),
                 theme::color::WARNING,
+                "Peers are verifying and acknowledging the descriptor.",
             ),
             DescriptorProgress::Complete => (
                 "Descriptor coordination complete".into(),
                 theme::color::SUCCESS,
+                "The wallet descriptor has been stored.",
             ),
-            DescriptorProgress::Failed(err) => (format!("Failed: {err}"), theme::color::ERROR),
+            DescriptorProgress::Failed(err) => (
+                format!("Failed: {err}"),
+                theme::color::ERROR,
+                "You can cancel and try again.",
+            ),
         };
 
         let status_badge = container(
@@ -351,19 +364,6 @@ impl WalletScreen {
         .style(theme::card_style)
         .padding(theme::space::LG)
         .width(Length::Fill);
-
-        let hint = match progress {
-            DescriptorProgress::WaitingContributions { .. } => {
-                "Peers need to contribute their extended public keys."
-            }
-            DescriptorProgress::Contributed => "Waiting for the initiator to finalize.",
-            DescriptorProgress::Finalizing => "Building the final wallet descriptor.",
-            DescriptorProgress::WaitingAcks { .. } => {
-                "Peers are verifying and acknowledging the descriptor."
-            }
-            DescriptorProgress::Complete => "The wallet descriptor has been stored.",
-            DescriptorProgress::Failed(_) => "You can cancel and try again.",
-        };
 
         let content = column![
             header,

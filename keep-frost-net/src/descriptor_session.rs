@@ -133,10 +133,13 @@ impl DescriptorSession {
                 "fingerprint exceeds maximum length".into(),
             ));
         }
-        if !xpub.starts_with("xpub") && !xpub.starts_with("tpub") {
-            return Err(FrostNetError::Session(
-                "xpub must start with 'xpub' or 'tpub'".into(),
-            ));
+        let is_mainnet = self.network == "bitcoin";
+        let valid_prefix = if is_mainnet { "xpub" } else { "tpub" };
+        if !xpub.starts_with(valid_prefix) {
+            return Err(FrostNetError::Session(format!(
+                "xpub must start with '{valid_prefix}' for network '{}'",
+                self.network
+            )));
         }
 
         self.contributions.insert(
@@ -412,6 +415,17 @@ mod tests {
     }
 
     #[test]
+    fn test_xpub_network_mismatch_rejected() {
+        // signet session should reject xpub (mainnet) prefix
+        let mut session = test_session(); // network = "signet"
+        let result = session.add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("tpub"));
+        assert!(err.contains("signet"));
+    }
+
+    #[test]
     fn test_session_manager_max_sessions() {
         let mut manager = DescriptorSessionManager::new();
         let policy = test_policy();
@@ -497,17 +511,17 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
         assert!(!session.has_all_contributions());
 
         session
-            .add_contribution(2, "xpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
             .unwrap();
         assert!(!session.has_all_contributions());
 
         session
-            .add_contribution(3, "xpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
             .unwrap();
         assert!(session.has_all_contributions());
 
@@ -519,10 +533,10 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
 
-        let result = session.add_contribution(1, "xpub1dupzzzzzzzzzzzz".into(), "aabbccdd".into());
+        let result = session.add_contribution(1, "tpub1dupzzzzzzzzzzzz".into(), "aabbccdd".into());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Duplicate"));
@@ -532,7 +546,7 @@ mod tests {
     fn test_unexpected_contributor_rejected() {
         let mut session = test_session();
 
-        let result = session.add_contribution(99, "xpub99zzzzzzzzzzzzzz".into(), "deadbeef".into());
+        let result = session.add_contribution(99, "tpub99zzzzzzzzzzzzzz".into(), "deadbeef".into());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not an expected contributor"));
@@ -543,13 +557,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
             .unwrap();
         session
-            .add_contribution(2, "xpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
             .unwrap();
         session
-            .add_contribution(3, "xpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
             .unwrap();
 
         let finalized = FinalizedDescriptor {
@@ -586,13 +600,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aa".into())
             .unwrap();
         session
-            .add_contribution(2, "xpub2".into(), "bb".into())
+            .add_contribution(2, "tpub2".into(), "bb".into())
             .unwrap();
         session
-            .add_contribution(3, "xpub3".into(), "cc".into())
+            .add_contribution(3, "tpub3".into(), "cc".into())
             .unwrap();
 
         let external = "tr(frost_key,{pk(xpub1),pk(xpub2)})";
@@ -623,13 +637,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aa".into())
             .unwrap();
         session
-            .add_contribution(2, "xpub2".into(), "bb".into())
+            .add_contribution(2, "tpub2".into(), "bb".into())
             .unwrap();
         session
-            .add_contribution(3, "xpub3".into(), "cc".into())
+            .add_contribution(3, "tpub3".into(), "cc".into())
             .unwrap();
 
         let finalized = FinalizedDescriptor {
@@ -680,13 +694,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "xpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aa".into())
             .unwrap();
         session
-            .add_contribution(2, "xpub2".into(), "bb".into())
+            .add_contribution(2, "tpub2".into(), "bb".into())
             .unwrap();
         session
-            .add_contribution(3, "xpub3".into(), "cc".into())
+            .add_contribution(3, "tpub3".into(), "cc".into())
             .unwrap();
 
         let finalized = FinalizedDescriptor {
@@ -696,7 +710,7 @@ mod tests {
         };
         session.set_finalized(finalized).unwrap();
 
-        let result = session.add_contribution(1, "xpub1newzzzzzzzzzzzzz".into(), "aa".into());
+        let result = session.add_contribution(1, "tpub1newzzzzzzzzzzzzz".into(), "aa".into());
         assert!(result.is_err());
     }
 
@@ -846,7 +860,7 @@ mod tests {
 
         let session = manager.get_session_mut(&[1u8; 32]).unwrap();
         session
-            .add_contribution(1, "xpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aa".into())
             .unwrap();
 
         let session = manager.get_session(&[1u8; 32]).unwrap();
