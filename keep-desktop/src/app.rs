@@ -1675,6 +1675,7 @@ impl App {
         drop(guard);
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
         self.active_share_hex = None;
+        self.active_coordinations.clear();
         self.identities.clear();
         self.identity_switcher_open = false;
         self.delete_identity_confirm = None;

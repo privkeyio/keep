@@ -608,7 +608,9 @@ impl App {
     ) {
         if let Screen::Wallet(ws) = &mut self.screen {
             if let Some(setup) = &mut ws.setup {
-                if setup.session_id.as_ref() == Some(session_id) {
+                let matches =
+                    setup.session_id.as_ref() == Some(session_id) || setup.session_id.is_none();
+                if matches {
                     f(setup);
                 }
             }
@@ -706,6 +708,10 @@ impl App {
         let Some(node) = self.get_frost_node() else {
             return iced::Task::none();
         };
+
+        if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
+            return iced::Task::none();
+        }
 
         self.active_coordinations.insert(
             session_id,
