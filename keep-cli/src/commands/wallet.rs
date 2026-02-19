@@ -476,6 +476,18 @@ pub fn cmd_wallet_propose(
                         ready = true;
                         break;
                     }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorNacked {
+                        session_id: sid,
+                        share_index,
+                        reason,
+                    })) if sid == session_id => {
+                        spinner.finish();
+                        node.cancel_descriptor_session(&session_id);
+                        node_handle.abort();
+                        return Err(KeepError::Frost(format!(
+                            "Peer {share_index} rejected descriptor: {reason}"
+                        )));
+                    }
                     Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
                         session_id: sid,
                         error,
@@ -532,6 +544,18 @@ pub fn cmd_wallet_propose(
                     internal_descriptor = int;
                     complete = true;
                     break;
+                }
+                Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorNacked {
+                    session_id: sid,
+                    share_index,
+                    reason,
+                })) if sid == session_id => {
+                    spinner.finish();
+                    node.cancel_descriptor_session(&session_id);
+                    node_handle.abort();
+                    return Err(KeepError::Frost(format!(
+                        "Peer {share_index} rejected descriptor: {reason}"
+                    )));
                 }
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
                     session_id: sid,

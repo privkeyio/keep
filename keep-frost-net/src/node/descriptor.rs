@@ -438,7 +438,7 @@ impl KfpNode {
             ));
         }
 
-        let (expected_external, expected_internal) = {
+        let reconstruction_result = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -468,33 +468,42 @@ impl KfpNode {
 
             let expected_hash = derive_policy_hash(session.policy());
             if payload.policy_hash != expected_hash {
+                Err("Policy hash does not match proposal".to_string())
+            } else {
+                reconstruct_descriptor(
+                    session.group_pubkey(),
+                    session.policy(),
+                    &payload.contributions,
+                    session.network(),
+                )
+                .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
+            }
+        };
+
+        let (expected_external, expected_internal) = match reconstruction_result {
+            Ok(result) => result,
+            Err(reason) => {
+                self.send_descriptor_nack(payload.session_id, &sender, &reason)
+                    .await;
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
                     session_id: payload.session_id,
-                    error: "Policy hash mismatch".into(),
+                    error: reason.clone(),
                 });
-                return Err(FrostNetError::Session(
-                    "Policy hash does not match proposal".into(),
-                ));
+                return Err(FrostNetError::Session(reason));
             }
-
-            reconstruct_descriptor(
-                session.group_pubkey(),
-                session.policy(),
-                &payload.contributions,
-                session.network(),
-            )?
         };
 
         if payload.external_descriptor != expected_external
             || payload.internal_descriptor != expected_internal
         {
+            let reason = "Descriptor mismatch: independent reconstruction differs";
+            self.send_descriptor_nack(payload.session_id, &sender, reason)
+                .await;
             let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
                 session_id: payload.session_id,
-                error: "Descriptor mismatch: independent reconstruction differs".into(),
+                error: reason.into(),
             });
-            return Err(FrostNetError::Session(
-                "Finalized descriptor does not match independent reconstruction".into(),
-            ));
+            return Err(FrostNetError::Session(reason.into()));
         }
 
         info!(
@@ -540,6 +549,106 @@ impl KfpNode {
             session_id: payload.session_id,
             external_descriptor: payload.external_descriptor,
             internal_descriptor: payload.internal_descriptor,
+        });
+
+        Ok(())
+    }
+
+    async fn send_descriptor_nack(
+        &self,
+        session_id: [u8; 32],
+        recipient: &PublicKey,
+        reason: &str,
+    ) {
+        let nack = DescriptorNackPayload::new(session_id, self.group_pubkey, reason);
+        let msg = KfpMessage::DescriptorNack(nack);
+        let json = match msg.to_json() {
+            Ok(j) => j,
+            Err(e) => {
+                debug!("Failed to serialize descriptor nack: {e}");
+                return;
+            }
+        };
+
+        let encrypted = match nip44::encrypt(
+            self.keys.secret_key(),
+            recipient,
+            &json,
+            nip44::Version::V2,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("Failed to encrypt descriptor nack: {e}");
+                return;
+            }
+        };
+
+        let event = match EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(self.group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+            .tag(Tag::custom(TagKind::custom("t"), ["descriptor_nack"]))
+            .sign_with_keys(&self.keys)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("Failed to sign descriptor nack: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = self.client.send_event(&event).await {
+            debug!("Failed to send descriptor nack: {e}");
+        }
+    }
+
+    pub(crate) async fn handle_descriptor_nack(
+        &self,
+        sender: PublicKey,
+        payload: DescriptorNackPayload,
+    ) -> Result<()> {
+        if payload.group_pubkey != self.group_pubkey {
+            return Ok(());
+        }
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "Descriptor NACK outside replay window".into(),
+            ));
+        }
+
+        let share_index = {
+            let peers = self.peers.read();
+            peers
+                .get_peer_by_pubkey(&sender)
+                .map(|p| p.share_index)
+                .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
+        };
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            if let Some(session) = sessions.get_session_mut(&payload.session_id) {
+                session.fail(format!(
+                    "Peer {share_index} rejected descriptor: {}",
+                    payload.reason
+                ));
+            }
+        }
+
+        info!(
+            session_id = %hex::encode(payload.session_id),
+            share_index,
+            reason = %payload.reason,
+            "Received descriptor NACK"
+        );
+
+        let _ = self.event_tx.send(KfpNodeEvent::DescriptorNacked {
+            session_id: payload.session_id,
+            share_index,
+            reason: payload.reason,
         });
 
         Ok(())

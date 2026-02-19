@@ -1347,6 +1347,20 @@ impl KeepMobile {
                             )
                             .await;
                         }
+                        Ok(KfpNodeEvent::DescriptorNacked {
+                            session_id,
+                            share_index,
+                            reason,
+                        }) => {
+                            clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
+                            let error =
+                                format!("Peer {share_index} rejected descriptor: {reason}");
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                if let Err(e) = cb.on_failed(hex::encode(session_id), error) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
+                        }
                         Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
                             clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {

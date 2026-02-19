@@ -23,6 +23,7 @@ pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
+pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
@@ -53,6 +54,7 @@ pub enum KfpMessage {
     DescriptorContribute(DescriptorContributePayload),
     DescriptorFinalize(DescriptorFinalizePayload),
     DescriptorAck(DescriptorAckPayload),
+    DescriptorNack(DescriptorNackPayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -77,6 +79,7 @@ impl KfpMessage {
             KfpMessage::DescriptorContribute(_) => "descriptor_contribute",
             KfpMessage::DescriptorFinalize(_) => "descriptor_finalize",
             KfpMessage::DescriptorAck(_) => "descriptor_ack",
+            KfpMessage::DescriptorNack(_) => "descriptor_nack",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -100,6 +103,7 @@ impl KfpMessage {
             KfpMessage::DescriptorContribute(p) => Some(&p.session_id),
             KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
             KfpMessage::DescriptorAck(p) => Some(&p.session_id),
+            KfpMessage::DescriptorNack(p) => Some(&p.session_id),
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -115,6 +119,7 @@ impl KfpMessage {
             KfpMessage::DescriptorContribute(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorFinalize(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -332,6 +337,11 @@ impl KfpMessage {
                 }
             }
             KfpMessage::DescriptorAck(_) => {}
+            KfpMessage::DescriptorNack(p) => {
+                if p.reason.len() > MAX_NACK_REASON_LENGTH {
+                    return Err("Nack reason exceeds maximum length");
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -946,6 +956,31 @@ impl DescriptorAckPayload {
             session_id,
             group_pubkey,
             descriptor_hash,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorNackPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub reason: String,
+    pub created_at: u64,
+}
+
+impl DescriptorNackPayload {
+    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], reason: &str) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            reason: reason.to_string(),
             created_at: chrono::Utc::now().timestamp() as u64,
         }
     }
