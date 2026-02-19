@@ -174,6 +174,7 @@ struct PendingRequest {
     response_tx: mpsc::Sender<bool>,
 }
 
+#[derive(Clone)]
 struct PendingContribution {
     network: String,
     initiator_pubkey: nostr_sdk::PublicKey,
@@ -729,6 +730,8 @@ impl KeepMobile {
                 .derive_account_xpub(&network)
                 .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
 
+            validate_xpub_network(&xpub, &network)?;
+
             let session_id = node
                 .request_descriptor(policy, &network, &xpub, &fingerprint)
                 .await
@@ -765,14 +768,17 @@ impl KeepMobile {
         let id = parse_session_id(&session_id)?;
 
         let pending = {
-            let mut guard =
+            let guard =
                 self.pending_contributions
                     .lock()
                     .map_err(|_| KeepMobileError::StorageError {
                         msg: "Pending contributions lock poisoned".into(),
                     })?;
-            guard.retain(|_, c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT);
-            guard.remove(&id).ok_or(KeepMobileError::Timeout)?
+            guard
+                .get(&id)
+                .filter(|c| c.created_at.elapsed() < DESCRIPTOR_SESSION_TIMEOUT)
+                .cloned()
+                .ok_or(KeepMobileError::Timeout)?
         };
 
         self.runtime.block_on(async {
@@ -789,8 +795,17 @@ impl KeepMobile {
                 .await
                 .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
 
-            Ok(())
-        })
+            Ok::<(), KeepMobileError>(())
+        })?;
+
+        self.pending_contributions
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Pending contributions lock poisoned".into(),
+            })?
+            .remove(&id);
+
+        Ok(())
     }
 }
 
@@ -1373,6 +1388,13 @@ impl KeepMobile {
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {
             tracing::error!("Failed to persist descriptor: {e}");
+            if let Some(cb) = cbs.read().await.as_ref() {
+                cb.on_failed(
+                    hex::encode(session_id),
+                    format!("Failed to persist descriptor: {e}"),
+                );
+            }
+            return;
         }
 
         if let Some(cb) = cbs.read().await.as_ref() {
