@@ -98,10 +98,8 @@ struct StoredShareData {
 #[uniffi::export(with_foreign)]
 pub trait DescriptorCallbacks: Send + Sync {
     fn on_proposed(&self, session_id: String) -> Result<(), KeepMobileError>;
-    fn on_contribution_needed(&self, proposal: DescriptorProposal)
-        -> Result<(), KeepMobileError>;
-    fn on_contributed(&self, session_id: String, share_index: u16)
-        -> Result<(), KeepMobileError>;
+    fn on_contribution_needed(&self, proposal: DescriptorProposal) -> Result<(), KeepMobileError>;
+    fn on_contributed(&self, session_id: String, share_index: u16) -> Result<(), KeepMobileError>;
     fn on_complete(
         &self,
         session_id: String,
