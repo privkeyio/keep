@@ -297,6 +297,55 @@ impl Keep {
         Ok(pubkey)
     }
 
+    /// Import a Nostr key from raw secret bytes.
+    pub fn import_secret_bytes(&mut self, secret: &mut [u8; 32], name: &str) -> Result<[u8; 32]> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepError::InvalidInput("name cannot be empty".into()));
+        }
+        if name.chars().count() > 64 {
+            return Err(KeepError::InvalidInput(
+                "name must be 64 characters or fewer".into(),
+            ));
+        }
+
+        let keypair = NostrKeypair::from_secret_bytes(secret)?;
+        let pubkey = *keypair.public_bytes();
+
+        if self.keyring.get(&pubkey).is_some() {
+            return Err(KeepError::KeyAlreadyExists(keypair.to_npub()));
+        }
+
+        let data_key = self.get_data_key()?;
+        let encrypted = crypto::encrypt(keypair.secret_bytes(), &data_key)?;
+
+        let record = KeyRecord::new(
+            pubkey,
+            KeyType::Nostr,
+            name.to_string(),
+            encrypted.to_bytes(),
+        );
+
+        self.storage.store_key(&record)?;
+
+        self.keyring.load_key(
+            pubkey,
+            *keypair.secret_bytes(),
+            KeyType::Nostr,
+            name.to_string(),
+        )?;
+
+        self.audit_event(AuditEventType::KeyImport, |e| {
+            e.with_pubkey(&pubkey).with_key_type("nostr")
+        });
+
+        Ok(pubkey)
+    }
+
     /// The primary key slot, if set.
     pub fn get_primary_key(&self) -> Option<&keyring::KeySlot> {
         self.keyring.get_primary()
@@ -305,6 +354,26 @@ impl Keep {
     /// List all stored key records.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         self.storage.list_keys()
+    }
+
+    /// Export a stored nsec key as NIP-49 ncryptsec.
+    pub fn export_ncryptsec(&mut self, pubkey: &[u8; 32], password: &str) -> Result<String> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let slot = self
+            .keyring
+            .get(pubkey)
+            .ok_or_else(|| KeepError::KeyNotFound(hex::encode(pubkey)))?;
+
+        if slot.key_type != KeyType::Nostr {
+            return Err(KeepError::InvalidInput("not a Nostr key".into()));
+        }
+
+        let result = keys::nip49::encrypt(slot.expose_secret(), password, None)?;
+        self.audit_event(AuditEventType::KeyExport, |e| e.with_pubkey(pubkey));
+        Ok(result)
     }
 
     /// Delete a key.

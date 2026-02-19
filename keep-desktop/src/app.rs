@@ -29,6 +29,7 @@ use crate::message::{
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::create::CreateScreen;
 use crate::screen::export::ExportScreen;
+use crate::screen::export_ncryptsec::ExportNcryptsecScreen;
 use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::layout::SidebarState;
 use crate::screen::relay::RelayScreen;
@@ -563,14 +564,23 @@ impl App {
             | Message::CopyToClipboard(..)
             | Message::ResetExport => self.handle_export_message(message),
 
+            Message::GoToExportNcryptsec(..)
+            | Message::ExportNcryptsecPasswordChanged(..)
+            | Message::ExportNcryptsecConfirmChanged(..)
+            | Message::GenerateNcryptsec
+            | Message::NcryptsecGenerated(..)
+            | Message::ResetNcryptsec => self.handle_ncryptsec_export_message(message),
+
             Message::ImportDataChanged(..)
             | Message::ImportPassphraseChanged(..)
             | Message::ImportNameChanged(..)
             | Message::ImportToggleVisibility
             | Message::ImportShare
             | Message::ImportNsec
+            | Message::ImportNcryptsec
             | Message::ImportResult(..)
-            | Message::ImportNsecResult(..) => self.handle_import_message(message),
+            | Message::ImportNsecResult(..)
+            | Message::ImportNcryptsecResult(..) => self.handle_import_message(message),
 
             Message::ScannerOpen
             | Message::ScannerClose
@@ -657,8 +667,10 @@ impl App {
         }
         if self.copy_feedback_until.is_some_and(|t| now >= t) {
             self.copy_feedback_until = None;
-            if let Screen::Export(s) = &mut self.screen {
-                s.copied = false;
+            match &mut self.screen {
+                Screen::Export(s) => s.copied = false,
+                Screen::ExportNcryptsec(s) => s.copied = false,
+                _ => {}
             }
         }
         if self.toast_dismiss_at.is_some_and(|t| now >= t) {
@@ -933,8 +945,10 @@ impl App {
             Message::CopyToClipboard(t) => {
                 self.start_clipboard_timer();
                 self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
-                if let Screen::Export(s) = &mut self.screen {
-                    s.copied = true;
+                match &mut self.screen {
+                    Screen::Export(s) => s.copied = true,
+                    Screen::ExportNcryptsec(s) => s.copied = true,
+                    _ => {}
                 }
                 let plain = (*t).clone();
                 iced::clipboard::write(plain)
@@ -955,7 +969,11 @@ impl App {
             Message::ImportDataChanged(d) => {
                 if let Screen::Import(s) = &mut self.screen {
                     let trimmed = d.trim();
-                    s.mode = ImportScreen::detect_mode(trimmed);
+                    let new_mode = ImportScreen::detect_mode(trimmed);
+                    if new_mode != s.mode {
+                        s.passphrase = Zeroizing::new(String::new());
+                    }
+                    s.mode = new_mode;
                     s.npub_preview = if s.mode == ImportMode::Nsec {
                         keep_core::keys::NostrKeypair::from_nsec(trimmed)
                             .ok()
@@ -989,8 +1007,10 @@ impl App {
             }
             Message::ImportShare => self.handle_import(),
             Message::ImportNsec => self.handle_import_nsec(),
+            Message::ImportNcryptsec => self.handle_import_ncryptsec(),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
+            Message::ImportNcryptsecResult(result) => self.handle_import_result(result),
             _ => Task::none(),
         }
     }
@@ -1246,7 +1266,11 @@ impl App {
 
         if matches!(
             self.screen,
-            Screen::Create(_) | Screen::Export(_) | Screen::Import(_) | Screen::Scanner(_)
+            Screen::Create(_)
+                | Screen::Export(_)
+                | Screen::ExportNcryptsec(_)
+                | Screen::Import(_)
+                | Screen::Scanner(_)
         ) {
             subs.push(iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed {
@@ -1779,6 +1803,141 @@ impl App {
         result: Result<(Vec<ShareEntry>, String), String>,
     ) -> Task<Message> {
         self.handle_import_result(result)
+    }
+
+    fn handle_import_ncryptsec(&mut self) -> Task<Message> {
+        let (data, password, name) = match &mut self.screen {
+            Screen::Import(s) => {
+                if s.loading
+                    || s.data.is_empty()
+                    || s.passphrase.is_empty()
+                    || s.name.trim().is_empty()
+                {
+                    return Task::none();
+                }
+                s.loading = true;
+                s.error = None;
+                (s.data.clone(), s.passphrase.clone(), s.name.clone())
+            }
+            _ => return Task::none(),
+        };
+
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
+                        let mut secret = keep_core::keys::nip49::decrypt(data.trim(), &password)
+                            .map_err(friendly_err)?;
+                        keep.import_secret_bytes(&mut secret, &name)
+                            .map_err(friendly_err)?;
+                        let shares = collect_shares(keep)?;
+                        Ok((shares, name))
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::ImportNcryptsecResult,
+        )
+    }
+
+    fn handle_ncryptsec_export_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::GoToExportNcryptsec(pubkey_hex) => {
+                let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex);
+                if let Some(id) = identity {
+                    self.screen = Screen::ExportNcryptsec(Box::new(ExportNcryptsecScreen::new(
+                        id.pubkey_hex.clone(),
+                        id.name.clone(),
+                        id.npub.clone(),
+                    )));
+                }
+                Task::none()
+            }
+            Message::ExportNcryptsecPasswordChanged(p) => {
+                if let Screen::ExportNcryptsec(s) = &mut self.screen {
+                    s.password = p;
+                    s.confirm_password = Zeroizing::new(String::new());
+                    s.error = None;
+                }
+                Task::none()
+            }
+            Message::ExportNcryptsecConfirmChanged(p) => {
+                if let Screen::ExportNcryptsec(s) = &mut self.screen {
+                    s.confirm_password = p;
+                    s.error = None;
+                }
+                Task::none()
+            }
+            Message::GenerateNcryptsec => {
+                let (pubkey_hex, password) = match &mut self.screen {
+                    Screen::ExportNcryptsec(s) => {
+                        if s.loading || s.password.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
+                            return Task::none();
+                        }
+                        if *s.password != *s.confirm_password {
+                            s.error = Some("Passwords do not match".into());
+                            return Task::none();
+                        }
+                        s.loading = true;
+                        s.error = None;
+                        (s.pubkey_hex.clone(), s.password.clone())
+                    }
+                    _ => return Task::none(),
+                };
+
+                let Some(pubkey_bytes) = hex::decode(&pubkey_hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                else {
+                    self.screen.set_loading_error("Invalid public key".into());
+                    return Task::none();
+                };
+
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            with_keep_blocking(
+                                &keep_arc,
+                                "Internal error during export",
+                                move |keep| {
+                                    let ncryptsec = keep
+                                        .export_ncryptsec(&pubkey_bytes, &password)
+                                        .map_err(friendly_err)?;
+                                    Ok(ExportData {
+                                        bech32: Zeroizing::new(ncryptsec),
+                                        frames: Vec::new(),
+                                    })
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::NcryptsecGenerated,
+                )
+            }
+            Message::NcryptsecGenerated(Ok(data)) => {
+                if let Screen::ExportNcryptsec(s) = &mut self.screen {
+                    s.set_result(data.bech32);
+                }
+                Task::none()
+            }
+            Message::NcryptsecGenerated(Err(e)) => {
+                self.screen.set_loading_error(e);
+                Task::none()
+            }
+            Message::ResetNcryptsec => {
+                self.copy_feedback_until = None;
+                if let Screen::ExportNcryptsec(s) = &mut self.screen {
+                    s.reset();
+                }
+                Task::none()
+            }
+            _ => Task::none(),
+        }
     }
 
     fn load_audit_page(

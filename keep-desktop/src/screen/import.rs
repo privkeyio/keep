@@ -13,6 +13,7 @@ pub enum ImportMode {
     Unknown,
     FrostShare,
     Nsec,
+    Ncryptsec,
 }
 
 pub struct ImportScreen {
@@ -41,7 +42,9 @@ impl ImportScreen {
     }
 
     pub fn detect_mode(trimmed: &str) -> ImportMode {
-        if trimmed.starts_with("nsec1") {
+        if trimmed.starts_with("ncryptsec1") {
+            ImportMode::Ncryptsec
+        } else if trimmed.starts_with("nsec1") {
             ImportMode::Nsec
         } else if trimmed.starts_with("kshare1") || trimmed.starts_with('{') {
             ImportMode::FrostShare
@@ -63,7 +66,7 @@ impl ImportScreen {
         let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
             .align_y(Alignment::Center);
 
-        let subtitle = text("Paste a FROST share or Nostr secret key, or scan a QR code")
+        let subtitle = text("Paste a FROST share, Nostr secret key, or encrypted key")
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
@@ -72,15 +75,18 @@ impl ImportScreen {
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
-        let is_nsec = self.mode == ImportMode::Nsec;
+        let is_secret = self.mode == ImportMode::Nsec;
 
-        let data_input = text_input("Paste kshare1..., JSON, or nsec1... here", &self.data)
-            .on_input(|s| Message::ImportDataChanged(Zeroizing::new(s)))
-            .secure(is_nsec && !self.nsec_visible)
-            .padding(theme::space::MD)
-            .width(Length::Fill);
+        let data_input = text_input(
+            "Paste kshare1..., nsec1..., or ncryptsec1... here",
+            &self.data,
+        )
+        .on_input(|s| Message::ImportDataChanged(Zeroizing::new(s)))
+        .secure(is_secret && !self.nsec_visible)
+        .padding(theme::space::MD)
+        .width(Length::Fill);
 
-        let data_row = if is_nsec {
+        let data_row = if is_secret {
             let toggle_label = if self.nsec_visible { "Hide" } else { "Show" };
             let toggle_btn = button(text(toggle_label).size(theme::size::SMALL))
                 .on_press(Message::ImportToggleVisibility)
@@ -122,6 +128,11 @@ impl ImportScreen {
                         content = content.push(theme::success_text("Nostr secret key detected"));
                     }
                 }
+                ImportMode::Ncryptsec => {
+                    content = content.push(theme::success_text(
+                        "Encrypted secret key detected (NIP-49)",
+                    ));
+                }
                 ImportMode::FrostShare => {
                     if trimmed_data.starts_with("kshare1") {
                         content =
@@ -132,13 +143,13 @@ impl ImportScreen {
                 }
                 ImportMode::Unknown => {
                     content = content.push(theme::error_text(
-                        "Expected kshare1..., JSON, or nsec1... format",
+                        "Expected kshare1..., nsec1..., or ncryptsec1... format",
                     ));
                 }
             }
         } else {
             content = content.push(
-                text("Accepts kshare1... (bech32), JSON, or nsec1... format")
+                text("Accepts kshare1..., nsec1..., or ncryptsec1... format")
                     .size(theme::size::TINY)
                     .color(theme::color::TEXT_DIM),
             );
@@ -146,7 +157,7 @@ impl ImportScreen {
 
         match self.mode {
             ImportMode::Nsec => {
-                let can_import = !self.data.trim().is_empty() && !self.name.trim().is_empty();
+                let can_import = !trimmed_data.is_empty() && !self.name.trim().is_empty();
                 let submit_msg = can_import.then_some(Message::ImportNsec);
 
                 let name_input = text_input("Key name", &self.name)
@@ -169,13 +180,62 @@ impl ImportScreen {
                 if self.loading {
                     content = content.push(theme::label("Importing..."));
                 } else {
-                    let mut btn = button(text("Import").size(theme::size::BODY))
-                        .style(theme::primary_button)
-                        .padding(theme::space::MD);
-                    if can_import {
-                        btn = btn.on_press(Message::ImportNsec);
-                    }
-                    content = content.push(btn);
+                    content = content.push(
+                        button(text("Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportNsec))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
+                }
+            }
+            ImportMode::Ncryptsec => {
+                let has_password = !self.passphrase.is_empty();
+                let has_name = !self.name.trim().is_empty();
+                let can_import = !trimmed_data.is_empty() && has_password && has_name;
+
+                let password_input = text_input("Decryption password", &self.passphrase)
+                    .on_input(|s| Message::ImportPassphraseChanged(Zeroizing::new(s)))
+                    .on_submit_maybe(can_import.then_some(Message::ImportNcryptsec))
+                    .secure(true)
+                    .padding(theme::space::MD)
+                    .width(theme::size::INPUT_WIDTH);
+
+                content = content
+                    .push(Space::new().height(theme::space::MD))
+                    .push(theme::label("Password"))
+                    .push(
+                        text("Enter the password used to encrypt this key")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
+                    )
+                    .push(password_input);
+
+                let name_input = text_input("Key name", &self.name)
+                    .on_input(Message::ImportNameChanged)
+                    .on_submit_maybe(can_import.then_some(Message::ImportNcryptsec))
+                    .padding(theme::space::MD)
+                    .width(theme::size::INPUT_WIDTH);
+
+                content = content
+                    .push(Space::new().height(theme::space::MD))
+                    .push(theme::label("Key Name"))
+                    .push(
+                        text("A label for this key in your vault")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
+                    )
+                    .push(name_input)
+                    .push(Space::new().height(theme::space::MD));
+
+                if self.loading {
+                    content = content.push(theme::label("Decrypting..."));
+                } else {
+                    content = content.push(
+                        button(text("Decrypt & Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportNcryptsec))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
                 }
             }
             _ => {
@@ -202,13 +262,12 @@ impl ImportScreen {
                 if self.loading {
                     content = content.push(theme::label("Importing..."));
                 } else {
-                    let mut btn = button(text("Import").size(theme::size::BODY))
-                        .style(theme::primary_button)
-                        .padding(theme::space::MD);
-                    if can_import {
-                        btn = btn.on_press(Message::ImportShare);
-                    }
-                    content = content.push(btn);
+                    content = content.push(
+                        button(text("Import").size(theme::size::BODY))
+                            .on_press_maybe(can_import.then_some(Message::ImportShare))
+                            .style(theme::primary_button)
+                            .padding(theme::space::MD),
+                    );
                 }
             }
         }

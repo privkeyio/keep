@@ -58,7 +58,9 @@ impl ScannerScreen {
     pub fn process_qr_content(&mut self, content: &str) -> Option<String> {
         let trimmed = content.trim();
 
-        if is_valid_bech32_payload("kshare1", trimmed) || is_valid_bech32_payload("nsec1", trimmed)
+        if is_valid_bech32_payload("kshare1", trimmed)
+            || is_valid_bech32_payload("nsec1", trimmed)
+            || is_valid_bech32_payload("ncryptsec1", trimmed)
         {
             return Some(trimmed.to_string());
         }
@@ -189,7 +191,7 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::Sender<Camer
         let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
             nokhwa::utils::CameraFormat::new(
                 Resolution::new(640, 480),
-                nokhwa::utils::FrameFormat::RAWRGB,
+                nokhwa::utils::FrameFormat::MJPEG,
                 30,
             ),
         ));
@@ -214,10 +216,23 @@ pub fn start_camera(active: Arc<AtomicBool>, tx: tokio::sync::mpsc::Sender<Camer
             ..Default::default()
         };
 
+        let mut frame_failures: u32 = 0;
+        const MAX_FRAME_FAILURES: u32 = 5;
+
         while active.load(Ordering::Acquire) {
             let buffer = match camera.frame() {
-                Ok(b) => b,
-                Err(_) => {
+                Ok(b) => {
+                    frame_failures = 0;
+                    b
+                }
+                Err(e) => {
+                    frame_failures += 1;
+                    if frame_failures >= MAX_FRAME_FAILURES {
+                        let _ = tx.try_send(CameraEvent::Error(format!(
+                            "Camera failed after {frame_failures} consecutive errors: {e}"
+                        )));
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }

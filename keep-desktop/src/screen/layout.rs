@@ -329,6 +329,16 @@ fn identity_switcher<'a>(state: &SidebarState<'a>) -> Element<'a, Message> {
         item_row = item_row.push(name_col);
         item_row = item_row.push(Space::new().width(Length::Fill));
 
+        if id.kind == IdentityKind::Nsec {
+            item_row = item_row.push(
+                button(text("ncryptsec").size(9.0))
+                    .on_press(Message::GoToExportNcryptsec(id.pubkey_hex.clone()))
+                    .style(theme::secondary_button)
+                    .padding([1.0, 4.0]),
+            );
+            item_row = item_row.push(Space::new().width(2.0));
+        }
+
         if !is_active && state.identities.len() > 1 {
             item_row = item_row.push(
                 button(text("x").size(9.0))

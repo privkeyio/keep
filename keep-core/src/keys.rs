@@ -5,6 +5,7 @@
 use bech32::{Bech32, Hrp};
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::crypto::{self, MlockedBox};
 use crate::error::{CryptoError, KeepError, Result};
@@ -52,6 +53,7 @@ impl NostrKeypair {
                     public_key: verifying_key.to_bytes().into(),
                 });
             }
+            secret_bytes.zeroize();
         }
         Err(CryptoError::invalid_key("failed to generate valid keypair after 64 attempts").into())
     }
@@ -87,18 +89,21 @@ impl NostrKeypair {
     ///
     /// Returns [`KeepError::InvalidNsec`] if the string is not a valid nsec.
     pub fn from_nsec(nsec: &str) -> Result<Self> {
-        let (hrp, data) = bech32::decode(nsec).map_err(|_| KeepError::InvalidNsec)?;
+        let (hrp, mut data) = bech32::decode(nsec).map_err(|_| KeepError::InvalidNsec)?;
 
         if hrp.as_str() != "nsec" {
+            data.zeroize();
             return Err(KeepError::InvalidNsec);
         }
 
         if data.len() != 32 {
+            data.zeroize();
             return Err(KeepError::InvalidNsec);
         }
 
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&data);
+        data.zeroize();
         Self::from_secret_bytes(&mut secret)
     }
 
@@ -255,6 +260,139 @@ pub fn bytes_to_npub(pubkey: &[u8; 32]) -> String {
     bech32::encode::<Bech32>(hrp, pubkey).unwrap()
 }
 
+/// NIP-49 encrypted private key (ncryptsec) support.
+pub mod nip49 {
+    use bech32::{Bech32, Hrp};
+    use chacha20poly1305::aead::generic_array::GenericArray;
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::XChaCha20Poly1305;
+    use unicode_normalization::UnicodeNormalization;
+    use zeroize::{Zeroize, Zeroizing};
+
+    use crate::entropy;
+    use crate::error::{CryptoError, KeepError, Result};
+
+    const VERSION: u8 = 0x02;
+    const DEFAULT_LOG_N: u8 = 16;
+    const MAX_LOG_N: u8 = 20;
+
+    /// Encrypt a secret key with a password, returning an ncryptsec string.
+    pub fn encrypt(secret_key: &[u8; 32], password: &str, log_n: Option<u8>) -> Result<String> {
+        if password.is_empty() {
+            return Err(KeepError::InvalidInput(
+                "ncryptsec password must not be empty".into(),
+            ));
+        }
+        let log_n = log_n.unwrap_or(DEFAULT_LOG_N);
+        if log_n > MAX_LOG_N {
+            return Err(KeepError::InvalidInput(format!(
+                "ncryptsec log_n too large: {log_n} (max {MAX_LOG_N})"
+            )));
+        }
+        let password_nfkc = Zeroizing::new(password.nfkc().collect::<String>());
+
+        let salt: [u8; 16] = entropy::random_bytes();
+        let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
+
+        let nonce: [u8; 24] = entropy::random_bytes();
+        let key_security_byte: u8 = 0x01;
+
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
+        let payload = Payload {
+            msg: secret_key.as_slice(),
+            aad: &[key_security_byte],
+        };
+        let ciphertext = cipher
+            .encrypt(GenericArray::from_slice(&nonce), payload)
+            .map_err(|_| CryptoError::encryption("NIP-49 encryption failed"))?;
+
+        let mut concat = Vec::with_capacity(91);
+        concat.push(VERSION);
+        concat.push(log_n);
+        concat.extend_from_slice(&salt);
+        concat.extend_from_slice(&nonce);
+        concat.push(key_security_byte);
+        concat.extend_from_slice(&ciphertext);
+
+        let hrp = Hrp::parse("ncryptsec").unwrap();
+        bech32::encode::<Bech32>(hrp, &concat)
+            .map_err(|_| CryptoError::encryption("bech32 encoding failed").into())
+    }
+
+    /// Decrypt an ncryptsec string with a password, returning the secret key.
+    pub fn decrypt(ncryptsec: &str, password: &str) -> Result<Zeroizing<[u8; 32]>> {
+        let (hrp, mut data) = bech32::decode(ncryptsec)
+            .map_err(|_| KeepError::InvalidInput("invalid bech32".into()))?;
+
+        if hrp.as_str() != "ncryptsec" {
+            data.zeroize();
+            return Err(KeepError::InvalidInput("not an ncryptsec string".into()));
+        }
+
+        if data.len() != 91 {
+            data.zeroize();
+            return Err(KeepError::InvalidInput(format!(
+                "invalid ncryptsec length: expected 91, got {}",
+                data.len()
+            )));
+        }
+
+        let version = data[0];
+        if version != VERSION {
+            data.zeroize();
+            return Err(KeepError::InvalidInput(format!(
+                "unsupported ncryptsec version: {version}"
+            )));
+        }
+
+        let log_n = data[1];
+        if log_n > MAX_LOG_N {
+            data.zeroize();
+            return Err(KeepError::InvalidInput(format!(
+                "ncryptsec log_n too large: {log_n} (max {MAX_LOG_N})"
+            )));
+        }
+        let salt: [u8; 16] = data[2..18].try_into().expect("length checked");
+        let nonce: [u8; 24] = data[18..42].try_into().expect("length checked");
+        let key_security_byte = data[42];
+        let ciphertext = data[43..].to_vec();
+        data.zeroize();
+
+        let password_nfkc = Zeroizing::new(password.nfkc().collect::<String>());
+        let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
+
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
+        let payload = Payload {
+            msg: &ciphertext,
+            aad: &[key_security_byte],
+        };
+        let mut plaintext = cipher
+            .decrypt(GenericArray::from_slice(&nonce), payload)
+            .map_err(|_| KeepError::DecryptionFailed)?;
+
+        if plaintext.len() != 32 {
+            plaintext.zeroize();
+            return Err(CryptoError::decryption("invalid decrypted key length").into());
+        }
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&plaintext);
+        plaintext.zeroize();
+        Ok(key)
+    }
+
+    fn derive_key(password: &str, salt: &[u8; 16], log_n: u8) -> Result<Zeroizing<[u8; 32]>> {
+        let params = scrypt::Params::new(log_n, 8, 1, 32)
+            .map_err(|e| CryptoError::kdf(format!("scrypt params: {e}")))?;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        scrypt::scrypt(password.as_bytes(), salt, &params, &mut *key)
+            .map_err(|e| CryptoError::kdf(format!("scrypt: {e}")))?;
+
+        Ok(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +435,35 @@ mod tests {
 
         let result = NostrKeypair::from_nsec("npub1abc");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nip49_roundtrip() {
+        let kp = NostrKeypair::generate().unwrap();
+        let password = "test-password-123";
+
+        let ncryptsec = nip49::encrypt(kp.secret_bytes(), password, Some(16)).unwrap();
+        assert!(ncryptsec.starts_with("ncryptsec1"));
+
+        let decrypted = nip49::decrypt(&ncryptsec, password).unwrap();
+        assert_eq!(&*decrypted, kp.secret_bytes());
+    }
+
+    #[test]
+    fn test_nip49_wrong_password() {
+        let kp = NostrKeypair::generate().unwrap();
+        let ncryptsec = nip49::encrypt(kp.secret_bytes(), "correct", Some(16)).unwrap();
+        let result = nip49::decrypt(&ncryptsec, "wrong");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nip49_spec_vector() {
+        let ncryptsec = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+        let expected_hex = "3501454135014541350145413501453fefb02227e449e57cf4d3a3ce05378683";
+        let expected: Vec<u8> = hex::decode(expected_hex).unwrap();
+
+        let decrypted = nip49::decrypt(ncryptsec, "nostr").unwrap();
+        assert_eq!(decrypted.as_slice(), expected.as_slice());
     }
 }

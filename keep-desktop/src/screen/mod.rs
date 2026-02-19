@@ -4,6 +4,7 @@
 pub mod bunker;
 pub mod create;
 pub mod export;
+pub mod export_ncryptsec;
 pub mod import;
 pub mod layout;
 pub mod relay;
@@ -22,6 +23,7 @@ pub enum Screen {
     ShareList(shares::ShareListScreen),
     Create(create::CreateScreen),
     Export(Box<export::ExportScreen>),
+    ExportNcryptsec(Box<export_ncryptsec::ExportNcryptsecScreen>),
     Import(import::ImportScreen),
     Scanner(scanner::ScannerScreen),
     Wallet(wallet::WalletScreen),
@@ -44,6 +46,7 @@ impl Screen {
             Screen::ShareList(s) => (NavItem::Shares, s.view_content(), share_count),
             Screen::Create(s) => (NavItem::Create, s.view_content(), None),
             Screen::Export(s) => (NavItem::Shares, s.view_content(), None),
+            Screen::ExportNcryptsec(s) => (NavItem::Shares, s.view_content(), None),
             Screen::Import(s) => (NavItem::Import, s.view_content(), None),
             Screen::Scanner(s) => (NavItem::Import, s.view_content(), None),
             Screen::Wallet(s) => (NavItem::Wallets, s.view_content(), None),
@@ -73,6 +76,10 @@ impl Screen {
                 s.error = Some(error);
             }
             Screen::Export(s) => {
+                s.loading = false;
+                s.error = Some(error);
+            }
+            Screen::ExportNcryptsec(s) => {
                 s.loading = false;
                 s.error = Some(error);
             }

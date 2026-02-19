@@ -124,6 +124,14 @@ pub enum Message {
     CopyToClipboard(Zeroizing<String>),
     ResetExport,
 
+    // Export ncryptsec
+    GoToExportNcryptsec(String),
+    ExportNcryptsecPasswordChanged(Zeroizing<String>),
+    ExportNcryptsecConfirmChanged(Zeroizing<String>),
+    GenerateNcryptsec,
+    NcryptsecGenerated(Result<ExportData, String>),
+    ResetNcryptsec,
+
     // Import
     ImportDataChanged(Zeroizing<String>),
     ImportPassphraseChanged(Zeroizing<String>),
@@ -131,8 +139,10 @@ pub enum Message {
     ImportToggleVisibility,
     ImportShare,
     ImportNsec,
+    ImportNcryptsec,
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
     ImportNsecResult(Result<(Vec<ShareEntry>, String), String>),
+    ImportNcryptsecResult(Result<(Vec<ShareEntry>, String), String>),
 
     // Scanner
     ScannerOpen,
@@ -283,16 +293,31 @@ impl fmt::Debug for Message {
             Self::GenerateExport => f.write_str("GenerateExport"),
             Self::AdvanceQrFrame => f.write_str("AdvanceQrFrame"),
             Self::ResetExport => f.write_str("ResetExport"),
+            Self::GoToExportNcryptsec(k) => f.debug_tuple("GoToExportNcryptsec").field(k).finish(),
+            Self::ExportNcryptsecPasswordChanged(_) => {
+                f.write_str("ExportNcryptsecPasswordChanged(***)")
+            }
+            Self::ExportNcryptsecConfirmChanged(_) => {
+                f.write_str("ExportNcryptsecConfirmChanged(***)")
+            }
+            Self::GenerateNcryptsec => f.write_str("GenerateNcryptsec"),
+            Self::NcryptsecGenerated(_) => f.write_str("NcryptsecGenerated(***)"),
+            Self::ResetNcryptsec => f.write_str("ResetNcryptsec"),
             Self::ImportNameChanged(n) => f.debug_tuple("ImportNameChanged").field(n).finish(),
             Self::ImportToggleVisibility => f.write_str("ImportToggleVisibility"),
             Self::ImportShare => f.write_str("ImportShare"),
             Self::ImportNsec => f.write_str("ImportNsec"),
+            Self::ImportNcryptsec => f.write_str("ImportNcryptsec"),
             Self::ImportResult(r) => f
                 .debug_tuple("ImportResult")
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::ImportNsecResult(r) => f
                 .debug_tuple("ImportNsecResult")
+                .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::ImportNcryptsecResult(r) => f
+                .debug_tuple("ImportNcryptsecResult")
                 .field(&r.as_ref().map(|(v, _)| v.len()).map_err(|e| e.as_str()))
                 .finish(),
             Self::CopyNpub(n) => f.debug_tuple("CopyNpub").field(n).finish(),
