@@ -157,9 +157,16 @@ dictionary RecoveryTierConfig {
     u32 timelock_months;
 };
 
+dictionary DescriptorProposal {
+    string session_id;
+    string network;
+    sequence<RecoveryTierConfig> tiers;
+};
+
 [Trait, WithForeign]
 interface DescriptorCallbacks {
-    void on_contribution_needed(string session_id, string network);
+    void on_proposed(string session_id);
+    void on_contribution_needed(DescriptorProposal proposal);
     void on_contributed(string session_id, u16 share_index);
     void on_complete(string session_id, string external_descriptor, string internal_descriptor);
     void on_failed(string session_id, string error);
@@ -260,6 +267,9 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void wallet_descriptor_cancel(string session_id);
+
+    [Throws=KeepMobileError]
+    void wallet_descriptor_approve_contribution(string session_id);
 };
 
 dictionary ParsedBunkerUrl {

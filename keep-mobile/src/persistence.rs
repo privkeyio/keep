@@ -32,14 +32,7 @@ pub(crate) fn persist_policy(
     let data = serde_json::to_vec(bundle).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize policy: {e}"),
     })?;
-    let metadata = ShareMetadataInfo {
-        name: "policy".into(),
-        identifier: 0,
-        threshold: 0,
-        total_shares: 0,
-        group_pubkey: vec![],
-    };
-    storage.store_share_by_key(POLICY_STORAGE_KEY.into(), data, metadata)
+    storage.store_share_by_key(POLICY_STORAGE_KEY.into(), data, storage_metadata("policy"))
 }
 
 pub(crate) fn load_velocity(
@@ -65,14 +58,11 @@ pub(crate) fn persist_velocity(
         .map_err(|e| KeepMobileError::StorageError {
             msg: format!("Failed to serialize velocity: {e}"),
         })?;
-    let metadata = ShareMetadataInfo {
-        name: "velocity".into(),
-        identifier: 0,
-        threshold: 0,
-        total_shares: 0,
-        group_pubkey: vec![],
-    };
-    storage.store_share_by_key(VELOCITY_STORAGE_KEY.into(), data, metadata)
+    storage.store_share_by_key(
+        VELOCITY_STORAGE_KEY.into(),
+        data,
+        storage_metadata("velocity"),
+    )
 }
 
 pub(crate) fn load_trusted_wardens(
@@ -122,14 +112,11 @@ pub(crate) fn persist_trusted_wardens(
     let data = serde_json::to_vec(&hex_list).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize trusted wardens: {e}"),
     })?;
-    let metadata = ShareMetadataInfo {
-        name: "trusted_wardens".into(),
-        identifier: 0,
-        threshold: 0,
-        total_shares: 0,
-        group_pubkey: vec![],
-    };
-    storage.store_share_by_key(TRUSTED_WARDENS_KEY.into(), data, metadata)
+    storage.store_share_by_key(
+        TRUSTED_WARDENS_KEY.into(),
+        data,
+        storage_metadata("trusted_wardens"),
+    )
 }
 
 pub(crate) fn load_cert_pins(
@@ -183,14 +170,11 @@ pub(crate) fn persist_cert_pins(
     let data = serde_json::to_vec(&map).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize cert pins: {e}"),
     })?;
-    let metadata = ShareMetadataInfo {
-        name: "cert_pins".into(),
-        identifier: 0,
-        threshold: 0,
-        total_shares: 0,
-        group_pubkey: vec![],
-    };
-    storage.store_share_by_key(CERT_PINS_STORAGE_KEY.into(), data, metadata)
+    storage.store_share_by_key(
+        CERT_PINS_STORAGE_KEY.into(),
+        data,
+        storage_metadata("cert_pins"),
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,18 +214,21 @@ fn persist_descriptor_index(
     let data = serde_json::to_vec(index).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize descriptor index: {e}"),
     })?;
-    storage.store_share_by_key(DESCRIPTOR_INDEX_KEY.into(), data, storage_metadata("descriptor_index"))
+    storage.store_share_by_key(
+        DESCRIPTOR_INDEX_KEY.into(),
+        data,
+        storage_metadata("descriptor_index"),
+    )
 }
 
-pub(crate) fn load_descriptors(
-    storage: &Arc<dyn SecureStorage>,
-) -> Vec<WalletDescriptorInfo> {
+pub(crate) fn load_descriptors(storage: &Arc<dyn SecureStorage>) -> Vec<WalletDescriptorInfo> {
     let index = load_descriptor_index(storage);
     let mut result = Vec::with_capacity(index.len());
+    let mut stale = Vec::new();
     for group_hex in &index {
         match storage.load_share_by_key(descriptor_key(group_hex)) {
-            Ok(data) => {
-                if let Ok(stored) = serde_json::from_slice::<StoredDescriptor>(&data) {
+            Ok(data) => match serde_json::from_slice::<StoredDescriptor>(&data) {
+                Ok(stored) => {
                     result.push(WalletDescriptorInfo {
                         group_pubkey: stored.group_pubkey,
                         external_descriptor: stored.external_descriptor,
@@ -250,11 +237,40 @@ pub(crate) fn load_descriptors(
                         created_at: stored.created_at,
                     });
                 }
+                Err(e) => {
+                    tracing::warn!("Corrupt descriptor for {group_hex}: {e}");
+                    stale.push(group_hex.clone());
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Missing descriptor for {group_hex}: {e}");
+                stale.push(group_hex.clone());
             }
-            Err(_) => continue,
         }
     }
+    if !stale.is_empty() {
+        let cleaned: Vec<String> = index.into_iter().filter(|k| !stale.contains(k)).collect();
+        let _ = persist_descriptor_index(storage, &cleaned);
+    }
     result
+}
+
+pub(crate) fn load_descriptor(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey_hex: &str,
+) -> Result<WalletDescriptorInfo, KeepMobileError> {
+    let data = storage.load_share_by_key(descriptor_key(group_pubkey_hex))?;
+    let stored: StoredDescriptor =
+        serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to deserialize descriptor: {e}"),
+        })?;
+    Ok(WalletDescriptorInfo {
+        group_pubkey: stored.group_pubkey,
+        external_descriptor: stored.external_descriptor,
+        internal_descriptor: stored.internal_descriptor,
+        network: stored.network,
+        created_at: stored.created_at,
+    })
 }
 
 pub(crate) fn persist_descriptor(
