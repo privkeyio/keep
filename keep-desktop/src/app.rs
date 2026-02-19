@@ -2594,13 +2594,21 @@ impl App {
             }
             Message::CertPinMismatchConfirmClear => {
                 self.pin_mismatch_confirm = false;
-                let Some(mismatch) = self.pin_mismatch.take() else {
+                let Some(mismatch) = self.pin_mismatch.as_ref() else {
                     return Task::none();
                 };
-                if let Ok(mut pins) = self.certificate_pins.lock() {
+                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     pins.remove_pin(&mismatch.hostname);
                     save_cert_pins(&self.keep_path, &pins);
+                    true
+                } else {
+                    false
+                };
+                if !ok {
+                    self.set_toast("Failed to clear pin".into(), ToastKind::Error);
+                    return Task::none();
                 }
+                self.pin_mismatch = None;
                 self.sync_cert_pins_to_screen();
                 let mut tasks = Vec::new();
                 if matches!(self.frost_status, ConnectionStatus::Error(_)) {
