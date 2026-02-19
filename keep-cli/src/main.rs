@@ -438,18 +438,9 @@ fn dispatch_wallet(
             share,
             recovery,
         } => {
-            let relay = relay
-                .as_deref()
-                .unwrap_or_else(|| cfg.default_relay())
-                .to_string();
+            let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
             commands::wallet::cmd_wallet_propose(
-                out,
-                path,
-                &group,
-                &network,
-                &relay,
-                share,
-                recovery.as_deref(),
+                out, path, &group, &network, relay, share, &recovery,
             )
         }
     }

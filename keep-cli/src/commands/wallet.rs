@@ -46,10 +46,9 @@ pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
     for desc in &descriptors {
         let group_short = hex::encode(&desc.group_pubkey[..8]);
         let ext = &desc.external_descriptor;
-        let desc_display = if ext.len() > 36 {
-            format!("{}...", &ext[..36])
-        } else {
-            ext.clone()
+        let desc_display = match ext.get(..36) {
+            Some(prefix) if ext.len() > 36 => format!("{prefix}..."),
+            _ => ext.clone(),
         };
         out.table_row(&[
             (&format!("{group_short}..."), 18, false),
@@ -222,11 +221,11 @@ pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<(
     Ok(())
 }
 
-fn parse_recovery_policy(
-    recovery: &str,
-    total_shares: u16,
-) -> Result<keep_frost_net::WalletPolicy> {
-    let parts: Vec<&str> = recovery.split('@').collect();
+const BLOCKS_PER_MONTH: u32 = 144 * 30;
+const MAX_CSV_BLOCKS: u32 = 0xFFFF;
+
+fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::PolicyTier> {
+    let parts: Vec<&str> = spec.split('@').collect();
     if parts.len() != 2 {
         return Err(KeepError::InvalidInput(
             "Recovery format: 'ThresholdOfKeys@TimelockMonths' e.g. '2of3@6mo'".into(),
@@ -273,18 +272,55 @@ fn parse_recovery_policy(
         ));
     }
 
+    let timelock_blocks = timelock_months
+        .checked_mul(BLOCKS_PER_MONTH)
+        .ok_or_else(|| {
+            KeepError::InvalidInput(format!(
+                "Timelock {timelock_months} months overflows block count"
+            ))
+        })?;
+    if timelock_blocks > MAX_CSV_BLOCKS {
+        return Err(KeepError::InvalidInput(format!(
+            "Timelock {timelock_months} months ({timelock_blocks} blocks) exceeds Bitcoin CSV maximum ({MAX_CSV_BLOCKS} blocks, ~{} months)",
+            MAX_CSV_BLOCKS / BLOCKS_PER_MONTH
+        )));
+    }
+
     // Key slots use sequential indices 1..=key_count. The protocol validates
     // that these indices correspond to actual shares on the receiving end.
     let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count)
         .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
         .collect();
 
+    Ok(keep_frost_net::PolicyTier {
+        threshold,
+        key_slots,
+        timelock_months,
+    })
+}
+
+fn parse_recovery_policy(
+    specs: &[String],
+    total_shares: u16,
+) -> Result<keep_frost_net::WalletPolicy> {
+    let mut tiers: Vec<keep_frost_net::PolicyTier> = Vec::new();
+    for spec in specs {
+        tiers.push(parse_recovery_tier(spec, total_shares)?);
+    }
+
+    tiers.sort_by_key(|t| t.timelock_months);
+
+    for w in tiers.windows(2) {
+        if w[1].timelock_months == w[0].timelock_months {
+            return Err(KeepError::InvalidInput(format!(
+                "Duplicate timelock: {}mo appears in multiple recovery tiers",
+                w[0].timelock_months
+            )));
+        }
+    }
+
     Ok(keep_frost_net::WalletPolicy {
-        recovery_tiers: vec![keep_frost_net::PolicyTier {
-            threshold,
-            key_slots,
-            timelock_months,
-        }],
+        recovery_tiers: tiers,
     })
 }
 
@@ -304,7 +340,7 @@ pub fn cmd_wallet_propose(
     network: &str,
     relay: &str,
     share_index: Option<u16>,
-    recovery: Option<&str>,
+    recovery: &[String],
 ) -> Result<()> {
     debug!(group, network, relay, share = ?share_index, "wallet propose");
 
@@ -330,22 +366,26 @@ pub fn cmd_wallet_propose(
     };
     let total_shares = share.metadata.total_shares;
 
-    let policy = match recovery {
-        Some(r) => parse_recovery_policy(r, total_shares)?,
-        None => keep_frost_net::WalletPolicy {
-            recovery_tiers: vec![],
-        },
-    };
+    let policy = parse_recovery_policy(recovery, total_shares)?;
 
     out.newline();
     out.header("Wallet Descriptor Proposal");
     out.field("Group", &hex::encode(group_pubkey));
     out.field("Network", network);
     out.field("Relay", relay);
-    if let Some(r) = recovery {
-        out.field("Recovery", r);
+    for spec in recovery {
+        out.field("Recovery", spec);
     }
     out.newline();
+
+    let expected_contributions = keep_frost_net::participant_indices(&policy).len();
+    let our_index = share.metadata.identifier;
+    let we_contribute = keep_frost_net::participant_indices(&policy).contains(&our_index);
+    let remaining_contributions = if we_contribute {
+        expected_contributions.saturating_sub(1)
+    } else {
+        expected_contributions
+    };
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -405,10 +445,13 @@ pub fn cmd_wallet_propose(
         out.field("Session", &hex::encode(&session_id[..8]));
         out.newline();
 
-        let spinner = out.spinner("Waiting for contributions...");
+        let spinner = out.spinner(&format!(
+            "Waiting for contributions (0/{remaining_contributions})..."
+        ));
         let timeout = Duration::from_secs(keep_frost_net::DESCRIPTOR_SESSION_TIMEOUT_SECS);
         let deadline = tokio::time::Instant::now() + timeout;
 
+        let mut received = 0usize;
         let mut ready = false;
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline - tokio::time::Instant::now();
@@ -416,7 +459,10 @@ pub fn cmd_wallet_propose(
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorContributed {
                     share_index, ..
                 })) => {
-                    out.info(&format!("  Share {share_index} contributed"));
+                    received += 1;
+                    out.info(&format!(
+                        "  Share {share_index} contributed ({received}/{remaining_contributions})"
+                    ));
                 }
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorReady { session_id: sid }))
                     if sid == session_id =>
@@ -428,7 +474,9 @@ pub fn cmd_wallet_propose(
                     spinner.finish();
                     node.cancel_descriptor_session(&session_id);
                     node_handle.abort();
-                    return Err(KeepError::Frost(format!("Descriptor session failed: {error}")));
+                    return Err(KeepError::Frost(format!(
+                        "Descriptor session failed: {error}"
+                    )));
                 }
                 Ok(Err(_)) => break,
                 Err(_) => break,
@@ -478,7 +526,9 @@ pub fn cmd_wallet_propose(
                     spinner.finish();
                     node.cancel_descriptor_session(&session_id);
                     node_handle.abort();
-                    return Err(KeepError::Frost(format!("Descriptor finalization failed: {error}")));
+                    return Err(KeepError::Frost(format!(
+                        "Descriptor finalization failed: {error}"
+                    )));
                 }
                 Ok(Err(_)) => break,
                 Err(_) => break,
@@ -502,8 +552,8 @@ pub fn cmd_wallet_propose(
 
         let descriptor = WalletDescriptor {
             group_pubkey,
-            external_descriptor: external_descriptor.clone(),
-            internal_descriptor: internal_descriptor.clone(),
+            external_descriptor,
+            internal_descriptor,
             network: network.to_string(),
             created_at: now,
         };
@@ -513,9 +563,9 @@ pub fn cmd_wallet_propose(
         out.newline();
         out.success("Wallet descriptor coordinated and stored!");
         out.newline();
-        out.field("External (receive)", &external_descriptor);
+        out.field("External (receive)", &descriptor.external_descriptor);
         out.newline();
-        out.field("Internal (change)", &internal_descriptor);
+        out.field("Internal (change)", &descriptor.internal_descriptor);
 
         Ok::<_, KeepError>(())
     })?;

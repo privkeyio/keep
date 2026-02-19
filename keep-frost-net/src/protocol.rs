@@ -270,6 +270,9 @@ impl KfpMessage {
                     if tier.threshold == 0 {
                         return Err("Tier threshold must be non-zero");
                     }
+                    if tier.timelock_months == 0 {
+                        return Err("Tier timelock must be non-zero");
+                    }
                     if tier.threshold as usize > tier.key_slots.len() {
                         return Err("Tier threshold exceeds number of key slots");
                     }

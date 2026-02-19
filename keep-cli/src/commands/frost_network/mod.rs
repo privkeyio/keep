@@ -107,25 +107,25 @@ pub fn cmd_frost_network_serve(
                                 session,
                                 "descriptor contribution requested but --auto-contribute-descriptor not set, ignoring"
                             );
-                        } else {
-                            tracing::info!(session, "descriptor contribution requested, auto-contributing");
-                            match event_node.derive_account_xpub(&network) {
-                                Ok((xpub, fingerprint)) => {
-                                    if let Err(e) = event_node
-                                        .contribute_descriptor(
-                                            session_id,
-                                            &initiator_pubkey,
-                                            &xpub,
-                                            &fingerprint,
-                                        )
-                                        .await
-                                    {
-                                        tracing::error!(session, error = %e, "failed to contribute descriptor");
-                                    }
+                            continue;
+                        }
+                        tracing::info!(session, "descriptor contribution requested, auto-contributing");
+                        match event_node.derive_account_xpub(&network) {
+                            Ok((xpub, fingerprint)) => {
+                                if let Err(e) = event_node
+                                    .contribute_descriptor(
+                                        session_id,
+                                        &initiator_pubkey,
+                                        &xpub,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(session, error = %e, "failed to contribute descriptor");
                                 }
-                                Err(e) => {
-                                    tracing::error!(session, error = %e, "failed to derive xpub for contribution");
-                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(session, error = %e, "failed to derive xpub for contribution");
                             }
                         }
                     }

@@ -226,9 +226,10 @@ impl KfpNode {
             "signet" => keep_bitcoin::Network::Signet,
             "regtest" => keep_bitcoin::Network::Regtest,
             _ => {
+                signing_share_bytes.zeroize();
                 return Err(FrostNetError::Session(format!(
                     "unknown network: {network}"
-                )))
+                )));
             }
         };
 
