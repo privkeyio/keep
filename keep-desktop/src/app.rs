@@ -969,7 +969,11 @@ impl App {
             Message::ImportDataChanged(d) => {
                 if let Screen::Import(s) = &mut self.screen {
                     let trimmed = d.trim();
-                    s.mode = ImportScreen::detect_mode(trimmed);
+                    let new_mode = ImportScreen::detect_mode(trimmed);
+                    if new_mode != s.mode {
+                        s.passphrase = Zeroizing::new(String::new());
+                    }
+                    s.mode = new_mode;
                     s.npub_preview = if s.mode == ImportMode::Nsec {
                         keep_core::keys::NostrKeypair::from_nsec(trimmed)
                             .ok()
@@ -1862,6 +1866,7 @@ impl App {
             Message::ExportNcryptsecConfirmChanged(p) => {
                 if let Screen::ExportNcryptsec(s) = &mut self.screen {
                     s.confirm_password = p;
+                    s.error = None;
                 }
                 Task::none()
             }
