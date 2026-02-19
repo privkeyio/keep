@@ -1275,17 +1275,19 @@ impl App {
             Message::WalletSessionStarted(result) => {
                 match result {
                     Ok((session_id, group_pubkey, network)) => {
-                        self.active_coordinations.insert(
-                            session_id,
-                            ActiveCoordination {
-                                group_pubkey,
-                                network,
-                            },
-                        );
                         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
                             &mut self.screen
                         {
+                            self.active_coordinations.insert(
+                                session_id,
+                                ActiveCoordination {
+                                    group_pubkey,
+                                    network,
+                                },
+                            );
                             s.session_id = Some(session_id);
+                        } else if let Some(node) = self.get_frost_node() {
+                            node.cancel_descriptor_session(&session_id);
                         }
                     }
                     Err(e) => {

@@ -69,13 +69,7 @@ pub(crate) async fn verify_relay_certificates(
 }
 
 fn parse_bitcoin_network(net: &str) -> Result<bitcoin::Network, String> {
-    match net {
-        "bitcoin" => Ok(bitcoin::Network::Bitcoin),
-        "testnet" => Ok(bitcoin::Network::Testnet),
-        "signet" => Ok(bitcoin::Network::Signet),
-        "regtest" => Ok(bitcoin::Network::Regtest),
-        _ => Err(format!("Unknown network: {net}")),
-    }
+    net.parse::<bitcoin::Network>().map_err(|e| format!("{e}"))
 }
 
 pub(crate) async fn derive_xpub(
@@ -381,8 +375,13 @@ pub(crate) async fn spawn_frost_node(
         }
     }
 
-    if let Ok(mut guard) = node_out.lock() {
-        *guard = Some(node);
+    match node_out.lock() {
+        Ok(mut guard) => *guard = Some(node),
+        Err(_) => {
+            return Err(crate::message::ConnectionError::Other(
+                "Node mutex poisoned".into(),
+            ));
+        }
     }
     Ok(())
 }
