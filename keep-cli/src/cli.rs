@@ -260,6 +260,8 @@ pub(crate) enum FrostNetworkCommands {
         relay: Option<String>,
         #[arg(short, long)]
         share: Option<u16>,
+        #[arg(long, help = "Automatically contribute xpub to descriptor proposals")]
+        auto_contribute_descriptor: bool,
     },
     Peers {
         #[arg(short, long)]

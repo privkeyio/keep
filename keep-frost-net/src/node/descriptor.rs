@@ -221,7 +221,7 @@ impl KfpNode {
             .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
 
         let net = match network {
-            "bitcoin" | "mainnet" => keep_bitcoin::Network::Bitcoin,
+            "bitcoin" => keep_bitcoin::Network::Bitcoin,
             "testnet" => keep_bitcoin::Network::Testnet,
             "signet" => keep_bitcoin::Network::Signet,
             "regtest" => keep_bitcoin::Network::Regtest,
@@ -232,9 +232,10 @@ impl KfpNode {
             }
         };
 
-        let derivation = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net)
-            .map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
+        let result = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net);
         signing_share_bytes.zeroize();
+        let derivation =
+            result.map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
 
         let xpub = derivation
             .account_xpub(0)

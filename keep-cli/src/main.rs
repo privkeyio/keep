@@ -230,9 +230,17 @@ fn dispatch_frost_network(
             group,
             relay,
             share,
+            auto_contribute_descriptor,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
-            commands::frost_network::cmd_frost_network_serve(out, path, &group, relay, share)
+            commands::frost_network::cmd_frost_network_serve(
+                out,
+                path,
+                &group,
+                relay,
+                share,
+                auto_contribute_descriptor,
+            )
         }
         FrostNetworkCommands::Peers { group, relay } => {
             let relay = relay.as_deref().unwrap_or(default_relay);

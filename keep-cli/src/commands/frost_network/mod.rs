@@ -28,6 +28,7 @@ pub fn cmd_frost_network_serve(
     group_npub: &str,
     relay: &str,
     share_index: Option<u16>,
+    auto_contribute_descriptor: bool,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, "starting FROST network node");
 
@@ -101,23 +102,30 @@ pub fn cmd_frost_network_serve(
                         ..
                     }) => {
                         let session = hex::encode(&session_id[..8]);
-                        tracing::info!(session, "descriptor contribution requested, auto-contributing");
-                        match event_node.derive_account_xpub(&network) {
-                            Ok((xpub, fingerprint)) => {
-                                if let Err(e) = event_node
-                                    .contribute_descriptor(
-                                        session_id,
-                                        &initiator_pubkey,
-                                        &xpub,
-                                        &fingerprint,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(session, error = %e, "failed to contribute descriptor");
+                        if !auto_contribute_descriptor {
+                            tracing::warn!(
+                                session,
+                                "descriptor contribution requested but --auto-contribute-descriptor not set, ignoring"
+                            );
+                        } else {
+                            tracing::info!(session, "descriptor contribution requested, auto-contributing");
+                            match event_node.derive_account_xpub(&network) {
+                                Ok((xpub, fingerprint)) => {
+                                    if let Err(e) = event_node
+                                        .contribute_descriptor(
+                                            session_id,
+                                            &initiator_pubkey,
+                                            &xpub,
+                                            &fingerprint,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(session, error = %e, "failed to contribute descriptor");
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::error!(session, error = %e, "failed to derive xpub for contribution");
+                                Err(e) => {
+                                    tracing::error!(session, error = %e, "failed to derive xpub for contribution");
+                                }
                             }
                         }
                     }
@@ -127,10 +135,9 @@ pub fn cmd_frost_network_serve(
                         ..
                     }) => {
                         let session = hex::encode(&session_id[..8]);
-                        let desc_short = if external_descriptor.len() > 40 {
-                            format!("{}...", &external_descriptor[..40])
-                        } else {
-                            external_descriptor
+                        let desc_short = match external_descriptor.get(..40) {
+                            Some(prefix) => format!("{prefix}..."),
+                            None => external_descriptor,
                         };
                         tracing::info!(session, descriptor = desc_short, "descriptor complete");
                     }

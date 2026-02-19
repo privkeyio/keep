@@ -246,11 +246,17 @@ fn parse_recovery_policy(
     let threshold: u32 = of_parts[0]
         .parse()
         .map_err(|_| KeepError::InvalidInput("Invalid threshold number".into()))?;
-    let key_count: u32 = of_parts[1]
+    let key_count: u16 = of_parts[1]
         .parse()
         .map_err(|_| KeepError::InvalidInput("Invalid key count".into()))?;
 
-    if key_count as u16 > total_shares {
+    if threshold == 0 || threshold > key_count as u32 {
+        return Err(KeepError::InvalidInput(format!(
+            "Threshold {threshold} must be between 1 and key count {key_count}"
+        )));
+    }
+
+    if key_count > total_shares {
         return Err(KeepError::InvalidInput(format!(
             "Key count {key_count} exceeds total shares {total_shares}"
         )));
@@ -261,7 +267,15 @@ fn parse_recovery_policy(
         .parse()
         .map_err(|_| KeepError::InvalidInput("Invalid timelock, use e.g. '6mo'".into()))?;
 
-    let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count as u16)
+    if timelock_months == 0 {
+        return Err(KeepError::InvalidInput(
+            "Timelock must be at least 1 month".into(),
+        ));
+    }
+
+    // Key slots use sequential indices 1..=key_count. The protocol validates
+    // that these indices correspond to actual shares on the receiving end.
+    let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count)
         .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
         .collect();
 
@@ -293,6 +307,13 @@ pub fn cmd_wallet_propose(
     recovery: Option<&str>,
 ) -> Result<()> {
     debug!(group, network, relay, share = ?share_index, "wallet propose");
+
+    if !keep_frost_net::VALID_NETWORKS.contains(&network) {
+        return Err(KeepError::InvalidInput(format!(
+            "Invalid network '{network}' (valid: {})",
+            keep_frost_net::VALID_NETWORKS.join(", ")
+        )));
+    }
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -405,6 +426,7 @@ pub fn cmd_wallet_propose(
                 }
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed { error, .. })) => {
                     spinner.finish();
+                    node.cancel_descriptor_session(&session_id);
                     node_handle.abort();
                     return Err(KeepError::Frost(format!("Descriptor session failed: {error}")));
                 }
@@ -416,6 +438,7 @@ pub fn cmd_wallet_propose(
         spinner.finish();
 
         if !ready {
+            node.cancel_descriptor_session(&session_id);
             node_handle.abort();
             return Err(KeepError::Frost(
                 "Timed out waiting for all contributions".into(),
@@ -453,6 +476,7 @@ pub fn cmd_wallet_propose(
                 }
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed { error, .. })) => {
                     spinner.finish();
+                    node.cancel_descriptor_session(&session_id);
                     node_handle.abort();
                     return Err(KeepError::Frost(format!("Descriptor finalization failed: {error}")));
                 }
@@ -465,6 +489,7 @@ pub fn cmd_wallet_propose(
         node_handle.abort();
 
         if !complete {
+            node.cancel_descriptor_session(&session_id);
             return Err(KeepError::Frost(
                 "Timed out waiting for descriptor ACKs".into(),
             ));
