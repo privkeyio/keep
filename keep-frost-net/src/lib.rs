@@ -74,8 +74,9 @@ pub use attestation::{derive_attestation_nonce, verify_peer_attestation, Expecte
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, participant_indices, DescriptorSession,
-    DescriptorSessionManager, DescriptorSessionState, FinalizedDescriptor, XpubContribution,
+    derive_descriptor_session_id, derive_policy_hash, participant_indices,
+    reconstruct_descriptor, DescriptorSession, DescriptorSessionManager,
+    DescriptorSessionState, FinalizedDescriptor, XpubContribution,
 };
 pub use ecdh::{
     aggregate_ecdh_shares, compute_partial_ecdh, derive_ecdh_session_id, EcdhSession,

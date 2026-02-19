@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, participant_indices, FinalizedDescriptor,
+    derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
+    FinalizedDescriptor,
 };
 use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
@@ -406,6 +407,32 @@ impl KfpNode {
                     "Policy hash does not match proposal".into(),
                 ));
             }
+        }
+
+        let (expected_external, expected_internal) = {
+            let sessions = self.descriptor_sessions.read();
+            let session = sessions
+                .get_session(&payload.session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+
+            reconstruct_descriptor(
+                session.group_pubkey(),
+                session.policy(),
+                session.contributions(),
+                session.network(),
+            )?
+        };
+
+        if payload.external_descriptor != expected_external
+            || payload.internal_descriptor != expected_internal
+        {
+            let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                session_id: payload.session_id,
+                error: "Descriptor mismatch: independent reconstruction differs".into(),
+            });
+            return Err(FrostNetError::Session(
+                "Finalized descriptor does not match independent reconstruction".into(),
+            ));
         }
 
         info!(
