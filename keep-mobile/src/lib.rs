@@ -639,7 +639,13 @@ impl KeepMobile {
         self.runtime.block_on(async {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
             for relay in &relays {
-                keep_frost_net::verify_relay_certificate(relay, &mut pins).await?;
+                let (_hash, new_pin) =
+                    keep_frost_net::verify_relay_certificate(relay, &pins).await?;
+                if let Some((hostname, hash)) = new_pin {
+                    if pins.get_pin(&hostname).is_none() {
+                        pins.add_pin(hostname, hash);
+                    }
+                }
             }
             persistence::persist_cert_pins(&self.storage, &pins)?;
 
