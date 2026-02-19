@@ -449,6 +449,18 @@ pub fn cmd_wallet_propose(
         out.field("Session", &hex::encode(&session_id[..8]));
         out.newline();
 
+        macro_rules! handle_nack {
+            ($spinner:expr, $sid:expr, $share_index:expr, $reason:expr) => {{
+                $spinner.finish();
+                node.cancel_descriptor_session(&session_id);
+                node_handle.abort();
+                return Err(KeepError::Frost(format!(
+                    "Peer {} rejected descriptor: {}",
+                    $share_index, $reason
+                )));
+            }};
+        }
+
         if remaining_contributions > 0 {
             let spinner = out.spinner(&format!(
                 "Waiting for contributions (0/{remaining_contributions})..."
@@ -481,12 +493,7 @@ pub fn cmd_wallet_propose(
                         share_index,
                         reason,
                     })) if sid == session_id => {
-                        spinner.finish();
-                        node.cancel_descriptor_session(&session_id);
-                        node_handle.abort();
-                        return Err(KeepError::Frost(format!(
-                            "Peer {share_index} rejected descriptor: {reason}"
-                        )));
+                        handle_nack!(spinner, sid, share_index, reason);
                     }
                     Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
                         session_id: sid,
@@ -550,12 +557,7 @@ pub fn cmd_wallet_propose(
                     share_index,
                     reason,
                 })) if sid == session_id => {
-                    spinner.finish();
-                    node.cancel_descriptor_session(&session_id);
-                    node_handle.abort();
-                    return Err(KeepError::Frost(format!(
-                        "Peer {share_index} rejected descriptor: {reason}"
-                    )));
+                    handle_nack!(spinner, sid, share_index, reason);
                 }
                 Ok(Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
                     session_id: sid,

@@ -47,6 +47,7 @@ pub struct DescriptorSession {
     expected_contributors: HashSet<u16>,
     descriptor: Option<FinalizedDescriptor>,
     acks: HashSet<u16>,
+    nacks: HashSet<u16>,
     expected_acks: HashSet<u16>,
     state: DescriptorSessionState,
     created_at: Instant,
@@ -73,6 +74,7 @@ impl DescriptorSession {
             expected_contributors,
             descriptor: None,
             acks: HashSet::new(),
+            nacks: HashSet::new(),
             expected_acks,
             state: DescriptorSessionState::Proposed,
             created_at: Instant::now(),
@@ -243,6 +245,23 @@ impl DescriptorSession {
 
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() > self.timeout
+    }
+
+    pub fn is_participant(&self, share_index: u16) -> bool {
+        self.expected_contributors.contains(&share_index)
+            || self.expected_acks.contains(&share_index)
+    }
+
+    pub fn has_nacked(&self, share_index: u16) -> bool {
+        self.nacks.contains(&share_index)
+    }
+
+    pub fn add_nack(&mut self, share_index: u16) {
+        self.nacks.insert(share_index);
+    }
+
+    pub fn is_failed(&self) -> bool {
+        matches!(self.state, DescriptorSessionState::Failed(_))
     }
 
     pub fn fail(&mut self, reason: String) {

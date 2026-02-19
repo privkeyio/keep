@@ -570,18 +570,14 @@ impl KfpNode {
             }
         };
 
-        let encrypted = match nip44::encrypt(
-            self.keys.secret_key(),
-            recipient,
-            &json,
-            nip44::Version::V2,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                debug!("Failed to encrypt descriptor nack: {e}");
-                return;
-            }
-        };
+        let encrypted =
+            match nip44::encrypt(self.keys.secret_key(), recipient, &json, nip44::Version::V2) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("Failed to encrypt descriptor nack: {e}");
+                    return;
+                }
+            };
 
         let event = match EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
             .tag(Tag::public_key(*recipient))
@@ -628,27 +624,40 @@ impl KfpNode {
                 .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
         };
 
+        let reason = sanitize_reason(&payload.reason);
+
         {
             let mut sessions = self.descriptor_sessions.write();
             if let Some(session) = sessions.get_session_mut(&payload.session_id) {
-                session.fail(format!(
-                    "Peer {share_index} rejected descriptor: {}",
-                    payload.reason
-                ));
+                if !session.is_participant(share_index) {
+                    return Err(FrostNetError::Session(format!(
+                        "Share {share_index} is not a session participant"
+                    )));
+                }
+
+                if session.has_nacked(share_index) {
+                    return Ok(());
+                }
+
+                session.add_nack(share_index);
+
+                if !session.is_failed() {
+                    session.fail(format!("Peer {share_index} rejected descriptor: {reason}"));
+                }
             }
         }
 
         info!(
             session_id = %hex::encode(payload.session_id),
             share_index,
-            reason = %payload.reason,
+            reason = %reason,
             "Received descriptor NACK"
         );
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorNacked {
             session_id: payload.session_id,
             share_index,
-            reason: payload.reason,
+            reason,
         });
 
         Ok(())
@@ -734,4 +743,11 @@ impl KfpNode {
     pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
         self.descriptor_sessions.write().remove_session(session_id);
     }
+}
+
+fn sanitize_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect()
 }

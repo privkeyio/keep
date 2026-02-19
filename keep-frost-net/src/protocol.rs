@@ -338,6 +338,9 @@ impl KfpMessage {
             }
             KfpMessage::DescriptorAck(_) => {}
             KfpMessage::DescriptorNack(p) => {
+                if p.reason.is_empty() {
+                    return Err("Nack reason must not be empty");
+                }
                 if p.reason.len() > MAX_NACK_REASON_LENGTH {
                     return Err("Nack reason exceeds maximum length");
                 }
