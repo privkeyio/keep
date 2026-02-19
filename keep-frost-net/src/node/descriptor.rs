@@ -152,6 +152,11 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
+        let initiator_share_index = {
+            let peers = self.peers.read();
+            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
+        };
+
         {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
@@ -165,13 +170,14 @@ impl KfpNode {
                 Ok(session) => {
                     session.set_initiator(sender);
 
-                    let peers = self.peers.read();
-                    if let Some(peer) = peers.get_peer_by_pubkey(&sender) {
-                        let _ = session.add_contribution(
-                            peer.share_index,
+                    if let Some(idx) = initiator_share_index {
+                        if let Err(e) = session.add_contribution(
+                            idx,
                             payload.initiator_xpub.clone(),
                             payload.initiator_fingerprint.clone(),
-                        );
+                        ) {
+                            debug!("Failed to store initiator contribution: {e}");
+                        }
                     }
                 }
                 Err(_) => {
@@ -392,7 +398,7 @@ impl KfpNode {
             ));
         }
 
-        {
+        let (expected_external, expected_internal) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -419,6 +425,7 @@ impl KfpNode {
                 }
                 Some(_) => {}
             }
+
             let expected_hash = derive_policy_hash(session.policy());
             if payload.policy_hash != expected_hash {
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -429,13 +436,6 @@ impl KfpNode {
                     "Policy hash does not match proposal".into(),
                 ));
             }
-        }
-
-        let (expected_external, expected_internal) = {
-            let sessions = self.descriptor_sessions.read();
-            let session = sessions
-                .get_session(&payload.session_id)
-                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             reconstruct_descriptor(
                 session.group_pubkey(),
