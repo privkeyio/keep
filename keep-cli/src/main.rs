@@ -120,7 +120,7 @@ fn run(out: &Output) -> Result<()> {
                 &frost_relay,
             )
         }
-        Commands::Wallet { command } => dispatch_wallet(out, &path, command),
+        Commands::Wallet { command } => dispatch_wallet(out, &path, &cfg, command),
         Commands::Audit { command } => dispatch_audit(out, &path, command, hidden),
         Commands::Frost { command } => dispatch_frost(out, &path, &cfg, command),
         Commands::Bitcoin { command } => dispatch_bitcoin(out, &path, command),
@@ -230,9 +230,17 @@ fn dispatch_frost_network(
             group,
             relay,
             share,
+            auto_contribute_descriptor,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
-            commands::frost_network::cmd_frost_network_serve(out, path, &group, relay, share)
+            commands::frost_network::cmd_frost_network_serve(
+                out,
+                path,
+                &group,
+                relay,
+                share,
+                auto_contribute_descriptor,
+            )
         }
         FrostNetworkCommands::Peers { group, relay } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
@@ -407,7 +415,12 @@ fn dispatch_bitcoin(out: &Output, path: &std::path::Path, command: BitcoinComman
     }
 }
 
-fn dispatch_wallet(out: &Output, path: &std::path::Path, cmd: WalletCommands) -> Result<()> {
+fn dispatch_wallet(
+    out: &Output,
+    path: &std::path::Path,
+    cfg: &Config,
+    cmd: WalletCommands,
+) -> Result<()> {
     match cmd {
         WalletCommands::List => commands::wallet::cmd_wallet_list(out, path),
         WalletCommands::Show { group } => commands::wallet::cmd_wallet_show(out, path, &group),
@@ -418,6 +431,18 @@ fn dispatch_wallet(out: &Output, path: &std::path::Path, cmd: WalletCommands) ->
             commands::wallet::cmd_wallet_descriptor(out, path, &group, &network)
         }
         WalletCommands::Delete { group } => commands::wallet::cmd_wallet_delete(out, path, &group),
+        WalletCommands::Propose {
+            group,
+            network,
+            relay,
+            share,
+            recovery,
+        } => {
+            let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
+            commands::wallet::cmd_wallet_propose(
+                out, path, &group, &network, relay, share, &recovery,
+            )
+        }
     }
 }
 

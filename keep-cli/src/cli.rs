@@ -172,6 +172,23 @@ pub(crate) enum WalletCommands {
         #[arg(short, long)]
         group: String,
     },
+    /// Propose a wallet descriptor via Nostr descriptor coordination
+    Propose {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(long, default_value = "signet")]
+        network: String,
+        #[arg(short, long, help = "Nostr relay URL")]
+        relay: Option<String>,
+        #[arg(long, help = "Share index to use")]
+        share: Option<u16>,
+        #[arg(
+            long,
+            help = "Recovery tier, e.g. '2of3@6mo' (threshold-of-keys@timelock). Repeat for multiple tiers.",
+            required = true
+        )]
+        recovery: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -244,6 +261,8 @@ pub(crate) enum FrostNetworkCommands {
         relay: Option<String>,
         #[arg(short, long)]
         share: Option<u16>,
+        #[arg(long, help = "Automatically contribute xpub to descriptor proposals")]
+        auto_contribute_descriptor: bool,
     },
     Peers {
         #[arg(short, long)]
