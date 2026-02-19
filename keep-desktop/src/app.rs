@@ -667,8 +667,10 @@ impl App {
         }
         if self.copy_feedback_until.is_some_and(|t| now >= t) {
             self.copy_feedback_until = None;
-            if let Screen::Export(s) = &mut self.screen {
-                s.copied = false;
+            match &mut self.screen {
+                Screen::Export(s) => s.copied = false,
+                Screen::ExportNcryptsec(s) => s.copied = false,
+                _ => {}
             }
         }
         if self.toast_dismiss_at.is_some_and(|t| now >= t) {
@@ -1260,7 +1262,11 @@ impl App {
 
         if matches!(
             self.screen,
-            Screen::Create(_) | Screen::Export(_) | Screen::Import(_) | Screen::Scanner(_)
+            Screen::Create(_)
+                | Screen::Export(_)
+                | Screen::ExportNcryptsec(_)
+                | Screen::Import(_)
+                | Screen::Scanner(_)
         ) {
             subs.push(iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed {
@@ -1849,6 +1855,7 @@ impl App {
                 if let Screen::ExportNcryptsec(s) = &mut self.screen {
                     s.password = p;
                     s.confirm_password = Zeroizing::new(String::new());
+                    s.error = None;
                 }
                 Task::none()
             }

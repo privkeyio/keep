@@ -75,7 +75,7 @@ impl ImportScreen {
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
-        let is_secret = self.mode == ImportMode::Nsec || self.mode == ImportMode::Ncryptsec;
+        let is_secret = self.mode == ImportMode::Nsec;
 
         let data_input = text_input(
             "Paste kshare1..., nsec1..., or ncryptsec1... here",
