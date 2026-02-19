@@ -72,3 +72,18 @@ pub struct DkgConfig {
     pub our_index: u16,
     pub relays: Vec<String>,
 }
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct WalletDescriptorInfo {
+    pub group_pubkey: String,
+    pub external_descriptor: String,
+    pub internal_descriptor: String,
+    pub network: String,
+    pub created_at: u64,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct RecoveryTierConfig {
+    pub threshold: u32,
+    pub timelock_months: u32,
+}

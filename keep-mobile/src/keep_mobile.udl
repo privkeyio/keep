@@ -144,6 +144,27 @@ enum PeerStatus {
     "Unknown",
 };
 
+dictionary WalletDescriptorInfo {
+    string group_pubkey;
+    string external_descriptor;
+    string internal_descriptor;
+    string network;
+    u64 created_at;
+};
+
+dictionary RecoveryTierConfig {
+    u32 threshold;
+    u32 timelock_months;
+};
+
+[Trait, WithForeign]
+interface DescriptorCallbacks {
+    void on_contribution_needed(string session_id, string network);
+    void on_contributed(string session_id, u16 share_index);
+    void on_complete(string session_id, string external_descriptor, string internal_descriptor);
+    void on_failed(string session_id, string error);
+};
+
 [Trait, WithForeign]
 interface SecureStorage {
     [Throws=KeepMobileError]
@@ -223,6 +244,22 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void clear_certificate_pin(string hostname);
+
+    sequence<WalletDescriptorInfo> wallet_descriptor_list();
+
+    [Throws=KeepMobileError]
+    string wallet_descriptor_export(string group_pubkey, string format);
+
+    [Throws=KeepMobileError]
+    void wallet_descriptor_delete(string group_pubkey);
+
+    void wallet_descriptor_set_callbacks(DescriptorCallbacks callbacks);
+
+    [Throws=KeepMobileError]
+    string wallet_descriptor_propose(string network, sequence<RecoveryTierConfig> tiers);
+
+    [Throws=KeepMobileError]
+    void wallet_descriptor_cancel(string session_id);
 };
 
 dictionary ParsedBunkerUrl {
