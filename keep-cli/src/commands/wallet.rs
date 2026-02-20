@@ -235,10 +235,49 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
     let thresh_part = parts[0];
     let timelock_part = parts[1];
 
-    let of_parts: Vec<&str> = thresh_part.split("of").collect();
+    let (of_spec, explicit_slots) = if let Some(bracket_start) = thresh_part.find('[') {
+        let of_spec = &thresh_part[..bracket_start];
+        let bracket_content = thresh_part[bracket_start + 1..].trim_end_matches(']');
+        let slots: Vec<keep_frost_net::KeySlot> = bracket_content
+            .split(',')
+            .map(|s| {
+                let s = s.trim();
+                if let Some(ext_data) = s.strip_prefix("ext:") {
+                    let slash_pos = ext_data.rfind('/').ok_or_else(|| {
+                        KeepError::InvalidInput(
+                            "External key format: ext:XPUB/FINGERPRINT".into(),
+                        )
+                    })?;
+                    let xpub = &ext_data[..slash_pos];
+                    let fingerprint = &ext_data[slash_pos + 1..];
+                    if xpub.is_empty() || fingerprint.is_empty() {
+                        return Err(KeepError::InvalidInput(
+                            "External key xpub and fingerprint must not be empty".into(),
+                        ));
+                    }
+                    Ok(keep_frost_net::KeySlot::External {
+                        xpub: xpub.to_string(),
+                        fingerprint: fingerprint.to_string(),
+                    })
+                } else {
+                    let idx: u16 = s.parse().map_err(|_| {
+                        KeepError::InvalidInput(format!(
+                            "Invalid bracket entry '{s}': use a number or ext:XPUB/FINGERPRINT"
+                        ))
+                    })?;
+                    Ok(keep_frost_net::KeySlot::Participant { share_index: idx })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (of_spec, Some(slots))
+    } else {
+        (thresh_part, None)
+    };
+
+    let of_parts: Vec<&str> = of_spec.split("of").collect();
     if of_parts.len() != 2 {
         return Err(KeepError::InvalidInput(
-            "Threshold format: 'NofM' e.g. '2of3'".into(),
+            "Threshold format: 'NofM' e.g. '2of3' or '2of3[1,3,5]'".into(),
         ));
     }
 
@@ -255,7 +294,29 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    if key_count > total_shares {
+    if let Some(ref slots) = explicit_slots {
+        if slots.len() != key_count as usize {
+            return Err(KeepError::InvalidInput(format!(
+                "Bracket list has {} entries but key count is {key_count}",
+                slots.len()
+            )));
+        }
+        let mut seen_indices = std::collections::HashSet::new();
+        for slot in slots {
+            if let keep_frost_net::KeySlot::Participant { share_index } = slot {
+                if *share_index < 1 || *share_index > total_shares {
+                    return Err(KeepError::InvalidInput(format!(
+                        "Participant index {share_index} must be between 1 and {total_shares}"
+                    )));
+                }
+                if !seen_indices.insert(*share_index) {
+                    return Err(KeepError::InvalidInput(format!(
+                        "Duplicate participant index {share_index} in brackets"
+                    )));
+                }
+            }
+        }
+    } else if key_count > total_shares {
         return Err(KeepError::InvalidInput(format!(
             "Key count {key_count} exceeds total shares {total_shares}"
         )));
@@ -286,9 +347,13 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count)
-        .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
-        .collect();
+    let key_slots: Vec<keep_frost_net::KeySlot> = if let Some(slots) = explicit_slots {
+        slots
+    } else {
+        (1..=key_count)
+            .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
+            .collect()
+    };
 
     Ok(keep_frost_net::PolicyTier {
         threshold,
