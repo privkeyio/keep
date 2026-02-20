@@ -88,6 +88,13 @@ impl KfpNode {
                 .collect()
         };
 
+        if target_peers.is_empty() {
+            self.descriptor_sessions.write().remove_session(&session_id);
+            return Err(FrostNetError::Session(
+                "No online peers to coordinate with".into(),
+            ));
+        }
+
         for pubkey in &target_peers {
             let encrypted =
                 nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
