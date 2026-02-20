@@ -147,6 +147,16 @@ impl DescriptorSession {
             )));
         }
 
+        if self
+            .contributions
+            .values()
+            .any(|c| c.account_xpub == xpub)
+        {
+            return Err(FrostNetError::Session(
+                "Duplicate xpub: another participant already contributed this key".into(),
+            ));
+        }
+
         self.contributions.insert(
             share_index,
             XpubContribution {
@@ -956,5 +966,51 @@ mod tests {
     fn test_session_manager_default() {
         let manager = DescriptorSessionManager::default();
         assert!(manager.get_session(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn test_own_contribution_tamper_detection() {
+        let mut session = test_session();
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+        session
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .unwrap();
+        session
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .unwrap();
+
+        let our_stored = session.contributions().get(&1).unwrap();
+        assert_eq!(our_stored.account_xpub, "tpub1zzzzzzzzzzzzzzz");
+        assert_eq!(our_stored.fingerprint, "aabbccdd");
+
+        let mut tampered_contributions = session.contributions().clone();
+        tampered_contributions.insert(
+            1,
+            XpubContribution {
+                account_xpub: "tpub_EVIL_zzzzzzzzz".into(),
+                fingerprint: "deadbeef".into(),
+            },
+        );
+
+        let forwarded = tampered_contributions.get(&1).unwrap();
+        assert_ne!(forwarded.account_xpub, our_stored.account_xpub);
+        assert_ne!(forwarded.fingerprint, our_stored.fingerprint);
+    }
+
+    #[test]
+    fn test_duplicate_xpub_across_participants_rejected() {
+        let mut session = test_session();
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+
+        let result = session.add_contribution(2, "tpub1zzzzzzzzzzzzzzz".into(), "11223344".into());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Duplicate xpub"));
     }
 }

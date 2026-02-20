@@ -251,10 +251,23 @@ impl KfpNode {
         account_xpub: &str,
         fingerprint: &str,
     ) -> Result<()> {
+        let our_index = self.share.metadata.identifier;
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            if let Some(session) = sessions.get_session_mut(&session_id) {
+                session.add_contribution(
+                    our_index,
+                    account_xpub.to_string(),
+                    fingerprint.to_string(),
+                )?;
+            }
+        }
+
         let payload = DescriptorContributePayload::new(
             session_id,
             self.group_pubkey,
-            self.share.metadata.identifier,
+            our_index,
             account_xpub,
             fingerprint,
         );
@@ -438,7 +451,7 @@ impl KfpNode {
             ));
         }
 
-        let reconstruction_result = {
+        let own_xpub_tampered = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -465,6 +478,40 @@ impl KfpNode {
                 }
                 Some(_) => {}
             }
+
+            let our_index = self.share.metadata.identifier;
+            if let Some(our_stored) = session.contributions().get(&our_index) {
+                match payload.contributions.get(&our_index) {
+                    Some(forwarded) => {
+                        forwarded.account_xpub != our_stored.account_xpub
+                            || forwarded.fingerprint != our_stored.fingerprint
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            }
+        };
+
+        if own_xpub_tampered {
+            let reason = "Own xpub contribution was tampered with in finalize";
+            self.descriptor_sessions
+                .write()
+                .remove_session(&payload.session_id);
+            self.send_descriptor_nack(payload.session_id, &sender, reason)
+                .await;
+            let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                session_id: payload.session_id,
+                error: reason.into(),
+            });
+            return Err(FrostNetError::Session(reason.into()));
+        }
+
+        let reconstruction_result = {
+            let sessions = self.descriptor_sessions.read();
+            let session = sessions
+                .get_session(&payload.session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             let expected_hash = derive_policy_hash(session.policy());
             if payload.policy_hash != expected_hash {
