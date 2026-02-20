@@ -913,6 +913,7 @@ pub struct DescriptorFinalizePayload {
     pub internal_descriptor: String,
     #[serde(with = "hex_bytes")]
     pub policy_hash: [u8; 32],
+    #[serde(with = "string_key_btreemap")]
     pub contributions: std::collections::BTreeMap<u16, crate::descriptor_session::XpubContribution>,
     pub created_at: u64,
 }
@@ -1070,6 +1071,53 @@ mod hex_vec {
     {
         let s = String::deserialize(deserializer)?;
         hex::decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod string_key_btreemap {
+    use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+    use serde::ser::{Serialize, SerializeMap, Serializer};
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::str::FromStr;
+
+    pub fn serialize<S, V>(map: &BTreeMap<u16, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        let mut m = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            m.serialize_entry(&k.to_string(), v)?;
+        }
+        m.end()
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<u16, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        struct StringKeyVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for StringKeyVisitor<V> {
+            type Value = BTreeMap<u16, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map with string-encoded u16 keys")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut result = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    let k = u16::from_str(&key).map_err(serde::de::Error::custom)?;
+                    result.insert(k, value);
+                }
+                Ok(result)
+            }
+        }
+
+        deserializer.deserialize_map(StringKeyVisitor(std::marker::PhantomData))
     }
 }
 
