@@ -907,16 +907,26 @@ impl KeepMobile {
 
         self.runtime.block_on(async {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            let mut pins_changed = false;
             for relay in &relays {
-                let (_hash, new_pin) =
-                    keep_frost_net::verify_relay_certificate(relay, &pins).await?;
-                if let Some((hostname, hash)) = new_pin {
-                    if pins.get_pin(&hostname).is_none() {
-                        pins.add_pin(hostname, hash);
+                match keep_frost_net::verify_relay_certificate(relay, &pins).await {
+                    Ok((_hash, new_pin)) => {
+                        if let Some((hostname, hash)) = new_pin {
+                            if pins.get_pin(&hostname).is_none() {
+                                pins.add_pin(hostname, hash);
+                                pins_changed = true;
+                            }
+                        }
                     }
+                    Err(e @ keep_frost_net::FrostNetError::CertificatePinMismatch { .. }) => {
+                        return Err(e.into());
+                    }
+                    Err(_) => {}
                 }
             }
-            persistence::persist_cert_pins(&self.storage, &pins)?;
+            if pins_changed {
+                persistence::persist_cert_pins(&self.storage, &pins)?;
+            }
 
             let node = match proxy {
                 Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,

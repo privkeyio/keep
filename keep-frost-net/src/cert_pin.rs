@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,7 +88,20 @@ pub async fn verify_relay_certificate(
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+    let resolve_addr = addr.clone();
+    let socket_addr: SocketAddr = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            resolve_addr.to_socket_addrs().ok().and_then(|mut a| a.next())
+        }),
+    )
+    .await
+    .map_err(|_| FrostNetError::Timeout(format!("DNS resolve {addr}")))?
+    .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
+    .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
+
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
         .await
         .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
         .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;
