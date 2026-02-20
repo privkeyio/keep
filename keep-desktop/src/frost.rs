@@ -511,6 +511,20 @@ pub(crate) async fn frost_event_listener(
                             },
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorNacked {
+                        session_id,
+                        share_index,
+                        reason,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorNacked {
+                                session_id,
+                                share_index,
+                                reason,
+                            },
+                        );
+                    }
                     Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
                         push_frost_event(
                             &frost_events,
@@ -684,6 +698,17 @@ impl App {
                     external_descriptor,
                     internal_descriptor,
                 );
+            }
+            FrostNodeMsg::DescriptorNacked {
+                session_id,
+                share_index,
+                reason,
+            } => {
+                self.active_coordinations.remove(&session_id);
+                let error = format!("Peer {share_index} rejected descriptor: {reason}");
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
+                });
             }
             FrostNodeMsg::DescriptorFailed { session_id, error } => {
                 self.active_coordinations.remove(&session_id);

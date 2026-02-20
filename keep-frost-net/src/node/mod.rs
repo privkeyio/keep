@@ -160,6 +160,11 @@ pub enum KfpNodeEvent {
         external_descriptor: String,
         internal_descriptor: String,
     },
+    DescriptorNacked {
+        session_id: [u8; 32],
+        share_index: u16,
+        reason: String,
+    },
     DescriptorFailed {
         session_id: [u8; 32],
         error: String,
@@ -672,6 +677,9 @@ impl KfpNode {
             }
             KfpMessage::DescriptorAck(payload) => {
                 self.handle_descriptor_ack(event.pubkey, payload).await?;
+            }
+            KfpMessage::DescriptorNack(payload) => {
+                self.handle_descriptor_nack(event.pubkey, payload).await?;
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

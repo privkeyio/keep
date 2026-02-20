@@ -154,6 +154,14 @@ pub fn cmd_frost_network_serve(
                         };
                         tracing::info!(session, descriptor = desc_short, "descriptor complete");
                     }
+                    Ok(keep_frost_net::KfpNodeEvent::DescriptorNacked {
+                        session_id,
+                        share_index,
+                        reason,
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::error!(session, share_index, reason, "descriptor nacked by peer");
+                    }
                     Ok(keep_frost_net::KfpNodeEvent::DescriptorFailed {
                         session_id,
                         error,
