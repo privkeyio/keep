@@ -327,6 +327,14 @@ impl KfpMessage {
                 if p.contributions.len() > MAX_PARTICIPANTS {
                     return Err("Too many contributions in finalize payload");
                 }
+                for &idx in p.contributions.keys() {
+                    if idx == 0 {
+                        return Err("Invalid contribution index");
+                    }
+                    if idx as usize > MAX_PARTICIPANTS {
+                        return Err("Contribution index exceeds maximum");
+                    }
+                }
                 for contrib in p.contributions.values() {
                     if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Contribution xpub exceeds maximum length");
@@ -1409,6 +1417,98 @@ mod tests {
         let mut payload = DescriptorNackPayload::new([1u8; 32], [2u8; 32], "placeholder");
         payload.reason = String::new();
         let msg = KfpMessage::DescriptorNack(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contributions_roundtrip() {
+        use std::collections::BTreeMap;
+
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            1,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        contributions.insert(
+            3,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6DEF".to_string(),
+                fingerprint: "11223344".to_string(),
+            },
+        );
+
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/0/*,[11223344]xpub6DEF/0/*))",
+            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/1/*,[11223344]xpub6DEF/1/*))",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
+        let json = msg.to_json().unwrap();
+
+        assert!(json.contains("\"1\""));
+        assert!(json.contains("\"3\""));
+
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::DescriptorFinalize(p) => {
+                assert!(p.contributions.contains_key(&1));
+                assert!(p.contributions.contains_key(&3));
+                assert_eq!(p.contributions[&1].fingerprint, "aabbccdd");
+                assert_eq!(p.contributions[&3].fingerprint, "11223344");
+            }
+            _ => panic!("expected DescriptorFinalize"),
+        }
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contribution_index_zero() {
+        use std::collections::BTreeMap;
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            0,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "desc",
+            "desc",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contribution_index_exceeds_max() {
+        use std::collections::BTreeMap;
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            MAX_PARTICIPANTS as u16 + 1,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "desc",
+            "desc",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
         assert!(msg.validate().is_err());
     }
 

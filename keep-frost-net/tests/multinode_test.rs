@@ -603,7 +603,12 @@ async fn test_descriptor_coordination_flow() {
                     ));
                 }
                 Ok(_) => {}
-                Err(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(
+                        "Event channel closed while waiting for DescriptorComplete".to_string()
+                    );
+                }
             }
         }
     })
