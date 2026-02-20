@@ -965,38 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn test_own_contribution_tamper_detection() {
-        let mut session = test_session();
-
-        session
-            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
-            .unwrap();
-        session
-            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
-            .unwrap();
-        session
-            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
-            .unwrap();
-
-        let our_stored = session.contributions().get(&1).unwrap();
-        assert_eq!(our_stored.account_xpub, "tpub1zzzzzzzzzzzzzzz");
-        assert_eq!(our_stored.fingerprint, "aabbccdd");
-
-        let mut tampered_contributions = session.contributions().clone();
-        tampered_contributions.insert(
-            1,
-            XpubContribution {
-                account_xpub: "tpub_EVIL_zzzzzzzzz".into(),
-                fingerprint: "deadbeef".into(),
-            },
-        );
-
-        let forwarded = tampered_contributions.get(&1).unwrap();
-        assert_ne!(forwarded.account_xpub, our_stored.account_xpub);
-        assert_ne!(forwarded.fingerprint, our_stored.fingerprint);
-    }
-
-    #[test]
     fn test_duplicate_xpub_across_participants_rejected() {
         let mut session = test_session();
 

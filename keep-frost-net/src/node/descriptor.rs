@@ -459,7 +459,7 @@ impl KfpNode {
             }
         }
 
-        let own_xpub_tampered = {
+        let reconstruction_result = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -484,50 +484,29 @@ impl KfpNode {
             }
 
             let our_index = self.share.metadata.identifier;
-            if let Some(our_stored) = session.contributions().get(&our_index) {
-                match payload.contributions.get(&our_index) {
-                    Some(forwarded) => {
-                        forwarded.account_xpub != our_stored.account_xpub
-                            || forwarded.fingerprint != our_stored.fingerprint
-                    }
-                    None => true,
+            let own_xpub_tampered = match session.contributions().get(&our_index) {
+                Some(our_stored) => payload.contributions.get(&our_index).map_or(true, |fwd| {
+                    fwd.account_xpub != our_stored.account_xpub
+                        || fwd.fingerprint != our_stored.fingerprint
+                }),
+                None => session.is_participant(our_index),
+            };
+
+            if own_xpub_tampered {
+                Err("Own xpub contribution was tampered with in finalize".into())
+            } else {
+                let expected_hash = derive_policy_hash(session.policy());
+                if payload.policy_hash != expected_hash {
+                    Err("Policy hash does not match proposal".into())
+                } else {
+                    reconstruct_descriptor(
+                        session.group_pubkey(),
+                        session.policy(),
+                        &payload.contributions,
+                        session.network(),
+                    )
+                    .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
                 }
-            } else {
-                false
-            }
-        };
-
-        if own_xpub_tampered {
-            let reason = "Own xpub contribution was tampered with in finalize";
-            self.descriptor_sessions
-                .write()
-                .remove_session(&payload.session_id);
-            self.send_descriptor_nack(payload.session_id, &sender, reason)
-                .await;
-            let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                session_id: payload.session_id,
-                error: reason.into(),
-            });
-            return Err(FrostNetError::Session(reason.into()));
-        }
-
-        let reconstruction_result = {
-            let sessions = self.descriptor_sessions.read();
-            let session = sessions
-                .get_session(&payload.session_id)
-                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
-
-            let expected_hash = derive_policy_hash(session.policy());
-            if payload.policy_hash != expected_hash {
-                Err("Policy hash does not match proposal".to_string())
-            } else {
-                reconstruct_descriptor(
-                    session.group_pubkey(),
-                    session.policy(),
-                    &payload.contributions,
-                    session.network(),
-                )
-                .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
             }
         };
 
@@ -807,11 +786,14 @@ impl KfpNode {
 const MAX_NACK_REASON_LENGTH: usize = 256;
 
 fn sanitize_reason(reason: &str) -> String {
-    let mut sanitized: String = reason.chars().filter(|c| !c.is_control()).collect();
+    let sanitized: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NACK_REASON_LENGTH)
+        .collect();
     if sanitized.is_empty() {
         "no reason given".to_string()
     } else {
-        sanitized.truncate(MAX_NACK_REASON_LENGTH);
         sanitized
     }
 }
