@@ -255,13 +255,14 @@ impl KfpNode {
 
         {
             let mut sessions = self.descriptor_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&session_id) {
-                session.add_contribution(
-                    our_index,
-                    account_xpub.to_string(),
-                    fingerprint.to_string(),
-                )?;
-            }
+            let session = sessions
+                .get_session_mut(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+            session.add_contribution(
+                our_index,
+                account_xpub.to_string(),
+                fingerprint.to_string(),
+            )?;
         }
 
         let payload = DescriptorContributePayload::new(
@@ -451,6 +452,13 @@ impl KfpNode {
             ));
         }
 
+        {
+            let peers = self.peers.read();
+            if peers.get_peer_by_pubkey(&sender).is_none() {
+                return Err(FrostNetError::UntrustedPeer(sender.to_string()));
+            }
+        }
+
         let own_xpub_tampered = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
@@ -459,10 +467,6 @@ impl KfpNode {
 
             match session.initiator() {
                 Some(initiator) if *initiator != sender => {
-                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                        session_id: payload.session_id,
-                        error: "Finalize from non-initiator".into(),
-                    });
                     return Err(FrostNetError::Session(
                         "DescriptorFinalize sender is not the session initiator".into(),
                     ));
@@ -800,11 +804,14 @@ impl KfpNode {
     }
 }
 
+const MAX_NACK_REASON_LENGTH: usize = 256;
+
 fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason.chars().filter(|c| !c.is_control()).collect();
+    let mut sanitized: String = reason.chars().filter(|c| !c.is_control()).collect();
     if sanitized.is_empty() {
         "no reason given".to_string()
     } else {
+        sanitized.truncate(MAX_NACK_REASON_LENGTH);
         sanitized
     }
 }

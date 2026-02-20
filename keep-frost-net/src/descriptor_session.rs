@@ -147,11 +147,7 @@ impl DescriptorSession {
             )));
         }
 
-        if self
-            .contributions
-            .values()
-            .any(|c| c.account_xpub == xpub)
-        {
+        if self.contributions.values().any(|c| c.account_xpub == xpub) {
             return Err(FrostNetError::Session(
                 "Duplicate xpub: another participant already contributed this key".into(),
             ));
