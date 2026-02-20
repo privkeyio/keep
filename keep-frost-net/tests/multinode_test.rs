@@ -579,6 +579,7 @@ async fn test_descriptor_coordination_flow() {
                     session_id: sid,
                     external_descriptor,
                     internal_descriptor,
+                    ..
                 }) => {
                     return Ok((sid, external_descriptor, internal_descriptor));
                 }
@@ -620,6 +621,7 @@ async fn test_descriptor_coordination_flow() {
                 session_id: sid,
                 external_descriptor,
                 internal_descriptor,
+                ..
             }) = rx1.recv().await
             {
                 return (sid, external_descriptor, internal_descriptor);

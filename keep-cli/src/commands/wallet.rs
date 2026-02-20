@@ -237,7 +237,15 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
 
     let (of_spec, explicit_slots) = if let Some(bracket_start) = thresh_part.find('[') {
         let of_spec = &thresh_part[..bracket_start];
-        let bracket_content = thresh_part[bracket_start + 1..].trim_end_matches(']');
+        let bracket_end = thresh_part.rfind(']').ok_or_else(|| {
+            KeepError::InvalidInput("Missing closing ']' in bracket notation".into())
+        })?;
+        if bracket_end <= bracket_start {
+            return Err(KeepError::InvalidInput(
+                "Missing closing ']' in bracket notation".into(),
+            ));
+        }
+        let bracket_content = &thresh_part[bracket_start + 1..bracket_end];
         let slots: Vec<keep_frost_net::KeySlot> = bracket_content
             .split(',')
             .map(|s| {
@@ -299,18 +307,27 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
                 slots.len()
             )));
         }
-        let mut seen_indices = std::collections::HashSet::new();
+        let mut seen_keys = std::collections::HashSet::new();
         for slot in slots {
-            if let keep_frost_net::KeySlot::Participant { share_index } = slot {
-                if *share_index < 1 || *share_index > total_shares {
-                    return Err(KeepError::InvalidInput(format!(
-                        "Participant index {share_index} must be between 1 and {total_shares}"
-                    )));
+            match slot {
+                keep_frost_net::KeySlot::Participant { share_index } => {
+                    if *share_index < 1 || *share_index > total_shares {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Participant index {share_index} must be between 1 and {total_shares}"
+                        )));
+                    }
+                    if !seen_keys.insert(format!("p:{share_index}")) {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Duplicate participant index {share_index} in brackets"
+                        )));
+                    }
                 }
-                if !seen_indices.insert(*share_index) {
-                    return Err(KeepError::InvalidInput(format!(
-                        "Duplicate participant index {share_index} in brackets"
-                    )));
+                keep_frost_net::KeySlot::External { xpub, fingerprint } => {
+                    if !seen_keys.insert(format!("e:{xpub}/{fingerprint}")) {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Duplicate external key {fingerprint} in brackets"
+                        )));
+                    }
                 }
             }
         }
@@ -603,6 +620,7 @@ pub fn cmd_wallet_propose(
                     session_id: sid,
                     external_descriptor: ext,
                     internal_descriptor: int,
+                    ..
                 })) if sid == session_id => {
                     external_descriptor = ext;
                     internal_descriptor = int;
@@ -727,6 +745,12 @@ mod tests {
             5,
         )
         .unwrap();
+        match &tier.key_slots[0] {
+            keep_frost_net::KeySlot::Participant { share_index } => {
+                assert_eq!(*share_index, 1);
+            }
+            _ => panic!("expected Participant"),
+        }
         match &tier.key_slots[1] {
             keep_frost_net::KeySlot::External { xpub, fingerprint } => {
                 assert_eq!(xpub, "[deadbeef/48h/0h/0h/2h]xpub6ABC123");
@@ -768,6 +792,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("ext:XPUB/FINGERPRINT"));
+    }
+
+    #[test]
+    fn test_parse_missing_closing_bracket() {
+        let err = parse_recovery_tier("2of3[1,3,5@6mo", 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Missing closing ']'"));
+    }
+
+    #[test]
+    fn test_parse_duplicate_external_key() {
+        let err = parse_recovery_tier("2of2[ext:xpub6TEST/abcd1234,ext:xpub6TEST/abcd1234]@6mo", 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Duplicate external"));
     }
 
     #[test]

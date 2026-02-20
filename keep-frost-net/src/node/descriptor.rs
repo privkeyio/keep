@@ -407,6 +407,13 @@ impl KfpNode {
                 .collect()
         };
 
+        if target_peers.is_empty() {
+            self.descriptor_sessions.write().remove_session(&session_id);
+            return Err(FrostNetError::Session(
+                "No online peers to send finalize to".into(),
+            ));
+        }
+
         for pubkey in &target_peers {
             let encrypted =
                 nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
@@ -466,11 +473,13 @@ impl KfpNode {
             }
         }
 
-        let reconstruction_result = {
+        let (reconstruction_result, session_network) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+
+            let network = session.network().to_string();
 
             match session.initiator() {
                 Some(initiator) if *initiator != sender => {
@@ -499,7 +508,7 @@ impl KfpNode {
                 None => session.is_participant(our_index),
             };
 
-            if own_xpub_tampered {
+            let result = if own_xpub_tampered {
                 Err("Own xpub contribution was tampered with in finalize".into())
             } else {
                 let expected_hash = derive_policy_hash(session.policy());
@@ -514,7 +523,8 @@ impl KfpNode {
                     )
                     .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
                 }
-            }
+            };
+            (result, network)
         };
 
         let (expected_external, expected_internal) = match reconstruction_result {
@@ -592,6 +602,7 @@ impl KfpNode {
             session_id: payload.session_id,
             external_descriptor: payload.external_descriptor,
             internal_descriptor: payload.internal_descriptor,
+            network: session_network,
         });
 
         Ok(())
@@ -756,6 +767,7 @@ impl KfpNode {
                         session_id: payload.session_id,
                         external_descriptor: desc.external.clone(),
                         internal_descriptor: desc.internal.clone(),
+                        network: session.network().to_string(),
                     });
                 }
             }
