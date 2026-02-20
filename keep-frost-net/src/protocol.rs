@@ -1328,6 +1328,43 @@ mod tests {
     }
 
     #[test]
+    fn test_descriptor_nack_serialization() {
+        let payload = DescriptorNackPayload::new([5u8; 32], [6u8; 32], "policy hash mismatch");
+        let msg = KfpMessage::DescriptorNack(payload);
+
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+
+        match parsed {
+            KfpMessage::DescriptorNack(p) => {
+                assert_eq!(p.session_id, [5u8; 32]);
+                assert_eq!(p.group_pubkey, [6u8; 32]);
+                assert_eq!(p.reason, "policy hash mismatch");
+            }
+            _ => panic!("expected DescriptorNack"),
+        }
+    }
+
+    #[test]
+    fn test_descriptor_nack_reason_too_long() {
+        let payload = DescriptorNackPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            &"a".repeat(MAX_NACK_REASON_LENGTH + 1),
+        );
+        let msg = KfpMessage::DescriptorNack(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_descriptor_nack_reason_empty() {
+        let mut payload = DescriptorNackPayload::new([1u8; 32], [2u8; 32], "placeholder");
+        payload.reason = String::new();
+        let msg = KfpMessage::DescriptorNack(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
     fn test_announce_without_attestation_serialization() {
         let payload = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890);
         let msg = KfpMessage::Announce(payload);

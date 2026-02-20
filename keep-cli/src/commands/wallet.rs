@@ -286,12 +286,6 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    // Key slots use sequential indices 1..=key_count, assuming participants are
-    // indexed 1..=total_shares contiguously. Non-contiguous groups (e.g. shares
-    // {1, 3, 5}) will fail at descriptor reconstruction when looking up
-    // contributions by index. The key_count <= total_shares check above guards
-    // the upper bound; protocol-level validation catches invalid indices on
-    // the receiving end.
     let key_slots: Vec<keep_frost_net::KeySlot> = (1..=key_count)
         .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
         .collect();
@@ -452,7 +446,7 @@ pub fn cmd_wallet_propose(
         macro_rules! handle_nack {
             ($spinner:expr, $sid:expr, $share_index:expr, $reason:expr) => {{
                 $spinner.finish();
-                node.cancel_descriptor_session(&session_id);
+                node.cancel_descriptor_session(&$sid);
                 node_handle.abort();
                 return Err(KeepError::Frost(format!(
                     "Peer {} rejected descriptor: {}",

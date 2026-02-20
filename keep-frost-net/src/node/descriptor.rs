@@ -483,6 +483,9 @@ impl KfpNode {
         let (expected_external, expected_internal) = match reconstruction_result {
             Ok(result) => result,
             Err(reason) => {
+                self.descriptor_sessions
+                    .write()
+                    .remove_session(&payload.session_id);
                 self.send_descriptor_nack(payload.session_id, &sender, &reason)
                     .await;
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -497,6 +500,9 @@ impl KfpNode {
             || payload.internal_descriptor != expected_internal
         {
             let reason = "Descriptor mismatch: independent reconstruction differs";
+            self.descriptor_sessions
+                .write()
+                .remove_session(&payload.session_id);
             self.send_descriptor_nack(payload.session_id, &sender, reason)
                 .await;
             let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -626,26 +632,28 @@ impl KfpNode {
 
         let reason = sanitize_reason(&payload.reason);
 
-        {
-            let mut sessions = self.descriptor_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&payload.session_id) {
-                if !session.is_participant(share_index) {
-                    return Err(FrostNetError::Session(format!(
-                        "Share {share_index} is not a session participant"
-                    )));
-                }
+        let mut sessions = self.descriptor_sessions.write();
+        let Some(session) = sessions.get_session_mut(&payload.session_id) else {
+            return Ok(());
+        };
 
-                if session.has_nacked(share_index) {
-                    return Ok(());
-                }
-
-                session.add_nack(share_index);
-
-                if !session.is_failed() {
-                    session.fail(format!("Peer {share_index} rejected descriptor: {reason}"));
-                }
-            }
+        if !session.is_participant(share_index) {
+            return Err(FrostNetError::Session(format!(
+                "Share {share_index} is not a session participant"
+            )));
         }
+
+        if session.has_nacked(share_index) {
+            return Ok(());
+        }
+
+        session.add_nack(share_index);
+
+        if !session.is_failed() {
+            session.fail(format!("Peer {share_index} rejected descriptor: {reason}"));
+        }
+
+        drop(sessions);
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -746,8 +754,10 @@ impl KfpNode {
 }
 
 fn sanitize_reason(reason: &str) -> String {
-    reason
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect()
+    let sanitized: String = reason.chars().filter(|c| !c.is_control()).collect();
+    if sanitized.is_empty() {
+        "no reason given".to_string()
+    } else {
+        sanitized
+    }
 }
