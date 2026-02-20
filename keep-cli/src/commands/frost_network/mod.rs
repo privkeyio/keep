@@ -8,6 +8,7 @@ use secrecy::ExposeSecret;
 use tracing::debug;
 
 use keep_core::error::{FrostError, KeepError, NetworkError, Result};
+use keep_core::wallet::WalletDescriptor;
 use keep_core::Keep;
 
 use crate::output::Output;
@@ -74,8 +75,15 @@ pub fn cmd_frost_network_serve(
         out.newline();
         out.info("Listening for FROST messages... (Ctrl+C to stop)");
 
+        let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
+        let session_networks: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<[u8; 32], String>>,
+        > = Default::default();
+
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
+        let event_keep = keep.clone();
+        let event_session_networks = session_networks.clone();
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
@@ -102,6 +110,10 @@ pub fn cmd_frost_network_serve(
                         ..
                     }) => {
                         let session = hex::encode(&session_id[..8]);
+                        event_session_networks
+                            .lock()
+                            .unwrap()
+                            .insert(session_id, network.clone());
                         if !auto_contribute_descriptor {
                             tracing::warn!(
                                 session,
@@ -145,14 +157,49 @@ pub fn cmd_frost_network_serve(
                     Ok(keep_frost_net::KfpNodeEvent::DescriptorComplete {
                         session_id,
                         external_descriptor,
-                        ..
+                        internal_descriptor,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
                             Some(prefix) => format!("{prefix}..."),
-                            None => external_descriptor,
+                            None => external_descriptor.clone(),
                         };
                         tracing::info!(session, descriptor = desc_short, "descriptor complete");
+
+                        let network = event_session_networks
+                            .lock()
+                            .unwrap()
+                            .remove(&session_id);
+                        if let Some(network) = network {
+                            let keep = event_keep.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let descriptor = WalletDescriptor {
+                                    group_pubkey,
+                                    external_descriptor,
+                                    internal_descriptor,
+                                    network,
+                                    created_at: now,
+                                };
+                                let guard = keep.lock().unwrap();
+                                match guard.store_wallet_descriptor(&descriptor) {
+                                    Ok(()) => {
+                                        tracing::info!("wallet descriptor stored");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "failed to store wallet descriptor");
+                                    }
+                                }
+                            });
+                        } else {
+                            tracing::warn!(
+                                session,
+                                "no network found for session, descriptor not stored"
+                            );
+                        }
                     }
                     Ok(keep_frost_net::KfpNodeEvent::DescriptorNacked {
                         session_id,
