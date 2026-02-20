@@ -1317,12 +1317,13 @@ impl KeepMobile {
                             session_id,
                             external_descriptor,
                             internal_descriptor,
+                            network,
                         }) => {
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
                             }
-                            let network = match desc.networks.lock().ok().and_then(|mut n| n.remove(&session_id)) {
-                                Some(n) if !n.is_empty() => n,
+                            let network = match Some(network).filter(|n| !n.is_empty()) {
+                                Some(n) => n,
                                 _ => {
                                     tracing::error!("Missing network for descriptor session");
                                     if let Some(cb) = desc.callbacks.read().await.as_ref() {

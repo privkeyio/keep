@@ -391,7 +391,6 @@ async fn test_full_signing_flow() {
 }
 
 #[tokio::test]
-#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
 async fn test_descriptor_coordination_flow() {
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -568,25 +567,54 @@ async fn test_descriptor_coordination_flow() {
         .internal_descriptor()
         .expect("internal descriptor failed");
 
-    node1
+    let finalize_result = node1
         .finalize_descriptor(session_id, &external_desc, &internal_desc, policy_hash)
-        .await
-        .expect("finalize_descriptor failed");
+        .await;
+    finalize_result.expect("finalize_descriptor failed");
 
-    let node2_complete = timeout(Duration::from_secs(15), async {
+    let node2_complete = timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(KfpNodeEvent::DescriptorComplete {
-                session_id: sid,
-                external_descriptor,
-                internal_descriptor,
-            }) = rx2.recv().await
-            {
-                return (sid, external_descriptor, internal_descriptor);
+            match rx2.recv().await {
+                Ok(KfpNodeEvent::DescriptorComplete {
+                    session_id: sid,
+                    external_descriptor,
+                    internal_descriptor,
+                    ..
+                }) => {
+                    return Ok((sid, external_descriptor, internal_descriptor));
+                }
+                Ok(KfpNodeEvent::DescriptorFailed {
+                    session_id: sid,
+                    error,
+                }) => {
+                    return Err(format!(
+                        "DescriptorFailed session={} error={error}",
+                        hex::encode(&sid[..8])
+                    ));
+                }
+                Ok(KfpNodeEvent::DescriptorNacked {
+                    session_id: sid,
+                    share_index,
+                    reason,
+                }) => {
+                    return Err(format!(
+                        "DescriptorNacked session={} share={share_index} reason={reason}",
+                        hex::encode(&sid[..8])
+                    ));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(
+                        "Event channel closed while waiting for DescriptorComplete".to_string()
+                    );
+                }
             }
         }
     })
     .await
-    .expect("Timed out waiting for DescriptorComplete on node2");
+    .expect("Timed out waiting for DescriptorComplete on node2")
+    .expect("Descriptor coordination failed on node2");
 
     assert_eq!(node2_complete.0, session_id);
     assert_eq!(node2_complete.1, external_desc);
@@ -598,6 +626,7 @@ async fn test_descriptor_coordination_flow() {
                 session_id: sid,
                 external_descriptor,
                 internal_descriptor,
+                ..
             }) = rx1.recv().await
             {
                 return (sid, external_descriptor, internal_descriptor);
@@ -613,4 +642,42 @@ async fn test_descriptor_coordination_flow() {
 
     graceful_shutdown(shutdown1, node1_handle).await;
     graceful_shutdown(shutdown2, node2_handle).await;
+}
+
+#[tokio::test]
+async fn test_request_descriptor_fails_with_no_peers() {
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-no-peers").unwrap();
+
+    let share1 = shares.remove(0);
+
+    let node1 = KfpNode::new(share1, vec![relay])
+        .await
+        .expect("Failed to create node");
+
+    let policy = WalletPolicy {
+        recovery_tiers: vec![PolicyTier {
+            threshold: 1,
+            key_slots: vec![
+                KeySlot::Participant { share_index: 1 },
+                KeySlot::Participant { share_index: 2 },
+            ],
+            timelock_months: 6,
+        }],
+    };
+
+    let result = node1
+        .request_descriptor(policy, "signet", "tpub_test", "aabbccdd")
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("No online peers"),
+        "Expected 'No online peers' error, got: {err}"
+    );
 }

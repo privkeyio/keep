@@ -327,6 +327,14 @@ impl KfpMessage {
                 if p.contributions.len() > MAX_PARTICIPANTS {
                     return Err("Too many contributions in finalize payload");
                 }
+                for &idx in p.contributions.keys() {
+                    if idx == 0 {
+                        return Err("Invalid contribution index");
+                    }
+                    if idx as usize > MAX_PARTICIPANTS {
+                        return Err("Contribution index exceeds maximum");
+                    }
+                }
                 for contrib in p.contributions.values() {
                     if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Contribution xpub exceeds maximum length");
@@ -913,6 +921,7 @@ pub struct DescriptorFinalizePayload {
     pub internal_descriptor: String,
     #[serde(with = "hex_bytes")]
     pub policy_hash: [u8; 32],
+    #[serde(with = "string_key_btreemap")]
     pub contributions: std::collections::BTreeMap<u16, crate::descriptor_session::XpubContribution>,
     pub created_at: u64,
 }
@@ -1070,6 +1079,53 @@ mod hex_vec {
     {
         let s = String::deserialize(deserializer)?;
         hex::decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod string_key_btreemap {
+    use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+    use serde::ser::{Serialize, SerializeMap, Serializer};
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::str::FromStr;
+
+    pub fn serialize<S, V>(map: &BTreeMap<u16, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        let mut m = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            m.serialize_entry(&k.to_string(), v)?;
+        }
+        m.end()
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<u16, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        struct StringKeyVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for StringKeyVisitor<V> {
+            type Value = BTreeMap<u16, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map with string-encoded u16 keys")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut result = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    let k = u16::from_str(&key).map_err(serde::de::Error::custom)?;
+                    result.insert(k, value);
+                }
+                Ok(result)
+            }
+        }
+
+        deserializer.deserialize_map(StringKeyVisitor(std::marker::PhantomData))
     }
 }
 
@@ -1361,6 +1417,98 @@ mod tests {
         let mut payload = DescriptorNackPayload::new([1u8; 32], [2u8; 32], "placeholder");
         payload.reason = String::new();
         let msg = KfpMessage::DescriptorNack(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contributions_roundtrip() {
+        use std::collections::BTreeMap;
+
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            1,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        contributions.insert(
+            3,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6DEF".to_string(),
+                fingerprint: "11223344".to_string(),
+            },
+        );
+
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/0/*,[11223344]xpub6DEF/0/*))",
+            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/1/*,[11223344]xpub6DEF/1/*))",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
+        let json = msg.to_json().unwrap();
+
+        assert!(json.contains("\"1\""));
+        assert!(json.contains("\"3\""));
+
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::DescriptorFinalize(p) => {
+                assert!(p.contributions.contains_key(&1));
+                assert!(p.contributions.contains_key(&3));
+                assert_eq!(p.contributions[&1].fingerprint, "aabbccdd");
+                assert_eq!(p.contributions[&3].fingerprint, "11223344");
+            }
+            _ => panic!("expected DescriptorFinalize"),
+        }
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contribution_index_zero() {
+        use std::collections::BTreeMap;
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            0,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "desc",
+            "desc",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_descriptor_finalize_contribution_index_exceeds_max() {
+        use std::collections::BTreeMap;
+        let mut contributions = BTreeMap::new();
+        contributions.insert(
+            MAX_PARTICIPANTS as u16 + 1,
+            crate::descriptor_session::XpubContribution {
+                account_xpub: "xpub6ABC".to_string(),
+                fingerprint: "aabbccdd".to_string(),
+            },
+        );
+        let payload = DescriptorFinalizePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            "desc",
+            "desc",
+            [3u8; 32],
+            contributions,
+        );
+        let msg = KfpMessage::DescriptorFinalize(payload);
         assert!(msg.validate().is_err());
     }
 

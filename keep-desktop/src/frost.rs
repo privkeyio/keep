@@ -501,6 +501,7 @@ pub(crate) async fn frost_event_listener(
                         session_id,
                         external_descriptor,
                         internal_descriptor,
+                        ..
                     }) => {
                         push_frost_event(
                             &frost_events,
