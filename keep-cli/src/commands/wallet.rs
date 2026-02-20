@@ -244,9 +244,7 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
                 let s = s.trim();
                 if let Some(ext_data) = s.strip_prefix("ext:") {
                     let slash_pos = ext_data.rfind('/').ok_or_else(|| {
-                        KeepError::InvalidInput(
-                            "External key format: ext:XPUB/FINGERPRINT".into(),
-                        )
+                        KeepError::InvalidInput("External key format: ext:XPUB/FINGERPRINT".into())
                     })?;
                     let xpub = &ext_data[..slash_pos];
                     let fingerprint = &ext_data[slash_pos + 1..];
@@ -670,4 +668,113 @@ pub fn cmd_wallet_propose(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sequential_tier() {
+        let tier = parse_recovery_tier("2of3@6mo", 5).unwrap();
+        assert_eq!(tier.threshold, 2);
+        assert_eq!(tier.key_slots.len(), 3);
+        assert_eq!(tier.timelock_months, 6);
+        for (i, slot) in tier.key_slots.iter().enumerate() {
+            match slot {
+                keep_frost_net::KeySlot::Participant { share_index } => {
+                    assert_eq!(*share_index, (i + 1) as u16);
+                }
+                _ => panic!("expected Participant"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_explicit_indices() {
+        let tier = parse_recovery_tier("2of3[1,3,5]@6mo", 5).unwrap();
+        assert_eq!(tier.threshold, 2);
+        assert_eq!(tier.key_slots.len(), 3);
+        let indices: Vec<u16> = tier
+            .key_slots
+            .iter()
+            .map(|s| match s {
+                keep_frost_net::KeySlot::Participant { share_index } => *share_index,
+                _ => panic!("expected Participant"),
+            })
+            .collect();
+        assert_eq!(indices, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_parse_external_key() {
+        let tier = parse_recovery_tier("2of3[1,2,ext:xpub6TEST/abcd1234]@6mo", 5).unwrap();
+        assert_eq!(tier.threshold, 2);
+        assert_eq!(tier.key_slots.len(), 3);
+        match &tier.key_slots[2] {
+            keep_frost_net::KeySlot::External { xpub, fingerprint } => {
+                assert_eq!(xpub, "xpub6TEST");
+                assert_eq!(fingerprint, "abcd1234");
+            }
+            _ => panic!("expected External"),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_key_with_derivation_path() {
+        let tier = parse_recovery_tier(
+            "1of2[1,ext:[deadbeef/48h/0h/0h/2h]xpub6ABC123/deadbeef]@3mo",
+            5,
+        )
+        .unwrap();
+        match &tier.key_slots[1] {
+            keep_frost_net::KeySlot::External { xpub, fingerprint } => {
+                assert_eq!(xpub, "[deadbeef/48h/0h/0h/2h]xpub6ABC123");
+                assert_eq!(fingerprint, "deadbeef");
+            }
+            _ => panic!("expected External"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bracket_count_mismatch() {
+        let err = parse_recovery_tier("2of3[1,2]@6mo", 5);
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("2 entries but key count is 3"));
+    }
+
+    #[test]
+    fn test_parse_duplicate_index() {
+        let err = parse_recovery_tier("2of3[1,1,2]@6mo", 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Duplicate"));
+    }
+
+    #[test]
+    fn test_parse_index_out_of_range() {
+        let err = parse_recovery_tier("2of3[1,2,10]@6mo", 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("between 1 and 5"));
+    }
+
+    #[test]
+    fn test_parse_invalid_external_key_format() {
+        let err = parse_recovery_tier("1of1[ext:noslash]@6mo", 5);
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("ext:XPUB/FINGERPRINT"));
+    }
+
+    #[test]
+    fn test_parse_policy_duplicate_timelock() {
+        let specs = vec!["2of3@6mo".to_string(), "1of2@6mo".to_string()];
+        let err = parse_recovery_policy(&specs, 5);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Duplicate timelock"));
+    }
 }
