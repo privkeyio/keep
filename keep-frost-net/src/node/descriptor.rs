@@ -251,10 +251,24 @@ impl KfpNode {
         account_xpub: &str,
         fingerprint: &str,
     ) -> Result<()> {
+        let our_index = self.share.metadata.identifier;
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            let session = sessions
+                .get_session_mut(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
+            session.add_contribution(
+                our_index,
+                account_xpub.to_string(),
+                fingerprint.to_string(),
+            )?;
+        }
+
         let payload = DescriptorContributePayload::new(
             session_id,
             self.group_pubkey,
-            self.share.metadata.identifier,
+            our_index,
             account_xpub,
             fingerprint,
         );
@@ -438,6 +452,13 @@ impl KfpNode {
             ));
         }
 
+        {
+            let peers = self.peers.read();
+            if peers.get_peer_by_pubkey(&sender).is_none() {
+                return Err(FrostNetError::UntrustedPeer(sender.to_string()));
+            }
+        }
+
         let reconstruction_result = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
@@ -446,10 +467,6 @@ impl KfpNode {
 
             match session.initiator() {
                 Some(initiator) if *initiator != sender => {
-                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                        session_id: payload.session_id,
-                        error: "Finalize from non-initiator".into(),
-                    });
                     return Err(FrostNetError::Session(
                         "DescriptorFinalize sender is not the session initiator".into(),
                     ));
@@ -466,17 +483,30 @@ impl KfpNode {
                 Some(_) => {}
             }
 
-            let expected_hash = derive_policy_hash(session.policy());
-            if payload.policy_hash != expected_hash {
-                Err("Policy hash does not match proposal".to_string())
+            let our_index = self.share.metadata.identifier;
+            let own_xpub_tampered = match session.contributions().get(&our_index) {
+                Some(our_stored) => payload.contributions.get(&our_index).map_or(true, |fwd| {
+                    fwd.account_xpub != our_stored.account_xpub
+                        || fwd.fingerprint != our_stored.fingerprint
+                }),
+                None => session.is_participant(our_index),
+            };
+
+            if own_xpub_tampered {
+                Err("Own xpub contribution was tampered with in finalize".into())
             } else {
-                reconstruct_descriptor(
-                    session.group_pubkey(),
-                    session.policy(),
-                    &payload.contributions,
-                    session.network(),
-                )
-                .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
+                let expected_hash = derive_policy_hash(session.policy());
+                if payload.policy_hash != expected_hash {
+                    Err("Policy hash does not match proposal".into())
+                } else {
+                    reconstruct_descriptor(
+                        session.group_pubkey(),
+                        session.policy(),
+                        &payload.contributions,
+                        session.network(),
+                    )
+                    .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
+                }
             }
         };
 
@@ -753,8 +783,14 @@ impl KfpNode {
     }
 }
 
+const MAX_NACK_REASON_LENGTH: usize = 256;
+
 fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason.chars().filter(|c| !c.is_control()).collect();
+    let sanitized: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NACK_REASON_LENGTH)
+        .collect();
     if sanitized.is_empty() {
         "no reason given".to_string()
     } else {

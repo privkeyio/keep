@@ -147,6 +147,12 @@ impl DescriptorSession {
             )));
         }
 
+        if self.contributions.values().any(|c| c.account_xpub == xpub) {
+            return Err(FrostNetError::Session(
+                "Duplicate xpub: another participant already contributed this key".into(),
+            ));
+        }
+
         self.contributions.insert(
             share_index,
             XpubContribution {
@@ -956,5 +962,19 @@ mod tests {
     fn test_session_manager_default() {
         let manager = DescriptorSessionManager::default();
         assert!(manager.get_session(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn test_duplicate_xpub_across_participants_rejected() {
+        let mut session = test_session();
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+
+        let result = session.add_contribution(2, "tpub1zzzzzzzzzzzzzzz".into(), "11223344".into());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Duplicate xpub"));
     }
 }
