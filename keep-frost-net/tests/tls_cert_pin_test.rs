@@ -3,7 +3,9 @@
 
 #![forbid(unsafe_code)]
 
-use keep_frost_net::{install_default_crypto_provider, verify_relay_certificate, CertificatePinSet};
+use keep_frost_net::{
+    install_default_crypto_provider, verify_relay_certificate, CertificatePinSet,
+};
 
 #[tokio::test]
 #[ignore] // requires network
@@ -37,7 +39,10 @@ async fn test_cert_pin_verification_passes() {
         .expect("Pinned verification should pass");
 
     assert_eq!(verified_hash, hash);
-    assert!(new_pin.is_none(), "Should not return new pin when pin exists and matches");
+    assert!(
+        new_pin.is_none(),
+        "Should not return new pin when pin exists and matches"
+    );
 }
 
 #[tokio::test]
@@ -80,7 +85,10 @@ async fn test_cert_pin_multiple_relays() {
         .await
         .expect("primal relay");
 
-    assert_ne!(hash1, hash2, "Different relays should have different cert hashes");
+    assert_ne!(
+        hash1, hash2,
+        "Different relays should have different cert hashes"
+    );
     assert_ne!(hash1, [0u8; 32]);
     assert_ne!(hash2, [0u8; 32]);
 }

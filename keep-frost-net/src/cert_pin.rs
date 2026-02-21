@@ -89,11 +89,15 @@ pub async fn verify_relay_certificate(
         .to_owned();
 
     let resolve_addr = addr.clone();
-    let socket_addr: SocketAddr = tokio::time::timeout(
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio::task::spawn_blocking(move || {
             use std::net::ToSocketAddrs;
-            resolve_addr.to_socket_addrs().ok().and_then(|mut a| a.next())
+            resolve_addr
+                .to_socket_addrs()
+                .ok()
+                .map(|iter| iter.collect::<Vec<SocketAddr>>())
+                .filter(|v| !v.is_empty())
         }),
     )
     .await
@@ -101,7 +105,7 @@ pub async fn verify_relay_certificate(
     .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
     .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
 
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..]))
         .await
         .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
         .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;

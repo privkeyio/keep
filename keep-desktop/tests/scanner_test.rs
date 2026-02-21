@@ -209,8 +209,7 @@ fn test_invalid_bech32_chars_rejected() {
 fn test_animated_max_frames_exceeded() {
     let mut frames = HashMap::new();
     let mut total = None;
-    let (r, k) =
-        process_qr_content(r#"{"f":0,"t":101,"d":"chunk0"}"#, &mut frames, &mut total);
+    let (r, k) = process_qr_content(r#"{"f":0,"t":101,"d":"chunk0"}"#, &mut frames, &mut total);
     assert!(r.is_none());
     assert_eq!(k, "invalid");
 }
