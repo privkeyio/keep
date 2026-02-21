@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,7 +88,24 @@ pub async fn verify_relay_certificate(
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+    let resolve_addr = addr.clone();
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            resolve_addr
+                .to_socket_addrs()
+                .ok()
+                .map(|iter| iter.collect::<Vec<SocketAddr>>())
+                .filter(|v| !v.is_empty())
+        }),
+    )
+    .await
+    .map_err(|_| FrostNetError::Timeout(format!("DNS resolve {addr}")))?
+    .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
+    .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
+
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..]))
         .await
         .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
         .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;
@@ -114,7 +132,7 @@ pub async fn verify_relay_certificate(
         if spki_hash.ct_ne(expected).into() {
             return Err(FrostNetError::CertificatePinMismatch {
                 hostname,
-                expected: hex::encode(expected),
+                expected: "***".into(),
                 actual: hex::encode(spki_hash),
             });
         }
@@ -194,6 +212,12 @@ fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
     for i in 0..num_bytes {
         len = len.checked_shl(8)?.checked_add(data[1 + i] as usize)?;
     }
+    if num_bytes == 1 && len < 0x80 {
+        return None;
+    }
+    if num_bytes > 1 && data[1] == 0 {
+        return None;
+    }
     Some((1 + num_bytes, len))
 }
 
@@ -232,5 +256,11 @@ mod tests {
     fn test_der_length_invalid() {
         assert_eq!(read_der_length(&[]), None);
         assert_eq!(read_der_length(&[0x80]), None);
+    }
+
+    #[test]
+    fn test_der_length_rejects_non_canonical() {
+        assert_eq!(read_der_length(&[0x81, 0x05]), None);
+        assert_eq!(read_der_length(&[0x82, 0x00, 0x80]), None);
     }
 }

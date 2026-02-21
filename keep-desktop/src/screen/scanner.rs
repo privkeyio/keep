@@ -288,3 +288,146 @@ pub enum CameraEvent {
     },
     Error(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_single_kshare1_recognized() {
+        let mut s = ScannerScreen::new();
+        let kshare = "kshare1qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        let result = s.process_qr_content(kshare);
+        assert_eq!(result, Some(kshare.to_string()));
+    }
+
+    #[test]
+    fn test_single_nsec_recognized() {
+        let mut s = ScannerScreen::new();
+        let nsec = "nsec1qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        assert_eq!(s.process_qr_content(nsec), Some(nsec.to_string()));
+    }
+
+    #[test]
+    fn test_single_ncryptsec_recognized() {
+        let mut s = ScannerScreen::new();
+        let ncryptsec = "ncryptsec1qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        assert_eq!(s.process_qr_content(ncryptsec), Some(ncryptsec.to_string()));
+    }
+
+    #[test]
+    fn test_unrecognized_content() {
+        let mut s = ScannerScreen::new();
+        assert!(s.process_qr_content("https://example.com").is_none());
+        assert!(matches!(s.status, ScannerStatus::Unrecognized(_)));
+    }
+
+    #[test]
+    fn test_json_share_format() {
+        let mut s = ScannerScreen::new();
+        let json = r#"{"version":1,"encrypted_share":"deadbeef"}"#;
+        assert_eq!(s.process_qr_content(json), Some(json.to_string()));
+    }
+
+    #[test]
+    fn test_animated_frame_collection() {
+        let mut s = ScannerScreen::new();
+        assert!(s
+            .process_qr_content(r#"{"f":0,"t":3,"d":"chunk0"}"#)
+            .is_none());
+        assert_eq!(s.collected_frames.len(), 1);
+        assert_eq!(s.total_expected, Some(3));
+        assert!(matches!(
+            s.status,
+            ScannerStatus::CollectingFrames { got: 1, total: 3 }
+        ));
+
+        assert!(s
+            .process_qr_content(r#"{"f":1,"t":3,"d":"chunk1"}"#)
+            .is_none());
+        assert_eq!(s.collected_frames.len(), 2);
+    }
+
+    #[test]
+    fn test_animated_frame_total_mismatch_resets() {
+        let mut s = ScannerScreen::new();
+        s.process_qr_content(r#"{"f":0,"t":3,"d":"chunk0"}"#);
+        assert_eq!(s.collected_frames.len(), 1);
+
+        s.process_qr_content(r#"{"f":0,"t":5,"d":"chunk0"}"#);
+        assert_eq!(s.total_expected, Some(5));
+        assert_eq!(s.collected_frames.len(), 1);
+    }
+
+    #[test]
+    fn test_animated_frame_zero_total_rejected() {
+        let mut s = ScannerScreen::new();
+        assert!(s
+            .process_qr_content(r#"{"f":0,"t":0,"d":"chunk0"}"#)
+            .is_none());
+        assert!(s.collected_frames.is_empty());
+    }
+
+    #[test]
+    fn test_animated_frame_index_exceeds_total() {
+        let mut s = ScannerScreen::new();
+        assert!(s
+            .process_qr_content(r#"{"f":5,"t":3,"d":"chunk0"}"#)
+            .is_none());
+        assert!(s.collected_frames.is_empty());
+    }
+
+    #[test]
+    fn test_kshare_too_long_rejected() {
+        let mut s = ScannerScreen::new();
+        let long = format!("kshare1{}", "q".repeat(8200));
+        assert!(s.process_qr_content(&long).is_none());
+    }
+
+    #[test]
+    fn test_kshare_empty_payload_rejected() {
+        let mut s = ScannerScreen::new();
+        assert!(s.process_qr_content("kshare1").is_none());
+    }
+
+    #[test]
+    fn test_whitespace_trimmed() {
+        let mut s = ScannerScreen::new();
+        let result = s.process_qr_content("  kshare1qpzry9x8gf2tvdw0s3jn54khce6mua7l  ");
+        assert_eq!(
+            result,
+            Some("kshare1qpzry9x8gf2tvdw0s3jn54khce6mua7l".to_string())
+        );
+    }
+
+    #[test]
+    fn test_invalid_bech32_chars_rejected() {
+        let mut s = ScannerScreen::new();
+        assert!(s.process_qr_content("kshare1INVALID_CHARS!").is_none());
+    }
+
+    #[test]
+    fn test_animated_max_frames_exceeded() {
+        let mut s = ScannerScreen::new();
+        assert!(s
+            .process_qr_content(r#"{"f":0,"t":101,"d":"chunk0"}"#)
+            .is_none());
+    }
+
+    #[test]
+    fn test_duplicate_frame_overwrites() {
+        let mut s = ScannerScreen::new();
+        s.process_qr_content(r#"{"f":0,"t":3,"d":"first"}"#);
+        s.process_qr_content(r#"{"f":0,"t":3,"d":"second"}"#);
+        assert_eq!(s.collected_frames.len(), 1);
+        assert!(s.collected_frames.get(&0).unwrap().contains("second"));
+    }
+
+    #[test]
+    fn test_is_valid_bech32_payload() {
+        assert!(is_valid_bech32_payload("kshare1", "kshare1qpzry9x8"));
+        assert!(!is_valid_bech32_payload("kshare1", "kshare1"));
+        assert!(!is_valid_bech32_payload("kshare1", "kshare1INVALID"));
+        assert!(!is_valid_bech32_payload("kshare1", "wrong_prefix"));
+    }
+}

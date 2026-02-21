@@ -907,20 +907,56 @@ impl KeepMobile {
 
         self.runtime.block_on(async {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            let mut pins_changed = false;
             for relay in &relays {
-                let (_hash, new_pin) =
-                    keep_frost_net::verify_relay_certificate(relay, &pins).await?;
-                if let Some((hostname, hash)) = new_pin {
-                    if pins.get_pin(&hostname).is_none() {
-                        pins.add_pin(hostname, hash);
+                match keep_frost_net::verify_relay_certificate(relay, &pins).await {
+                    Ok((_hash, new_pin)) => {
+                        if let Some((hostname, hash)) = new_pin {
+                            if pins.get_pin(&hostname).is_none() {
+                                pins.add_pin(hostname, hash);
+                                pins_changed = true;
+                            }
+                        }
+                    }
+                    Err(e @ keep_frost_net::FrostNetError::CertificatePinMismatch { .. }) => {
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        tracing::warn!(relay = %relay, error = %e, "TLS certificate verification failed, skipping relay");
                     }
                 }
             }
-            persistence::persist_cert_pins(&self.storage, &pins)?;
+            if pins_changed {
+                persistence::persist_cert_pins(&self.storage, &pins)?;
+            }
+
+            let verified_relays: Vec<String> = relays
+                .iter()
+                .filter(|r| {
+                    let url = match url::Url::parse(r) {
+                        Ok(u) => u,
+                        Err(_) => return false,
+                    };
+                    if url.scheme() != "wss" {
+                        return true;
+                    }
+                    url.host_str()
+                        .map(|h| pins.get_pin(h).is_some())
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            if verified_relays.is_empty() {
+                return Err(keep_frost_net::FrostNetError::Transport(
+                    "No relays passed TLS certificate verification".into(),
+                )
+                .into());
+            }
 
             let node = match proxy {
-                Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,
-                None => KfpNode::new(share, relays).await?,
+                Some(addr) => KfpNode::new_with_proxy(share, verified_relays, addr).await?,
+                None => KfpNode::new(share, verified_relays).await?,
             };
 
             let (request_tx, request_rx) = mpsc::channel(32);
