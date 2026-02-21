@@ -70,8 +70,7 @@ fn test_cert_pins_file_display() {
     pins.add_pin("relay.damus.io".into(), hash);
     save_cert_pins(dir.path(), &pins);
 
-    let contents =
-        std::fs::read_to_string(dir.path().join("cert-pins.json")).expect("read");
+    let contents = std::fs::read_to_string(dir.path().join("cert-pins.json")).expect("read");
     let map: HashMap<String, String> = serde_json::from_str(&contents).expect("parse");
 
     assert_eq!(map.len(), 1);
@@ -89,12 +88,8 @@ fn test_inject_bad_pin() {
 
     let path = dir.path().join("cert-pins.json");
     let contents = std::fs::read_to_string(&path).expect("read");
-    let mut map: HashMap<String, String> =
-        serde_json::from_str(&contents).expect("parse");
-    map.insert(
-        "relay.damus.io".into(),
-        hex::encode([0xFF; 32]),
-    );
+    let mut map: HashMap<String, String> = serde_json::from_str(&contents).expect("parse");
+    map.insert("relay.damus.io".into(), hex::encode([0xFF; 32]));
     let json = serde_json::to_string_pretty(&map).expect("serialize");
     std::fs::write(&path, &json).expect("write");
 
@@ -117,8 +112,7 @@ fn test_clear_all_pins_file() {
     let loaded = load_cert_pins(dir.path());
     assert!(loaded.is_empty());
 
-    let contents =
-        std::fs::read_to_string(dir.path().join("cert-pins.json")).expect("read");
+    let contents = std::fs::read_to_string(dir.path().join("cert-pins.json")).expect("read");
     let map: HashMap<String, String> = serde_json::from_str(&contents).expect("parse");
     assert!(map.is_empty());
 }

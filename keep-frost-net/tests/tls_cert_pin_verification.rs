@@ -56,8 +56,7 @@ async fn test_pin_persistence_reconnect() {
         .collect();
     let json = serde_json::to_string(&serialized).expect("serialize");
 
-    let deserialized: HashMap<String, String> =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
     let mut restored_pins = CertificatePinSet::new();
     for (hostname, hex_hash) in deserialized {
         let bytes = hex::decode(&hex_hash).expect("hex decode");
@@ -156,8 +155,7 @@ async fn test_lock_unlock_cycle() {
 
     drop(pins);
 
-    let deserialized: HashMap<String, String> =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
     let mut restored = CertificatePinSet::new();
     for (hostname, hex_hash) in deserialized {
         let bytes = hex::decode(&hex_hash).expect("hex decode");
