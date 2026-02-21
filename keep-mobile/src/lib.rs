@@ -921,16 +921,39 @@ impl KeepMobile {
                     Err(e @ keep_frost_net::FrostNetError::CertificatePinMismatch { .. }) => {
                         return Err(e.into());
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        tracing::warn!(relay = %relay, error = %e, "TLS certificate verification failed, skipping relay");
+                    }
                 }
             }
             if pins_changed {
                 persistence::persist_cert_pins(&self.storage, &pins)?;
             }
 
+            let verified_relays: Vec<String> = relays
+                .iter()
+                .filter(|r| {
+                    let hostname = url::Url::parse(r)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|s| s.to_string()));
+                    match hostname {
+                        Some(h) => pins.get_pin(&h).is_some(),
+                        None => false,
+                    }
+                })
+                .cloned()
+                .collect();
+
+            if verified_relays.is_empty() {
+                return Err(keep_frost_net::FrostNetError::Transport(
+                    "No relays passed TLS certificate verification".into(),
+                )
+                .into());
+            }
+
             let node = match proxy {
-                Some(addr) => KfpNode::new_with_proxy(share, relays, addr).await?,
-                None => KfpNode::new(share, relays).await?,
+                Some(addr) => KfpNode::new_with_proxy(share, verified_relays, addr).await?,
+                None => KfpNode::new(share, verified_relays).await?,
             };
 
             let (request_tx, request_rx) = mpsc::channel(32);

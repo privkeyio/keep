@@ -132,7 +132,7 @@ pub async fn verify_relay_certificate(
         if spki_hash.ct_ne(expected).into() {
             return Err(FrostNetError::CertificatePinMismatch {
                 hostname,
-                expected: hex::encode(expected),
+                expected: "***".into(),
                 actual: hex::encode(spki_hash),
             });
         }
@@ -212,6 +212,12 @@ fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
     for i in 0..num_bytes {
         len = len.checked_shl(8)?.checked_add(data[1 + i] as usize)?;
     }
+    if num_bytes == 1 && len < 0x80 {
+        return None;
+    }
+    if num_bytes > 1 && data[1] == 0 {
+        return None;
+    }
     Some((1 + num_bytes, len))
 }
 
@@ -250,5 +256,11 @@ mod tests {
     fn test_der_length_invalid() {
         assert_eq!(read_der_length(&[]), None);
         assert_eq!(read_der_length(&[0x80]), None);
+    }
+
+    #[test]
+    fn test_der_length_rejects_non_canonical() {
+        assert_eq!(read_der_length(&[0x81, 0x05]), None);
+        assert_eq!(read_der_length(&[0x82, 0x00, 0x80]), None);
     }
 }

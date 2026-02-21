@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use std::sync::Once;
+
 use keep_frost_net::{
     install_default_crypto_provider, verify_relay_certificate, CertificatePinSet, FrostNetError,
     SpkiHash,
@@ -13,11 +15,14 @@ use keep_frost_net::{
 const TEST_RELAY: &str = "wss://relay.damus.io";
 const TEST_HOSTNAME: &str = "relay.damus.io";
 
+static SETUP: Once = Once::new();
+
 fn setup() {
-    install_default_crypto_provider();
+    SETUP.call_once(install_default_crypto_provider);
 }
 
 async fn fetch_pin() -> SpkiHash {
+    setup();
     let pins = CertificatePinSet::new();
     let (hash, _) = verify_relay_certificate(TEST_RELAY, &pins)
         .await
@@ -93,7 +98,7 @@ async fn test_mismatch_detection() {
             actual,
         } => {
             assert_eq!(hostname, TEST_HOSTNAME);
-            assert_eq!(expected, &hex::encode(wrong_hash));
+            assert_eq!(expected, "***");
             assert_eq!(actual, &hex::encode(actual_hash));
         }
         other => panic!("expected CertificatePinMismatch, got: {other}"),
