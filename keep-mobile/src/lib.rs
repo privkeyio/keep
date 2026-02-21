@@ -933,13 +933,16 @@ impl KeepMobile {
             let verified_relays: Vec<String> = relays
                 .iter()
                 .filter(|r| {
-                    let hostname = url::Url::parse(r)
-                        .ok()
-                        .and_then(|u| u.host_str().map(|s| s.to_string()));
-                    match hostname {
-                        Some(h) => pins.get_pin(&h).is_some(),
-                        None => false,
+                    let url = match url::Url::parse(r) {
+                        Ok(u) => u,
+                        Err(_) => return false,
+                    };
+                    if url.scheme() != "wss" {
+                        return true;
                     }
+                    url.host_str()
+                        .map(|h| pins.get_pin(h).is_some())
+                        .unwrap_or(false)
                 })
                 .cloned()
                 .collect();

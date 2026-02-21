@@ -79,7 +79,7 @@ fn test_cert_pins_file_display() {
 }
 
 #[test]
-fn test_inject_bad_pin() {
+fn test_pin_replacement_via_json_mutation() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let mut pins = CertificatePinSet::new();
@@ -95,6 +95,55 @@ fn test_inject_bad_pin() {
 
     let loaded = load_cert_pins(dir.path());
     assert_eq!(loaded.get_pin("relay.damus.io"), Some(&[0xFFu8; 32]));
+}
+
+#[test]
+fn test_load_corrupt_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cert-pins.json");
+    std::fs::write(&path, "not valid json {{{").expect("write");
+
+    let loaded = load_cert_pins(dir.path());
+    assert!(loaded.is_empty());
+}
+
+#[test]
+fn test_load_invalid_hex_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cert-pins.json");
+
+    let valid_hex = hex::encode([0x42u8; 32]);
+    let mut map = HashMap::new();
+    map.insert("bad-hex.example.com", "not-hex");
+    map.insert("wrong-len.example.com", "aabb");
+    map.insert("valid.example.com", valid_hex.as_str());
+    let json = serde_json::to_string_pretty(&map).expect("serialize");
+    std::fs::write(&path, &json).expect("write");
+
+    let loaded = load_cert_pins(dir.path());
+    assert_eq!(loaded.pins().len(), 1);
+    assert_eq!(loaded.get_pin("valid.example.com"), Some(&[0x42u8; 32]));
+    assert!(loaded.get_pin("bad-hex.example.com").is_none());
+    assert!(loaded.get_pin("wrong-len.example.com").is_none());
+}
+
+#[test]
+fn test_json_mutation_with_invalid_hex() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut pins = CertificatePinSet::new();
+    pins.add_pin("relay.damus.io".into(), [0x42; 32]);
+    save_cert_pins(dir.path(), &pins);
+
+    let path = dir.path().join("cert-pins.json");
+    let contents = std::fs::read_to_string(&path).expect("read");
+    let mut map: HashMap<String, String> = serde_json::from_str(&contents).expect("parse");
+    map.insert("relay.damus.io".into(), "not-hex".into());
+    let json = serde_json::to_string_pretty(&map).expect("serialize");
+    std::fs::write(&path, &json).expect("write");
+
+    let loaded = load_cert_pins(dir.path());
+    assert!(loaded.get_pin("relay.damus.io").is_none());
 }
 
 #[test]

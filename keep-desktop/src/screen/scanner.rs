@@ -312,10 +312,7 @@ mod tests {
     fn test_single_ncryptsec_recognized() {
         let mut s = ScannerScreen::new();
         let ncryptsec = "ncryptsec1qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-        assert_eq!(
-            s.process_qr_content(ncryptsec),
-            Some(ncryptsec.to_string())
-        );
+        assert_eq!(s.process_qr_content(ncryptsec), Some(ncryptsec.to_string()));
     }
 
     #[test]

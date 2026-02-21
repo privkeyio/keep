@@ -4,7 +4,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-
 use std::sync::Once;
 
 use keep_frost_net::{
@@ -28,6 +27,23 @@ async fn fetch_pin() -> SpkiHash {
         .await
         .expect("should connect");
     hash
+}
+
+fn roundtrip_pins(original: &CertificatePinSet) -> CertificatePinSet {
+    let map: HashMap<String, String> = original
+        .pins()
+        .iter()
+        .map(|(k, v)| (k.clone(), hex::encode(v)))
+        .collect();
+    let json = serde_json::to_string(&map).expect("serialize");
+    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
+    let mut restored = CertificatePinSet::new();
+    for (hostname, hex_hash) in deserialized {
+        let bytes = hex::decode(&hex_hash).expect("hex decode");
+        let h: [u8; 32] = bytes.try_into().expect("32 bytes");
+        restored.add_pin(hostname, h);
+    }
+    restored
 }
 
 #[tokio::test]
@@ -54,20 +70,7 @@ async fn test_pin_persistence_reconnect() {
     let mut pins = CertificatePinSet::new();
     pins.add_pin(TEST_HOSTNAME.into(), hash);
 
-    let serialized: HashMap<String, String> = pins
-        .pins()
-        .iter()
-        .map(|(k, v)| (k.clone(), hex::encode(v)))
-        .collect();
-    let json = serde_json::to_string(&serialized).expect("serialize");
-
-    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
-    let mut restored_pins = CertificatePinSet::new();
-    for (hostname, hex_hash) in deserialized {
-        let bytes = hex::decode(&hex_hash).expect("hex decode");
-        let h: [u8; 32] = bytes.try_into().expect("32 bytes");
-        restored_pins.add_pin(hostname, h);
-    }
+    let restored_pins = roundtrip_pins(&pins);
 
     let (verified_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &restored_pins)
         .await
@@ -125,10 +128,8 @@ async fn test_clear_and_repin() {
     assert_eq!(hostname, TEST_HOSTNAME);
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_pin_set_empty_all() {
-    setup();
+#[test]
+fn test_pin_set_empty_all() {
     let mut pins = CertificatePinSet::new();
     pins.add_pin("relay1.example.com".into(), [0x11; 32]);
     pins.add_pin("relay2.example.com".into(), [0x22; 32]);
@@ -151,22 +152,8 @@ async fn test_lock_unlock_cycle() {
     let mut pins = CertificatePinSet::new();
     pins.add_pin(TEST_HOSTNAME.into(), hash);
 
-    let serialized: HashMap<String, String> = pins
-        .pins()
-        .iter()
-        .map(|(k, v)| (k.clone(), hex::encode(v)))
-        .collect();
-    let json = serde_json::to_string(&serialized).expect("serialize");
-
+    let restored = roundtrip_pins(&pins);
     drop(pins);
-
-    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
-    let mut restored = CertificatePinSet::new();
-    for (hostname, hex_hash) in deserialized {
-        let bytes = hex::decode(&hex_hash).expect("hex decode");
-        let h: [u8; 32] = bytes.try_into().expect("32 bytes");
-        restored.add_pin(hostname, h);
-    }
 
     let (verified, new_pin) = verify_relay_certificate(TEST_RELAY, &restored)
         .await
