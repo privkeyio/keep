@@ -26,7 +26,7 @@ x509-cert = { version = "0.2", features = ["pem", "builder"] }
 const-oid = "0.9"
 k256 = { version = "0.13.4", features = ["schnorr"] }
 signature = "2.2"
-getrandom = "0.2"
+getrandom = "0.4"
 aes-gcm = "0.10.3"
 base64 = "0.22"
 redb.workspace = true

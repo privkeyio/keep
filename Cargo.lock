@@ -4124,7 +4124,7 @@ name = "keep-bitcoin"
 version = "0.1.4"
 dependencies = [
  "bitcoin",
- "getrandom 0.2.17",
+ "getrandom 0.4.1",
  "hex",
  "keep-core",
  "serde",
@@ -4269,7 +4269,7 @@ dependencies = [
  "ciborium",
  "const-oid",
  "der",
- "getrandom 0.2.17",
+ "getrandom 0.4.1",
  "hex",
  "k256",
  "keep-core",
