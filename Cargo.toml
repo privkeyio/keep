@@ -83,7 +83,7 @@ redb = "2.6.3"
 
 # Misc
 bitflags = "2.4"
-ctrlc = "3.4"
+ctrlc = "3.5"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 
