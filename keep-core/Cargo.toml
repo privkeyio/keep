@@ -21,7 +21,7 @@ sha2 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
-rand = "0.9"
+rand = "0.10"
 frost-secp256k1-tr = "2.2.0"
 
 scrypt = "0.11"
