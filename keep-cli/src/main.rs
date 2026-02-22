@@ -60,6 +60,7 @@ fn init_logging() {
 fn main() {
     init_logging();
     panic::install();
+    keep_frost_net::install_default_crypto_provider();
 
     ctrlc::set_handler(|| {
         let _ = crossterm::terminal::disable_raw_mode();
