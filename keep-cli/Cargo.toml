@@ -48,7 +48,7 @@ fs2 = "0.4"
 shellexpand = "3.1"
 
 bitflags = { version = "2.4", features = ["serde"] }
-ctrlc = { version = "3.4", features = ["termination"] }
+ctrlc = { version = "3.5", features = ["termination"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
