@@ -70,8 +70,8 @@ indicatif = "0.17"
 console = "0.15"
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # URL handling
 urlencoding = "2.1"
@@ -83,9 +83,9 @@ redb = "2.6.3"
 
 # Misc
 bitflags = "2.4"
-ctrlc = "3.4"
+ctrlc = "3.5"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5.0"
+dirs = "6.0"
 
 # Logging
 tracing = "0.1"

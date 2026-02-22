@@ -16,7 +16,7 @@ keep-frost-net = { path = "../keep-frost-net", default-features = false }
 keep-nip46 = { path = "../keep-nip46" }
 bitcoin = { version = "0.32", features = ["serde", "base64"] }
 frost-secp256k1-tr = { version = "2.1", default-features = false }
-uniffi = { version = "0.28", features = ["cli"] }
+uniffi = { version = "0.31", features = ["cli"] }
 thiserror = "1.0"
 tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time"] }
 hex = "0.4"
@@ -38,7 +38,7 @@ nostr-sdk = { version = "0.44", default-features = false }
 tracing-android = "0.2"
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.31", features = ["build"] }
 
 [[bin]]
 name = "uniffi-bindgen"
