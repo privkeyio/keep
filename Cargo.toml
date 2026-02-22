@@ -70,7 +70,7 @@ indicatif = "0.17"
 console = "0.15"
 
 # TUI
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # URL handling
