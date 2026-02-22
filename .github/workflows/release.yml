@@ -17,7 +17,7 @@ jobs:
         run: docker build -f Dockerfile.reproducible -o type=local,dest=./dist .
       - name: Rename binary
         run: mv dist/keep keep-linux-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: linux
           path: keep-linux-x86_64
@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: mv target/release/keep keep-macos-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: macos
           path: keep-macos-x86_64
@@ -49,7 +49,7 @@ jobs:
           key: macos-arm
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: mv target/aarch64-apple-darwin/release/keep keep-macos-aarch64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: macos-arm
           path: keep-macos-aarch64
@@ -62,7 +62,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: mv target/release/keep.exe keep-windows-x86_64.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows
           path: keep-windows-x86_64.exe
