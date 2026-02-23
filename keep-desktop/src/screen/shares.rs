@@ -85,7 +85,7 @@ impl ShareListScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let title = theme::heading("FROST Shares");
 
         let mut content = column![title].spacing(theme::space::MD);

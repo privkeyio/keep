@@ -501,7 +501,7 @@ impl KfpNode {
 
             let our_index = self.share.metadata.identifier;
             let own_xpub_tampered = match session.contributions().get(&our_index) {
-                Some(our_stored) => payload.contributions.get(&our_index).map_or(true, |fwd| {
+                Some(our_stored) => payload.contributions.get(&our_index).is_none_or(|fwd| {
                     fwd.account_xpub != our_stored.account_xpub
                         || fwd.fingerprint != our_stored.fingerprint
                 }),

@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::rand::seq::IndexedRandom;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
-use rand_09::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
@@ -410,7 +410,7 @@ impl KfpNode {
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
-                .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
                 .collect();
 
             if eligible_peers.len() + 1 < threshold {
@@ -421,7 +421,7 @@ impl KfpNode {
             }
 
             eligible_peers
-                .choose_multiple(&mut rand_09::rng(), threshold - 1)
+                .sample(&mut ::rand::rng(), threshold - 1)
                 .copied()
                 .cloned()
                 .collect()

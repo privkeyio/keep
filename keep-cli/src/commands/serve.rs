@@ -260,8 +260,13 @@ pub fn cmd_serve(
 
             let mut server =
                 if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
-                    match Server::new_frost(frost, transport_key, &[relay_clone.clone()], callbacks)
-                        .await
+                    match Server::new_frost(
+                        frost,
+                        transport_key,
+                        std::slice::from_ref(&relay_clone),
+                        callbacks,
+                    )
+                    .await
                     {
                         Ok(s) => s,
                         Err(e) => {
@@ -273,7 +278,13 @@ pub fn cmd_serve(
                         }
                     }
                 } else {
-                    match Server::new(keyring_for_tui, &[relay_clone.clone()], callbacks).await {
+                    match Server::new(
+                        keyring_for_tui,
+                        std::slice::from_ref(&relay_clone),
+                        callbacks,
+                    )
+                    .await
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tui_tx_clone.send(TuiEvent::Log(
@@ -323,15 +334,17 @@ fn spawn_tui_server(
                 tx: tui_tx_clone.clone(),
             }));
 
-            let mut server = match Server::new(keyring, &[relay_clone.clone()], callbacks).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx_clone.send(TuiEvent::Log(
-                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
-                    ));
-                    return;
-                }
-            };
+            let mut server =
+                match Server::new(keyring, std::slice::from_ref(&relay_clone), callbacks).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tui_tx_clone.send(TuiEvent::Log(
+                            LogEntry::new("system", "server error", false)
+                                .with_detail(&e.to_string()),
+                        ));
+                        return;
+                    }
+                };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(TuiEvent::Log(

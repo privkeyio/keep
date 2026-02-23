@@ -35,7 +35,7 @@ impl UnlockScreen {
         s
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let title = text(if self.vault_exists {
             "Unlock Keep"
         } else {

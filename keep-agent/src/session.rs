@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use chrono::{DateTime, Duration, Utc};
-use rand::{rngs::OsRng, TryRngCore};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -49,7 +49,7 @@ pub struct SessionToken(String);
 impl SessionToken {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        OsRng.try_fill_bytes(&mut bytes).expect("OS RNG failed");
+        rand::rng().fill_bytes(&mut bytes);
         Self(format!("keep_sess_{}", hex::encode(bytes)))
     }
 

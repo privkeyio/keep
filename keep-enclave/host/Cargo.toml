@@ -1,8 +1,8 @@
 [package]
 name = "keep-enclave-host"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.89"
 description = "Host-side enclave client for Keep"
 license = "AGPL-3.0-or-later"
 
@@ -26,11 +26,11 @@ x509-cert = { version = "0.2", features = ["pem", "builder"] }
 const-oid = "0.9"
 k256 = { version = "0.13.4", features = ["schnorr"] }
 signature = "2.2"
-getrandom = "0.2"
+getrandom = "0.4"
 aes-gcm = "0.10.3"
 base64 = "0.22"
 redb.workspace = true
-rand_core = "0.6"
+rand_core = "0.9"
 der = { version = "0.7", features = ["alloc"] }
 
 [dev-dependencies]

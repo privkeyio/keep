@@ -3,7 +3,7 @@
 #![allow(unsafe_code)]
 
 use blake2::{Blake2b512, Digest};
-use rand::RngCore;
+use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 

@@ -20,9 +20,9 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/privkeyio/keep"
 
@@ -39,7 +39,7 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
-rand = "0.9"
+rand = "0.10"
 frost-secp256k1-tr = "2.2"
 
 # Bitcoin
@@ -78,7 +78,7 @@ urlencoding = "2.1"
 url = "2.5"
 
 # Storage
-redb = "2.6.3"
+redb = "3"
 
 
 # Misc

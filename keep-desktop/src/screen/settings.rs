@@ -73,7 +73,7 @@ impl SettingsScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let title = theme::heading("Settings");
 
         let kill_switch_card = self.kill_switch_card();
@@ -103,7 +103,7 @@ impl SettingsScreen {
             .into()
     }
 
-    fn kill_switch_card(&self) -> Element<Message> {
+    fn kill_switch_card(&self) -> Element<'_, Message> {
         if self.kill_switch_active {
             let password_input = text_input("Vault password", &self.kill_switch_password)
                 .on_input(|s| Message::KillSwitchPasswordChanged(Zeroizing::new(s)))
@@ -201,7 +201,7 @@ impl SettingsScreen {
         }
     }
 
-    fn auto_lock_card(&self) -> Element<Message> {
+    fn auto_lock_card(&self) -> Element<'_, Message> {
         let options: Vec<(u64, &str)> = vec![
             (60, "1 min"),
             (300, "5 min"),
@@ -242,7 +242,7 @@ impl SettingsScreen {
         .into()
     }
 
-    fn clipboard_card(&self) -> Element<Message> {
+    fn clipboard_card(&self) -> Element<'_, Message> {
         let options: Vec<(u64, &str)> = vec![(10, "10s"), (30, "30s"), (60, "60s"), (0, "Never")];
 
         let buttons =
@@ -277,7 +277,7 @@ impl SettingsScreen {
         .into()
     }
 
-    fn tray_card(&self) -> Element<Message> {
+    fn tray_card(&self) -> Element<'_, Message> {
         let minimize_btn = toggle_button(
             self.minimize_to_tray,
             Message::SettingsMinimizeToTrayToggled(!self.minimize_to_tray),
@@ -305,7 +305,7 @@ impl SettingsScreen {
         .into()
     }
 
-    fn proxy_card(&self) -> Element<Message> {
+    fn proxy_card(&self) -> Element<'_, Message> {
         let port_input = text_input("9050", &self.proxy_port_input)
             .on_input(Message::SettingsProxyPortChanged)
             .size(theme::size::BODY)
@@ -351,7 +351,7 @@ impl SettingsScreen {
             .into()
     }
 
-    fn cert_pins_card(&self) -> Element<Message> {
+    fn cert_pins_card(&self) -> Element<'_, Message> {
         let mut col = column![
             theme::label("TLS certificate pinning"),
             theme::muted("Pins are set on first connection to each relay (TOFU)"),
@@ -428,7 +428,7 @@ impl SettingsScreen {
             .into()
     }
 
-    fn info_card(&self) -> Element<Message> {
+    fn info_card(&self) -> Element<'_, Message> {
         container(
             column![
                 column![theme::label("Vault"), theme::muted(&self.vault_path),]

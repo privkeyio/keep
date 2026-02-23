@@ -53,7 +53,7 @@ impl ImportScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)

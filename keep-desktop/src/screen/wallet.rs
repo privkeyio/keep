@@ -101,7 +101,7 @@ impl WalletScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         if let Some(setup) = &self.setup {
             return self.view_setup(setup);
         }

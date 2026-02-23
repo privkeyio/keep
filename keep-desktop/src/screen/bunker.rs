@@ -149,7 +149,7 @@ impl BunkerScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let title = theme::heading("Nostr Connect");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -181,7 +181,7 @@ impl BunkerScreen {
             .into()
     }
 
-    fn status_card(&self) -> Element<Message> {
+    fn status_card(&self) -> Element<'_, Message> {
         let status_text = if self.starting {
             "Starting..."
         } else if self.running {
@@ -295,7 +295,7 @@ impl BunkerScreen {
         .into()
     }
 
-    fn relay_card(&self) -> Element<Message> {
+    fn relay_card(&self) -> Element<'_, Message> {
         let mut relay_list = column![].spacing(theme::space::XS);
         for (i, relay) in self.relays.iter().enumerate() {
             let mut remove_btn = button(text("x").size(theme::size::SMALL))
@@ -359,7 +359,7 @@ impl BunkerScreen {
             .into()
     }
 
-    fn clients_card(&self) -> Element<Message> {
+    fn clients_card(&self) -> Element<'_, Message> {
         let mut client_list = column![].spacing(theme::space::SM);
         for (i, client) in self.clients.iter().enumerate() {
             let is_expanded = self.expanded_client == Some(i);
@@ -527,7 +527,7 @@ impl BunkerScreen {
         .into()
     }
 
-    fn approval_card(&self, approval: &PendingApprovalDisplay) -> Element<Message> {
+    fn approval_card(&self, approval: &PendingApprovalDisplay) -> Element<'_, Message> {
         let mut details = column![text(format!(
             "{} requests: {}",
             approval.app_name, approval.method
@@ -631,7 +631,7 @@ impl BunkerScreen {
         .into()
     }
 
-    fn log_card(&self) -> Element<Message> {
+    fn log_card(&self) -> Element<'_, Message> {
         let mut entries = column![].spacing(2.0);
         for entry in self.log.iter().rev().take(20) {
             let icon = if entry.success { "+" } else { "x" };

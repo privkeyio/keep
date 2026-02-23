@@ -41,7 +41,7 @@ impl RelayScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let title_row = row![
             theme::heading("FROST Relay"),
             Space::new().width(Length::Fill),
@@ -80,7 +80,7 @@ impl RelayScreen {
             .into()
     }
 
-    fn status_badge(&self) -> Element<Message> {
+    fn status_badge(&self) -> Element<'_, Message> {
         let (label, color) = match &self.status {
             ConnectionStatus::Disconnected => ("Disconnected", theme::color::TEXT_DIM),
             ConnectionStatus::Connecting => ("Connecting...", theme::color::WARNING),
@@ -109,7 +109,7 @@ impl RelayScreen {
         )
     }
 
-    fn share_selector(&self) -> Element<Message> {
+    fn share_selector(&self) -> Element<'_, Message> {
         let mut share_buttons = row![].spacing(theme::space::SM);
         for (i, share) in self.shares.iter().enumerate() {
             let is_selected = self.selected_share == Some(i);
@@ -138,7 +138,7 @@ impl RelayScreen {
             .into()
     }
 
-    fn relay_config(&self) -> Element<Message> {
+    fn relay_config(&self) -> Element<'_, Message> {
         let active = self.is_active();
 
         let mut relay_list = column![].spacing(theme::space::XS);
@@ -187,7 +187,7 @@ impl RelayScreen {
             .into()
     }
 
-    fn connect_form(&self) -> Element<Message> {
+    fn connect_form(&self) -> Element<'_, Message> {
         let can_connect = self.selected_share.is_some()
             && !self.relay_urls.is_empty()
             && !self.connect_password.is_empty();
@@ -213,7 +213,7 @@ impl RelayScreen {
         .into()
     }
 
-    fn connection_controls(&self) -> Element<Message> {
+    fn connection_controls(&self) -> Element<'_, Message> {
         match &self.status {
             ConnectionStatus::Disconnected => self.connect_form(),
             ConnectionStatus::Connecting => theme::muted("Connecting to relay...").into(),
@@ -233,7 +233,7 @@ impl RelayScreen {
         }
     }
 
-    fn peers_section(&self) -> Element<Message> {
+    fn peers_section(&self) -> Element<'_, Message> {
         let online_count = self.peers.iter().filter(|p| p.online).count();
 
         let mut peer_list = column![].spacing(theme::space::XS);
@@ -277,7 +277,7 @@ impl RelayScreen {
             .into()
     }
 
-    fn signing_requests_section(&self) -> Element<Message> {
+    fn signing_requests_section(&self) -> Element<'_, Message> {
         let mut request_list = column![].spacing(theme::space::SM);
 
         for req in &self.pending_requests {

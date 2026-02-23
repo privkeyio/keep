@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keep_frost_net::{KfpNode, KfpNodeEvent, PeerStatus, SessionInfo, SigningHooks};
-use rand::Rng as _;
+use rand::RngExt as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 

@@ -71,7 +71,7 @@ impl SigningAuditScreen {
         PAGE_SIZE
     }
 
-    pub fn view_content(&self) -> Element<Message> {
+    pub fn view_content(&self) -> Element<'_, Message> {
         let title = theme::heading("Signing History");
         let subtitle = theme::muted("View past signing requests and decisions");
 
@@ -135,7 +135,7 @@ impl SigningAuditScreen {
         inner.into()
     }
 
-    fn chain_status_row(&self) -> Element<Message> {
+    fn chain_status_row(&self) -> Element<'_, Message> {
         let (status_text, color) = match &self.chain_status {
             ChainStatus::Verifying => ("Verifying chain...".to_string(), theme::color::TEXT_MUTED),
             ChainStatus::Valid(count) => (
@@ -157,7 +157,7 @@ impl SigningAuditScreen {
             .into()
     }
 
-    fn filter_row(&self) -> Element<Message> {
+    fn filter_row(&self) -> Element<'_, Message> {
         let all_option = CallerOption {
             full: None,
             display: "All clients".to_string(),

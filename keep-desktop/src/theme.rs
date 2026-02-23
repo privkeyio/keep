@@ -195,23 +195,23 @@ pub fn text_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-pub fn heading(s: &str) -> text::Text {
+pub fn heading(s: &str) -> text::Text<'_> {
     text(s).size(size::HEADING).color(color::TEXT)
 }
 
-pub fn label(s: &str) -> text::Text {
+pub fn label(s: &str) -> text::Text<'_> {
     text(s).size(size::BODY).color(color::TEXT)
 }
 
-pub fn muted(s: &str) -> text::Text {
+pub fn muted(s: &str) -> text::Text<'_> {
     text(s).size(size::SMALL).color(color::TEXT_MUTED)
 }
 
-pub fn error_text(s: &str) -> text::Text {
+pub fn error_text(s: &str) -> text::Text<'_> {
     text(s).size(size::BODY).color(color::ERROR)
 }
 
-pub fn success_text(s: &str) -> text::Text {
+pub fn success_text(s: &str) -> text::Text<'_> {
     text(s).size(size::BODY).color(color::SUCCESS)
 }
 
