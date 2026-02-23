@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 pub const KFP_EVENT_KIND: u16 = 24242;
 pub const KFP_VERSION: u8 = 1;
@@ -36,7 +36,7 @@ fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     created_at >= min_valid && created_at <= max_valid
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KfpMessage {
     Announce(AnnouncePayload),
@@ -674,12 +674,12 @@ impl EcdhSharePayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize)]
 pub struct EcdhCompletePayload {
     #[serde(with = "hex_bytes")]
     pub session_id: [u8; 32],
-    #[serde(with = "hex_vec")]
-    pub shared_secret: Vec<u8>,
+    #[serde(with = "hex_vec_zeroizing")]
+    pub shared_secret: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for EcdhCompletePayload {
@@ -691,17 +691,11 @@ impl std::fmt::Debug for EcdhCompletePayload {
     }
 }
 
-impl Drop for EcdhCompletePayload {
-    fn drop(&mut self) {
-        self.shared_secret.zeroize();
-    }
-}
-
 impl EcdhCompletePayload {
     pub fn new(session_id: [u8; 32], shared_secret: [u8; 32]) -> Self {
         Self {
             session_id,
-            shared_secret: shared_secret.to_vec(),
+            shared_secret: Zeroizing::new(shared_secret.to_vec()),
         }
     }
 }
@@ -1095,6 +1089,28 @@ mod hex_vec {
     {
         let s = String::deserialize(deserializer)?;
         hex::decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod hex_vec_zeroizing {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S>(bytes: &Zeroizing<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes.as_slice()))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        hex::decode(&s)
+            .map(Zeroizing::new)
+            .map_err(serde::de::Error::custom)
     }
 }
 

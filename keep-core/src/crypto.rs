@@ -208,7 +208,7 @@ mod mlock {
                 if self.locked {
                     memsec::munlock(self.ptr.as_ptr(), self.capacity);
                 }
-                let _ = Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.capacity);
+                let _ = Vec::from_raw_parts(self.ptr.as_ptr(), 0, self.capacity);
             }
         }
     }
@@ -487,16 +487,17 @@ pub mod nip44 {
     use sha2::Sha256;
 
     use super::{entropy, CryptoError, Result};
+    use zeroize::Zeroizing;
 
     const NIP44_SALT: &[u8] = b"nip44-v2";
     #[allow(dead_code)]
     const MIN_PLAINTEXT_SIZE: usize = 1;
     const MAX_PLAINTEXT_SIZE: usize = 65535;
 
-    fn derive_conversation_key(shared_secret: &[u8; 32]) -> Result<[u8; 32]> {
+    fn derive_conversation_key(shared_secret: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
         let hk = Hkdf::<Sha256>::new(Some(NIP44_SALT), shared_secret);
-        let mut key = [0u8; 32];
-        hk.expand(b"", &mut key)
+        let mut key = Zeroizing::new([0u8; 32]);
+        hk.expand(b"", key.as_mut())
             .map_err(|_| CryptoError::kdf("NIP-44 conversation key derivation failed"))?;
         Ok(key)
     }
@@ -504,15 +505,15 @@ pub mod nip44 {
     fn derive_message_keys(
         conversation_key: &[u8; 32],
         nonce: &[u8; 32],
-    ) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+    ) -> Result<(Zeroizing<[u8; 32]>, [u8; 32], Zeroizing<[u8; 32]>)> {
         let hk = Hkdf::<Sha256>::new(Some(nonce), conversation_key);
-        let mut keys = [0u8; 96];
-        hk.expand(b"nip44-v2", &mut keys)
+        let mut keys = Zeroizing::new([0u8; 96]);
+        hk.expand(b"nip44-v2", keys.as_mut())
             .map_err(|_| CryptoError::kdf("NIP-44 message key derivation failed"))?;
 
-        let mut chacha_key = [0u8; 32];
+        let mut chacha_key = Zeroizing::new([0u8; 32]);
         let mut chacha_nonce = [0u8; 32];
-        let mut hmac_key = [0u8; 32];
+        let mut hmac_key = Zeroizing::new([0u8; 32]);
         chacha_key.copy_from_slice(&keys[0..32]);
         chacha_nonce.copy_from_slice(&keys[32..64]);
         hmac_key.copy_from_slice(&keys[64..96]);
@@ -573,7 +574,7 @@ pub mod nip44 {
         );
         cipher.apply_keystream(&mut ciphertext);
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(hmac_key.as_ref())
             .map_err(|_| CryptoError::encryption("Failed to create HMAC"))?;
         mac.update(&nonce);
         mac.update(&ciphertext);
@@ -614,7 +615,7 @@ pub mod nip44 {
         let conversation_key = derive_conversation_key(shared_secret)?;
         let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(hmac_key.as_ref())
             .map_err(|_| CryptoError::decryption("Failed to create HMAC"))?;
         mac.update(&nonce);
         mac.update(ciphertext);

@@ -3,8 +3,6 @@
 
 //! FROST share types and encrypted storage.
 
-#![allow(unused_assignments)]
-
 use frost_secp256k1_tr::{
     keys::{KeyPackage, PublicKeyPackage},
     Identifier,

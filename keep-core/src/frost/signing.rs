@@ -3,8 +3,6 @@
 
 //! FROST signing session management.
 
-#![allow(unused_assignments)]
-
 use std::collections::BTreeMap;
 
 use frost::{

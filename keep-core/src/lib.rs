@@ -65,7 +65,7 @@ pub mod wallet;
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::audit::{
     AuditEntry, AuditEventType, AuditLog, RetentionPolicy, SigningAuditEntry, SigningAuditLog,
@@ -443,7 +443,7 @@ impl Keep {
             .get_by_name(key_name)
             .ok_or_else(|| KeepError::KeyNotFound(key_name.to_string()))?;
 
-        let secret = *slot.expose_secret();
+        let secret = Zeroizing::new(*slot.expose_secret());
 
         let config = ThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
@@ -839,14 +839,12 @@ impl Keep {
             let encrypted = crypto::EncryptedData::from_bytes(&record.encrypted_secret)?;
             let secret_bytes = crypto::decrypt(&encrypted, &data_key)?;
 
-            let mut secret = [0u8; 32];
+            let mut secret = Zeroizing::new([0u8; 32]);
             let decrypted = secret_bytes.as_slice()?;
             secret.copy_from_slice(&decrypted);
 
             self.keyring
-                .load_key(record.pubkey, secret, record.key_type, record.name)?;
-
-            secret.zeroize();
+                .load_key(record.pubkey, *secret, record.key_type, record.name)?;
         }
 
         Ok(())

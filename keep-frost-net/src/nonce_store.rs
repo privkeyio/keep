@@ -88,6 +88,16 @@ impl NonceStore for FileNonceStore {
             return Ok(());
         }
 
+        let lock_path = self.path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| FrostNetError::Session(format!("Failed to open nonce lock: {e}")))?;
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
+
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -99,9 +109,6 @@ impl NonceStore for FileNonceStore {
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
-        file.lock_exclusive()
-            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
-
         let hex_id = hex::encode(session_id);
         let write_result = writeln!(file, "{hex_id}");
         let sync_result = if write_result.is_ok() {
@@ -110,8 +117,7 @@ impl NonceStore for FileNonceStore {
             Ok(())
         };
 
-        FileExt::unlock(&file)
-            .map_err(|e| FrostNetError::Session(format!("Failed to unlock nonce store: {e}")))?;
+        let _ = FileExt::unlock(&lock_file);
 
         write_result
             .map_err(|e| FrostNetError::Session(format!("Failed to write to nonce store: {e}")))?;

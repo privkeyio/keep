@@ -161,19 +161,25 @@ impl KfpNode {
     ) -> Result<()> {
         {
             let ecdh_sessions = self.ecdh_sessions.read();
-            if let Some(session) = ecdh_sessions.get_session(&payload.session_id) {
-                let peers = self.peers.read();
-                let is_participant = session.participants().iter().any(|&idx| {
-                    peers
-                        .get_peer(idx)
-                        .map(|p| p.pubkey == from)
-                        .unwrap_or(false)
-                });
-                if !is_participant {
-                    return Err(FrostNetError::UntrustedPeer(
-                        "Sender not an ECDH session participant".into(),
-                    ));
-                }
+            let session = ecdh_sessions
+                .get_session(&payload.session_id)
+                .ok_or_else(|| {
+                    FrostNetError::Session(format!(
+                        "No ECDH session found for {}",
+                        hex::encode(payload.session_id)
+                    ))
+                })?;
+            let peers = self.peers.read();
+            let is_participant = session.participants().iter().any(|&idx| {
+                peers
+                    .get_peer(idx)
+                    .map(|p| p.pubkey == from)
+                    .unwrap_or(false)
+            });
+            if !is_participant {
+                return Err(FrostNetError::UntrustedPeer(
+                    "Sender not an ECDH session participant".into(),
+                ));
             }
         }
 
