@@ -112,8 +112,7 @@ impl MockEnclaveClient {
         }
 
         let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret)
-            .map_err(|e| format!("Mock ephemeral key RNG failed: {e}"))?;
+        getrandom::fill(&mut secret).map_err(|e| format!("Mock ephemeral key RNG failed: {e}"))?;
         drop(rtxn);
 
         let wtxn = db.begin_write().unwrap();
