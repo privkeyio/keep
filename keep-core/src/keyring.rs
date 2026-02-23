@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use secrecy::{ExposeSecret, SecretBox};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{KeepError, Result};
 use crate::keys::{KeyType, NostrKeypair};
@@ -45,10 +45,8 @@ impl KeySlot {
 
     /// Convert this slot to a NostrKeypair.
     pub fn to_nostr_keypair(&self) -> Result<NostrKeypair> {
-        let mut secret_copy = *self.secret.expose_secret();
-        let result = NostrKeypair::from_secret_bytes(&mut secret_copy);
-        secret_copy.zeroize();
-        result
+        let mut secret_copy = Zeroizing::new(*self.secret.expose_secret());
+        NostrKeypair::from_secret_bytes(&mut secret_copy)
     }
 }
 

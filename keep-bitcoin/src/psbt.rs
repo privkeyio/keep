@@ -28,7 +28,7 @@ pub struct OutputInfo {
 }
 
 // NOTE: `Keypair` (from secp256k1) does not implement `Zeroize` and cannot be reliably
-// zeroed. Transient `Keypair` values created during `sign()` may leave stack residue.
+// zeroed. A single `Keypair` is created per `sign()` call to minimize stack copies.
 // The canonical secret key is held in `MlockedBox` which provides mlock + madvise +
 // zeroize-on-drop, so the authoritative copy is protected at rest.
 pub struct PsbtSigner {
@@ -135,12 +135,14 @@ impl PsbtSigner {
 
         let prevouts_ref = Prevouts::All(&prevouts);
 
+        let keypair = self.keypair()?;
+
         for i in 0..psbt.inputs.len() {
             if !self.should_sign_input(psbt, i)? {
                 continue;
             }
 
-            self.sign_taproot_keypath(psbt, i, &prevouts_ref)?;
+            self.sign_taproot_keypath(psbt, i, &prevouts_ref, &keypair)?;
             signed_count += 1;
         }
 
@@ -177,6 +179,7 @@ impl PsbtSigner {
         psbt: &mut Psbt,
         index: usize,
         prevouts: &Prevouts<TxOut>,
+        keypair: &Keypair,
     ) -> Result<()> {
         let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
 
@@ -187,11 +190,10 @@ impl PsbtSigner {
         let msg = Message::from_digest_slice(sighash.as_ref())
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
-        let keypair = self.keypair()?;
         let aux_rand = crate::aux_rand()?;
         let sig = self
             .secp
-            .sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
+            .sign_schnorr_with_aux_rand(&msg, keypair, &aux_rand);
 
         let taproot_sig = TaprootSignature {
             signature: sig,

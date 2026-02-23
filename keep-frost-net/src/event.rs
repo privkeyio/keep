@@ -259,7 +259,8 @@ impl KfpEventBuilder {
         recipient: &PublicKey,
         payload: EcdhCompletePayload,
     ) -> Result<Event> {
-        let msg = KfpMessage::EcdhComplete(payload.clone());
+        let session_id = payload.session_id;
+        let msg = KfpMessage::EcdhComplete(payload);
         let content = msg.to_json()?;
 
         let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
@@ -267,10 +268,7 @@ impl KfpEventBuilder {
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
             .tag(Tag::public_key(*recipient))
-            .tag(Tag::custom(
-                TagKind::custom("s"),
-                [hex::encode(payload.session_id)],
-            ))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
             .tag(Tag::custom(TagKind::custom("t"), ["ecdh_complete"]))
             .sign_with_keys(keys)
             .map_err(|e| FrostNetError::Nostr(e.to_string()))

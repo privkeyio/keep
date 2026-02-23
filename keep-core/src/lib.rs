@@ -65,7 +65,7 @@ pub mod wallet;
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::audit::{
     AuditEntry, AuditEventType, AuditLog, RetentionPolicy, SigningAuditEntry, SigningAuditLog,
@@ -443,7 +443,7 @@ impl Keep {
             .get_by_name(key_name)
             .ok_or_else(|| KeepError::KeyNotFound(key_name.to_string()))?;
 
-        let secret = *slot.expose_secret();
+        let secret = Zeroizing::new(*slot.expose_secret());
 
         let config = ThresholdConfig::new(threshold, total_shares)?;
         let dealer = TrustedDealer::new(config);
@@ -839,14 +839,12 @@ impl Keep {
             let encrypted = crypto::EncryptedData::from_bytes(&record.encrypted_secret)?;
             let secret_bytes = crypto::decrypt(&encrypted, &data_key)?;
 
-            let mut secret = [0u8; 32];
+            let mut secret = Zeroizing::new([0u8; 32]);
             let decrypted = secret_bytes.as_slice()?;
             secret.copy_from_slice(&decrypted);
 
             self.keyring
-                .load_key(record.pubkey, secret, record.key_type, record.name)?;
-
-            secret.zeroize();
+                .load_key(record.pubkey, *secret, record.key_type, record.name)?;
         }
 
         Ok(())
@@ -1008,12 +1006,21 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Returns the default path to the Keep directory (~/.keep).
 /// Override with the `KEEP_HOME` environment variable.
 pub fn default_keep_path() -> Result<PathBuf> {
-    std::env::var("KEEP_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|p| p.join(".keep")))
-        .ok_or(KeepError::HomeNotFound)
+    match std::env::var("KEEP_HOME") {
+        Ok(val) if !val.trim().is_empty() => {
+            let path = PathBuf::from(&val);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(KeepError::InvalidInput(
+                    "KEEP_HOME must be an absolute path".into(),
+                ))
+            }
+        }
+        _ => dirs::home_dir()
+            .map(|p| p.join(".keep"))
+            .ok_or(KeepError::HomeNotFound),
+    }
 }
 
 fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
@@ -1227,9 +1234,22 @@ mod tests {
 
     #[test]
     fn test_default_keep_path_from_env() {
-        temp_env::with_var("KEEP_HOME", Some("/tmp/my-keep"), || {
+        let abs_path = if cfg!(windows) {
+            "C:\\tmp\\my-keep"
+        } else {
+            "/tmp/my-keep"
+        };
+        temp_env::with_var("KEEP_HOME", Some(abs_path), || {
             let p = default_keep_path().unwrap();
-            assert_eq!(p, PathBuf::from("/tmp/my-keep"));
+            assert_eq!(p, PathBuf::from(abs_path));
+        });
+    }
+
+    #[test]
+    fn test_default_keep_path_relative_env_rejected() {
+        temp_env::with_var("KEEP_HOME", Some("relative/path"), || {
+            let result = default_keep_path();
+            assert!(result.is_err());
         });
     }
 

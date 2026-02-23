@@ -114,30 +114,52 @@ impl RateLimiter {
     }
 
     pub fn check_minute(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.minute_buckets.lock().unwrap();
+        let mut buckets = match self.minute_buckets.lock() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check_minute: minute_buckets mutex poisoned: {e}");
+                return false;
+            }
+        };
         buckets.check(key_id, max)
     }
 
     pub fn check_hour(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.hour_buckets.lock().unwrap();
+        let mut buckets = match self.hour_buckets.lock() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check_hour: hour_buckets mutex poisoned: {e}");
+                return false;
+            }
+        };
         buckets.check(key_id, max)
     }
 
     pub fn check_day(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.day_buckets.lock().unwrap();
+        let mut buckets = match self.day_buckets.lock() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("check_day: day_buckets mutex poisoned: {e}");
+                return false;
+            }
+        };
         buckets.check(key_id, max)
     }
 
-    pub fn record(&self, key_id: &str) {
-        if let Ok(mut buckets) = self.minute_buckets.lock() {
-            buckets.record(key_id, 60);
-        }
-        if let Ok(mut buckets) = self.hour_buckets.lock() {
-            buckets.record(key_id, 600);
-        }
-        if let Ok(mut buckets) = self.day_buckets.lock() {
-            buckets.record(key_id, 5000);
-        }
+    pub fn record(&self, key_id: &str) -> bool {
+        let Ok(mut minute) = self.minute_buckets.lock() else {
+            return false;
+        };
+        let Ok(mut hour) = self.hour_buckets.lock() else {
+            return false;
+        };
+        let Ok(mut day) = self.day_buckets.lock() else {
+            return false;
+        };
+        minute.record(key_id, 60);
+        hour.record(key_id, 600);
+        day.record(key_id, 5000);
+        true
     }
 
     pub fn clear(&self) {

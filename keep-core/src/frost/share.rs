@@ -3,8 +3,6 @@
 
 //! FROST share types and encrypted storage.
 
-#![allow(unused_assignments)]
-
 use frost_secp256k1_tr::{
     keys::{KeyPackage, PublicKeyPackage},
     Identifier,
@@ -159,7 +157,7 @@ impl StoredShare {
 
         Ok(SharePackage {
             metadata: self.metadata.clone(),
-            key_package_bytes,
+            key_package_bytes: key_package_bytes.to_vec(),
             pubkey_package_bytes: self.pubkey_package.clone(),
         })
     }

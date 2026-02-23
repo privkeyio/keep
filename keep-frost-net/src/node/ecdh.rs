@@ -147,7 +147,7 @@ impl KfpNode {
 
             let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
                 session_id: payload.session_id,
-                shared_secret: *secret,
+                shared_secret: Zeroizing::new(*secret),
             });
         }
 
@@ -161,27 +161,35 @@ impl KfpNode {
     ) -> Result<()> {
         {
             let ecdh_sessions = self.ecdh_sessions.read();
-            if let Some(session) = ecdh_sessions.get_session(&payload.session_id) {
-                let peers = self.peers.read();
-                let is_participant = session.participants().iter().any(|&idx| {
-                    peers
-                        .get_peer(idx)
-                        .map(|p| p.pubkey == from)
-                        .unwrap_or(false)
-                });
-                if !is_participant {
-                    return Err(FrostNetError::UntrustedPeer(
-                        "Sender not an ECDH session participant".into(),
-                    ));
-                }
+            let session = ecdh_sessions
+                .get_session(&payload.session_id)
+                .ok_or_else(|| {
+                    FrostNetError::Session(format!(
+                        "No ECDH session found for {}",
+                        hex::encode(payload.session_id)
+                    ))
+                })?;
+            let peers = self.peers.read();
+            let is_participant = session.participants().iter().any(|&idx| {
+                peers
+                    .get_peer(idx)
+                    .map(|p| p.pubkey == from)
+                    .unwrap_or(false)
+            });
+            if !is_participant {
+                return Err(FrostNetError::UntrustedPeer(
+                    "Sender not an ECDH session participant".into(),
+                ));
             }
         }
 
-        let shared_secret: [u8; 32] = payload
-            .shared_secret
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid shared secret length".into()))?;
+        let shared_secret: Zeroizing<[u8; 32]> = Zeroizing::new(
+            payload
+                .shared_secret
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid shared secret length".into()))?,
+        );
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -200,7 +208,7 @@ impl KfpNode {
         Ok(())
     }
 
-    pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<[u8; 32]> {
+    pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>> {
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;

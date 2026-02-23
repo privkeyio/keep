@@ -109,14 +109,16 @@ impl NostrKeypair {
 
     /// Export as a bech32 nsec string.
     pub fn to_nsec(&self) -> String {
-        let hrp = Hrp::parse("nsec").unwrap();
-        bech32::encode::<Bech32>(hrp, &*self.secret_key).unwrap()
+        const NSEC_HRP: Hrp = Hrp::parse_unchecked("nsec");
+        bech32::encode::<Bech32>(NSEC_HRP, &*self.secret_key)
+            .expect("bech32 encode of 32-byte secret with valid HRP is infallible")
     }
 
     /// Export as a bech32 npub string.
     pub fn to_npub(&self) -> String {
-        let hrp = Hrp::parse("npub").unwrap();
-        bech32::encode::<Bech32>(hrp, &self.public_key).unwrap()
+        const NPUB_HRP: Hrp = Hrp::parse_unchecked("npub");
+        bech32::encode::<Bech32>(NPUB_HRP, &self.public_key)
+            .expect("bech32 encode of 32-byte pubkey with valid HRP is infallible")
     }
 
     /// The secret key bytes.
@@ -203,8 +205,11 @@ impl KeyRecord {
     /// The npub string, if this is a Nostr key.
     pub fn npub(&self) -> Option<String> {
         if self.key_type == KeyType::Nostr {
-            let hrp = Hrp::parse("npub").unwrap();
-            Some(bech32::encode::<Bech32>(hrp, &self.pubkey).unwrap())
+            const NPUB_HRP: Hrp = Hrp::parse_unchecked("npub");
+            Some(
+                bech32::encode::<Bech32>(NPUB_HRP, &self.pubkey)
+                    .expect("bech32 encode of 32-byte pubkey with valid HRP is infallible"),
+            )
         } else {
             None
         }
@@ -256,8 +261,9 @@ pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
 /// assert!(npub.starts_with("npub1"));
 /// ```
 pub fn bytes_to_npub(pubkey: &[u8; 32]) -> String {
-    let hrp = Hrp::parse("npub").unwrap();
-    bech32::encode::<Bech32>(hrp, pubkey).unwrap()
+    const NPUB_HRP: Hrp = Hrp::parse_unchecked("npub");
+    bech32::encode::<Bech32>(NPUB_HRP, pubkey)
+        .expect("bech32 encode of 32-byte pubkey with valid HRP is infallible")
 }
 
 /// NIP-49 encrypted private key (ncryptsec) support.
@@ -314,8 +320,8 @@ pub mod nip49 {
         concat.push(key_security_byte);
         concat.extend_from_slice(&ciphertext);
 
-        let hrp = Hrp::parse("ncryptsec").unwrap();
-        bech32::encode::<Bech32>(hrp, &concat)
+        const NCRYPTSEC_HRP: Hrp = Hrp::parse_unchecked("ncryptsec");
+        bech32::encode::<Bech32>(NCRYPTSEC_HRP, &concat)
             .map_err(|_| CryptoError::encryption("bech32 encoding failed").into())
     }
 

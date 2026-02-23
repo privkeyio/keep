@@ -88,6 +88,22 @@ impl NonceStore for FileNonceStore {
             return Ok(());
         }
 
+        let lock_path = self.path.with_extension("lock");
+        let lock_file = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&lock_path)
+                .map_err(|e| FrostNetError::Session(format!("Failed to open nonce lock: {e}")))?
+        };
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
+
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -99,9 +115,6 @@ impl NonceStore for FileNonceStore {
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
 
-        file.lock_exclusive()
-            .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
-
         let hex_id = hex::encode(session_id);
         let write_result = writeln!(file, "{hex_id}");
         let sync_result = if write_result.is_ok() {
@@ -110,8 +123,7 @@ impl NonceStore for FileNonceStore {
             Ok(())
         };
 
-        FileExt::unlock(&file)
-            .map_err(|e| FrostNetError::Session(format!("Failed to unlock nonce store: {e}")))?;
+        let _ = FileExt::unlock(&lock_file);
 
         write_result
             .map_err(|e| FrostNetError::Session(format!("Failed to write to nonce store: {e}")))?;
@@ -161,26 +173,43 @@ fn rewrite_nonce_file<'a>(
     path: &Path,
     entries: impl Iterator<Item = &'a [u8; 32]>,
 ) -> std::result::Result<(), std::io::Error> {
-    let tmp_path = path.with_extension("tmp");
-
-    let mut file = {
+    let lock_path = path.with_extension("lock");
+    let lock_file = {
         let mut opts = OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        opts.create(true).truncate(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        opts.open(&tmp_path)?
+        opts.open(&lock_path)?
     };
+    lock_file.lock_exclusive()?;
 
-    for entry in entries {
-        writeln!(file, "{}", hex::encode(entry))?;
-    }
-    file.sync_all()?;
+    let tmp_path = path.with_extension("tmp");
 
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    let result = (|| {
+        let mut file = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&tmp_path)?
+        };
+
+        for entry in entries {
+            writeln!(file, "{}", hex::encode(entry))?;
+        }
+        file.sync_all()?;
+
+        std::fs::rename(&tmp_path, path)
+    })();
+
+    let _ = FileExt::unlock(&lock_file);
+    result
 }
 
 const DEFAULT_MAX_ENTRIES: usize = 100_000;

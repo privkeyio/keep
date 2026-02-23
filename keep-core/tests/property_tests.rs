@@ -18,7 +18,8 @@ proptest! {
         let key = SecretKey::generate().unwrap();
         let encrypted = encrypt(&plaintext, &key).unwrap();
         let decrypted = decrypt(&encrypted, &key).unwrap();
-        prop_assert_eq!(plaintext, decrypted.as_slice().unwrap());
+        let decrypted_bytes = decrypted.as_slice().unwrap();
+        prop_assert_eq!(&plaintext[..], &decrypted_bytes[..]);
     }
 
     #[test]
