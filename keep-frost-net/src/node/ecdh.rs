@@ -147,7 +147,7 @@ impl KfpNode {
 
             let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
                 session_id: payload.session_id,
-                shared_secret: *secret,
+                shared_secret: Zeroizing::new(*secret),
             });
         }
 
@@ -194,7 +194,7 @@ impl KfpNode {
 
         let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
             session_id: payload.session_id,
-            shared_secret,
+            shared_secret: Zeroizing::new(shared_secret),
         });
 
         Ok(())
@@ -277,7 +277,7 @@ impl KfpNode {
                         shared_secret,
                     }) => {
                         if sid == session_id {
-                            return Ok(shared_secret);
+                            return Ok(*shared_secret);
                         }
                     }
                     Ok(KfpNodeEvent::EcdhFailed {

@@ -1012,6 +1012,7 @@ pub fn default_keep_path() -> Result<PathBuf> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| dirs::home_dir().map(|p| p.join(".keep")))
         .ok_or(KeepError::HomeNotFound)
 }

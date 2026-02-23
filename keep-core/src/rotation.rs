@@ -331,7 +331,7 @@ impl Storage {
             .map(|record| {
                 let encrypted = EncryptedData::from_bytes(&record.encrypted_secret)?;
                 let secret = crypto::decrypt(&encrypted, data_key)?;
-                Ok((record.clone(), Zeroizing::new(secret.as_slice()?.to_vec())))
+                Ok((record.clone(), secret.as_slice()?))
             })
             .collect()
     }
@@ -346,10 +346,7 @@ impl Storage {
             .map(|stored| {
                 let encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
                 let key_package_bytes = crypto::decrypt(&encrypted, data_key)?;
-                Ok((
-                    stored.clone(),
-                    Zeroizing::new(key_package_bytes.as_slice()?.to_vec()),
-                ))
+                Ok((stored.clone(), key_package_bytes.as_slice()?))
             })
             .collect()
     }

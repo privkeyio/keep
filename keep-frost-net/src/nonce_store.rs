@@ -161,26 +161,37 @@ fn rewrite_nonce_file<'a>(
     path: &Path,
     entries: impl Iterator<Item = &'a [u8; 32]>,
 ) -> std::result::Result<(), std::io::Error> {
+    let lock_path = path.with_extension("lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+
     let tmp_path = path.with_extension("tmp");
 
-    let mut file = {
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+    let result = (|| {
+        let mut file = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&tmp_path)?
+        };
+
+        for entry in entries {
+            writeln!(file, "{}", hex::encode(entry))?;
         }
-        opts.open(&tmp_path)?
-    };
+        file.sync_all()?;
 
-    for entry in entries {
-        writeln!(file, "{}", hex::encode(entry))?;
-    }
-    file.sync_all()?;
+        std::fs::rename(&tmp_path, path)
+    })();
 
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    let _ = FileExt::unlock(&lock_file);
+    result
 }
 
 const DEFAULT_MAX_ENTRIES: usize = 100_000;

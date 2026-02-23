@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 pub const KFP_EVENT_KIND: u16 = 24242;
 pub const KFP_VERSION: u8 = 1;
@@ -673,12 +674,27 @@ impl EcdhSharePayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct EcdhCompletePayload {
     #[serde(with = "hex_bytes")]
     pub session_id: [u8; 32],
     #[serde(with = "hex_vec")]
     pub shared_secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for EcdhCompletePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdhCompletePayload")
+            .field("session_id", &hex::encode(self.session_id))
+            .field("shared_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for EcdhCompletePayload {
+    fn drop(&mut self) {
+        self.shared_secret.zeroize();
+    }
 }
 
 impl EcdhCompletePayload {

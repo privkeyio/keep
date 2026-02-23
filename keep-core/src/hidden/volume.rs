@@ -507,7 +507,7 @@ impl HiddenStorage {
             let encrypted_length = EncryptedData::from_bytes(&length_blob).ok()?;
             let decrypted_length = crypto::decrypt(&encrypted_length, data_key).ok()?;
             let length_bytes = decrypted_length.as_slice().ok()?;
-            let arr: [u8; 8] = length_bytes.try_into().ok()?;
+            let arr: [u8; 8] = length_bytes.as_slice().try_into().ok()?;
             Some(u64::from_le_bytes(arr))
         })();
 

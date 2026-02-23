@@ -20,6 +20,8 @@ use chacha20poly1305::{
 use memsecurity::EncryptedMem;
 use zeroize::Zeroize;
 
+use zeroize::Zeroizing;
+
 use crate::entropy;
 use crate::error::{CryptoError, KeepError, Result};
 
@@ -249,10 +251,10 @@ impl SecretVec {
         Ok(Self { encrypted })
     }
 
-    pub fn as_slice(&self) -> Result<Vec<u8>> {
+    pub fn as_slice(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.encrypted
             .decrypt()
-            .map(|z| z.expose_borrowed().to_vec())
+            .map(|z| Zeroizing::new(z.expose_borrowed().to_vec()))
             .map_err(|_| CryptoError::decryption("decrypt secret from RAM").into())
     }
 }

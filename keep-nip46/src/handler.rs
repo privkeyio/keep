@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
@@ -94,6 +95,7 @@ pub struct SignerHandler {
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     rate_limiters: Mutex<HashMap<PublicKey, RateLimiter>>,
     rate_limit_config: Option<RateLimitConfig>,
+    new_conn_timestamps: Mutex<VecDeque<Instant>>,
     expected_secret: Option<String>,
     auto_approve: bool,
     relay_urls: Vec<String>,
@@ -116,6 +118,7 @@ impl SignerHandler {
             callbacks,
             rate_limiters: Mutex::new(HashMap::new()),
             rate_limit_config: None,
+            new_conn_timestamps: Mutex::new(VecDeque::new()),
             expected_secret: None,
             auto_approve: false,
             relay_urls: Vec::new(),
@@ -173,6 +176,7 @@ impl SignerHandler {
     }
 
     const MAX_RATE_LIMITERS: usize = 1_000;
+    const MAX_NEW_CONNS_PER_MINUTE: usize = 50;
 
     async fn check_rate_limit(&self, app_pubkey: &PublicKey) -> Result<()> {
         let config = match &self.rate_limit_config {
@@ -188,6 +192,16 @@ impl SignerHandler {
                 !rl.is_empty()
             });
             if limiters.len() >= Self::MAX_RATE_LIMITERS {
+                let mut timestamps = self.new_conn_timestamps.lock().await;
+                let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+                while timestamps.front().is_some_and(|&t| t < cutoff) {
+                    timestamps.pop_front();
+                }
+                if timestamps.len() >= Self::MAX_NEW_CONNS_PER_MINUTE {
+                    return Err(KeepError::RateLimited(60));
+                }
+                timestamps.push_back(Instant::now());
+
                 let oldest_key = limiters
                     .iter()
                     .min_by_key(|(_, rl)| rl.last_used())

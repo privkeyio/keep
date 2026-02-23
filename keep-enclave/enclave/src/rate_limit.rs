@@ -114,17 +114,23 @@ impl RateLimiter {
     }
 
     pub fn check_minute(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.minute_buckets.lock().unwrap();
+        let Ok(mut buckets) = self.minute_buckets.lock() else {
+            return false;
+        };
         buckets.check(key_id, max)
     }
 
     pub fn check_hour(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.hour_buckets.lock().unwrap();
+        let Ok(mut buckets) = self.hour_buckets.lock() else {
+            return false;
+        };
         buckets.check(key_id, max)
     }
 
     pub fn check_day(&self, key_id: &str, max: u32) -> bool {
-        let mut buckets = self.day_buckets.lock().unwrap();
+        let Ok(mut buckets) = self.day_buckets.lock() else {
+            return false;
+        };
         buckets.check(key_id, max)
     }
 

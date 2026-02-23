@@ -111,7 +111,7 @@ pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum KfpNodeEvent {
     PeerDiscovered {
         share_index: u16,
@@ -133,7 +133,7 @@ pub enum KfpNodeEvent {
     },
     EcdhComplete {
         session_id: [u8; 32],
-        shared_secret: [u8; 32],
+        shared_secret: Zeroizing<[u8; 32]>,
     },
     EcdhFailed {
         session_id: [u8; 32],
@@ -170,6 +170,88 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+}
+
+impl std::fmt::Debug for KfpNodeEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EcdhComplete { session_id, .. } => f
+                .debug_struct("EcdhComplete")
+                .field("session_id", &hex::encode(session_id))
+                .field("shared_secret", &"[REDACTED]")
+                .finish(),
+            Self::PeerDiscovered { share_index, name } => f
+                .debug_struct("PeerDiscovered")
+                .field("share_index", share_index)
+                .field("name", name)
+                .finish(),
+            Self::PeerOffline { share_index } => f
+                .debug_struct("PeerOffline")
+                .field("share_index", share_index)
+                .finish(),
+            Self::SigningStarted { session_id } => f
+                .debug_struct("SigningStarted")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::SignatureComplete {
+                session_id,
+                signature,
+            } => f
+                .debug_struct("SignatureComplete")
+                .field("session_id", &hex::encode(session_id))
+                .field("signature", &hex::encode(signature))
+                .finish(),
+            Self::SigningFailed { session_id, error } => f
+                .debug_struct("SigningFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
+            Self::EcdhFailed { session_id, error } => f
+                .debug_struct("EcdhFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
+            Self::DescriptorProposed { session_id } => f
+                .debug_struct("DescriptorProposed")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorContributionNeeded { session_id, .. } => f
+                .debug_struct("DescriptorContributionNeeded")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorContributed {
+                session_id,
+                share_index,
+            } => f
+                .debug_struct("DescriptorContributed")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .finish(),
+            Self::DescriptorReady { session_id } => f
+                .debug_struct("DescriptorReady")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorComplete { session_id, .. } => f
+                .debug_struct("DescriptorComplete")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorNacked {
+                session_id,
+                share_index,
+                reason,
+            } => f
+                .debug_struct("DescriptorNacked")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .field("reason", reason)
+                .finish(),
+            Self::DescriptorFailed { session_id, error } => f
+                .debug_struct("DescriptorFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
+        }
+    }
 }
 
 pub struct KfpNode {
