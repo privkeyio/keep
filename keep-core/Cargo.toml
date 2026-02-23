@@ -1,8 +1,8 @@
 [package]
 name = "keep-core"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.89"
 description = "Core library for Keep - sovereign key management for Nostr and Bitcoin"
 license = "AGPL-3.0-or-later"
 
@@ -31,7 +31,7 @@ secrecy = "0.10"
 memsec = "0.7"
 subtle = "2.5"
 memsecurity = { version = "3", features = ["encryption", "symm_asymm"] }
-redb = "2.6.3"
+redb = "3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"

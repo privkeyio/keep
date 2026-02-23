@@ -20,9 +20,9 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/privkeyio/keep"
 
@@ -78,7 +78,7 @@ urlencoding = "2.1"
 url = "2.5"
 
 # Storage
-redb = "2.6.3"
+redb = "3"
 
 
 # Misc

@@ -37,7 +37,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rand::Rng;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result, StorageError};

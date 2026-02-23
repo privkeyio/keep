@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::rand::seq::IndexedRandom;
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
-use ::rand::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};

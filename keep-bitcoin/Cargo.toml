@@ -1,8 +1,8 @@
 [package]
 name = "keep-bitcoin"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.89"
 description = "Bitcoin PSBT and Taproot support for Keep"
 license = "AGPL-3.0-or-later"
 

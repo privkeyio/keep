@@ -5,8 +5,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 
-use nostr_sdk::prelude::*;
 use ::rand::Rng;
+use nostr_sdk::prelude::*;
 use tracing::debug;
 
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result, StorageError};

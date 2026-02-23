@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use k256::schnorr::SigningKey;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use tracing::warn;
 
 use crate::kms::EncryptedWallet;

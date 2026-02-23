@@ -1,5 +1,5 @@
 //! Database schema versioning and migrations.
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, info};
 
 use crate::error::{KeepError, Result};

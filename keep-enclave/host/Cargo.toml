@@ -1,8 +1,8 @@
 [package]
 name = "keep-enclave-host"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.89"
 description = "Host-side enclave client for Keep"
 license = "AGPL-3.0-or-later"
 
