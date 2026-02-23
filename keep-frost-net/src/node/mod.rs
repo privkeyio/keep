@@ -410,7 +410,7 @@ impl KfpNode {
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
-                .filter(|p| policies.get(&p.pubkey).map_or(true, |pol| pol.allow_send))
+                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
                 .collect();
 
             if eligible_peers.len() + 1 < threshold {

@@ -1523,7 +1523,7 @@ impl App {
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let pending_count = self.pending_sign_display.len();
         let sidebar_state = SidebarState {
             identities: &self.identities,

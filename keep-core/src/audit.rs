@@ -342,7 +342,7 @@ impl AuditLog {
 
         let mut filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max))
+            .filter(|e| max_age_secs.is_none_or(|max| now.saturating_sub(e.timestamp) <= max))
             .collect();
 
         if let Some(max) = self.retention.max_entries {
@@ -689,7 +689,7 @@ impl SigningAuditLog {
 
         let mut filtered: Vec<_> = entries
             .into_iter()
-            .filter(|e| max_age_secs.map_or(true, |max| now.saturating_sub(e.timestamp) <= max))
+            .filter(|e| max_age_secs.is_none_or(|max| now.saturating_sub(e.timestamp) <= max))
             .collect();
 
         if let Some(max) = self.retention.max_entries {
@@ -749,7 +749,7 @@ impl SigningAuditLog {
         let entries = all
             .into_iter()
             .rev()
-            .filter(|e| caller_filter.map_or(true, |c| e.caller == c))
+            .filter(|e| caller_filter.is_none_or(|c| e.caller == c))
             .skip(offset)
             .take(limit)
             .collect();
@@ -778,7 +778,7 @@ impl SigningAuditLog {
         let entries = all
             .into_iter()
             .rev()
-            .filter(|e| caller_filter.map_or(true, |c| e.caller == c))
+            .filter(|e| caller_filter.is_none_or(|c| e.caller == c))
             .skip(offset)
             .take(limit)
             .collect();

@@ -44,7 +44,7 @@ async fn test_bunker_e2e_connect_and_sign() {
         keyring,
         None,
         None,
-        &[relay_url.clone()],
+        std::slice::from_ref(&relay_url),
         None,
         ServerConfig {
             auto_approve: true,
@@ -205,7 +205,7 @@ async fn test_bunker_rejects_without_auto_approve() {
         keyring,
         None,
         None,
-        &[relay_url.clone()],
+        std::slice::from_ref(&relay_url),
         None,
         ServerConfig {
             auto_approve: false,
@@ -243,7 +243,7 @@ async fn test_bunker_permission_scoping() {
         keyring,
         None,
         None,
-        &[relay_url.clone()],
+        std::slice::from_ref(&relay_url),
         None,
         ServerConfig {
             auto_approve: true,
