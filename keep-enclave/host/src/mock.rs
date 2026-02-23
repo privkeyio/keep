@@ -81,30 +81,39 @@ impl MockEnclaveClient {
     }
 
     fn mock_attestation(&self, nonce: [u8; 32]) -> EnclaveResponse {
-        let mock_doc = create_mock_attestation_document(&nonce, &self.get_ephemeral_pubkey());
-        EnclaveResponse::Attestation { document: mock_doc }
+        match self.get_ephemeral_pubkey() {
+            Ok(pubkey) => {
+                let mock_doc = create_mock_attestation_document(&nonce, &pubkey);
+                EnclaveResponse::Attestation { document: mock_doc }
+            }
+            Err(msg) => EnclaveResponse::Error {
+                code: ErrorCode::InternalError,
+                message: msg,
+            },
+        }
     }
 
-    fn get_ephemeral_pubkey(&self) -> [u8; 32] {
+    fn get_ephemeral_pubkey(&self) -> std::result::Result<[u8; 32], String> {
         let db = self.db.lock().unwrap();
         let rtxn = db.begin_read().unwrap();
 
         if let Ok(table) = rtxn.open_table(META_TABLE) {
             if let Ok(Some(data)) = table.get("ephemeral_secret") {
-                let secret: [u8; 32] = data.value().try_into().unwrap_or([0u8; 32]);
-                if let Ok(sk) = SigningKey::from_bytes(&secret) {
-                    let mut pubkey = [0u8; 32];
-                    pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
-                    return pubkey;
-                }
+                let secret: [u8; 32] = data
+                    .value()
+                    .try_into()
+                    .map_err(|_| "Invalid stored ephemeral secret length".to_string())?;
+                let sk = SigningKey::from_bytes(&secret)
+                    .map_err(|e| format!("Mock ephemeral key derivation failed: {e}"))?;
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
+                return Ok(pubkey);
             }
         }
 
         let mut secret = [0u8; 32];
-        if let Err(e) = getrandom::fill(&mut secret) {
-            warn!("Mock ephemeral key RNG failed: {e}");
-            return [0u8; 32];
-        }
+        getrandom::fill(&mut secret)
+            .map_err(|e| format!("Mock ephemeral key RNG failed: {e}"))?;
         drop(rtxn);
 
         let wtxn = db.begin_write().unwrap();
@@ -114,17 +123,11 @@ impl MockEnclaveClient {
         }
         wtxn.commit().unwrap();
 
-        match SigningKey::from_bytes(&secret) {
-            Ok(sk) => {
-                let mut pubkey = [0u8; 32];
-                pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
-                pubkey
-            }
-            Err(e) => {
-                warn!("Mock ephemeral key derivation failed: {e}");
-                [0u8; 32]
-            }
-        }
+        let sk = SigningKey::from_bytes(&secret)
+            .map_err(|e| format!("Mock ephemeral key derivation failed: {e}"))?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
+        Ok(pubkey)
     }
 
     fn mock_generate_key(&self, name: &str) -> EnclaveResponse {
@@ -446,7 +449,9 @@ fn create_mock_attestation_document(nonce: &[u8; 32], pubkey: &[u8; 32]) -> Vec<
     let unprotected = ciborium::Value::Map(vec![]);
 
     let mut signature = [0u8; 96];
-    getrandom::fill(&mut signature).unwrap_or_default();
+    if let Err(e) = getrandom::fill(&mut signature) {
+        warn!("create_mock_attestation_document: RNG failed for signature: {e}");
+    }
 
     let cose_sign1 = ciborium::Value::Array(vec![
         ciborium::Value::Bytes(protected),
@@ -466,7 +471,9 @@ fn create_mock_certificate() -> Vec<u8> {
     cert.extend_from_slice(&[0x30, 0x82, 0x01, 0x00]);
 
     let mut random = [0u8; 64];
-    getrandom::fill(&mut random).unwrap_or_default();
+    if let Err(e) = getrandom::fill(&mut random) {
+        warn!("create_mock_certificate: RNG failed: {e}");
+    }
     cert.extend_from_slice(&random);
 
     cert.resize(256, 0);
@@ -488,7 +495,9 @@ struct MockAttestationDoc {
 
 fn rand_u64() -> u64 {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).unwrap_or_default();
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        warn!("rand_u64: RNG failed: {e}");
+    }
     u64::from_le_bytes(bytes)
 }
 

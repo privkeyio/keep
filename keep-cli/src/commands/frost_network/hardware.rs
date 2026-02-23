@@ -377,11 +377,12 @@ pub fn cmd_frost_network_nonce_precommit(
     let spinner = out.spinner(&format!("Generating {count} nonce commitments..."));
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
+    let mut rng = ::rand::rng();
     for i in 0..count {
         let mut dummy_session = [0u8; 32];
         let mut dummy_message = [0u8; 32];
-        ::rand::rng().fill_bytes(&mut dummy_session);
-        ::rand::rng().fill_bytes(&mut dummy_message);
+        rng.fill_bytes(&mut dummy_session);
+        rng.fill_bytes(&mut dummy_message);
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
             .map_err(|e| KeepError::FrostErr(FrostError::commitment(format!("nonce {i}: {e}"))))?;
