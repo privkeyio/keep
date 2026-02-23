@@ -531,7 +531,7 @@ fn getrandom(buf: &mut [u8]) -> Result<()> {
 
     let fd = nsm_init();
     if fd < 0 {
-        ::getrandom::fill(buf)
+        ::getrandom::getrandom(buf)
             .map_err(|e| EnclaveError::Nsm(format!("getrandom fallback failed: {}", e)))?;
         return Ok(());
     }
@@ -545,7 +545,7 @@ fn getrandom(buf: &mut [u8]) -> Result<()> {
             let copy_len = buf.len().min(random.len());
             buf[..copy_len].copy_from_slice(&random[..copy_len]);
             if copy_len < buf.len() {
-                ::getrandom::fill(&mut buf[copy_len..]).map_err(|e| {
+                ::getrandom::getrandom(&mut buf[copy_len..]).map_err(|e| {
                     EnclaveError::Nsm(format!("getrandom fallback for remainder failed: {}", e))
                 })?;
             }
@@ -558,7 +558,7 @@ fn getrandom(buf: &mut [u8]) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn getrandom(buf: &mut [u8]) -> Result<()> {
-    ::getrandom::fill(buf)
+    ::getrandom::getrandom(buf)
         .map_err(|e| EnclaveError::Nsm(format!("getrandom failed: {}", e)))?;
     Ok(())
 }

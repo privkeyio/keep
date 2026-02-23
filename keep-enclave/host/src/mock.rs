@@ -101,7 +101,10 @@ impl MockEnclaveClient {
         }
 
         let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).unwrap_or_default();
+        if let Err(e) = getrandom::fill(&mut secret) {
+            warn!("Mock ephemeral key RNG failed: {e}");
+            return [0u8; 32];
+        }
         drop(rtxn);
 
         let wtxn = db.begin_write().unwrap();
@@ -111,12 +114,16 @@ impl MockEnclaveClient {
         }
         wtxn.commit().unwrap();
 
-        if let Ok(sk) = SigningKey::from_bytes(&secret) {
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
-            pubkey
-        } else {
-            [0u8; 32]
+        match SigningKey::from_bytes(&secret) {
+            Ok(sk) => {
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(&sk.verifying_key().to_bytes());
+                pubkey
+            }
+            Err(e) => {
+                warn!("Mock ephemeral key derivation failed: {e}");
+                [0u8; 32]
+            }
         }
     }
 
