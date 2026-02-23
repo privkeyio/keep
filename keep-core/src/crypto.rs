@@ -18,9 +18,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
 };
 use memsecurity::EncryptedMem;
-use zeroize::Zeroize;
-
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::entropy;
 use crate::error::{CryptoError, KeepError, Result};
@@ -502,6 +500,7 @@ pub mod nip44 {
         Ok(key)
     }
 
+    #[allow(clippy::type_complexity)]
     fn derive_message_keys(
         conversation_key: &[u8; 32],
         nonce: &[u8; 32],

@@ -293,7 +293,6 @@ impl Nip55Handler {
 
             node.request_ecdh(pubkey_bytes)
                 .await
-                .map(Zeroizing::new)
                 .map_err(|_| KeepMobileError::FrostError {
                     msg: "ECDH failed".into(),
                 })

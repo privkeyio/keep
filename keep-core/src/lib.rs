@@ -1006,13 +1006,21 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Returns the default path to the Keep directory (~/.keep).
 /// Override with the `KEEP_HOME` environment variable.
 pub fn default_keep_path() -> Result<PathBuf> {
-    std::env::var("KEEP_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| dirs::home_dir().map(|p| p.join(".keep")))
-        .ok_or(KeepError::HomeNotFound)
+    match std::env::var("KEEP_HOME") {
+        Ok(val) if !val.trim().is_empty() => {
+            let path = PathBuf::from(&val);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(KeepError::InvalidInput(
+                    "KEEP_HOME must be an absolute path".into(),
+                ))
+            }
+        }
+        _ => dirs::home_dir()
+            .map(|p| p.join(".keep"))
+            .ok_or(KeepError::HomeNotFound),
+    }
 }
 
 fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
@@ -1226,9 +1234,22 @@ mod tests {
 
     #[test]
     fn test_default_keep_path_from_env() {
-        temp_env::with_var("KEEP_HOME", Some("/tmp/my-keep"), || {
+        let abs_path = if cfg!(windows) {
+            "C:\\tmp\\my-keep"
+        } else {
+            "/tmp/my-keep"
+        };
+        temp_env::with_var("KEEP_HOME", Some(abs_path), || {
             let p = default_keep_path().unwrap();
-            assert_eq!(p, PathBuf::from("/tmp/my-keep"));
+            assert_eq!(p, PathBuf::from(abs_path));
+        });
+    }
+
+    #[test]
+    fn test_default_keep_path_relative_env_rejected() {
+        temp_env::with_var("KEEP_HOME", Some("relative/path"), || {
+            let result = default_keep_path();
+            assert!(result.is_err());
         });
     }
 

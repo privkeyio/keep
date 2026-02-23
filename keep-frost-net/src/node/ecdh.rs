@@ -183,11 +183,13 @@ impl KfpNode {
             }
         }
 
-        let shared_secret: [u8; 32] = payload
-            .shared_secret
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid shared secret length".into()))?;
+        let shared_secret: Zeroizing<[u8; 32]> = Zeroizing::new(
+            payload
+                .shared_secret
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid shared secret length".into()))?,
+        );
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -200,13 +202,13 @@ impl KfpNode {
 
         let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
             session_id: payload.session_id,
-            shared_secret: Zeroizing::new(shared_secret),
+            shared_secret,
         });
 
         Ok(())
     }
 
-    pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<[u8; 32]> {
+    pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>> {
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
@@ -283,7 +285,7 @@ impl KfpNode {
                         shared_secret,
                     }) => {
                         if sid == session_id {
-                            return Ok(*shared_secret);
+                            return Ok(shared_secret);
                         }
                     }
                     Ok(KfpNodeEvent::EcdhFailed {

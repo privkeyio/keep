@@ -89,11 +89,17 @@ impl NonceStore for FileNonceStore {
         }
 
         let lock_path = self.path.with_extension("lock");
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| FrostNetError::Session(format!("Failed to open nonce lock: {e}")))?;
+        let lock_file = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&lock_path)
+                .map_err(|e| FrostNetError::Session(format!("Failed to open nonce lock: {e}")))?
+        };
         lock_file
             .lock_exclusive()
             .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
@@ -168,10 +174,16 @@ fn rewrite_nonce_file<'a>(
     entries: impl Iterator<Item = &'a [u8; 32]>,
 ) -> std::result::Result<(), std::io::Error> {
     let lock_path = path.with_extension("lock");
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)?;
+    let lock_file = {
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&lock_path)?
+    };
     lock_file.lock_exclusive()?;
 
     let tmp_path = path.with_extension("tmp");
