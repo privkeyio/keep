@@ -150,7 +150,7 @@ impl App {
                                 let base_ms =
                                     (RECONNECT_BASE_MS << attempts.min(7)).min(RECONNECT_MAX_MS);
                                 let jitter_ms =
-                                    rand::Rng::gen_range(&mut rand::thread_rng(), 0..=base_ms / 2);
+                                    rand::Rng::gen_range(&mut rand::rng(), 0..=base_ms / 2);
                                 let delay_ms = (base_ms + jitter_ms).min(RECONNECT_MAX_MS);
                                 tracing::error!(error = %e, attempt = attempts, "bunker server error, reconnecting in {delay_ms}ms");
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
