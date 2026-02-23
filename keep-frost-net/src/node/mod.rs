@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use parking_lot::RwLock;
-use rand_09::seq::IndexedRandom;
+use ::rand::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
@@ -421,7 +421,7 @@ impl KfpNode {
             }
 
             eligible_peers
-                .choose_multiple(&mut rand_09::rng(), threshold - 1)
+                .sample(&mut ::rand::rng(), threshold - 1)
                 .copied()
                 .cloned()
                 .collect()

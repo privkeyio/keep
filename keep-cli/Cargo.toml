@@ -39,7 +39,7 @@ url = "2.5"
 
 frost-secp256k1-tr = "2.2.0"
 sha2 = "0.10.9"
-rand = "0.9"
+rand = "0.10"
 
 serialport = "4.8.1"
 

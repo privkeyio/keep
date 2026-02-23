@@ -21,7 +21,7 @@ sha2 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
-rand = "0.9"
+rand = "0.10"
 frost-secp256k1-tr = "2.2.0"
 
 scrypt = "0.11"
@@ -47,7 +47,7 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3.10"
 temp-env = "0.3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.5"
 
 [[test]]

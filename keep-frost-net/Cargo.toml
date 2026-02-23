@@ -17,7 +17,7 @@ keep-enclave-host = { path = "../keep-enclave/host", optional = true }
 
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 frost-secp256k1-tr = "2.2"
-rand_09 = { package = "rand", version = "0.9" }
+rand = "0.10"
 k256 = { version = "0.13.4", features = ["schnorr"] }
 
 tokio = { version = "1", features = ["full", "sync"] }

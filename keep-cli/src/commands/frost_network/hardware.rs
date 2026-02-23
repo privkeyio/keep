@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use nostr_sdk::prelude::*;
+use ::rand::Rng;
 use tracing::debug;
 
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result, StorageError};
@@ -37,8 +38,7 @@ pub fn cmd_frost_network_sign_hardware(
     message_arr.copy_from_slice(&message_bytes);
 
     let mut session_id = [0u8; 32];
-    ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut session_id)
-        .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))))?;
+    ::rand::rng().fill_bytes(&mut session_id);
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
@@ -380,12 +380,8 @@ pub fn cmd_frost_network_nonce_precommit(
     for i in 0..count {
         let mut dummy_session = [0u8; 32];
         let mut dummy_message = [0u8; 32];
-        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_session).map_err(
-            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))),
-        )?;
-        ::rand::TryRngCore::try_fill_bytes(&mut ::rand::rngs::OsRng, &mut dummy_message).map_err(
-            |e| KeepError::CryptoErr(CryptoError::encryption(format!("RNG failed: {e}"))),
-        )?;
+        ::rand::rng().fill_bytes(&mut dummy_session);
+        ::rand::rng().fill_bytes(&mut dummy_message);
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
             .map_err(|e| KeepError::FrostErr(FrostError::commitment(format!("nonce {i}: {e}"))))?;

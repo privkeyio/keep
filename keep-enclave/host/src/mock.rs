@@ -101,7 +101,7 @@ impl MockEnclaveClient {
         }
 
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).unwrap_or_default();
+        getrandom::fill(&mut secret).unwrap_or_default();
         drop(rtxn);
 
         let wtxn = db.begin_write().unwrap();
@@ -122,7 +122,7 @@ impl MockEnclaveClient {
 
     fn mock_generate_key(&self, name: &str) -> EnclaveResponse {
         let mut secret = [0u8; 32];
-        if let Err(e) = getrandom::getrandom(&mut secret) {
+        if let Err(e) = getrandom::fill(&mut secret) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
                 message: format!("Random generation failed: {e}"),
@@ -382,7 +382,7 @@ impl MockEnclaveClient {
 
     fn mock_frost_round1(&self, _key_id: &str, _message: &[u8]) -> EnclaveResponse {
         let mut session_id = [0u8; 32];
-        if let Err(e) = getrandom::getrandom(&mut session_id) {
+        if let Err(e) = getrandom::fill(&mut session_id) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
                 message: format!("Random generation failed: {e}"),
@@ -439,7 +439,7 @@ fn create_mock_attestation_document(nonce: &[u8; 32], pubkey: &[u8; 32]) -> Vec<
     let unprotected = ciborium::Value::Map(vec![]);
 
     let mut signature = [0u8; 96];
-    getrandom::getrandom(&mut signature).unwrap_or_default();
+    getrandom::fill(&mut signature).unwrap_or_default();
 
     let cose_sign1 = ciborium::Value::Array(vec![
         ciborium::Value::Bytes(protected),
@@ -459,7 +459,7 @@ fn create_mock_certificate() -> Vec<u8> {
     cert.extend_from_slice(&[0x30, 0x82, 0x01, 0x00]);
 
     let mut random = [0u8; 64];
-    getrandom::getrandom(&mut random).unwrap_or_default();
+    getrandom::fill(&mut random).unwrap_or_default();
     cert.extend_from_slice(&random);
 
     cert.resize(256, 0);
@@ -481,7 +481,7 @@ struct MockAttestationDoc {
 
 fn rand_u64() -> u64 {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).unwrap_or_default();
+    getrandom::fill(&mut bytes).unwrap_or_default();
     u64::from_le_bytes(bytes)
 }
 

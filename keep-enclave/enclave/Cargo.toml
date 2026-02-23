@@ -31,8 +31,8 @@ ciborium = { version = "0.2", default-features = false }
 zeroize = { version = "1.8", features = ["derive"] }
 memsec = "0.7"
 subtle = { version = "2.5", default-features = false }
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
-getrandom = { version = "0.2", default-features = false, features = ["std"] }
+rand_core = { version = "0.9", default-features = false, features = ["getrandom"] }
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 thiserror = "1.0"

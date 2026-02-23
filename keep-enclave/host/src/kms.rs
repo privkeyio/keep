@@ -42,7 +42,7 @@ impl<K: KmsProvider> EnvelopeEncryption<K> {
         let data_key_result = self.kms.generate_data_key()?;
 
         let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes)
+        getrandom::fill(&mut nonce_bytes)
             .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {e}")))?;
 
         let cipher = Aes256Gcm::new_from_slice(&data_key_result.plaintext)
@@ -93,7 +93,7 @@ pub struct MockKmsProvider {
 impl MockKmsProvider {
     pub fn new() -> Self {
         let mut master_key = [0u8; 32];
-        getrandom::getrandom(&mut master_key).expect("Failed to generate master key");
+        getrandom::fill(&mut master_key).expect("Failed to generate master key");
         Self { master_key }
     }
 
@@ -111,11 +111,11 @@ impl Default for MockKmsProvider {
 impl KmsProvider for MockKmsProvider {
     fn generate_data_key(&self) -> Result<DataKeyResult> {
         let mut plaintext = vec![0u8; 32];
-        getrandom::getrandom(&mut plaintext)
+        getrandom::fill(&mut plaintext)
             .map_err(|e| EnclaveError::Kms(format!("Failed to generate data key: {e}")))?;
 
         let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes)
+        getrandom::fill(&mut nonce_bytes)
             .map_err(|e| EnclaveError::Kms(format!("Failed to generate nonce: {e}")))?;
 
         let cipher = Aes256Gcm::new_from_slice(&self.master_key)

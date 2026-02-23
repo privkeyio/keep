@@ -115,7 +115,7 @@ impl SignerBackend for crate::MockEnclaveClient {
     ) -> Result<(Vec<u8>, usize)> {
         use crate::protocol::{EnclaveRequest, EnclaveResponse, PsbtSigningRequest};
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).ok();
+        getrandom::fill(&mut nonce).ok();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

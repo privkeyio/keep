@@ -187,7 +187,7 @@ impl EnclaveClient {
     ) -> Result<(Vec<u8>, usize)> {
         debug!(key_id, "Signing PSBT in enclave");
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).ok();
+        getrandom::fill(&mut nonce).ok();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -249,7 +249,7 @@ impl EnclaveClient {
     pub fn frost_round1(&self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         debug!(key_id, "FROST round 1 in enclave");
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).ok();
+        getrandom::fill(&mut nonce).ok();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -302,7 +302,7 @@ impl EnclaveClient {
     pub fn frost_round2(&self, session_id: [u8; 32]) -> Result<Vec<u8>> {
         debug!("FROST round 2 in enclave");
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).ok();
+        getrandom::fill(&mut nonce).ok();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
