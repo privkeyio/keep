@@ -170,6 +170,10 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+    XpubAnnounced {
+        share_index: u16,
+        recovery_xpubs: Vec<AnnouncedXpub>,
+    },
 }
 
 impl std::fmt::Debug for KfpNodeEvent {
@@ -249,6 +253,14 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .debug_struct("DescriptorFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
+                .finish(),
+            Self::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => f
+                .debug_struct("XpubAnnounced")
+                .field("share_index", share_index)
+                .field("xpub_count", &recovery_xpubs.len())
                 .finish(),
         }
     }
@@ -447,6 +459,44 @@ impl KfpNode {
 
     pub fn get_peer_policy(&self, pubkey: &PublicKey) -> Option<PeerPolicy> {
         self.policies.read().get(pubkey).cloned()
+    }
+
+    pub async fn announce_xpubs(&self, recovery_xpubs: Vec<AnnouncedXpub>) -> Result<()> {
+        let peers_snapshot: Vec<(u16, PublicKey)> = self
+            .peers
+            .read()
+            .get_online_peers()
+            .iter()
+            .map(|p| (p.share_index, p.pubkey))
+            .collect();
+
+        for (_, pubkey) in &peers_snapshot {
+            let payload = XpubAnnouncePayload::new(
+                self.group_pubkey,
+                self.share.metadata.identifier,
+                recovery_xpubs.clone(),
+            );
+            let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload)?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        }
+
+        info!(
+            share_index = self.share.metadata.identifier,
+            xpub_count = recovery_xpubs.len(),
+            peer_count = peers_snapshot.len(),
+            "Announced recovery xpubs"
+        );
+        Ok(())
+    }
+
+    pub fn get_peer_recovery_xpubs(&self, share_index: u16) -> Option<Vec<AnnouncedXpub>> {
+        self.peers
+            .read()
+            .get_peer_recovery_xpubs(share_index)
+            .map(|xpubs| xpubs.to_vec())
     }
 
     pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
@@ -763,6 +813,9 @@ impl KfpNode {
             }
             KfpMessage::DescriptorNack(payload) => {
                 self.handle_descriptor_nack(event.pubkey, payload).await?;
+            }
+            KfpMessage::XpubAnnounce(payload) => {
+                self.handle_xpub_announce(event.pubkey, payload).await?;
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

@@ -25,6 +25,8 @@ pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const MAX_NACK_REASON_LENGTH: usize = 1024;
+pub const MAX_RECOVERY_XPUBS: usize = 20;
+pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
@@ -56,6 +58,7 @@ pub enum KfpMessage {
     DescriptorFinalize(DescriptorFinalizePayload),
     DescriptorAck(DescriptorAckPayload),
     DescriptorNack(DescriptorNackPayload),
+    XpubAnnounce(XpubAnnouncePayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -81,6 +84,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(_) => "descriptor_finalize",
             KfpMessage::DescriptorAck(_) => "descriptor_ack",
             KfpMessage::DescriptorNack(_) => "descriptor_nack",
+            KfpMessage::XpubAnnounce(_) => "xpub_announce",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -105,6 +109,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
             KfpMessage::DescriptorAck(p) => Some(&p.session_id),
             KfpMessage::DescriptorNack(p) => Some(&p.session_id),
+            KfpMessage::XpubAnnounce(_) => None,
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -121,6 +126,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
+            KfpMessage::XpubAnnounce(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -354,6 +360,36 @@ impl KfpMessage {
                     return Err("Nack reason exceeds maximum length");
                 }
             }
+            KfpMessage::XpubAnnounce(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
+                if p.recovery_xpubs.len() > MAX_RECOVERY_XPUBS {
+                    return Err("Too many recovery xpubs");
+                }
+                if p.recovery_xpubs.is_empty() {
+                    return Err("Recovery xpubs must not be empty");
+                }
+                for xpub in &p.recovery_xpubs {
+                    if xpub.xpub.is_empty() {
+                        return Err("Recovery xpub cannot be empty");
+                    }
+                    if xpub.xpub.len() > MAX_XPUB_LENGTH {
+                        return Err("Recovery xpub exceeds maximum length");
+                    }
+                    if xpub.fingerprint.is_empty() {
+                        return Err("Recovery fingerprint cannot be empty");
+                    }
+                    if xpub.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                        return Err("Recovery fingerprint exceeds maximum length");
+                    }
+                    if let Some(ref label) = xpub.label {
+                        if label.len() > MAX_XPUB_LABEL_LENGTH {
+                            return Err("Recovery xpub label exceeds maximum length");
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -454,6 +490,42 @@ impl AnnouncePayload {
     pub fn with_attestation(mut self, attestation: EnclaveAttestation) -> Self {
         self.attestation = Some(attestation);
         self
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AnnouncedXpub {
+    pub xpub: String,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct XpubAnnouncePayload {
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub share_index: u16,
+    pub recovery_xpubs: Vec<AnnouncedXpub>,
+    pub created_at: u64,
+}
+
+impl XpubAnnouncePayload {
+    pub fn new(
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        recovery_xpubs: Vec<AnnouncedXpub>,
+    ) -> Self {
+        Self {
+            group_pubkey,
+            share_index,
+            recovery_xpubs,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
