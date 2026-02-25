@@ -473,7 +473,9 @@ impl KfpNode {
             }
         }
 
-        let (reconstruction_result, session_network) = {
+        let our_index = self.share.metadata.identifier;
+
+        let (reconstruction_result, session_network, our_xpub) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -499,7 +501,6 @@ impl KfpNode {
                 Some(_) => {}
             }
 
-            let our_index = self.share.metadata.identifier;
             let own_xpub_tampered = match session.contributions().get(&our_index) {
                 Some(our_stored) => payload.contributions.get(&our_index).is_none_or(|fwd| {
                     fwd.account_xpub != our_stored.account_xpub
@@ -507,6 +508,11 @@ impl KfpNode {
                 }),
                 None => session.is_participant(our_index),
             };
+
+            let our_xpub = session
+                .contributions()
+                .get(&our_index)
+                .map(|c| c.account_xpub.clone());
 
             let result = if own_xpub_tampered {
                 Err("Own xpub contribution was tampered with in finalize".into())
@@ -524,7 +530,7 @@ impl KfpNode {
                     .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
                 }
             };
-            (result, network)
+            (result, network, our_xpub)
         };
 
         let (expected_external, expected_internal) = match reconstruction_result {
@@ -572,7 +578,51 @@ impl KfpNode {
             hasher.finalize().into()
         };
 
-        let ack = DescriptorAckPayload::new(payload.session_id, self.group_pubkey, descriptor_hash);
+        let key_proof_psbt_bytes = {
+            let our_xpub = our_xpub.ok_or_else(|| {
+                FrostNetError::Session("Missing own xpub contribution for key proof".into())
+            })?;
+
+            let net = match session_network.as_str() {
+                "bitcoin" => keep_bitcoin::Network::Bitcoin,
+                "testnet" => keep_bitcoin::Network::Testnet,
+                "signet" => keep_bitcoin::Network::Signet,
+                "regtest" => keep_bitcoin::Network::Regtest,
+                _ => {
+                    return Err(FrostNetError::Session(format!(
+                        "unknown network: {session_network}"
+                    )));
+                }
+            };
+
+            let key_package = self
+                .share
+                .key_package()
+                .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
+            let signing_share = key_package.signing_share();
+            let signing_share_bytes = Zeroizing::new(
+                <[u8; 32]>::try_from(signing_share.serialize().as_slice())
+                    .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+            );
+
+            let mut proof_psbt = keep_bitcoin::build_key_proof_psbt(
+                &payload.session_id,
+                our_index,
+                &our_xpub,
+                net,
+            )
+            .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
+
+            keep_bitcoin::sign_key_proof(&mut proof_psbt, &signing_share_bytes, net)
+                .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))?
+        };
+
+        let ack = DescriptorAckPayload::new(
+            payload.session_id,
+            self.group_pubkey,
+            descriptor_hash,
+            key_proof_psbt_bytes,
+        );
         let msg = KfpMessage::DescriptorAck(ack);
         let json = msg.to_json()?;
 
@@ -748,7 +798,7 @@ impl KfpNode {
                 .get_session_mut(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
-            session.add_ack(share_index, payload.descriptor_hash)?;
+            session.add_ack(share_index, payload.descriptor_hash, &payload.key_proof_psbt)?;
             session.is_complete()
         };
 

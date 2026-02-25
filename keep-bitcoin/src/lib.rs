@@ -6,6 +6,7 @@
 mod address;
 mod descriptor;
 mod error;
+pub mod key_proof;
 pub mod psbt;
 pub mod recovery;
 pub mod recovery_tx;
@@ -14,6 +15,7 @@ mod signer;
 pub use address::{AddressDerivation, DerivedAddress};
 pub use descriptor::{xpub_to_x_only, DescriptorExport};
 pub use error::{BitcoinError, Result};
+pub use key_proof::{build_key_proof_psbt, sign_key_proof, verify_key_proof};
 pub use psbt::{PsbtAnalysis, PsbtSigner};
 pub use recovery::{
     PolicyInput, PolicyTierInput, RecoveryConfig, RecoveryOutput, RecoveryTier, SpendingTier,

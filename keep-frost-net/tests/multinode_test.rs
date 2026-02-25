@@ -422,16 +422,12 @@ async fn test_descriptor_coordination_flow() {
     let node1_pubkey = node1.pubkey();
     let group_pubkey = *node1.group_pubkey();
 
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-    let xpriv1 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[1u8; 32]).unwrap();
-    let xpub1 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv1);
-    let xpub1_str = xpub1.to_string();
-    let fp1 = "aabbccdd";
-
-    let xpriv2 = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Signet, &[2u8; 32]).unwrap();
-    let xpub2 = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv2);
-    let xpub2_str = xpub2.to_string();
-    let fp2 = "11223344";
+    let (xpub1_str, fp1) = node1
+        .derive_account_xpub("signet")
+        .expect("derive_account_xpub node1");
+    let (xpub2_str, fp2) = node2
+        .derive_account_xpub("signet")
+        .expect("derive_account_xpub node2");
 
     let mut rx1 = node1.subscribe();
     let mut rx2 = node2.subscribe();
@@ -489,7 +485,7 @@ async fn test_descriptor_coordination_flow() {
     };
 
     let session_id = node1
-        .request_descriptor(policy.clone(), "signet", &xpub1_str, fp1)
+        .request_descriptor(policy.clone(), "signet", &xpub1_str, &fp1)
         .await
         .expect("request_descriptor failed");
 
@@ -509,7 +505,7 @@ async fn test_descriptor_coordination_flow() {
     assert_eq!(contribution_needed, session_id);
 
     node2
-        .contribute_descriptor(session_id, &node1_pubkey, &xpub2_str, fp2)
+        .contribute_descriptor(session_id, &node1_pubkey, &xpub2_str, &fp2)
         .await
         .expect("contribute_descriptor failed");
 

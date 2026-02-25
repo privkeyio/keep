@@ -30,6 +30,7 @@ pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const MAX_RECOVERY_XPUBS: usize = 20;
 pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
+pub const MAX_KEY_PROOF_PSBT_SIZE: usize = 512;
 pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
@@ -357,7 +358,14 @@ impl KfpMessage {
                     }
                 }
             }
-            KfpMessage::DescriptorAck(_) => {}
+            KfpMessage::DescriptorAck(p) => {
+                if p.key_proof_psbt.is_empty() {
+                    return Err("key_proof_psbt must not be empty");
+                }
+                if p.key_proof_psbt.len() > MAX_KEY_PROOF_PSBT_SIZE {
+                    return Err("key_proof_psbt exceeds maximum size");
+                }
+            }
             KfpMessage::DescriptorNack(p) => {
                 if p.reason.is_empty() {
                     return Err("Nack reason must not be empty");
@@ -1059,15 +1067,23 @@ pub struct DescriptorAckPayload {
     pub group_pubkey: [u8; 32],
     #[serde(with = "hex_bytes")]
     pub descriptor_hash: [u8; 32],
+    #[serde(with = "base64_vec")]
+    pub key_proof_psbt: Vec<u8>,
     pub created_at: u64,
 }
 
 impl DescriptorAckPayload {
-    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], descriptor_hash: [u8; 32]) -> Self {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        descriptor_hash: [u8; 32],
+        key_proof_psbt: Vec<u8>,
+    ) -> Self {
         Self {
             session_id,
             group_pubkey,
             descriptor_hash,
+            key_proof_psbt,
             created_at: chrono::Utc::now().timestamp() as u64,
         }
     }
