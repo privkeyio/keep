@@ -216,16 +216,7 @@ impl KfpNode {
     }
 
     pub fn derive_account_xpub(&self, network: &str) -> Result<(String, String)> {
-        let key_package = self
-            .share
-            .key_package()
-            .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
-        let signing_share = key_package.signing_share();
-        let signing_share_bytes = Zeroizing::new(
-            <[u8; 32]>::try_from(signing_share.serialize().as_slice())
-                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
-        );
-
+        let signing_share_bytes = self.signing_share_bytes()?;
         let net = crate::descriptor_session::parse_network(network)?;
 
         let derivation = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net)
@@ -574,16 +565,7 @@ impl KfpNode {
             })?;
 
             let net = crate::descriptor_session::parse_network(&session_network)?;
-
-            let key_package = self
-                .share
-                .key_package()
-                .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
-            let signing_share = key_package.signing_share();
-            let signing_share_bytes = Zeroizing::new(
-                <[u8; 32]>::try_from(signing_share.serialize().as_slice())
-                    .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
-            );
+            let signing_share_bytes = self.signing_share_bytes()?;
 
             let mut proof_psbt = keep_bitcoin::build_key_proof_psbt(
                 &payload.session_id,
@@ -884,6 +866,17 @@ impl KfpNode {
         });
 
         Ok(())
+    }
+
+    fn signing_share_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
+        let signing_share = key_package.signing_share();
+        let bytes = <[u8; 32]>::try_from(signing_share.serialize().as_slice())
+            .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
+        Ok(Zeroizing::new(bytes))
     }
 }
 

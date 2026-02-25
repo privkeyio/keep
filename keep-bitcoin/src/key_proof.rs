@@ -33,13 +33,15 @@ fn derive_proof_txid(session_id: &[u8; 32], share_index: u16) -> Txid {
     Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
 }
 
-fn derive_child_xonly(account_xpub: &str) -> Result<XOnlyPublicKey> {
-    let secp = Secp256k1::new();
+fn derive_child_xonly(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    account_xpub: &str,
+) -> Result<XOnlyPublicKey> {
     let xpub = Xpub::from_str(account_xpub)
         .map_err(|e| BitcoinError::InvalidPsbt(format!("invalid xpub: {e}")))?;
     let child = xpub
         .derive_pub(
-            &secp,
+            secp,
             &[
                 ChildNumber::Normal { index: 0 },
                 ChildNumber::Normal { index: 0 },
@@ -49,6 +51,20 @@ fn derive_child_xonly(account_xpub: &str) -> Result<XOnlyPublicKey> {
     Ok(child.to_x_only_pub())
 }
 
+fn compute_sighash(psbt: &Psbt) -> Result<Message> {
+    let witness_utxo = psbt.inputs[0]
+        .witness_utxo
+        .clone()
+        .ok_or(BitcoinError::MissingWitnessUtxo(0))?;
+    let prevouts = [witness_utxo];
+    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let sighash = sighash_cache
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+        .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
+    Message::from_digest_slice(sighash.as_ref())
+        .map_err(|e| BitcoinError::Signing(e.to_string()))
+}
+
 pub fn build_key_proof_psbt(
     session_id: &[u8; 32],
     share_index: u16,
@@ -56,7 +72,7 @@ pub fn build_key_proof_psbt(
     network: Network,
 ) -> Result<Psbt> {
     let secp = Secp256k1::new();
-    let x_only = derive_child_xonly(account_xpub)?;
+    let x_only = derive_child_xonly(&secp, account_xpub)?;
     let txid = derive_proof_txid(session_id, share_index);
     let address = Address::p2tr(&secp, x_only, None, network);
     let script_pubkey = address.script_pubkey();
@@ -109,20 +125,7 @@ pub fn sign_key_proof(
     let keypair = Keypair::from_seckey_slice(&secp, &child_bytes)
         .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
-    let prevouts = vec![psbt.inputs[0]
-        .witness_utxo
-        .clone()
-        .ok_or(BitcoinError::MissingWitnessUtxo(0))?];
-    let prevouts_ref = Prevouts::All(&prevouts);
-
-    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-    let sighash = sighash_cache
-        .taproot_key_spend_signature_hash(0, &prevouts_ref, TapSighashType::Default)
-        .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
-
-    let msg = Message::from_digest_slice(sighash.as_ref())
-        .map_err(|e| BitcoinError::Signing(e.to_string()))?;
-
+    let msg = compute_sighash(psbt)?;
     let aux_rand = crate::aux_rand()?;
     let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
 
@@ -141,7 +144,6 @@ pub fn verify_key_proof(
     signed_psbt_bytes: &[u8],
     network: Network,
 ) -> Result<()> {
-    let secp = Secp256k1::new();
     let expected_psbt = build_key_proof_psbt(session_id, share_index, account_xpub, network)?;
 
     let signed_psbt = Psbt::deserialize(signed_psbt_bytes)
@@ -164,23 +166,13 @@ pub fn verify_key_proof(
         )));
     }
 
-    let x_only = derive_child_xonly(account_xpub)?;
+    let x_only = expected_psbt.inputs[0]
+        .tap_internal_key
+        .ok_or_else(|| BitcoinError::InvalidPsbt("missing tap internal key".into()))?;
+    let msg = compute_sighash(&expected_psbt)?;
 
-    let prevouts = vec![expected_psbt.inputs[0]
-        .witness_utxo
-        .clone()
-        .ok_or(BitcoinError::MissingWitnessUtxo(0))?];
-    let prevouts_ref = Prevouts::All(&prevouts);
-
-    let mut sighash_cache = SighashCache::new(&expected_psbt.unsigned_tx);
-    let sighash = sighash_cache
-        .taproot_key_spend_signature_hash(0, &prevouts_ref, TapSighashType::Default)
-        .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
-
-    let msg = Message::from_digest_slice(sighash.as_ref())
-        .map_err(|e| BitcoinError::Signing(e.to_string()))?;
-
-    secp.verify_schnorr(&tap_sig.signature, &msg, &x_only)
+    Secp256k1::verification_only()
+        .verify_schnorr(&tap_sig.signature, &msg, &x_only)
         .map_err(|_| BitcoinError::InvalidPsbt("key proof signature verification failed".into()))
 }
 
