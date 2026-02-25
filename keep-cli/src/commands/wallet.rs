@@ -362,13 +362,11 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    let key_slots: Vec<keep_frost_net::KeySlot> = if let Some(slots) = explicit_slots {
-        slots
-    } else {
+    let key_slots: Vec<keep_frost_net::KeySlot> = explicit_slots.unwrap_or_else(|| {
         (1..=key_count)
             .map(|i| keep_frost_net::KeySlot::Participant { share_index: i })
             .collect()
-    };
+    });
 
     Ok(keep_frost_net::PolicyTier {
         threshold,
@@ -381,10 +379,10 @@ fn parse_recovery_policy(
     specs: &[String],
     total_shares: u16,
 ) -> Result<keep_frost_net::WalletPolicy> {
-    let mut tiers: Vec<keep_frost_net::PolicyTier> = Vec::new();
-    for spec in specs {
-        tiers.push(parse_recovery_tier(spec, total_shares)?);
-    }
+    let mut tiers: Vec<keep_frost_net::PolicyTier> = specs
+        .iter()
+        .map(|spec| parse_recovery_tier(spec, total_shares))
+        .collect::<Result<Vec<_>>>()?;
 
     tiers.sort_by_key(|t| t.timelock_months);
 
@@ -692,7 +690,9 @@ fn parse_announced_xpub(s: &str) -> Result<keep_frost_net::AnnouncedXpub> {
     let err_msg = "Expected format: 'xpub.../fingerprint' or 'xpub.../fingerprint/label'";
     let is_fingerprint = |s: &str| s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit());
 
-    let last_slash = s.rfind('/').ok_or_else(|| KeepError::InvalidInput(err_msg.into()))?;
+    let last_slash = s
+        .rfind('/')
+        .ok_or_else(|| KeepError::InvalidInput(err_msg.into()))?;
     let (before_last, after_last) = (&s[..last_slash], &s[last_slash + 1..]);
 
     let (xpub, fingerprint, label) = if is_fingerprint(after_last) {
@@ -714,6 +714,9 @@ fn parse_announced_xpub(s: &str) -> Result<keep_frost_net::AnnouncedXpub> {
         )
     };
 
+    if xpub.len() < keep_frost_net::MIN_XPUB_LENGTH {
+        return Err(KeepError::InvalidInput(err_msg.into()));
+    }
     if !keep_frost_net::VALID_XPUB_PREFIXES
         .iter()
         .any(|p| xpub.starts_with(p))
@@ -745,6 +748,12 @@ pub fn cmd_wallet_announce_keys(
         .map(|s| parse_announced_xpub(s))
         .collect::<Result<Vec<_>>>()?;
 
+    if recovery_xpubs.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "At least one recovery xpub is required for announce".into(),
+        ));
+    }
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
@@ -765,10 +774,8 @@ pub fn cmd_wallet_announce_keys(
     out.field("Relay", relay);
     for xpub in &recovery_xpubs {
         let label = xpub.label.as_deref().unwrap_or("(none)");
-        out.field(
-            "Xpub",
-            &format!("{}.../{}/{}", &xpub.xpub[..12], xpub.fingerprint, label),
-        );
+        let prefix: String = xpub.xpub.chars().take(12).collect();
+        out.field("Xpub", &format!("{prefix}.../{}/{label}", xpub.fingerprint));
     }
     out.newline();
 
@@ -820,8 +827,9 @@ pub fn cmd_wallet_announce_keys(
             recovery_xpubs.len()
         ));
 
+        const ANNOUNCE_LISTEN_TIMEOUT: Duration = Duration::from_secs(15);
         let spinner = out.spinner("Listening for peer announcements...");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + ANNOUNCE_LISTEN_TIMEOUT;
 
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline - tokio::time::Instant::now();

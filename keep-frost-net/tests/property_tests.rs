@@ -9,6 +9,9 @@ use keep_frost_net::{
 };
 use proptest::prelude::*;
 
+const TEST_XPUB: &str = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
+const TEST_TPUB: &str = "tpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
+
 fn roundtrip(msg: KfpMessage) -> KfpMessage {
     let json = msg.to_json().unwrap();
     KfpMessage::from_json(&json).unwrap()
@@ -174,7 +177,7 @@ proptest! {
         let fingerprint = format!("{fingerprint_byte:08x}");
         let xpubs: Vec<AnnouncedXpub> = (0..xpub_count)
             .map(|i| AnnouncedXpub {
-                xpub: format!("xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYg{i:02}"),
+                xpub: format!("{TEST_XPUB}{i:02}"),
                 fingerprint: fingerprint.clone(),
                 label: None,
             })
@@ -195,7 +198,7 @@ proptest! {
     fn xpub_announce_too_many_rejected(extra in 1usize..10) {
         let xpubs: Vec<AnnouncedXpub> = (0..MAX_RECOVERY_XPUBS + extra)
             .map(|i| AnnouncedXpub {
-                xpub: format!("xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYg{i:04}"),
+                xpub: format!("{TEST_XPUB}{i:04}"),
                 fingerprint: "aabbccdd".into(),
                 label: None,
             })
@@ -210,7 +213,7 @@ proptest! {
             return Ok(());
         }
         let xpubs = vec![AnnouncedXpub {
-            xpub: format!("{prefix}661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK"),
+            xpub: format!("{prefix}{}", &TEST_XPUB[4..]),
             fingerprint: "aabbccdd".into(),
             label: None,
         }];
@@ -221,7 +224,7 @@ proptest! {
     #[test]
     fn xpub_announce_invalid_fingerprint_rejected(bad_fp in "[g-z]{8}") {
         let xpubs = vec![AnnouncedXpub {
-            xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_XPUB.into(),
             fingerprint: bad_fp,
             label: None,
         }];
@@ -232,7 +235,7 @@ proptest! {
     #[test]
     fn xpub_announce_oversized_label_rejected(extra in 1usize..50) {
         let xpubs = vec![AnnouncedXpub {
-            xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_XPUB.into(),
             fingerprint: "aabbccdd".into(),
             label: Some("L".repeat(MAX_XPUB_LABEL_LENGTH + extra)),
         }];
@@ -334,12 +337,12 @@ fn boundary_sizes_valid() {
 fn valid_xpub_announce_passes_validation() {
     let xpubs = vec![
         AnnouncedXpub {
-            xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_XPUB.into(),
             fingerprint: "aabbccdd".into(),
             label: Some("hot".into()),
         },
         AnnouncedXpub {
-            xpub: "tpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_TPUB.into(),
             fingerprint: "00112233".into(),
             label: None,
         },
@@ -352,12 +355,12 @@ fn valid_xpub_announce_passes_validation() {
 fn xpub_announce_duplicate_xpubs_rejected() {
     let xpubs = vec![
         AnnouncedXpub {
-            xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_XPUB.into(),
             fingerprint: "aabbccdd".into(),
             label: None,
         },
         AnnouncedXpub {
-            xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+            xpub: TEST_XPUB.into(),
             fingerprint: "11223344".into(),
             label: None,
         },
@@ -375,7 +378,7 @@ fn xpub_announce_empty_rejected() {
 #[test]
 fn xpub_announce_zero_share_index_rejected() {
     let xpubs = vec![AnnouncedXpub {
-        xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+        xpub: TEST_XPUB.into(),
         fingerprint: "aabbccdd".into(),
         label: None,
     }];
@@ -386,7 +389,7 @@ fn xpub_announce_zero_share_index_rejected() {
 #[test]
 fn xpub_announce_short_fingerprint_rejected() {
     let xpubs = vec![AnnouncedXpub {
-        xpub: "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUK".into(),
+        xpub: TEST_XPUB.into(),
         fingerprint: "aabb".into(),
         label: None,
     }];

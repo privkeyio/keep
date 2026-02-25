@@ -817,6 +817,11 @@ impl KeepMobile {
         &self,
         xpubs: Vec<AnnouncedXpubInfo>,
     ) -> Result<(), KeepMobileError> {
+        if xpubs.is_empty() {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "empty xpub list".into(),
+            });
+        }
         let announced: Vec<keep_frost_net::AnnouncedXpub> = xpubs
             .into_iter()
             .map(|x| keep_frost_net::AnnouncedXpub {

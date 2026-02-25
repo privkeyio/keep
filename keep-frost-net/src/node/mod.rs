@@ -4,7 +4,7 @@ mod descriptor;
 mod ecdh;
 mod signing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -283,7 +283,7 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
-    pub(crate) seen_xpub_announces: RwLock<HashMap<u16, u64>>,
+    pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
 }
 
 impl KfpNode {
@@ -397,7 +397,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
-            seen_xpub_announces: RwLock::new(HashMap::new()),
+            seen_xpub_announces: RwLock::new(HashSet::new()),
         })
     }
 
@@ -464,33 +464,37 @@ impl KfpNode {
     }
 
     pub async fn announce_xpubs(&self, recovery_xpubs: Vec<AnnouncedXpub>) -> Result<()> {
-        let peer_pubkeys: Vec<PublicKey> = self
-            .peers
-            .read()
-            .get_online_peers()
-            .iter()
-            .map(|p| p.pubkey)
-            .collect();
+        let peer_pubkeys: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            let policies = self.policies.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
+                .map(|p| p.pubkey)
+                .collect()
+        };
 
+        let xpub_count = recovery_xpubs.len();
         let payload = XpubAnnouncePayload::new(
             self.group_pubkey,
             self.share.metadata.identifier,
-            recovery_xpubs.clone(),
+            recovery_xpubs,
         );
 
         KfpMessage::XpubAnnounce(payload.clone())
             .validate()
             .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
 
-        let mut errors = Vec::new();
+        let mut fail_count = 0usize;
         for pubkey in &peer_pubkeys {
             let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload.clone())?;
             if let Err(e) = self.client.send_event(&event).await {
                 warn!(peer = %pubkey, error = %e, "Failed to send xpub announcement");
-                errors.push(e.to_string());
+                fail_count += 1;
             }
         }
-        if errors.len() == peer_pubkeys.len() && !peer_pubkeys.is_empty() {
+        if fail_count == peer_pubkeys.len() && !peer_pubkeys.is_empty() {
             return Err(FrostNetError::Transport(
                 "Failed to send xpub announcement to any peer".into(),
             ));
@@ -498,7 +502,7 @@ impl KfpNode {
 
         info!(
             share_index = self.share.metadata.identifier,
-            xpub_count = recovery_xpubs.len(),
+            xpub_count,
             peer_count = peer_pubkeys.len(),
             "Announced recovery xpubs"
         );
@@ -719,8 +723,8 @@ impl KfpNode {
                     {
                         let now = chrono::Utc::now().timestamp().max(0) as u64;
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
-                        self.seen_xpub_announces.write().retain(|_, ts| {
-                            now.saturating_sub(window) <= *ts
+                        self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
+                            now.saturating_sub(window) <= ts
                         });
                     }
                 }

@@ -113,7 +113,6 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
             KfpMessage::DescriptorAck(p) => Some(&p.session_id),
             KfpMessage::DescriptorNack(p) => Some(&p.session_id),
-            KfpMessage::XpubAnnounce(_) => None,
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -309,8 +308,8 @@ impl KfpMessage {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
                 }
-                if p.account_xpub.is_empty() {
-                    return Err("Account xpub cannot be empty");
+                if p.account_xpub.len() < MIN_XPUB_LENGTH {
+                    return Err("Account xpub too short");
                 }
                 if p.account_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Account xpub exceeds maximum length");
@@ -347,6 +346,9 @@ impl KfpMessage {
                     }
                 }
                 for contrib in p.contributions.values() {
+                    if contrib.account_xpub.len() < MIN_XPUB_LENGTH {
+                        return Err("Contribution xpub too short");
+                    }
                     if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Contribution xpub exceeds maximum length");
                     }
@@ -391,7 +393,7 @@ impl KfpMessage {
                     if !seen_xpubs.insert(&xpub.xpub) {
                         return Err("Duplicate recovery xpub");
                     }
-                    if xpub.fingerprint.len() != 8
+                    if xpub.fingerprint.len() != MAX_FINGERPRINT_LENGTH
                         || !xpub.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
                     {
                         return Err("Recovery fingerprint must be exactly 8 hex characters");
@@ -1544,18 +1546,21 @@ mod tests {
     fn test_descriptor_finalize_contributions_roundtrip() {
         use std::collections::BTreeMap;
 
+        let xpub_a = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxAAAAAAAAAAAA";
+        let xpub_b = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxBBBBBBBBBBBB";
+
         let mut contributions = BTreeMap::new();
         contributions.insert(
             1,
             crate::descriptor_session::XpubContribution {
-                account_xpub: "xpub6ABC".to_string(),
+                account_xpub: xpub_a.to_string(),
                 fingerprint: "aabbccdd".to_string(),
             },
         );
         contributions.insert(
             3,
             crate::descriptor_session::XpubContribution {
-                account_xpub: "xpub6DEF".to_string(),
+                account_xpub: xpub_b.to_string(),
                 fingerprint: "11223344".to_string(),
             },
         );
@@ -1563,8 +1568,8 @@ mod tests {
         let payload = DescriptorFinalizePayload::new(
             [1u8; 32],
             [2u8; 32],
-            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/0/*,[11223344]xpub6DEF/0/*))",
-            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/1/*,[11223344]xpub6DEF/1/*))",
+            &format!("wsh(sortedmulti(2,[aabbccdd]{xpub_a}/0/*,[11223344]{xpub_b}/0/*))"),
+            &format!("wsh(sortedmulti(2,[aabbccdd]{xpub_a}/1/*,[11223344]{xpub_b}/1/*))"),
             [3u8; 32],
             contributions,
         );

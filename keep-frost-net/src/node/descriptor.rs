@@ -819,13 +819,19 @@ impl KfpNode {
         self.verify_peer_share_index(sender, payload.share_index)?;
 
         {
-            let mut seen = self.seen_xpub_announces.write();
-            if let Some(&prev_ts) = seen.get(&payload.share_index) {
-                if payload.created_at <= prev_ts {
-                    return Ok(());
+            let mut hasher = Sha256::new();
+            for xpub in &payload.recovery_xpubs {
+                hasher.update(xpub.xpub.as_bytes());
+                hasher.update(xpub.fingerprint.as_bytes());
+                if let Some(ref label) = xpub.label {
+                    hasher.update(label.as_bytes());
                 }
             }
-            seen.insert(payload.share_index, payload.created_at);
+            let digest: [u8; 32] = hasher.finalize().into();
+            let dedup_key = (payload.share_index, payload.created_at, digest);
+            if !self.seen_xpub_announces.write().insert(dedup_key) {
+                return Ok(());
+            }
         }
 
         {
