@@ -133,7 +133,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Invalid host characters".into());
     }
 
-    if !cfg!(feature = "allow-ws") && is_internal_host(host) {
+    if is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
 
@@ -254,7 +254,11 @@ mod tests {
 
     #[test]
     fn rejects_non_wss() {
-        assert!(validate_relay_url("ws://relay.example.com").is_err());
+        if cfg!(feature = "allow-ws") {
+            assert!(validate_relay_url("ws://relay.example.com").is_ok());
+        } else {
+            assert!(validate_relay_url("ws://relay.example.com").is_err());
+        }
         assert!(validate_relay_url("http://relay.example.com").is_err());
         assert!(validate_relay_url("relay.example.com").is_err());
     }
