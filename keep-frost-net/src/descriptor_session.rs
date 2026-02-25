@@ -439,7 +439,7 @@ pub fn derive_descriptor_session_id(
     hasher.finalize().into()
 }
 
-fn parse_network(network_str: &str) -> Result<Network> {
+pub(crate) fn parse_network(network_str: &str) -> Result<Network> {
     Network::from_str(network_str)
         .map_err(|_| FrostNetError::Session(format!("unknown network: {network_str}")))
 }

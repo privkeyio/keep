@@ -226,17 +226,7 @@ impl KfpNode {
                 .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
         );
 
-        let net = match network {
-            "bitcoin" => keep_bitcoin::Network::Bitcoin,
-            "testnet" => keep_bitcoin::Network::Testnet,
-            "signet" => keep_bitcoin::Network::Signet,
-            "regtest" => keep_bitcoin::Network::Regtest,
-            _ => {
-                return Err(FrostNetError::Session(format!(
-                    "unknown network: {network}"
-                )));
-            }
-        };
+        let net = crate::descriptor_session::parse_network(network)?;
 
         let derivation = keep_bitcoin::AddressDerivation::new(&signing_share_bytes, net)
             .map_err(|e| FrostNetError::Crypto(format!("address derivation: {e}")))?;
@@ -583,17 +573,7 @@ impl KfpNode {
                 FrostNetError::Session("Missing own xpub contribution for key proof".into())
             })?;
 
-            let net = match session_network.as_str() {
-                "bitcoin" => keep_bitcoin::Network::Bitcoin,
-                "testnet" => keep_bitcoin::Network::Testnet,
-                "signet" => keep_bitcoin::Network::Signet,
-                "regtest" => keep_bitcoin::Network::Regtest,
-                _ => {
-                    return Err(FrostNetError::Session(format!(
-                        "unknown network: {session_network}"
-                    )));
-                }
-            };
+            let net = crate::descriptor_session::parse_network(&session_network)?;
 
             let key_package = self
                 .share

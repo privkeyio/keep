@@ -12,7 +12,7 @@ use bitcoin::{
     absolute::LockTime, transaction::Version, Address, Amount, Network, OutPoint, ScriptBuf,
     Sequence, Transaction, Txid, TxIn, TxOut, Witness, XOnlyPublicKey,
 };
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{BitcoinError, Result};
 
@@ -20,6 +20,9 @@ const PROOF_DOMAIN: &[u8] = b"keep-key-proof/v1";
 const INPUT_SATS: u64 = 1000;
 const OUTPUT_SATS: u64 = 546;
 
+// Intentionally single SHA-256 cast to sha256d: this produces a synthetic/virtual txid
+// that is deterministic from session parameters and never appears on-chain. The Txid type
+// requires sha256d internally, so we reinterpret the single-hash bytes directly.
 fn derive_proof_txid(session_id: &[u8; 32], share_index: u16) -> Txid {
     let mut engine = sha256::HashEngine::default();
     engine.input(PROOF_DOMAIN);
@@ -95,15 +98,16 @@ pub fn sign_key_proof(
     let path = DerivationPath::from_str(&format!("m/86'/{coin_type}'/0'/0/0"))
         .map_err(|e| BitcoinError::Signing(format!("derivation path: {e}")))?;
 
-    let master = Xpriv::new_master(network, signing_secret)
-        .map_err(|e| BitcoinError::Signing(format!("master key: {e}")))?;
-    let child = master
-        .derive_priv(&secp, &path)
-        .map_err(|e| BitcoinError::Signing(format!("child derivation: {e}")))?;
-    let mut child_bytes = child.private_key.secret_bytes();
+    let child_bytes = Zeroizing::new({
+        let master = Xpriv::new_master(network, signing_secret)
+            .map_err(|e| BitcoinError::Signing(format!("master key: {e}")))?;
+        let child = master
+            .derive_priv(&secp, &path)
+            .map_err(|e| BitcoinError::Signing(format!("child derivation: {e}")))?;
+        child.private_key.secret_bytes()
+    });
     let keypair = Keypair::from_seckey_slice(&secp, &child_bytes)
         .map_err(|e| BitcoinError::Signing(e.to_string()))?;
-    child_bytes.zeroize();
 
     let prevouts = vec![psbt.inputs[0]
         .witness_utxo
@@ -152,6 +156,13 @@ pub fn verify_key_proof(
     let tap_sig = signed_psbt.inputs[0]
         .tap_key_sig
         .ok_or_else(|| BitcoinError::InvalidPsbt("key proof missing signature".into()))?;
+
+    if tap_sig.sighash_type != TapSighashType::Default {
+        return Err(BitcoinError::InvalidPsbt(format!(
+            "key proof sighash type must be Default, got {:?}",
+            tap_sig.sighash_type
+        )));
+    }
 
     let x_only = derive_child_xonly(account_xpub)?;
 
