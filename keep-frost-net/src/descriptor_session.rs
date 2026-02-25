@@ -616,7 +616,12 @@ mod tests {
         (xpub.to_string(), fp.to_string(), secret)
     }
 
-    fn sign_proof(session_id: &[u8; 32], share_index: u16, xpub: &str, secret: &[u8; 32]) -> Vec<u8> {
+    fn sign_proof(
+        session_id: &[u8; 32],
+        share_index: u16,
+        xpub: &str,
+        secret: &[u8; 32],
+    ) -> Vec<u8> {
         let mut psbt = keep_bitcoin::build_key_proof_psbt(
             session_id,
             share_index,

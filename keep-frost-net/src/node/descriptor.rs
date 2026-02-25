@@ -567,13 +567,9 @@ impl KfpNode {
             let net = crate::descriptor_session::parse_network(&session_network)?;
             let signing_share_bytes = self.signing_share_bytes()?;
 
-            let mut proof_psbt = keep_bitcoin::build_key_proof_psbt(
-                &payload.session_id,
-                our_index,
-                &our_xpub,
-                net,
-            )
-            .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
+            let mut proof_psbt =
+                keep_bitcoin::build_key_proof_psbt(&payload.session_id, our_index, &our_xpub, net)
+                    .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
 
             keep_bitcoin::sign_key_proof(&mut proof_psbt, &signing_share_bytes, net)
                 .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))?
@@ -760,7 +756,11 @@ impl KfpNode {
                 .get_session_mut(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
-            session.add_ack(share_index, payload.descriptor_hash, &payload.key_proof_psbt)?;
+            session.add_ack(
+                share_index,
+                payload.descriptor_hash,
+                &payload.key_proof_psbt,
+            )?;
             session.is_complete()
         };
 

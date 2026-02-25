@@ -10,7 +10,7 @@ use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::Signature as TaprootSignature;
 use bitcoin::{
     absolute::LockTime, transaction::Version, Address, Amount, Network, OutPoint, ScriptBuf,
-    Sequence, Transaction, Txid, TxIn, TxOut, Witness, XOnlyPublicKey,
+    Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
 };
 use zeroize::Zeroizing;
 
@@ -61,8 +61,7 @@ fn compute_sighash(psbt: &Psbt) -> Result<Message> {
     let sighash = sighash_cache
         .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
         .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
-    Message::from_digest_slice(sighash.as_ref())
-        .map_err(|e| BitcoinError::Signing(e.to_string()))
+    Message::from_digest_slice(sighash.as_ref()).map_err(|e| BitcoinError::Signing(e.to_string()))
 }
 
 pub fn build_key_proof_psbt(
@@ -122,7 +121,7 @@ pub fn sign_key_proof(
             .map_err(|e| BitcoinError::Signing(format!("child derivation: {e}")))?;
         child.private_key.secret_bytes()
     });
-    let keypair = Keypair::from_seckey_slice(&secp, &child_bytes)
+    let keypair = Keypair::from_seckey_slice(&secp, child_bytes.as_ref())
         .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
     let msg = compute_sighash(psbt)?;
@@ -242,8 +241,14 @@ mod tests {
             build_key_proof_psbt(&session_id, share_index, &xpub, Network::Testnet).unwrap();
         let signed_bytes = sign_key_proof(&mut psbt, &secret, Network::Testnet).unwrap();
 
-        verify_key_proof(&session_id, share_index, &xpub, &signed_bytes, Network::Testnet)
-            .unwrap();
+        verify_key_proof(
+            &session_id,
+            share_index,
+            &xpub,
+            &signed_bytes,
+            Network::Testnet,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -295,8 +300,7 @@ mod tests {
         let secret = [42u8; 32];
         let (xpub, _) = test_xpub(&secret, Network::Bitcoin);
 
-        let mut psbt =
-            build_key_proof_psbt(&session_id, 1, &xpub, Network::Bitcoin).unwrap();
+        let mut psbt = build_key_proof_psbt(&session_id, 1, &xpub, Network::Bitcoin).unwrap();
         let signed_bytes = sign_key_proof(&mut psbt, &secret, Network::Bitcoin).unwrap();
 
         verify_key_proof(&session_id, 1, &xpub, &signed_bytes, Network::Bitcoin).unwrap();
