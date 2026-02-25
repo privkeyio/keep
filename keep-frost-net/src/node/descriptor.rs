@@ -62,11 +62,8 @@ impl KfpNode {
                 expected_acks,
             )?;
             session.set_initiator(self.keys.public_key());
-        }
 
-        if we_are_contributor {
-            let mut sessions = self.descriptor_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&session_id) {
+            if we_are_contributor {
                 session.add_contribution(
                     our_index,
                     own_xpub.to_string(),
@@ -146,6 +143,17 @@ impl KfpNode {
         if !payload.is_within_replay_window(self.replay_window_secs) {
             return Err(FrostNetError::ReplayDetected(
                 "Descriptor proposal outside replay window".into(),
+            ));
+        }
+
+        let expected_id = derive_descriptor_session_id(
+            &payload.group_pubkey,
+            &payload.policy,
+            payload.created_at,
+        );
+        if payload.session_id != expected_id {
+            return Err(FrostNetError::Session(
+                "session_id does not match derived value".into(),
             ));
         }
 

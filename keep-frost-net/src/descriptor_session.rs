@@ -17,6 +17,7 @@ use crate::protocol::{
 };
 
 const MAX_SESSIONS: usize = 64;
+const REAP_GRACE_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorSessionState {
@@ -285,26 +286,7 @@ impl DescriptorSession {
     }
 
     pub fn is_expired(&self) -> bool {
-        if self.created_at.elapsed() > self.timeout {
-            return true;
-        }
-        match self.state {
-            DescriptorSessionState::Proposed => {
-                if let Some(complete_at) = self.contributions_complete_at {
-                    complete_at.elapsed() > self.finalize_timeout
-                } else {
-                    self.created_at.elapsed() > self.contribution_timeout
-                }
-            }
-            DescriptorSessionState::Finalized => {
-                if let Some(fin_at) = self.finalized_at {
-                    fin_at.elapsed() > self.ack_phase_timeout
-                } else {
-                    false
-                }
-            }
-            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => false,
-        }
+        self.expired_phase().is_some()
     }
 
     pub fn expired_phase(&self) -> Option<&'static str> {
@@ -323,14 +305,18 @@ impl DescriptorSession {
                 None
             }
             DescriptorSessionState::Finalized => {
-                if let Some(fin_at) = self.finalized_at {
-                    if fin_at.elapsed() > self.ack_phase_timeout {
-                        return Some("ack");
-                    }
+                let fin_at = self.finalized_at.expect("finalized_at set in set_finalized");
+                if fin_at.elapsed() > self.ack_phase_timeout {
+                    return Some("ack");
                 }
                 None
             }
-            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => None,
+            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => {
+                if self.created_at.elapsed() > self.timeout + Duration::from_secs(REAP_GRACE_SECS) {
+                    return Some("reap");
+                }
+                None
+            }
         }
     }
 
@@ -399,7 +385,7 @@ impl DescriptorSessionManager {
             self.sessions.remove(&session_id);
         }
 
-        self.cleanup_expired();
+        let _ = self.cleanup_expired();
 
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(FrostNetError::Session(

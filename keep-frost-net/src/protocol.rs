@@ -265,11 +265,17 @@ impl KfpMessage {
                 if !VALID_NETWORKS.contains(&p.network.as_str()) {
                     return Err("Invalid network value");
                 }
-                if p.initiator_xpub.is_empty() {
-                    return Err("Initiator xpub cannot be empty");
+                if p.initiator_xpub.len() < MIN_XPUB_LENGTH {
+                    return Err("Initiator xpub too short");
                 }
                 if p.initiator_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Initiator xpub exceeds maximum length");
+                }
+                if !VALID_XPUB_PREFIXES
+                    .iter()
+                    .any(|pfx| p.initiator_xpub.starts_with(pfx))
+                {
+                    return Err("Initiator xpub has invalid prefix");
                 }
                 if p.initiator_fingerprint.is_empty() {
                     return Err("Initiator fingerprint cannot be empty");
@@ -297,12 +303,28 @@ impl KfpMessage {
                         return Err("Tier threshold exceeds number of key slots");
                     }
                     for slot in &tier.key_slots {
-                        if let KeySlot::External { xpub, fingerprint } = slot {
-                            if xpub.len() > MAX_XPUB_LENGTH {
-                                return Err("External xpub exceeds maximum length");
+                        match slot {
+                            KeySlot::Participant { share_index } => {
+                                if *share_index == 0 {
+                                    return Err("Participant share_index must be non-zero");
+                                }
                             }
-                            if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                                return Err("External fingerprint exceeds maximum length");
+                            KeySlot::External { xpub, fingerprint } => {
+                                if xpub.len() < MIN_XPUB_LENGTH {
+                                    return Err("External xpub too short");
+                                }
+                                if xpub.len() > MAX_XPUB_LENGTH {
+                                    return Err("External xpub exceeds maximum length");
+                                }
+                                if !VALID_XPUB_PREFIXES
+                                    .iter()
+                                    .any(|pfx| xpub.starts_with(pfx))
+                                {
+                                    return Err("External xpub has invalid prefix");
+                                }
+                                if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+                                    return Err("External fingerprint exceeds maximum length");
+                                }
                             }
                         }
                     }
@@ -317,6 +339,12 @@ impl KfpMessage {
                 }
                 if p.account_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Account xpub exceeds maximum length");
+                }
+                if !VALID_XPUB_PREFIXES
+                    .iter()
+                    .any(|pfx| p.account_xpub.starts_with(pfx))
+                {
+                    return Err("Account xpub has invalid prefix");
                 }
                 if p.fingerprint.is_empty() {
                     return Err("Fingerprint cannot be empty");
@@ -341,15 +369,13 @@ impl KfpMessage {
                 if p.contributions.len() > MAX_PARTICIPANTS {
                     return Err("Too many contributions in finalize payload");
                 }
-                for &idx in p.contributions.keys() {
+                for (&idx, contrib) in &p.contributions {
                     if idx == 0 {
                         return Err("Invalid contribution index");
                     }
                     if idx as usize > MAX_PARTICIPANTS {
                         return Err("Contribution index exceeds maximum");
                     }
-                }
-                for contrib in p.contributions.values() {
                     if contrib.account_xpub.len() < MIN_XPUB_LENGTH {
                         return Err("Contribution xpub too short");
                     }
