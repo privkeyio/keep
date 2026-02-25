@@ -78,6 +78,13 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
 
     let rest = url
         .strip_prefix("wss://")
+        .or_else(|| {
+            if cfg!(feature = "allow-ws") {
+                url.strip_prefix("ws://")
+            } else {
+                None
+            }
+        })
         .ok_or("Must use wss:// protocol")?;
 
     if rest.is_empty() {
@@ -126,7 +133,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Invalid host characters".into());
     }
 
-    if is_internal_host(host) {
+    if !cfg!(feature = "allow-ws") && is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
 

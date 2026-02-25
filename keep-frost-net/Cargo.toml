@@ -49,3 +49,4 @@ tokio-test = "0.4"
 nostr-relay-builder = "0.44"
 chrono = "0.4"
 proptest = "1.5"
+keep-core = { path = "../keep-core", features = ["allow-ws"] }

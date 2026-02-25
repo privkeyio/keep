@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 [features]
 default = []
 testing = []
+allow-ws = []
 
 [dependencies]
 argon2 = "0.5"
