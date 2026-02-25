@@ -133,7 +133,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Invalid host characters".into());
     }
 
-    if is_internal_host(host) {
+    if !cfg!(feature = "allow-ws") && is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
 
