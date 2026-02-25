@@ -4,7 +4,7 @@ mod descriptor;
 mod ecdh;
 mod signing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -283,6 +283,7 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
+    pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64)>>,
 }
 
 impl KfpNode {
@@ -396,6 +397,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
+            seen_xpub_announces: RwLock::new(HashSet::new()),
         })
     }
 
@@ -470,13 +472,14 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey))
             .collect();
 
+        let payload = XpubAnnouncePayload::new(
+            self.group_pubkey,
+            self.share.metadata.identifier,
+            recovery_xpubs.clone(),
+        );
+
         for (_, pubkey) in &peers_snapshot {
-            let payload = XpubAnnouncePayload::new(
-                self.group_pubkey,
-                self.share.metadata.identifier,
-                recovery_xpubs.clone(),
-            );
-            let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload)?;
+            let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload.clone())?;
             self.client
                 .send_event(&event)
                 .await
@@ -703,6 +706,13 @@ impl KfpNode {
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
                     self.descriptor_sessions.write().cleanup_expired();
+                    {
+                        let now = chrono::Utc::now().timestamp() as u64;
+                        let window = self.replay_window_secs + 30;
+                        self.seen_xpub_announces.write().retain(|(_, ts)| {
+                            now.saturating_sub(window) <= *ts
+                        });
+                    }
                 }
                 notification = notifications.recv() => {
                     match notification {

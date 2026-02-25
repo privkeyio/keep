@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -27,6 +29,7 @@ pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const MAX_RECOVERY_XPUBS: usize = 20;
 pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
+pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
 const MAX_FUTURE_SKEW_SECS: u64 = 30;
@@ -370,6 +373,7 @@ impl KfpMessage {
                 if p.recovery_xpubs.is_empty() {
                     return Err("Recovery xpubs must not be empty");
                 }
+                let mut seen_xpubs = HashSet::with_capacity(p.recovery_xpubs.len());
                 for xpub in &p.recovery_xpubs {
                     if xpub.xpub.is_empty() {
                         return Err("Recovery xpub cannot be empty");
@@ -377,11 +381,16 @@ impl KfpMessage {
                     if xpub.xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Recovery xpub exceeds maximum length");
                     }
-                    if xpub.fingerprint.is_empty() {
-                        return Err("Recovery fingerprint cannot be empty");
+                    if !VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.xpub.starts_with(pfx)) {
+                        return Err("Recovery xpub has invalid prefix");
                     }
-                    if xpub.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                        return Err("Recovery fingerprint exceeds maximum length");
+                    if !seen_xpubs.insert(&xpub.xpub) {
+                        return Err("Duplicate recovery xpub");
+                    }
+                    if xpub.fingerprint.len() != 8
+                        || !xpub.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err("Recovery fingerprint must be exactly 8 hex characters");
                     }
                     if let Some(ref label) = xpub.label {
                         if label.len() > MAX_XPUB_LABEL_LENGTH {
@@ -493,7 +502,7 @@ impl AnnouncePayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AnnouncedXpub {
     pub xpub: String,
     pub fingerprint: String,
