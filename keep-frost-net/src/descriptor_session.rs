@@ -198,7 +198,12 @@ impl DescriptorSession {
         Ok(())
     }
 
-    pub fn add_ack(&mut self, share_index: u16, descriptor_hash: [u8; 32]) -> Result<()> {
+    pub fn add_ack(
+        &mut self,
+        share_index: u16,
+        descriptor_hash: [u8; 32],
+        key_proof_psbt: &[u8],
+    ) -> Result<()> {
         if self.state != DescriptorSessionState::Finalized {
             return Err(FrostNetError::Session("Not accepting ACKs".into()));
         }
@@ -227,6 +232,19 @@ impl DescriptorSession {
         if descriptor_hash != expected_hash {
             return Err(FrostNetError::Session("Descriptor hash mismatch".into()));
         }
+
+        let contrib = self.contributions.get(&share_index).ok_or_else(|| {
+            FrostNetError::Session(format!("No xpub contribution for share {share_index}"))
+        })?;
+        let network = parse_network(&self.network)?;
+        keep_bitcoin::verify_key_proof(
+            &self.session_id,
+            share_index,
+            &contrib.account_xpub,
+            key_proof_psbt,
+            network,
+        )
+        .map_err(|e| FrostNetError::Session(format!("Key proof invalid: {e}")))?;
 
         self.acks.insert(share_index);
 
@@ -421,7 +439,7 @@ pub fn derive_descriptor_session_id(
     hasher.finalize().into()
 }
 
-fn parse_network(network_str: &str) -> Result<Network> {
+pub(crate) fn parse_network(network_str: &str) -> Result<Network> {
     Network::from_str(network_str)
         .map_err(|_| FrostNetError::Session(format!("unknown network: {network_str}")))
 }
@@ -585,6 +603,35 @@ mod tests {
         hasher.finalize().into()
     }
 
+    fn real_xpub(seed: u8) -> (String, String, [u8; 32]) {
+        use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let secret = [seed; 32];
+        let master = Xpriv::new_master(bitcoin::Network::Signet, &secret).unwrap();
+        let path = DerivationPath::from_str("m/86'/1'/0'").unwrap();
+        let account = master.derive_priv(&secp, &path).unwrap();
+        let xpub = Xpub::from_priv(&secp, &account);
+        let fp = master.fingerprint(&secp);
+        (xpub.to_string(), fp.to_string(), secret)
+    }
+
+    fn sign_proof(
+        session_id: &[u8; 32],
+        share_index: u16,
+        xpub: &str,
+        secret: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut psbt = keep_bitcoin::build_key_proof_psbt(
+            session_id,
+            share_index,
+            xpub,
+            keep_bitcoin::Network::Signet,
+        )
+        .unwrap();
+        keep_bitcoin::sign_key_proof(&mut psbt, secret, keep_bitcoin::Network::Signet).unwrap()
+    }
+
     #[test]
     fn test_session_creation_and_state() {
         let session = test_session();
@@ -689,16 +736,15 @@ mod tests {
     #[test]
     fn test_ack_flow_and_completion() {
         let mut session = test_session();
+        let session_id = *session.session_id();
 
-        session
-            .add_contribution(1, "tpub1".into(), "aa".into())
-            .unwrap();
-        session
-            .add_contribution(2, "tpub2".into(), "bb".into())
-            .unwrap();
-        session
-            .add_contribution(3, "tpub3".into(), "cc".into())
-            .unwrap();
+        let (xpub1, fp1, secret1) = real_xpub(41);
+        let (xpub2, fp2, secret2) = real_xpub(42);
+        let (xpub3, fp3, secret3) = real_xpub(43);
+
+        session.add_contribution(1, xpub1.clone(), fp1).unwrap();
+        session.add_contribution(2, xpub2.clone(), fp2).unwrap();
+        session.add_contribution(3, xpub3.clone(), fp3).unwrap();
 
         let external = "tr(frost_key,{pk(xpub1),pk(xpub2)})";
         let internal = "tr(frost_key,{pk(xpub1),pk(xpub2)})/1";
@@ -712,13 +758,17 @@ mod tests {
 
         let hash = descriptor_hash(external, internal, &policy_hash);
 
-        session.add_ack(1, hash).unwrap();
+        let proof1 = sign_proof(&session_id, 1, &xpub1, &secret1);
+        let proof2 = sign_proof(&session_id, 2, &xpub2, &secret2);
+        let proof3 = sign_proof(&session_id, 3, &xpub3, &secret3);
+
+        session.add_ack(1, hash, &proof1).unwrap();
         assert!(!session.is_complete());
 
-        session.add_ack(2, hash).unwrap();
+        session.add_ack(2, hash, &proof2).unwrap();
         assert!(!session.is_complete());
 
-        session.add_ack(3, hash).unwrap();
+        session.add_ack(3, hash, &proof3).unwrap();
         assert!(session.is_complete());
         assert_eq!(*session.state(), DescriptorSessionState::Complete);
     }
@@ -726,16 +776,15 @@ mod tests {
     #[test]
     fn test_ack_wrong_hash() {
         let mut session = test_session();
+        let session_id = *session.session_id();
 
-        session
-            .add_contribution(1, "tpub1".into(), "aa".into())
-            .unwrap();
-        session
-            .add_contribution(2, "tpub2".into(), "bb".into())
-            .unwrap();
-        session
-            .add_contribution(3, "tpub3".into(), "cc".into())
-            .unwrap();
+        let (xpub1, fp1, secret1) = real_xpub(41);
+        let (xpub2, fp2, _) = real_xpub(42);
+        let (xpub3, fp3, _) = real_xpub(43);
+
+        session.add_contribution(1, xpub1.clone(), fp1).unwrap();
+        session.add_contribution(2, xpub2, fp2).unwrap();
+        session.add_contribution(3, xpub3, fp3).unwrap();
 
         let finalized = FinalizedDescriptor {
             external: "tr(frost_key)".into(),
@@ -744,8 +793,9 @@ mod tests {
         };
         session.set_finalized(finalized).unwrap();
 
+        let proof1 = sign_proof(&session_id, 1, &xpub1, &secret1);
         let wrong_hash = [0xFF; 32];
-        let result = session.add_ack(1, wrong_hash);
+        let result = session.add_ack(1, wrong_hash, &proof1);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("hash mismatch"));
@@ -755,7 +805,7 @@ mod tests {
     fn test_ack_wrong_state() {
         let mut session = test_session();
 
-        let result = session.add_ack(1, [0; 32]);
+        let result = session.add_ack(1, [0; 32], &[]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Not accepting ACKs"));
