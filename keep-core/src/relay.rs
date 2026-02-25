@@ -314,6 +314,12 @@ mod tests {
         assert!(validate_relay_url("wss://[fd00::1]/").is_err());
         assert!(validate_relay_url("wss://[fe80::1]/").is_err());
         assert!(validate_relay_url("wss://[ff02::1]/").is_err());
+        // IPv4-compatible (::x.x.x.x) — exercises to_embedded_v4 deprecated-compat path
+        assert!(validate_relay_url("wss://[::7f00:1]/").is_err()); // ::127.0.0.1
+        assert!(validate_relay_url("wss://[::a00:1]/").is_err()); // ::10.0.0.1
+        // NAT64 Well-Known Prefix 64:ff9b::/96 — exercises to_embedded_v4 NAT64 path
+        assert!(validate_relay_url("wss://[64:ff9b::7f00:1]/").is_err()); // embeds 127.0.0.1
+        assert!(validate_relay_url("wss://[64:ff9b::a00:1]/").is_err()); // embeds 10.0.0.1
     }
 
     #[test]
