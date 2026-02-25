@@ -316,10 +316,7 @@ impl KfpMessage {
                                 if xpub.len() > MAX_XPUB_LENGTH {
                                     return Err("External xpub exceeds maximum length");
                                 }
-                                if !VALID_XPUB_PREFIXES
-                                    .iter()
-                                    .any(|pfx| xpub.starts_with(pfx))
-                                {
+                                if !VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.starts_with(pfx)) {
                                     return Err("External xpub has invalid prefix");
                                 }
                                 if fingerprint.len() > MAX_FINGERPRINT_LENGTH {

@@ -305,7 +305,9 @@ impl DescriptorSession {
                 None
             }
             DescriptorSessionState::Finalized => {
-                let fin_at = self.finalized_at.expect("finalized_at set in set_finalized");
+                let fin_at = self
+                    .finalized_at
+                    .expect("finalized_at set in set_finalized");
                 if fin_at.elapsed() > self.ack_phase_timeout {
                     return Some("ack");
                 }
