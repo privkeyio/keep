@@ -25,10 +25,19 @@ impl KfpNode {
         own_xpub: &str,
         own_fingerprint: &str,
     ) -> Result<[u8; 32]> {
+        let our_index = self.share.metadata.identifier;
+
+        {
+            let proposers = self.descriptor_proposers.read();
+            if !proposers.is_empty() && !proposers.contains(&our_index) {
+                return Err(FrostNetError::Session(format!(
+                    "Share {our_index} is not authorized to propose descriptors"
+                )));
+            }
+        }
+
         let created_at = chrono::Utc::now().timestamp() as u64;
         let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
-
-        let our_index = self.share.metadata.identifier;
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
 
@@ -140,11 +149,21 @@ impl KfpNode {
             ));
         }
 
-        {
+        let sender_share_index = {
             let peers = self.peers.read();
-            if peers.get_peer_by_pubkey(&sender).is_none() {
-                return Err(FrostNetError::UntrustedPeer(format!(
+            let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!(
                     "Descriptor proposal from unknown peer: {sender}"
+                ))
+            })?;
+            peer.share_index
+        };
+
+        {
+            let proposers = self.descriptor_proposers.read();
+            if !proposers.is_empty() && !proposers.contains(&sender_share_index) {
+                return Err(FrostNetError::Session(format!(
+                    "Share {sender_share_index} is not authorized to propose descriptors"
                 )));
             }
         }
@@ -160,11 +179,6 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let initiator_share_index = {
-            let peers = self.peers.read();
-            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
-        };
-
         {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
@@ -178,14 +192,12 @@ impl KfpNode {
                 Ok(session) => {
                     session.set_initiator(sender);
 
-                    if let Some(idx) = initiator_share_index {
-                        if let Err(e) = session.add_contribution(
-                            idx,
-                            payload.initiator_xpub.clone(),
-                            payload.initiator_fingerprint.clone(),
-                        ) {
-                            debug!("Failed to store initiator contribution: {e}");
-                        }
+                    if let Err(e) = session.add_contribution(
+                        sender_share_index,
+                        payload.initiator_xpub.clone(),
+                        payload.initiator_fingerprint.clone(),
+                    ) {
+                        debug!("Failed to store initiator contribution: {e}");
                     }
                 }
                 Err(_) => {

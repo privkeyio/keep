@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
-    KeySlot, WalletPolicy, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
+    KeySlot, WalletPolicy, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
+    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
+    MAX_XPUB_LENGTH,
 };
 
 const MAX_SESSIONS: usize = 64;
@@ -51,7 +53,12 @@ pub struct DescriptorSession {
     expected_acks: HashSet<u16>,
     state: DescriptorSessionState,
     created_at: Instant,
+    contributions_complete_at: Option<Instant>,
+    finalized_at: Option<Instant>,
     timeout: Duration,
+    contribution_timeout: Duration,
+    finalize_timeout: Duration,
+    ack_phase_timeout: Duration,
 }
 
 impl DescriptorSession {
@@ -78,7 +85,12 @@ impl DescriptorSession {
             expected_acks,
             state: DescriptorSessionState::Proposed,
             created_at: Instant::now(),
+            contributions_complete_at: None,
+            finalized_at: None,
             timeout,
+            contribution_timeout: Duration::from_secs(DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS),
+            finalize_timeout: Duration::from_secs(DESCRIPTOR_FINALIZE_TIMEOUT_SECS),
+            ack_phase_timeout: Duration::from_secs(DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS),
         }
     }
 
@@ -161,6 +173,10 @@ impl DescriptorSession {
             },
         );
 
+        if self.has_all_contributions() {
+            self.contributions_complete_at = Some(Instant::now());
+        }
+
         Ok(())
     }
 
@@ -195,6 +211,7 @@ impl DescriptorSession {
 
         self.descriptor = Some(descriptor);
         self.state = DescriptorSessionState::Finalized;
+        self.finalized_at = Some(Instant::now());
         Ok(())
     }
 
@@ -268,7 +285,53 @@ impl DescriptorSession {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > self.timeout
+        if self.created_at.elapsed() > self.timeout {
+            return true;
+        }
+        match self.state {
+            DescriptorSessionState::Proposed => {
+                if let Some(complete_at) = self.contributions_complete_at {
+                    complete_at.elapsed() > self.finalize_timeout
+                } else {
+                    self.created_at.elapsed() > self.contribution_timeout
+                }
+            }
+            DescriptorSessionState::Finalized => {
+                if let Some(fin_at) = self.finalized_at {
+                    fin_at.elapsed() > self.ack_phase_timeout
+                } else {
+                    false
+                }
+            }
+            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => false,
+        }
+    }
+
+    pub fn expired_phase(&self) -> Option<&'static str> {
+        if self.created_at.elapsed() > self.timeout {
+            return Some("session");
+        }
+        match self.state {
+            DescriptorSessionState::Proposed => {
+                if let Some(complete_at) = self.contributions_complete_at {
+                    if complete_at.elapsed() > self.finalize_timeout {
+                        return Some("finalize");
+                    }
+                } else if self.created_at.elapsed() > self.contribution_timeout {
+                    return Some("contribution");
+                }
+                None
+            }
+            DescriptorSessionState::Finalized => {
+                if let Some(fin_at) = self.finalized_at {
+                    if fin_at.elapsed() > self.ack_phase_timeout {
+                        return Some("ack");
+                    }
+                }
+                None
+            }
+            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => None,
+        }
     }
 
     pub fn is_participant(&self, share_index: u16) -> bool {
@@ -372,8 +435,18 @@ impl DescriptorSessionManager {
         self.sessions.remove(session_id);
     }
 
-    pub fn cleanup_expired(&mut self) {
-        self.sessions.retain(|_, session| !session.is_expired());
+    pub fn cleanup_expired(&mut self) -> Vec<([u8; 32], String)> {
+        let mut expired = Vec::new();
+        self.sessions.retain(|id, session| {
+            if session.is_expired() {
+                let phase = session.expired_phase().unwrap_or("session");
+                expired.push((*id, format!("timeout:{phase}")));
+                false
+            } else {
+                true
+            }
+        });
+        expired
     }
 }
 
@@ -949,7 +1022,8 @@ mod tests {
             .unwrap();
 
         std::thread::sleep(Duration::from_millis(10));
-        manager.cleanup_expired();
+        let expired = manager.cleanup_expired();
+        assert!(!expired.is_empty());
         assert!(manager.get_session(&[1u8; 32]).is_none());
     }
 
@@ -1012,6 +1086,128 @@ mod tests {
     fn test_session_manager_default() {
         let manager = DescriptorSessionManager::default();
         assert!(manager.get_session(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn test_contribution_phase_timeout() {
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let mut session = DescriptorSession::new(
+            [1u8; 32],
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        session.contribution_timeout = Duration::from_millis(1);
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(session.is_expired());
+        assert_eq!(session.expired_phase(), Some("contribution"));
+    }
+
+    #[test]
+    fn test_finalize_phase_timeout() {
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let mut session = DescriptorSession::new(
+            [1u8; 32],
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        session.finalize_timeout = Duration::from_millis(1);
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+        session
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .unwrap();
+        session
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .unwrap();
+        assert!(session.contributions_complete_at.is_some());
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(session.is_expired());
+        assert_eq!(session.expired_phase(), Some("finalize"));
+    }
+
+    #[test]
+    fn test_ack_phase_timeout() {
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let mut session = DescriptorSession::new(
+            [1u8; 32],
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        session.ack_phase_timeout = Duration::from_millis(1);
+
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+        session
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .unwrap();
+        session
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .unwrap();
+
+        let finalized = FinalizedDescriptor {
+            external: "tr(frost_key)".into(),
+            internal: "tr(frost_key)/1".into(),
+            policy_hash: [0; 32],
+        };
+        session.set_finalized(finalized).unwrap();
+        assert!(session.finalized_at.is_some());
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(session.is_expired());
+        assert_eq!(session.expired_phase(), Some("ack"));
+    }
+
+    #[test]
+    fn test_cleanup_returns_phase_reasons() {
+        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_secs(600));
+        let policy = test_policy();
+
+        {
+            let session = manager
+                .create_session(
+                    [1u8; 32],
+                    [2u8; 32],
+                    policy,
+                    "signet".into(),
+                    [1, 2, 3].into(),
+                    [1, 2, 3].into(),
+                )
+                .unwrap();
+            session.contribution_timeout = Duration::from_millis(1);
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+        let expired = manager.cleanup_expired();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, [1u8; 32]);
+        assert_eq!(expired[0].1, "timeout:contribution");
     }
 
     #[test]

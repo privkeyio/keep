@@ -284,6 +284,7 @@ pub struct KfpNode {
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
+    pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
 }
 
 impl KfpNode {
@@ -398,6 +399,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
+            descriptor_proposers: RwLock::new(HashSet::new()),
         })
     }
 
@@ -514,6 +516,14 @@ impl KfpNode {
             .read()
             .get_peer_recovery_xpubs(share_index)
             .map(|xpubs| xpubs.to_vec())
+    }
+
+    pub fn set_descriptor_proposers(&self, indices: HashSet<u16>) {
+        *self.descriptor_proposers.write() = indices;
+    }
+
+    pub fn descriptor_proposers(&self) -> HashSet<u16> {
+        self.descriptor_proposers.read().clone()
     }
 
     pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
@@ -719,7 +729,13 @@ impl KfpNode {
                 _ = cleanup_interval.tick() => {
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
-                    self.descriptor_sessions.write().cleanup_expired();
+                    let expired = self.descriptor_sessions.write().cleanup_expired();
+                    for (session_id, reason) in expired {
+                        let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                            session_id,
+                            error: reason,
+                        });
+                    }
                     {
                         let now = chrono::Utc::now().timestamp().max(0) as u64;
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
