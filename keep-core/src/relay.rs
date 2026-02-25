@@ -133,7 +133,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Invalid host characters".into());
     }
 
-    if !cfg!(feature = "allow-ws") && is_internal_host(host) {
+    if !cfg!(feature = "allow-internal") && is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
 
@@ -168,13 +168,16 @@ fn to_embedded_v4(addr: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if let Some(mapped) = addr.to_ipv4_mapped() {
         return Some(mapped);
     }
-    // IPv4-compatible addresses (::x.x.x.x) -- deprecated but still exploitable
     let s = addr.segments();
+    let octets = addr.octets();
+    let v4 = || std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+    // IPv4-compatible addresses (::x.x.x.x) -- deprecated but still exploitable
     if s[..6] == [0, 0, 0, 0, 0, 0] {
-        let octets = addr.octets();
-        return Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
+        return Some(v4());
+    }
+    // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return Some(v4());
     }
     None
 }
@@ -501,5 +504,18 @@ mod tests {
     fn is_internal_ip_blocks_this_network() {
         use std::net::IpAddr;
         assert!(is_internal_ip(&"0.1.2.3".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_nat64_wkp() {
+        use std::net::IpAddr;
+        // 64:ff9b::a00:1 embeds 10.0.0.1 (private)
+        assert!(is_internal_ip(
+            &"64:ff9b::a00:1".parse::<IpAddr>().unwrap()
+        ));
+        // 64:ff9b::7f00:1 embeds 127.0.0.1 (loopback)
+        assert!(is_internal_ip(
+            &"64:ff9b::7f00:1".parse::<IpAddr>().unwrap()
+        ));
     }
 }

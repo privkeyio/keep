@@ -10,6 +10,8 @@ license = "AGPL-3.0-or-later"
 default = []
 testing = []
 allow-ws = []
+# WARNING: allow-internal disables SSRF internal-host checks. MUST NOT be enabled in production.
+allow-internal = []
 
 [dependencies]
 argon2 = "0.5"
