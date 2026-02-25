@@ -444,9 +444,7 @@ mod tests {
         use std::net::IpAddr;
         assert!(!is_internal_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
         assert!(!is_internal_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
-        assert!(!is_internal_ip(
-            &"2607:f8b0::1".parse::<IpAddr>().unwrap()
-        ));
+        assert!(!is_internal_ip(&"2607:f8b0::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -482,7 +480,9 @@ mod tests {
     fn is_internal_ip_blocks_multicast_v4() {
         use std::net::IpAddr;
         assert!(is_internal_ip(&"224.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_internal_ip(&"239.255.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(
+            &"239.255.255.255".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]

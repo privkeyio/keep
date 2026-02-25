@@ -7,9 +7,8 @@ use crate::error::KeepMobileError;
 use crate::types::PeerStatus;
 
 pub(crate) fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError> {
-    keep_core::relay::validate_relay_url(relay_url).map_err(|msg| {
-        KeepMobileError::InvalidRelayUrl { msg }
-    })
+    keep_core::relay::validate_relay_url(relay_url)
+        .map_err(|msg| KeepMobileError::InvalidRelayUrl { msg })
 }
 
 pub(crate) fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
@@ -77,4 +76,3 @@ pub(crate) fn parse_warden_pubkey(
             ),
         })
 }
-
