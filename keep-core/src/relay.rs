@@ -158,6 +158,7 @@ fn is_internal_v6(addr: &std::net::Ipv6Addr) -> bool {
     let segments = addr.segments();
     (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
         || addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
