@@ -432,6 +432,15 @@ fn dispatch_wallet(
             commands::wallet::cmd_wallet_descriptor(out, path, &group, &network)
         }
         WalletCommands::Delete { group } => commands::wallet::cmd_wallet_delete(out, path, &group),
+        WalletCommands::AnnounceKeys {
+            group,
+            relay,
+            share,
+            xpub,
+        } => {
+            let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
+            commands::wallet::cmd_wallet_announce_keys(out, path, &group, relay, share, &xpub)
+        }
         WalletCommands::Propose {
             group,
             network,

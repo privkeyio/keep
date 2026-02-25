@@ -32,7 +32,7 @@ pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
 pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
-const MAX_FUTURE_SKEW_SECS: u64 = 30;
+pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     let now = chrono::Utc::now().timestamp() as u64;
@@ -381,7 +381,10 @@ impl KfpMessage {
                     if xpub.xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Recovery xpub exceeds maximum length");
                     }
-                    if !VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.xpub.starts_with(pfx)) {
+                    if !VALID_XPUB_PREFIXES
+                        .iter()
+                        .any(|pfx| xpub.xpub.starts_with(pfx))
+                    {
                         return Err("Recovery xpub has invalid prefix");
                     }
                     if !seen_xpubs.insert(&xpub.xpub) {
@@ -393,6 +396,9 @@ impl KfpMessage {
                         return Err("Recovery fingerprint must be exactly 8 hex characters");
                     }
                     if let Some(ref label) = xpub.label {
+                        if label.is_empty() {
+                            return Err("Recovery xpub label cannot be empty");
+                        }
                         if label.len() > MAX_XPUB_LABEL_LENGTH {
                             return Err("Recovery xpub label exceeds maximum length");
                         }

@@ -688,6 +688,159 @@ pub fn cmd_wallet_propose(
     Ok(())
 }
 
+fn parse_announced_xpub(s: &str) -> Result<keep_frost_net::AnnouncedXpub> {
+    let parts: Vec<&str> = s.splitn(3, '/').collect();
+    if parts.len() < 2 {
+        return Err(KeepError::InvalidInput(
+            "Expected format: 'xpub.../fingerprint' or 'xpub.../fingerprint/label'".into(),
+        ));
+    }
+    let xpub = parts[0].to_string();
+    if !keep_frost_net::VALID_XPUB_PREFIXES
+        .iter()
+        .any(|p| xpub.starts_with(p))
+    {
+        return Err(KeepError::InvalidInput(format!(
+            "xpub must start with one of: {}",
+            keep_frost_net::VALID_XPUB_PREFIXES.join(", ")
+        )));
+    }
+    let fingerprint = parts[1].to_string();
+    if fingerprint.len() != 8 || !fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(KeepError::InvalidInput(
+            "fingerprint must be exactly 8 hex characters".into(),
+        ));
+    }
+    let label = parts.get(2).map(|s| s.to_string());
+    Ok(keep_frost_net::AnnouncedXpub {
+        xpub,
+        fingerprint,
+        label,
+    })
+}
+
+pub fn cmd_wallet_announce_keys(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    relay: &str,
+    share_index: Option<u16>,
+    xpub_args: &[String],
+) -> Result<()> {
+    debug!(group, relay, share = ?share_index, "wallet announce-keys");
+
+    let recovery_xpubs: Vec<keep_frost_net::AnnouncedXpub> = xpub_args
+        .iter()
+        .map(|s| parse_announced_xpub(s))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = parse_group_id(group)?;
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    out.newline();
+    out.header("Announce Recovery Keys");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Relay", relay);
+    for xpub in &recovery_xpubs {
+        let label = xpub.label.as_deref().unwrap_or("(none)");
+        out.field(
+            "Xpub",
+            &format!("{}.../{}/{}", &xpub.xpub[..12], xpub.fingerprint, label),
+        );
+    }
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    rt.block_on(async {
+        let node = std::sync::Arc::new(
+            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?,
+        );
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let mut event_rx = node.subscribe();
+
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            }
+        });
+
+        let spinner = out.spinner("Discovering peers...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        spinner.finish();
+
+        let online = node.online_peers();
+        out.info(&format!("{online} peer(s) online"));
+        if online == 0 {
+            node_handle.abort();
+            return Err(KeepError::Frost(
+                "No peers online. Run 'keep frost network serve' on other devices first.".into(),
+            ));
+        }
+
+        let spinner = out.spinner("Announcing recovery xpubs...");
+        node.announce_xpubs(recovery_xpubs.clone())
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+        out.success(&format!(
+            "Announced {} recovery xpub(s)",
+            recovery_xpubs.len()
+        ));
+
+        let spinner = out.spinner("Listening for peer announcements...");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Ok(keep_frost_net::KfpNodeEvent::XpubAnnounced {
+                    share_index,
+                    recovery_xpubs: xpubs,
+                })) => {
+                    out.info(&format!(
+                        "  Share {} announced {} recovery xpub(s)",
+                        share_index,
+                        xpubs.len()
+                    ));
+                }
+                Ok(Err(_)) => break,
+                Err(_) => break,
+                _ => {}
+            }
+        }
+        spinner.finish();
+        node_handle.abort();
+
+        out.newline();
+        out.success("Done! Recovery xpubs exchanged.");
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

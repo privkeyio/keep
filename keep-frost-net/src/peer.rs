@@ -153,7 +153,7 @@ impl PeerManager {
             .map(|p| p.recovery_xpubs.as_slice())
     }
 
-    pub fn get_peer_mut(&mut self, share_index: u16) -> Option<&mut Peer> {
+    pub(crate) fn get_peer_mut(&mut self, share_index: u16) -> Option<&mut Peer> {
         self.peers.get_mut(&share_index)
     }
 

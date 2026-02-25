@@ -88,7 +88,7 @@ pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, Signin
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
-    AnnouncedXpub, AnnouncePayload, CommitmentPayload, DescriptorAckPayload,
+    AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
     DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
     EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, PingPayload, PolicyTier, PongPayload,
@@ -100,7 +100,7 @@ pub use protocol::{
     MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE,
     MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS,
     MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
-    MAX_XPUB_LENGTH, VALID_NETWORKS,
+    MAX_XPUB_LENGTH, VALID_NETWORKS, VALID_XPUB_PREFIXES,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

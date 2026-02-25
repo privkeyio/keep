@@ -464,12 +464,12 @@ impl KfpNode {
     }
 
     pub async fn announce_xpubs(&self, recovery_xpubs: Vec<AnnouncedXpub>) -> Result<()> {
-        let peers_snapshot: Vec<(u16, PublicKey)> = self
+        let peer_pubkeys: Vec<PublicKey> = self
             .peers
             .read()
             .get_online_peers()
             .iter()
-            .map(|p| (p.share_index, p.pubkey))
+            .map(|p| p.pubkey)
             .collect();
 
         let payload = XpubAnnouncePayload::new(
@@ -478,18 +478,24 @@ impl KfpNode {
             recovery_xpubs.clone(),
         );
 
-        for (_, pubkey) in &peers_snapshot {
+        let mut errors = Vec::new();
+        for pubkey in &peer_pubkeys {
             let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload.clone())?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            if let Err(e) = self.client.send_event(&event).await {
+                warn!(peer = %pubkey, error = %e, "Failed to send xpub announcement");
+                errors.push(e.to_string());
+            }
+        }
+        if errors.len() == peer_pubkeys.len() && !peer_pubkeys.is_empty() {
+            return Err(FrostNetError::Transport(
+                "Failed to send xpub announcement to any peer".into(),
+            ));
         }
 
         info!(
             share_index = self.share.metadata.identifier,
             xpub_count = recovery_xpubs.len(),
-            peer_count = peers_snapshot.len(),
+            peer_count = peer_pubkeys.len(),
             "Announced recovery xpubs"
         );
         Ok(())
@@ -707,8 +713,8 @@ impl KfpNode {
                     self.ecdh_sessions.write().cleanup_expired();
                     self.descriptor_sessions.write().cleanup_expired();
                     {
-                        let now = chrono::Utc::now().timestamp() as u64;
-                        let window = self.replay_window_secs + 30;
+                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
                         self.seen_xpub_announces.write().retain(|(_, ts)| {
                             now.saturating_sub(window) <= *ts
                         });

@@ -106,3 +106,10 @@ pub struct DescriptorProposal {
     pub network: String,
     pub tiers: Vec<RecoveryTierConfig>,
 }
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct AnnouncedXpubInfo {
+    pub xpub: String,
+    pub fingerprint: String,
+    pub label: Option<String>,
+}

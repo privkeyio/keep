@@ -816,25 +816,19 @@ impl KfpNode {
             ));
         }
 
+        self.verify_peer_share_index(sender, payload.share_index)?;
+
         let dedup_key = (payload.share_index, payload.created_at);
         if !self.seen_xpub_announces.write().insert(dedup_key) {
             return Ok(());
         }
 
-        self.verify_peer_share_index(sender, payload.share_index)?;
-
-        let peer_found = {
+        {
             let mut peers = self.peers.write();
-            if let Some(peer) = peers.get_peer_mut(payload.share_index) {
-                peer.set_recovery_xpubs(payload.recovery_xpubs.clone());
-                true
-            } else {
-                false
-            }
-        };
-
-        if !peer_found {
-            return Ok(());
+            let Some(peer) = peers.get_peer_mut(payload.share_index) else {
+                return Ok(());
+            };
+            peer.set_recovery_xpubs(payload.recovery_xpubs.clone());
         }
 
         info!(

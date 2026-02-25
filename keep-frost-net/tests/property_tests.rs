@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use keep_frost_net::{
-    AnnouncedXpub, AnnouncePayload, CommitmentPayload, ErrorPayload, KfpMessage,
+    AnnouncePayload, AnnouncedXpub, CommitmentPayload, ErrorPayload, KfpMessage,
     SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, XpubAnnouncePayload,
     MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_ERROR_CODE_LENGTH,
     MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH,
