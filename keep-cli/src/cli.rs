@@ -172,6 +172,21 @@ pub(crate) enum WalletCommands {
         #[arg(short, long)]
         group: String,
     },
+    /// Announce recovery xpubs to FROST group peers
+    AnnounceKeys {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(short, long, help = "Nostr relay URL")]
+        relay: Option<String>,
+        #[arg(long, help = "Share index to use")]
+        share: Option<u16>,
+        #[arg(
+            long,
+            help = "Recovery xpub: 'xpub.../fingerprint' or 'xpub.../fingerprint/label'",
+            required = true
+        )]
+        xpub: Vec<String>,
+    },
     /// Propose a wallet descriptor via Nostr descriptor coordination
     Propose {
         #[arg(short, long, help = "FROST group npub or hex")]

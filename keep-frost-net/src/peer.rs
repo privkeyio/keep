@@ -4,6 +4,8 @@ use nostr_sdk::PublicKey;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::protocol::AnnouncedXpub;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
     Online,
@@ -34,6 +36,7 @@ pub struct Peer {
     pub status: PeerStatus,
     pub protocol_version: u8,
     pub attestation_status: AttestationStatus,
+    pub recovery_xpubs: Vec<AnnouncedXpub>,
 }
 
 impl Peer {
@@ -48,6 +51,7 @@ impl Peer {
             status: PeerStatus::Online,
             protocol_version: crate::KFP_VERSION,
             attestation_status: AttestationStatus::NotProvided,
+            recovery_xpubs: Vec::new(),
         }
     }
 
@@ -78,6 +82,11 @@ impl Peer {
         self
     }
 
+    pub fn with_recovery_xpubs(mut self, xpubs: Vec<AnnouncedXpub>) -> Self {
+        self.recovery_xpubs = xpubs;
+        self
+    }
+
     pub fn can_sign(&self) -> bool {
         self.capabilities.contains(&"sign".to_string())
     }
@@ -89,6 +98,10 @@ impl Peer {
     pub fn touch(&mut self) {
         self.last_seen = Instant::now();
         self.status = PeerStatus::Online;
+    }
+
+    pub fn set_recovery_xpubs(&mut self, xpubs: Vec<AnnouncedXpub>) {
+        self.recovery_xpubs = xpubs;
     }
 }
 
@@ -132,6 +145,16 @@ impl PeerManager {
 
     pub fn get_peer(&self, share_index: u16) -> Option<&Peer> {
         self.peers.get(&share_index)
+    }
+
+    pub fn get_peer_recovery_xpubs(&self, share_index: u16) -> Option<&[AnnouncedXpub]> {
+        self.peers
+            .get(&share_index)
+            .map(|p| p.recovery_xpubs.as_slice())
+    }
+
+    pub(crate) fn get_peer_mut(&mut self, share_index: u16) -> Option<&mut Peer> {
+        self.peers.get_mut(&share_index)
     }
 
     pub fn get_peer_by_pubkey(&self, pubkey: &PublicKey) -> Option<&Peer> {

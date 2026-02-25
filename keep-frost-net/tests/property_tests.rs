@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
 
 use keep_frost_net::{
-    AnnouncePayload, CommitmentPayload, ErrorPayload, KfpMessage, SignRequestPayload,
-    SignatureCompletePayload, SignatureSharePayload, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH,
-    MAX_COMMITMENT_SIZE, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE,
-    MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_SIGNATURE_SHARE_SIZE,
+    AnnouncePayload, AnnouncedXpub, CommitmentPayload, ErrorPayload, KfpMessage,
+    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, XpubAnnouncePayload,
+    MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_ERROR_CODE_LENGTH,
+    MAX_ERROR_MESSAGE_LENGTH, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NAME_LENGTH,
+    MAX_PARTICIPANTS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
 };
 use proptest::prelude::*;
+
+const TEST_XPUB: &str = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
+const TEST_TPUB: &str = "tpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
 
 fn roundtrip(msg: KfpMessage) -> KfpMessage {
     let json = msg.to_json().unwrap();
@@ -163,6 +167,81 @@ proptest! {
         payload.capabilities = vec!["c".repeat(MAX_CAPABILITY_LENGTH + extra)];
         prop_assert!(KfpMessage::Announce(payload).validate().is_err());
     }
+
+    #[test]
+    fn xpub_announce_roundtrip(
+        share_index in 1u16..256,
+        xpub_count in 1usize..5,
+        fingerprint_byte in 0u32..=0xFFFFFFFFu32,
+    ) {
+        let fingerprint = format!("{fingerprint_byte:08x}");
+        let xpubs: Vec<AnnouncedXpub> = (0..xpub_count)
+            .map(|i| AnnouncedXpub {
+                xpub: format!("{TEST_XPUB}{i:02}"),
+                fingerprint: fingerprint.clone(),
+                label: None,
+            })
+            .collect();
+        let payload = XpubAnnouncePayload::new([1u8; 32], share_index, xpubs.clone());
+        let KfpMessage::XpubAnnounce(p) = roundtrip(KfpMessage::XpubAnnounce(payload)) else {
+            panic!("Expected XpubAnnounce");
+        };
+        prop_assert_eq!(p.share_index, share_index);
+        prop_assert_eq!(p.recovery_xpubs.len(), xpub_count);
+        for (orig, decoded) in xpubs.iter().zip(p.recovery_xpubs.iter()) {
+            prop_assert_eq!(&orig.xpub, &decoded.xpub);
+            prop_assert_eq!(&orig.fingerprint, &decoded.fingerprint);
+        }
+    }
+
+    #[test]
+    fn xpub_announce_too_many_rejected(extra in 1usize..10) {
+        let xpubs: Vec<AnnouncedXpub> = (0..MAX_RECOVERY_XPUBS + extra)
+            .map(|i| AnnouncedXpub {
+                xpub: format!("{TEST_XPUB}{i:04}"),
+                fingerprint: "aabbccdd".into(),
+                label: None,
+            })
+            .collect();
+        let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+        prop_assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+    }
+
+    #[test]
+    fn xpub_announce_invalid_prefix_rejected(prefix in "[a-z]{4}") {
+        if prefix == "xpub" || prefix == "tpub" {
+            return Ok(());
+        }
+        let xpubs = vec![AnnouncedXpub {
+            xpub: format!("{prefix}{}", &TEST_XPUB[4..]),
+            fingerprint: "aabbccdd".into(),
+            label: None,
+        }];
+        let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+        prop_assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+    }
+
+    #[test]
+    fn xpub_announce_invalid_fingerprint_rejected(bad_fp in "[g-z]{8}") {
+        let xpubs = vec![AnnouncedXpub {
+            xpub: TEST_XPUB.into(),
+            fingerprint: bad_fp,
+            label: None,
+        }];
+        let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+        prop_assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+    }
+
+    #[test]
+    fn xpub_announce_oversized_label_rejected(extra in 1usize..50) {
+        let xpubs = vec![AnnouncedXpub {
+            xpub: TEST_XPUB.into(),
+            fingerprint: "aabbccdd".into(),
+            label: Some("L".repeat(MAX_XPUB_LABEL_LENGTH + extra)),
+        }];
+        let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+        prop_assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+    }
 }
 
 #[test]
@@ -252,4 +331,68 @@ fn boundary_sizes_valid() {
     ))
     .validate()
     .is_ok());
+}
+
+#[test]
+fn valid_xpub_announce_passes_validation() {
+    let xpubs = vec![
+        AnnouncedXpub {
+            xpub: TEST_XPUB.into(),
+            fingerprint: "aabbccdd".into(),
+            label: Some("hot".into()),
+        },
+        AnnouncedXpub {
+            xpub: TEST_TPUB.into(),
+            fingerprint: "00112233".into(),
+            label: None,
+        },
+    ];
+    let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+    assert!(KfpMessage::XpubAnnounce(payload).validate().is_ok());
+}
+
+#[test]
+fn xpub_announce_duplicate_xpubs_rejected() {
+    let xpubs = vec![
+        AnnouncedXpub {
+            xpub: TEST_XPUB.into(),
+            fingerprint: "aabbccdd".into(),
+            label: None,
+        },
+        AnnouncedXpub {
+            xpub: TEST_XPUB.into(),
+            fingerprint: "11223344".into(),
+            label: None,
+        },
+    ];
+    let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+    assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+}
+
+#[test]
+fn xpub_announce_empty_rejected() {
+    let payload = XpubAnnouncePayload::new([1u8; 32], 1, vec![]);
+    assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+}
+
+#[test]
+fn xpub_announce_zero_share_index_rejected() {
+    let xpubs = vec![AnnouncedXpub {
+        xpub: TEST_XPUB.into(),
+        fingerprint: "aabbccdd".into(),
+        label: None,
+    }];
+    let payload = XpubAnnouncePayload::new([1u8; 32], 0, xpubs);
+    assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
+}
+
+#[test]
+fn xpub_announce_short_fingerprint_rejected() {
+    let xpubs = vec![AnnouncedXpub {
+        xpub: TEST_XPUB.into(),
+        fingerprint: "aabb".into(),
+        label: None,
+    }];
+    let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
+    assert!(KfpMessage::XpubAnnounce(payload).validate().is_err());
 }

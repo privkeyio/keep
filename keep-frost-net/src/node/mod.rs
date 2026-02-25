@@ -4,7 +4,7 @@ mod descriptor;
 mod ecdh;
 mod signing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -170,6 +170,10 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+    XpubAnnounced {
+        share_index: u16,
+        recovery_xpubs: Vec<AnnouncedXpub>,
+    },
 }
 
 impl std::fmt::Debug for KfpNodeEvent {
@@ -250,6 +254,14 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
                 .finish(),
+            Self::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => f
+                .debug_struct("XpubAnnounced")
+                .field("share_index", share_index)
+                .field("xpub_count", &recovery_xpubs.len())
+                .finish(),
         }
     }
 }
@@ -271,6 +283,7 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
+    pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
 }
 
 impl KfpNode {
@@ -384,6 +397,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
+            seen_xpub_announces: RwLock::new(HashSet::new()),
         })
     }
 
@@ -447,6 +461,59 @@ impl KfpNode {
 
     pub fn get_peer_policy(&self, pubkey: &PublicKey) -> Option<PeerPolicy> {
         self.policies.read().get(pubkey).cloned()
+    }
+
+    pub async fn announce_xpubs(&self, recovery_xpubs: Vec<AnnouncedXpub>) -> Result<()> {
+        let peer_pubkeys: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            let policies = self.policies.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
+                .map(|p| p.pubkey)
+                .collect()
+        };
+
+        let xpub_count = recovery_xpubs.len();
+        let payload = XpubAnnouncePayload::new(
+            self.group_pubkey,
+            self.share.metadata.identifier,
+            recovery_xpubs,
+        );
+
+        KfpMessage::XpubAnnounce(payload.clone())
+            .validate()
+            .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
+
+        let mut fail_count = 0usize;
+        for pubkey in &peer_pubkeys {
+            let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload.clone())?;
+            if let Err(e) = self.client.send_event(&event).await {
+                warn!(peer = %pubkey, error = %e, "Failed to send xpub announcement");
+                fail_count += 1;
+            }
+        }
+        if fail_count == peer_pubkeys.len() && !peer_pubkeys.is_empty() {
+            return Err(FrostNetError::Transport(
+                "Failed to send xpub announcement to any peer".into(),
+            ));
+        }
+
+        info!(
+            share_index = self.share.metadata.identifier,
+            xpub_count,
+            peer_count = peer_pubkeys.len(),
+            "Announced recovery xpubs"
+        );
+        Ok(())
+    }
+
+    pub fn get_peer_recovery_xpubs(&self, share_index: u16) -> Option<Vec<AnnouncedXpub>> {
+        self.peers
+            .read()
+            .get_peer_recovery_xpubs(share_index)
+            .map(|xpubs| xpubs.to_vec())
     }
 
     pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
@@ -653,6 +720,13 @@ impl KfpNode {
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
                     self.descriptor_sessions.write().cleanup_expired();
+                    {
+                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
+                        self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
+                            now.saturating_sub(window) <= ts
+                        });
+                    }
                 }
                 notification = notifications.recv() => {
                     match notification {
@@ -763,6 +837,9 @@ impl KfpNode {
             }
             KfpMessage::DescriptorNack(payload) => {
                 self.handle_descriptor_nack(event.pubkey, payload).await?;
+            }
+            KfpMessage::XpubAnnounce(payload) => {
+                self.handle_xpub_announce(event.pubkey, payload).await?;
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

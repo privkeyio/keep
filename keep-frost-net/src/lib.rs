@@ -88,18 +88,19 @@ pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, Signin
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
-    AnnouncePayload, CommitmentPayload, DescriptorAckPayload, DescriptorContributePayload,
-    DescriptorFinalizePayload, DescriptorNackPayload, DescriptorProposePayload,
-    EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload, EnclaveAttestation, ErrorPayload,
-    KeySlot, KfpMessage, PingPayload, PolicyTier, PongPayload, RefreshCompletePayload,
-    RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload,
-    SignatureCompletePayload, SignatureSharePayload, WalletPolicy, DEFAULT_REPLAY_WINDOW_SECS,
-    DESCRIPTOR_ACK_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND, KFP_VERSION,
-    MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_DESCRIPTOR_LENGTH,
-    MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER,
-    MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH,
-    MAX_PARTICIPANTS, MAX_RECOVERY_TIERS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LENGTH,
-    VALID_NETWORKS,
+    AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
+    DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
+    DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
+    EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, PingPayload, PolicyTier, PongPayload,
+    RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
+    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, WalletPolicy,
+    XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
+    MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH,
+    MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE,
+    MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS,
+    MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
+    MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, VALID_NETWORKS, VALID_XPUB_PREFIXES,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

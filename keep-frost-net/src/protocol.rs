@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -19,15 +21,19 @@ pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 pub const MAX_RECOVERY_TIERS: usize = 10;
 pub const MAX_KEYS_PER_TIER: usize = 20;
+pub const MIN_XPUB_LENGTH: usize = 111;
 pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const MAX_NACK_REASON_LENGTH: usize = 1024;
+pub const MAX_RECOVERY_XPUBS: usize = 20;
+pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
+pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
-const MAX_FUTURE_SKEW_SECS: u64 = 30;
+pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     let now = chrono::Utc::now().timestamp() as u64;
@@ -56,6 +62,7 @@ pub enum KfpMessage {
     DescriptorFinalize(DescriptorFinalizePayload),
     DescriptorAck(DescriptorAckPayload),
     DescriptorNack(DescriptorNackPayload),
+    XpubAnnounce(XpubAnnouncePayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -81,6 +88,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(_) => "descriptor_finalize",
             KfpMessage::DescriptorAck(_) => "descriptor_ack",
             KfpMessage::DescriptorNack(_) => "descriptor_nack",
+            KfpMessage::XpubAnnounce(_) => "xpub_announce",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -121,6 +129,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
+            KfpMessage::XpubAnnounce(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -299,8 +308,8 @@ impl KfpMessage {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
                 }
-                if p.account_xpub.is_empty() {
-                    return Err("Account xpub cannot be empty");
+                if p.account_xpub.len() < MIN_XPUB_LENGTH {
+                    return Err("Account xpub too short");
                 }
                 if p.account_xpub.len() > MAX_XPUB_LENGTH {
                     return Err("Account xpub exceeds maximum length");
@@ -337,6 +346,9 @@ impl KfpMessage {
                     }
                 }
                 for contrib in p.contributions.values() {
+                    if contrib.account_xpub.len() < MIN_XPUB_LENGTH {
+                        return Err("Contribution xpub too short");
+                    }
                     if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Contribution xpub exceeds maximum length");
                     }
@@ -352,6 +364,48 @@ impl KfpMessage {
                 }
                 if p.reason.len() > MAX_NACK_REASON_LENGTH {
                     return Err("Nack reason exceeds maximum length");
+                }
+            }
+            KfpMessage::XpubAnnounce(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
+                if p.recovery_xpubs.len() > MAX_RECOVERY_XPUBS {
+                    return Err("Too many recovery xpubs");
+                }
+                if p.recovery_xpubs.is_empty() {
+                    return Err("Recovery xpubs must not be empty");
+                }
+                let mut seen_xpubs = HashSet::with_capacity(p.recovery_xpubs.len());
+                for xpub in &p.recovery_xpubs {
+                    if xpub.xpub.len() < MIN_XPUB_LENGTH {
+                        return Err("Recovery xpub too short");
+                    }
+                    if xpub.xpub.len() > MAX_XPUB_LENGTH {
+                        return Err("Recovery xpub exceeds maximum length");
+                    }
+                    if !VALID_XPUB_PREFIXES
+                        .iter()
+                        .any(|pfx| xpub.xpub.starts_with(pfx))
+                    {
+                        return Err("Recovery xpub has invalid prefix");
+                    }
+                    if !seen_xpubs.insert(&xpub.xpub) {
+                        return Err("Duplicate recovery xpub");
+                    }
+                    if xpub.fingerprint.len() != MAX_FINGERPRINT_LENGTH
+                        || !xpub.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err("Recovery fingerprint must be exactly 8 hex characters");
+                    }
+                    if let Some(ref label) = xpub.label {
+                        if label.is_empty() {
+                            return Err("Recovery xpub label cannot be empty");
+                        }
+                        if label.len() > MAX_XPUB_LABEL_LENGTH {
+                            return Err("Recovery xpub label exceeds maximum length");
+                        }
+                    }
                 }
             }
             _ => {}
@@ -454,6 +508,42 @@ impl AnnouncePayload {
     pub fn with_attestation(mut self, attestation: EnclaveAttestation) -> Self {
         self.attestation = Some(attestation);
         self
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AnnouncedXpub {
+    pub xpub: String,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct XpubAnnouncePayload {
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub share_index: u16,
+    pub recovery_xpubs: Vec<AnnouncedXpub>,
+    pub created_at: u64,
+}
+
+impl XpubAnnouncePayload {
+    pub fn new(
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        recovery_xpubs: Vec<AnnouncedXpub>,
+    ) -> Self {
+        Self {
+            group_pubkey,
+            share_index,
+            recovery_xpubs,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -1456,18 +1546,21 @@ mod tests {
     fn test_descriptor_finalize_contributions_roundtrip() {
         use std::collections::BTreeMap;
 
+        let xpub_a = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxAAAAAAAAAAAA";
+        let xpub_b = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxBBBBBBBBBBBB";
+
         let mut contributions = BTreeMap::new();
         contributions.insert(
             1,
             crate::descriptor_session::XpubContribution {
-                account_xpub: "xpub6ABC".to_string(),
+                account_xpub: xpub_a.to_string(),
                 fingerprint: "aabbccdd".to_string(),
             },
         );
         contributions.insert(
             3,
             crate::descriptor_session::XpubContribution {
-                account_xpub: "xpub6DEF".to_string(),
+                account_xpub: xpub_b.to_string(),
                 fingerprint: "11223344".to_string(),
             },
         );
@@ -1475,8 +1568,8 @@ mod tests {
         let payload = DescriptorFinalizePayload::new(
             [1u8; 32],
             [2u8; 32],
-            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/0/*,[11223344]xpub6DEF/0/*))",
-            "wsh(sortedmulti(2,[aabbccdd]xpub6ABC/1/*,[11223344]xpub6DEF/1/*))",
+            &format!("wsh(sortedmulti(2,[aabbccdd]{xpub_a}/0/*,[11223344]{xpub_b}/0/*))"),
+            &format!("wsh(sortedmulti(2,[aabbccdd]{xpub_a}/1/*,[11223344]{xpub_b}/1/*))"),
             [3u8; 32],
             contributions,
         );

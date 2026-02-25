@@ -28,9 +28,9 @@ pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    DescriptorProposal, DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, PeerInfo,
-    PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
-    WalletDescriptorInfo,
+    AnnouncedXpubInfo, DescriptorProposal, DkgConfig, DkgStatus, FrostGenerationResult,
+    GeneratedShareInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata,
+    ThresholdConfig, WalletDescriptorInfo,
 };
 
 use keep_core::frost::{
@@ -107,6 +107,11 @@ pub trait DescriptorCallbacks: Send + Sync {
         internal_descriptor: String,
     ) -> Result<(), KeepMobileError>;
     fn on_failed(&self, session_id: String, error: String) -> Result<(), KeepMobileError>;
+    fn on_xpub_announced(
+        &self,
+        share_index: u16,
+        xpubs: Vec<AnnouncedXpubInfo>,
+    ) -> Result<(), KeepMobileError>;
 }
 
 struct MobileSigningHooks {
@@ -807,6 +812,54 @@ impl KeepMobile {
 
         Ok(())
     }
+
+    pub fn wallet_announce_xpubs(
+        &self,
+        xpubs: Vec<AnnouncedXpubInfo>,
+    ) -> Result<(), KeepMobileError> {
+        if xpubs.is_empty() {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "empty xpub list".into(),
+            });
+        }
+        let announced: Vec<keep_frost_net::AnnouncedXpub> = xpubs
+            .into_iter()
+            .map(|x| keep_frost_net::AnnouncedXpub {
+                xpub: x.xpub,
+                fingerprint: x.fingerprint,
+                label: x.label,
+            })
+            .collect();
+
+        self.runtime.block_on(async {
+            let node_guard = self.node.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            node.announce_xpubs(announced)
+                .await
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+            Ok(())
+        })
+    }
+
+    pub fn wallet_get_peer_recovery_xpubs(
+        &self,
+        share_index: u16,
+    ) -> Result<Option<Vec<AnnouncedXpubInfo>>, KeepMobileError> {
+        self.runtime.block_on(async {
+            let node_guard = self.node.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            Ok(node.get_peer_recovery_xpubs(share_index).map(|xpubs| {
+                xpubs
+                    .into_iter()
+                    .map(|x| AnnouncedXpubInfo {
+                        xpub: x.xpub,
+                        fingerprint: x.fingerprint,
+                        label: x.label,
+                    })
+                    .collect()
+            }))
+        })
+    }
 }
 
 fn clear_descriptor_state(
@@ -1402,6 +1455,24 @@ impl KeepMobile {
                             clear_descriptor_state(&desc.networks, &desc.pending, &session_id);
                             if let Some(cb) = desc.callbacks.read().await.as_ref() {
                                 if let Err(e) = cb.on_failed(hex::encode(session_id), error) {
+                                    tracing::error!("Descriptor callback error: {e}");
+                                }
+                            }
+                        }
+                        Ok(KfpNodeEvent::XpubAnnounced {
+                            share_index,
+                            recovery_xpubs,
+                        }) => {
+                            if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                let xpubs = recovery_xpubs
+                                    .into_iter()
+                                    .map(|x| AnnouncedXpubInfo {
+                                        xpub: x.xpub,
+                                        fingerprint: x.fingerprint,
+                                        label: x.label,
+                                    })
+                                    .collect();
+                                if let Err(e) = cb.on_xpub_announced(share_index, xpubs) {
                                     tracing::error!("Descriptor callback error: {e}");
                                 }
                             }

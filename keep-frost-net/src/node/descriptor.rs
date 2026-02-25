@@ -800,9 +800,62 @@ impl KfpNode {
     pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
         self.descriptor_sessions.write().remove_session(session_id);
     }
-}
 
-const MAX_NACK_REASON_LENGTH: usize = 256;
+    pub(crate) async fn handle_xpub_announce(
+        &self,
+        sender: PublicKey,
+        payload: XpubAnnouncePayload,
+    ) -> Result<()> {
+        if payload.group_pubkey != self.group_pubkey {
+            return Ok(());
+        }
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "XpubAnnounce timestamp outside replay window".into(),
+            ));
+        }
+
+        self.verify_peer_share_index(sender, payload.share_index)?;
+
+        {
+            let mut hasher = Sha256::new();
+            for xpub in &payload.recovery_xpubs {
+                hasher.update(xpub.xpub.as_bytes());
+                hasher.update(xpub.fingerprint.as_bytes());
+                if let Some(ref label) = xpub.label {
+                    hasher.update(label.as_bytes());
+                }
+            }
+            let digest: [u8; 32] = hasher.finalize().into();
+            let dedup_key = (payload.share_index, payload.created_at, digest);
+            if !self.seen_xpub_announces.write().insert(dedup_key) {
+                return Ok(());
+            }
+        }
+
+        {
+            let mut peers = self.peers.write();
+            let Some(peer) = peers.get_peer_mut(payload.share_index) else {
+                return Ok(());
+            };
+            peer.set_recovery_xpubs(payload.recovery_xpubs.clone());
+        }
+
+        info!(
+            share_index = payload.share_index,
+            xpub_count = payload.recovery_xpubs.len(),
+            "Received recovery xpub announcement"
+        );
+
+        let _ = self.event_tx.send(KfpNodeEvent::XpubAnnounced {
+            share_index: payload.share_index,
+            recovery_xpubs: payload.recovery_xpubs,
+        });
+
+        Ok(())
+    }
+}
 
 fn sanitize_reason(reason: &str) -> String {
     let sanitized: String = reason
