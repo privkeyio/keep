@@ -241,6 +241,13 @@ mod tests {
             build_key_proof_psbt(&session_id, share_index, &xpub, Network::Testnet).unwrap();
         let signed_bytes = sign_key_proof(&mut psbt, &secret, Network::Testnet).unwrap();
 
+        // Must fit within MAX_KEY_PROOF_PSBT_SIZE (keep-frost-net/src/protocol.rs)
+        assert!(
+            signed_bytes.len() <= 512,
+            "key proof PSBT {} bytes exceeds protocol max 512",
+            signed_bytes.len(),
+        );
+
         verify_key_proof(
             &session_id,
             share_index,

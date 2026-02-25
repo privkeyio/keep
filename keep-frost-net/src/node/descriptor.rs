@@ -38,7 +38,7 @@ impl KfpNode {
                 .get_online_peers()
                 .iter()
                 .map(|p| p.share_index)
-                .filter(|idx| *idx != our_index)
+                .filter(|idx| *idx != our_index && expected_contributors.contains(idx))
                 .collect()
         };
 
