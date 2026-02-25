@@ -510,9 +510,7 @@ mod tests {
     fn is_internal_ip_blocks_nat64_wkp() {
         use std::net::IpAddr;
         // 64:ff9b::a00:1 embeds 10.0.0.1 (private)
-        assert!(is_internal_ip(
-            &"64:ff9b::a00:1".parse::<IpAddr>().unwrap()
-        ));
+        assert!(is_internal_ip(&"64:ff9b::a00:1".parse::<IpAddr>().unwrap()));
         // 64:ff9b::7f00:1 embeds 127.0.0.1 (loopback)
         assert!(is_internal_ip(
             &"64:ff9b::7f00:1".parse::<IpAddr>().unwrap()
