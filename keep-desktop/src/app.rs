@@ -304,20 +304,36 @@ pub(crate) fn save_cert_pins(
     }
 }
 
+fn filter_valid_relays(urls: Vec<String>) -> Vec<String> {
+    urls.into_iter()
+        .filter(|url| match validate_relay_url(url) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(url, "Dropping invalid relay loaded from disk: {e}");
+                false
+            }
+        })
+        .collect()
+}
+
 fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
     let path = relay_config_path(keep_path);
-    std::fs::read_to_string(&path)
+    let urls: Vec<String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    filter_valid_relays(urls)
 }
 
 fn load_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
     let path = relay_config_path_for(keep_path, pubkey_hex);
-    std::fs::read_to_string(&path)
+    match std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| load_relay_urls(keep_path))
+    {
+        Some(urls) => filter_valid_relays(urls),
+        None => load_relay_urls(keep_path),
+    }
 }
 
 fn save_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[String]) {
@@ -331,18 +347,22 @@ fn save_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[St
 
 fn load_bunker_relays(keep_path: &std::path::Path) -> Vec<String> {
     let path = bunker_relay_config_path(keep_path);
-    std::fs::read_to_string(&path)
+    let urls: Vec<String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(default_bunker_relays)
+        .unwrap_or_else(default_bunker_relays);
+    filter_valid_relays(urls)
 }
 
 fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
     let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
-    std::fs::read_to_string(&path)
+    match std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| load_bunker_relays(keep_path))
+    {
+        Some(urls) => filter_valid_relays(urls),
+        None => load_bunker_relays(keep_path),
+    }
 }
 
 fn save_bunker_relays(keep_path: &std::path::Path, urls: &[String]) {

@@ -133,6 +133,55 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Check if a resolved IP address is internal/private/reserved.
+///
+/// Use this after DNS resolution to prevent DNS rebinding attacks where
+/// a hostname passes URL validation but resolves to an internal IP.
+pub fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(addr) => is_internal_v4(*addr),
+        std::net::IpAddr::V6(addr) => is_internal_v6(addr),
+    }
+}
+
+fn is_internal_v6(addr: &std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = to_embedded_v4(addr) {
+        return is_internal_v4(v4);
+    }
+    let segments = addr.segments();
+    (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+}
+
+fn to_embedded_v4(addr: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    // IPv4-compatible addresses (::x.x.x.x) -- deprecated but still exploitable
+    let s = addr.segments();
+    if s[..6] == [0, 0, 0, 0, 0, 0] {
+        let octets = addr.octets();
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
+}
+
+fn is_internal_v4(addr: std::net::Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || addr.octets()[0] == 0
+        || is_cgn(addr)
+        || is_special_purpose_v4(addr)
+}
+
 fn is_internal_host(host: &str) -> bool {
     let host = host.to_lowercase();
 
@@ -145,35 +194,14 @@ fn is_internal_host(host: &str) -> bool {
     // Strip trailing dot (FQDN bypass)
     let bare = bare.strip_suffix('.').unwrap_or(bare);
 
-    // Try parsing as IPv6
     if let Ok(addr) = bare.parse::<std::net::Ipv6Addr>() {
-        if let Some(mapped_v4) = addr.to_ipv4_mapped() {
-            return mapped_v4.is_loopback()
-                || mapped_v4.is_private()
-                || mapped_v4.is_link_local()
-                || mapped_v4.is_unspecified()
-                || is_cgn(mapped_v4)
-                || is_special_purpose_v4(mapped_v4);
-        }
-        let segments = addr.segments();
-        return (segments[0] & 0xfe00) == 0xfc00
-            || (segments[0] & 0xffc0) == 0xfe80
-            || addr.is_loopback()
-            || addr.is_unspecified()
-            || addr.is_multicast();
+        return is_internal_v6(&addr);
     }
 
-    // Try parsing as IPv4
     if let Ok(addr) = bare.parse::<std::net::Ipv4Addr>() {
-        return addr.is_loopback()
-            || addr.is_private()
-            || addr.is_link_local()
-            || addr.is_unspecified()
-            || is_cgn(addr)
-            || is_special_purpose_v4(addr);
+        return is_internal_v4(addr);
     }
 
-    // Hostname checks
     const FORBIDDEN: &[&str] = &["localhost"];
 
     if FORBIDDEN.contains(&bare) || bare.ends_with(".local") || bare.ends_with(".localhost") {
@@ -393,12 +421,73 @@ mod tests {
     }
 
     #[test]
+    fn is_internal_ip_blocks_private() {
+        use std::net::IpAddr;
+        assert!(is_internal_ip(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"192.168.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"169.254.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"0.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"100.64.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"240.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"::1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"fc00::1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(
+            &"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn is_internal_ip_allows_public() {
+        use std::net::IpAddr;
+        assert!(!is_internal_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_internal_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_internal_ip(
+            &"2607:f8b0::1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
     fn allows_nearby_public_ranges() {
         assert!(validate_relay_url("wss://192.0.3.1/").is_ok());
         assert!(validate_relay_url("wss://198.51.101.1/").is_ok());
         assert!(validate_relay_url("wss://203.0.114.1/").is_ok());
         assert!(validate_relay_url("wss://198.17.0.1/").is_ok());
         assert!(validate_relay_url("wss://198.20.0.1/").is_ok());
-        assert!(validate_relay_url("wss://239.255.255.255/").is_ok());
+    }
+
+    #[test]
+    fn rejects_ipv4_multicast() {
+        assert!(validate_relay_url("wss://224.0.0.1/").is_err());
+        assert!(validate_relay_url("wss://239.255.255.255/").is_err());
+    }
+
+    #[test]
+    fn rejects_this_network_range() {
+        assert!(validate_relay_url("wss://0.1.2.3/").is_err());
+        assert!(validate_relay_url("wss://0.255.255.255/").is_err());
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_ipv4_compatible_v6() {
+        use std::net::IpAddr;
+        assert!(is_internal_ip(&"::7f00:1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"::a00:1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"::c0a8:101".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_multicast_v4() {
+        use std::net::IpAddr;
+        assert!(is_internal_ip(&"224.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"239.255.255.255".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_this_network() {
+        use std::net::IpAddr;
+        assert!(is_internal_ip(&"0.1.2.3".parse::<IpAddr>().unwrap()));
     }
 }

@@ -13,6 +13,8 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use keep_core::relay::is_internal_ip;
+
 use crate::error::{FrostNetError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,7 +107,17 @@ pub async fn verify_relay_certificate(
     .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
     .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
 
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..]))
+    let safe_addrs: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| !is_internal_ip(&a.ip()))
+        .collect();
+    if safe_addrs.is_empty() {
+        return Err(FrostNetError::Transport(format!(
+            "Relay {hostname} resolves to internal addresses only"
+        )));
+    }
+
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&safe_addrs[..]))
         .await
         .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
         .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;
