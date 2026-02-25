@@ -689,13 +689,31 @@ pub fn cmd_wallet_propose(
 }
 
 fn parse_announced_xpub(s: &str) -> Result<keep_frost_net::AnnouncedXpub> {
-    let parts: Vec<&str> = s.splitn(3, '/').collect();
-    if parts.len() < 2 {
-        return Err(KeepError::InvalidInput(
-            "Expected format: 'xpub.../fingerprint' or 'xpub.../fingerprint/label'".into(),
-        ));
-    }
-    let xpub = parts[0].to_string();
+    let err_msg = "Expected format: 'xpub.../fingerprint' or 'xpub.../fingerprint/label'";
+    let is_fingerprint = |s: &str| s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit());
+
+    let last_slash = s.rfind('/').ok_or_else(|| KeepError::InvalidInput(err_msg.into()))?;
+    let (before_last, after_last) = (&s[..last_slash], &s[last_slash + 1..]);
+
+    let (xpub, fingerprint, label) = if is_fingerprint(after_last) {
+        (before_last.to_string(), after_last.to_string(), None)
+    } else {
+        let second_last = before_last
+            .rfind('/')
+            .ok_or_else(|| KeepError::InvalidInput(err_msg.into()))?;
+        let fp = &before_last[second_last + 1..];
+        if !is_fingerprint(fp) {
+            return Err(KeepError::InvalidInput(
+                "fingerprint must be exactly 8 hex characters".into(),
+            ));
+        }
+        (
+            before_last[..second_last].to_string(),
+            fp.to_string(),
+            Some(after_last.to_string()),
+        )
+    };
+
     if !keep_frost_net::VALID_XPUB_PREFIXES
         .iter()
         .any(|p| xpub.starts_with(p))
@@ -705,13 +723,6 @@ fn parse_announced_xpub(s: &str) -> Result<keep_frost_net::AnnouncedXpub> {
             keep_frost_net::VALID_XPUB_PREFIXES.join(", ")
         )));
     }
-    let fingerprint = parts[1].to_string();
-    if fingerprint.len() != 8 || !fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(KeepError::InvalidInput(
-            "fingerprint must be exactly 8 hex characters".into(),
-        ));
-    }
-    let label = parts.get(2).map(|s| s.to_string());
     Ok(keep_frost_net::AnnouncedXpub {
         xpub,
         fingerprint,

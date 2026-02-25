@@ -21,6 +21,7 @@ pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 pub const MAX_RECOVERY_TIERS: usize = 10;
 pub const MAX_KEYS_PER_TIER: usize = 20;
+pub const MIN_XPUB_LENGTH: usize = 111;
 pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
@@ -375,8 +376,8 @@ impl KfpMessage {
                 }
                 let mut seen_xpubs = HashSet::with_capacity(p.recovery_xpubs.len());
                 for xpub in &p.recovery_xpubs {
-                    if xpub.xpub.is_empty() {
-                        return Err("Recovery xpub cannot be empty");
+                    if xpub.xpub.len() < MIN_XPUB_LENGTH {
+                        return Err("Recovery xpub too short");
                     }
                     if xpub.xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Recovery xpub exceeds maximum length");

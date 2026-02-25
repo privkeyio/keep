@@ -4,7 +4,7 @@ mod descriptor;
 mod ecdh;
 mod signing;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -283,7 +283,7 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
-    pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64)>>,
+    pub(crate) seen_xpub_announces: RwLock<HashMap<u16, u64>>,
 }
 
 impl KfpNode {
@@ -397,7 +397,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
-            seen_xpub_announces: RwLock::new(HashSet::new()),
+            seen_xpub_announces: RwLock::new(HashMap::new()),
         })
     }
 
@@ -477,6 +477,10 @@ impl KfpNode {
             self.share.metadata.identifier,
             recovery_xpubs.clone(),
         );
+
+        KfpMessage::XpubAnnounce(payload.clone())
+            .validate()
+            .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
 
         let mut errors = Vec::new();
         for pubkey in &peer_pubkeys {
@@ -715,7 +719,7 @@ impl KfpNode {
                     {
                         let now = chrono::Utc::now().timestamp().max(0) as u64;
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
-                        self.seen_xpub_announces.write().retain(|(_, ts)| {
+                        self.seen_xpub_announces.write().retain(|_, ts| {
                             now.saturating_sub(window) <= *ts
                         });
                     }

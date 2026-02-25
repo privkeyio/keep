@@ -818,9 +818,14 @@ impl KfpNode {
 
         self.verify_peer_share_index(sender, payload.share_index)?;
 
-        let dedup_key = (payload.share_index, payload.created_at);
-        if !self.seen_xpub_announces.write().insert(dedup_key) {
-            return Ok(());
+        {
+            let mut seen = self.seen_xpub_announces.write();
+            if let Some(&prev_ts) = seen.get(&payload.share_index) {
+                if payload.created_at <= prev_ts {
+                    return Ok(());
+                }
+            }
+            seen.insert(payload.share_index, payload.created_at);
         }
 
         {
@@ -845,8 +850,6 @@ impl KfpNode {
         Ok(())
     }
 }
-
-const MAX_NACK_REASON_LENGTH: usize = 256;
 
 fn sanitize_reason(reason: &str) -> String {
     let sanitized: String = reason
