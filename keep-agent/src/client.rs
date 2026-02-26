@@ -289,6 +289,9 @@ impl AgentClient {
             AgentError::Connection("Missing relay parameter in bunker URL".into())
         })?;
 
+        keep_core::relay::validate_relay_url(&relay_url)
+            .map_err(|e| AgentError::Connection(format!("Invalid relay URL: {e}")))?;
+
         Ok((signer_pubkey, relay_url, secret))
     }
 
@@ -435,14 +438,22 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
+        let mut added = Vec::new();
         for relay in &valid_relays {
-            let _ = self.client.add_relay(relay).await;
+            if self.client.add_relay(relay).await.is_ok() {
+                added.push(relay.clone());
+            }
+        }
+        if added.is_empty() {
+            return Err(AgentError::Connection(
+                "Failed to add any relay during switch".into(),
+            ));
         }
         self.client.connect().await;
 
-        self.relay_url = valid_relays[0].clone();
+        self.relay_url = added[0].clone();
 
-        Ok(Some(valid_relays))
+        Ok(Some(added))
     }
 
     async fn send_request(&self, content: &str) -> Result<String> {

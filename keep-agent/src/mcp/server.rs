@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use zeroize::Zeroizing;
+
 use crate::error::{AgentError, Result};
 use crate::manager::SessionManager;
 use crate::scope::Operation;
@@ -45,7 +47,7 @@ pub struct McpServer {
     version: String,
     session_manager: Arc<RwLock<Option<(SessionToken, String)>>>,
     manager: SessionManager,
-    secret_key: Option<[u8; 32]>,
+    secret_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl McpServer {
@@ -65,7 +67,7 @@ impl McpServer {
             version: env!("CARGO_PKG_VERSION").into(),
             session_manager: Arc::new(RwLock::new(None)),
             manager: SessionManager::new(pubkey),
-            secret_key: Some(secret),
+            secret_key: Some(Zeroizing::new(secret)),
         }
     }
 
@@ -265,10 +267,10 @@ impl McpServer {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
 
-                if let Some(secret) = self.secret_key {
+                if let Some(ref secret) = self.secret_key {
                     use nostr_sdk::prelude::*;
 
-                    let keys = Keys::parse(&hex::encode(secret))
+                    let keys = Keys::parse(&hex::encode(&**secret))
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let nostr_tags: Vec<Tag> = tags
@@ -322,7 +324,8 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("testnet");
 
-                if let Some(mut secret) = self.secret_key {
+                if let Some(ref secret) = self.secret_key {
+                    let mut secret_copy = Zeroizing::new(**secret);
                     let network = match network_str {
                         "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
                         "signet" => keep_bitcoin::Network::Signet,
@@ -333,7 +336,7 @@ impl McpServer {
                     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
                         .map_err(|e| AgentError::Other(format!("Invalid PSBT: {e}")))?;
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret_copy, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let analysis = signer
@@ -416,7 +419,8 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("testnet");
 
-                if let Some(mut secret) = self.secret_key {
+                if let Some(ref secret) = self.secret_key {
+                    let mut secret_copy = Zeroizing::new(**secret);
                     let network = match network_str {
                         "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
                         "signet" => keep_bitcoin::Network::Signet,
@@ -424,7 +428,7 @@ impl McpServer {
                         _ => keep_bitcoin::Network::Testnet,
                     };
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret_copy, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let address = signer

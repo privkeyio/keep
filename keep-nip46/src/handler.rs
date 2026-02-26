@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use keep_core::error::{CryptoError, KeepError, Result};
 use keep_core::keyring::Keyring;
@@ -96,7 +97,7 @@ pub struct SignerHandler {
     rate_limiters: Mutex<HashMap<PublicKey, RateLimiter>>,
     rate_limit_config: Option<RateLimitConfig>,
     new_conn_timestamps: Mutex<VecDeque<Instant>>,
-    expected_secret: Option<String>,
+    expected_secret: Option<Zeroizing<String>>,
     auto_approve: bool,
     relay_urls: Vec<String>,
     kill_switch: Arc<AtomicBool>,
@@ -127,7 +128,7 @@ impl SignerHandler {
     }
 
     pub fn with_expected_secret(mut self, secret: String) -> Self {
-        self.expected_secret = Some(secret);
+        self.expected_secret = Some(Zeroizing::new(secret));
         self
     }
 
@@ -569,6 +570,7 @@ impl SignerHandler {
     }
 
     pub async fn handle_switch_relays(&self, app_pubkey: PublicKey) -> Result<Option<Vec<String>>> {
+        self.check_kill_switch()?;
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::GET_PUBLIC_KEY)
             .await?;

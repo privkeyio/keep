@@ -7,6 +7,8 @@ use crate::error::{AgentError, Result};
 use crate::scope::Operation;
 use crate::session::{AgentSession, SessionConfig, SessionMetadata, SessionToken};
 
+const MAX_SESSIONS: usize = 128;
+
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, AgentSession>>>,
     pubkey: [u8; 32],
@@ -33,6 +35,12 @@ impl SessionManager {
             .sessions
             .write()
             .map_err(|_| AgentError::Other("Failed to acquire session lock".into()))?;
+
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(AgentError::Other(format!(
+                "Maximum session count ({MAX_SESSIONS}) reached"
+            )));
+        }
 
         sessions.insert(session_id.clone(), session);
         Ok((token, session_id))

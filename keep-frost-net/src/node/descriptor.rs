@@ -52,11 +52,15 @@ impl KfpNode {
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let expected_acks: HashSet<u16> = expected_contributors
-            .iter()
-            .copied()
-            .filter(|idx| *idx != our_index)
-            .collect();
+        let expected_acks: HashSet<u16> = {
+            let peers = self.peers.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .map(|p| p.share_index)
+                .filter(|idx| *idx != our_index && expected_contributors.contains(idx))
+                .collect()
+        };
 
         let session_timeout = timeout_secs.map(std::time::Duration::from_secs);
 
