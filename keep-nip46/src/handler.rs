@@ -482,6 +482,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
             .await?;
+        self.require_approval(app_pubkey, "nip44_encrypt").await?;
+        self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
             .map_err(|e| CryptoError::encryption(format!("NIP-44: {e}")))?;
@@ -528,6 +530,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
             .await?;
+        self.require_approval(app_pubkey, "nip04_encrypt").await?;
+        self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
             .map_err(|e| CryptoError::encryption(format!("NIP-04: {e}")))?;
@@ -569,9 +573,10 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::GET_PUBLIC_KEY)
             .await?;
 
-        self.audit.lock().await.log(
-            AuditEntry::new(AuditAction::GetPublicKey, app_pubkey).with_reason("switch_relays"),
-        );
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::SwitchRelays, app_pubkey));
 
         let relays = (!self.relay_urls.is_empty()).then(|| self.relay_urls.clone());
         Ok(relays)

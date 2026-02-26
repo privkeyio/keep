@@ -19,6 +19,7 @@ pub struct PendingSession {
     relay_url: String,
     client_keys: Keys,
     client: Client,
+    connect_sent: std::sync::atomic::AtomicBool,
 }
 
 impl PendingSession {
@@ -56,6 +57,7 @@ impl PendingSession {
             relay_url,
             client_keys,
             client,
+            connect_sent: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -67,16 +69,20 @@ impl PendingSession {
         let encoded_relay = urlencoding::encode(&self.relay_url);
         format!(
             "nostrconnect://{}?relay={}&metadata={}",
-            self.client_keys
-                .public_key()
-                .to_bech32()
-                .unwrap_or_default(),
+            self.client_keys.public_key().to_hex(),
             encoded_relay,
             urlencoding::encode("{\"name\":\"Keep Agent\"}")
         )
     }
 
-    pub async fn poll(&self, timeout: Duration) -> Result<ApprovalStatus> {
+    async fn send_connect_once(&self) -> Result<()> {
+        if self
+            .connect_sent
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+
         let request = serde_json::json!({
             "id": &self.request_id,
             "method": "connect",
@@ -108,6 +114,12 @@ impl PendingSession {
             .send_event(&event)
             .await
             .map_err(|e| AgentError::Nostr(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn poll(&self, timeout: Duration) -> Result<ApprovalStatus> {
+        self.send_connect_once().await?;
 
         let filter = Filter::new()
             .kind(Kind::NostrConnect)
@@ -171,19 +183,19 @@ impl PendingSession {
         while start.elapsed() < timeout {
             match self.poll(poll_interval).await? {
                 ApprovalStatus::Approved => {
-                    return Ok(AgentClient {
+                    let mut client = AgentClient {
                         signer_pubkey: self.signer_pubkey,
                         relay_url: self.relay_url.clone(),
                         client_keys: self.client_keys.clone(),
                         client: self.client.clone(),
-                    });
+                    };
+                    let _ = client.switch_relays().await;
+                    return Ok(client);
                 }
                 ApprovalStatus::Denied => {
                     return Err(AgentError::AuthFailed("Session request denied".into()));
                 }
-                ApprovalStatus::Pending => {
-                    tokio::time::sleep(poll_interval).await;
-                }
+                ApprovalStatus::Pending => {}
             }
         }
 
@@ -197,7 +209,6 @@ impl PendingSession {
 
 pub struct AgentClient {
     signer_pubkey: PublicKey,
-    #[allow(dead_code)]
     relay_url: String,
     client_keys: Keys,
     client: Client,
@@ -230,7 +241,7 @@ impl AgentClient {
         .await
         .map_err(|_| AgentError::Connection("Relay connection timeout".into()))?;
 
-        let agent_client = Self {
+        let mut agent_client = Self {
             signer_pubkey,
             relay_url,
             client_keys,
@@ -238,6 +249,7 @@ impl AgentClient {
         };
 
         agent_client.send_connect(secret.as_deref()).await?;
+        let _ = agent_client.switch_relays().await;
 
         Ok(agent_client)
     }
@@ -373,7 +385,78 @@ impl AgentClient {
         Ok(false)
     }
 
+    pub async fn switch_relays(&mut self) -> Result<Option<Vec<String>>> {
+        let request = serde_json::json!({
+            "id": generate_uuid(),
+            "method": "switch_relays",
+            "params": []
+        });
+
+        let response = self.send_request(&request.to_string()).await?;
+        let parsed: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|e| AgentError::Serialization(e.to_string()))?;
+
+        if let Some(error) = parsed.get("error") {
+            if !error.is_null() {
+                return Err(AgentError::Nostr(error.to_string()));
+            }
+        }
+
+        let result = parsed
+            .get("result")
+            .ok_or_else(|| AgentError::Serialization("Missing result field".into()))?;
+
+        if result.is_null() || (result.is_string() && result.as_str() == Some("null")) {
+            return Ok(None);
+        }
+
+        let relays: Vec<String> = if result.is_string() {
+            serde_json::from_str(result.as_str().unwrap())
+                .map_err(|e| AgentError::Serialization(format!("Invalid relay list: {e}")))?
+        } else if result.is_array() {
+            serde_json::from_value(result.clone())
+                .map_err(|e| AgentError::Serialization(format!("Invalid relay list: {e}")))?
+        } else {
+            return Err(AgentError::Serialization(
+                "Unexpected switch_relays result format".into(),
+            ));
+        };
+
+        if relays.is_empty() {
+            return Ok(None);
+        }
+
+        let valid_relays: Vec<String> = relays
+            .into_iter()
+            .filter(|r| keep_core::relay::validate_relay_url(r).is_ok())
+            .collect();
+
+        if valid_relays.is_empty() {
+            return Ok(None);
+        }
+
+        self.client.disconnect().await;
+        for relay in &valid_relays {
+            let _ = self.client.add_relay(relay).await;
+        }
+        self.client.connect().await;
+        let relays = valid_relays;
+
+        self.relay_url = relays[0].clone();
+
+        Ok(Some(relays))
+    }
+
     async fn send_request(&self, content: &str) -> Result<String> {
+        let request_id = {
+            let parsed: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| AgentError::Serialization(e.to_string()))?;
+            parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+
         let encrypted = nip44::encrypt(
             self.client_keys.secret_key(),
             &self.signer_pubkey,
@@ -424,6 +507,17 @@ impl AgentClient {
                             &self.signer_pubkey,
                             &event.content,
                         ) {
+                            if let Some(ref expected_id) = request_id {
+                                if let Ok(resp) =
+                                    serde_json::from_str::<serde_json::Value>(&decrypted)
+                                {
+                                    if resp.get("id").and_then(|v| v.as_str())
+                                        != Some(expected_id)
+                                    {
+                                        continue;
+                                    }
+                                }
+                            }
                             return Ok(decrypted);
                         }
                     }
@@ -490,5 +584,36 @@ mod tests {
         let uuid2 = generate_uuid();
         assert_ne!(uuid1, uuid2);
         assert_eq!(uuid1.len(), 36);
+    }
+
+    #[test]
+    fn test_switch_relays_parse() {
+        let null_response = r#"{"id":"abc","result":null}"#;
+        let parsed: serde_json::Value = serde_json::from_str(null_response).unwrap();
+        let result = parsed.get("result").unwrap();
+        assert!(result.is_null());
+
+        let null_string_response = r#"{"id":"abc","result":"null"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(null_string_response).unwrap();
+        let result = parsed.get("result").unwrap();
+        assert!(result.is_string() && result.as_str() == Some("null"));
+
+        let array_response =
+            r#"{"id":"abc","result":["wss://relay1.example.com","wss://relay2.example.com"]}"#;
+        let parsed: serde_json::Value = serde_json::from_str(array_response).unwrap();
+        let result = parsed.get("result").unwrap();
+        assert!(result.is_array());
+        let relays: Vec<String> = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0], "wss://relay1.example.com");
+        assert_eq!(relays[1], "wss://relay2.example.com");
+
+        let string_array_response = r#"{"id":"abc","result":"[\"wss://relay1.example.com\",\"wss://relay2.example.com\"]"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(string_array_response).unwrap();
+        let result = parsed.get("result").unwrap();
+        assert!(result.is_string());
+        let relays: Vec<String> = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0], "wss://relay1.example.com");
     }
 }

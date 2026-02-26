@@ -8,6 +8,7 @@ use keep_bitcoin::recovery::{RecoveryConfig, RecoveryTier as BitcoinRecoveryTier
 use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
 use nostr_sdk::PublicKey;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
@@ -273,7 +274,7 @@ impl DescriptorSession {
         hasher.update(finalized.policy_hash);
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
-        if descriptor_hash != expected_hash {
+        if !bool::from(descriptor_hash.ct_eq(&expected_hash)) {
             return Err(FrostNetError::Session("Descriptor hash mismatch".into()));
         }
 

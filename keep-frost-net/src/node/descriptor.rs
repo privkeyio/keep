@@ -52,15 +52,11 @@ impl KfpNode {
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let expected_acks: HashSet<u16> = {
-            let peers = self.peers.read();
-            peers
-                .get_online_peers()
-                .iter()
-                .map(|p| p.share_index)
-                .filter(|idx| *idx != our_index && expected_contributors.contains(idx))
-                .collect()
-        };
+        let expected_acks: HashSet<u16> = expected_contributors
+            .iter()
+            .copied()
+            .filter(|idx| *idx != our_index)
+            .collect();
 
         let session_timeout = timeout_secs.map(std::time::Duration::from_secs);
 
@@ -658,11 +654,6 @@ impl KfpNode {
             .sign_with_keys(&self.keys)
             .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-
         {
             let mut sessions = self.descriptor_sessions.write();
             let Some(session) = sessions.get_session_mut(&payload.session_id) else {
@@ -676,6 +667,11 @@ impl KfpNode {
                 policy_hash: payload.policy_hash,
             })?;
         }
+
+        self.client
+            .send_event(&event)
+            .await
+            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
             session_id: payload.session_id,

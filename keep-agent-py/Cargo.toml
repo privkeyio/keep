@@ -19,3 +19,4 @@ serde_json = "1.0"
 hex = "0.4"
 nostr-sdk = { version = "0.44", features = ["nip44"] }
 k256 = { version = "0.13", features = ["schnorr"] }
+zeroize = "1"
