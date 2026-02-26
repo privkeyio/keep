@@ -888,14 +888,19 @@ impl App {
                 }
                 Task::none()
             }
-            Message::NavigateShares | Message::GoBack => {
+            Message::NavigateShares => {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
-                let go_to_nsec = matches!(self.screen, Screen::ExportNcryptsec(_));
                 self.stop_scanner();
                 self.copy_feedback_until = None;
-                if go_to_nsec {
+                self.set_share_screen(self.current_shares());
+                Task::none()
+            }
+            Message::GoBack => {
+                self.stop_scanner();
+                self.copy_feedback_until = None;
+                if matches!(self.screen, Screen::ExportNcryptsec(_)) {
                     self.set_nsec_keys_screen();
                 } else {
                     self.set_share_screen(self.current_shares());
@@ -1149,7 +1154,7 @@ impl App {
             Message::ImportNcryptsec => self.handle_import_ncryptsec(),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
-            Message::ImportNcryptsecResult(result) => self.handle_import_result(result),
+            Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
             _ => Task::none(),
         }
     }
@@ -1843,45 +1848,37 @@ impl App {
                 Task::none()
             }
             Message::ConfirmDeleteNsecKey(hex) => {
-                if let Screen::NsecKeys(s) = &self.screen {
-                    if s.delete_confirm.as_deref() != Some(hex.as_str()) {
-                        return Task::none();
+                let (pubkey, name) = match &self.screen {
+                    Screen::NsecKeys(s)
+                        if s.delete_confirm.as_deref() == Some(hex.as_str()) =>
+                    {
+                        match s.keys.iter().find(|k| k.pubkey_hex == hex) {
+                            Some(k) => (k.pubkey, k.name.clone()),
+                            None => return Task::none(),
+                        }
                     }
-                } else {
-                    return Task::none();
-                }
+                    _ => return Task::none(),
+                };
                 if self.active_share_hex.as_deref() == Some(hex.as_str()) {
                     self.handle_disconnect_relay();
                     self.stop_bunker();
                 }
-                let Ok(bytes) = hex::decode(&hex) else {
-                    return Task::none();
-                };
-                let Ok(pubkey_bytes) = <[u8; 32]>::try_from(bytes) else {
-                    return Task::none();
-                };
                 let delete_result = {
                     let mut guard = lock_keep(&self.keep);
-                    guard.as_mut().map(|keep| keep.delete_key(&pubkey_bytes))
+                    guard.as_mut().map(|keep| keep.delete_key(&pubkey))
                 };
                 match delete_result {
                     Some(Ok(())) => {
-                        let name = if let Screen::NsecKeys(s) = &self.screen {
-                            s.keys
-                                .iter()
-                                .find(|k| k.pubkey_hex == hex)
-                                .map(|k| k.name.clone())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        let shares = self.current_shares();
-                        self.resolve_active_share(&shares);
-                        self.refresh_identities(&shares);
-                        self.set_nsec_keys_screen();
-                        if !name.is_empty() {
-                            self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
-                        }
+                        let _ = std::fs::remove_file(relay_config_path_for(
+                            &self.keep_path,
+                            &hex,
+                        ));
+                        let _ = std::fs::remove_file(bunker_relay_config_path_for(
+                            &self.keep_path,
+                            &hex,
+                        ));
+                        self.refresh_shares();
+                        self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
                     }
                     Some(Err(e)) => {
                         self.set_toast(friendly_err(e), ToastKind::Error);

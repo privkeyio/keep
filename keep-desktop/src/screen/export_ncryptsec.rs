@@ -115,7 +115,7 @@ impl ExportNcryptsecScreen {
             }
 
             let display = if ncryptsec.len() > 80 {
-                format!("{}...", &ncryptsec[..80])
+                format!("{}...", ncryptsec.chars().take(80).collect::<String>())
             } else {
                 ncryptsec.to_string()
             };

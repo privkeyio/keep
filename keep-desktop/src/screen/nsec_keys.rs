@@ -12,7 +12,6 @@ use crate::theme;
 #[derive(Debug, Clone)]
 pub struct NsecKeyEntry {
     pub name: String,
-    #[allow(dead_code)]
     pub pubkey: [u8; 32],
     pub pubkey_hex: String,
     pub npub: String,
