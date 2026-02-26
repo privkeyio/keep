@@ -656,9 +656,7 @@ impl App {
     ) {
         if let Screen::Wallet(ws) = &mut self.screen {
             if let Some(setup) = &mut ws.setup {
-                let matches =
-                    setup.session_id.as_ref() == Some(session_id) || setup.session_id.is_none();
-                if matches {
+                if setup.session_id.as_ref() == Some(session_id) {
                     f(setup);
                 }
             }
@@ -817,6 +815,7 @@ impl App {
         };
 
         if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
+            tracing::warn!(network = %network, "Ignoring descriptor contribution for invalid network");
             return iced::Task::none();
         }
 
@@ -937,6 +936,7 @@ impl App {
                 let _ = entry.response_tx.try_send(false);
             }
         }
+        self.active_coordinations.clear();
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
             s.peers.clear();

@@ -170,6 +170,7 @@ impl KfpNode {
             peer.share_index
         };
 
+        self.verify_peer_share_index(sender, sender_share_index)?;
         self.check_proposer_authorized(sender_share_index)?;
 
         info!(
@@ -900,9 +901,7 @@ impl KfpNode {
                 return Ok(());
             }
             if seen.len() >= 10_000 {
-                if let Some(&oldest) = seen.iter().min_by_key(|(_, ts, _)| *ts) {
-                    seen.remove(&oldest);
-                }
+                seen.clear();
             }
             seen.insert(dedup_key);
         }
@@ -963,7 +962,8 @@ impl KfpNode {
             .key_package()
             .map_err(|e| FrostNetError::Crypto(format!("key package: {e}")))?;
         let signing_share = key_package.signing_share();
-        let bytes = <[u8; 32]>::try_from(signing_share.serialize().as_slice())
+        let serialized = Zeroizing::new(signing_share.serialize());
+        let bytes = <[u8; 32]>::try_from(serialized.as_slice())
             .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
         Ok(Zeroizing::new(bytes))
     }
