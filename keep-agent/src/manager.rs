@@ -36,6 +36,8 @@ impl SessionManager {
             .write()
             .map_err(|_| AgentError::Other("Failed to acquire session lock".into()))?;
 
+        sessions.retain(|_, s| !s.is_expired());
+
         if sessions.len() >= MAX_SESSIONS {
             return Err(AgentError::Other(format!(
                 "Maximum session count ({MAX_SESSIONS}) reached"

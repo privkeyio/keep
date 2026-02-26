@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nostr_relay_builder::prelude::*;
 use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
 
@@ -37,7 +38,8 @@ async fn test_bunker_e2e_connect_and_sign() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io".to_string();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay_url = mock_relay.url().await.to_string();
 
     let (keyring, signer_pubkey) = setup_keyring();
     let mut server = Server::new_with_config(
@@ -71,14 +73,14 @@ async fn test_bunker_e2e_connect_and_sign() {
         let _ = server.run().await;
     });
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let client_keys = Keys::generate();
     let client = Client::new(client_keys.clone());
     client.add_relay(relay_url).await.unwrap();
     client.connect().await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Send connect request with bunker secret
     let connect_req = serde_json::json!({
@@ -103,7 +105,7 @@ async fn test_bunker_e2e_connect_and_sign() {
 
     client.send_event(&connect_event).await.unwrap();
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Verify the client connected
     let clients = server_handler.list_clients().await;
@@ -164,7 +166,7 @@ async fn test_bunker_e2e_connect_and_sign() {
 
     client.send_event(&sign_event).await.unwrap();
 
-    // Wait for relay to deliver responses - retry a few times
+    // Wait for relay to deliver responses
     let mut request_count = 0;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -197,7 +199,8 @@ async fn test_bunker_rejects_without_auto_approve() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io".to_string();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay_url = mock_relay.url().await.to_string();
     let (keyring, _signer_pubkey) = setup_keyring();
 
     // auto_approve: false, no callbacks = rejects by default
@@ -226,8 +229,6 @@ async fn test_bunker_rejects_without_auto_approve() {
         result.is_err(),
         "connect should be rejected without callbacks or auto_approve"
     );
-
-    println!("Rejection test passed: connect properly denied without auto_approve");
 }
 
 #[tokio::test]
@@ -236,7 +237,8 @@ async fn test_bunker_permission_scoping() {
         .install_default()
         .ok();
 
-    let relay_url = "wss://relay.damus.io".to_string();
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay_url = mock_relay.url().await.to_string();
     let (keyring, signer_pubkey) = setup_keyring();
 
     let server = Server::new_with_config(
@@ -286,8 +288,4 @@ async fn test_bunker_permission_scoping() {
         sign_result.is_err(),
         "sign_event should be denied when only get_public_key requested"
     );
-
-    println!("Permission scoping test passed:");
-    println!("  - get_public_key: allowed");
-    println!("  - sign_event: correctly denied");
 }

@@ -858,7 +858,7 @@ impl KfpNode {
             });
         }
 
-        if is_complete {
+        if is_new && is_complete {
             let sessions = self.descriptor_sessions.read();
             if let Some(session) = sessions.get_session(&payload.session_id) {
                 if let Some(desc) = session.descriptor() {
