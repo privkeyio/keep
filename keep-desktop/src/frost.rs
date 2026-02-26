@@ -841,8 +841,6 @@ impl App {
                 group_pubkey: share.group_pubkey,
                 network: network.clone(),
                 is_initiator: false,
-                expected_participants: 0,
-                acks_received: 0,
             },
         );
 

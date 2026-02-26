@@ -110,8 +110,6 @@ pub(crate) struct ActiveCoordination {
     pub group_pubkey: [u8; 32],
     pub network: String,
     pub is_initiator: bool,
-    pub expected_participants: usize,
-    pub acks_received: usize,
 }
 
 pub struct App {
@@ -698,7 +696,6 @@ impl App {
             | Message::WalletBeginCoordination
             | Message::WalletCancelSetup
             | Message::WalletSessionStarted(..)
-            | Message::WalletFinalizeResult(..)
             | Message::WalletDescriptorProgress(..) => self.handle_wallet_message(message),
 
             Message::RelayUrlChanged(..)
@@ -1311,7 +1308,7 @@ impl App {
             Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
             Message::WalletSessionStarted(result) => {
                 match result {
-                    Ok((session_id, group_pubkey, network, expected_participants)) => {
+                    Ok((session_id, group_pubkey, network, _expected_participants)) => {
                         let on_wallet_screen = matches!(
                             self.screen,
                             Screen::Wallet(WalletScreen { setup: Some(_), .. })
@@ -1338,8 +1335,6 @@ impl App {
                                     group_pubkey,
                                     network,
                                     is_initiator: true,
-                                    expected_participants,
-                                    acks_received: 0,
                                 },
                             );
                             if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
@@ -1371,15 +1366,6 @@ impl App {
                             node.cancel_descriptor_session(&sid);
                         }
                     }
-                }
-                Task::none()
-            }
-            Message::WalletFinalizeResult(result, session_id) => {
-                if let Err(e) = result {
-                    self.active_coordinations.remove(&session_id);
-                    self.update_wallet_setup(&session_id, |setup| {
-                        setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
-                    });
                 }
                 Task::none()
             }
