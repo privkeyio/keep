@@ -109,6 +109,7 @@ pub struct Toast {
 pub(crate) struct ActiveCoordination {
     pub group_pubkey: [u8; 32],
     pub network: String,
+    pub is_initiator: bool,
     pub expected_participants: usize,
     pub acks_received: usize,
 }
@@ -1311,27 +1312,43 @@ impl App {
             Message::WalletSessionStarted(result) => {
                 match result {
                     Ok((session_id, group_pubkey, network, expected_participants)) => {
-                        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
-                            &mut self.screen
-                        {
-                            if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
-                                if let Some(node) = self.get_frost_node() {
-                                    node.cancel_descriptor_session(&session_id);
-                                }
-                            } else {
-                                self.active_coordinations.insert(
-                                    session_id,
-                                    ActiveCoordination {
-                                        group_pubkey,
-                                        network,
-                                        expected_participants,
-                                        acks_received: 0,
-                                    },
+                        let on_wallet_screen = matches!(
+                            self.screen,
+                            Screen::Wallet(WalletScreen { setup: Some(_), .. })
+                        );
+                        if !on_wallet_screen {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                        } else if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
+                                s.phase = SetupPhase::Coordinating(
+                                    DescriptorProgress::Failed(
+                                        "Too many active coordinations".to_string(),
+                                    ),
                                 );
+                            }
+                        } else {
+                            self.active_coordinations.insert(
+                                session_id,
+                                ActiveCoordination {
+                                    group_pubkey,
+                                    network,
+                                    is_initiator: true,
+                                    expected_participants,
+                                    acks_received: 0,
+                                },
+                            );
+                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
                                 s.session_id = Some(session_id);
                             }
-                        } else if let Some(node) = self.get_frost_node() {
-                            node.cancel_descriptor_session(&session_id);
                         }
                     }
                     Err(e) => {

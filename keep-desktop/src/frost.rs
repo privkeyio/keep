@@ -709,45 +709,41 @@ impl App {
                 let is_initiator = self
                     .active_coordinations
                     .get(&session_id)
-                    .map(|c| c.expected_participants > 0)
-                    .unwrap_or(false);
+                    .is_some_and(|c| c.is_initiator);
                 if !is_initiator {
                     return iced::Task::none();
                 }
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
-                if self.active_coordinations.contains_key(&session_id) {
-                    let Some(node) = self.get_frost_node() else {
-                        return iced::Task::none();
-                    };
-                    return iced::Task::perform(
-                        async move {
-                            node.build_and_finalize_descriptor(session_id)
-                                .await
-                                .map_err(|e| format!("{e}"))
-                        },
-                        move |result| match result {
-                            Ok(expected_acks) => Message::WalletDescriptorProgress(
-                                DescriptorProgress::WaitingAcks {
-                                    received: 0,
-                                    expected: expected_acks,
-                                },
-                                Some(session_id),
-                            ),
-                            Err(e) => Message::WalletDescriptorProgress(
-                                DescriptorProgress::Failed(e),
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                } else {
+                let Some(node) = self.get_frost_node() else {
                     self.update_wallet_setup(&session_id, |setup| {
                         setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
                             "Node unavailable".to_string(),
                         ));
                     });
-                }
+                    return iced::Task::none();
+                };
+                return iced::Task::perform(
+                    async move {
+                        node.build_and_finalize_descriptor(session_id)
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    move |result| match result {
+                        Ok(expected_acks) => Message::WalletDescriptorProgress(
+                            DescriptorProgress::WaitingAcks {
+                                received: 0,
+                                expected: expected_acks,
+                            },
+                            Some(session_id),
+                        ),
+                        Err(e) => Message::WalletDescriptorProgress(
+                            DescriptorProgress::Failed(e),
+                            Some(session_id),
+                        ),
+                    },
+                );
             }
             FrostNodeMsg::DescriptorContributed { session_id, .. } => {
                 self.update_wallet_setup(&session_id, |setup| {
@@ -835,6 +831,7 @@ impl App {
         }
 
         if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+            tracing::warn!("Dropping descriptor contribution: too many active coordinations");
             return iced::Task::none();
         }
 
@@ -843,6 +840,7 @@ impl App {
             ActiveCoordination {
                 group_pubkey: share.group_pubkey,
                 network: network.clone(),
+                is_initiator: false,
                 expected_participants: 0,
                 acks_received: 0,
             },
