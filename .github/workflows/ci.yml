@@ -66,7 +66,7 @@ jobs:
 
   reproducible:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft != true
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
       - name: Build twice and compare
