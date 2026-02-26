@@ -16,8 +16,9 @@ use keep_core::Keep;
 
 use crate::app::{
     friendly_err, lock_keep, with_keep_blocking, ActiveCoordination, App, ToastKind,
-    MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER,
-    RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS,
+    MAX_ACTIVE_COORDINATIONS, MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL,
+    RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS,
+    RECONNECT_MAX_MS,
     SIGNING_RESPONSE_TIMEOUT,
 };
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
@@ -705,6 +706,14 @@ impl App {
                 );
             }
             FrostNodeMsg::DescriptorReady { session_id } => {
+                let is_initiator = self
+                    .active_coordinations
+                    .get(&session_id)
+                    .map(|c| c.expected_participants > 0)
+                    .unwrap_or(false);
+                if !is_initiator {
+                    return iced::Task::none();
+                }
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
@@ -732,6 +741,12 @@ impl App {
                             ),
                         },
                     );
+                } else {
+                    self.update_wallet_setup(&session_id, |setup| {
+                        setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
+                            "Node unavailable".to_string(),
+                        ));
+                    });
                 }
             }
             FrostNodeMsg::DescriptorContributed { session_id, .. } => {
@@ -816,6 +831,10 @@ impl App {
 
         if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
             tracing::warn!(network = %network, "Ignoring descriptor contribution for invalid network");
+            return iced::Task::none();
+        }
+
+        if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
             return iced::Task::none();
         }
 
