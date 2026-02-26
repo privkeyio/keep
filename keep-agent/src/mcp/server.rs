@@ -270,7 +270,8 @@ impl McpServer {
                 if let Some(ref secret) = self.secret_key {
                     use nostr_sdk::prelude::*;
 
-                    let keys = Keys::parse(&hex::encode(&**secret))
+                    let hex_secret = Zeroizing::new(hex::encode(**secret));
+                    let keys = Keys::parse(hex_secret.as_str())
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let nostr_tags: Vec<Tag> = tags
@@ -336,7 +337,7 @@ impl McpServer {
                     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
                         .map_err(|e| AgentError::Other(format!("Invalid PSBT: {e}")))?;
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret_copy, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret_copy, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let analysis = signer
@@ -428,7 +429,7 @@ impl McpServer {
                         _ => keep_bitcoin::Network::Testnet,
                     };
 
-                    let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret_copy, network)
+                    let signer = keep_bitcoin::BitcoinSigner::new(&mut secret_copy, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
                     let address = signer
@@ -453,7 +454,9 @@ impl McpServer {
             _ => ToolResult::error(format!("Unknown tool: {name}")),
         };
 
-        self.manager.record_request(&session_id)?;
+        if result.success {
+            self.manager.record_request(&session_id)?;
+        }
 
         let text = serde_json::to_string(&result.content)
             .map_err(|e| AgentError::Serialization(e.to_string()))?;

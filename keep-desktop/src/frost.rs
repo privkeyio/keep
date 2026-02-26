@@ -954,7 +954,6 @@ impl App {
                 let _ = entry.response_tx.try_send(false);
             }
         }
-        self.active_coordinations.clear();
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
             s.peers.clear();

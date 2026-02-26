@@ -340,7 +340,7 @@ impl Server {
         generate_bunker_url(
             &self.keys.public_key(),
             &self.relay_urls,
-            self.bunker_secret.as_deref(),
+            self.bunker_secret.as_ref().map(|s| s.as_str()),
         )
     }
 
