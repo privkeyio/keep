@@ -303,6 +303,12 @@ pub enum FrostNodeMsg {
         external_descriptor: String,
         internal_descriptor: String,
     },
+    DescriptorAcked {
+        session_id: [u8; 32],
+        share_index: u16,
+        ack_count: usize,
+        expected_acks: usize,
+    },
     DescriptorNacked {
         session_id: [u8; 32],
         share_index: u16,
@@ -346,6 +352,18 @@ impl fmt::Debug for FrostNodeMsg {
                 .field("session_id", &hex::encode(session_id))
                 .field("external_descriptor", &"***")
                 .field("internal_descriptor", &"***")
+                .finish(),
+            Self::DescriptorAcked {
+                session_id,
+                share_index,
+                ack_count,
+                expected_acks,
+            } => f
+                .debug_struct("DescriptorAcked")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .field("ack_count", ack_count)
+                .field("expected_acks", expected_acks)
                 .finish(),
             Self::DescriptorNacked {
                 session_id,

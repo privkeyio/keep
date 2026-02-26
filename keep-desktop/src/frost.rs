@@ -517,6 +517,22 @@ pub(crate) async fn frost_event_listener(
                             },
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorAcked {
+                        session_id,
+                        share_index,
+                        ack_count,
+                        expected_acks,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorAcked {
+                                session_id,
+                                share_index,
+                                ack_count,
+                                expected_acks,
+                            },
+                        );
+                    }
                     Ok(KfpNodeEvent::DescriptorNacked {
                         session_id,
                         share_index,
@@ -705,8 +721,11 @@ impl App {
                                 .map_err(|e| format!("{e}"))
                         },
                         move |result| match result {
-                            Ok(()) => Message::WalletDescriptorProgress(
-                                DescriptorProgress::Finalizing,
+                            Ok(expected_acks) => Message::WalletDescriptorProgress(
+                                DescriptorProgress::WaitingAcks {
+                                    received: 0,
+                                    expected: expected_acks,
+                                },
                                 Some(session_id),
                             ),
                             Err(e) => Message::WalletDescriptorProgress(
@@ -726,6 +745,19 @@ impl App {
                     {
                         *received += 1;
                     }
+                });
+            }
+            FrostNodeMsg::DescriptorAcked {
+                session_id,
+                ack_count,
+                expected_acks,
+                ..
+            } => {
+                self.update_wallet_setup(&session_id, |setup| {
+                    setup.phase = SetupPhase::Coordinating(DescriptorProgress::WaitingAcks {
+                        received: ack_count,
+                        expected: expected_acks,
+                    });
                 });
             }
             FrostNodeMsg::DescriptorComplete {

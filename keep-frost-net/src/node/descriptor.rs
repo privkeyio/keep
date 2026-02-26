@@ -789,7 +789,7 @@ impl KfpNode {
                 .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
         };
 
-        let is_complete = {
+        let (is_complete, ack_count, expected_acks) = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
@@ -800,15 +800,28 @@ impl KfpNode {
                 payload.descriptor_hash,
                 &payload.key_proof_psbt,
             )?;
-            session.is_complete()
+            (
+                session.is_complete(),
+                session.ack_count(),
+                session.expected_ack_count(),
+            )
         };
 
         info!(
             session_id = %hex::encode(payload.session_id),
             share_index,
+            ack_count,
+            expected_acks,
             complete = is_complete,
             "Received descriptor ACK"
         );
+
+        let _ = self.event_tx.send(KfpNodeEvent::DescriptorAcked {
+            session_id: payload.session_id,
+            share_index,
+            ack_count,
+            expected_acks,
+        });
 
         if is_complete {
             let sessions = self.descriptor_sessions.read();
@@ -827,25 +840,27 @@ impl KfpNode {
         Ok(())
     }
 
-    pub async fn build_and_finalize_descriptor(&self, session_id: [u8; 32]) -> Result<()> {
-        let (external, internal, policy_hash) = {
+    pub async fn build_and_finalize_descriptor(&self, session_id: [u8; 32]) -> Result<usize> {
+        let (external, internal, policy_hash, expected_acks) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             let policy_hash = derive_policy_hash(session.policy());
+            let expected_acks = session.expected_ack_count();
             let (external, internal) = reconstruct_descriptor(
                 session.group_pubkey(),
                 session.policy(),
                 session.contributions(),
                 session.network(),
             )?;
-            (external, internal, policy_hash)
+            (external, internal, policy_hash, expected_acks)
         };
 
         self.finalize_descriptor(session_id, &external, &internal, policy_hash)
-            .await
+            .await?;
+        Ok(expected_acks)
     }
 
     pub fn cancel_descriptor_session(&self, session_id: &[u8; 32]) {
