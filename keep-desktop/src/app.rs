@@ -1849,9 +1849,7 @@ impl App {
             }
             Message::ConfirmDeleteNsecKey(hex) => {
                 let (pubkey, name) = match &self.screen {
-                    Screen::NsecKeys(s)
-                        if s.delete_confirm.as_deref() == Some(hex.as_str()) =>
-                    {
+                    Screen::NsecKeys(s) if s.delete_confirm.as_deref() == Some(hex.as_str()) => {
                         match s.keys.iter().find(|k| k.pubkey_hex == hex) {
                             Some(k) => (k.pubkey, k.name.clone()),
                             None => return Task::none(),
@@ -1869,10 +1867,7 @@ impl App {
                 };
                 match delete_result {
                     Some(Ok(())) => {
-                        let _ = std::fs::remove_file(relay_config_path_for(
-                            &self.keep_path,
-                            &hex,
-                        ));
+                        let _ = std::fs::remove_file(relay_config_path_for(&self.keep_path, &hex));
                         let _ = std::fs::remove_file(bunker_relay_config_path_for(
                             &self.keep_path,
                             &hex,
