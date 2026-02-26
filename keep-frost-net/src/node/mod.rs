@@ -1081,16 +1081,18 @@ impl KfpNode {
             .filter(|idx| !responsive.contains(idx))
             .collect();
 
-        let _ = self.event_tx.send(KfpNodeEvent::HealthCheckComplete {
-            group_pubkey: self.group_pubkey,
-            responsive: responsive.clone(),
-            unresponsive: unresponsive.clone(),
-        });
-
-        Ok(HealthCheckResult {
+        let result = HealthCheckResult {
             responsive,
             unresponsive,
-        })
+        };
+
+        let _ = self.event_tx.send(KfpNodeEvent::HealthCheckComplete {
+            group_pubkey: self.group_pubkey,
+            responsive: result.responsive.clone(),
+            unresponsive: result.unresponsive.clone(),
+        });
+
+        Ok(result)
     }
 
     pub async fn ping_peers(&self, timeout: Duration) -> Result<Vec<u16>> {

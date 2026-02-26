@@ -758,22 +758,21 @@ impl KeepMobile {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let all_shares: Vec<(u16, bool)> = result
+            for (idx, responsive) in result
                 .responsive
                 .iter()
                 .map(|&idx| (idx, true))
                 .chain(result.unresponsive.iter().map(|&idx| (idx, false)))
-                .collect();
-            for (idx, responsive) in &all_shares {
+            {
                 let existing_created_at =
-                    persistence::existing_created_at(&self.storage, &group_pubkey, *idx);
+                    persistence::existing_created_at(&self.storage, &group_pubkey, idx);
                 if let Err(e) = persistence::persist_health_status(
                     &self.storage,
                     &KeyHealthStatusInfo {
                         group_pubkey: group_pubkey.clone(),
-                        share_index: *idx,
+                        share_index: idx,
                         last_check_timestamp: now,
-                        responsive: *responsive,
+                        responsive,
                         created_at: existing_created_at.unwrap_or(now),
                         is_stale: false,
                         is_critical: false,

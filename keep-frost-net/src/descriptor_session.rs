@@ -12,25 +12,25 @@ use sha2::{Digest, Sha256};
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
     KeySlot, WalletPolicy, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
-    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
-    MAX_XPUB_LENGTH,
+    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
 };
 
 const MAX_SESSIONS: usize = 64;
 const REAP_GRACE_SECS: u64 = 60;
-const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(86_400);
 
 fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
+    let max = Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS);
     if timeout.is_zero() {
         return Err(FrostNetError::Session(
             "Session timeout must be greater than zero".into(),
         ));
     }
-    if timeout > MAX_SESSION_TIMEOUT {
+    if timeout > max {
         return Err(FrostNetError::Session(format!(
             "Session timeout {}s exceeds maximum {}s",
             timeout.as_secs(),
-            MAX_SESSION_TIMEOUT.as_secs()
+            max.as_secs()
         )));
     }
     Ok(timeout)
@@ -407,7 +407,6 @@ impl DescriptorSessionManager {
         self.sessions.len()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &mut self,
         session_id: [u8; 32],
@@ -456,10 +455,10 @@ impl DescriptorSessionManager {
             ));
         }
 
-        let effective_timeout = match timeout {
-            Some(t) => validate_session_timeout(t)?,
-            None => self.default_timeout,
-        };
+        let effective_timeout = timeout
+            .map(validate_session_timeout)
+            .transpose()?
+            .unwrap_or(self.default_timeout);
         let session = DescriptorSession::new(
             session_id,
             group_pubkey,

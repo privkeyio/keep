@@ -407,10 +407,8 @@ pub fn cmd_frost_network_sign(
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
         out.info("Starting FROST coordination node...");
-        out.field("Node pubkey", &{
-            let pk = node.pubkey();
-            pk.to_bech32().unwrap_or_else(|_| format!("{pk}"))
-        });
+        let pk = node.pubkey();
+        out.field("Node pubkey", &pk.to_bech32().unwrap_or_else(|_| format!("{pk}")));
         out.newline();
 
         let node = std::sync::Arc::new(node);

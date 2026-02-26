@@ -615,9 +615,10 @@ pub fn cmd_wallet_propose(
         spinner.finish();
 
         let spinner = out.spinner("Waiting for ACKs...");
+        let default_ack = keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS;
         let ack_timeout = timeout_secs
-            .map(|t| t.clamp(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS, keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS * 4))
-            .unwrap_or(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS);
+            .map(|t| t.clamp(default_ack, default_ack * 4))
+            .unwrap_or(default_ack);
         let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(ack_timeout);
 
         let mut external_descriptor = String::new();
