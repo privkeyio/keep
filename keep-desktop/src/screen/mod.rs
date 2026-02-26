@@ -16,8 +16,23 @@ pub mod signing_audit;
 pub mod unlock;
 pub mod wallet;
 
+use chrono::{DateTime, Utc};
+
 use crate::message::Message;
 use layout::{NavItem, SidebarState};
+
+pub fn format_timestamp(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+pub fn truncate_npub(npub: &str) -> String {
+    if !npub.is_ascii() || npub.len() <= 20 {
+        return npub.to_owned();
+    }
+    format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
+}
 
 pub enum Screen {
     Unlock(unlock::UnlockScreen),

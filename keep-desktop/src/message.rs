@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
+use crate::screen::truncate_npub;
 use crate::screen::wallet::{DescriptorProgress, WalletEntry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,14 +31,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn truncated_npub(&self) -> String {
-        if !self.npub.is_ascii() || self.npub.len() <= 20 {
-            return self.npub.clone();
-        }
-        format!(
-            "{}...{}",
-            &self.npub[..12],
-            &self.npub[self.npub.len() - 6..]
-        )
+        truncate_npub(&self.npub)
     }
 }
 

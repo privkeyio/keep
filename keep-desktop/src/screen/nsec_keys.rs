@@ -1,24 +1,18 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 use keep_core::keys::{bytes_to_npub, KeyRecord, KeyType};
 
+use super::{format_timestamp, truncate_npub};
 use crate::message::Message;
 use crate::theme;
 
-fn format_timestamp(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| ts.to_string())
-}
-
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct NsecKeyEntry {
     pub name: String,
+    #[allow(dead_code)]
     pub pubkey: [u8; 32],
     pub pubkey_hex: String,
     pub npub: String,
@@ -44,14 +38,7 @@ impl NsecKeyEntry {
     }
 
     fn truncated_npub(&self) -> String {
-        if !self.npub.is_ascii() || self.npub.len() <= 20 {
-            return self.npub.clone();
-        }
-        format!(
-            "{}...{}",
-            &self.npub[..12],
-            &self.npub[self.npub.len() - 6..]
-        )
+        truncate_npub(&self.npub)
     }
 
     fn created_display(&self) -> String {
@@ -169,7 +156,7 @@ impl NsecKeysScreen {
 
         if !is_active {
             let activate_btn = button(text("Activate").size(theme::size::SMALL))
-                .on_press(Message::SetActiveShare(key.pubkey_hex.clone()))
+                .on_press(Message::SwitchIdentity(key.pubkey_hex.clone()))
                 .style(theme::secondary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 

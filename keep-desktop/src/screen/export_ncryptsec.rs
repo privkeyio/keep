@@ -5,6 +5,7 @@ use iced::widget::{button, column, container, qr_code, row, text, text_input, Sp
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
+use super::truncate_npub;
 use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::message::Message;
 use crate::theme;
@@ -85,15 +86,7 @@ impl ExportNcryptsecScreen {
             .size(theme::size::HEADING)
             .color(theme::color::TEXT);
 
-        let truncated_npub = if self.npub.len() > 20 {
-            format!(
-                "{}...{}",
-                &self.npub[..12],
-                &self.npub[self.npub.len() - 6..]
-            )
-        } else {
-            self.npub.clone()
-        };
+        let truncated_npub = truncate_npub(&self.npub);
 
         let info = text(format!("nsec | {truncated_npub}"))
             .size(theme::size::SMALL)

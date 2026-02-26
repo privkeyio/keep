@@ -892,9 +892,14 @@ impl App {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
+                let go_to_nsec = matches!(self.screen, Screen::ExportNcryptsec(_));
                 self.stop_scanner();
                 self.copy_feedback_until = None;
-                self.set_share_screen(self.current_shares());
+                if go_to_nsec {
+                    self.set_nsec_keys_screen();
+                } else {
+                    self.set_share_screen(self.current_shares());
+                }
                 Task::none()
             }
             Message::NavigateNsecKeys => {
@@ -1838,6 +1843,13 @@ impl App {
                 Task::none()
             }
             Message::ConfirmDeleteNsecKey(hex) => {
+                if let Screen::NsecKeys(s) = &self.screen {
+                    if s.delete_confirm.as_deref() != Some(hex.as_str()) {
+                        return Task::none();
+                    }
+                } else {
+                    return Task::none();
+                }
                 if self.active_share_hex.as_deref() == Some(hex.as_str()) {
                     self.handle_disconnect_relay();
                     self.stop_bunker();
