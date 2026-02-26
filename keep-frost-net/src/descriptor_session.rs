@@ -298,11 +298,17 @@ impl DescriptorSession {
     }
 
     pub fn expired_phase(&self) -> Option<&'static str> {
-        if self.created_at.elapsed() > self.timeout {
-            return Some("session");
-        }
         match self.state {
+            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => {
+                if self.created_at.elapsed() > self.timeout + Duration::from_secs(REAP_GRACE_SECS) {
+                    return Some("reap");
+                }
+                None
+            }
             DescriptorSessionState::Proposed => {
+                if self.created_at.elapsed() > self.timeout {
+                    return Some("session");
+                }
                 if let Some(complete_at) = self.contributions_complete_at {
                     if complete_at.elapsed() > self.finalize_timeout {
                         return Some("finalize");
@@ -313,17 +319,14 @@ impl DescriptorSession {
                 None
             }
             DescriptorSessionState::Finalized => {
+                if self.created_at.elapsed() > self.timeout {
+                    return Some("session");
+                }
                 let Some(fin_at) = self.finalized_at else {
                     return Some("session");
                 };
                 if fin_at.elapsed() > self.ack_phase_timeout {
                     return Some("ack");
-                }
-                None
-            }
-            DescriptorSessionState::Complete | DescriptorSessionState::Failed(_) => {
-                if self.created_at.elapsed() > self.timeout + Duration::from_secs(REAP_GRACE_SECS) {
-                    return Some("reap");
                 }
                 None
             }

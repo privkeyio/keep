@@ -633,15 +633,16 @@ impl KfpNode {
 
         {
             let mut sessions = self.descriptor_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&payload.session_id) {
-                if let Err(e) = session.set_finalized(FinalizedDescriptor {
-                    external: payload.external_descriptor.clone(),
-                    internal: payload.internal_descriptor.clone(),
-                    policy_hash: payload.policy_hash,
-                }) {
-                    debug!("Failed to finalize receiver session: {e}");
-                }
-            }
+            let Some(session) = sessions.get_session_mut(&payload.session_id) else {
+                return Err(FrostNetError::Session(
+                    "Session not found for finalize".into(),
+                ));
+            };
+            session.set_finalized(FinalizedDescriptor {
+                external: payload.external_descriptor.clone(),
+                internal: payload.internal_descriptor.clone(),
+                policy_hash: payload.policy_hash,
+            })?;
         }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
