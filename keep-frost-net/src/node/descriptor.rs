@@ -901,7 +901,8 @@ impl KfpNode {
                 return Ok(());
             }
             if seen.len() >= 10_000 {
-                seen.clear();
+                tracing::warn!("seen_xpub_announces at capacity, dropping announce");
+                return Ok(());
             }
             seen.insert(dedup_key);
         }
