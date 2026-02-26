@@ -365,6 +365,11 @@ impl KfpNode {
         proxy: Option<SocketAddr>,
         session_timeout: Option<Duration>,
     ) -> Result<Self> {
+        let descriptor_manager = match session_timeout {
+            Some(t) => DescriptorSessionManager::with_timeout(t)?,
+            None => DescriptorSessionManager::new(),
+        };
+
         for relay in &relays {
             let validate = if ALLOW_INTERNAL_HOSTS {
                 validate_relay_url_allow_internal
@@ -424,11 +429,6 @@ impl KfpNode {
         let ecdh_manager = match session_timeout {
             Some(t) => EcdhSessionManager::new().with_timeout(t),
             None => EcdhSessionManager::new(),
-        };
-
-        let descriptor_manager = match session_timeout {
-            Some(t) => DescriptorSessionManager::with_timeout(t)?,
-            None => DescriptorSessionManager::new(),
         };
 
         let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
@@ -1066,6 +1066,7 @@ impl KfpNode {
     }
 
     pub async fn health_check(&self, timeout: Duration) -> Result<HealthCheckResult> {
+        let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(300));
         let peers_snapshot: Vec<(u16, PublicKey, std::time::Instant)> = self
             .peers
             .read()
@@ -1116,9 +1117,26 @@ impl KfpNode {
             return Ok(Vec::new());
         }
 
-        for (_, pubkey, _) in peers_snapshot {
-            if let Ok(event) = KfpEventBuilder::ping(&self.keys, pubkey) {
-                let _ = self.client.send_event(&event).await;
+        for (share_index, pubkey, _) in peers_snapshot {
+            match KfpEventBuilder::ping(&self.keys, pubkey) {
+                Ok(event) => {
+                    if let Err(e) = self.client.send_event(&event).await {
+                        warn!(
+                            peer = %pubkey,
+                            share_index,
+                            error = %e,
+                            "Failed to send ping"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        peer = %pubkey,
+                        share_index,
+                        error = %e,
+                        "Failed to build ping event"
+                    );
+                }
             }
         }
 

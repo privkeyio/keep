@@ -735,15 +735,16 @@ impl KeepMobile {
             });
         }
         self.runtime.block_on(async {
-            let node_guard = self.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            let group_pubkey = hex::encode(node.group_pubkey());
-
-            let result = node
-                .health_check(Duration::from_secs(timeout_secs))
-                .await
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+            let (group_pubkey, result) = {
+                let node_guard = self.node.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                let gp = hex::encode(node.group_pubkey());
+                let r = node
+                    .health_check(Duration::from_secs(timeout_secs))
+                    .await
+                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                (gp, r)
+            };
 
             if let Some(cb) = self.health_callbacks.read().await.as_ref() {
                 if let Err(e) = cb.on_health_check_complete(
@@ -814,26 +815,36 @@ impl KeepMobile {
                 msg: format!("Invalid network: {network}"),
             });
         }
+        if let Some(t) = timeout_secs {
+            if t == 0 || t > keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
+                return Err(KeepMobileError::InvalidInput {
+                    msg: format!(
+                        "timeout_secs must be between 1 and {}, got {t}",
+                        keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS
+                    ),
+                });
+            }
+        }
 
         self.runtime.block_on(async {
-            let node_guard = self.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            let session_id = {
+                let node_guard = self.node.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
-            let share_info = self
-                .storage
-                .get_share_metadata()
-                .ok_or(KeepMobileError::NotInitialized)?;
+                let share_info = self
+                    .storage
+                    .get_share_metadata()
+                    .ok_or(KeepMobileError::NotInitialized)?;
 
-            let policy = build_wallet_policy(&tiers, share_info.total_shares)?;
+                let policy = build_wallet_policy(&tiers, share_info.total_shares)?;
 
-            let (xpub, fingerprint) = node
-                .derive_account_xpub(&network)
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+                let (xpub, fingerprint) = node
+                    .derive_account_xpub(&network)
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
 
-            validate_xpub_network(&xpub, &network)?;
+                validate_xpub_network(&xpub, &network)?;
 
-            let session_id = node
-                .request_descriptor_with_timeout(
+                node.request_descriptor_with_timeout(
                     policy,
                     &network,
                     &xpub,
@@ -841,7 +852,8 @@ impl KeepMobile {
                     timeout_secs,
                 )
                 .await
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?
+            };
 
             self.descriptor_networks
                 .lock()
