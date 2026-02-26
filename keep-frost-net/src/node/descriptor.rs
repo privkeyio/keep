@@ -609,6 +609,9 @@ impl KfpNode {
             Ok(bytes) => bytes,
             Err(e) => {
                 let reason = format!("Key proof failed: {e}");
+                self.descriptor_sessions
+                    .write()
+                    .remove_session(&payload.session_id);
                 self.send_descriptor_nack(payload.session_id, &sender, &reason)
                     .await;
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -653,11 +656,13 @@ impl KfpNode {
         {
             let mut sessions = self.descriptor_sessions.write();
             if let Some(session) = sessions.get_session_mut(&payload.session_id) {
-                let _ = session.set_finalized(FinalizedDescriptor {
+                if let Err(e) = session.set_finalized(FinalizedDescriptor {
                     external: payload.external_descriptor.clone(),
                     internal: payload.internal_descriptor.clone(),
                     policy_hash: payload.policy_hash,
-                });
+                }) {
+                    debug!("Failed to finalize receiver session: {e}");
+                }
             }
         }
 
