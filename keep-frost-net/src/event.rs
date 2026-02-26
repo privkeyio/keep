@@ -43,6 +43,7 @@ impl KfpEventBuilder {
         let content = msg.to_json()?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::custom(
                 TagKind::custom("g"),
                 [hex::encode(group_pubkey)],

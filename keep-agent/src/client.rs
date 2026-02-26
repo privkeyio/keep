@@ -30,15 +30,9 @@ impl PendingSession {
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
 
-        let relay_opts = RelayOptions::default()
-            .reconnect(true)
-            .ping(true)
-            .retry_interval(Duration::from_secs(10))
-            .adjust_retry_interval(true);
-
         client
             .pool()
-            .add_relay(&relay_url, relay_opts)
+            .add_relay(&relay_url, default_relay_opts())
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -130,7 +124,7 @@ impl PendingSession {
             .kind(Kind::NostrConnect)
             .author(self.signer_pubkey)
             .pubkey(self.client_keys.public_key())
-            .since(Timestamp::now());
+            .since(Timestamp::now() - Duration::from_secs(10));
 
         let mut stream = self
             .client
@@ -220,15 +214,9 @@ impl AgentClient {
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
 
-        let relay_opts = RelayOptions::default()
-            .reconnect(true)
-            .ping(true)
-            .retry_interval(Duration::from_secs(10))
-            .adjust_retry_interval(true);
-
         client
             .pool()
-            .add_relay(&relay_url, relay_opts)
+            .add_relay(&relay_url, default_relay_opts())
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -420,7 +408,7 @@ impl AgentClient {
         }
 
         let relays: Vec<String> = if result.is_string() {
-            serde_json::from_str(result.as_str().unwrap())
+            serde_json::from_str(result.as_str().expect("guarded by is_string check"))
                 .map_err(|e| AgentError::Serialization(format!("Invalid relay list: {e}")))?
         } else if result.is_array() {
             serde_json::from_value(result.clone())
@@ -446,11 +434,7 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
-        let relay_opts = RelayOptions::default()
-            .reconnect(true)
-            .ping(true)
-            .retry_interval(Duration::from_secs(10))
-            .adjust_retry_interval(true);
+        let relay_opts = default_relay_opts();
         let mut added = Vec::new();
         for relay in &valid_relays {
             if self
@@ -515,7 +499,7 @@ impl AgentClient {
             .kind(Kind::NostrConnect)
             .author(self.signer_pubkey)
             .pubkey(self.client_keys.public_key())
-            .since(Timestamp::now());
+            .since(Timestamp::now() - Duration::from_secs(10));
 
         let mut stream = self
             .client
@@ -572,7 +556,7 @@ impl AgentClient {
             .get("result")
             .map(|v| {
                 if v.is_string() {
-                    v.as_str().unwrap().to_string()
+                    v.as_str().expect("guarded by is_string check").to_string()
                 } else {
                     v.to_string()
                 }
@@ -591,6 +575,14 @@ impl AgentClient {
     pub async fn disconnect(&self) {
         let _ = self.client.disconnect().await;
     }
+}
+
+fn default_relay_opts() -> RelayOptions {
+    RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(Duration::from_secs(10))
+        .adjust_retry_interval(true)
 }
 
 fn generate_uuid() -> String {

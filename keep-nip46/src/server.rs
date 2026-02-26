@@ -21,6 +21,8 @@ use crate::permissions::PermissionManager;
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 
+const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+
 pub struct ServerConfig {
     pub max_event_json_size: usize,
     pub audit_log_capacity: usize,
@@ -513,7 +515,7 @@ impl Server {
         .map_err(|e| CryptoError::encryption(e.to_string()))?;
 
         let response_event = EventBuilder::new(Kind::NostrConnect, encrypted)
-            .custom_created_at(Timestamp::tweaked(0..5))
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(app_pubkey))
             .sign_with_keys(keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;

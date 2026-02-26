@@ -391,11 +391,7 @@ impl KfpNode {
             None => Client::new(keys.clone()),
         };
 
-        let relay_opts = RelayOptions::default()
-            .reconnect(true)
-            .ping(true)
-            .retry_interval(Duration::from_secs(10))
-            .adjust_retry_interval(true);
+        let relay_opts = default_relay_opts();
 
         for relay in &relays {
             client
@@ -409,13 +405,20 @@ impl KfpNode {
 
         client.connect().await;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let connected_relays = client.relays().await;
-        if connected_relays.is_empty() {
-            return Err(FrostNetError::Transport(
-                "Failed to connect to any relays".into(),
-            ));
-        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let relay_map = client.relays().await;
+                let any_connected = relay_map
+                    .values()
+                    .any(|r| matches!(r.status(), RelayStatus::Connected));
+                if any_connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| FrostNetError::Transport("Timed out waiting for relay connection".into()))?;
 
         let group_pubkey = *share.group_pubkey();
         let our_index = share.metadata.identifier;
@@ -1170,6 +1173,14 @@ impl KfpNode {
 
         Ok(responsive)
     }
+}
+
+fn default_relay_opts() -> RelayOptions {
+    RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(Duration::from_secs(10))
+        .adjust_retry_interval(true)
 }
 
 fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
