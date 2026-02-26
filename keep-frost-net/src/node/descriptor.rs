@@ -37,6 +37,12 @@ impl KfpNode {
         own_fingerprint: &str,
         timeout_secs: Option<u64>,
     ) -> Result<[u8; 32]> {
+        if !VALID_NETWORKS.contains(&network) {
+            return Err(FrostNetError::Session(format!(
+                "Invalid network: {network}"
+            )));
+        }
+
         let our_index = self.share.metadata.identifier;
 
         self.check_proposer_authorized(our_index)?;

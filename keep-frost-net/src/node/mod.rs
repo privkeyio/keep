@@ -1066,19 +1066,19 @@ impl KfpNode {
     }
 
     pub async fn health_check(&self, timeout: Duration) -> Result<HealthCheckResult> {
-        let all_peers: Vec<u16> = self
+        let peers_snapshot: Vec<(u16, PublicKey, std::time::Instant)> = self
             .peers
             .read()
             .all_peers()
             .iter()
-            .map(|p| p.share_index)
+            .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
-        let responsive = self.ping_peers(timeout).await?;
-        let unresponsive: Vec<u16> = all_peers
+        let responsive = self.ping_peers_snapshot(&peers_snapshot, timeout).await?;
+        let unresponsive: Vec<u16> = peers_snapshot
             .iter()
+            .map(|(idx, _, _)| *idx)
             .filter(|idx| !responsive.contains(idx))
-            .copied()
             .collect();
 
         let _ = self.event_tx.send(KfpNodeEvent::HealthCheckComplete {
@@ -1102,11 +1102,19 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
+        self.ping_peers_snapshot(&peers_snapshot, timeout).await
+    }
+
+    async fn ping_peers_snapshot(
+        &self,
+        peers_snapshot: &[(u16, PublicKey, std::time::Instant)],
+        timeout: Duration,
+    ) -> Result<Vec<u16>> {
         if peers_snapshot.is_empty() {
             return Ok(Vec::new());
         }
 
-        for (_, pubkey, _) in &peers_snapshot {
+        for (_, pubkey, _) in peers_snapshot {
             if let Ok(event) = KfpEventBuilder::ping(&self.keys, pubkey) {
                 let _ = self.client.send_event(&event).await;
             }

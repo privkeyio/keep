@@ -746,10 +746,12 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
 
             if let Some(cb) = self.health_callbacks.read().await.as_ref() {
-                let _ = cb.on_health_check_complete(
+                if let Err(e) = cb.on_health_check_complete(
                     result.responsive.clone(),
                     result.unresponsive.clone(),
-                );
+                ) {
+                    tracing::warn!("Health check callback failed: {e}");
+                }
             }
 
             let now = std::time::SystemTime::now()
