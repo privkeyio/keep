@@ -183,9 +183,7 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        if let Some(idx) = self.peers.read().get_peer_by_pubkey(&sender).map(|p| p.share_index) {
-            self.verify_peer_share_index(sender, idx)?;
-        }
+        self.verify_peer_share_index(sender, sender_share_index)?;
 
         let session_created = {
             let mut sessions = self.descriptor_sessions.write();

@@ -55,16 +55,10 @@ impl Default for TierConfig {
 
 #[derive(Debug, Clone)]
 pub enum DescriptorProgress {
-    WaitingContributions {
-        received: usize,
-        expected: usize,
-    },
+    WaitingContributions { received: usize, expected: usize },
     Contributed,
     Finalizing,
-    WaitingAcks {
-        received: usize,
-        expected: usize,
-    },
+    WaitingAcks { received: usize, expected: usize },
     Complete,
     Failed(String),
 }
