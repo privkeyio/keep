@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
+
 use crate::error::{AgentError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,24 +33,13 @@ impl PendingSession {
         let client = Client::new(client_keys.clone());
 
         client
-            .add_relay(&relay_url)
+            .pool()
+            .add_relay(&relay_url, default_relay_opts())
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
         client.connect().await;
-
-        tokio::time::timeout(timeout, async {
-            loop {
-                if let Ok(relay) = client.relay(&relay_url).await {
-                    if matches!(relay.status(), RelayStatus::Connected) {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .map_err(|_| AgentError::Connection("Relay connection timeout".into()))?;
+        wait_for_relay_connection(&client, &relay_url, timeout).await?;
 
         let request_id = generate_uuid();
 
@@ -98,7 +89,7 @@ impl PendingSession {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::now(),
+            Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE),
             Kind::NostrConnect,
             tags,
             encrypted,
@@ -123,50 +114,48 @@ impl PendingSession {
             .kind(Kind::NostrConnect)
             .author(self.signer_pubkey)
             .pubkey(self.client_keys.public_key())
-            .since(Timestamp::now());
+            .since(Timestamp::now() - Duration::from_secs(10));
 
-        let sub_output = self
+        let mut stream = self
             .client
-            .subscribe(filter, None)
+            .pool()
+            .stream_events(filter, timeout, ReqExitPolicy::WaitForEventsAfterEOSE(1))
             .await
             .map_err(|e| AgentError::Nostr(e.to_string()))?;
 
-        let sub_id = sub_output.id();
-        let mut notifications = self.client.notifications();
-
         let result = tokio::time::timeout(timeout, async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
-                        if let Ok(decrypted) = nip44::decrypt(
-                            self.client_keys.secret_key(),
-                            &self.signer_pubkey,
-                            &event.content,
-                        ) {
-                            let parsed: serde_json::Value = serde_json::from_str(&decrypted)
-                                .map_err(|e| AgentError::Serialization(e.to_string()))?;
+            while let Some(event) = stream.next().await {
+                if event.kind != Kind::NostrConnect || event.pubkey != self.signer_pubkey {
+                    continue;
+                }
+                let Ok(decrypted) = nip44::decrypt(
+                    self.client_keys.secret_key(),
+                    &self.signer_pubkey,
+                    &event.content,
+                ) else {
+                    continue;
+                };
+                let parsed: serde_json::Value = serde_json::from_str(&decrypted)
+                    .map_err(|e| AgentError::Serialization(e.to_string()))?;
 
-                            if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
-                                if id == self.request_id {
-                                    if let Some(error) = parsed.get("error") {
-                                        if !error.is_null() {
-                                            return Ok(ApprovalStatus::Denied);
-                                        }
-                                    }
-                                    if parsed.get("result").is_some() {
-                                        return Ok(ApprovalStatus::Approved);
-                                    }
-                                }
-                            }
-                        }
+                let Some(id) = parsed.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if id != self.request_id {
+                    continue;
+                }
+                if let Some(error) = parsed.get("error") {
+                    if !error.is_null() {
+                        return Ok(ApprovalStatus::Denied);
                     }
+                }
+                if parsed.get("result").is_some() {
+                    return Ok(ApprovalStatus::Approved);
                 }
             }
             Ok(ApprovalStatus::Pending)
         })
         .await;
-
-        self.client.unsubscribe(sub_id).await;
 
         match result {
             Ok(inner) => inner,
@@ -220,24 +209,13 @@ impl AgentClient {
         let client = Client::new(client_keys.clone());
 
         client
-            .add_relay(&relay_url)
+            .pool()
+            .add_relay(&relay_url, default_relay_opts())
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
         client.connect().await;
-
-        tokio::time::timeout(timeout, async {
-            loop {
-                if let Ok(relay) = client.relay(&relay_url).await {
-                    if matches!(relay.status(), RelayStatus::Connected) {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .map_err(|_| AgentError::Connection("Relay connection timeout".into()))?;
+        wait_for_relay_connection(&client, &relay_url, timeout).await?;
 
         let mut agent_client = Self {
             signer_pubkey,
@@ -412,7 +390,7 @@ impl AgentClient {
         }
 
         let relays: Vec<String> = if result.is_string() {
-            serde_json::from_str(result.as_str().unwrap())
+            serde_json::from_str(result.as_str().expect("guarded by is_string check"))
                 .map_err(|e| AgentError::Serialization(format!("Invalid relay list: {e}")))?
         } else if result.is_array() {
             serde_json::from_value(result.clone())
@@ -438,9 +416,16 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
+        let relay_opts = default_relay_opts();
         let mut added = Vec::new();
         for relay in &valid_relays {
-            if self.client.add_relay(relay).await.is_ok() {
+            if self
+                .client
+                .pool()
+                .add_relay(relay, relay_opts.clone())
+                .await
+                .is_ok()
+            {
                 added.push(relay.clone());
             }
         }
@@ -450,6 +435,7 @@ impl AgentClient {
             ));
         }
         self.client.connect().await;
+        wait_for_any_relay_connection(&self.client, &added, Duration::from_secs(10)).await?;
 
         self.relay_url = added[0].clone();
 
@@ -477,7 +463,7 @@ impl AgentClient {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::now(),
+            Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE),
             Kind::NostrConnect,
             tags,
             encrypted,
@@ -496,46 +482,43 @@ impl AgentClient {
             .kind(Kind::NostrConnect)
             .author(self.signer_pubkey)
             .pubkey(self.client_keys.public_key())
-            .since(Timestamp::now());
+            .since(Timestamp::now() - Duration::from_secs(10));
 
-        let sub_output = self
+        let mut stream = self
             .client
-            .subscribe(filter, None)
+            .pool()
+            .stream_events(
+                filter,
+                Duration::from_secs(30),
+                ReqExitPolicy::WaitForEventsAfterEOSE(5),
+            )
             .await
             .map_err(|e| AgentError::Nostr(e.to_string()))?;
 
-        let sub_id = sub_output.id();
-        let mut notifications = self.client.notifications();
-
         let result = tokio::time::timeout(Duration::from_secs(30), async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
-                        if let Ok(decrypted) = nip44::decrypt(
-                            self.client_keys.secret_key(),
-                            &self.signer_pubkey,
-                            &event.content,
-                        ) {
-                            if let Some(ref expected_id) = request_id {
-                                if let Ok(resp) =
-                                    serde_json::from_str::<serde_json::Value>(&decrypted)
-                                {
-                                    if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id)
-                                    {
-                                        continue;
-                                    }
-                                }
-                            }
-                            return Ok(decrypted);
+            while let Some(event) = stream.next().await {
+                if event.kind != Kind::NostrConnect || event.pubkey != self.signer_pubkey {
+                    continue;
+                }
+                let Ok(decrypted) = nip44::decrypt(
+                    self.client_keys.secret_key(),
+                    &self.signer_pubkey,
+                    &event.content,
+                ) else {
+                    continue;
+                };
+                if let Some(ref expected_id) = request_id {
+                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&decrypted) {
+                        if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
+                            continue;
                         }
                     }
                 }
+                return Ok(decrypted);
             }
             Err(AgentError::Connection("No response received".into()))
         })
         .await;
-
-        self.client.unsubscribe(sub_id).await;
 
         match result {
             Ok(inner) => inner,
@@ -557,7 +540,7 @@ impl AgentClient {
             .get("result")
             .map(|v| {
                 if v.is_string() {
-                    v.as_str().unwrap().to_string()
+                    v.as_str().expect("guarded by is_string check").to_string()
                 } else {
                     v.to_string()
                 }
@@ -576,6 +559,56 @@ impl AgentClient {
     pub async fn disconnect(&self) {
         let _ = self.client.disconnect().await;
     }
+}
+
+async fn wait_for_relay_connection(
+    client: &Client,
+    relay_url: &str,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Ok(relay) = client.relay(relay_url).await {
+                if matches!(relay.status(), RelayStatus::Connected) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| AgentError::Connection("Relay connection timeout".into()))
+}
+
+async fn wait_for_any_relay_connection(
+    client: &Client,
+    relays: &[String],
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            for relay in relays {
+                if let Ok(r) = client.relay(relay).await {
+                    if matches!(r.status(), RelayStatus::Connected) {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| AgentError::Connection("Relay connection timeout".into()))
+}
+
+fn default_relay_opts() -> RelayOptions {
+    RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(Duration::from_secs(10))
+        .adjust_retry_interval(true)
+        .ban_relay_on_mismatch(true)
+        .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
 fn generate_uuid() -> String {

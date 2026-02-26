@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::HashSet;
 
+use nostr_sdk::Timestamp;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -41,7 +42,7 @@ pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"]
 pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = Timestamp::now().as_secs();
     let min_valid = now.saturating_sub(window_secs);
     let max_valid = now.saturating_add(MAX_FUTURE_SKEW_SECS);
     created_at >= min_valid && created_at <= max_valid
@@ -560,7 +561,7 @@ impl XpubAnnouncePayload {
             group_pubkey,
             share_index,
             recovery_xpubs,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -598,7 +599,7 @@ impl SignRequestPayload {
             message,
             message_type: message_type.to_string(),
             participants,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
             metadata: None,
         }
     }
@@ -682,7 +683,7 @@ impl PingPayload {
     pub fn new() -> Self {
         Self {
             challenge: keep_core::crypto::random_bytes::<32>(),
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: Timestamp::now().as_secs(),
         }
     }
 }
@@ -704,7 +705,7 @@ impl PongPayload {
     pub fn from_ping(ping: &PingPayload) -> Self {
         Self {
             challenge: ping.challenge,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: Timestamp::now().as_secs(),
         }
     }
 }
@@ -758,7 +759,7 @@ impl EcdhRequestPayload {
             group_pubkey,
             recipient_pubkey,
             participants,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -828,7 +829,7 @@ impl RefreshRequestPayload {
             session_id,
             group_pubkey,
             participants,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -853,7 +854,7 @@ impl RefreshRound1Payload {
             session_id,
             share_index,
             package,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -896,7 +897,7 @@ impl RefreshRound2Payload {
             share_index,
             target_index,
             package,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -932,7 +933,7 @@ impl RefreshCompletePayload {
             session_id,
             share_index,
             success,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -1033,7 +1034,7 @@ impl DescriptorContributePayload {
             share_index,
             account_xpub: account_xpub.to_string(),
             fingerprint: fingerprint.to_string(),
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -1073,7 +1074,7 @@ impl DescriptorFinalizePayload {
             internal_descriptor: internal_descriptor.to_string(),
             policy_hash,
             contributions,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -1107,7 +1108,7 @@ impl DescriptorAckPayload {
             group_pubkey,
             descriptor_hash,
             key_proof_psbt,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -1132,7 +1133,7 @@ impl DescriptorNackPayload {
             session_id,
             group_pubkey,
             reason: reason.to_string(),
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at: Timestamp::now().as_secs(),
         }
     }
 
@@ -1493,16 +1494,16 @@ mod tests {
         assert!(payload.is_within_replay_window(1));
 
         let mut old_payload = payload.clone();
-        old_payload.created_at = chrono::Utc::now().timestamp() as u64 - 400;
+        old_payload.created_at = Timestamp::now().as_secs() - 400;
         assert!(!old_payload.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
         assert!(old_payload.is_within_replay_window(500));
 
         let mut slight_future = payload.clone();
-        slight_future.created_at = chrono::Utc::now().timestamp() as u64 + 10;
+        slight_future.created_at = Timestamp::now().as_secs() + 10;
         assert!(slight_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
 
         let mut far_future = payload.clone();
-        far_future.created_at = chrono::Utc::now().timestamp() as u64 + 400;
+        far_future.created_at = Timestamp::now().as_secs() + 400;
         assert!(!far_future.is_within_replay_window(DEFAULT_REPLAY_WINDOW_SECS));
         assert!(!far_future.is_within_replay_window(500));
     }

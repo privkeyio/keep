@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use nostr_sdk::prelude::*;
 
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
+
 use crate::error::{FrostNetError, Result};
 use crate::proof;
 use crate::protocol::*;
@@ -17,7 +19,7 @@ impl KfpEventBuilder {
         verifying_share: &[u8; 33],
         name: Option<&str>,
     ) -> Result<Event> {
-        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let timestamp = Timestamp::now().as_secs();
         let proof_signature = proof::sign_proof(
             signing_share,
             group_pubkey,
@@ -41,6 +43,7 @@ impl KfpEventBuilder {
         let content = msg.to_json()?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::custom(
                 TagKind::custom("g"),
                 [hex::encode(group_pubkey)],
@@ -62,6 +65,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -88,6 +92,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -110,6 +115,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -132,6 +138,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -151,6 +158,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["ping"]))
             .sign_with_keys(keys)
@@ -160,7 +168,7 @@ impl KfpEventBuilder {
     pub fn pong(keys: &Keys, recipient: &PublicKey, challenge: [u8; 32]) -> Result<Event> {
         let payload = PongPayload {
             challenge,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: Timestamp::now().as_secs(),
         };
         let msg = KfpMessage::Pong(payload);
         let content = msg.to_json()?;
@@ -169,6 +177,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["pong"]))
             .sign_with_keys(keys)
@@ -194,6 +203,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         let mut builder = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["error"]));
 
@@ -218,6 +228,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -244,6 +255,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -267,6 +279,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
             .tag(Tag::custom(TagKind::custom("t"), ["ecdh_complete"]))
@@ -287,6 +300,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -305,13 +319,16 @@ impl KfpEventBuilder {
             ));
         }
 
-        let is_addressed_to_us = event.tags.iter().any(|t| {
-            if let Some(TagStandard::PublicKey { public_key, .. }) = t.as_standardized() {
-                public_key == &keys.public_key()
-            } else {
-                false
-            }
-        });
+        let is_addressed_to_us =
+            event
+                .tags
+                .filter(TagKind::p())
+                .any(|t| match t.as_standardized() {
+                    Some(TagStandard::PublicKey { public_key, .. }) => {
+                        public_key == &keys.public_key()
+                    }
+                    _ => false,
+                });
 
         let content = if is_addressed_to_us {
             nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)
@@ -330,40 +347,28 @@ impl KfpEventBuilder {
     }
 
     pub fn get_message_type(event: &Event) -> Option<String> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "t" {
-                tag.get(1).map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("t"))
+            .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
     }
 
     pub fn get_session_id(event: &Event) -> Option<[u8; 32]> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "s" {
-                let hex_str = tag.get(1)?;
-                let bytes = hex::decode(hex_str).ok()?;
-                bytes.try_into().ok()
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("s"))
+            .and_then(|t| t.as_slice().get(1))
+            .and_then(|hex_str| hex::decode(hex_str).ok())
+            .and_then(|bytes| bytes.try_into().ok())
     }
 
     pub fn get_group_pubkey(event: &Event) -> Option<[u8; 32]> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "g" {
-                let hex_str = tag.get(1)?;
-                let bytes = hex::decode(hex_str).ok()?;
-                bytes.try_into().ok()
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("g"))
+            .and_then(|t| t.as_slice().get(1))
+            .and_then(|hex_str| hex::decode(hex_str).ok())
+            .and_then(|bytes| bytes.try_into().ok())
     }
 }
 

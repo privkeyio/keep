@@ -11,6 +11,9 @@ pub const MAX_RELAYS: usize = 10;
 /// Maximum length of a relay URL.
 pub const MAX_RELAY_URL_LENGTH: usize = 256;
 
+/// Range of seconds to randomly tweak event timestamps for privacy.
+pub const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+
 /// Relay configuration for a FROST share, keyed by group public key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayConfig {

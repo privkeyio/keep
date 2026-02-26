@@ -20,6 +20,7 @@ use crate::handler::SignerHandler;
 use crate::permissions::PermissionManager;
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
 pub struct ServerConfig {
     pub max_event_json_size: usize,
@@ -56,9 +57,16 @@ pub struct Server {
 }
 
 async fn add_relays(client: &Client, relay_urls: &[String]) -> Result<()> {
+    let opts = nostr_sdk::RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(std::time::Duration::from_secs(10))
+        .adjust_retry_interval(true);
+
     for relay_url in relay_urls {
         client
-            .add_relay(relay_url)
+            .pool()
+            .add_relay(relay_url, opts.clone())
             .await
             .map_err(|e| NetworkError::relay(e.to_string()))?;
     }
@@ -506,6 +514,7 @@ impl Server {
         .map_err(|e| CryptoError::encryption(e.to_string()))?;
 
         let response_event = EventBuilder::new(Kind::NostrConnect, encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(app_pubkey))
             .sign_with_keys(keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;

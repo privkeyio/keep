@@ -391,21 +391,34 @@ impl KfpNode {
             None => Client::new(keys.clone()),
         };
 
+        let relay_opts = default_relay_opts();
+
         for relay in &relays {
-            client.add_relay(relay).await.map_err(|e| {
-                FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
-            })?;
+            client
+                .pool()
+                .add_relay(relay, relay_opts.clone())
+                .await
+                .map_err(|e| {
+                    FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
+                })?;
         }
 
         client.connect().await;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let connected_relays = client.relays().await;
-        if connected_relays.is_empty() {
-            return Err(FrostNetError::Transport(
-                "Failed to connect to any relays".into(),
-            ));
-        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let relay_map = client.relays().await;
+                let any_connected = relay_map
+                    .values()
+                    .any(|r| matches!(r.status(), RelayStatus::Connected));
+                if any_connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| FrostNetError::Transport("Timed out waiting for relay connection".into()))?;
 
         let group_pubkey = *share.group_pubkey();
         let our_index = share.metadata.identifier;
@@ -744,10 +757,9 @@ impl KfpNode {
                 let matching: Vec<_> = events
                     .into_iter()
                     .filter(|e| {
-                        e.tags.iter().any(|t| {
-                            t.kind() == TagKind::custom("g")
-                                && t.content().map(|c| c == group_hex).unwrap_or(false)
-                        })
+                        e.tags
+                            .filter(TagKind::custom("g"))
+                            .any(|t| t.content() == Some(&group_hex))
                     })
                     .collect();
                 debug!(count = matching.len(), "Fetched historical events");
@@ -790,7 +802,7 @@ impl KfpNode {
                         });
                     }
                     {
-                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        let now = Timestamp::now().as_secs();
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
@@ -933,7 +945,7 @@ impl KfpNode {
             return Ok(());
         }
 
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = Timestamp::now().as_secs();
         if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
             debug!(
                 timestamp = payload.timestamp,
@@ -1162,6 +1174,16 @@ impl KfpNode {
     }
 }
 
+fn default_relay_opts() -> RelayOptions {
+    RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(Duration::from_secs(10))
+        .adjust_retry_interval(true)
+        .ban_relay_on_mismatch(true)
+        .max_avg_latency(Some(Duration::from_secs(3)))
+}
+
 fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
     let mut hasher = Sha256::new();
     hasher.update(b"keep-frost-node-identity-v2");
@@ -1188,6 +1210,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_node_creation() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
         let config = ThresholdConfig::two_of_three();
         let dealer = TrustedDealer::new(config);
         let (mut shares, _) = dealer.generate("test").unwrap();
