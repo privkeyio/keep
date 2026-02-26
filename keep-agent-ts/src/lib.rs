@@ -7,7 +7,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use keep_agent::{
     AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
@@ -367,10 +367,10 @@ impl KeepAgentSession {
             .check_operation(&Operation::SignPsbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = *self
+        let mut secret = Zeroizing::new(*self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?;
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -382,7 +382,7 @@ impl KeepAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(&psbt_base64)
             .map_err(|e| Error::from_reason(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let analysis = signer
@@ -417,9 +417,7 @@ impl KeepAgentSession {
             .record_request(&self.session_id)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let result = signer.sign_psbt(&mut psbt).map_err(|e| Error::from_reason(e.to_string()));
-        secret.zeroize();
-        result?;
+        signer.sign_psbt(&mut psbt).map_err(|e| Error::from_reason(e.to_string()))?;
 
         Ok(keep_bitcoin::psbt::serialize_psbt_base64(&psbt))
     }
@@ -452,10 +450,10 @@ impl KeepAgentSession {
             .check_operation(&Operation::GetBitcoinAddress)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = *self
+        let mut secret = Zeroizing::new(*self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?;
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -464,14 +462,12 @@ impl KeepAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let result = signer
+        signer
             .get_receive_address(0)
-            .map_err(|e| Error::from_reason(e.to_string()));
-        secret.zeroize();
-        result
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 }
 

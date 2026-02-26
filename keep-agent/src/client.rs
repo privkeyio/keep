@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -19,7 +20,7 @@ pub struct PendingSession {
     relay_url: String,
     client_keys: Keys,
     client: Client,
-    connect_sent: std::sync::atomic::AtomicBool,
+    connect_sent: AtomicBool,
 }
 
 impl PendingSession {
@@ -57,7 +58,7 @@ impl PendingSession {
             relay_url,
             client_keys,
             client,
-            connect_sent: std::sync::atomic::AtomicBool::new(false),
+            connect_sent: AtomicBool::new(false),
         })
     }
 
@@ -78,7 +79,7 @@ impl PendingSession {
     async fn send_connect_once(&self) -> Result<()> {
         if self
             .connect_sent
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            .swap(true, Ordering::AcqRel)
         {
             return Ok(());
         }
@@ -436,15 +437,15 @@ impl AgentClient {
         }
 
         self.client.disconnect().await;
+        self.client.remove_all_relays().await;
         for relay in &valid_relays {
             let _ = self.client.add_relay(relay).await;
         }
         self.client.connect().await;
-        let relays = valid_relays;
 
-        self.relay_url = relays[0].clone();
+        self.relay_url = valid_relays[0].clone();
 
-        Ok(Some(relays))
+        Ok(Some(valid_relays))
     }
 
     async fn send_request(&self, content: &str) -> Result<String> {
