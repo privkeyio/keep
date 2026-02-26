@@ -312,7 +312,9 @@ impl KfpMessage {
                                     return Err("Invalid external xpub");
                                 }
                                 if !is_valid_fingerprint(fingerprint) {
-                                    return Err("External fingerprint must be exactly 8 hex characters");
+                                    return Err(
+                                        "External fingerprint must be exactly 8 hex characters",
+                                    );
                                 }
                             }
                         }
