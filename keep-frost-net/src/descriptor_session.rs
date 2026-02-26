@@ -32,8 +32,7 @@ fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
                 "Session timeout {}s exceeds maximum {}s",
                 timeout.as_secs(),
                 MAX_SESSION_TIMEOUT.as_secs()
-            )
-            .into(),
+            ),
         ));
     }
     Ok(timeout)
