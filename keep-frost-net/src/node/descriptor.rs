@@ -202,10 +202,17 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let propose_timeout = payload
-            .timeout_secs
-            .filter(|&t| t > 0 && t <= DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS)
-            .map(std::time::Duration::from_secs);
+        let propose_timeout = match payload.timeout_secs {
+            None => None,
+            Some(t) if t > 0 && t <= DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS => {
+                Some(std::time::Duration::from_secs(t))
+            }
+            Some(t) => {
+                return Err(FrostNetError::Session(format!(
+                    "Invalid proposal timeout {t}s, must be 1..={DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS}"
+                )));
+            }
+        };
 
         let session_created = {
             let mut sessions = self.descriptor_sessions.write();

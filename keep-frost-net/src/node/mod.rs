@@ -1066,7 +1066,12 @@ impl KfpNode {
     }
 
     pub async fn health_check(&self, timeout: Duration) -> Result<HealthCheckResult> {
-        let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(300));
+        if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(300) {
+            return Err(FrostNetError::Session(format!(
+                "Health check timeout must be between 1s and 300s, got {}s",
+                timeout.as_secs()
+            )));
+        }
         let peers_snapshot: Vec<(u16, PublicKey, std::time::Instant)> = self
             .peers
             .read()

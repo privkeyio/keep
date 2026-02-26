@@ -402,21 +402,28 @@ pub(crate) fn load_health_statuses(storage: &Arc<dyn SecureStorage>) -> Vec<KeyH
         .as_secs();
     let index = load_health_index(storage);
     let mut results = Vec::new();
-    for key in index {
-        if let Ok(data) = storage.load_share_by_key(key) {
-            if let Ok(stored) = serde_json::from_slice::<StoredHealthStatus>(&data) {
-                let stale_age = now.saturating_sub(stored.last_check_timestamp);
-                results.push(KeyHealthStatusInfo {
-                    group_pubkey: stored.group_pubkey,
-                    share_index: stored.share_index,
-                    last_check_timestamp: stored.last_check_timestamp,
-                    responsive: stored.responsive,
-                    created_at: stored.created_at.unwrap_or(stored.last_check_timestamp),
-                    is_stale: stale_age >= keep_core::wallet::KEY_HEALTH_STALE_THRESHOLD_SECS,
-                    is_critical: stale_age >= keep_core::wallet::KEY_HEALTH_CRITICAL_THRESHOLD_SECS,
-                });
-            }
-        }
+    let mut live_keys = Vec::with_capacity(index.len());
+    for key in &index {
+        let Some(data) = storage.load_share_by_key(key.clone()).ok() else {
+            continue;
+        };
+        let Some(stored) = serde_json::from_slice::<StoredHealthStatus>(&data).ok() else {
+            continue;
+        };
+        live_keys.push(key.clone());
+        let stale_age = now.saturating_sub(stored.last_check_timestamp);
+        results.push(KeyHealthStatusInfo {
+            group_pubkey: stored.group_pubkey,
+            share_index: stored.share_index,
+            last_check_timestamp: stored.last_check_timestamp,
+            responsive: stored.responsive,
+            created_at: stored.created_at.unwrap_or(stored.last_check_timestamp),
+            is_stale: stale_age >= keep_core::wallet::KEY_HEALTH_STALE_THRESHOLD_SECS,
+            is_critical: stale_age >= keep_core::wallet::KEY_HEALTH_CRITICAL_THRESHOLD_SECS,
+        });
+    }
+    if live_keys.len() < index.len() {
+        let _ = persist_health_index(storage, &live_keys);
     }
     results
 }
