@@ -1327,11 +1327,9 @@ impl App {
                             if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
                                 &mut self.screen
                             {
-                                s.phase = SetupPhase::Coordinating(
-                                    DescriptorProgress::Failed(
-                                        "Too many active coordinations".to_string(),
-                                    ),
-                                );
+                                s.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
+                                    "Too many active coordinations".to_string(),
+                                ));
                             }
                         } else {
                             self.active_coordinations.insert(
@@ -1380,8 +1378,7 @@ impl App {
                 if let Err(e) = result {
                     self.active_coordinations.remove(&session_id);
                     self.update_wallet_setup(&session_id, |setup| {
-                        setup.phase =
-                            SetupPhase::Coordinating(DescriptorProgress::Failed(e));
+                        setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(e));
                     });
                 }
                 Task::none()
