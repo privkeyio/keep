@@ -224,12 +224,13 @@ impl DescriptorSession {
         Ok(())
     }
 
+    /// Returns `Ok(true)` when the ack was new, `Ok(false)` for duplicates.
     pub fn add_ack(
         &mut self,
         share_index: u16,
         descriptor_hash: [u8; 32],
         key_proof_psbt: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.state != DescriptorSessionState::Finalized {
             return Err(FrostNetError::Session("Not accepting ACKs".into()));
         }
@@ -241,7 +242,7 @@ impl DescriptorSession {
         }
 
         if self.acks.contains(&share_index) {
-            return Ok(());
+            return Ok(false);
         }
 
         let finalized = self
@@ -278,7 +279,7 @@ impl DescriptorSession {
             self.state = DescriptorSessionState::Complete;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn has_all_acks(&self) -> bool {

@@ -532,6 +532,30 @@ pub(crate) async fn frost_event_listener(
                             FrostNodeMsg::DescriptorFailed { session_id, error },
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorAckReceived {
+                        session_id,
+                        share_index,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::DescriptorAckReceived {
+                                session_id,
+                                share_index,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::XpubAnnounced {
+                        share_index,
+                        recovery_xpubs,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::XpubAnnounced {
+                                share_index,
+                                recovery_xpubs,
+                            },
+                        );
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -717,6 +741,33 @@ impl App {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
                 });
             }
+            FrostNodeMsg::DescriptorAckReceived {
+                session_id,
+                share_index: _,
+            } => {
+                if let Some(coord) = self.active_coordinations.get_mut(&session_id) {
+                    if coord.expected_participants > 0 {
+                        coord.acks_received += 1;
+                        let received = coord.acks_received;
+                        let expected = coord.expected_participants;
+                        self.update_wallet_setup(&session_id, |setup| {
+                            setup.phase = SetupPhase::Coordinating(
+                                DescriptorProgress::WaitingAcks { received, expected },
+                            );
+                        });
+                    }
+                }
+            }
+            FrostNodeMsg::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => {
+                tracing::info!(
+                    share_index,
+                    count = recovery_xpubs.len(),
+                    "Received XpubAnnounce from peer"
+                );
+            }
         }
         iced::Task::none()
     }
@@ -744,6 +795,8 @@ impl App {
             ActiveCoordination {
                 group_pubkey: share.group_pubkey,
                 network: network.clone(),
+                expected_participants: 0,
+                acks_received: 0,
             },
         );
 

@@ -161,6 +161,10 @@ pub enum KfpNodeEvent {
         internal_descriptor: String,
         network: String,
     },
+    DescriptorAckReceived {
+        session_id: [u8; 32],
+        share_index: u16,
+    },
     DescriptorNacked {
         session_id: [u8; 32],
         share_index: u16,
@@ -238,6 +242,14 @@ impl std::fmt::Debug for KfpNodeEvent {
             Self::DescriptorComplete { session_id, .. } => f
                 .debug_struct("DescriptorComplete")
                 .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::DescriptorAckReceived {
+                session_id,
+                share_index,
+            } => f
+                .debug_struct("DescriptorAckReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
                 .finish(),
             Self::DescriptorNacked {
                 session_id,
@@ -1049,12 +1061,19 @@ impl KfpNode {
 }
 
 fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
+    let key_package = share
+        .key_package()
+        .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
+    let signing_share = key_package.signing_share();
+    let signing_share_bytes = signing_share.serialize();
+
     let mut hasher = Sha256::new();
     hasher.update(b"keep-frost-node-identity-v2");
     hasher.update(share.metadata.group_pubkey);
     hasher.update(share.metadata.identifier.to_be_bytes());
-    let derived: [u8; 32] = hasher.finalize().into();
-    let secret_key = SecretKey::from_slice(&derived)
+    hasher.update(signing_share_bytes.as_slice());
+    let derived: Zeroizing<[u8; 32]> = Zeroizing::new(hasher.finalize().into());
+    let secret_key = SecretKey::from_slice(&*derived)
         .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {e}")))?;
     Ok(Keys::new(secret_key))
 }

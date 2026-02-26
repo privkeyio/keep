@@ -183,6 +183,15 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
+        let initiator_share_index = {
+            let peers = self.peers.read();
+            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
+        };
+
+        if let Some(idx) = initiator_share_index {
+            self.verify_peer_share_index(sender, idx)?;
+        }
+
         let session_created = {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
@@ -789,19 +798,26 @@ impl KfpNode {
                 .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
         };
 
-        let is_complete = {
+        let (is_new, is_complete) = {
             let mut sessions = self.descriptor_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
-            session.add_ack(
+            let is_new = session.add_ack(
                 share_index,
                 payload.descriptor_hash,
                 &payload.key_proof_psbt,
             )?;
-            session.is_complete()
+            (is_new, session.is_complete())
         };
+
+        if is_new {
+            let _ = self.event_tx.send(KfpNodeEvent::DescriptorAckReceived {
+                session_id: payload.session_id,
+                share_index,
+            });
+        }
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -881,15 +897,19 @@ impl KfpNode {
             let digest: [u8; 32] = hasher.finalize().into();
             let dedup_key = (payload.share_index, payload.created_at, digest);
             let mut seen = self.seen_xpub_announces.write();
-            if seen.contains(&dedup_key) {
+            if !seen.insert(dedup_key) {
                 return Ok(());
             }
-            if seen.len() >= 10_000 {
-                if let Some(&oldest) = seen.iter().min_by_key(|(_, ts, _)| *ts) {
-                    seen.remove(&oldest);
+            const MAX_SEEN_XPUB_ANNOUNCES: usize = 10_000;
+            if seen.len() > MAX_SEEN_XPUB_ANNOUNCES {
+                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                let window = self.replay_window_secs + super::MAX_FUTURE_SKEW_SECS;
+                seen.retain(|&(_, ts, _)| now.saturating_sub(window) <= ts);
+                if seen.len() > MAX_SEEN_XPUB_ANNOUNCES {
+                    seen.clear();
+                    seen.insert(dedup_key);
                 }
             }
-            seen.insert(dedup_key);
         }
 
         {

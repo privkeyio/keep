@@ -61,7 +61,6 @@ pub enum DescriptorProgress {
     },
     Contributed,
     Finalizing,
-    #[allow(dead_code)]
     WaitingAcks {
         received: usize,
         expected: usize,

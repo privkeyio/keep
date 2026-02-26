@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
+use keep_frost_net::AnnouncedXpub;
+
 use crate::screen::wallet::{DescriptorProgress, WalletEntry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -198,7 +200,7 @@ pub enum Message {
     WalletRemoveTier(usize),
     WalletBeginCoordination,
     WalletCancelSetup,
-    WalletSessionStarted(Result<([u8; 32], [u8; 32], String), String>),
+    WalletSessionStarted(Result<([u8; 32], [u8; 32], String, usize), String>),
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     // Relay / FROST
     RelayUrlChanged(String),
@@ -303,6 +305,10 @@ pub enum FrostNodeMsg {
         external_descriptor: String,
         internal_descriptor: String,
     },
+    DescriptorAckReceived {
+        session_id: [u8; 32],
+        share_index: u16,
+    },
     DescriptorNacked {
         session_id: [u8; 32],
         share_index: u16,
@@ -311,6 +317,10 @@ pub enum FrostNodeMsg {
     DescriptorFailed {
         session_id: [u8; 32],
         error: String,
+    },
+    XpubAnnounced {
+        share_index: u16,
+        recovery_xpubs: Vec<AnnouncedXpub>,
     },
 }
 
@@ -343,6 +353,14 @@ impl fmt::Debug for FrostNodeMsg {
                 .field("external_descriptor", &"***")
                 .field("internal_descriptor", &"***")
                 .finish(),
+            Self::DescriptorAckReceived {
+                session_id,
+                share_index,
+            } => f
+                .debug_struct("DescriptorAckReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .finish(),
             Self::DescriptorNacked {
                 session_id,
                 share_index,
@@ -357,6 +375,14 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("DescriptorFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
+                .finish(),
+            Self::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => f
+                .debug_struct("XpubAnnounced")
+                .field("share_index", share_index)
+                .field("xpub_count", &recovery_xpubs.len())
                 .finish(),
         }
     }
