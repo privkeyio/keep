@@ -901,8 +901,10 @@ impl KfpNode {
                 return Ok(());
             }
             if seen.len() >= 10_000 {
-                tracing::warn!("seen_xpub_announces at capacity, dropping announce");
-                return Ok(());
+                tracing::warn!("seen_xpub_announces at capacity, evicting oldest entry");
+                if let Some(&oldest) = seen.iter().min_by_key(|&(_, ts, _)| ts) {
+                    seen.remove(&oldest);
+                }
             }
             seen.insert(dedup_key);
         }

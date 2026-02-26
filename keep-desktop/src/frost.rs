@@ -968,6 +968,7 @@ impl App {
         }
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.active_coordinations.clear();
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
