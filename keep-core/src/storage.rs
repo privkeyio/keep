@@ -583,7 +583,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
-        let descriptor: WalletDescriptor = serde_json::from_slice(decrypted_bytes)
+        let descriptor: WalletDescriptor = serde_json::from_slice(&decrypted_bytes)
             .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
         Ok(Some(descriptor))
     }
@@ -601,7 +601,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
-            let descriptor: WalletDescriptor = serde_json::from_slice(decrypted_bytes)
+            let descriptor: WalletDescriptor = serde_json::from_slice(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
             descriptors.push(descriptor);
         }
@@ -651,7 +651,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
-        let config: RelayConfig = serde_json::from_slice(decrypted_bytes)
+        let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
             .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
         Ok(Some(config))
     }
@@ -669,7 +669,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
-            let config: RelayConfig = serde_json::from_slice(decrypted_bytes)
+            let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
             configs.push(config);
         }
@@ -755,7 +755,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
-        let status: KeyHealthStatus = serde_json::from_slice(decrypted_bytes)
+        let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)
             .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
         Ok(Some(status))
     }
@@ -772,7 +772,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
-            let status: KeyHealthStatus = serde_json::from_slice(decrypted_bytes)
+            let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)
                 .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
             statuses.push(status);
         }
