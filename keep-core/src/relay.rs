@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: (C) 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of relays per category per share.
@@ -70,7 +72,7 @@ pub fn normalize_relay_url(url: &str) -> String {
     }
 }
 
-/// `true` when the `allow-internal` Cargo feature is enabled.
+/// Whether the `allow-internal` Cargo feature is active.
 pub const ALLOW_INTERNAL_HOSTS: bool = cfg!(feature = "allow-internal");
 
 /// Validate a relay URL is a valid wss:// URL pointing to a public host.
@@ -103,12 +105,11 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
         return Err("Missing host".into());
     }
 
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.contains('@') {
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    if host_port.contains('@') {
         return Err("Userinfo not allowed in relay URLs".into());
     }
 
-    let host_port = authority;
     let (host, port_str) = if host_port.starts_with('[') {
         match host_port.find(']') {
             Some(bracket_end) => {
@@ -160,59 +161,59 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
 ///
 /// Use this after DNS resolution to prevent DNS rebinding attacks where
 /// a hostname passes URL validation but resolves to an internal IP.
-pub fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
+pub fn is_internal_ip(ip: &IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(addr) => is_internal_v4(*addr),
-        std::net::IpAddr::V6(addr) => is_internal_v6(addr),
+        IpAddr::V4(addr) => is_internal_v4(*addr),
+        IpAddr::V6(addr) => is_internal_v6(addr),
     }
 }
 
-fn is_internal_v6(addr: &std::net::Ipv6Addr) -> bool {
+fn is_internal_v6(addr: &Ipv6Addr) -> bool {
     if let Some(v4) = to_embedded_v4(addr) {
         return is_internal_v4(v4);
     }
-    let segments = addr.segments();
-    (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || (segments[0] & 0xffc0) == 0xfec0
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+    let s = addr.segments();
+    (s[0] & 0xfe00) == 0xfc00        // ULA fc00::/7
+        || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        || (s[0] & 0xffc0) == 0xfec0 // site-local fec0::/10 (deprecated)
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
         || addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
 }
 
-fn to_embedded_v4(addr: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(mapped) = addr.to_ipv4_mapped() {
         return Some(mapped);
     }
     let s = addr.segments();
-    let octets = addr.octets();
-    let v4 = || std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
-    // IPv4-compatible addresses (::x.x.x.x) -- deprecated but still exploitable
+    let o = addr.octets();
+    let tail_v4 = || Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    // IPv4-compatible (::x.x.x.x) — deprecated but still exploitable
     if s[..6] == [0, 0, 0, 0, 0, 0] {
-        return Some(v4());
+        return Some(tail_v4());
     }
     // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
-        return Some(v4());
+        return Some(tail_v4());
     }
-    // 6to4 (2002::/16) — IPv4 is embedded in bits 16-47 (octets 2-5)
+    // 6to4 (2002::/16) — IPv4 embedded in bits 16-47
     if s[0] == 0x2002 {
-        return Some(std::net::Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
     }
-    // Teredo (2001:0000::/32) — IPv4 is XOR'd in last 32 bits (octets 12-15)
+    // Teredo (2001:0000::/32) — IPv4 XOR'd in last 32 bits
     if s[0] == 0x2001 && s[1] == 0x0000 {
-        return Some(std::net::Ipv4Addr::new(
-            octets[12] ^ 0xff,
-            octets[13] ^ 0xff,
-            octets[14] ^ 0xff,
-            octets[15] ^ 0xff,
+        return Some(Ipv4Addr::new(
+            o[12] ^ 0xff,
+            o[13] ^ 0xff,
+            o[14] ^ 0xff,
+            o[15] ^ 0xff,
         ));
     }
     None
 }
 
-fn is_internal_v4(addr: std::net::Ipv4Addr) -> bool {
+fn is_internal_v4(addr: Ipv4Addr) -> bool {
     addr.is_loopback()
         || addr.is_private()
         || addr.is_link_local()
@@ -235,11 +236,11 @@ fn is_internal_host(host: &str) -> bool {
     // Strip trailing dot (FQDN bypass)
     let bare = bare.strip_suffix('.').unwrap_or(bare);
 
-    if let Ok(addr) = bare.parse::<std::net::Ipv6Addr>() {
+    if let Ok(addr) = bare.parse::<Ipv6Addr>() {
         return is_internal_v6(&addr);
     }
 
-    if let Ok(addr) = bare.parse::<std::net::Ipv4Addr>() {
+    if let Ok(addr) = bare.parse::<Ipv4Addr>() {
         return is_internal_v4(addr);
     }
 
@@ -258,12 +259,12 @@ fn is_internal_host(host: &str) -> bool {
     !bare.contains('.')
 }
 
-fn is_cgn(addr: std::net::Ipv4Addr) -> bool {
+fn is_cgn(addr: Ipv4Addr) -> bool {
     let octets = addr.octets();
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
-fn is_special_purpose_v4(addr: std::net::Ipv4Addr) -> bool {
+fn is_special_purpose_v4(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     // TEST-NET-1 192.0.2.0/24 (RFC 5737)
     (o[0] == 192 && o[1] == 0 && o[2] == 2)
