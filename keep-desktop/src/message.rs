@@ -303,6 +303,12 @@ pub enum FrostNodeMsg {
         external_descriptor: String,
         internal_descriptor: String,
     },
+    DescriptorAcked {
+        session_id: [u8; 32],
+        share_index: u16,
+        ack_count: usize,
+        expected_acks: usize,
+    },
     DescriptorNacked {
         session_id: [u8; 32],
         share_index: u16,
@@ -311,6 +317,10 @@ pub enum FrostNodeMsg {
     DescriptorFailed {
         session_id: [u8; 32],
         error: String,
+    },
+    XpubAnnounced {
+        share_index: u16,
+        recovery_xpubs: Vec<keep_frost_net::AnnouncedXpub>,
     },
 }
 
@@ -343,6 +353,18 @@ impl fmt::Debug for FrostNodeMsg {
                 .field("external_descriptor", &"***")
                 .field("internal_descriptor", &"***")
                 .finish(),
+            Self::DescriptorAcked {
+                session_id,
+                share_index,
+                ack_count,
+                expected_acks,
+            } => f
+                .debug_struct("DescriptorAcked")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
+                .field("ack_count", ack_count)
+                .field("expected_acks", expected_acks)
+                .finish(),
             Self::DescriptorNacked {
                 session_id,
                 share_index,
@@ -357,6 +379,14 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("DescriptorFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
+                .finish(),
+            Self::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => f
+                .debug_struct("XpubAnnounced")
+                .field("share_index", share_index)
+                .field("xpub_count", &recovery_xpubs.len())
                 .finish(),
         }
     }

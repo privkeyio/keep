@@ -285,6 +285,14 @@ impl DescriptorSession {
         self.expected_acks.iter().all(|idx| self.acks.contains(idx))
     }
 
+    pub fn ack_count(&self) -> usize {
+        self.acks.len()
+    }
+
+    pub fn expected_ack_count(&self) -> usize {
+        self.expected_acks.len()
+    }
+
     pub fn descriptor(&self) -> Option<&FinalizedDescriptor> {
         self.descriptor.as_ref()
     }
