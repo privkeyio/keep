@@ -81,6 +81,7 @@ impl KfpNode {
         let payload = DescriptorProposePayload::new(
             session_id,
             self.group_pubkey,
+            created_at,
             network,
             policy,
             own_xpub,
@@ -887,14 +888,15 @@ impl KfpNode {
             let digest: [u8; 32] = hasher.finalize().into();
             let dedup_key = (payload.share_index, payload.created_at, digest);
             let mut seen = self.seen_xpub_announces.write();
+            if seen.contains(&dedup_key) {
+                return Ok(());
+            }
             if seen.len() >= 10_000 {
                 return Err(FrostNetError::Session(
                     "Too many xpub announcements tracked".into(),
                 ));
             }
-            if !seen.insert(dedup_key) {
-                return Ok(());
-            }
+            seen.insert(dedup_key);
         }
 
         {

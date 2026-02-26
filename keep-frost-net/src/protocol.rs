@@ -989,6 +989,7 @@ impl DescriptorProposePayload {
     pub fn new(
         session_id: [u8; 32],
         group_pubkey: [u8; 32],
+        created_at: u64,
         network: &str,
         policy: WalletPolicy,
         initiator_xpub: &str,
@@ -997,7 +998,7 @@ impl DescriptorProposePayload {
         Self {
             session_id,
             group_pubkey,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at,
             network: network.to_string(),
             policy,
             initiator_xpub: initiator_xpub.to_string(),
