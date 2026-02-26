@@ -128,6 +128,7 @@ pub enum Message {
     GoToCreate,
     GoBack,
     NavigateShares,
+    NavigateNsecKeys,
     NavigateWallets,
     NavigateRelay,
     NavigateBunker,
@@ -136,6 +137,12 @@ pub enum Message {
 
     // Share list
     ToggleShareDetails(usize),
+
+    // Nsec keys list
+    ToggleNsecKeyDetails(usize),
+    RequestDeleteNsecKey(String),
+    ConfirmDeleteNsecKey(String),
+    CancelDeleteNsecKey,
     SetActiveShare(String),
     RequestDelete(ShareIdentity),
     ConfirmDelete(ShareIdentity),
@@ -426,6 +433,7 @@ impl fmt::Debug for Message {
             Self::GoToCreate => f.write_str("GoToCreate"),
             Self::GoBack => f.write_str("GoBack"),
             Self::NavigateShares => f.write_str("NavigateShares"),
+            Self::NavigateNsecKeys => f.write_str("NavigateNsecKeys"),
             Self::NavigateWallets => f.write_str("NavigateWallets"),
             Self::NavigateRelay => f.write_str("NavigateRelay"),
             Self::NavigateBunker => f.write_str("NavigateBunker"),
@@ -436,6 +444,16 @@ impl fmt::Debug for Message {
             Self::RequestDelete(id) => f.debug_tuple("RequestDelete").field(id).finish(),
             Self::ConfirmDelete(id) => f.debug_tuple("ConfirmDelete").field(id).finish(),
             Self::CancelDelete => f.write_str("CancelDelete"),
+            Self::ToggleNsecKeyDetails(i) => {
+                f.debug_tuple("ToggleNsecKeyDetails").field(i).finish()
+            }
+            Self::RequestDeleteNsecKey(k) => {
+                f.debug_tuple("RequestDeleteNsecKey").field(k).finish()
+            }
+            Self::ConfirmDeleteNsecKey(k) => {
+                f.debug_tuple("ConfirmDeleteNsecKey").field(k).finish()
+            }
+            Self::CancelDeleteNsecKey => f.write_str("CancelDeleteNsecKey"),
             Self::CreateNameChanged(n) => f.debug_tuple("CreateNameChanged").field(n).finish(),
             Self::CreateThresholdChanged(t) => {
                 f.debug_tuple("CreateThresholdChanged").field(t).finish()

@@ -7,6 +7,7 @@ pub mod export;
 pub mod export_ncryptsec;
 pub mod import;
 pub mod layout;
+pub mod nsec_keys;
 pub mod relay;
 pub mod scanner;
 pub mod settings;
@@ -29,6 +30,7 @@ pub enum Screen {
     Wallet(wallet::WalletScreen),
     Relay(relay::RelayScreen),
     Bunker(Box<bunker::BunkerScreen>),
+    NsecKeys(nsec_keys::NsecKeysScreen),
     SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
 }
@@ -38,28 +40,31 @@ impl Screen {
         &'a self,
         sidebar_state: &SidebarState<'a>,
         share_count: Option<usize>,
+        nsec_count: Option<usize>,
         pending_requests: usize,
         kill_switch_active: bool,
     ) -> iced::Element<'a, Message> {
-        let (nav, content, count) = match self {
+        let (nav, content) = match self {
             Screen::Unlock(s) => return s.view(),
-            Screen::ShareList(s) => (NavItem::Shares, s.view_content(), share_count),
-            Screen::Create(s) => (NavItem::Create, s.view_content(), None),
-            Screen::Export(s) => (NavItem::Shares, s.view_content(), None),
-            Screen::ExportNcryptsec(s) => (NavItem::Shares, s.view_content(), None),
-            Screen::Import(s) => (NavItem::Import, s.view_content(), None),
-            Screen::Scanner(s) => (NavItem::Import, s.view_content(), None),
-            Screen::Wallet(s) => (NavItem::Wallets, s.view_content(), None),
-            Screen::Relay(s) => (NavItem::Relay, s.view_content(), None),
-            Screen::Bunker(s) => (NavItem::Bunker, s.view_content(), None),
-            Screen::SigningAudit(s) => (NavItem::Audit, s.view_content(), None),
-            Screen::Settings(s) => (NavItem::Settings, s.view_content(), None),
+            Screen::ShareList(s) => (NavItem::Shares, s.view_content()),
+            Screen::Create(s) => (NavItem::Create, s.view_content()),
+            Screen::Export(s) => (NavItem::Shares, s.view_content()),
+            Screen::ExportNcryptsec(s) => (NavItem::NsecKeys, s.view_content()),
+            Screen::Import(s) => (NavItem::Import, s.view_content()),
+            Screen::Scanner(s) => (NavItem::Import, s.view_content()),
+            Screen::Wallet(s) => (NavItem::Wallets, s.view_content()),
+            Screen::Relay(s) => (NavItem::Relay, s.view_content()),
+            Screen::Bunker(s) => (NavItem::Bunker, s.view_content()),
+            Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view_content()),
+            Screen::SigningAudit(s) => (NavItem::Audit, s.view_content()),
+            Screen::Settings(s) => (NavItem::Settings, s.view_content()),
         };
         layout::with_sidebar(
             nav,
             content,
             sidebar_state,
-            count,
+            share_count,
+            nsec_count,
             pending_requests,
             kill_switch_active,
         )
@@ -93,6 +98,7 @@ impl Screen {
                 s.error = Some(error);
             }
             Screen::ShareList(_)
+            | Screen::NsecKeys(_)
             | Screen::Wallet(_)
             | Screen::Relay(_)
             | Screen::SigningAudit(_)
