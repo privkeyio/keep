@@ -33,14 +33,7 @@ impl KfpNode {
 
         let our_index = self.share.metadata.identifier;
 
-        {
-            let proposers = self.descriptor_proposers.read();
-            if !proposers.is_empty() && !proposers.contains(&our_index) {
-                return Err(FrostNetError::Session(format!(
-                    "Share {our_index} is not authorized to propose descriptors"
-                )));
-            }
-        }
+        self.check_proposer_authorized(our_index)?;
 
         let created_at = chrono::Utc::now().timestamp().max(0) as u64;
         let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
@@ -177,14 +170,7 @@ impl KfpNode {
             peer.share_index
         };
 
-        {
-            let proposers = self.descriptor_proposers.read();
-            if !proposers.is_empty() && !proposers.contains(&sender_share_index) {
-                return Err(FrostNetError::Session(format!(
-                    "Share {sender_share_index} is not authorized to propose descriptors"
-                )));
-            }
-        }
+        self.check_proposer_authorized(sender_share_index)?;
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -491,14 +477,7 @@ impl KfpNode {
             peer.share_index
         };
 
-        {
-            let proposers = self.descriptor_proposers.read();
-            if !proposers.is_empty() && !proposers.contains(&sender_share_index) {
-                return Err(FrostNetError::Session(format!(
-                    "Share {sender_share_index} is not authorized to propose descriptors"
-                )));
-            }
-        }
+        self.check_proposer_authorized(sender_share_index)?;
 
         let our_index = self.share.metadata.identifier;
 
@@ -931,6 +910,16 @@ impl KfpNode {
             recovery_xpubs: payload.recovery_xpubs,
         });
 
+        Ok(())
+    }
+
+    fn check_proposer_authorized(&self, share_index: u16) -> Result<()> {
+        let proposers = self.descriptor_proposers.read();
+        if !proposers.is_empty() && !proposers.contains(&share_index) {
+            return Err(FrostNetError::Session(format!(
+                "Share {share_index} is not authorized to propose descriptors"
+            )));
+        }
         Ok(())
     }
 

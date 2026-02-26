@@ -313,9 +313,8 @@ impl DescriptorSession {
                 None
             }
             DescriptorSessionState::Finalized => {
-                let fin_at = match self.finalized_at {
-                    Some(t) => t,
-                    None => return Some("session"),
+                let Some(fin_at) = self.finalized_at else {
+                    return Some("session");
                 };
                 if fin_at.elapsed() > self.ack_phase_timeout {
                     return Some("ack");
@@ -439,8 +438,7 @@ impl DescriptorSessionManager {
     pub fn cleanup_expired(&mut self) -> Vec<([u8; 32], String)> {
         let mut expired = Vec::new();
         self.sessions.retain(|id, session| {
-            if session.is_expired() {
-                let phase = session.expired_phase().unwrap_or("session");
+            if let Some(phase) = session.expired_phase() {
                 expired.push((*id, format!("timeout:{phase}")));
                 false
             } else {

@@ -46,6 +46,16 @@ fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     created_at >= min_valid && created_at <= max_valid
 }
 
+fn is_valid_xpub(xpub: &str) -> bool {
+    xpub.len() >= MIN_XPUB_LENGTH
+        && xpub.len() <= MAX_XPUB_LENGTH
+        && VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.starts_with(pfx))
+}
+
+fn is_valid_fingerprint(fp: &str) -> bool {
+    fp.len() == MAX_FINGERPRINT_LENGTH && fp.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KfpMessage {
@@ -265,24 +275,10 @@ impl KfpMessage {
                 if !VALID_NETWORKS.contains(&p.network.as_str()) {
                     return Err("Invalid network value");
                 }
-                if p.initiator_xpub.len() < MIN_XPUB_LENGTH {
-                    return Err("Initiator xpub too short");
+                if !is_valid_xpub(&p.initiator_xpub) {
+                    return Err("Invalid initiator xpub");
                 }
-                if p.initiator_xpub.len() > MAX_XPUB_LENGTH {
-                    return Err("Initiator xpub exceeds maximum length");
-                }
-                if !VALID_XPUB_PREFIXES
-                    .iter()
-                    .any(|pfx| p.initiator_xpub.starts_with(pfx))
-                {
-                    return Err("Initiator xpub has invalid prefix");
-                }
-                if p.initiator_fingerprint.len() != MAX_FINGERPRINT_LENGTH
-                    || !p
-                        .initiator_fingerprint
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit())
-                {
+                if !is_valid_fingerprint(&p.initiator_fingerprint) {
                     return Err("Initiator fingerprint must be exactly 8 hex characters");
                 }
                 if p.policy.recovery_tiers.is_empty() {
@@ -312,17 +308,11 @@ impl KfpMessage {
                                 }
                             }
                             KeySlot::External { xpub, fingerprint } => {
-                                if xpub.len() < MIN_XPUB_LENGTH {
-                                    return Err("External xpub too short");
+                                if !is_valid_xpub(xpub) {
+                                    return Err("Invalid external xpub");
                                 }
-                                if xpub.len() > MAX_XPUB_LENGTH {
-                                    return Err("External xpub exceeds maximum length");
-                                }
-                                if !VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.starts_with(pfx)) {
-                                    return Err("External xpub has invalid prefix");
-                                }
-                                if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                                    return Err("External fingerprint exceeds maximum length");
+                                if !is_valid_fingerprint(fingerprint) {
+                                    return Err("External fingerprint must be exactly 8 hex characters");
                                 }
                             }
                         }
@@ -333,21 +323,10 @@ impl KfpMessage {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
                 }
-                if p.account_xpub.len() < MIN_XPUB_LENGTH {
-                    return Err("Account xpub too short");
+                if !is_valid_xpub(&p.account_xpub) {
+                    return Err("Invalid account xpub");
                 }
-                if p.account_xpub.len() > MAX_XPUB_LENGTH {
-                    return Err("Account xpub exceeds maximum length");
-                }
-                if !VALID_XPUB_PREFIXES
-                    .iter()
-                    .any(|pfx| p.account_xpub.starts_with(pfx))
-                {
-                    return Err("Account xpub has invalid prefix");
-                }
-                if p.fingerprint.len() != MAX_FINGERPRINT_LENGTH
-                    || !p.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
-                {
+                if !is_valid_fingerprint(&p.fingerprint) {
                     return Err("Fingerprint must be exactly 8 hex characters");
                 }
             }
@@ -374,21 +353,10 @@ impl KfpMessage {
                     if idx as usize > MAX_PARTICIPANTS {
                         return Err("Contribution index exceeds maximum");
                     }
-                    if contrib.account_xpub.len() < MIN_XPUB_LENGTH {
-                        return Err("Contribution xpub too short");
+                    if !is_valid_xpub(&contrib.account_xpub) {
+                        return Err("Invalid contribution xpub");
                     }
-                    if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
-                        return Err("Contribution xpub exceeds maximum length");
-                    }
-                    if !VALID_XPUB_PREFIXES
-                        .iter()
-                        .any(|pfx| contrib.account_xpub.starts_with(pfx))
-                    {
-                        return Err("Contribution xpub has invalid prefix");
-                    }
-                    if contrib.fingerprint.len() != MAX_FINGERPRINT_LENGTH
-                        || !contrib.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
-                    {
+                    if !is_valid_fingerprint(&contrib.fingerprint) {
                         return Err("Contribution fingerprint must be exactly 8 hex characters");
                     }
                 }
