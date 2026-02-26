@@ -72,6 +72,15 @@ pub fn normalize_relay_url(url: &str) -> String {
 
 /// Validate a relay URL is a valid wss:// URL pointing to a public host.
 pub fn validate_relay_url(url: &str) -> Result<(), String> {
+    validate_relay_url_inner(url, false)
+}
+
+/// Like [`validate_relay_url`] but permits internal/private addresses.
+pub fn validate_relay_url_allow_internal(url: &str) -> Result<(), String> {
+    validate_relay_url_inner(url, true)
+}
+
+fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), String> {
     if url.len() > MAX_RELAY_URL_LENGTH {
         return Err("URL too long".into());
     }
@@ -93,7 +102,6 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
 
     let host_port = rest.split('/').next().unwrap_or(rest);
     let (host, port_str) = if host_port.starts_with('[') {
-        // IPv6 bracket notation: [::1]:port or [::1]
         match host_port.find(']') {
             Some(bracket_end) => {
                 let host = &host_port[..=bracket_end];
@@ -133,7 +141,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), String> {
         return Err("Invalid host characters".into());
     }
 
-    if !cfg!(feature = "allow-internal") && is_internal_host(host) {
+    if !allow_internal && is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
 
@@ -317,7 +325,7 @@ mod tests {
         // IPv4-compatible (::x.x.x.x) — exercises to_embedded_v4 deprecated-compat path
         assert!(validate_relay_url("wss://[::7f00:1]/").is_err()); // ::127.0.0.1
         assert!(validate_relay_url("wss://[::a00:1]/").is_err()); // ::10.0.0.1
-        // NAT64 Well-Known Prefix 64:ff9b::/96 — exercises to_embedded_v4 NAT64 path
+                                                                  // NAT64 Well-Known Prefix 64:ff9b::/96 — exercises to_embedded_v4 NAT64 path
         assert!(validate_relay_url("wss://[64:ff9b::7f00:1]/").is_err()); // embeds 127.0.0.1
         assert!(validate_relay_url("wss://[64:ff9b::a00:1]/").is_err()); // embeds 10.0.0.1
     }
