@@ -1210,6 +1210,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_node_creation() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
         let config = ThresholdConfig::two_of_three();
         let dealer = TrustedDealer::new(config);
         let (mut shares, _) = dealer.generate("test").unwrap();
