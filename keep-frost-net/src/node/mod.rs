@@ -19,6 +19,9 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use keep_core::frost::SharePackage;
+use keep_core::relay::{
+    validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
+};
 
 use crate::attestation::{verify_peer_attestation, ExpectedPcrs};
 use crate::audit::SigningAuditLog;
@@ -323,6 +326,17 @@ impl KfpNode {
         proxy: Option<SocketAddr>,
         session_timeout: Option<Duration>,
     ) -> Result<Self> {
+        for relay in &relays {
+            let validate = if ALLOW_INTERNAL_HOSTS {
+                validate_relay_url_allow_internal
+            } else {
+                validate_relay_url
+            };
+            validate(relay).map_err(|e| {
+                FrostNetError::Transport(format!("Rejected relay URL {relay}: {e}"))
+            })?;
+        }
+
         let keys = derive_keys_from_share(&share)?;
         let client = match proxy {
             Some(addr) => {

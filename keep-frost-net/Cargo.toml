@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 [features]
 default = ["nitro-attestation"]
 nitro-attestation = ["dep:keep-enclave-host"]
+testing = ["keep-core/allow-ws"]
 
 [dependencies]
 keep-bitcoin = { path = "../keep-bitcoin" }
@@ -49,3 +50,4 @@ tokio-test = "0.4"
 nostr-relay-builder = "0.44"
 chrono = "0.4"
 proptest = "1.5"
+keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal"] }

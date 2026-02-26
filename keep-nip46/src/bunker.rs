@@ -316,7 +316,12 @@ mod tests {
             "nostrconnect://{}?relay=ws%3A%2F%2Frelay.example.com&secret=abcdef0123456789",
             pubkey.to_hex()
         );
-        assert!(parse_nostrconnect_uri(&uri).is_err());
+        let ws_allowed = keep_core::relay::validate_relay_url("ws://relay.example.com").is_ok();
+        if ws_allowed {
+            assert!(parse_nostrconnect_uri(&uri).is_ok());
+        } else {
+            assert!(parse_nostrconnect_uri(&uri).is_err());
+        }
     }
 
     #[test]
@@ -529,8 +534,13 @@ mod tests {
             "bunker://{}?relay=ws%3A%2F%2Frelay.example.com",
             keys.public_key().to_hex()
         );
-        let err = parse_bunker_url(&url).unwrap_err();
-        assert!(err.contains("Must use wss://"));
+        let ws_allowed = keep_core::relay::validate_relay_url("ws://relay.example.com").is_ok();
+        if ws_allowed {
+            assert!(parse_bunker_url(&url).is_ok());
+        } else {
+            let err = parse_bunker_url(&url).unwrap_err();
+            assert!(err.contains("Must use wss://"));
+        }
     }
 
     #[test]
