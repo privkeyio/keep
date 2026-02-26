@@ -567,9 +567,7 @@ mod tests {
             &"2002:7f00:0001::1".parse::<IpAddr>().unwrap()
         ));
         // 2002:0a00:0001::1 embeds 10.0.0.1
-        assert!(is_internal_ip(
-            &"2002:a00:1::1".parse::<IpAddr>().unwrap()
-        ));
+        assert!(is_internal_ip(&"2002:a00:1::1".parse::<IpAddr>().unwrap()));
         // 2002:c0a8:0101::1 embeds 192.168.1.1
         assert!(is_internal_ip(
             &"2002:c0a8:101::1".parse::<IpAddr>().unwrap()
@@ -622,9 +620,7 @@ mod tests {
     #[test]
     fn is_internal_ip_blocks_documentation_prefix() {
         use std::net::IpAddr;
-        assert!(is_internal_ip(
-            &"2001:db8::1".parse::<IpAddr>().unwrap()
-        ));
+        assert!(is_internal_ip(&"2001:db8::1".parse::<IpAddr>().unwrap()));
         assert!(is_internal_ip(
             &"2001:db8:ffff::1".parse::<IpAddr>().unwrap()
         ));
