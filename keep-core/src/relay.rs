@@ -103,7 +103,12 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
         return Err("Missing host".into());
     }
 
-    let host_port = rest.split('/').next().unwrap_or(rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.contains('@') {
+        return Err("Userinfo not allowed in relay URLs".into());
+    }
+
+    let host_port = authority;
     let (host, port_str) = if host_port.starts_with('[') {
         match host_port.find(']') {
             Some(bracket_end) => {
@@ -170,6 +175,7 @@ fn is_internal_v6(addr: &std::net::Ipv6Addr) -> bool {
     (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         || addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
@@ -189,6 +195,19 @@ fn to_embedded_v4(addr: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         return Some(v4());
+    }
+    // 6to4 (2002::/16) — IPv4 is embedded in bits 16-47 (octets 2-5)
+    if s[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+    // Teredo (2001:0000::/32) — IPv4 is XOR'd in last 32 bits (octets 12-15)
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return Some(std::net::Ipv4Addr::new(
+            octets[12] ^ 0xff,
+            octets[13] ^ 0xff,
+            octets[14] ^ 0xff,
+            octets[15] ^ 0xff,
+        ));
     }
     None
 }
@@ -226,7 +245,12 @@ fn is_internal_host(host: &str) -> bool {
 
     const FORBIDDEN: &[&str] = &["localhost"];
 
-    if FORBIDDEN.contains(&bare) || bare.ends_with(".local") || bare.ends_with(".localhost") {
+    if FORBIDDEN.contains(&bare)
+        || bare.ends_with(".local")
+        || bare.ends_with(".localhost")
+        || bare.ends_with(".arpa")
+        || bare.ends_with(".onion")
+    {
         return true;
     }
 
@@ -532,5 +556,96 @@ mod tests {
         assert!(is_internal_ip(
             &"64:ff9b::7f00:1".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_6to4() {
+        use std::net::IpAddr;
+        // 2002:7f00:0001::1 embeds 127.0.0.1
+        assert!(is_internal_ip(
+            &"2002:7f00:0001::1".parse::<IpAddr>().unwrap()
+        ));
+        // 2002:0a00:0001::1 embeds 10.0.0.1
+        assert!(is_internal_ip(
+            &"2002:a00:1::1".parse::<IpAddr>().unwrap()
+        ));
+        // 2002:c0a8:0101::1 embeds 192.168.1.1
+        assert!(is_internal_ip(
+            &"2002:c0a8:101::1".parse::<IpAddr>().unwrap()
+        ));
+        // Public 6to4: 2002:0808:0808::1 embeds 8.8.8.8
+        assert!(!is_internal_ip(
+            &"2002:808:808::1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_teredo() {
+        use std::net::IpAddr;
+        // Teredo: 2001:0000:x:x:x:x:XXXX:XXXX where last 32 bits are XOR'd IPv4
+        // XOR'd 127.0.0.1 = 0x80ff:fffe
+        assert!(is_internal_ip(
+            &"2001:0000:0000:0000:0000:0000:80ff:fffe"
+                .parse::<IpAddr>()
+                .unwrap()
+        ));
+        // XOR'd 10.0.0.1 = 0xf5ff:fffe
+        assert!(is_internal_ip(
+            &"2001:0000:0000:0000:0000:0000:f5ff:fffe"
+                .parse::<IpAddr>()
+                .unwrap()
+        ));
+        // XOR'd 8.8.8.8 = 0xf7f7:f7f7 (public, should NOT be internal)
+        assert!(!is_internal_ip(
+            &"2001:0000:0000:0000:0000:0000:f7f7:f7f7"
+                .parse::<IpAddr>()
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_6to4_embedded_internal() {
+        assert!(validate_relay_url("wss://[2002:7f00:1::1]/").is_err());
+        assert!(validate_relay_url("wss://[2002:a00:1::1]/").is_err());
+        assert!(validate_relay_url("wss://[2002:c0a8:101::1]/").is_err());
+    }
+
+    #[test]
+    fn rejects_teredo_embedded_internal() {
+        // Teredo embedding 127.0.0.1 (XOR'd)
+        assert!(validate_relay_url("wss://[2001:0000::80ff:fffe]/").is_err());
+        // Teredo embedding 10.0.0.1 (XOR'd)
+        assert!(validate_relay_url("wss://[2001:0000::f5ff:fffe]/").is_err());
+    }
+
+    #[test]
+    fn is_internal_ip_blocks_documentation_prefix() {
+        use std::net::IpAddr;
+        assert!(is_internal_ip(
+            &"2001:db8::1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_internal_ip(
+            &"2001:db8:ffff::1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_userinfo_in_url() {
+        assert!(validate_relay_url("wss://user@relay.example.com/").is_err());
+        assert!(validate_relay_url("wss://user:pass@relay.example.com/").is_err());
+        assert!(validate_relay_url("wss://evil.com@relay.example.com/").is_err());
+    }
+
+    #[test]
+    fn rejects_arpa_and_onion_tlds() {
+        assert!(validate_relay_url("wss://host.arpa/").is_err());
+        assert!(validate_relay_url("wss://10.in-addr.arpa/").is_err());
+        assert!(validate_relay_url("wss://hidden.onion/").is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_case_trailing_dot() {
+        assert!(validate_relay_url("wss://LocalHost./").is_err());
+        assert!(validate_relay_url("wss://LOCALHOST./").is_err());
     }
 }
