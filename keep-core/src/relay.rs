@@ -70,6 +70,9 @@ pub fn normalize_relay_url(url: &str) -> String {
     }
 }
 
+/// `true` when the `allow-internal` Cargo feature is enabled.
+pub const ALLOW_INTERNAL_HOSTS: bool = cfg!(feature = "allow-internal");
+
 /// Validate a relay URL is a valid wss:// URL pointing to a public host.
 pub fn validate_relay_url(url: &str) -> Result<(), String> {
     validate_relay_url_inner(url, false)
