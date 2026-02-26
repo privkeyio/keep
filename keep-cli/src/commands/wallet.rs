@@ -417,8 +417,18 @@ pub fn cmd_wallet_propose(
     relay: &str,
     share_index: Option<u16>,
     recovery: &[String],
+    timeout_secs: Option<u64>,
 ) -> Result<()> {
-    debug!(group, network, relay, share = ?share_index, "wallet propose");
+    debug!(group, network, relay, share = ?share_index, timeout = ?timeout_secs, "wallet propose");
+
+    if let Some(t) = timeout_secs {
+        if t == 0 || t > keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
+            return Err(KeepError::InvalidInput(format!(
+                "timeout must be between 1 and {} seconds",
+                keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS
+            )));
+        }
+    }
 
     if !keep_frost_net::VALID_NETWORKS.contains(&network) {
         return Err(KeepError::InvalidInput(format!(
@@ -513,7 +523,7 @@ pub fn cmd_wallet_propose(
 
         let spinner = out.spinner("Sending descriptor proposal...");
         let session_id = node
-            .request_descriptor(policy, network, &xpub, &fingerprint)
+            .request_descriptor_with_timeout(policy, network, &xpub, &fingerprint, timeout_secs)
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         spinner.finish();
@@ -537,7 +547,8 @@ pub fn cmd_wallet_propose(
             let spinner = out.spinner(&format!(
                 "Waiting for contributions (0/{remaining_contributions})..."
             ));
-            let timeout = Duration::from_secs(keep_frost_net::DESCRIPTOR_SESSION_TIMEOUT_SECS);
+            let effective_timeout = timeout_secs.unwrap_or(keep_frost_net::DESCRIPTOR_SESSION_TIMEOUT_SECS);
+            let timeout = Duration::from_secs(effective_timeout);
             let deadline = tokio::time::Instant::now() + timeout;
 
             let mut received = 0usize;
@@ -604,8 +615,10 @@ pub fn cmd_wallet_propose(
         spinner.finish();
 
         let spinner = out.spinner("Waiting for ACKs...");
-        let ack_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS);
+        let ack_timeout = timeout_secs
+            .map(|t| t.max(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS).min(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS * 4))
+            .unwrap_or(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS);
+        let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(ack_timeout);
 
         let mut external_descriptor = String::new();
         let mut internal_descriptor = String::new();

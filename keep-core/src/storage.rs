@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, trace};
 
 use crate::backend::{
-    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE,
-    SHARES_TABLE,
+    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
+    RELAY_CONFIGS_TABLE, SHARES_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -17,7 +17,7 @@ use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 use crate::relay::RelayConfig;
-use crate::wallet::WalletDescriptor;
+use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
 
@@ -245,6 +245,7 @@ impl Storage {
         backend.create_table(DESCRIPTORS_TABLE)?;
         backend.create_table(RELAY_CONFIGS_TABLE)?;
         backend.create_table(CONFIG_TABLE)?;
+        backend.create_table(HEALTH_STATUS_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -717,6 +718,79 @@ impl Storage {
         backend.put(CONFIG_TABLE, b"kill_switch", &encrypted_bytes)?;
         Ok(())
     }
+
+    /// Store a key health status record.
+    pub fn store_health_status(&self, status: &KeyHealthStatus) -> Result<()> {
+        debug!(
+            group = %hex::encode(status.group_pubkey),
+            share = status.share_index,
+            responsive = status.responsive,
+            "storing health status"
+        );
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let key = health_status_key(&status.group_pubkey, status.share_index);
+        let serialized = serde_json::to_vec(status)
+            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        backend.put(HEALTH_STATUS_TABLE, key.as_bytes(), &encrypted.to_bytes())?;
+        Ok(())
+    }
+
+    /// Get a key health status record.
+    pub fn get_health_status(
+        &self,
+        group_pubkey: &[u8; 32],
+        share_index: u16,
+    ) -> Result<Option<KeyHealthStatus>> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let key = health_status_key(group_pubkey, share_index);
+        let Some(encrypted_bytes) = backend.get(HEALTH_STATUS_TABLE, key.as_bytes())? else {
+            return Ok(None);
+        };
+
+        let encrypted = crypto::EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)
+            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+        Ok(Some(status))
+    }
+
+    /// List all key health status records.
+    pub fn list_health_statuses(&self) -> Result<Vec<KeyHealthStatus>> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let entries = backend.list(HEALTH_STATUS_TABLE)?;
+        let mut statuses = Vec::new();
+
+        for (_, encrypted_bytes) in entries {
+            let encrypted = crypto::EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)
+                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
+            statuses.push(status);
+        }
+
+        Ok(statuses)
+    }
+
+    /// Delete a key health status record.
+    pub fn delete_health_status(&self, group_pubkey: &[u8; 32], share_index: u16) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let key = health_status_key(group_pubkey, share_index);
+        backend.delete(HEALTH_STATUS_TABLE, key.as_bytes())?;
+        Ok(())
+    }
+}
+
+fn health_status_key(group_pubkey: &[u8; 32], share_index: u16) -> String {
+    format!("{}:{}", hex::encode(group_pubkey), share_index)
 }
 
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {

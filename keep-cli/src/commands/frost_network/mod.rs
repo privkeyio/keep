@@ -70,7 +70,8 @@ pub fn cmd_frost_network_serve(
                 .map_err(|e| KeepError::Frost(e.to_string()))?,
         );
 
-        let npub = node.pubkey().to_bech32().unwrap_or_default();
+        let pk = node.pubkey();
+        let npub = pk.to_bech32().unwrap_or_else(|_| format!("{pk}"));
         out.field("Node pubkey", &npub);
         out.newline();
         out.info("Listening for FROST messages... (Ctrl+C to stop)");
@@ -172,7 +173,7 @@ pub fn cmd_frost_network_serve(
                                 network,
                                 created_at: now,
                             };
-                            let guard = keep.lock().unwrap_or_else(|e| e.into_inner());
+                            let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
                                     tracing::info!("wallet descriptor stored");
@@ -472,4 +473,180 @@ pub fn cmd_frost_network_sign_event(
     Err(KeepError::NotImplemented(
         "FROST network event signing".into(),
     ))
+}
+
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+pub fn cmd_frost_network_health_check(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    relay: &str,
+    share_index: Option<u16>,
+    timeout: u64,
+) -> Result<()> {
+    const MAX_HEALTH_CHECK_TIMEOUT_SECS: u64 = 3600;
+    if timeout == 0 || timeout > MAX_HEALTH_CHECK_TIMEOUT_SECS {
+        return Err(KeepError::InvalidInput(format!(
+            "timeout must be between 1 and {MAX_HEALTH_CHECK_TIMEOUT_SECS} seconds"
+        )));
+    }
+    debug!(group, relay, share = ?share_index, timeout, "health check");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group)?;
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    out.newline();
+    out.header("Key Health Check");
+    out.field("Group", group);
+    out.field("Relay", relay);
+    out.field("Timeout", &format!("{timeout}s"));
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    rt.block_on(async {
+        let node = std::sync::Arc::new(
+            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?,
+        );
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            }
+        });
+
+        let spinner = out.spinner("Discovering peers...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        spinner.finish();
+
+        let online = node.online_peers();
+        out.info(&format!("{online} peer(s) discovered"));
+
+        if online == 0 {
+            node_handle.abort();
+            out.newline();
+            out.warn("No peers discovered. Run 'keep frost network serve' on other devices first.");
+            return Ok::<_, KeepError>(());
+        }
+
+        let spinner = out.spinner(&format!("Pinging peers (timeout: {timeout}s)..."));
+        let result = node
+            .health_check(std::time::Duration::from_secs(timeout))
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+        node_handle.abort();
+
+        out.newline();
+        out.header("Results");
+
+        if !result.responsive.is_empty() {
+            let shares: Vec<String> = result.responsive.iter().map(|s| s.to_string()).collect();
+            out.field("Responsive", &shares.join(", "));
+        }
+        if !result.unresponsive.is_empty() {
+            let shares: Vec<String> = result.unresponsive.iter().map(|s| s.to_string()).collect();
+            out.field("Unresponsive", &shares.join(", "));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for &idx in &result.responsive {
+            let existing = keep.get_health_status(&group_pubkey, idx)?;
+            let created_at = existing.and_then(|s| s.created_at).unwrap_or(now);
+            let status = keep_core::wallet::KeyHealthStatus {
+                group_pubkey,
+                share_index: idx,
+                last_check_timestamp: now,
+                responsive: true,
+                created_at: Some(created_at),
+            };
+            keep.store_health_status(&status)?;
+        }
+        for &idx in &result.unresponsive {
+            let existing = keep.get_health_status(&group_pubkey, idx)?;
+            let created_at = existing.and_then(|s| s.created_at).unwrap_or(now);
+            let status = keep_core::wallet::KeyHealthStatus {
+                group_pubkey,
+                share_index: idx,
+                last_check_timestamp: now,
+                responsive: false,
+                created_at: Some(created_at),
+            };
+            keep.store_health_status(&status)?;
+        }
+
+        out.newline();
+        out.success(&format!(
+            "{} responsive, {} unresponsive",
+            result.responsive.len(),
+            result.unresponsive.len()
+        ));
+
+        let all_statuses = keep.list_health_statuses()?;
+        let group_statuses: Vec<_> = all_statuses
+            .iter()
+            .filter(|s| s.group_pubkey == group_pubkey)
+            .collect();
+        if !group_statuses.is_empty() {
+            out.newline();
+            out.header("Health History");
+            for s in &group_statuses {
+                let age = now.saturating_sub(s.last_check_timestamp);
+                let status_str = if s.responsive {
+                    "responsive"
+                } else {
+                    "unresponsive"
+                };
+                let staleness = if s.is_critical(now) {
+                    " [CRITICAL]"
+                } else if s.is_stale(now) {
+                    " [STALE]"
+                } else {
+                    ""
+                };
+                let age_display = if age < 60 {
+                    format!("{age}s ago")
+                } else if age < 3600 {
+                    format!("{}m ago", age / 60)
+                } else if age < 86400 {
+                    format!("{}h ago", age / 3600)
+                } else {
+                    format!("{}d ago", age / 86400)
+                };
+                out.field(
+                    &format!("Share {}", s.share_index),
+                    &format!("{status_str} ({age_display}){staleness}"),
+                );
+            }
+        }
+
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
 }

@@ -84,7 +84,9 @@ pub use ecdh::{
 };
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
-pub use node::{KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks};
+pub use node::{
+    HealthCheckResult, KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, SessionInfo, SigningHooks,
+};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
@@ -94,7 +96,9 @@ pub use protocol::{
     EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, PingPayload, PolicyTier, PongPayload,
     RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
     SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, WalletPolicy,
-    XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS,
+    DESCRIPTOR_ACK_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
+    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
     DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
     MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH,
     MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE,

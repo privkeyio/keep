@@ -203,6 +203,8 @@ pub(crate) enum WalletCommands {
             required = true
         )]
         recovery: Vec<String>,
+        #[arg(long, help = "Session timeout in seconds (max 86400)")]
+        timeout: Option<u64>,
     },
 }
 
@@ -373,6 +375,16 @@ pub(crate) enum FrostNetworkCommands {
             help = "Number of nonces to pre-generate"
         )]
         count: u32,
+    },
+    HealthCheck {
+        #[arg(short, long)]
+        group: String,
+        #[arg(short, long)]
+        relay: Option<String>,
+        #[arg(short, long)]
+        share: Option<u16>,
+        #[arg(long, default_value = "10", help = "Timeout in seconds")]
+        timeout: u64,
     },
 }
 

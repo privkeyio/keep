@@ -109,6 +109,12 @@ impl SigningHooks for NoOpHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+#[derive(Clone, Debug)]
+pub struct HealthCheckResult {
+    pub responsive: Vec<u16>,
+    pub unresponsive: Vec<u16>,
+}
+
 /// Maximum age for announcement timestamps (5 minutes)
 pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
@@ -182,6 +188,11 @@ pub enum KfpNodeEvent {
     XpubAnnounced {
         share_index: u16,
         recovery_xpubs: Vec<AnnouncedXpub>,
+    },
+    HealthCheckComplete {
+        group_pubkey: [u8; 32],
+        responsive: Vec<u16>,
+        unresponsive: Vec<u16>,
     },
 }
 
@@ -282,6 +293,16 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .debug_struct("XpubAnnounced")
                 .field("share_index", share_index)
                 .field("xpub_count", &recovery_xpubs.len())
+                .finish(),
+            Self::HealthCheckComplete {
+                group_pubkey,
+                responsive,
+                unresponsive,
+            } => f
+                .debug_struct("HealthCheckComplete")
+                .field("group_pubkey", &hex::encode(group_pubkey))
+                .field("responsive", responsive)
+                .field("unresponsive", unresponsive)
                 .finish(),
         }
     }
@@ -1042,6 +1063,34 @@ impl KfpNode {
             self.peers.write().update_last_seen(peer.share_index);
         }
         Ok(())
+    }
+
+    pub async fn health_check(&self, timeout: Duration) -> Result<HealthCheckResult> {
+        let all_peers: Vec<u16> = self
+            .peers
+            .read()
+            .all_peers()
+            .iter()
+            .map(|p| p.share_index)
+            .collect();
+
+        let responsive = self.ping_peers(timeout).await?;
+        let unresponsive: Vec<u16> = all_peers
+            .iter()
+            .filter(|idx| !responsive.contains(idx))
+            .copied()
+            .collect();
+
+        let _ = self.event_tx.send(KfpNodeEvent::HealthCheckComplete {
+            group_pubkey: self.group_pubkey,
+            responsive: responsive.clone(),
+            unresponsive: unresponsive.clone(),
+        });
+
+        Ok(HealthCheckResult {
+            responsive,
+            unresponsive,
+        })
     }
 
     pub async fn ping_peers(&self, timeout: Duration) -> Result<Vec<u16>> {

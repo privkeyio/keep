@@ -342,6 +342,17 @@ fn dispatch_frost_network(
                 out, path, &group, relay, &hardware, count,
             )
         }
+        FrostNetworkCommands::HealthCheck {
+            group,
+            relay,
+            share,
+            timeout,
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_health_check(
+                out, path, &group, relay, share, timeout,
+            )
+        }
     }
 }
 
@@ -447,10 +458,11 @@ fn dispatch_wallet(
             relay,
             share,
             recovery,
+            timeout,
         } => {
             let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
             commands::wallet::cmd_wallet_propose(
-                out, path, &group, &network, relay, share, &recovery,
+                out, path, &group, &network, relay, share, &recovery, timeout,
             )
         }
     }
