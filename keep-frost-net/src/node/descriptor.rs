@@ -183,12 +183,7 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let initiator_share_index = {
-            let peers = self.peers.read();
-            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
-        };
-
-        if let Some(idx) = initiator_share_index {
+        if let Some(idx) = self.peers.read().get_peer_by_pubkey(&sender).map(|p| p.share_index) {
             self.verify_peer_share_index(sender, idx)?;
         }
 
