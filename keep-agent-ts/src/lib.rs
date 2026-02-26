@@ -314,7 +314,8 @@ impl KeepAgentSession {
 
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
 
-        let keys = Keys::parse(&hex::encode(secret.as_ref()))
+        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let keys = Keys::parse(hex.as_str())
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         let nostr_tags: Vec<Tag> = tags

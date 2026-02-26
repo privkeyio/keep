@@ -716,6 +716,7 @@ impl App {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
                 let Some(node) = self.get_frost_node() else {
+                    self.active_coordinations.remove(&session_id);
                     self.update_wallet_setup(&session_id, |setup| {
                         setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
                             "Node unavailable".to_string(),

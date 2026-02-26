@@ -308,7 +308,8 @@ impl PyAgentSession {
 
         use nostr_sdk::prelude::*;
 
-        let keys = Keys::parse(&hex::encode(secret.as_ref()))
+        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let keys = Keys::parse(hex.as_str())
             .map_err(to_py_value_err)?;
 
         let mut nostr_tags: Vec<Tag> = Vec::new();

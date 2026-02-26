@@ -77,10 +77,7 @@ impl PendingSession {
     }
 
     async fn send_connect_once(&self) -> Result<()> {
-        if self
-            .connect_sent
-            .swap(true, Ordering::AcqRel)
-        {
+        if self.connect_sent.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
 
@@ -512,8 +509,7 @@ impl AgentClient {
                                 if let Ok(resp) =
                                     serde_json::from_str::<serde_json::Value>(&decrypted)
                                 {
-                                    if resp.get("id").and_then(|v| v.as_str())
-                                        != Some(expected_id)
+                                    if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id)
                                     {
                                         continue;
                                     }
