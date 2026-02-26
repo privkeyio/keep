@@ -237,8 +237,8 @@ impl KfpNode {
                     }
                     true
                 }
-                Err(_) => {
-                    debug!("Descriptor session already exists, ignoring duplicate proposal");
+                Err(e) => {
+                    debug!("Descriptor session creation failed: {e}");
                     false
                 }
             }

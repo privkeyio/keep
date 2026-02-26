@@ -411,7 +411,9 @@ pub(crate) fn load_health_statuses(storage: &Arc<dyn SecureStorage>) -> Vec<KeyH
             continue;
         };
         live_keys.push(key.clone());
-        let stale_age = now.saturating_sub(stored.last_check_timestamp);
+        let stale_age = now
+            .checked_sub(stored.last_check_timestamp)
+            .unwrap_or(u64::MAX);
         results.push(KeyHealthStatusInfo {
             group_pubkey: stored.group_pubkey,
             share_index: stored.share_index,
