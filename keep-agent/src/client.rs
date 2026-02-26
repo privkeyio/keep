@@ -7,6 +7,8 @@ use nostr_sdk::prelude::*;
 
 use crate::error::{AgentError, Result};
 
+const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalStatus {
     Pending,
@@ -99,7 +101,7 @@ impl PendingSession {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::tweaked(0..5),
+            Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE),
             Kind::NostrConnect,
             tags,
             encrypted,
@@ -454,6 +456,22 @@ impl AgentClient {
         }
         self.client.connect().await;
 
+        let timeout = Duration::from_secs(10);
+        tokio::time::timeout(timeout, async {
+            loop {
+                for relay in &added {
+                    if let Ok(r) = self.client.relay(relay).await {
+                        if matches!(r.status(), RelayStatus::Connected) {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| AgentError::Connection("Relay connection timeout after switch".into()))?;
+
         self.relay_url = added[0].clone();
 
         Ok(Some(added))
@@ -480,7 +498,7 @@ impl AgentClient {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::tweaked(0..5),
+            Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE),
             Kind::NostrConnect,
             tags,
             encrypted,
