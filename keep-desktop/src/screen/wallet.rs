@@ -455,7 +455,9 @@ impl WalletScreen {
                 .size(theme::size::TINY)
                 .color(theme::color::TEXT_DIM);
 
-            let created = DateTime::<Utc>::from_timestamp(entry.created_at as i64, 0)
+            let created = i64::try_from(entry.created_at)
+                .ok()
+                .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
                 .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| entry.created_at.to_string());
             let created_text = text(format!("Created: {created}"))

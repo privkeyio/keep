@@ -83,6 +83,7 @@ pub(crate) const RECONNECT_MAX_MS: u64 = 30_000;
 pub(crate) const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 pub(crate) const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
+pub(crate) const MAX_ACTIVE_COORDINATIONS: usize = 64;
 
 const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
@@ -1281,16 +1282,22 @@ impl App {
                         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
                             &mut self.screen
                         {
-                            self.active_coordinations.insert(
-                                session_id,
-                                ActiveCoordination {
-                                    group_pubkey,
-                                    network,
-                                    expected_participants,
-                                    acks_received: 0,
-                                },
-                            );
-                            s.session_id = Some(session_id);
+                            if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+                                if let Some(node) = self.get_frost_node() {
+                                    node.cancel_descriptor_session(&session_id);
+                                }
+                            } else {
+                                self.active_coordinations.insert(
+                                    session_id,
+                                    ActiveCoordination {
+                                        group_pubkey,
+                                        network,
+                                        expected_participants,
+                                        acks_received: 0,
+                                    },
+                                );
+                                s.session_id = Some(session_id);
+                            }
                         } else if let Some(node) = self.get_frost_node() {
                             node.cancel_descriptor_session(&session_id);
                         }
