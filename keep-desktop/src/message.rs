@@ -312,6 +312,10 @@ pub enum FrostNodeMsg {
         session_id: [u8; 32],
         error: String,
     },
+    XpubAnnounced {
+        share_index: u16,
+        recovery_xpubs: Vec<keep_frost_net::AnnouncedXpub>,
+    },
 }
 
 impl fmt::Debug for FrostNodeMsg {
@@ -357,6 +361,14 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("DescriptorFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
+                .finish(),
+            Self::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => f
+                .debug_struct("XpubAnnounced")
+                .field("share_index", share_index)
+                .field("xpub_count", &recovery_xpubs.len())
                 .finish(),
         }
     }

@@ -122,11 +122,16 @@ pub(crate) struct FrostChannels {
 }
 
 fn push_frost_event(queue: &Mutex<VecDeque<FrostNodeMsg>>, event: FrostNodeMsg) {
-    if let Ok(mut q) = queue.lock() {
-        if q.len() >= MAX_FROST_EVENT_QUEUE {
-            q.pop_front();
+    match queue.lock() {
+        Ok(mut q) => {
+            if q.len() >= MAX_FROST_EVENT_QUEUE {
+                q.pop_front();
+            }
+            q.push_back(event);
         }
-        q.push_back(event);
+        Err(e) => {
+            tracing::warn!("frost event queue mutex poisoned, dropping event: {e}");
+        }
     }
 }
 
@@ -532,6 +537,18 @@ pub(crate) async fn frost_event_listener(
                             FrostNodeMsg::DescriptorFailed { session_id, error },
                         );
                     }
+                    Ok(KfpNodeEvent::XpubAnnounced {
+                        share_index,
+                        recovery_xpubs,
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::XpubAnnounced {
+                                share_index,
+                                recovery_xpubs,
+                            },
+                        );
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -677,6 +694,28 @@ impl App {
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
+                if self.active_coordinations.contains_key(&session_id) {
+                    let Some(node) = self.get_frost_node() else {
+                        return iced::Task::none();
+                    };
+                    return iced::Task::perform(
+                        async move {
+                            node.build_and_finalize_descriptor(session_id)
+                                .await
+                                .map_err(|e| format!("{e}"))
+                        },
+                        move |result| match result {
+                            Ok(()) => Message::WalletDescriptorProgress(
+                                DescriptorProgress::Finalizing,
+                                Some(session_id),
+                            ),
+                            Err(e) => Message::WalletDescriptorProgress(
+                                DescriptorProgress::Failed(e),
+                                Some(session_id),
+                            ),
+                        },
+                    );
+                }
             }
             FrostNodeMsg::DescriptorContributed { session_id, .. } => {
                 self.update_wallet_setup(&session_id, |setup| {
@@ -716,6 +755,16 @@ impl App {
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(error));
                 });
+            }
+            FrostNodeMsg::XpubAnnounced {
+                share_index,
+                recovery_xpubs,
+            } => {
+                tracing::info!(
+                    share_index,
+                    count = recovery_xpubs.len(),
+                    "Received recovery xpub announcement"
+                );
             }
         }
         iced::Task::none()
@@ -881,6 +930,9 @@ impl App {
             if let Some(tx) = guard.take() {
                 let _ = tx.try_send(());
             }
+        }
+        if let Ok(mut guard) = self.frost_node.lock() {
+            *guard = None;
         }
         self.frost_peers.clear();
         self.pending_sign_display.clear();
