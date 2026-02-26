@@ -3,12 +3,11 @@
 
 use std::fmt;
 
+use keep_frost_net::AnnouncedXpub;
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
-use keep_frost_net::AnnouncedXpub;
-
 use crate::screen::wallet::{DescriptorProgress, WalletEntry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -201,6 +200,7 @@ pub enum Message {
     WalletBeginCoordination,
     WalletCancelSetup,
     WalletSessionStarted(Result<([u8; 32], [u8; 32], String, usize), String>),
+    WalletFinalizeResult(Result<(), String>, [u8; 32]),
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     // Relay / FROST
     RelayUrlChanged(String),
@@ -502,6 +502,11 @@ impl fmt::Debug for Message {
             Self::WalletSessionStarted(r) => f
                 .debug_tuple("WalletSessionStarted")
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::WalletFinalizeResult(r, sid) => f
+                .debug_struct("WalletFinalizeResult")
+                .field("result", &r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .field("session_id", &hex::encode(sid))
                 .finish(),
             Self::WalletDescriptorProgress(..) => f.write_str("WalletDescriptorProgress"),
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),

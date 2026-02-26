@@ -696,6 +696,7 @@ impl App {
             | Message::WalletBeginCoordination
             | Message::WalletCancelSetup
             | Message::WalletSessionStarted(..)
+            | Message::WalletFinalizeResult(..)
             | Message::WalletDescriptorProgress(..) => self.handle_wallet_message(message),
 
             Message::RelayUrlChanged(..)
@@ -1348,6 +1349,16 @@ impl App {
                             node.cancel_descriptor_session(&sid);
                         }
                     }
+                }
+                Task::none()
+            }
+            Message::WalletFinalizeResult(result, session_id) => {
+                if let Err(e) = result {
+                    self.active_coordinations.remove(&session_id);
+                    self.update_wallet_setup(&session_id, |setup| {
+                        setup.phase =
+                            SetupPhase::Coordinating(DescriptorProgress::Failed(e));
+                    });
                 }
                 Task::none()
             }

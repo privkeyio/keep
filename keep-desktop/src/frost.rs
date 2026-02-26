@@ -928,6 +928,7 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.active_coordinations.clear();
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.frost_node.lock() {
