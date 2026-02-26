@@ -26,6 +26,9 @@ pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
+pub const DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS: u64 = 300;
+pub const DESCRIPTOR_FINALIZE_TIMEOUT_SECS: u64 = 120;
+pub const DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS: u64 = 120;
 pub const MAX_DESCRIPTOR_LENGTH: usize = 4096;
 pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const MAX_RECOVERY_XPUBS: usize = 20;
@@ -37,10 +40,20 @@ pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"]
 pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
-    let now = chrono::Utc::now().timestamp() as u64;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
     let min_valid = now.saturating_sub(window_secs);
     let max_valid = now.saturating_add(MAX_FUTURE_SKEW_SECS);
     created_at >= min_valid && created_at <= max_valid
+}
+
+fn is_valid_xpub(xpub: &str) -> bool {
+    xpub.len() >= MIN_XPUB_LENGTH
+        && xpub.len() <= MAX_XPUB_LENGTH
+        && VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.starts_with(pfx))
+}
+
+fn is_valid_fingerprint(fp: &str) -> bool {
+    fp.len() == MAX_FINGERPRINT_LENGTH && fp.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -262,17 +275,11 @@ impl KfpMessage {
                 if !VALID_NETWORKS.contains(&p.network.as_str()) {
                     return Err("Invalid network value");
                 }
-                if p.initiator_xpub.is_empty() {
-                    return Err("Initiator xpub cannot be empty");
+                if !is_valid_xpub(&p.initiator_xpub) {
+                    return Err("Invalid initiator xpub");
                 }
-                if p.initiator_xpub.len() > MAX_XPUB_LENGTH {
-                    return Err("Initiator xpub exceeds maximum length");
-                }
-                if p.initiator_fingerprint.is_empty() {
-                    return Err("Initiator fingerprint cannot be empty");
-                }
-                if p.initiator_fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                    return Err("Initiator fingerprint exceeds maximum length");
+                if !is_valid_fingerprint(&p.initiator_fingerprint) {
+                    return Err("Initiator fingerprint must be exactly 8 hex characters");
                 }
                 if p.policy.recovery_tiers.is_empty() {
                     return Err("Policy must have at least one recovery tier");
@@ -294,12 +301,21 @@ impl KfpMessage {
                         return Err("Tier threshold exceeds number of key slots");
                     }
                     for slot in &tier.key_slots {
-                        if let KeySlot::External { xpub, fingerprint } = slot {
-                            if xpub.len() > MAX_XPUB_LENGTH {
-                                return Err("External xpub exceeds maximum length");
+                        match slot {
+                            KeySlot::Participant { share_index } => {
+                                if *share_index == 0 {
+                                    return Err("Participant share_index must be non-zero");
+                                }
                             }
-                            if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                                return Err("External fingerprint exceeds maximum length");
+                            KeySlot::External { xpub, fingerprint } => {
+                                if !is_valid_xpub(xpub) {
+                                    return Err("Invalid external xpub");
+                                }
+                                if !is_valid_fingerprint(fingerprint) {
+                                    return Err(
+                                        "External fingerprint must be exactly 8 hex characters",
+                                    );
+                                }
                             }
                         }
                     }
@@ -309,17 +325,11 @@ impl KfpMessage {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
                 }
-                if p.account_xpub.len() < MIN_XPUB_LENGTH {
-                    return Err("Account xpub too short");
+                if !is_valid_xpub(&p.account_xpub) {
+                    return Err("Invalid account xpub");
                 }
-                if p.account_xpub.len() > MAX_XPUB_LENGTH {
-                    return Err("Account xpub exceeds maximum length");
-                }
-                if p.fingerprint.is_empty() {
-                    return Err("Fingerprint cannot be empty");
-                }
-                if p.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                    return Err("Fingerprint exceeds maximum length");
+                if !is_valid_fingerprint(&p.fingerprint) {
+                    return Err("Fingerprint must be exactly 8 hex characters");
                 }
             }
             KfpMessage::DescriptorFinalize(p) => {
@@ -338,23 +348,18 @@ impl KfpMessage {
                 if p.contributions.len() > MAX_PARTICIPANTS {
                     return Err("Too many contributions in finalize payload");
                 }
-                for &idx in p.contributions.keys() {
+                for (&idx, contrib) in &p.contributions {
                     if idx == 0 {
                         return Err("Invalid contribution index");
                     }
                     if idx as usize > MAX_PARTICIPANTS {
                         return Err("Contribution index exceeds maximum");
                     }
-                }
-                for contrib in p.contributions.values() {
-                    if contrib.account_xpub.len() < MIN_XPUB_LENGTH {
-                        return Err("Contribution xpub too short");
+                    if !is_valid_xpub(&contrib.account_xpub) {
+                        return Err("Invalid contribution xpub");
                     }
-                    if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
-                        return Err("Contribution xpub exceeds maximum length");
-                    }
-                    if contrib.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                        return Err("Contribution fingerprint exceeds maximum length");
+                    if !is_valid_fingerprint(&contrib.fingerprint) {
+                        return Err("Contribution fingerprint must be exactly 8 hex characters");
                     }
                 }
             }
@@ -963,6 +968,7 @@ impl DescriptorProposePayload {
     pub fn new(
         session_id: [u8; 32],
         group_pubkey: [u8; 32],
+        created_at: u64,
         network: &str,
         policy: WalletPolicy,
         initiator_xpub: &str,
@@ -971,7 +977,7 @@ impl DescriptorProposePayload {
         Self {
             session_id,
             group_pubkey,
-            created_at: chrono::Utc::now().timestamp() as u64,
+            created_at,
             network: network.to_string(),
             policy,
             initiator_xpub: initiator_xpub.to_string(),

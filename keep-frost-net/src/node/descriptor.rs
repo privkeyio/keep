@@ -25,10 +25,18 @@ impl KfpNode {
         own_xpub: &str,
         own_fingerprint: &str,
     ) -> Result<[u8; 32]> {
-        let created_at = chrono::Utc::now().timestamp() as u64;
-        let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
+        if !VALID_NETWORKS.contains(&network) {
+            return Err(FrostNetError::Session(format!(
+                "Invalid network: {network}"
+            )));
+        }
 
         let our_index = self.share.metadata.identifier;
+
+        self.check_proposer_authorized(our_index)?;
+
+        let created_at = chrono::Utc::now().timestamp().max(0) as u64;
+        let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
 
@@ -53,22 +61,23 @@ impl KfpNode {
                 expected_acks,
             )?;
             session.set_initiator(self.keys.public_key());
-        }
 
-        if we_are_contributor {
-            let mut sessions = self.descriptor_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&session_id) {
-                session.add_contribution(
+            if we_are_contributor {
+                if let Err(e) = session.add_contribution(
                     our_index,
                     own_xpub.to_string(),
                     own_fingerprint.to_string(),
-                )?;
+                ) {
+                    sessions.remove_session(&session_id);
+                    return Err(e);
+                }
             }
         }
 
         let payload = DescriptorProposePayload::new(
             session_id,
             self.group_pubkey,
+            created_at,
             network,
             policy,
             own_xpub,
@@ -140,14 +149,28 @@ impl KfpNode {
             ));
         }
 
-        {
-            let peers = self.peers.read();
-            if peers.get_peer_by_pubkey(&sender).is_none() {
-                return Err(FrostNetError::UntrustedPeer(format!(
-                    "Descriptor proposal from unknown peer: {sender}"
-                )));
-            }
+        let expected_id = derive_descriptor_session_id(
+            &payload.group_pubkey,
+            &payload.policy,
+            payload.created_at,
+        );
+        if payload.session_id != expected_id {
+            return Err(FrostNetError::Session(
+                "session_id does not match derived value".into(),
+            ));
         }
+
+        let sender_share_index = {
+            let peers = self.peers.read();
+            let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!(
+                    "Descriptor proposal from unknown peer: {sender}"
+                ))
+            })?;
+            peer.share_index
+        };
+
+        self.check_proposer_authorized(sender_share_index)?;
 
         info!(
             session_id = %hex::encode(payload.session_id),
@@ -160,12 +183,7 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        let initiator_share_index = {
-            let peers = self.peers.read();
-            peers.get_peer_by_pubkey(&sender).map(|p| p.share_index)
-        };
-
-        {
+        let session_created = {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
                 payload.session_id,
@@ -178,20 +196,24 @@ impl KfpNode {
                 Ok(session) => {
                     session.set_initiator(sender);
 
-                    if let Some(idx) = initiator_share_index {
-                        if let Err(e) = session.add_contribution(
-                            idx,
-                            payload.initiator_xpub.clone(),
-                            payload.initiator_fingerprint.clone(),
-                        ) {
-                            debug!("Failed to store initiator contribution: {e}");
-                        }
+                    if let Err(e) = session.add_contribution(
+                        sender_share_index,
+                        payload.initiator_xpub.clone(),
+                        payload.initiator_fingerprint.clone(),
+                    ) {
+                        debug!("Failed to store initiator contribution: {e}");
                     }
+                    true
                 }
                 Err(_) => {
                     debug!("Descriptor session already exists, ignoring duplicate proposal");
+                    false
                 }
             }
+        };
+
+        if !session_created {
+            return Ok(());
         }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorProposed {
@@ -436,23 +458,26 @@ impl KfpNode {
             ));
         }
 
-        if payload.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
-            return Err(FrostNetError::Session(
-                "External descriptor exceeds maximum length".into(),
-            ));
-        }
-        if payload.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
-            return Err(FrostNetError::Session(
-                "Internal descriptor exceeds maximum length".into(),
-            ));
-        }
-
-        {
-            let peers = self.peers.read();
-            if peers.get_peer_by_pubkey(&sender).is_none() {
-                return Err(FrostNetError::UntrustedPeer(sender.to_string()));
+        for (name, desc) in [
+            ("External", &payload.external_descriptor),
+            ("Internal", &payload.internal_descriptor),
+        ] {
+            if desc.len() > MAX_DESCRIPTOR_LENGTH {
+                return Err(FrostNetError::Session(format!(
+                    "{name} descriptor exceeds maximum length"
+                )));
             }
         }
+
+        let sender_share_index = {
+            let peers = self.peers.read();
+            let peer = peers
+                .get_peer_by_pubkey(&sender)
+                .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?;
+            peer.share_index
+        };
+
+        self.check_proposer_authorized(sender_share_index)?;
 
         let our_index = self.share.metadata.identifier;
 
@@ -464,29 +489,26 @@ impl KfpNode {
 
             let network = session.network().to_string();
 
-            match session.initiator() {
-                Some(initiator) if *initiator != sender => {
-                    return Err(FrostNetError::Session(
-                        "DescriptorFinalize sender is not the session initiator".into(),
-                    ));
-                }
-                None => {
-                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                        session_id: payload.session_id,
-                        error: "Missing initiator".into(),
-                    });
-                    return Err(FrostNetError::Session(
-                        "DescriptorFinalize missing session initiator".into(),
-                    ));
-                }
-                Some(_) => {}
+            let initiator = session.initiator().ok_or_else(|| {
+                let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                    session_id: payload.session_id,
+                    error: "Missing initiator".into(),
+                });
+                FrostNetError::Session("DescriptorFinalize missing session initiator".into())
+            })?;
+            if *initiator != sender {
+                return Err(FrostNetError::Session(
+                    "DescriptorFinalize sender is not the session initiator".into(),
+                ));
             }
 
             let own_xpub_tampered = match session.contributions().get(&our_index) {
-                Some(our_stored) => payload.contributions.get(&our_index).is_none_or(|fwd| {
-                    fwd.account_xpub != our_stored.account_xpub
-                        || fwd.fingerprint != our_stored.fingerprint
-                }),
+                Some(our_stored) => {
+                    let forwarded = payload.contributions.get(&our_index);
+                    !matches!(forwarded, Some(fwd)
+                        if fwd.account_xpub == our_stored.account_xpub
+                            && fwd.fingerprint == our_stored.fingerprint)
+                }
                 None => session.is_participant(our_index),
             };
 
@@ -497,19 +519,16 @@ impl KfpNode {
 
             let result = if own_xpub_tampered {
                 Err("Own xpub contribution was tampered with in finalize".into())
+            } else if payload.policy_hash != derive_policy_hash(session.policy()) {
+                Err("Policy hash does not match proposal".into())
             } else {
-                let expected_hash = derive_policy_hash(session.policy());
-                if payload.policy_hash != expected_hash {
-                    Err("Policy hash does not match proposal".into())
-                } else {
-                    reconstruct_descriptor(
-                        session.group_pubkey(),
-                        session.policy(),
-                        &payload.contributions,
-                        session.network(),
-                    )
-                    .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
-                }
+                reconstruct_descriptor(
+                    session.group_pubkey(),
+                    session.policy(),
+                    &payload.contributions,
+                    session.network(),
+                )
+                .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
             };
             (result, network, our_xpub)
         };
@@ -559,20 +578,26 @@ impl KfpNode {
             hasher.finalize().into()
         };
 
-        let key_proof_psbt_bytes = {
-            let our_xpub = our_xpub.ok_or_else(|| {
-                FrostNetError::Session("Missing own xpub contribution for key proof".into())
-            })?;
-
-            let net = crate::descriptor_session::parse_network(&session_network)?;
-            let signing_share_bytes = self.signing_share_bytes()?;
-
-            let mut proof_psbt =
-                keep_bitcoin::build_key_proof_psbt(&payload.session_id, our_index, &our_xpub, net)
-                    .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
-
-            keep_bitcoin::sign_key_proof(&mut proof_psbt, &signing_share_bytes, net)
-                .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))?
+        let key_proof_psbt_bytes = match self.build_key_proof(
+            &payload.session_id,
+            our_index,
+            our_xpub.as_deref(),
+            &session_network,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = format!("Key proof failed: {e}");
+                self.descriptor_sessions
+                    .write()
+                    .remove_session(&payload.session_id);
+                self.send_descriptor_nack(payload.session_id, &sender, &reason)
+                    .await;
+                let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                    session_id: payload.session_id,
+                    error: reason.clone(),
+                });
+                return Err(FrostNetError::Session(reason));
+            }
         };
 
         let ack = DescriptorAckPayload::new(
@@ -605,6 +630,20 @@ impl KfpNode {
             .send_event(&event)
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            let Some(session) = sessions.get_session_mut(&payload.session_id) else {
+                return Err(FrostNetError::Session(
+                    "Session not found for finalize".into(),
+                ));
+            };
+            session.set_finalized(FinalizedDescriptor {
+                external: payload.external_descriptor.clone(),
+                internal: payload.internal_descriptor.clone(),
+                policy_hash: payload.policy_hash,
+            })?;
+        }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
             session_id: payload.session_id,
@@ -699,7 +738,7 @@ impl KfpNode {
             )));
         }
 
-        if session.has_nacked(share_index) {
+        if session.is_complete() || session.has_nacked(share_index) {
             return Ok(());
         }
 
@@ -841,9 +880,16 @@ impl KfpNode {
             }
             let digest: [u8; 32] = hasher.finalize().into();
             let dedup_key = (payload.share_index, payload.created_at, digest);
-            if !self.seen_xpub_announces.write().insert(dedup_key) {
+            let mut seen = self.seen_xpub_announces.write();
+            if seen.contains(&dedup_key) {
                 return Ok(());
             }
+            if seen.len() >= 10_000 {
+                if let Some(&oldest) = seen.iter().min_by_key(|(_, ts, _)| *ts) {
+                    seen.remove(&oldest);
+                }
+            }
+            seen.insert(dedup_key);
         }
 
         {
@@ -866,6 +912,34 @@ impl KfpNode {
         });
 
         Ok(())
+    }
+
+    fn check_proposer_authorized(&self, share_index: u16) -> Result<()> {
+        let proposers = self.descriptor_proposers.read();
+        if !proposers.is_empty() && !proposers.contains(&share_index) {
+            return Err(FrostNetError::Session(format!(
+                "Share {share_index} is not authorized to propose descriptors"
+            )));
+        }
+        Ok(())
+    }
+
+    fn build_key_proof(
+        &self,
+        session_id: &[u8; 32],
+        share_index: u16,
+        xpub: Option<&str>,
+        network_str: &str,
+    ) -> Result<Vec<u8>> {
+        let xpub = xpub.ok_or_else(|| {
+            FrostNetError::Session("Missing own xpub contribution for key proof".into())
+        })?;
+        let net = crate::descriptor_session::parse_network(network_str)?;
+        let signing_share_bytes = self.signing_share_bytes()?;
+        let mut proof_psbt = keep_bitcoin::build_key_proof_psbt(session_id, share_index, xpub, net)
+            .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
+        keep_bitcoin::sign_key_proof(&mut proof_psbt, &signing_share_bytes, net)
+            .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))
     }
 
     fn signing_share_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
