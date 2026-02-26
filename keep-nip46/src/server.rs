@@ -20,8 +20,7 @@ use crate::handler::SignerHandler;
 use crate::permissions::PermissionManager;
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
-
-const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
 pub struct ServerConfig {
     pub max_event_json_size: usize,

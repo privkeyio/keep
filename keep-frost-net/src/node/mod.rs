@@ -757,10 +757,9 @@ impl KfpNode {
                 let matching: Vec<_> = events
                     .into_iter()
                     .filter(|e| {
-                        e.tags.iter().any(|t| {
-                            t.kind() == TagKind::custom("g")
-                                && t.content().map(|c| c == group_hex).unwrap_or(false)
-                        })
+                        e.tags
+                            .filter(TagKind::custom("g"))
+                            .any(|t| t.content() == Some(&group_hex))
                     })
                     .collect();
                 debug!(count = matching.len(), "Fetched historical events");
@@ -803,7 +802,7 @@ impl KfpNode {
                         });
                     }
                     {
-                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        let now = Timestamp::now().as_secs();
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
@@ -946,7 +945,7 @@ impl KfpNode {
             return Ok(());
         }
 
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = Timestamp::now().as_secs();
         if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
             debug!(
                 timestamp = payload.timestamp,
@@ -1181,6 +1180,8 @@ fn default_relay_opts() -> RelayOptions {
         .ping(true)
         .retry_interval(Duration::from_secs(10))
         .adjust_retry_interval(true)
+        .ban_relay_on_mismatch(true)
+        .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
 fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {

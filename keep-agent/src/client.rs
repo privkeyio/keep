@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
-use crate::error::{AgentError, Result};
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
-const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+use crate::error::{AgentError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalStatus {
@@ -607,6 +607,8 @@ fn default_relay_opts() -> RelayOptions {
         .ping(true)
         .retry_interval(Duration::from_secs(10))
         .adjust_retry_interval(true)
+        .ban_relay_on_mismatch(true)
+        .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
 fn generate_uuid() -> String {

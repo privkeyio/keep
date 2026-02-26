@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use nostr_sdk::prelude::*;
 
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
+
 use crate::error::{FrostNetError, Result};
 use crate::proof;
 use crate::protocol::*;
-
-pub(crate) const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
 
 pub struct KfpEventBuilder;
 
@@ -19,7 +19,7 @@ impl KfpEventBuilder {
         verifying_share: &[u8; 33],
         name: Option<&str>,
     ) -> Result<Event> {
-        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let timestamp = Timestamp::now().as_secs();
         let proof_signature = proof::sign_proof(
             signing_share,
             group_pubkey,
@@ -168,7 +168,7 @@ impl KfpEventBuilder {
     pub fn pong(keys: &Keys, recipient: &PublicKey, challenge: [u8; 32]) -> Result<Event> {
         let payload = PongPayload {
             challenge,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: Timestamp::now().as_secs(),
         };
         let msg = KfpMessage::Pong(payload);
         let content = msg.to_json()?;
@@ -319,13 +319,16 @@ impl KfpEventBuilder {
             ));
         }
 
-        let is_addressed_to_us = event.tags.iter().any(|t| {
-            if let Some(TagStandard::PublicKey { public_key, .. }) = t.as_standardized() {
-                public_key == &keys.public_key()
-            } else {
-                false
-            }
-        });
+        let is_addressed_to_us =
+            event
+                .tags
+                .filter(TagKind::p())
+                .any(|t| match t.as_standardized() {
+                    Some(TagStandard::PublicKey { public_key, .. }) => {
+                        public_key == &keys.public_key()
+                    }
+                    _ => false,
+                });
 
         let content = if is_addressed_to_us {
             nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)

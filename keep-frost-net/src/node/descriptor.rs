@@ -13,8 +13,8 @@ use crate::descriptor_session::{
     FinalizedDescriptor,
 };
 use crate::error::{FrostNetError, Result};
-use crate::event::TIMESTAMP_TWEAK_RANGE;
 use crate::protocol::*;
+use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
 use super::{KfpNode, KfpNodeEvent};
 
@@ -48,7 +48,7 @@ impl KfpNode {
 
         self.check_proposer_authorized(our_index)?;
 
-        let created_at = chrono::Utc::now().timestamp().max(0) as u64;
+        let created_at = Timestamp::now().as_secs();
         let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
@@ -942,7 +942,7 @@ impl KfpNode {
             }
             const MAX_SEEN_XPUB_ANNOUNCES: usize = 10_000;
             if seen.len() > MAX_SEEN_XPUB_ANNOUNCES {
-                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                let now = Timestamp::now().as_secs();
                 let window = self
                     .replay_window_secs
                     .saturating_add(super::MAX_FUTURE_SKEW_SECS);
