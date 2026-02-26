@@ -355,8 +355,7 @@ pub(crate) fn existing_created_at(
     group_pubkey_hex: &str,
     share_index: u16,
 ) -> Option<u64> {
-    load_stored_health_status(storage, group_pubkey_hex, share_index)
-        .and_then(|s| s.created_at)
+    load_stored_health_status(storage, group_pubkey_hex, share_index).and_then(|s| s.created_at)
 }
 
 fn load_stored_health_status(

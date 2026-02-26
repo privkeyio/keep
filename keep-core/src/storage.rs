@@ -784,8 +784,13 @@ impl Storage {
     pub fn delete_health_status(&self, group_pubkey: &[u8; 32], share_index: u16) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let key = health_status_key(group_pubkey, share_index);
-        backend.delete(HEALTH_STATUS_TABLE, key.as_bytes())?;
-        Ok(())
+        if backend.delete(HEALTH_STATUS_TABLE, key.as_bytes())? {
+            Ok(())
+        } else {
+            Err(KeepError::KeyNotFound(format!(
+                "health status for share {share_index} not found"
+            )))
+        }
     }
 }
 

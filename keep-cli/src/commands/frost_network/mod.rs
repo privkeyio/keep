@@ -407,13 +407,10 @@ pub fn cmd_frost_network_sign(
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
         out.info("Starting FROST coordination node...");
-        out.field(
-            "Node pubkey",
-            &{
-                let pk = node.pubkey();
-                pk.to_bech32().unwrap_or_else(|_| format!("{pk}"))
-            },
-        );
+        out.field("Node pubkey", &{
+            let pk = node.pubkey();
+            pk.to_bech32().unwrap_or_else(|_| format!("{pk}"))
+        });
         out.newline();
 
         let node = std::sync::Arc::new(node);
@@ -614,7 +611,11 @@ pub fn cmd_frost_network_health_check(
             out.header("Health History");
             for s in &group_statuses {
                 let age = now.saturating_sub(s.last_check_timestamp);
-                let status_str = if s.responsive { "responsive" } else { "unresponsive" };
+                let status_str = if s.responsive {
+                    "responsive"
+                } else {
+                    "unresponsive"
+                };
                 let staleness = if s.is_critical(now) {
                     " [CRITICAL]"
                 } else if s.is_stale(now) {

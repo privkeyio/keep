@@ -729,6 +729,11 @@ impl KeepMobile {
     }
 
     pub fn health_check(&self, timeout_secs: u64) -> Result<Vec<u16>, KeepMobileError> {
+        if timeout_secs == 0 || timeout_secs > 300 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("timeout_secs must be between 1 and 300, got {timeout_secs}"),
+            });
+        }
         self.runtime.block_on(async {
             let node_guard = self.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
@@ -758,12 +763,9 @@ impl KeepMobile {
                 .chain(result.unresponsive.iter().map(|&idx| (idx, false)))
                 .collect();
             for (idx, responsive) in &all_shares {
-                let existing_created_at = persistence::existing_created_at(
-                    &self.storage,
-                    &group_pubkey,
-                    *idx,
-                );
-                let _ = persistence::persist_health_status(
+                let existing_created_at =
+                    persistence::existing_created_at(&self.storage, &group_pubkey, *idx);
+                if let Err(e) = persistence::persist_health_status(
                     &self.storage,
                     &KeyHealthStatusInfo {
                         group_pubkey: group_pubkey.clone(),
@@ -774,7 +776,14 @@ impl KeepMobile {
                         is_stale: false,
                         is_critical: false,
                     },
-                );
+                ) {
+                    tracing::warn!(
+                        group_pubkey = %group_pubkey,
+                        share_index = %idx,
+                        error = %e,
+                        "Failed to persist health status"
+                    );
+                }
             }
 
             Ok(result.responsive)

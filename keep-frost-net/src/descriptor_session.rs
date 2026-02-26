@@ -18,6 +18,26 @@ use crate::protocol::{
 
 const MAX_SESSIONS: usize = 64;
 const REAP_GRACE_SECS: u64 = 60;
+const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(86_400);
+
+fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
+    if timeout.is_zero() {
+        return Err(FrostNetError::Session(
+            "Session timeout must be greater than zero".into(),
+        ));
+    }
+    if timeout > MAX_SESSION_TIMEOUT {
+        return Err(FrostNetError::Session(
+            format!(
+                "Session timeout {}s exceeds maximum {}s",
+                timeout.as_secs(),
+                MAX_SESSION_TIMEOUT.as_secs()
+            )
+            .into(),
+        ));
+    }
+    Ok(timeout)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorSessionState {
@@ -378,11 +398,12 @@ impl DescriptorSessionManager {
         }
     }
 
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self {
+    pub fn with_timeout(timeout: Duration) -> Result<Self> {
+        let validated = validate_session_timeout(timeout)?;
+        Ok(Self {
             sessions: HashMap::new(),
-            default_timeout: timeout,
-        }
+            default_timeout: validated,
+        })
     }
 
     pub fn session_count(&self) -> usize {
@@ -438,7 +459,10 @@ impl DescriptorSessionManager {
             ));
         }
 
-        let effective_timeout = timeout.unwrap_or(self.default_timeout);
+        let effective_timeout = match timeout {
+            Some(t) => validate_session_timeout(t)?,
+            None => self.default_timeout,
+        };
         let session = DescriptorSession::new(
             session_id,
             group_pubkey,
@@ -1038,7 +1062,7 @@ mod tests {
 
     #[test]
     fn test_session_manager_cleanup_expired() {
-        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_millis(1));
+        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_millis(1)).unwrap();
         let policy = test_policy();
 
         manager
@@ -1217,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_returns_phase_reasons() {
-        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_secs(600));
+        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_secs(600)).unwrap();
         let policy = test_policy();
 
         {

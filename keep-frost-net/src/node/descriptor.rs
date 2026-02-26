@@ -37,7 +37,6 @@ impl KfpNode {
         own_fingerprint: &str,
         timeout_secs: Option<u64>,
     ) -> Result<[u8; 32]> {
-
         let our_index = self.share.metadata.identifier;
 
         self.check_proposer_authorized(our_index)?;

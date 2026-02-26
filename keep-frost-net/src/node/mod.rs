@@ -427,7 +427,7 @@ impl KfpNode {
         };
 
         let descriptor_manager = match session_timeout {
-            Some(t) => DescriptorSessionManager::with_timeout(t),
+            Some(t) => DescriptorSessionManager::with_timeout(t)?,
             None => DescriptorSessionManager::new(),
         };
 
