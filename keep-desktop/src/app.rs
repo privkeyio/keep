@@ -108,6 +108,8 @@ pub struct Toast {
 pub(crate) struct ActiveCoordination {
     pub group_pubkey: [u8; 32],
     pub network: String,
+    pub expected_participants: usize,
+    pub acks_received: usize,
 }
 
 pub struct App {
@@ -1306,7 +1308,7 @@ impl App {
             Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
             Message::WalletSessionStarted(result) => {
                 match result {
-                    Ok((session_id, group_pubkey, network)) => {
+                    Ok((session_id, group_pubkey, network, expected_participants)) => {
                         if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
                             &mut self.screen
                         {
@@ -1315,6 +1317,8 @@ impl App {
                                 ActiveCoordination {
                                     group_pubkey,
                                     network,
+                                    expected_participants,
+                                    acks_received: 0,
                                 },
                             );
                             s.session_id = Some(session_id);
@@ -1472,7 +1476,12 @@ impl App {
                     .await
                     .map_err(|e| format!("{e}"))?;
 
-                Ok::<([u8; 32], [u8; 32], String), String>((session_id, group_pubkey, net))
+                Ok::<([u8; 32], [u8; 32], String, usize), String>((
+                    session_id,
+                    group_pubkey,
+                    net,
+                    expected_total,
+                ))
             },
             Message::WalletSessionStarted,
         )

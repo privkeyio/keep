@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::AuditDisplayEntry;
+use keep_frost_net::AnnouncedXpub;
+
 use crate::screen::wallet::{DescriptorProgress, WalletEntry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -198,7 +200,7 @@ pub enum Message {
     WalletRemoveTier(usize),
     WalletBeginCoordination,
     WalletCancelSetup,
-    WalletSessionStarted(Result<([u8; 32], [u8; 32], String), String>),
+    WalletSessionStarted(Result<([u8; 32], [u8; 32], String, usize), String>),
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     // Relay / FROST
     RelayUrlChanged(String),
@@ -320,7 +322,7 @@ pub enum FrostNodeMsg {
     },
     XpubAnnounced {
         share_index: u16,
-        recovery_xpubs: Vec<keep_frost_net::AnnouncedXpub>,
+        recovery_xpubs: Vec<AnnouncedXpub>,
     },
 }
 

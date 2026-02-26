@@ -824,6 +824,8 @@ impl App {
             ActiveCoordination {
                 group_pubkey: share.group_pubkey,
                 network: network.clone(),
+                expected_participants: 0,
+                acks_received: 0,
             },
         );
 
