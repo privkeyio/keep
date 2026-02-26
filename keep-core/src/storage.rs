@@ -752,7 +752,7 @@ impl Storage {
             return Ok(None);
         };
 
-        let encrypted = crypto::EncryptedData::from_bytes(&encrypted_bytes)?;
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
         let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)
@@ -769,7 +769,7 @@ impl Storage {
         let mut statuses = Vec::new();
 
         for (_, encrypted_bytes) in entries {
-            let encrypted = crypto::EncryptedData::from_bytes(&encrypted_bytes)?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
             let status: KeyHealthStatus = serde_json::from_slice(&decrypted_bytes)

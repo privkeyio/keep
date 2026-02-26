@@ -399,37 +399,15 @@ impl DescriptorSessionManager {
         expected_contributors: HashSet<u16>,
         expected_acks: HashSet<u16>,
     ) -> Result<&mut DescriptorSession> {
-        if let Some(existing) = self.sessions.get(&session_id) {
-            if !existing.is_expired() {
-                return Err(FrostNetError::Session(
-                    "Descriptor session already active".into(),
-                ));
-            }
-            self.sessions.remove(&session_id);
-        }
-
-        let _ = self.cleanup_expired();
-
-        if self.sessions.len() >= MAX_SESSIONS {
-            return Err(FrostNetError::Session(
-                "Maximum number of descriptor sessions reached".into(),
-            ));
-        }
-
-        let session = DescriptorSession::new(
+        self.create_session_with_timeout(
             session_id,
             group_pubkey,
             policy,
             network,
             expected_contributors,
             expected_acks,
-            self.default_timeout,
-        );
-
-        self.sessions.insert(session_id, session);
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| FrostNetError::Session("Failed to retrieve created session".into()))
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

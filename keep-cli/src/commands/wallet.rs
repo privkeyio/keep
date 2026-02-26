@@ -616,7 +616,7 @@ pub fn cmd_wallet_propose(
 
         let spinner = out.spinner("Waiting for ACKs...");
         let ack_timeout = timeout_secs
-            .map(|t| t.max(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS).min(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS * 4))
+            .map(|t| t.clamp(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS, keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS * 4))
             .unwrap_or(keep_frost_net::DESCRIPTOR_ACK_TIMEOUT_SECS);
         let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(ack_timeout);
 

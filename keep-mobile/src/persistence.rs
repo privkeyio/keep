@@ -350,6 +350,27 @@ fn persist_health_index(
     )
 }
 
+pub(crate) fn existing_created_at(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey_hex: &str,
+    share_index: u16,
+) -> Option<u64> {
+    load_stored_health_status(storage, group_pubkey_hex, share_index)
+        .and_then(|s| s.created_at)
+}
+
+fn load_stored_health_status(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey_hex: &str,
+    share_index: u16,
+) -> Option<StoredHealthStatus> {
+    let key = health_status_key(group_pubkey_hex, share_index);
+    storage
+        .load_share_by_key(key)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+}
+
 pub(crate) fn persist_health_status(
     storage: &Arc<dyn SecureStorage>,
     info: &KeyHealthStatusInfo,

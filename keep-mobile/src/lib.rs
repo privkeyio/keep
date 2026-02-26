@@ -758,6 +758,11 @@ impl KeepMobile {
                 .chain(result.unresponsive.iter().map(|&idx| (idx, false)))
                 .collect();
             for (idx, responsive) in &all_shares {
+                let existing_created_at = persistence::existing_created_at(
+                    &self.storage,
+                    &group_pubkey,
+                    *idx,
+                );
                 let _ = persistence::persist_health_status(
                     &self.storage,
                     &KeyHealthStatusInfo {
@@ -765,7 +770,7 @@ impl KeepMobile {
                         share_index: *idx,
                         last_check_timestamp: now,
                         responsive: *responsive,
-                        created_at: now,
+                        created_at: existing_created_at.unwrap_or(now),
                         is_stale: false,
                         is_critical: false,
                     },

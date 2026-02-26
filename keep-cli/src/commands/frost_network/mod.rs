@@ -124,8 +124,12 @@ pub fn cmd_frost_network_serve(
                                 move || node.derive_account_xpub(&net)
                             })
                             .await;
-                            match derived {
-                                Ok(Ok((xpub, fingerprint))) => {
+                            let xpub_result = match derived {
+                                Ok(inner) => inner,
+                                Err(e) => Err(keep_frost_net::FrostNetError::Crypto(e.to_string())),
+                            };
+                            match xpub_result {
+                                Ok((xpub, fingerprint)) => {
                                     if let Err(e) = contribute_node
                                         .contribute_descriptor(
                                             session_id,
@@ -137,9 +141,6 @@ pub fn cmd_frost_network_serve(
                                     {
                                         tracing::error!(session, error = %e, "failed to contribute descriptor");
                                     }
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::error!(session, error = %e, "failed to derive xpub for contribution");
                                 }
                                 Err(e) => {
                                     tracing::error!(session, error = %e, "failed to derive xpub for contribution");
@@ -408,7 +409,10 @@ pub fn cmd_frost_network_sign(
         out.info("Starting FROST coordination node...");
         out.field(
             "Node pubkey",
-            &node.pubkey().to_bech32().unwrap_or_default(),
+            &{
+                let pk = node.pubkey();
+                pk.to_bech32().unwrap_or_else(|_| format!("{pk}"))
+            },
         );
         out.newline();
 
@@ -575,26 +579,19 @@ pub fn cmd_frost_network_health_check(
             .unwrap_or_default()
             .as_secs();
 
-        for &idx in &result.responsive {
+        for (&idx, responsive) in result
+            .responsive
+            .iter()
+            .map(|i| (i, true))
+            .chain(result.unresponsive.iter().map(|i| (i, false)))
+        {
             let existing = keep.get_health_status(&group_pubkey, idx)?;
             let created_at = existing.and_then(|s| s.created_at).unwrap_or(now);
             let status = keep_core::wallet::KeyHealthStatus {
                 group_pubkey,
                 share_index: idx,
                 last_check_timestamp: now,
-                responsive: true,
-                created_at: Some(created_at),
-            };
-            keep.store_health_status(&status)?;
-        }
-        for &idx in &result.unresponsive {
-            let existing = keep.get_health_status(&group_pubkey, idx)?;
-            let created_at = existing.and_then(|s| s.created_at).unwrap_or(now);
-            let status = keep_core::wallet::KeyHealthStatus {
-                group_pubkey,
-                share_index: idx,
-                last_check_timestamp: now,
-                responsive: false,
+                responsive,
                 created_at: Some(created_at),
             };
             keep.store_health_status(&status)?;
@@ -617,11 +614,7 @@ pub fn cmd_frost_network_health_check(
             out.header("Health History");
             for s in &group_statuses {
                 let age = now.saturating_sub(s.last_check_timestamp);
-                let status_str = if s.responsive {
-                    "responsive"
-                } else {
-                    "unresponsive"
-                };
+                let status_str = if s.responsive { "responsive" } else { "unresponsive" };
                 let staleness = if s.is_critical(now) {
                     " [CRITICAL]"
                 } else if s.is_stale(now) {
@@ -629,15 +622,7 @@ pub fn cmd_frost_network_health_check(
                 } else {
                     ""
                 };
-                let age_display = if age < 60 {
-                    format!("{age}s ago")
-                } else if age < 3600 {
-                    format!("{}m ago", age / 60)
-                } else if age < 86400 {
-                    format!("{}h ago", age / 3600)
-                } else {
-                    format!("{}d ago", age / 86400)
-                };
+                let age_display = format_duration_ago(age);
                 out.field(
                     &format!("Share {}", s.share_index),
                     &format!("{status_str} ({age_display}){staleness}"),
@@ -649,4 +634,16 @@ pub fn cmd_frost_network_health_check(
     })?;
 
     Ok(())
+}
+
+fn format_duration_ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
