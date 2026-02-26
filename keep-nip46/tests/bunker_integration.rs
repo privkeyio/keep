@@ -166,31 +166,9 @@ async fn test_bunker_e2e_connect_and_sign() {
 
     client.send_event(&sign_event).await.unwrap();
 
-    // Wait for relay to deliver responses
-    let mut request_count = 0;
-    for _ in 0..10 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let apps = server_handler.list_clients().await;
-        if let Some(app) = apps.first() {
-            request_count = app.request_count;
-            if request_count > 0 {
-                break;
-            }
-        }
-    }
-
     // Cleanup
     server_handle.abort();
     client.disconnect().await;
-
-    println!("NIP-46 bunker integration test passed!");
-    println!("  - Server started with bunker URL: {bunker_url}");
-    println!(
-        "  - Client connected successfully ({} clients)",
-        clients.len()
-    );
-    println!("  - get_public_key and sign_event requests sent");
-    println!("  - {request_count} request(s) recorded via relay round-trip");
 }
 
 #[tokio::test]

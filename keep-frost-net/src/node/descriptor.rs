@@ -658,6 +658,11 @@ impl KfpNode {
             .sign_with_keys(&self.keys)
             .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
+        self.client
+            .send_event(&event)
+            .await
+            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
         {
             let mut sessions = self.descriptor_sessions.write();
             let Some(session) = sessions.get_session_mut(&payload.session_id) else {
@@ -671,11 +676,6 @@ impl KfpNode {
                 policy_hash: payload.policy_hash,
             })?;
         }
-
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
             session_id: payload.session_id,
@@ -937,7 +937,9 @@ impl KfpNode {
             const MAX_SEEN_XPUB_ANNOUNCES: usize = 10_000;
             if seen.len() > MAX_SEEN_XPUB_ANNOUNCES {
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
-                let window = self.replay_window_secs + super::MAX_FUTURE_SKEW_SECS;
+                let window = self
+                    .replay_window_secs
+                    .saturating_add(super::MAX_FUTURE_SKEW_SECS);
                 seen.retain(|&(_, ts, _)| now.saturating_sub(window) <= ts);
                 if seen.len() > MAX_SEEN_XPUB_ANNOUNCES {
                     seen.clear();
