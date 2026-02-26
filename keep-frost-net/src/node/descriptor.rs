@@ -70,11 +70,14 @@ impl KfpNode {
             session.set_initiator(self.keys.public_key());
 
             if we_are_contributor {
-                session.add_contribution(
+                if let Err(e) = session.add_contribution(
                     our_index,
                     own_xpub.to_string(),
                     own_fingerprint.to_string(),
-                )?;
+                ) {
+                    sessions.remove_session(&session_id);
+                    return Err(e);
+                }
             }
         }
 
@@ -480,10 +483,20 @@ impl KfpNode {
             }
         }
 
-        {
+        let sender_share_index = {
             let peers = self.peers.read();
-            if peers.get_peer_by_pubkey(&sender).is_none() {
-                return Err(FrostNetError::UntrustedPeer(sender.to_string()));
+            let peer = peers
+                .get_peer_by_pubkey(&sender)
+                .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?;
+            peer.share_index
+        };
+
+        {
+            let proposers = self.descriptor_proposers.read();
+            if !proposers.is_empty() && !proposers.contains(&sender_share_index) {
+                return Err(FrostNetError::Session(format!(
+                    "Share {sender_share_index} is not authorized to propose descriptors"
+                )));
             }
         }
 
@@ -892,9 +905,9 @@ impl KfpNode {
                 return Ok(());
             }
             if seen.len() >= 10_000 {
-                return Err(FrostNetError::Session(
-                    "Too many xpub announcements tracked".into(),
-                ));
+                if let Some(&oldest) = seen.iter().min_by_key(|(_, ts, _)| *ts) {
+                    seen.remove(&oldest);
+                }
             }
             seen.insert(dedup_key);
         }

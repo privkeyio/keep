@@ -417,7 +417,9 @@ impl DescriptorSessionManager {
         );
 
         self.sessions.insert(session_id, session);
-        Ok(self.sessions.get_mut(&session_id).unwrap())
+        self.sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| FrostNetError::Session("Failed to retrieve created session".into()))
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&DescriptorSession> {

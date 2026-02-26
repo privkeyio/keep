@@ -40,7 +40,7 @@ pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"]
 pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
-    let now = chrono::Utc::now().timestamp() as u64;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
     let min_valid = now.saturating_sub(window_secs);
     let max_valid = now.saturating_add(MAX_FUTURE_SKEW_SECS);
     created_at >= min_valid && created_at <= max_valid
@@ -277,11 +277,13 @@ impl KfpMessage {
                 {
                     return Err("Initiator xpub has invalid prefix");
                 }
-                if p.initiator_fingerprint.is_empty() {
-                    return Err("Initiator fingerprint cannot be empty");
-                }
-                if p.initiator_fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                    return Err("Initiator fingerprint exceeds maximum length");
+                if p.initiator_fingerprint.len() != MAX_FINGERPRINT_LENGTH
+                    || !p
+                        .initiator_fingerprint
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err("Initiator fingerprint must be exactly 8 hex characters");
                 }
                 if p.policy.recovery_tiers.is_empty() {
                     return Err("Policy must have at least one recovery tier");
@@ -343,11 +345,10 @@ impl KfpMessage {
                 {
                     return Err("Account xpub has invalid prefix");
                 }
-                if p.fingerprint.is_empty() {
-                    return Err("Fingerprint cannot be empty");
-                }
-                if p.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                    return Err("Fingerprint exceeds maximum length");
+                if p.fingerprint.len() != MAX_FINGERPRINT_LENGTH
+                    || !p.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err("Fingerprint must be exactly 8 hex characters");
                 }
             }
             KfpMessage::DescriptorFinalize(p) => {
@@ -379,8 +380,16 @@ impl KfpMessage {
                     if contrib.account_xpub.len() > MAX_XPUB_LENGTH {
                         return Err("Contribution xpub exceeds maximum length");
                     }
-                    if contrib.fingerprint.len() > MAX_FINGERPRINT_LENGTH {
-                        return Err("Contribution fingerprint exceeds maximum length");
+                    if !VALID_XPUB_PREFIXES
+                        .iter()
+                        .any(|pfx| contrib.account_xpub.starts_with(pfx))
+                    {
+                        return Err("Contribution xpub has invalid prefix");
+                    }
+                    if contrib.fingerprint.len() != MAX_FINGERPRINT_LENGTH
+                        || !contrib.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err("Contribution fingerprint must be exactly 8 hex characters");
                     }
                 }
             }
