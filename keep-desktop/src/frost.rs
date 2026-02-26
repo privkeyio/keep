@@ -16,9 +16,9 @@ use keep_core::Keep;
 
 use crate::app::{
     friendly_err, lock_keep, with_keep_blocking, ActiveCoordination, App, ToastKind,
-    MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL, RATE_LIMIT_PER_PEER,
-    RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_MS,
-    SIGNING_RESPONSE_TIMEOUT,
+    MAX_ACTIVE_COORDINATIONS, MAX_PENDING_REQUESTS, MAX_REQUESTS_PER_PEER, RATE_LIMIT_GLOBAL,
+    RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS,
+    RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
 };
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
 use crate::screen::relay::RelayScreen;
@@ -705,34 +705,45 @@ impl App {
                 );
             }
             FrostNodeMsg::DescriptorReady { session_id } => {
+                let is_initiator = self
+                    .active_coordinations
+                    .get(&session_id)
+                    .is_some_and(|c| c.is_initiator);
+                if !is_initiator {
+                    return iced::Task::none();
+                }
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
-                if self.active_coordinations.contains_key(&session_id) {
-                    let Some(node) = self.get_frost_node() else {
-                        return iced::Task::none();
-                    };
-                    return iced::Task::perform(
-                        async move {
-                            node.build_and_finalize_descriptor(session_id)
-                                .await
-                                .map_err(|e| format!("{e}"))
-                        },
-                        move |result| match result {
-                            Ok(expected_acks) => Message::WalletDescriptorProgress(
-                                DescriptorProgress::WaitingAcks {
-                                    received: 0,
-                                    expected: expected_acks,
-                                },
-                                Some(session_id),
-                            ),
-                            Err(e) => Message::WalletDescriptorProgress(
-                                DescriptorProgress::Failed(e),
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                }
+                let Some(node) = self.get_frost_node() else {
+                    self.active_coordinations.remove(&session_id);
+                    self.update_wallet_setup(&session_id, |setup| {
+                        setup.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
+                            "Node unavailable".to_string(),
+                        ));
+                    });
+                    return iced::Task::none();
+                };
+                return iced::Task::perform(
+                    async move {
+                        node.build_and_finalize_descriptor(session_id)
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    move |result| match result {
+                        Ok(expected_acks) => Message::WalletDescriptorProgress(
+                            DescriptorProgress::WaitingAcks {
+                                received: 0,
+                                expected: expected_acks,
+                            },
+                            Some(session_id),
+                        ),
+                        Err(e) => Message::WalletDescriptorProgress(
+                            DescriptorProgress::Failed(e),
+                            Some(session_id),
+                        ),
+                    },
+                );
             }
             FrostNodeMsg::DescriptorContributed { session_id, .. } => {
                 self.update_wallet_setup(&session_id, |setup| {
@@ -819,11 +830,17 @@ impl App {
             return iced::Task::none();
         }
 
+        if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+            tracing::warn!("Dropping descriptor contribution: too many active coordinations");
+            return iced::Task::none();
+        }
+
         self.active_coordinations.insert(
             session_id,
             ActiveCoordination {
                 group_pubkey: share.group_pubkey,
                 network: network.clone(),
+                is_initiator: false,
             },
         );
 
@@ -926,6 +943,7 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.active_coordinations.clear();
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.frost_node.lock() {
@@ -936,7 +954,6 @@ impl App {
                 let _ = entry.response_tx.try_send(false);
             }
         }
-        self.active_coordinations.clear();
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
             s.peers.clear();

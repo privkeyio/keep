@@ -4384,6 +4384,7 @@ dependencies = [
  "hex",
  "keep-core",
  "keep-frost-net",
+ "nostr-relay-builder",
  "nostr-sdk",
  "rustls",
  "serde",
@@ -4396,6 +4397,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

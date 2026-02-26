@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyRuntimeError, PyValueError, PyConnectionError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use ::keep_agent::{
     RateLimitConfig, SessionConfig, SessionManager, SessionMetadata,
@@ -155,7 +156,7 @@ pub struct PyAgentSession {
     manager: SessionManager,
     token: SessionToken,
     session_id: String,
-    secret_key: Option<[u8; 32]>,
+    secret_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 #[pymethods]
@@ -169,9 +170,9 @@ impl PyAgentSession {
         policy: Option<String>,
         secret_key: Option<String>,
     ) -> PyResult<Self> {
-        let secret_bytes: Option<[u8; 32]> = if let Some(sk) = secret_key {
-            let decoded = hex::decode(&sk)
-                .map_err(|e| PyValueError::new_err(format!("Invalid secret key hex: {}", e)))?;
+        let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(sk) = secret_key {
+            let decoded = Zeroizing::new(hex::decode(&sk)
+                .map_err(|e| PyValueError::new_err(format!("Invalid secret key hex: {}", e)))?);
             if decoded.len() != 32 {
                 return Err(PyValueError::new_err(format!(
                     "Secret key must be 32 bytes, got {}",
@@ -180,14 +181,14 @@ impl PyAgentSession {
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&decoded);
-            Some(arr)
+            Some(Zeroizing::new(arr))
         } else {
             None
         };
 
         let pubkey_bytes: [u8; 32] = if let Some(ref sk) = secret_bytes {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let scalar = k256::NonZeroScalar::try_from(sk.as_slice())
+            let scalar = k256::NonZeroScalar::try_from(sk.as_ref().as_slice())
                 .map_err(|_| PyValueError::new_err("Invalid secret key"))?;
             let pk = k256::PublicKey::from_secret_scalar(&scalar);
             let point = pk.to_encoded_point(true);
@@ -300,14 +301,15 @@ impl PyAgentSession {
         session.check_operation(&Operation::SignNostrEvent).map_err(to_py_err)?;
         session.check_event_kind(kind).map_err(to_py_err)?;
 
-        let secret = self.secret_key
+        let secret = self.secret_key.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?;
 
         self.manager.record_request(&self.session_id).map_err(to_py_err)?;
 
         use nostr_sdk::prelude::*;
 
-        let keys = Keys::parse(&hex::encode(secret))
+        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let keys = Keys::parse(hex.as_str())
             .map_err(to_py_value_err)?;
 
         let mut nostr_tags: Vec<Tag> = Vec::new();
@@ -358,8 +360,8 @@ impl PyAgentSession {
 
         session.check_operation(&Operation::SignPsbt).map_err(to_py_err)?;
 
-        let mut secret = self.secret_key
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?;
+        let mut secret = Zeroizing::new(*self.secret_key.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?);
 
         let network = match network.unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -371,7 +373,7 @@ impl PyAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
             .map_err(|e| PyValueError::new_err(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(to_py_err)?;
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
@@ -408,7 +410,7 @@ impl PyAgentSession {
     }
 
     fn get_public_key(&self) -> PyResult<String> {
-        let _ = self.secret_key
+        let _ = self.secret_key.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No secret key configured"))?;
 
         let session = self.manager
@@ -429,8 +431,8 @@ impl PyAgentSession {
 
         session.check_operation(&Operation::GetBitcoinAddress).map_err(to_py_err)?;
 
-        let mut secret = self.secret_key
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?;
+        let mut secret = Zeroizing::new(*self.secret_key.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?);
 
         let network = match network.unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -439,7 +441,7 @@ impl PyAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(to_py_err)?;
 
         signer.get_receive_address(0).map_err(to_py_err)
@@ -521,6 +523,14 @@ impl PyRemoteSession {
         self.runtime.block_on(async {
             let c = client.lock().await;
             c.ping().await
+        }).map_err(to_py_err)
+    }
+
+    fn switch_relays(&self) -> PyResult<Option<Vec<String>>> {
+        let client = self.client.clone();
+        self.runtime.block_on(async {
+            let mut c = client.lock().await;
+            c.switch_relays().await
         }).map_err(to_py_err)
     }
 

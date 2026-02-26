@@ -7,6 +7,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use keep_agent::{
     AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
@@ -53,7 +54,7 @@ pub struct KeepAgentSession {
     manager: SessionManager,
     token: Arc<Mutex<SessionToken>>,
     session_id: String,
-    secret_key: Option<[u8; 32]>,
+    secret_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 #[napi]
@@ -66,9 +67,9 @@ impl KeepAgentSession {
         policy: Option<String>,
         secret_key: Option<String>,
     ) -> Result<Self> {
-        let secret_bytes: Option<[u8; 32]> = if let Some(ref sk) = secret_key {
-            let decoded = hex::decode(sk)
-                .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?;
+        let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(ref sk) = secret_key {
+            let decoded = Zeroizing::new(hex::decode(sk)
+                .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?);
             if decoded.len() != 32 {
                 return Err(Error::from_reason(format!(
                     "Secret key must be 32 bytes, got {}",
@@ -77,14 +78,14 @@ impl KeepAgentSession {
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&decoded);
-            Some(arr)
+            Some(Zeroizing::new(arr))
         } else {
             None
         };
 
         let pubkey: [u8; 32] = if let Some(ref sk) = secret_bytes {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let scalar = k256::NonZeroScalar::try_from(sk.as_slice())
+            let scalar = k256::NonZeroScalar::try_from(sk.as_ref().as_slice())
                 .map_err(|_| Error::from_reason("Invalid secret key"))?;
             let pk = k256::PublicKey::from_secret_scalar(&scalar);
             let point = pk.to_encoded_point(true);
@@ -304,6 +305,7 @@ impl KeepAgentSession {
 
         let secret = self
             .secret_key
+            .as_ref()
             .ok_or_else(|| Error::from_reason("No secret key configured"))?;
 
         self.manager
@@ -312,7 +314,8 @@ impl KeepAgentSession {
 
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
 
-        let keys = Keys::parse(&hex::encode(secret))
+        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let keys = Keys::parse(hex.as_str())
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         let nostr_tags: Vec<Tag> = tags
@@ -365,9 +368,10 @@ impl KeepAgentSession {
             .check_operation(&Operation::SignPsbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = self
+        let mut secret = Zeroizing::new(*self
             .secret_key
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?;
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -379,7 +383,7 @@ impl KeepAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(&psbt_base64)
             .map_err(|e| Error::from_reason(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let analysis = signer
@@ -414,9 +418,7 @@ impl KeepAgentSession {
             .record_request(&self.session_id)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        signer
-            .sign_psbt(&mut psbt)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        signer.sign_psbt(&mut psbt).map_err(|e| Error::from_reason(e.to_string()))?;
 
         Ok(keep_bitcoin::psbt::serialize_psbt_base64(&psbt))
     }
@@ -449,9 +451,10 @@ impl KeepAgentSession {
             .check_operation(&Operation::GetBitcoinAddress)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = self
+        let mut secret = Zeroizing::new(*self
             .secret_key
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?;
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -460,7 +463,7 @@ impl KeepAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         signer
@@ -530,6 +533,15 @@ impl RemoteSession {
         let client = self.client.lock().await;
         client
             .ping()
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub async fn switch_relays(&self) -> Result<Option<Vec<String>>> {
+        let mut client = self.client.lock().await;
+        client
+            .switch_relays()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))
     }

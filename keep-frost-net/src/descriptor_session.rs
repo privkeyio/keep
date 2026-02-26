@@ -8,6 +8,7 @@ use keep_bitcoin::recovery::{RecoveryConfig, RecoveryTier as BitcoinRecoveryTier
 use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
 use nostr_sdk::PublicKey;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
@@ -241,12 +242,13 @@ impl DescriptorSession {
         Ok(())
     }
 
+    /// Returns `Ok(true)` when the ack was new, `Ok(false)` for duplicates.
     pub fn add_ack(
         &mut self,
         share_index: u16,
         descriptor_hash: [u8; 32],
         key_proof_psbt: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.state != DescriptorSessionState::Finalized {
             return Err(FrostNetError::Session("Not accepting ACKs".into()));
         }
@@ -258,7 +260,7 @@ impl DescriptorSession {
         }
 
         if self.acks.contains(&share_index) {
-            return Ok(());
+            return Ok(false);
         }
 
         let finalized = self
@@ -272,7 +274,7 @@ impl DescriptorSession {
         hasher.update(finalized.policy_hash);
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
-        if descriptor_hash != expected_hash {
+        if !bool::from(descriptor_hash.ct_eq(&expected_hash)) {
             return Err(FrostNetError::Session("Descriptor hash mismatch".into()));
         }
 
@@ -295,7 +297,7 @@ impl DescriptorSession {
             self.state = DescriptorSessionState::Complete;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn has_all_acks(&self) -> bool {

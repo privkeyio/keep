@@ -7,6 +7,7 @@ use std::sync::Arc;
 use nostr_sdk::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 use keep_core::error::{CryptoError, KeepError, NetworkError, StorageError};
 use keep_core::keyring::Keyring;
@@ -51,7 +52,7 @@ pub struct Server {
     running: bool,
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     config: ServerConfig,
-    bunker_secret: Option<String>,
+    bunker_secret: Option<Zeroizing<String>>,
 }
 
 async fn add_relays(client: &Client, relay_urls: &[String]) -> Result<()> {
@@ -75,7 +76,7 @@ fn finalize_handler(
     mut handler: SignerHandler,
     config: &ServerConfig,
     relay_urls: &[String],
-) -> (SignerHandler, Option<String>) {
+) -> (SignerHandler, Option<Zeroizing<String>>) {
     handler = handler.with_relay_urls(relay_urls.to_vec());
     if let Some(ref rl_config) = config.rate_limit {
         handler = handler.with_rate_limit(rl_config.clone());
@@ -87,7 +88,7 @@ fn finalize_handler(
         let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
         warn!("headless mode: bunker secret required for authentication");
         handler = handler.with_expected_secret(secret.clone());
-        Some(secret)
+        Some(Zeroizing::new(secret))
     } else if let Some(ref secret) = config.expected_secret {
         handler = handler.with_expected_secret(secret.clone());
         None
@@ -105,7 +106,7 @@ impl Server {
         handler: SignerHandler,
         callbacks: Option<Arc<dyn ServerCallbacks>>,
         config: ServerConfig,
-        bunker_secret: Option<String>,
+        bunker_secret: Option<Zeroizing<String>>,
     ) -> Self {
         Self {
             keys,
@@ -339,7 +340,7 @@ impl Server {
         generate_bunker_url(
             &self.keys.public_key(),
             &self.relay_urls,
-            self.bunker_secret.as_deref(),
+            self.bunker_secret.as_ref().map(|s| s.as_str()),
         )
     }
 
@@ -460,6 +461,11 @@ impl Server {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(KeepError::InvalidInput("invalid request ID".into()));
+        }
+
+        const MAX_NIP46_PARAMS: usize = 10;
+        if request.params.len() > MAX_NIP46_PARAMS {
+            return Err(KeepError::InvalidInput("too many request params".into()));
         }
 
         debug!(method = %request.method, app_id, "NIP-46 request");

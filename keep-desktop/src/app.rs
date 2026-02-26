@@ -83,6 +83,7 @@ pub(crate) const RECONNECT_MAX_MS: u64 = 30_000;
 pub(crate) const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 pub(crate) const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
+pub(crate) const MAX_ACTIVE_COORDINATIONS: usize = 64;
 
 const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
 
@@ -108,6 +109,7 @@ pub struct Toast {
 pub(crate) struct ActiveCoordination {
     pub group_pubkey: [u8; 32],
     pub network: String,
+    pub is_initiator: bool,
 }
 
 pub struct App {
@@ -1306,20 +1308,40 @@ impl App {
             Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
             Message::WalletSessionStarted(result) => {
                 match result {
-                    Ok((session_id, group_pubkey, network)) => {
-                        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
-                            &mut self.screen
-                        {
+                    Ok((session_id, group_pubkey, network, _expected_participants)) => {
+                        let on_wallet_screen = matches!(
+                            self.screen,
+                            Screen::Wallet(WalletScreen { setup: Some(_), .. })
+                        );
+                        if !on_wallet_screen {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                        } else if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
+                                s.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
+                                    "Too many active coordinations".to_string(),
+                                ));
+                            }
+                        } else {
                             self.active_coordinations.insert(
                                 session_id,
                                 ActiveCoordination {
                                     group_pubkey,
                                     network,
+                                    is_initiator: true,
                                 },
                             );
-                            s.session_id = Some(session_id);
-                        } else if let Some(node) = self.get_frost_node() {
-                            node.cancel_descriptor_session(&session_id);
+                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
+                                s.session_id = Some(session_id);
+                            }
                         }
                     }
                     Err(e) => {
@@ -1472,7 +1494,12 @@ impl App {
                     .await
                     .map_err(|e| format!("{e}"))?;
 
-                Ok::<([u8; 32], [u8; 32], String), String>((session_id, group_pubkey, net))
+                Ok::<([u8; 32], [u8; 32], String, usize), String>((
+                    session_id,
+                    group_pubkey,
+                    net,
+                    expected_total,
+                ))
             },
             Message::WalletSessionStarted,
         )
