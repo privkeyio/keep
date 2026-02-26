@@ -701,6 +701,16 @@ impl App {
                 self.update_wallet_setup(&session_id, |setup| {
                     setup.phase = SetupPhase::Coordinating(DescriptorProgress::Finalizing);
                 });
+                if let Some(node) = self.get_frost_node() {
+                    return iced::Task::perform(
+                        async move {
+                            node.build_and_finalize_descriptor(session_id)
+                                .await
+                                .map_err(|e| format!("{e}"))
+                        },
+                        move |result| Message::WalletFinalizeResult(result, session_id),
+                    );
+                }
             }
             FrostNodeMsg::DescriptorContributed { session_id, .. } => {
                 self.update_wallet_setup(&session_id, |setup| {
@@ -899,6 +909,7 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.active_coordinations.clear();
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.frost_node.lock() {

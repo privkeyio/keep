@@ -1064,8 +1064,7 @@ fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
     let key_package = share
         .key_package()
         .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
-    let signing_share = key_package.signing_share();
-    let signing_share_bytes = signing_share.serialize();
+    let signing_share_bytes = key_package.signing_share().serialize();
 
     let mut hasher = Sha256::new();
     hasher.update(b"keep-frost-node-identity-v2");
