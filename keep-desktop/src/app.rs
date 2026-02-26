@@ -351,7 +351,12 @@ fn load_bunker_relays(keep_path: &std::path::Path) -> Vec<String> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(default_bunker_relays);
-    filter_valid_relays(urls)
+    let valid = filter_valid_relays(urls);
+    if valid.is_empty() {
+        default_bunker_relays()
+    } else {
+        valid
+    }
 }
 
 fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
@@ -360,7 +365,14 @@ fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
     {
-        Some(urls) => filter_valid_relays(urls),
+        Some(urls) => {
+            let valid = filter_valid_relays(urls);
+            if valid.is_empty() {
+                load_bunker_relays(keep_path)
+            } else {
+                valid
+            }
+        }
         None => load_bunker_relays(keep_path),
     }
 }

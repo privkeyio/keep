@@ -491,6 +491,7 @@ mod tests {
         assert!(is_internal_ip(&"::1".parse::<IpAddr>().unwrap()));
         assert!(is_internal_ip(&"fc00::1".parse::<IpAddr>().unwrap()));
         assert!(is_internal_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(is_internal_ip(&"fec0::1".parse::<IpAddr>().unwrap()));
         assert!(is_internal_ip(
             &"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
         ));
