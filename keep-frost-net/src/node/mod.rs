@@ -391,10 +391,20 @@ impl KfpNode {
             None => Client::new(keys.clone()),
         };
 
+        let relay_opts = RelayOptions::default()
+            .reconnect(true)
+            .ping(true)
+            .retry_interval(Duration::from_secs(10))
+            .adjust_retry_interval(true);
+
         for relay in &relays {
-            client.add_relay(relay).await.map_err(|e| {
-                FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
-            })?;
+            client
+                .pool()
+                .add_relay(relay, relay_opts.clone())
+                .await
+                .map_err(|e| {
+                    FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
+                })?;
         }
 
         client.connect().await;

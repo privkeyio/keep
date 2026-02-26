@@ -6,6 +6,8 @@ use crate::error::{FrostNetError, Result};
 use crate::proof;
 use crate::protocol::*;
 
+pub(crate) const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
+
 pub struct KfpEventBuilder;
 
 impl KfpEventBuilder {
@@ -62,6 +64,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -88,6 +91,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -110,6 +114,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -132,6 +137,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -151,6 +157,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["ping"]))
             .sign_with_keys(keys)
@@ -169,6 +176,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["pong"]))
             .sign_with_keys(keys)
@@ -194,6 +202,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         let mut builder = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("t"), ["error"]));
 
@@ -218,6 +227,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -244,6 +254,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("s"),
@@ -267,6 +278,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
             .tag(Tag::custom(TagKind::custom("t"), ["ecdh_complete"]))
@@ -287,6 +299,7 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),

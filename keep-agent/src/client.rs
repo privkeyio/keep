@@ -30,8 +30,15 @@ impl PendingSession {
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
 
+        let relay_opts = RelayOptions::default()
+            .reconnect(true)
+            .ping(true)
+            .retry_interval(Duration::from_secs(10))
+            .adjust_retry_interval(true);
+
         client
-            .add_relay(&relay_url)
+            .pool()
+            .add_relay(&relay_url, relay_opts)
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -98,7 +105,7 @@ impl PendingSession {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::now(),
+            Timestamp::tweaked(0..5),
             Kind::NostrConnect,
             tags,
             encrypted,
@@ -125,37 +132,33 @@ impl PendingSession {
             .pubkey(self.client_keys.public_key())
             .since(Timestamp::now());
 
-        let sub_output = self
+        let mut stream = self
             .client
-            .subscribe(filter, None)
+            .pool()
+            .stream_events(filter, timeout, ReqExitPolicy::WaitForEventsAfterEOSE(1))
             .await
             .map_err(|e| AgentError::Nostr(e.to_string()))?;
 
-        let sub_id = sub_output.id();
-        let mut notifications = self.client.notifications();
-
         let result = tokio::time::timeout(timeout, async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
-                        if let Ok(decrypted) = nip44::decrypt(
-                            self.client_keys.secret_key(),
-                            &self.signer_pubkey,
-                            &event.content,
-                        ) {
-                            let parsed: serde_json::Value = serde_json::from_str(&decrypted)
-                                .map_err(|e| AgentError::Serialization(e.to_string()))?;
+            while let Some(event) = stream.next().await {
+                if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
+                    if let Ok(decrypted) = nip44::decrypt(
+                        self.client_keys.secret_key(),
+                        &self.signer_pubkey,
+                        &event.content,
+                    ) {
+                        let parsed: serde_json::Value = serde_json::from_str(&decrypted)
+                            .map_err(|e| AgentError::Serialization(e.to_string()))?;
 
-                            if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
-                                if id == self.request_id {
-                                    if let Some(error) = parsed.get("error") {
-                                        if !error.is_null() {
-                                            return Ok(ApprovalStatus::Denied);
-                                        }
+                        if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
+                            if id == self.request_id {
+                                if let Some(error) = parsed.get("error") {
+                                    if !error.is_null() {
+                                        return Ok(ApprovalStatus::Denied);
                                     }
-                                    if parsed.get("result").is_some() {
-                                        return Ok(ApprovalStatus::Approved);
-                                    }
+                                }
+                                if parsed.get("result").is_some() {
+                                    return Ok(ApprovalStatus::Approved);
                                 }
                             }
                         }
@@ -165,8 +168,6 @@ impl PendingSession {
             Ok(ApprovalStatus::Pending)
         })
         .await;
-
-        self.client.unsubscribe(sub_id).await;
 
         match result {
             Ok(inner) => inner,
@@ -219,8 +220,15 @@ impl AgentClient {
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
 
+        let relay_opts = RelayOptions::default()
+            .reconnect(true)
+            .ping(true)
+            .retry_interval(Duration::from_secs(10))
+            .adjust_retry_interval(true);
+
         client
-            .add_relay(&relay_url)
+            .pool()
+            .add_relay(&relay_url, relay_opts)
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -438,9 +446,20 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
+        let relay_opts = RelayOptions::default()
+            .reconnect(true)
+            .ping(true)
+            .retry_interval(Duration::from_secs(10))
+            .adjust_retry_interval(true);
         let mut added = Vec::new();
         for relay in &valid_relays {
-            if self.client.add_relay(relay).await.is_ok() {
+            if self
+                .client
+                .pool()
+                .add_relay(relay, relay_opts.clone())
+                .await
+                .is_ok()
+            {
                 added.push(relay.clone());
             }
         }
@@ -477,7 +496,7 @@ impl AgentClient {
         let tags = vec![Tag::public_key(self.signer_pubkey)];
         let unsigned = UnsignedEvent::new(
             self.client_keys.public_key(),
-            Timestamp::now(),
+            Timestamp::tweaked(0..5),
             Kind::NostrConnect,
             tags,
             encrypted,
@@ -498,44 +517,40 @@ impl AgentClient {
             .pubkey(self.client_keys.public_key())
             .since(Timestamp::now());
 
-        let sub_output = self
+        let mut stream = self
             .client
-            .subscribe(filter, None)
+            .pool()
+            .stream_events(
+                filter,
+                Duration::from_secs(30),
+                ReqExitPolicy::WaitForEventsAfterEOSE(5),
+            )
             .await
             .map_err(|e| AgentError::Nostr(e.to_string()))?;
 
-        let sub_id = sub_output.id();
-        let mut notifications = self.client.notifications();
-
         let result = tokio::time::timeout(Duration::from_secs(30), async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
-                        if let Ok(decrypted) = nip44::decrypt(
-                            self.client_keys.secret_key(),
-                            &self.signer_pubkey,
-                            &event.content,
-                        ) {
-                            if let Some(ref expected_id) = request_id {
-                                if let Ok(resp) =
-                                    serde_json::from_str::<serde_json::Value>(&decrypted)
-                                {
-                                    if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id)
-                                    {
-                                        continue;
-                                    }
+            while let Some(event) = stream.next().await {
+                if event.kind == Kind::NostrConnect && event.pubkey == self.signer_pubkey {
+                    if let Ok(decrypted) = nip44::decrypt(
+                        self.client_keys.secret_key(),
+                        &self.signer_pubkey,
+                        &event.content,
+                    ) {
+                        if let Some(ref expected_id) = request_id {
+                            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&decrypted)
+                            {
+                                if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
+                                    continue;
                                 }
                             }
-                            return Ok(decrypted);
                         }
+                        return Ok(decrypted);
                     }
                 }
             }
             Err(AgentError::Connection("No response received".into()))
         })
         .await;
-
-        self.client.unsubscribe(sub_id).await;
 
         match result {
             Ok(inner) => inner,

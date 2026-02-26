@@ -13,6 +13,7 @@ use crate::descriptor_session::{
     FinalizedDescriptor,
 };
 use crate::error::{FrostNetError, Result};
+use crate::event::TIMESTAMP_TWEAK_RANGE;
 use crate::protocol::*;
 
 use super::{KfpNode, KfpNodeEvent};
@@ -128,6 +129,7 @@ impl KfpNode {
                     .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
             let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
                 .tag(Tag::public_key(*pubkey))
                 .tag(Tag::custom(
                     TagKind::custom("g"),
@@ -327,6 +329,7 @@ impl KfpNode {
         .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*initiator_pubkey))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -455,6 +458,7 @@ impl KfpNode {
                     .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
             let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
                 .tag(Tag::public_key(*pubkey))
                 .tag(Tag::custom(
                     TagKind::custom("g"),
@@ -645,6 +649,7 @@ impl KfpNode {
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
         let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(sender))
             .tag(Tag::custom(
                 TagKind::custom("g"),
@@ -713,6 +718,7 @@ impl KfpNode {
             };
 
         let event = match EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(*recipient))
             .tag(Tag::custom(
                 TagKind::custom("g"),

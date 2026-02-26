@@ -56,9 +56,16 @@ pub struct Server {
 }
 
 async fn add_relays(client: &Client, relay_urls: &[String]) -> Result<()> {
+    let opts = nostr_sdk::RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(std::time::Duration::from_secs(10))
+        .adjust_retry_interval(true);
+
     for relay_url in relay_urls {
         client
-            .add_relay(relay_url)
+            .pool()
+            .add_relay(relay_url, opts.clone())
             .await
             .map_err(|e| NetworkError::relay(e.to_string()))?;
     }
@@ -506,6 +513,7 @@ impl Server {
         .map_err(|e| CryptoError::encryption(e.to_string()))?;
 
         let response_event = EventBuilder::new(Kind::NostrConnect, encrypted)
+            .custom_created_at(Timestamp::tweaked(0..5))
             .tag(Tag::public_key(app_pubkey))
             .sign_with_keys(keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
