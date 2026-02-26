@@ -12,12 +12,29 @@ use sha2::{Digest, Sha256};
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
     KeySlot, WalletPolicy, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
-    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
-    MAX_XPUB_LENGTH,
+    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
 };
 
 const MAX_SESSIONS: usize = 64;
 const REAP_GRACE_SECS: u64 = 60;
+
+fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
+    let max = Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS);
+    if timeout.is_zero() {
+        return Err(FrostNetError::Session(
+            "Session timeout must be greater than zero".into(),
+        ));
+    }
+    if timeout > max {
+        return Err(FrostNetError::Session(format!(
+            "Session timeout {}s exceeds maximum {}s",
+            timeout.as_secs(),
+            max.as_secs()
+        )));
+    }
+    Ok(timeout)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorSessionState {
@@ -378,18 +395,18 @@ impl DescriptorSessionManager {
         }
     }
 
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self {
+    pub fn with_timeout(timeout: Duration) -> Result<Self> {
+        let validated = validate_session_timeout(timeout)?;
+        Ok(Self {
             sessions: HashMap::new(),
-            default_timeout: timeout,
-        }
+            default_timeout: validated,
+        })
     }
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &mut self,
         session_id: [u8; 32],
@@ -398,6 +415,28 @@ impl DescriptorSessionManager {
         network: String,
         expected_contributors: HashSet<u16>,
         expected_acks: HashSet<u16>,
+    ) -> Result<&mut DescriptorSession> {
+        self.create_session_with_timeout(
+            session_id,
+            group_pubkey,
+            policy,
+            network,
+            expected_contributors,
+            expected_acks,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_timeout(
+        &mut self,
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        policy: WalletPolicy,
+        network: String,
+        expected_contributors: HashSet<u16>,
+        expected_acks: HashSet<u16>,
+        timeout: Option<Duration>,
     ) -> Result<&mut DescriptorSession> {
         if let Some(existing) = self.sessions.get(&session_id) {
             if !existing.is_expired() {
@@ -408,7 +447,7 @@ impl DescriptorSessionManager {
             self.sessions.remove(&session_id);
         }
 
-        let _ = self.cleanup_expired();
+        self.cleanup_expired();
 
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(FrostNetError::Session(
@@ -416,6 +455,10 @@ impl DescriptorSessionManager {
             ));
         }
 
+        let effective_timeout = timeout
+            .map(validate_session_timeout)
+            .transpose()?
+            .unwrap_or(self.default_timeout);
         let session = DescriptorSession::new(
             session_id,
             group_pubkey,
@@ -423,13 +466,11 @@ impl DescriptorSessionManager {
             network,
             expected_contributors,
             expected_acks,
-            self.default_timeout,
+            effective_timeout,
         );
 
         self.sessions.insert(session_id, session);
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| FrostNetError::Session("Failed to retrieve created session".into()))
+        Ok(self.sessions.get_mut(&session_id).unwrap())
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&DescriptorSession> {
@@ -1017,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_session_manager_cleanup_expired() {
-        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_millis(1));
+        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_millis(1)).unwrap();
         let policy = test_policy();
 
         manager
@@ -1196,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_returns_phase_reasons() {
-        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_secs(600));
+        let mut manager = DescriptorSessionManager::with_timeout(Duration::from_secs(600)).unwrap();
         let policy = test_policy();
 
         {

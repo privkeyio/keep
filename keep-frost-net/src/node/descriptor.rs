@@ -25,6 +25,18 @@ impl KfpNode {
         own_xpub: &str,
         own_fingerprint: &str,
     ) -> Result<[u8; 32]> {
+        self.request_descriptor_with_timeout(policy, network, own_xpub, own_fingerprint, None)
+            .await
+    }
+
+    pub async fn request_descriptor_with_timeout(
+        &self,
+        policy: WalletPolicy,
+        network: &str,
+        own_xpub: &str,
+        own_fingerprint: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<[u8; 32]> {
         if !VALID_NETWORKS.contains(&network) {
             return Err(FrostNetError::Session(format!(
                 "Invalid network: {network}"
@@ -50,15 +62,18 @@ impl KfpNode {
                 .collect()
         };
 
+        let session_timeout = timeout_secs.map(std::time::Duration::from_secs);
+
         {
             let mut sessions = self.descriptor_sessions.write();
-            let session = sessions.create_session(
+            let session = sessions.create_session_with_timeout(
                 session_id,
                 self.group_pubkey,
                 policy.clone(),
                 network.to_string(),
                 expected_contributors,
                 expected_acks,
+                session_timeout,
             )?;
             session.set_initiator(self.keys.public_key());
 
@@ -74,7 +89,7 @@ impl KfpNode {
             }
         }
 
-        let payload = DescriptorProposePayload::new(
+        let mut payload = DescriptorProposePayload::new(
             session_id,
             self.group_pubkey,
             created_at,
@@ -83,6 +98,9 @@ impl KfpNode {
             own_xpub,
             own_fingerprint,
         );
+        if let Some(t) = timeout_secs {
+            payload = payload.with_timeout(t);
+        }
 
         let msg = KfpMessage::DescriptorPropose(payload);
         let json = msg.to_json()?;
@@ -184,15 +202,28 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
+        let propose_timeout = match payload.timeout_secs {
+            None => None,
+            Some(t) if t > 0 && t <= DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS => {
+                Some(std::time::Duration::from_secs(t))
+            }
+            Some(t) => {
+                return Err(FrostNetError::Session(format!(
+                    "Invalid proposal timeout {t}s, must be 1..={DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS}"
+                )));
+            }
+        };
+
         let session_created = {
             let mut sessions = self.descriptor_sessions.write();
-            match sessions.create_session(
+            match sessions.create_session_with_timeout(
                 payload.session_id,
                 self.group_pubkey,
                 payload.policy.clone(),
                 payload.network.clone(),
                 expected_contributors,
                 HashSet::new(),
+                propose_timeout,
             ) {
                 Ok(session) => {
                     session.set_initiator(sender);
@@ -206,8 +237,8 @@ impl KfpNode {
                     }
                     true
                 }
-                Err(_) => {
-                    debug!("Descriptor session already exists, ignoring duplicate proposal");
+                Err(e) => {
+                    debug!("Descriptor session creation failed: {e}");
                     false
                 }
             }

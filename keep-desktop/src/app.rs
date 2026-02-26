@@ -1355,9 +1355,10 @@ impl App {
                     self.update_wallet_setup(&sid, |setup| {
                         setup.phase = SetupPhase::Coordinating(progress);
                     });
-                } else if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen
-                {
-                    s.phase = SetupPhase::Coordinating(progress);
+                } else if matches!(progress, DescriptorProgress::Contributed) {
+                    if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+                        s.phase = SetupPhase::Coordinating(progress);
+                    }
                 }
                 Task::none()
             }

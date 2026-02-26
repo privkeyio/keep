@@ -25,6 +25,7 @@ pub const MIN_XPUB_LENGTH: usize = 111;
 pub const MAX_XPUB_LENGTH: usize = 256;
 pub const MAX_FINGERPRINT_LENGTH: usize = 8;
 pub const DESCRIPTOR_SESSION_TIMEOUT_SECS: u64 = 600;
+pub const DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS: u64 = 86400;
 pub const DESCRIPTOR_ACK_TIMEOUT_SECS: u64 = 60;
 pub const DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS: u64 = 300;
 pub const DESCRIPTOR_FINALIZE_TIMEOUT_SECS: u64 = 120;
@@ -272,6 +273,14 @@ impl KfpMessage {
                 }
             }
             KfpMessage::DescriptorPropose(p) => {
+                if let Some(t) = p.timeout_secs {
+                    if t == 0 {
+                        return Err("timeout_secs must be greater than zero");
+                    }
+                    if t > DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
+                        return Err("timeout_secs exceeds maximum allowed value");
+                    }
+                }
                 if !VALID_NETWORKS.contains(&p.network.as_str()) {
                     return Err("Invalid network value");
                 }
@@ -962,6 +971,8 @@ pub struct DescriptorProposePayload {
     pub policy: WalletPolicy,
     pub initiator_xpub: String,
     pub initiator_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl DescriptorProposePayload {
@@ -982,7 +993,13 @@ impl DescriptorProposePayload {
             policy,
             initiator_xpub: initiator_xpub.to_string(),
             initiator_fingerprint: initiator_fingerprint.to_string(),
+            timeout_secs: None,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {

@@ -665,6 +665,43 @@ impl Keep {
         self.storage.delete_descriptor(group_pubkey)
     }
 
+    /// Store a key health status record.
+    pub fn store_health_status(&self, status: &wallet::KeyHealthStatus) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.store_health_status(status)
+    }
+
+    /// Get a key health status record.
+    pub fn get_health_status(
+        &self,
+        group_pubkey: &[u8; 32],
+        share_index: u16,
+    ) -> Result<Option<wallet::KeyHealthStatus>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_health_status(group_pubkey, share_index)
+    }
+
+    /// List all key health status records.
+    pub fn list_health_statuses(&self) -> Result<Vec<wallet::KeyHealthStatus>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_health_statuses()
+    }
+
+    /// List health statuses that are stale (not checked within the threshold).
+    pub fn list_stale_health_statuses(&self, now: u64) -> Result<Vec<wallet::KeyHealthStatus>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let all = self.storage.list_health_statuses()?;
+        Ok(all.into_iter().filter(|s| s.is_stale(now)).collect())
+    }
+
     /// Store relay configuration for a FROST share.
     pub fn store_relay_config(&self, config: &RelayConfig) -> Result<()> {
         if !self.is_unlocked() {

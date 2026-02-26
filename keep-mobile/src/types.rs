@@ -113,3 +113,14 @@ pub struct AnnouncedXpubInfo {
     pub fingerprint: String,
     pub label: Option<String>,
 }
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct KeyHealthStatusInfo {
+    pub group_pubkey: String,
+    pub share_index: u16,
+    pub last_check_timestamp: u64,
+    pub responsive: bool,
+    pub created_at: u64,
+    pub is_stale: bool,
+    pub is_critical: bool,
+}

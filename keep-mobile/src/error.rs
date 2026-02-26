@@ -74,6 +74,9 @@ pub enum KeepMobileError {
     #[error("Policy signature verification failed")]
     PolicySignatureInvalid,
 
+    #[error("Invalid input: {msg}")]
+    InvalidInput { msg: String },
+
     #[error("Certificate pin mismatch")]
     CertificatePinMismatch {
         hostname: String,

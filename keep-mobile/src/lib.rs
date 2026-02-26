@@ -29,8 +29,8 @@ pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
     AnnouncedXpubInfo, DescriptorProposal, DkgConfig, DkgStatus, FrostGenerationResult,
-    GeneratedShareInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata,
-    ThresholdConfig, WalletDescriptorInfo,
+    GeneratedShareInfo, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
+    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
 use keep_core::frost::{
@@ -80,6 +80,8 @@ const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
 const CERT_PINS_STORAGE_KEY: &str = "__keep_cert_pins_v1";
 const DESCRIPTOR_INDEX_KEY: &str = "__keep_descriptor_index_v1";
 const DESCRIPTOR_KEY_PREFIX: &str = "__keep_descriptor_";
+const HEALTH_STATUS_INDEX_KEY: &str = "__keep_health_index_v1";
+const HEALTH_STATUS_KEY_PREFIX: &str = "__keep_health_";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -93,6 +95,15 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Vec<u8>,
     pubkey_package_bytes: Vec<u8>,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait HealthCallbacks: Send + Sync {
+    fn on_health_check_complete(
+        &self,
+        responsive: Vec<u16>,
+        unresponsive: Vec<u16>,
+    ) -> Result<(), KeepMobileError>;
 }
 
 #[uniffi::export(with_foreign)]
@@ -170,6 +181,7 @@ pub struct KeepMobile {
     policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
     velocity: Arc<std::sync::Mutex<VelocityTracker>>,
     descriptor_callbacks: Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
+    health_callbacks: Arc<RwLock<Option<Arc<dyn HealthCallbacks>>>>,
     descriptor_networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
 }
@@ -239,6 +251,7 @@ impl KeepMobile {
             policy,
             velocity,
             descriptor_callbacks: Arc::new(RwLock::new(None)),
+            health_callbacks: Arc::new(RwLock::new(None)),
             descriptor_networks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -709,38 +722,138 @@ impl KeepMobile {
         });
     }
 
+    pub fn set_health_callbacks(&self, callbacks: Arc<dyn HealthCallbacks>) {
+        self.runtime.block_on(async {
+            *self.health_callbacks.write().await = Some(callbacks);
+        });
+    }
+
+    pub fn health_check(&self, timeout_secs: u64) -> Result<Vec<u16>, KeepMobileError> {
+        if timeout_secs == 0 || timeout_secs > 300 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("timeout_secs must be between 1 and 300, got {timeout_secs}"),
+            });
+        }
+        self.runtime.block_on(async {
+            let (group_pubkey, result) = {
+                let node_guard = self.node.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                let gp = hex::encode(node.group_pubkey());
+                let r = node
+                    .health_check(Duration::from_secs(timeout_secs))
+                    .await
+                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                (gp, r)
+            };
+
+            if let Some(cb) = self.health_callbacks.read().await.as_ref() {
+                if let Err(e) = cb.on_health_check_complete(
+                    result.responsive.clone(),
+                    result.unresponsive.clone(),
+                ) {
+                    tracing::warn!("Health check callback failed: {e}");
+                }
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            for (idx, responsive) in result
+                .responsive
+                .iter()
+                .map(|&idx| (idx, true))
+                .chain(result.unresponsive.iter().map(|&idx| (idx, false)))
+            {
+                let existing_created_at =
+                    persistence::existing_created_at(&self.storage, &group_pubkey, idx);
+                if let Err(e) = persistence::persist_health_status(
+                    &self.storage,
+                    &KeyHealthStatusInfo {
+                        group_pubkey: group_pubkey.clone(),
+                        share_index: idx,
+                        last_check_timestamp: now,
+                        responsive,
+                        created_at: existing_created_at.unwrap_or(now),
+                        is_stale: false,
+                        is_critical: false,
+                    },
+                ) {
+                    tracing::warn!(
+                        group_pubkey = %group_pubkey,
+                        share_index = %idx,
+                        error = %e,
+                        "Failed to persist health status"
+                    );
+                }
+            }
+
+            Ok(result.responsive)
+        })
+    }
+
+    pub fn health_status_list(&self) -> Vec<KeyHealthStatusInfo> {
+        persistence::load_health_statuses(&self.storage)
+    }
+
     pub fn wallet_descriptor_propose(
         &self,
         network: String,
         tiers: Vec<RecoveryTierConfig>,
+    ) -> Result<String, KeepMobileError> {
+        self.wallet_descriptor_propose_with_timeout(network, tiers, None)
+    }
+
+    pub fn wallet_descriptor_propose_with_timeout(
+        &self,
+        network: String,
+        tiers: Vec<RecoveryTierConfig>,
+        timeout_secs: Option<u64>,
     ) -> Result<String, KeepMobileError> {
         if !keep_frost_net::VALID_NETWORKS.contains(&network.as_str()) {
             return Err(KeepMobileError::NetworkError {
                 msg: format!("Invalid network: {network}"),
             });
         }
+        if let Some(t) = timeout_secs {
+            if t == 0 || t > keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
+                return Err(KeepMobileError::InvalidInput {
+                    msg: format!(
+                        "timeout_secs must be between 1 and {}, got {t}",
+                        keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS
+                    ),
+                });
+            }
+        }
 
         self.runtime.block_on(async {
-            let node_guard = self.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            let session_id = {
+                let node_guard = self.node.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
-            let share_info = self
-                .storage
-                .get_share_metadata()
-                .ok_or(KeepMobileError::NotInitialized)?;
+                let share_info = self
+                    .storage
+                    .get_share_metadata()
+                    .ok_or(KeepMobileError::NotInitialized)?;
 
-            let policy = build_wallet_policy(&tiers, share_info.total_shares)?;
+                let policy = build_wallet_policy(&tiers, share_info.total_shares)?;
 
-            let (xpub, fingerprint) = node
-                .derive_account_xpub(&network)
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+                let (xpub, fingerprint) = node
+                    .derive_account_xpub(&network)
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
 
-            validate_xpub_network(&xpub, &network)?;
+                validate_xpub_network(&xpub, &network)?;
 
-            let session_id = node
-                .request_descriptor(policy, &network, &xpub, &fingerprint)
+                node.request_descriptor_with_timeout(
+                    policy,
+                    &network,
+                    &xpub,
+                    &fingerprint,
+                    timeout_secs,
+                )
                 .await
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?
+            };
 
             self.descriptor_networks
                 .lock()

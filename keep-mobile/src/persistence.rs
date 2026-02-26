@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_PUBKEY_LEN};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
-use crate::types::WalletDescriptorInfo;
+use crate::types::{KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::VelocityTracker;
 use crate::{
-    CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, POLICY_STORAGE_KEY,
-    TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
+    CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, HEALTH_STATUS_INDEX_KEY,
+    HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
 };
 
 pub(crate) fn load_policy(
@@ -313,4 +313,119 @@ pub(crate) fn delete_descriptor(
         persist_descriptor_index(storage, &index)?;
     }
     Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredHealthStatus {
+    group_pubkey: String,
+    share_index: u16,
+    last_check_timestamp: u64,
+    responsive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+}
+
+fn health_status_key(group_pubkey_hex: &str, share_index: u16) -> String {
+    format!("{HEALTH_STATUS_KEY_PREFIX}{group_pubkey_hex}_{share_index}")
+}
+
+fn load_health_index(storage: &Arc<dyn SecureStorage>) -> Vec<String> {
+    match storage.load_share_by_key(HEALTH_STATUS_INDEX_KEY.into()) {
+        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn persist_health_index(
+    storage: &Arc<dyn SecureStorage>,
+    index: &[String],
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(index).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize health index: {e}"),
+    })?;
+    storage.store_share_by_key(
+        HEALTH_STATUS_INDEX_KEY.into(),
+        data,
+        storage_metadata("health_index"),
+    )
+}
+
+pub(crate) fn existing_created_at(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey_hex: &str,
+    share_index: u16,
+) -> Option<u64> {
+    load_stored_health_status(storage, group_pubkey_hex, share_index).and_then(|s| s.created_at)
+}
+
+fn load_stored_health_status(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey_hex: &str,
+    share_index: u16,
+) -> Option<StoredHealthStatus> {
+    let key = health_status_key(group_pubkey_hex, share_index);
+    storage
+        .load_share_by_key(key)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+}
+
+pub(crate) fn persist_health_status(
+    storage: &Arc<dyn SecureStorage>,
+    info: &KeyHealthStatusInfo,
+) -> Result<(), KeepMobileError> {
+    let stored = StoredHealthStatus {
+        group_pubkey: info.group_pubkey.clone(),
+        share_index: info.share_index,
+        last_check_timestamp: info.last_check_timestamp,
+        responsive: info.responsive,
+        created_at: Some(info.created_at),
+    };
+    let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize health status: {e}"),
+    })?;
+    let key = health_status_key(&info.group_pubkey, info.share_index);
+    storage.store_share_by_key(key.clone(), data, storage_metadata("health_status"))?;
+
+    let mut index = load_health_index(storage);
+    if !index.contains(&key) {
+        index.push(key);
+        persist_health_index(storage, &index)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_health_statuses(storage: &Arc<dyn SecureStorage>) -> Vec<KeyHealthStatusInfo> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let index = load_health_index(storage);
+    let mut results = Vec::new();
+    let mut live_keys = Vec::with_capacity(index.len());
+    for key in &index {
+        let Some(data) = storage.load_share_by_key(key.clone()).ok() else {
+            continue;
+        };
+        let Some(stored) = serde_json::from_slice::<StoredHealthStatus>(&data).ok() else {
+            continue;
+        };
+        live_keys.push(key.clone());
+        let stale_age = now
+            .checked_sub(stored.last_check_timestamp)
+            .unwrap_or(u64::MAX);
+        results.push(KeyHealthStatusInfo {
+            group_pubkey: stored.group_pubkey,
+            share_index: stored.share_index,
+            last_check_timestamp: stored.last_check_timestamp,
+            responsive: stored.responsive,
+            created_at: stored.created_at.unwrap_or(stored.last_check_timestamp),
+            is_stale: stale_age >= keep_core::wallet::KEY_HEALTH_STALE_THRESHOLD_SECS,
+            is_critical: stale_age >= keep_core::wallet::KEY_HEALTH_CRITICAL_THRESHOLD_SECS,
+        });
+    }
+    if live_keys.len() < index.len() {
+        let _ = persist_health_index(storage, &live_keys);
+    }
+    results
 }
