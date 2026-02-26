@@ -343,40 +343,28 @@ impl KfpEventBuilder {
     }
 
     pub fn get_message_type(event: &Event) -> Option<String> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "t" {
-                tag.get(1).map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("t"))
+            .and_then(|t| t.as_slice().get(1).map(|s| s.to_string()))
     }
 
     pub fn get_session_id(event: &Event) -> Option<[u8; 32]> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "s" {
-                let hex_str = tag.get(1)?;
-                let bytes = hex::decode(hex_str).ok()?;
-                bytes.try_into().ok()
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("s"))
+            .and_then(|t| t.as_slice().get(1))
+            .and_then(|hex_str| hex::decode(hex_str).ok())
+            .and_then(|bytes| bytes.try_into().ok())
     }
 
     pub fn get_group_pubkey(event: &Event) -> Option<[u8; 32]> {
-        event.tags.iter().find_map(|t| {
-            let tag = t.as_slice();
-            if tag.first()? == "g" {
-                let hex_str = tag.get(1)?;
-                let bytes = hex::decode(hex_str).ok()?;
-                bytes.try_into().ok()
-            } else {
-                None
-            }
-        })
+        event
+            .tags
+            .find(TagKind::custom("g"))
+            .and_then(|t| t.as_slice().get(1))
+            .and_then(|hex_str| hex::decode(hex_str).ok())
+            .and_then(|bytes| bytes.try_into().ok())
     }
 }
 
