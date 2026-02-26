@@ -27,13 +27,11 @@ fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
         ));
     }
     if timeout > MAX_SESSION_TIMEOUT {
-        return Err(FrostNetError::Session(
-            format!(
-                "Session timeout {}s exceeds maximum {}s",
-                timeout.as_secs(),
-                MAX_SESSION_TIMEOUT.as_secs()
-            ),
-        ));
+        return Err(FrostNetError::Session(format!(
+            "Session timeout {}s exceeds maximum {}s",
+            timeout.as_secs(),
+            MAX_SESSION_TIMEOUT.as_secs()
+        )));
     }
     Ok(timeout)
 }
