@@ -25,6 +25,12 @@ impl KfpNode {
         own_xpub: &str,
         own_fingerprint: &str,
     ) -> Result<[u8; 32]> {
+        if !VALID_NETWORKS.contains(&network) {
+            return Err(FrostNetError::Session(format!(
+                "Invalid network: {network}"
+            )));
+        }
+
         let our_index = self.share.metadata.identifier;
 
         {
@@ -36,7 +42,7 @@ impl KfpNode {
             }
         }
 
-        let created_at = chrono::Utc::now().timestamp() as u64;
+        let created_at = chrono::Utc::now().timestamp().max(0) as u64;
         let session_id = derive_descriptor_session_id(&self.group_pubkey, &policy, created_at);
         let expected_contributors = participant_indices(&policy);
         let we_are_contributor = expected_contributors.contains(&our_index);
@@ -187,7 +193,7 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let we_are_contributor = expected_contributors.contains(&our_index);
 
-        {
+        let session_created = {
             let mut sessions = self.descriptor_sessions.write();
             match sessions.create_session(
                 payload.session_id,
@@ -207,11 +213,17 @@ impl KfpNode {
                     ) {
                         debug!("Failed to store initiator contribution: {e}");
                     }
+                    true
                 }
                 Err(_) => {
                     debug!("Descriptor session already exists, ignoring duplicate proposal");
+                    false
                 }
             }
+        };
+
+        if !session_created {
+            return Ok(());
         }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorProposed {
@@ -579,7 +591,7 @@ impl KfpNode {
             hasher.finalize().into()
         };
 
-        let key_proof_psbt_bytes = {
+        let key_proof_psbt_bytes = match (|| -> Result<Vec<u8>> {
             let our_xpub = our_xpub.ok_or_else(|| {
                 FrostNetError::Session("Missing own xpub contribution for key proof".into())
             })?;
@@ -592,7 +604,19 @@ impl KfpNode {
                     .map_err(|e| FrostNetError::Crypto(format!("key proof build: {e}")))?;
 
             keep_bitcoin::sign_key_proof(&mut proof_psbt, &signing_share_bytes, net)
-                .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))?
+                .map_err(|e| FrostNetError::Crypto(format!("key proof sign: {e}")))
+        })() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = format!("Key proof failed: {e}");
+                self.send_descriptor_nack(payload.session_id, &sender, &reason)
+                    .await;
+                let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                    session_id: payload.session_id,
+                    error: reason.clone(),
+                });
+                return Err(FrostNetError::Session(reason));
+            }
         };
 
         let ack = DescriptorAckPayload::new(
@@ -625,6 +649,17 @@ impl KfpNode {
             .send_event(&event)
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            if let Some(session) = sessions.get_session_mut(&payload.session_id) {
+                let _ = session.set_finalized(FinalizedDescriptor {
+                    external: payload.external_descriptor.clone(),
+                    internal: payload.internal_descriptor.clone(),
+                    policy_hash: payload.policy_hash,
+                });
+            }
+        }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
             session_id: payload.session_id,
@@ -719,7 +754,7 @@ impl KfpNode {
             )));
         }
 
-        if session.has_nacked(share_index) {
+        if session.is_complete() || session.has_nacked(share_index) {
             return Ok(());
         }
 
@@ -861,7 +896,13 @@ impl KfpNode {
             }
             let digest: [u8; 32] = hasher.finalize().into();
             let dedup_key = (payload.share_index, payload.created_at, digest);
-            if !self.seen_xpub_announces.write().insert(dedup_key) {
+            let mut seen = self.seen_xpub_announces.write();
+            if seen.len() >= 10_000 {
+                return Err(FrostNetError::Session(
+                    "Too many xpub announcements tracked".into(),
+                ));
+            }
+            if !seen.insert(dedup_key) {
                 return Ok(());
             }
         }

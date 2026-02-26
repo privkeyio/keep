@@ -116,7 +116,9 @@ impl DescriptorSession {
     }
 
     pub fn set_initiator(&mut self, initiator: PublicKey) {
-        self.initiator = Some(initiator);
+        if self.initiator.is_none() {
+            self.initiator = Some(initiator);
+        }
     }
 
     pub fn state(&self) -> &DescriptorSessionState {
@@ -146,17 +148,23 @@ impl DescriptorSession {
         if xpub.len() > MAX_XPUB_LENGTH {
             return Err(FrostNetError::Session("xpub exceeds maximum length".into()));
         }
-        if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+        if fingerprint.len() != MAX_FINGERPRINT_LENGTH
+            || !fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+        {
             return Err(FrostNetError::Session(
-                "fingerprint exceeds maximum length".into(),
+                "fingerprint must be exactly 8 hex characters".into(),
             ));
         }
         let is_mainnet = self.network == "bitcoin";
-        let valid_prefix = if is_mainnet { "xpub" } else { "tpub" };
-        if !xpub.starts_with(valid_prefix) {
+        let valid_prefixes: &[&str] = if is_mainnet {
+            &["xpub"]
+        } else {
+            &["tpub", "Vpub", "Upub"]
+        };
+        if !valid_prefixes.iter().any(|p| xpub.starts_with(p)) {
             return Err(FrostNetError::Session(format!(
-                "xpub must start with '{valid_prefix}' for network '{}'",
-                self.network
+                "xpub must start with one of {:?} for network '{}'",
+                valid_prefixes, self.network
             )));
         }
 
@@ -305,9 +313,10 @@ impl DescriptorSession {
                 None
             }
             DescriptorSessionState::Finalized => {
-                let fin_at = self
-                    .finalized_at
-                    .expect("finalized_at set in set_finalized");
+                let fin_at = match self.finalized_at {
+                    Some(t) => t,
+                    None => return Some("session"),
+                };
                 if fin_at.elapsed() > self.ack_phase_timeout {
                     return Some("ack");
                 }
@@ -340,7 +349,9 @@ impl DescriptorSession {
     }
 
     pub fn fail(&mut self, reason: String) {
-        self.state = DescriptorSessionState::Failed(reason);
+        if !self.is_complete() && !self.is_failed() {
+            self.state = DescriptorSessionState::Failed(reason);
+        }
     }
 }
 
@@ -896,13 +907,13 @@ mod tests {
         let mut session = test_session();
 
         session
-            .add_contribution(1, "tpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aabb0011".into())
             .unwrap();
         session
-            .add_contribution(2, "tpub2".into(), "bb".into())
+            .add_contribution(2, "tpub2".into(), "bbcc2233".into())
             .unwrap();
         session
-            .add_contribution(3, "tpub3".into(), "cc".into())
+            .add_contribution(3, "tpub3".into(), "ccdd4455".into())
             .unwrap();
 
         let finalized = FinalizedDescriptor {
@@ -912,7 +923,7 @@ mod tests {
         };
         session.set_finalized(finalized).unwrap();
 
-        let result = session.add_contribution(1, "tpub1newzzzzzzzzzzzzz".into(), "aa".into());
+        let result = session.add_contribution(1, "tpub1newzzzzzzzzzzzzz".into(), "aabb0011".into());
         assert!(result.is_err());
     }
 
@@ -1063,7 +1074,7 @@ mod tests {
 
         let session = manager.get_session_mut(&[1u8; 32]).unwrap();
         session
-            .add_contribution(1, "tpub1".into(), "aa".into())
+            .add_contribution(1, "tpub1".into(), "aabb0011".into())
             .unwrap();
 
         let session = manager.get_session(&[1u8; 32]).unwrap();
