@@ -146,6 +146,8 @@ pub struct App {
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
+    pub(crate) proxy_enabled: bool,
+    pub(crate) proxy_port: u16,
     pub(crate) settings: Settings,
     pub(crate) kill_switch: Arc<AtomicBool>,
     pub(crate) tray: Option<TrayState>,
@@ -256,22 +258,6 @@ pub(crate) fn with_keep_blocking<T: Send + 'static>(
     }
 }
 
-fn relay_config_path(keep_path: &std::path::Path) -> PathBuf {
-    keep_path.join("relays.json")
-}
-
-fn relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
-    keep_path.join(format!("relays-{pubkey_hex}.json"))
-}
-
-fn bunker_relay_config_path(keep_path: &std::path::Path) -> PathBuf {
-    keep_path.join("bunker-relays.json")
-}
-
-fn bunker_relay_config_path_for(keep_path: &std::path::Path, pubkey_hex: &str) -> PathBuf {
-    keep_path.join(format!("bunker-relays-{pubkey_hex}.json"))
-}
-
 fn cert_pins_path(keep_path: &std::path::Path) -> PathBuf {
     keep_path.join("cert-pins.json")
 }
@@ -313,104 +299,6 @@ pub(crate) fn save_cert_pins(
     }
 }
 
-fn filter_valid_relays(urls: Vec<String>) -> Vec<String> {
-    urls.into_iter()
-        .filter(|url| match validate_relay_url(url) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(url, "Dropping invalid relay loaded from disk: {e}");
-                false
-            }
-        })
-        .collect()
-}
-
-fn load_relay_urls(keep_path: &std::path::Path) -> Vec<String> {
-    let path = relay_config_path(keep_path);
-    let urls: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    filter_valid_relays(urls)
-}
-
-fn load_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
-    let path = relay_config_path_for(keep_path, pubkey_hex);
-    match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        Some(urls) => filter_valid_relays(urls),
-        None => load_relay_urls(keep_path),
-    }
-}
-
-fn save_relay_urls_for(keep_path: &std::path::Path, pubkey_hex: &str, urls: &[String]) {
-    let path = relay_config_path_for(keep_path, pubkey_hex);
-    if let Ok(json) = serde_json::to_string_pretty(urls) {
-        if let Err(e) = write_private(&path, &json) {
-            tracing::error!("Failed to save relay config: {e}");
-        }
-    }
-}
-
-fn load_bunker_relays(keep_path: &std::path::Path) -> Vec<String> {
-    let path = bunker_relay_config_path(keep_path);
-    let urls: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(default_bunker_relays);
-    let valid = filter_valid_relays(urls);
-    if valid.is_empty() {
-        default_bunker_relays()
-    } else {
-        valid
-    }
-}
-
-fn load_bunker_relays_for(keep_path: &std::path::Path, pubkey_hex: &str) -> Vec<String> {
-    let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
-    match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        Some(urls) => {
-            let valid = filter_valid_relays(urls);
-            if valid.is_empty() {
-                load_bunker_relays(keep_path)
-            } else {
-                valid
-            }
-        }
-        None => load_bunker_relays(keep_path),
-    }
-}
-
-fn save_bunker_relays(keep_path: &std::path::Path, urls: &[String]) {
-    let path = bunker_relay_config_path(keep_path);
-    if let Ok(json) = serde_json::to_string_pretty(urls) {
-        if let Err(e) = write_private(&path, &json) {
-            tracing::error!(
-                "Failed to save bunker relay config to {}: {e}",
-                path.display()
-            );
-        }
-    }
-}
-
-pub(crate) fn save_bunker_relays_for(
-    keep_path: &std::path::Path,
-    pubkey_hex: &str,
-    urls: &[String],
-) {
-    let path = bunker_relay_config_path_for(keep_path, pubkey_hex);
-    if let Ok(json) = serde_json::to_string_pretty(urls) {
-        if let Err(e) = write_private(&path, &json) {
-            tracing::error!("Failed to save bunker relay config: {e}");
-        }
-    }
-}
-
 fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or(path);
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
@@ -429,25 +317,12 @@ fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn save_relay_urls(keep_path: &std::path::Path, urls: &[String]) {
-    let path = relay_config_path(keep_path);
-    if let Ok(json) = serde_json::to_string_pretty(urls) {
-        if let Err(e) = write_private(&path, &json) {
-            tracing::error!("Failed to save relay config to {}: {e}", path.display());
-        }
-    }
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_auto_lock_secs")]
     pub auto_lock_secs: u64,
     #[serde(default = "default_clipboard_clear_secs")]
     pub clipboard_clear_secs: u64,
-    #[serde(default)]
-    pub proxy_enabled: bool,
-    #[serde(default = "default_proxy_port")]
-    pub proxy_port: u16,
     #[serde(default)]
     pub kill_switch_active: bool,
     #[serde(default)]
@@ -466,17 +341,11 @@ fn default_clipboard_clear_secs() -> u64 {
     CLIPBOARD_CLEAR_SECS
 }
 
-fn default_proxy_port() -> u16 {
-    DEFAULT_PROXY_PORT
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_lock_secs: AUTO_LOCK_SECS,
             clipboard_clear_secs: CLIPBOARD_CLEAR_SECS,
-            proxy_enabled: false,
-            proxy_port: DEFAULT_PROXY_PORT,
             kill_switch_active: false,
             minimize_to_tray: false,
             start_minimized: false,
@@ -513,6 +382,92 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
             tracing::error!("Failed to save settings to {}: {e}", path.display());
         }
     }
+}
+
+fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
+    if keep
+        .get_relay_config(&keep_core::GLOBAL_RELAY_KEY)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+
+    let mut config = keep_core::RelayConfig::new_global();
+
+    let relay_path = keep_path.join("relays.json");
+    if let Ok(contents) = std::fs::read_to_string(&relay_path) {
+        if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+            if !urls.is_empty() {
+                config.frost_relays = urls;
+            }
+        }
+    }
+
+    let bunker_path = keep_path.join("bunker-relays.json");
+    if let Ok(contents) = std::fs::read_to_string(&bunker_path) {
+        if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+            if !urls.is_empty() {
+                config.bunker_relays = urls;
+            }
+        }
+    }
+
+    if let Err(e) = keep.store_relay_config(&config) {
+        tracing::warn!("Failed to migrate global relay config to vault: {e}");
+        return;
+    }
+
+    let settings_path = keep_path.join("settings.json");
+    if let Ok(contents) = std::fs::read_to_string(&settings_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+            let enabled = json
+                .get("proxy_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let port = json
+                .get("proxy_port")
+                .and_then(|v| v.as_u64())
+                .map(|p| p as u16)
+                .unwrap_or(DEFAULT_PROXY_PORT);
+            if enabled || port != DEFAULT_PROXY_PORT {
+                let proxy = keep_core::ProxyConfig { enabled, port };
+                let _ = keep.set_proxy_config(&proxy);
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(keep_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(hex) = name_str
+                .strip_prefix("relays-")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                if let Ok(bytes) = hex::decode(hex) {
+                    if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        let mut per_key_config = keep_core::RelayConfig::new(key);
+                        if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                                per_key_config.frost_relays = urls;
+                            }
+                        }
+                        let bunker_file = keep_path.join(format!("bunker-relays-{hex}.json"));
+                        if let Ok(contents) = std::fs::read_to_string(&bunker_file) {
+                            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                                per_key_config.bunker_relays = urls;
+                            }
+                        }
+                        let _ = keep.store_relay_config(&per_key_config);
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("Migrated relay/proxy config from JSON files to vault");
 }
 
 impl App {
@@ -562,6 +517,8 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             nostrconnect_pending: None,
+            proxy_enabled: false,
+            proxy_port: DEFAULT_PROXY_PORT,
             has_tray: tray.is_some(),
             window_visible: tray.is_none()
                 || !settings.start_minimized
@@ -602,11 +559,10 @@ impl App {
             },
         };
         let vault_exists = keep_path.exists();
-        let relay_urls = load_relay_urls(&keep_path);
         let (settings, tray_migrated) = load_settings(&keep_path);
         let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
         let start_minimized = settings.start_minimized;
-        let mut app = Self::init(keep_path, screen, relay_urls, settings);
+        let mut app = Self::init(keep_path, screen, Vec::new(), settings);
         if tray_migrated {
             app.set_toast(
                 "New option: enable minimize-to-tray in Settings".into(),
@@ -1000,8 +956,8 @@ impl App {
                     self.settings.auto_lock_secs,
                     self.settings.clipboard_clear_secs,
                     self.keep_path.display().to_string(),
-                    self.settings.proxy_enabled,
-                    self.settings.proxy_port,
+                    self.proxy_enabled,
+                    self.proxy_port,
                     self.settings.kill_switch_active,
                     self.settings.minimize_to_tray,
                     self.settings.start_minimized,
@@ -1989,11 +1945,14 @@ impl App {
                 };
                 match delete_result {
                     Some(Ok(())) => {
-                        let _ = std::fs::remove_file(relay_config_path_for(&self.keep_path, &hex));
-                        let _ = std::fs::remove_file(bunker_relay_config_path_for(
-                            &self.keep_path,
-                            &hex,
-                        ));
+                        if let Ok(bytes) = hex::decode(&hex) {
+                            if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                let guard = lock_keep(&self.keep);
+                                if let Some(keep) = guard.as_ref() {
+                                    let _ = keep.delete_relay_config(&key);
+                                }
+                            }
+                        }
                         self.refresh_shares();
                         self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
                     }
@@ -2169,11 +2128,8 @@ impl App {
     }
 
     pub(crate) fn proxy_addr(&self) -> Option<SocketAddr> {
-        if self.settings.proxy_enabled && self.settings.proxy_port > 0 {
-            Some(SocketAddr::from((
-                Ipv4Addr::LOCALHOST,
-                self.settings.proxy_port,
-            )))
+        if self.proxy_enabled && self.proxy_port > 0 {
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, self.proxy_port)))
         } else {
             None
         }
@@ -2190,7 +2146,7 @@ impl App {
     pub(crate) fn network_config(&self) -> crate::frost::NetworkConfig {
         crate::frost::NetworkConfig {
             proxy: self.proxy_addr(),
-            session_timeout: if self.settings.proxy_enabled {
+            session_timeout: if self.proxy_enabled {
                 Some(PROXY_SESSION_TIMEOUT)
             } else {
                 None
@@ -2200,17 +2156,59 @@ impl App {
         }
     }
 
+    fn active_group_pubkey_bytes(&self) -> Option<[u8; 32]> {
+        self.active_share_hex
+            .as_ref()
+            .and_then(|hex| hex::decode(hex).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    }
+
     pub(crate) fn save_relay_urls(&self) {
-        match &self.active_share_hex {
-            Some(hex) => save_relay_urls_for(&self.keep_path, hex, &self.relay_urls),
-            None => save_relay_urls(&self.keep_path, &self.relay_urls),
+        let guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_ref() {
+            let key = self
+                .active_group_pubkey_bytes()
+                .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
+            let mut config = keep
+                .get_relay_config(&key)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| keep_core::RelayConfig::new(key));
+            config.frost_relays = self.relay_urls.clone();
+            if let Err(e) = keep.store_relay_config(&config) {
+                tracing::error!("Failed to save relay config: {e}");
+            }
         }
     }
 
     pub(crate) fn save_bunker_relays(&self) {
-        match &self.active_share_hex {
-            Some(hex) => save_bunker_relays_for(&self.keep_path, hex, &self.bunker_relays),
-            None => save_bunker_relays(&self.keep_path, &self.bunker_relays),
+        let guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_ref() {
+            let key = self
+                .active_group_pubkey_bytes()
+                .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
+            let mut config = keep
+                .get_relay_config(&key)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| keep_core::RelayConfig::new(key));
+            config.bunker_relays = self.bunker_relays.clone();
+            if let Err(e) = keep.store_relay_config(&config) {
+                tracing::error!("Failed to save bunker relay config: {e}");
+            }
+        }
+    }
+
+    fn save_proxy_config(&self) {
+        let guard = lock_keep(&self.keep);
+        if let Some(keep) = guard.as_ref() {
+            let proxy = keep_core::ProxyConfig {
+                enabled: self.proxy_enabled,
+                port: self.proxy_port,
+            };
+            if let Err(e) = keep.set_proxy_config(&proxy) {
+                tracing::error!("Failed to save proxy config: {e}");
+            }
         }
     }
 
@@ -2226,6 +2224,7 @@ impl App {
         match result {
             Ok(shares) => {
                 self.reconcile_kill_switch();
+                self.load_config_from_vault();
                 self.set_share_screen(shares);
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
@@ -2237,6 +2236,33 @@ impl App {
             Err(e) => self.screen.set_loading_error(e),
         }
         Task::none()
+    }
+
+    fn load_config_from_vault(&mut self) {
+        let guard = lock_keep(&self.keep);
+        let Some(keep) = guard.as_ref() else {
+            return;
+        };
+
+        migrate_json_config_to_vault(keep, &self.keep_path);
+
+        let key = self
+            .active_group_pubkey_bytes()
+            .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
+        let relay_config = keep
+            .get_relay_config_or_default(&key)
+            .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
+        self.relay_urls = relay_config.frost_relays;
+        let bunker = relay_config.bunker_relays;
+        if !bunker.is_empty() {
+            self.bunker_relays = bunker;
+        } else {
+            self.bunker_relays = default_bunker_relays();
+        }
+
+        let proxy = keep.get_proxy_config().unwrap_or_default();
+        self.proxy_enabled = proxy.enabled;
+        self.proxy_port = proxy.port;
     }
 
     fn reconcile_kill_switch(&mut self) {
@@ -2853,8 +2879,25 @@ impl App {
                 self.handle_disconnect_relay();
                 self.stop_bunker();
 
-                self.relay_urls = load_relay_urls_for(&self.keep_path, &pubkey_hex);
-                self.bunker_relays = load_bunker_relays_for(&self.keep_path, &pubkey_hex);
+                {
+                    let guard = lock_keep(&self.keep);
+                    if let Some(keep) = guard.as_ref() {
+                        if let Ok(bytes) = hex::decode(&pubkey_hex) {
+                            if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                let config = keep
+                                    .get_relay_config_or_default(&key)
+                                    .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
+                                self.relay_urls = config.frost_relays;
+                                let bunker = config.bunker_relays;
+                                if !bunker.is_empty() {
+                                    self.bunker_relays = bunker;
+                                } else {
+                                    self.bunker_relays = default_bunker_relays();
+                                }
+                            }
+                        }
+                    }
+                }
 
                 {
                     let guard = lock_keep(&self.keep);
@@ -2997,12 +3040,14 @@ impl App {
                 };
 
                 if result {
-                    let _ =
-                        std::fs::remove_file(relay_config_path_for(&self.keep_path, &pubkey_hex));
-                    let _ = std::fs::remove_file(bunker_relay_config_path_for(
-                        &self.keep_path,
-                        &pubkey_hex,
-                    ));
+                    if let Ok(bytes) = hex::decode(&pubkey_hex) {
+                        if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                            let guard = lock_keep(&self.keep);
+                            if let Some(keep) = guard.as_ref() {
+                                let _ = keep.delete_relay_config(&key);
+                            }
+                        }
+                    }
 
                     self.refresh_shares();
                     self.set_toast(format!("'{}' deleted", identity.name), ToastKind::Success);
@@ -3030,15 +3075,15 @@ impl App {
                 }
             }
             Message::SettingsProxyToggled(enabled) => {
-                self.settings.proxy_enabled = enabled;
+                self.proxy_enabled = enabled;
                 let frost_active = matches!(
                     self.frost_status,
                     ConnectionStatus::Connected | ConnectionStatus::Connecting
                 );
                 let bunker_active = self.bunker.is_some();
-                save_settings(&self.keep_path, &self.settings);
+                self.save_proxy_config();
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.proxy_enabled = self.settings.proxy_enabled;
+                    s.proxy_enabled = self.proxy_enabled;
                 }
                 let mut tasks = Vec::new();
                 if frost_active {
@@ -3062,9 +3107,14 @@ impl App {
                     s.proxy_port_input = port_str.clone();
                 }
                 match port_str.parse::<u16>() {
-                    Ok(port) if port > 0 => self.settings.proxy_port = port,
+                    Ok(port) if port > 0 => {
+                        self.proxy_port = port;
+                        self.save_proxy_config();
+                    }
                     _ => return Task::none(),
                 }
+                self.sync_settings_screen();
+                return Task::none();
             }
             Message::SettingsMinimizeToTrayToggled(v) => {
                 self.settings.minimize_to_tray = v;
@@ -3094,11 +3144,11 @@ impl App {
         if let Screen::Settings(s) = &mut self.screen {
             s.auto_lock_secs = self.settings.auto_lock_secs;
             s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
-            s.proxy_enabled = self.settings.proxy_enabled;
-            s.proxy_port = self.settings.proxy_port;
+            s.proxy_enabled = self.proxy_enabled;
+            s.proxy_port = self.proxy_port;
             s.minimize_to_tray = self.settings.minimize_to_tray;
             s.start_minimized = self.settings.start_minimized;
-            let formatted = self.settings.proxy_port.to_string();
+            let formatted = self.proxy_port.to_string();
             if s.proxy_port_input != formatted {
                 s.proxy_port_input = formatted;
             }
@@ -3469,6 +3519,8 @@ impl App {
             bunker_pending_approval: None,
             bunker_pending_setup: None,
             nostrconnect_pending: None,
+            proxy_enabled: false,
+            proxy_port: DEFAULT_PROXY_PORT,
             has_tray,
             window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
             tray_last_connected: false,
@@ -3721,8 +3773,6 @@ mod tests {
         let s = Settings {
             auto_lock_secs: 60,
             clipboard_clear_secs: 10,
-            proxy_enabled: true,
-            proxy_port: 9051,
             kill_switch_active: false,
             minimize_to_tray: false,
             start_minimized: true,
@@ -3732,8 +3782,6 @@ mod tests {
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.auto_lock_secs, 60);
         assert_eq!(parsed.clipboard_clear_secs, 10);
-        assert!(parsed.proxy_enabled);
-        assert_eq!(parsed.proxy_port, 9051);
         assert!(!parsed.minimize_to_tray);
         assert!(parsed.start_minimized);
     }
