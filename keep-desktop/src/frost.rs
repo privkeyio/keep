@@ -819,13 +819,17 @@ impl App {
                     count = recovery_xpubs.len(),
                     "Received recovery xpub announcement"
                 );
-                if let Screen::Wallet(ws) = &mut self.screen {
-                    let entry = ws.peer_xpubs.entry(share_index).or_default();
-                    for xpub in recovery_xpubs {
-                        if !entry.iter().any(|x| x.xpub == xpub.xpub) {
-                            entry.push(xpub);
-                        }
+                let entry = self.peer_xpubs.entry(share_index).or_default();
+                for xpub in recovery_xpubs {
+                    if entry.len() >= keep_frost_net::protocol::MAX_RECOVERY_XPUBS {
+                        break;
                     }
+                    if !entry.iter().any(|x| x.xpub == xpub.xpub) {
+                        entry.push(xpub);
+                    }
+                }
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.peer_xpubs = self.peer_xpubs.clone();
                 }
             }
             FrostNodeMsg::HealthCheckComplete {

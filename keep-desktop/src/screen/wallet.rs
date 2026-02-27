@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use keep_frost_net::protocol::VALID_XPUB_PREFIXES;
 use keep_frost_net::AnnouncedXpub;
 
 use crate::message::Message;
@@ -140,7 +141,7 @@ impl WalletScreen {
         let mut content = column![title_row].spacing(theme::space::MD);
 
         if self.descriptors.is_empty() {
-            let empty = column![
+            let mut inner = column![
                 text("No wallet descriptors yet")
                     .size(theme::size::BODY)
                     .color(theme::color::TEXT_MUTED),
@@ -151,21 +152,20 @@ impl WalletScreen {
             .align_x(Alignment::Center)
             .spacing(theme::space::SM);
 
-            content = content.push(
-                container(empty)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill),
-            );
+            if !self.peer_xpubs.is_empty() {
+                inner = inner.push(self.peer_xpubs_card());
+            }
+
+            content = content.push(scrollable(inner).height(Length::Fill));
         } else {
             let mut list = column![].spacing(theme::space::SM);
             for (i, entry) in self.descriptors.iter().enumerate() {
                 list = list.push(self.wallet_card(i, entry));
             }
+            if !self.peer_xpubs.is_empty() {
+                list = list.push(self.peer_xpubs_card());
+            }
             content = content.push(scrollable(list).height(Length::Fill));
-        }
-
-        if !self.peer_xpubs.is_empty() {
-            content = content.push(self.peer_xpubs_card());
         }
 
         container(content)
@@ -538,10 +538,9 @@ impl WalletScreen {
             .on_input(Message::WalletAnnounceLabelChanged)
             .padding(theme::space::SM);
 
-        let valid_prefixes = [
-            "xpub", "tpub", "ypub", "zpub", "upub", "vpub", "Ypub", "Zpub", "Upub", "Vpub",
-        ];
-        let xpub_valid = valid_prefixes.iter().any(|p| state.xpub.starts_with(p));
+        let xpub_valid = VALID_XPUB_PREFIXES
+            .iter()
+            .any(|p| state.xpub.starts_with(p));
         let fp_valid = state.fingerprint.len() == 8
             && state.fingerprint.chars().all(|c| c.is_ascii_hexdigit());
         let can_submit = xpub_valid && fp_valid && !state.submitting;
@@ -601,7 +600,8 @@ impl WalletScreen {
 
                 for xpub in xpubs {
                     let truncated = if xpub.xpub.len() > 32 {
-                        format!("{}...", &xpub.xpub[..32])
+                        let prefix: String = xpub.xpub.chars().take(32).collect();
+                        format!("{prefix}...")
                     } else {
                         xpub.xpub.clone()
                     };

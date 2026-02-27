@@ -45,6 +45,7 @@ use crate::screen::wallet::{
 use crate::screen::Screen;
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
+use keep_frost_net::protocol::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
 
@@ -158,6 +159,7 @@ pub struct App {
     pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
+    pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
     cached_share_count: usize,
     cached_nsec_count: usize,
@@ -568,6 +570,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             cached_share_count: 0,
             cached_nsec_count: 0,
@@ -959,7 +962,9 @@ impl App {
             Message::WalletsLoaded(result) => {
                 match result {
                     Ok(entries) => {
-                        self.screen = Screen::Wallet(WalletScreen::new(entries));
+                        let mut ws = WalletScreen::new(entries);
+                        ws.peer_xpubs = self.peer_xpubs.clone();
+                        self.screen = Screen::Wallet(ws);
                     }
                     Err(e) => {
                         self.set_toast(e, ToastKind::Error);
@@ -1445,7 +1450,7 @@ impl App {
                     announce: Some(a), ..
                 }) = &mut self.screen
                 {
-                    a.xpub = v;
+                    a.xpub = v.chars().take(MAX_XPUB_LENGTH).collect();
                 }
                 Task::none()
             }
@@ -1468,7 +1473,7 @@ impl App {
                     announce: Some(a), ..
                 }) = &mut self.screen
                 {
-                    a.label = v;
+                    a.label = v.chars().take(MAX_XPUB_LABEL_LENGTH).collect();
                 }
                 Task::none()
             }
@@ -3487,6 +3492,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             cached_share_count: 0,
             cached_nsec_count: 0,
