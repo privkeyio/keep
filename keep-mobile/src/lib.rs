@@ -33,6 +33,18 @@ pub use types::{
     SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
+pub fn format_timestamp(ts: i64) -> String {
+    keep_core::display::format_timestamp(ts)
+}
+
+pub fn format_timestamp_detailed(ts: i64) -> String {
+    keep_core::display::format_timestamp_detailed(ts)
+}
+
+pub fn truncate_str(s: String, prefix_len: u32, suffix_len: u32) -> String {
+    keep_core::display::truncate_str(&s, prefix_len as usize, suffix_len as usize)
+}
+
 use keep_core::frost::{
     ShareExport, ShareMetadata, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
 };

@@ -21,14 +21,7 @@ pub struct ConnectedClient {
 
 impl ConnectedClient {
     pub fn truncated_pubkey(&self) -> String {
-        if self.pubkey.len() <= 16 {
-            return self.pubkey.clone();
-        }
-        format!(
-            "{}...{}",
-            &self.pubkey[..8],
-            &self.pubkey[self.pubkey.len() - 6..]
-        )
+        keep_core::display::truncate_str(&self.pubkey, 8, 6)
     }
 
     pub fn permission_labels(&self) -> Vec<&'static str> {

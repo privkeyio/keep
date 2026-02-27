@@ -38,6 +38,8 @@ pub mod audit;
 pub mod backend;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
+/// Display formatting helpers for truncation and timestamps.
+pub mod display;
 /// Multi-source entropy mixing for defense-in-depth randomness.
 pub mod entropy;
 /// Error types and result aliases.
