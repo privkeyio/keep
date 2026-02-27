@@ -3,49 +3,41 @@
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
-use keep_core::keys::bytes_to_npub;
+use keep_core::keys::{bytes_to_npub, KeyRecord, KeyType};
 
 use super::{format_timestamp, truncate_npub};
-use crate::message::{Message, ShareIdentity};
+use crate::message::Message;
 use crate::theme;
 
 #[derive(Debug, Clone)]
-pub struct ShareEntry {
+pub struct NsecKeyEntry {
     pub name: String,
-    pub identifier: u16,
-    pub threshold: u16,
-    pub total_shares: u16,
-    pub group_pubkey: [u8; 32],
-    pub group_pubkey_hex: String,
+    pub pubkey: [u8; 32],
+    pub pubkey_hex: String,
     pub npub: String,
     pub created_at: i64,
     pub last_used: Option<i64>,
     pub sign_count: u64,
 }
 
-impl ShareEntry {
-    pub fn from_stored(stored: &keep_core::frost::StoredShare) -> Self {
-        let m = &stored.metadata;
-        Self {
-            name: m.name.clone(),
-            identifier: m.identifier,
-            threshold: m.threshold,
-            total_shares: m.total_shares,
-            group_pubkey: m.group_pubkey,
-            group_pubkey_hex: hex::encode(m.group_pubkey),
-            npub: bytes_to_npub(&m.group_pubkey),
-            created_at: m.created_at,
-            last_used: m.last_used,
-            sign_count: m.sign_count,
+impl NsecKeyEntry {
+    pub fn from_record(record: &KeyRecord) -> Option<Self> {
+        if record.key_type != KeyType::Nostr {
+            return None;
         }
+        Some(Self {
+            name: record.name.clone(),
+            pubkey: record.pubkey,
+            pubkey_hex: hex::encode(record.pubkey),
+            npub: bytes_to_npub(&record.pubkey),
+            created_at: record.created_at,
+            last_used: record.last_used,
+            sign_count: record.sign_count,
+        })
     }
 
     fn created_display(&self) -> String {
         format_timestamp(self.created_at)
-    }
-
-    pub fn truncated_npub(&self) -> String {
-        truncate_npub(&self.npub)
     }
 
     fn last_used_display(&self) -> String {
@@ -55,44 +47,44 @@ impl ShareEntry {
     }
 }
 
-pub struct ShareListScreen {
-    pub shares: Vec<ShareEntry>,
-    pub active_share_hex: Option<String>,
-    pub delete_confirm: Option<ShareIdentity>,
+pub struct NsecKeysScreen {
+    pub keys: Vec<NsecKeyEntry>,
+    pub active_key_hex: Option<String>,
+    pub delete_confirm: Option<String>,
     pub expanded: Option<usize>,
 }
 
-impl ShareListScreen {
-    pub fn new(shares: Vec<ShareEntry>, active_share_hex: Option<String>) -> Self {
+impl NsecKeysScreen {
+    pub fn new(keys: Vec<NsecKeyEntry>, active_key_hex: Option<String>) -> Self {
         Self {
-            shares,
-            active_share_hex,
+            keys,
+            active_key_hex,
             delete_confirm: None,
             expanded: None,
         }
     }
 
     pub fn view_content(&self) -> Element<'_, Message> {
-        let title = theme::heading("FROST Shares");
+        let title = theme::heading("Nsec Keys");
 
         let mut content = column![title].spacing(theme::space::MD);
 
-        if self.shares.is_empty() {
-            let create_card = container(
+        if self.keys.is_empty() {
+            let import_card = container(
                 column![
-                    text("Create Keyset")
+                    text("Import Nsec Key")
                         .size(theme::size::HEADING)
                         .color(theme::color::TEXT),
-                    text("Generate a new set of threshold signing shares")
+                    text("Import a nostr secret key (nsec or ncryptsec)")
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_MUTED),
                     Space::new().height(theme::space::SM),
                     button(
-                        text("Create")
+                        text("Import")
                             .width(Length::Fill)
                             .align_x(Alignment::Center),
                     )
-                    .on_press(Message::GoToCreate)
+                    .on_press(Message::GoToImport)
                     .style(theme::primary_button)
                     .padding(theme::space::MD)
                     .width(Length::Fill),
@@ -103,45 +95,15 @@ impl ShareListScreen {
             .padding(theme::space::LG)
             .width(Length::FillPortion(1));
 
-            let import_card = container(
-                column![
-                    text("Import Share")
-                        .size(theme::size::HEADING)
-                        .color(theme::color::TEXT),
-                    text("Scan or paste a share exported from another Keep device")
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT_MUTED),
-                    Space::new().height(theme::space::SM),
-                    button(
-                        text("Import")
-                            .width(Length::Fill)
-                            .align_x(Alignment::Center),
-                    )
-                    .on_press(Message::GoToImport)
-                    .style(theme::secondary_button)
-                    .padding(theme::space::MD)
-                    .width(Length::Fill),
-                ]
-                .spacing(theme::space::SM),
-            )
-            .style(theme::card_style)
-            .padding(theme::space::LG)
-            .width(Length::FillPortion(1));
-
-            let cards = row![create_card, import_card].spacing(theme::space::LG);
-
             let empty = column![
-                text("Welcome to Keep")
+                text("No nsec keys imported")
                     .size(theme::size::TITLE)
                     .color(theme::color::TEXT),
-                text("Manage your FROST threshold signing shares")
+                text("Import a nostr secret key to get started")
                     .size(theme::size::BODY)
                     .color(theme::color::TEXT_MUTED),
-                text("Create a keyset to generate shares, then export each share to a different device using QR codes.")
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_DIM),
                 Space::new().height(theme::space::LG),
-                cards,
+                import_card,
             ]
             .align_x(Alignment::Center)
             .spacing(theme::space::SM);
@@ -153,8 +115,8 @@ impl ShareListScreen {
             );
         } else {
             let mut list = column![].spacing(theme::space::SM);
-            for (i, share) in self.shares.iter().enumerate() {
-                list = list.push(self.share_card(i, share));
+            for (i, key) in self.keys.iter().enumerate() {
+                list = list.push(self.key_card(i, key));
             }
             content = content.push(scrollable(list).height(Length::Fill));
         }
@@ -166,34 +128,20 @@ impl ShareListScreen {
             .into()
     }
 
-    fn share_card<'a>(&self, i: usize, share: &ShareEntry) -> Element<'a, Message> {
-        let is_active = self.active_share_hex.as_deref() == Some(&share.group_pubkey_hex);
+    fn key_card<'a>(&self, i: usize, key: &NsecKeyEntry) -> Element<'a, Message> {
+        let is_active = self.active_key_hex.as_deref() == Some(&key.pubkey_hex);
 
-        let truncated_npub = share.truncated_npub();
-
-        let badge = container(
-            text(format!("{}-of-{}", share.threshold, share.total_shares))
-                .size(theme::size::TINY)
-                .color(theme::color::PRIMARY),
-        )
-        .style(theme::badge_style)
-        .padding([2.0, theme::space::SM]);
-
-        let share_index = text(format!("#{}", share.identifier))
-            .size(theme::size::SMALL)
-            .color(theme::color::TEXT_MUTED);
-
-        let npub_text = text(truncated_npub)
+        let npub_text = text(truncate_npub(&key.npub))
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 
         let arrow = if self.expanded == Some(i) { "v" } else { ">" };
         let name_btn = button(
-            text(format!("{arrow} {}", share.name))
+            text(format!("{arrow} {}", key.name))
                 .size(theme::size::HEADING)
                 .color(theme::color::TEXT),
         )
-        .on_press(Message::ToggleShareDetails(i))
+        .on_press(Message::ToggleNsecKeyDetails(i))
         .style(theme::text_button)
         .padding(0);
 
@@ -201,15 +149,15 @@ impl ShareListScreen {
 
         if !is_active {
             let activate_btn = button(text("Activate").size(theme::size::SMALL))
-                .on_press(Message::SetActiveShare(share.group_pubkey_hex.clone()))
+                .on_press(Message::SwitchIdentity(key.pubkey_hex.clone()))
                 .style(theme::secondary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 
             header_buttons = header_buttons.push(activate_btn);
         }
 
-        let export_btn = button(text("Export QR").size(theme::size::SMALL))
-            .on_press(Message::GoToExport(i))
+        let export_btn = button(text("Export ncryptsec").size(theme::size::SMALL))
+            .on_press(Message::GoToExportNcryptsec(key.pubkey_hex.clone()))
             .style(theme::primary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
@@ -218,9 +166,7 @@ impl ShareListScreen {
         let header_top = row![name_btn, Space::new().width(Length::Fill), header_buttons,]
             .align_y(Alignment::Center);
 
-        let mut info_row = row![badge, share_index]
-            .spacing(theme::space::SM)
-            .align_y(Alignment::Center);
+        let mut info_row = row![].spacing(theme::space::SM).align_y(Alignment::Center);
 
         if is_active {
             let active_badge_elem = container(
@@ -242,11 +188,11 @@ impl ShareListScreen {
 
         if self.expanded == Some(i) {
             let npub_row = row![
-                text(format!("npub: {}", share.npub))
+                text(format!("npub: {}", key.npub))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
                 button(text("Copy").size(theme::size::TINY))
-                    .on_press(Message::CopyNpub(share.npub.clone()))
+                    .on_press(Message::CopyNpub(key.npub.clone()))
                     .style(theme::secondary_button)
                     .padding([2.0, theme::space::SM]),
             ]
@@ -255,37 +201,33 @@ impl ShareListScreen {
 
             let details = column![
                 npub_row,
-                text(format!("hex: {}", share.group_pubkey_hex))
+                text(format!("hex: {}", key.pubkey_hex))
                     .size(theme::size::TINY)
                     .color(theme::color::TEXT_DIM),
-                text(format!("Created: {}", share.created_display()))
+                text(format!("Created: {}", key.created_display()))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
-                text(format!("Last used: {}", share.last_used_display()))
+                text(format!("Last used: {}", key.last_used_display()))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
-                text(format!("Signatures: {}", share.sign_count))
+                text(format!("Signatures: {}", key.sign_count))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
             ]
             .spacing(theme::space::XS);
 
-            let share_id = ShareIdentity {
-                group_pubkey: share.group_pubkey,
-                identifier: share.identifier,
-            };
-            let actions = if self.delete_confirm.as_ref() == Some(&share_id) {
+            let actions = if self.delete_confirm.as_deref() == Some(&key.pubkey_hex) {
                 row![
-                    text(format!("Delete '{}'? This cannot be undone.", share.name))
+                    text(format!("Delete '{}'? This cannot be undone.", key.name))
                         .size(theme::size::BODY)
                         .color(theme::color::ERROR),
                     Space::new().width(Length::Fill),
                     button(text("Yes").size(theme::size::BODY))
-                        .on_press(Message::ConfirmDelete(share_id.clone()))
+                        .on_press(Message::ConfirmDeleteNsecKey(key.pubkey_hex.clone()))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("No").size(theme::size::BODY))
-                        .on_press(Message::CancelDelete)
+                        .on_press(Message::CancelDeleteNsecKey)
                         .style(theme::secondary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]
@@ -295,7 +237,7 @@ impl ShareListScreen {
                 row![
                     Space::new().width(Length::Fill),
                     button(text("Delete").size(theme::size::BODY))
-                        .on_press(Message::RequestDelete(share_id))
+                        .on_press(Message::RequestDeleteNsecKey(key.pubkey_hex.clone()))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]

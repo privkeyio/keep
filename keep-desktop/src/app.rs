@@ -32,6 +32,7 @@ use crate::screen::export::ExportScreen;
 use crate::screen::export_ncryptsec::ExportNcryptsecScreen;
 use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::layout::SidebarState;
+use crate::screen::nsec_keys::{NsecKeyEntry, NsecKeysScreen};
 use crate::screen::relay::RelayScreen;
 use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
@@ -156,6 +157,9 @@ pub struct App {
     pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
+    import_return_to_nsec: bool,
+    cached_share_count: usize,
+    cached_nsec_count: usize,
 }
 
 pub(crate) fn lock_keep(
@@ -563,6 +567,9 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            import_return_to_nsec: false,
+            cached_share_count: 0,
+            cached_nsec_count: 0,
             settings,
             kill_switch,
             tray,
@@ -632,6 +639,7 @@ impl App {
             | Message::GoToImport
             | Message::GoToExport(..)
             | Message::NavigateShares
+            | Message::NavigateNsecKeys
             | Message::GoBack
             | Message::NavigateWallets
             | Message::WalletsLoaded(..)
@@ -645,6 +653,11 @@ impl App {
             | Message::RequestDelete(..)
             | Message::ConfirmDelete(..)
             | Message::CancelDelete => self.handle_share_list_message(message),
+
+            Message::ToggleNsecKeyDetails(..)
+            | Message::RequestDeleteNsecKey(..)
+            | Message::ConfirmDeleteNsecKey(..)
+            | Message::CancelDeleteNsecKey => self.handle_nsec_keys_message(message),
 
             Message::CreateNameChanged(..)
             | Message::CreateThresholdChanged(..)
@@ -871,6 +884,7 @@ impl App {
                 Task::none()
             }
             Message::GoToImport => {
+                self.import_return_to_nsec = matches!(self.screen, Screen::NsecKeys(_));
                 self.screen = Screen::Import(ImportScreen::new());
                 Task::none()
             }
@@ -881,13 +895,35 @@ impl App {
                 }
                 Task::none()
             }
-            Message::NavigateShares | Message::GoBack => {
+            Message::NavigateShares => {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
                 self.stop_scanner();
                 self.copy_feedback_until = None;
                 self.set_share_screen(self.current_shares());
+                Task::none()
+            }
+            Message::GoBack => {
+                self.stop_scanner();
+                self.copy_feedback_until = None;
+                let return_to_nsec = matches!(self.screen, Screen::ExportNcryptsec(_))
+                    || (matches!(self.screen, Screen::Import(_)) && self.import_return_to_nsec);
+                if return_to_nsec {
+                    self.import_return_to_nsec = false;
+                    self.set_nsec_keys_screen();
+                } else {
+                    self.set_share_screen(self.current_shares());
+                }
+                Task::none()
+            }
+            Message::NavigateNsecKeys => {
+                if matches!(self.screen, Screen::NsecKeys(_)) {
+                    return Task::none();
+                }
+                self.stop_scanner();
+                self.copy_feedback_until = None;
+                self.set_nsec_keys_screen();
                 Task::none()
             }
             Message::NavigateWallets => {
@@ -1128,7 +1164,7 @@ impl App {
             Message::ImportNcryptsec => self.handle_import_ncryptsec(),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
-            Message::ImportNcryptsecResult(result) => self.handle_import_result(result),
+            Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
             _ => Task::none(),
         }
     }
@@ -1591,13 +1627,20 @@ impl App {
             switcher_open: self.identity_switcher_open,
             delete_confirm: self.delete_identity_confirm.as_deref(),
         };
-        let share_count = match &self.screen {
-            Screen::ShareList(s) if !s.shares.is_empty() => Some(s.shares.len()),
-            _ => None,
+        let share_count = if self.cached_share_count > 0 {
+            Some(self.cached_share_count)
+        } else {
+            None
+        };
+        let nsec_count = if self.cached_nsec_count > 0 {
+            Some(self.cached_nsec_count)
+        } else {
+            None
         };
         let screen = self.screen.view(
             &sidebar_state,
             share_count,
+            nsec_count,
             pending_count,
             self.settings.kill_switch_active,
         );
@@ -1737,6 +1780,8 @@ impl App {
         self.active_share_hex = None;
         self.active_coordinations.clear();
         self.identities.clear();
+        self.cached_share_count = 0;
+        self.cached_nsec_count = 0;
         self.identity_switcher_open = false;
         self.delete_identity_confirm = None;
         self.toast = None;
@@ -1765,9 +1810,13 @@ impl App {
 
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
+        self.cached_share_count = shares.len();
+        self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
-        if let Screen::ShareList(s) = &mut self.screen {
+        if matches!(self.screen, Screen::NsecKeys(_)) {
+            self.set_nsec_keys_screen();
+        } else if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
             s.active_share_hex = self.active_share_hex.clone();
             s.delete_confirm = None;
@@ -1775,10 +1824,99 @@ impl App {
     }
 
     fn set_share_screen(&mut self, shares: Vec<ShareEntry>) {
+        self.cached_share_count = shares.len();
+        self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
         self.screen =
             Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
+    }
+
+    fn current_nsec_keys(&self) -> Vec<NsecKeyEntry> {
+        let guard = lock_keep(&self.keep);
+        let Some(keep) = guard.as_ref() else {
+            return Vec::new();
+        };
+        keep.list_keys()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(NsecKeyEntry::from_record)
+            .collect()
+    }
+
+    fn set_nsec_keys_screen(&mut self) {
+        let keys = self.current_nsec_keys();
+        self.cached_nsec_count = keys.len();
+        self.screen = Screen::NsecKeys(NsecKeysScreen::new(keys, self.active_share_hex.clone()));
+    }
+
+    fn handle_nsec_keys_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::ToggleNsecKeyDetails(i) => {
+                if let Screen::NsecKeys(s) = &mut self.screen {
+                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
+                    s.delete_confirm = None;
+                }
+                Task::none()
+            }
+            Message::RequestDeleteNsecKey(hex) => {
+                if let Screen::NsecKeys(s) = &mut self.screen {
+                    s.delete_confirm = Some(hex);
+                }
+                Task::none()
+            }
+            Message::ConfirmDeleteNsecKey(hex) => {
+                let Screen::NsecKeys(s) = &self.screen else {
+                    return Task::none();
+                };
+                if s.delete_confirm.as_deref() != Some(hex.as_str()) {
+                    return Task::none();
+                }
+                let Some(key) = s.keys.iter().find(|k| k.pubkey_hex == hex) else {
+                    return Task::none();
+                };
+                let (pubkey, name) = (key.pubkey, key.name.clone());
+                if self.active_share_hex.as_deref() == Some(hex.as_str()) {
+                    self.handle_disconnect_relay();
+                    self.stop_bunker();
+                }
+                let delete_result = {
+                    let mut guard = lock_keep(&self.keep);
+                    guard.as_mut().map(|keep| keep.delete_key(&pubkey))
+                };
+                match delete_result {
+                    Some(Ok(())) => {
+                        let _ = std::fs::remove_file(relay_config_path_for(&self.keep_path, &hex));
+                        let _ = std::fs::remove_file(bunker_relay_config_path_for(
+                            &self.keep_path,
+                            &hex,
+                        ));
+                        self.refresh_shares();
+                        self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
+                    }
+                    Some(Err(e)) => {
+                        if let Screen::NsecKeys(s) = &mut self.screen {
+                            s.delete_confirm = None;
+                        }
+                        self.set_toast(friendly_err(e), ToastKind::Error);
+                    }
+                    None => {
+                        if let Screen::NsecKeys(s) = &mut self.screen {
+                            s.delete_confirm = None;
+                        }
+                        self.set_toast("Vault locked or unavailable".into(), ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::CancelDeleteNsecKey => {
+                if let Screen::NsecKeys(s) = &mut self.screen {
+                    s.delete_confirm = None;
+                }
+                Task::none()
+            }
+            _ => Task::none(),
+        }
     }
 
     fn resolve_active_share(&mut self, shares: &[ShareEntry]) {
@@ -2234,7 +2372,19 @@ impl App {
         &mut self,
         result: Result<(Vec<ShareEntry>, String), String>,
     ) -> Task<Message> {
-        self.handle_import_result(result)
+        match result {
+            Ok((shares, name)) => {
+                self.cached_share_count = shares.len();
+                self.refresh_identities(&shares);
+                self.set_nsec_keys_screen();
+                self.set_toast(
+                    format!("'{name}' imported successfully"),
+                    ToastKind::Success,
+                );
+            }
+            Err(e) => self.screen.set_loading_error(e),
+        }
+        Task::none()
     }
 
     fn handle_import_ncryptsec(&mut self) -> Task<Message> {
@@ -2648,6 +2798,9 @@ impl App {
                     }
                     Screen::Bunker(_) => {
                         self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
+                    }
+                    Screen::NsecKeys(_) => {
+                        self.set_nsec_keys_screen();
                     }
                     _ => {}
                 }
@@ -3219,6 +3372,9 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            import_return_to_nsec: false,
+            cached_share_count: 0,
+            cached_nsec_count: 0,
             settings,
             kill_switch,
             tray: None,

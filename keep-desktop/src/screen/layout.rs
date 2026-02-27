@@ -31,6 +31,7 @@ fn identity_color(pubkey_hex: &str) -> iced::Color {
 #[derive(PartialEq)]
 pub enum NavItem {
     Shares,
+    NsecKeys,
     Create,
     Import,
     Wallets,
@@ -58,6 +59,7 @@ pub fn with_sidebar<'a>(
     content: Element<'a, Message>,
     sidebar_state: &SidebarState<'a>,
     share_count: Option<usize>,
+    nsec_count: Option<usize>,
     pending_requests: usize,
     kill_switch_active: bool,
 ) -> Element<'a, Message> {
@@ -66,17 +68,21 @@ pub fn with_sidebar<'a>(
     } else {
         NavBadge::None
     };
-    let share_badge = match share_count {
-        Some(n) => NavBadge::Count(n),
-        None => NavBadge::None,
-    };
+    let share_badge = share_count.map_or(NavBadge::None, NavBadge::Count);
+    let nsec_badge = nsec_count.map_or(NavBadge::None, NavBadge::Count);
 
     let nav_items: Vec<(&str, Message, NavItem, NavBadge)> = vec![
         (
-            "Shares",
+            "FROST Shares",
             Message::NavigateShares,
             NavItem::Shares,
             share_badge,
+        ),
+        (
+            "Nsec Keys",
+            Message::NavigateNsecKeys,
+            NavItem::NsecKeys,
+            nsec_badge,
         ),
         (
             "Create",
