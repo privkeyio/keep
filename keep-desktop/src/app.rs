@@ -39,11 +39,13 @@ use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{
-    DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry, WalletScreen,
+    AnnounceState, DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry,
+    WalletScreen,
 };
 use crate::screen::Screen;
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
+use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
 
@@ -157,6 +159,7 @@ pub struct App {
     pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
+    pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
     cached_share_count: usize,
     cached_nsec_count: usize,
@@ -567,6 +570,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             cached_share_count: 0,
             cached_nsec_count: 0,
@@ -709,7 +713,14 @@ impl App {
             | Message::WalletBeginCoordination
             | Message::WalletCancelSetup
             | Message::WalletSessionStarted(..)
-            | Message::WalletDescriptorProgress(..) => self.handle_wallet_message(message),
+            | Message::WalletDescriptorProgress(..)
+            | Message::WalletStartAnnounce
+            | Message::WalletAnnounceXpubChanged(..)
+            | Message::WalletAnnounceFingerprintChanged(..)
+            | Message::WalletAnnounceLabelChanged(..)
+            | Message::WalletCancelAnnounce
+            | Message::WalletSubmitAnnounce
+            | Message::WalletAnnounceResult(..) => self.handle_wallet_message(message),
 
             Message::RelayUrlChanged(..)
             | Message::ConnectPasswordChanged(..)
@@ -951,7 +962,9 @@ impl App {
             Message::WalletsLoaded(result) => {
                 match result {
                     Ok(entries) => {
-                        self.screen = Screen::Wallet(WalletScreen::new(entries));
+                        let mut ws = WalletScreen::new(entries);
+                        ws.peer_xpubs = self.peer_xpubs.clone();
+                        self.screen = Screen::Wallet(ws);
                     }
                     Err(e) => {
                         self.set_toast(e, ToastKind::Error);
@@ -1420,6 +1433,95 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WalletStartAnnounce => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.announce = Some(AnnounceState {
+                        xpub: String::new(),
+                        fingerprint: String::new(),
+                        label: String::new(),
+                        error: None,
+                        submitting: false,
+                    });
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceXpubChanged(v) => {
+                if let Some(a) = self.announce_state_mut() {
+                    a.xpub = v.chars().take(MAX_XPUB_LENGTH).collect();
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceFingerprintChanged(v) => {
+                if let Some(a) = self.announce_state_mut() {
+                    a.fingerprint = v
+                        .chars()
+                        .filter(|c| c.is_ascii_hexdigit())
+                        .take(8)
+                        .collect();
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceLabelChanged(v) => {
+                if let Some(a) = self.announce_state_mut() {
+                    a.label = v.chars().take(MAX_XPUB_LABEL_LENGTH).collect();
+                }
+                Task::none()
+            }
+            Message::WalletCancelAnnounce => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.announce = None;
+                }
+                Task::none()
+            }
+            Message::WalletSubmitAnnounce => {
+                let Some(a) = self.announce_state_mut() else {
+                    return Task::none();
+                };
+                a.submitting = true;
+                a.error = None;
+                let xpub = a.xpub.trim().to_string();
+                let fingerprint = a.fingerprint.trim().to_string();
+                let label = a.label.trim().to_string();
+
+                let Some(node) = self.get_frost_node() else {
+                    if let Some(a) = self.announce_state_mut() {
+                        a.error = Some("Relay not connected".into());
+                        a.submitting = false;
+                    }
+                    return Task::none();
+                };
+
+                let announced = keep_frost_net::AnnouncedXpub {
+                    xpub,
+                    fingerprint,
+                    label: if label.is_empty() { None } else { Some(label) },
+                };
+
+                Task::perform(
+                    async move {
+                        node.announce_xpubs(vec![announced])
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    Message::WalletAnnounceResult,
+                )
+            }
+            Message::WalletAnnounceResult(result) => {
+                match result {
+                    Ok(()) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.announce = None;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(a) = self.announce_state_mut() {
+                            a.error = Some(e);
+                            a.submitting = false;
+                        }
+                    }
+                }
+                Task::none()
+            }
             _ => Task::none(),
         }
     }
@@ -1779,6 +1881,7 @@ impl App {
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
         self.active_share_hex = None;
         self.active_coordinations.clear();
+        self.peer_xpubs.clear();
         self.identities.clear();
         self.cached_share_count = 0;
         self.cached_nsec_count = 0;
@@ -3372,6 +3475,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             cached_share_count: 0,
             cached_nsec_count: 0,

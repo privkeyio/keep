@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use keep_frost_net::AnnouncedXpub;
+use keep_frost_net::VALID_XPUB_PREFIXES;
 
 use crate::message::Message;
 use crate::screen::shares::ShareEntry;
@@ -69,10 +73,20 @@ pub enum SetupPhase {
     Coordinating(DescriptorProgress),
 }
 
+pub struct AnnounceState {
+    pub xpub: String,
+    pub fingerprint: String,
+    pub label: String,
+    pub error: Option<String>,
+    pub submitting: bool,
+}
+
 pub struct WalletScreen {
     pub descriptors: Vec<WalletEntry>,
     pub expanded: Option<usize>,
     pub setup: Option<SetupState>,
+    pub announce: Option<AnnounceState>,
+    pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
 }
 
 pub struct SetupState {
@@ -91,10 +105,16 @@ impl WalletScreen {
             descriptors,
             expanded: None,
             setup: None,
+            announce: None,
+            peer_xpubs: HashMap::new(),
         }
     }
 
     pub fn view_content(&self) -> Element<'_, Message> {
+        if let Some(announce) = &self.announce {
+            return self.view_announce(announce);
+        }
+
         if let Some(setup) = &self.setup {
             return self.view_setup(setup);
         }
@@ -104,39 +124,52 @@ impl WalletScreen {
             .padding([theme::space::SM, theme::space::LG])
             .on_press(Message::WalletStartSetup);
 
+        let announce_btn = button(text("Announce Recovery Keys").size(theme::size::BODY))
+            .style(theme::secondary_button)
+            .padding([theme::space::SM, theme::space::LG])
+            .on_press(Message::WalletStartAnnounce);
+
         let title_row = row![
             theme::heading("Wallet Descriptors"),
             Space::new().width(Length::Fill),
+            announce_btn,
             setup_btn,
         ]
+        .spacing(theme::space::SM)
         .align_y(Alignment::Center);
 
         let mut content = column![title_row].spacing(theme::space::MD);
 
-        if self.descriptors.is_empty() {
-            let empty = column![
-                text("No wallet descriptors yet")
-                    .size(theme::size::BODY)
-                    .color(theme::color::TEXT_MUTED),
-                text("Use Setup Wallet to coordinate a descriptor with your peers.")
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_DIM),
-            ]
-            .align_x(Alignment::Center)
-            .spacing(theme::space::SM);
+        let mut list = column![].spacing(theme::space::SM);
 
-            content = content.push(
-                container(empty)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill),
+        if self.descriptors.is_empty() {
+            list = list.push(
+                container(
+                    column![
+                        text("No wallet descriptors yet")
+                            .size(theme::size::BODY)
+                            .color(theme::color::TEXT_MUTED),
+                        text("Use Setup Wallet to coordinate a descriptor with your peers.")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_DIM),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(theme::space::SM),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
             );
         } else {
-            let mut list = column![].spacing(theme::space::SM);
             for (i, entry) in self.descriptors.iter().enumerate() {
                 list = list.push(self.wallet_card(i, entry));
             }
-            content = content.push(scrollable(list).height(Length::Fill));
         }
+
+        if !self.peer_xpubs.is_empty() {
+            list = list.push(self.peer_xpubs_card());
+        }
+
+        content = content.push(scrollable(list).height(Length::Fill));
 
         container(content)
             .padding(theme::space::XL)
@@ -472,6 +505,135 @@ impl WalletScreen {
         }
 
         container(card_content)
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_announce<'a>(&self, state: &'a AnnounceState) -> Element<'a, Message> {
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press(Message::WalletCancelAnnounce)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Announce Recovery Key")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
+        let subtitle = text("Share a recovery xpub with your FROST group peers")
+            .size(theme::size::SMALL)
+            .color(theme::color::TEXT_MUTED);
+
+        let xpub_input = text_input("tpub...", &state.xpub)
+            .on_input(Message::WalletAnnounceXpubChanged)
+            .padding(theme::space::SM);
+
+        let fp_input = text_input("8 hex chars", &state.fingerprint)
+            .on_input(Message::WalletAnnounceFingerprintChanged)
+            .padding(theme::space::SM)
+            .width(120);
+
+        let label_input = text_input("e.g. coldcard-backup", &state.label)
+            .on_input(Message::WalletAnnounceLabelChanged)
+            .padding(theme::space::SM);
+
+        let xpub_valid = VALID_XPUB_PREFIXES
+            .iter()
+            .any(|p| state.xpub.starts_with(p));
+        let fp_valid = state.fingerprint.len() == 8
+            && state.fingerprint.chars().all(|c| c.is_ascii_hexdigit());
+        let can_submit = xpub_valid && fp_valid && !state.submitting;
+
+        let mut submit_btn = button(text("Announce").size(theme::size::BODY))
+            .style(theme::primary_button)
+            .padding([theme::space::SM, theme::space::LG]);
+        if can_submit {
+            submit_btn = submit_btn.on_press(Message::WalletSubmitAnnounce);
+        }
+
+        let mut content = column![
+            header,
+            subtitle,
+            Space::new().height(theme::space::SM),
+            theme::label("Extended Public Key"),
+            xpub_input,
+            Space::new().height(theme::space::XS),
+            theme::label("Fingerprint"),
+            fp_input,
+            Space::new().height(theme::space::XS),
+            theme::label("Label (optional)"),
+            label_input,
+            Space::new().height(theme::space::MD),
+            submit_btn,
+        ]
+        .spacing(theme::space::XS);
+
+        if let Some(err) = &state.error {
+            content = content.push(theme::error_text(err.as_str()));
+        }
+
+        container(scrollable(content))
+            .padding(theme::space::XL)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn peer_xpubs_card(&self) -> Element<'_, Message> {
+        let title = text("Announced Recovery Keys")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let mut content = column![title].spacing(theme::space::SM);
+
+        let mut indices: Vec<_> = self.peer_xpubs.keys().copied().collect();
+        indices.sort();
+
+        for idx in indices {
+            let xpubs = &self.peer_xpubs[&idx];
+            let share_label = text(format!("Share {idx}"))
+                .size(theme::size::BODY)
+                .color(theme::color::TEXT);
+
+            let mut share_col = column![share_label].spacing(theme::space::XS);
+
+            for xpub in xpubs {
+                let display = if xpub.xpub.chars().count() > 32 {
+                    let prefix: String = xpub.xpub.chars().take(32).collect();
+                    format!("{prefix}...")
+                } else {
+                    xpub.xpub.clone()
+                };
+
+                let mut xpub_row = row![
+                    text(display)
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                    text(&xpub.fingerprint)
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_MUTED),
+                ]
+                .spacing(theme::space::SM);
+
+                if let Some(label) = &xpub.label {
+                    xpub_row = xpub_row.push(
+                        text(label)
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_MUTED),
+                    );
+                }
+
+                share_col = share_col.push(xpub_row);
+            }
+
+            content = content.push(share_col);
+        }
+
+        container(content)
             .style(theme::card_style)
             .padding(theme::space::LG)
             .width(Length::Fill)
