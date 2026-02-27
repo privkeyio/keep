@@ -565,6 +565,19 @@ pub(crate) async fn frost_event_listener(
                             },
                         );
                     }
+                    Ok(KfpNodeEvent::HealthCheckComplete {
+                        responsive,
+                        unresponsive,
+                        ..
+                    }) => {
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::HealthCheckComplete {
+                                responsive,
+                                unresponsive,
+                            },
+                        );
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -806,6 +819,25 @@ impl App {
                     count = recovery_xpubs.len(),
                     "Received recovery xpub announcement"
                 );
+            }
+            FrostNodeMsg::HealthCheckComplete {
+                responsive,
+                unresponsive,
+            } => {
+                tracing::info!(
+                    responsive = responsive.len(),
+                    unresponsive = unresponsive.len(),
+                    "Health check complete"
+                );
+                if let Some(s) = self.relay_screen_mut() {
+                    for peer in &mut s.peers {
+                        if responsive.contains(&peer.share_index) {
+                            peer.online = true;
+                        } else if unresponsive.contains(&peer.share_index) {
+                            peer.online = false;
+                        }
+                    }
+                }
             }
         }
         iced::Task::none()
