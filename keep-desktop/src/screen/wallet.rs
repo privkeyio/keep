@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
-use keep_frost_net::protocol::VALID_XPUB_PREFIXES;
 use keep_frost_net::AnnouncedXpub;
+use keep_frost_net::VALID_XPUB_PREFIXES;
 
 use crate::message::Message;
 use crate::screen::shares::ShareEntry;
@@ -140,33 +140,36 @@ impl WalletScreen {
 
         let mut content = column![title_row].spacing(theme::space::MD);
 
+        let mut list = column![].spacing(theme::space::SM);
+
         if self.descriptors.is_empty() {
-            let mut inner = column![
-                text("No wallet descriptors yet")
-                    .size(theme::size::BODY)
-                    .color(theme::color::TEXT_MUTED),
-                text("Use Setup Wallet to coordinate a descriptor with your peers.")
-                    .size(theme::size::SMALL)
-                    .color(theme::color::TEXT_DIM),
-            ]
-            .align_x(Alignment::Center)
-            .spacing(theme::space::SM);
-
-            if !self.peer_xpubs.is_empty() {
-                inner = inner.push(self.peer_xpubs_card());
-            }
-
-            content = content.push(scrollable(inner).height(Length::Fill));
+            list = list.push(
+                container(
+                    column![
+                        text("No wallet descriptors yet")
+                            .size(theme::size::BODY)
+                            .color(theme::color::TEXT_MUTED),
+                        text("Use Setup Wallet to coordinate a descriptor with your peers.")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_DIM),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(theme::space::SM),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+            );
         } else {
-            let mut list = column![].spacing(theme::space::SM);
             for (i, entry) in self.descriptors.iter().enumerate() {
                 list = list.push(self.wallet_card(i, entry));
             }
-            if !self.peer_xpubs.is_empty() {
-                list = list.push(self.peer_xpubs_card());
-            }
-            content = content.push(scrollable(list).height(Length::Fill));
         }
+
+        if !self.peer_xpubs.is_empty() {
+            list = list.push(self.peer_xpubs_card());
+        }
+
+        content = content.push(scrollable(list).height(Length::Fill));
 
         container(content)
             .padding(theme::space::XL)
@@ -591,44 +594,43 @@ impl WalletScreen {
         indices.sort();
 
         for idx in indices {
-            if let Some(xpubs) = self.peer_xpubs.get(&idx) {
-                let share_label = text(format!("Share {idx}"))
-                    .size(theme::size::BODY)
-                    .color(theme::color::TEXT);
+            let xpubs = &self.peer_xpubs[&idx];
+            let share_label = text(format!("Share {idx}"))
+                .size(theme::size::BODY)
+                .color(theme::color::TEXT);
 
-                let mut share_col = column![share_label].spacing(theme::space::XS);
+            let mut share_col = column![share_label].spacing(theme::space::XS);
 
-                for xpub in xpubs {
-                    let truncated = if xpub.xpub.len() > 32 {
-                        let prefix: String = xpub.xpub.chars().take(32).collect();
-                        format!("{prefix}...")
-                    } else {
-                        xpub.xpub.clone()
-                    };
+            for xpub in xpubs {
+                let display = if xpub.xpub.chars().count() > 32 {
+                    let prefix: String = xpub.xpub.chars().take(32).collect();
+                    format!("{prefix}...")
+                } else {
+                    xpub.xpub.clone()
+                };
 
-                    let mut xpub_row = row![
-                        text(truncated)
-                            .size(theme::size::TINY)
-                            .color(theme::color::TEXT_DIM),
-                        text(&xpub.fingerprint)
+                let mut xpub_row = row![
+                    text(display)
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                    text(&xpub.fingerprint)
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_MUTED),
+                ]
+                .spacing(theme::space::SM);
+
+                if let Some(label) = &xpub.label {
+                    xpub_row = xpub_row.push(
+                        text(label)
                             .size(theme::size::TINY)
                             .color(theme::color::TEXT_MUTED),
-                    ]
-                    .spacing(theme::space::SM);
-
-                    if let Some(label) = &xpub.label {
-                        xpub_row = xpub_row.push(
-                            text(label)
-                                .size(theme::size::TINY)
-                                .color(theme::color::TEXT_MUTED),
-                        );
-                    }
-
-                    share_col = share_col.push(xpub_row);
+                    );
                 }
 
-                content = content.push(share_col);
+                share_col = share_col.push(xpub_row);
             }
+
+            content = content.push(share_col);
         }
 
         container(content)

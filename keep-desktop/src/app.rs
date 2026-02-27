@@ -45,7 +45,7 @@ use crate::screen::wallet::{
 use crate::screen::Screen;
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
-use keep_frost_net::protocol::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH};
+use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
 
@@ -1446,33 +1446,23 @@ impl App {
                 Task::none()
             }
             Message::WalletAnnounceXpubChanged(v) => {
-                if let Screen::Wallet(WalletScreen {
-                    announce: Some(a), ..
-                }) = &mut self.screen
-                {
+                if let Some(a) = self.announce_state_mut() {
                     a.xpub = v.chars().take(MAX_XPUB_LENGTH).collect();
                 }
                 Task::none()
             }
             Message::WalletAnnounceFingerprintChanged(v) => {
-                if let Screen::Wallet(WalletScreen {
-                    announce: Some(a), ..
-                }) = &mut self.screen
-                {
-                    let filtered: String = v
+                if let Some(a) = self.announce_state_mut() {
+                    a.fingerprint = v
                         .chars()
                         .filter(|c| c.is_ascii_hexdigit())
                         .take(8)
                         .collect();
-                    a.fingerprint = filtered;
                 }
                 Task::none()
             }
             Message::WalletAnnounceLabelChanged(v) => {
-                if let Screen::Wallet(WalletScreen {
-                    announce: Some(a), ..
-                }) = &mut self.screen
-                {
+                if let Some(a) = self.announce_state_mut() {
                     a.label = v.chars().take(MAX_XPUB_LABEL_LENGTH).collect();
                 }
                 Task::none()
@@ -1484,27 +1474,17 @@ impl App {
                 Task::none()
             }
             Message::WalletSubmitAnnounce => {
-                let (xpub, fingerprint, label) = if let Screen::Wallet(WalletScreen {
-                    announce: Some(a),
-                    ..
-                }) = &mut self.screen
-                {
-                    a.submitting = true;
-                    a.error = None;
-                    (
-                        a.xpub.trim().to_string(),
-                        a.fingerprint.trim().to_string(),
-                        a.label.trim().to_string(),
-                    )
-                } else {
+                let Some(a) = self.announce_state_mut() else {
                     return Task::none();
                 };
+                a.submitting = true;
+                a.error = None;
+                let xpub = a.xpub.trim().to_string();
+                let fingerprint = a.fingerprint.trim().to_string();
+                let label = a.label.trim().to_string();
 
                 let Some(node) = self.get_frost_node() else {
-                    if let Screen::Wallet(WalletScreen {
-                        announce: Some(a), ..
-                    }) = &mut self.screen
-                    {
+                    if let Some(a) = self.announce_state_mut() {
                         a.error = Some("Relay not connected".into());
                         a.submitting = false;
                     }
@@ -1527,14 +1507,16 @@ impl App {
                 )
             }
             Message::WalletAnnounceResult(result) => {
-                if let Screen::Wallet(s) = &mut self.screen {
-                    match result {
-                        Ok(()) => s.announce = None,
-                        Err(e) => {
-                            if let Some(a) = &mut s.announce {
-                                a.error = Some(e);
-                                a.submitting = false;
-                            }
+                match result {
+                    Ok(()) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.announce = None;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(a) = self.announce_state_mut() {
+                            a.error = Some(e);
+                            a.submitting = false;
                         }
                     }
                 }
@@ -1899,6 +1881,7 @@ impl App {
         let clear_clipboard = self.clipboard_clear_at.take().is_some();
         self.active_share_hex = None;
         self.active_coordinations.clear();
+        self.peer_xpubs.clear();
         self.identities.clear();
         self.cached_share_count = 0;
         self.cached_nsec_count = 0;

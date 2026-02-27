@@ -536,14 +536,12 @@ impl fmt::Debug for Message {
             Self::WalletDescriptorProgress(..) => f.write_str("WalletDescriptorProgress"),
             Self::WalletStartAnnounce => f.write_str("WalletStartAnnounce"),
             Self::WalletAnnounceXpubChanged(_) => f.write_str("WalletAnnounceXpubChanged(***)"),
-            Self::WalletAnnounceFingerprintChanged(fp) => f
-                .debug_tuple("WalletAnnounceFingerprintChanged")
-                .field(fp)
-                .finish(),
-            Self::WalletAnnounceLabelChanged(l) => f
-                .debug_tuple("WalletAnnounceLabelChanged")
-                .field(l)
-                .finish(),
+            Self::WalletAnnounceFingerprintChanged(_) => {
+                f.write_str("WalletAnnounceFingerprintChanged(<redacted>)")
+            }
+            Self::WalletAnnounceLabelChanged(_) => {
+                f.write_str("WalletAnnounceLabelChanged(<redacted>)")
+            }
             Self::WalletCancelAnnounce => f.write_str("WalletCancelAnnounce"),
             Self::WalletSubmitAnnounce => f.write_str("WalletSubmitAnnounce"),
             Self::WalletAnnounceResult(r) => f

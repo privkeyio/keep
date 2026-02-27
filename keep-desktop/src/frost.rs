@@ -662,6 +662,16 @@ impl App {
         self.frost_node.lock().ok()?.clone()
     }
 
+    pub(crate) fn announce_state_mut(
+        &mut self,
+    ) -> Option<&mut crate::screen::wallet::AnnounceState> {
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.announce.as_mut()
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn update_wallet_setup(
         &mut self,
         session_id: &[u8; 32],
@@ -821,10 +831,10 @@ impl App {
                 );
                 let entry = self.peer_xpubs.entry(share_index).or_default();
                 for xpub in recovery_xpubs {
-                    if entry.len() >= keep_frost_net::protocol::MAX_RECOVERY_XPUBS {
-                        break;
-                    }
-                    if !entry.iter().any(|x| x.xpub == xpub.xpub) {
+                    if let Some(existing) = entry.iter_mut().find(|x| x.xpub == xpub.xpub) {
+                        existing.fingerprint = xpub.fingerprint;
+                        existing.label = xpub.label;
+                    } else if entry.len() < keep_frost_net::MAX_RECOVERY_XPUBS {
                         entry.push(xpub);
                     }
                 }
