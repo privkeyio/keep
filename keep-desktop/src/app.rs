@@ -158,6 +158,8 @@ pub struct App {
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     import_return_to_nsec: bool,
+    cached_share_count: usize,
+    cached_nsec_count: usize,
 }
 
 pub(crate) fn lock_keep(
@@ -566,6 +568,8 @@ impl App {
             scanner_rx: None,
             active_coordinations: HashMap::new(),
             import_return_to_nsec: false,
+            cached_share_count: 0,
+            cached_nsec_count: 0,
             settings,
             kill_switch,
             tray,
@@ -1623,13 +1627,15 @@ impl App {
             switcher_open: self.identity_switcher_open,
             delete_confirm: self.delete_identity_confirm.as_deref(),
         };
-        let share_count = match &self.screen {
-            Screen::ShareList(s) if !s.shares.is_empty() => Some(s.shares.len()),
-            _ => None,
+        let share_count = if self.cached_share_count > 0 {
+            Some(self.cached_share_count)
+        } else {
+            None
         };
-        let nsec_count = match &self.screen {
-            Screen::NsecKeys(s) if !s.keys.is_empty() => Some(s.keys.len()),
-            _ => None,
+        let nsec_count = if self.cached_nsec_count > 0 {
+            Some(self.cached_nsec_count)
+        } else {
+            None
         };
         let screen = self.screen.view(
             &sidebar_state,
@@ -1774,6 +1780,8 @@ impl App {
         self.active_share_hex = None;
         self.active_coordinations.clear();
         self.identities.clear();
+        self.cached_share_count = 0;
+        self.cached_nsec_count = 0;
         self.identity_switcher_open = false;
         self.delete_identity_confirm = None;
         self.toast = None;
@@ -1802,6 +1810,8 @@ impl App {
 
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
+        self.cached_share_count = shares.len();
+        self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
         if matches!(self.screen, Screen::NsecKeys(_)) {
@@ -1814,6 +1824,8 @@ impl App {
     }
 
     fn set_share_screen(&mut self, shares: Vec<ShareEntry>) {
+        self.cached_share_count = shares.len();
+        self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
         self.screen =
@@ -1834,6 +1846,7 @@ impl App {
 
     fn set_nsec_keys_screen(&mut self) {
         let keys = self.current_nsec_keys();
+        self.cached_nsec_count = keys.len();
         self.screen = Screen::NsecKeys(NsecKeysScreen::new(keys, self.active_share_hex.clone()));
     }
 
@@ -1887,7 +1900,12 @@ impl App {
                         }
                         self.set_toast(friendly_err(e), ToastKind::Error);
                     }
-                    None => {}
+                    None => {
+                        if let Screen::NsecKeys(s) = &mut self.screen {
+                            s.delete_confirm = None;
+                        }
+                        self.set_toast("Vault locked or unavailable".into(), ToastKind::Error);
+                    }
                 }
                 Task::none()
             }
@@ -2356,7 +2374,7 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok((shares, name)) => {
-                self.resolve_active_share(&shares);
+                self.cached_share_count = shares.len();
                 self.refresh_identities(&shares);
                 self.set_nsec_keys_screen();
                 self.set_toast(
@@ -3355,6 +3373,8 @@ impl App {
             scanner_rx: None,
             active_coordinations: HashMap::new(),
             import_return_to_nsec: false,
+            cached_share_count: 0,
+            cached_nsec_count: 0,
             settings,
             kill_switch,
             tray: None,
