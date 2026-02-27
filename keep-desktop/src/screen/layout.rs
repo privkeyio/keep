@@ -68,14 +68,8 @@ pub fn with_sidebar<'a>(
     } else {
         NavBadge::None
     };
-    let share_badge = match share_count {
-        Some(n) => NavBadge::Count(n),
-        None => NavBadge::None,
-    };
-    let nsec_badge = match nsec_count {
-        Some(n) => NavBadge::Count(n),
-        None => NavBadge::None,
-    };
+    let share_badge = share_count.map_or(NavBadge::None, NavBadge::Count);
+    let nsec_badge = nsec_count.map_or(NavBadge::None, NavBadge::Count);
 
     let nav_items: Vec<(&str, Message, NavItem, NavBadge)> = vec![
         (

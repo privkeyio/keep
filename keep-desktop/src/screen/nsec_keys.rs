@@ -36,10 +36,6 @@ impl NsecKeyEntry {
         })
     }
 
-    fn truncated_npub(&self) -> String {
-        truncate_npub(&self.npub)
-    }
-
     fn created_display(&self) -> String {
         format_timestamp(self.created_at)
     }
@@ -135,9 +131,7 @@ impl NsecKeysScreen {
     fn key_card<'a>(&self, i: usize, key: &NsecKeyEntry) -> Element<'a, Message> {
         let is_active = self.active_key_hex.as_deref() == Some(&key.pubkey_hex);
 
-        let truncated_npub = key.truncated_npub();
-
-        let npub_text = text(truncated_npub)
+        let npub_text = text(truncate_npub(&key.npub))
             .size(theme::size::SMALL)
             .color(theme::color::TEXT_MUTED);
 

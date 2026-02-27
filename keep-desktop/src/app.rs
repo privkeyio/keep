@@ -903,9 +903,9 @@ impl App {
             Message::GoBack => {
                 self.stop_scanner();
                 self.copy_feedback_until = None;
-                if matches!(self.screen, Screen::ExportNcryptsec(_)) {
-                    self.set_nsec_keys_screen();
-                } else if matches!(self.screen, Screen::Import(_)) && self.import_return_to_nsec {
+                let return_to_nsec = matches!(self.screen, Screen::ExportNcryptsec(_))
+                    || (matches!(self.screen, Screen::Import(_)) && self.import_return_to_nsec);
+                if return_to_nsec {
                     self.import_return_to_nsec = false;
                     self.set_nsec_keys_screen();
                 } else {
@@ -1804,8 +1804,7 @@ impl App {
         let shares = self.current_shares();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
-        let is_nsec_screen = matches!(self.screen, Screen::NsecKeys(_));
-        if is_nsec_screen {
+        if matches!(self.screen, Screen::NsecKeys(_)) {
             self.set_nsec_keys_screen();
         } else if let Screen::ShareList(s) = &mut self.screen {
             s.shares = shares;
@@ -1854,15 +1853,16 @@ impl App {
                 Task::none()
             }
             Message::ConfirmDeleteNsecKey(hex) => {
-                let (pubkey, name) = match &self.screen {
-                    Screen::NsecKeys(s) if s.delete_confirm.as_deref() == Some(hex.as_str()) => {
-                        match s.keys.iter().find(|k| k.pubkey_hex == hex) {
-                            Some(k) => (k.pubkey, k.name.clone()),
-                            None => return Task::none(),
-                        }
-                    }
-                    _ => return Task::none(),
+                let Screen::NsecKeys(s) = &self.screen else {
+                    return Task::none();
                 };
+                if s.delete_confirm.as_deref() != Some(hex.as_str()) {
+                    return Task::none();
+                }
+                let Some(key) = s.keys.iter().find(|k| k.pubkey_hex == hex) else {
+                    return Task::none();
+                };
+                let (pubkey, name) = (key.pubkey, key.name.clone());
                 if self.active_share_hex.as_deref() == Some(hex.as_str()) {
                     self.handle_disconnect_relay();
                     self.stop_bunker();
