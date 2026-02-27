@@ -324,6 +324,10 @@ pub enum FrostNodeMsg {
         share_index: u16,
         recovery_xpubs: Vec<AnnouncedXpub>,
     },
+    HealthCheckComplete {
+        responsive: Vec<u16>,
+        unresponsive: Vec<u16>,
+    },
 }
 
 impl fmt::Debug for FrostNodeMsg {
@@ -389,6 +393,14 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("XpubAnnounced")
                 .field("share_index", share_index)
                 .field("xpub_count", &recovery_xpubs.len())
+                .finish(),
+            Self::HealthCheckComplete {
+                responsive,
+                unresponsive,
+            } => f
+                .debug_struct("HealthCheckComplete")
+                .field("responsive", &responsive.len())
+                .field("unresponsive", &unresponsive.len())
                 .finish(),
         }
     }
