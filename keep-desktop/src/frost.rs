@@ -819,6 +819,14 @@ impl App {
                     count = recovery_xpubs.len(),
                     "Received recovery xpub announcement"
                 );
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    let entry = ws.peer_xpubs.entry(share_index).or_default();
+                    for xpub in recovery_xpubs {
+                        if !entry.iter().any(|x| x.xpub == xpub.xpub) {
+                            entry.push(xpub);
+                        }
+                    }
+                }
             }
             FrostNodeMsg::HealthCheckComplete {
                 responsive,

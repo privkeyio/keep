@@ -202,6 +202,13 @@ pub enum Message {
     WalletCancelSetup,
     WalletSessionStarted(Result<([u8; 32], [u8; 32], String, usize), String>),
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
+    WalletStartAnnounce,
+    WalletAnnounceXpubChanged(String),
+    WalletAnnounceFingerprintChanged(String),
+    WalletAnnounceLabelChanged(String),
+    WalletCancelAnnounce,
+    WalletSubmitAnnounce,
+    WalletAnnounceResult(Result<(), String>),
     // Relay / FROST
     RelayUrlChanged(String),
     ConnectPasswordChanged(Zeroizing<String>),
@@ -527,6 +534,22 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),
             Self::WalletDescriptorProgress(..) => f.write_str("WalletDescriptorProgress"),
+            Self::WalletStartAnnounce => f.write_str("WalletStartAnnounce"),
+            Self::WalletAnnounceXpubChanged(_) => f.write_str("WalletAnnounceXpubChanged(***)"),
+            Self::WalletAnnounceFingerprintChanged(fp) => f
+                .debug_tuple("WalletAnnounceFingerprintChanged")
+                .field(fp)
+                .finish(),
+            Self::WalletAnnounceLabelChanged(l) => f
+                .debug_tuple("WalletAnnounceLabelChanged")
+                .field(l)
+                .finish(),
+            Self::WalletCancelAnnounce => f.write_str("WalletCancelAnnounce"),
+            Self::WalletSubmitAnnounce => f.write_str("WalletSubmitAnnounce"),
+            Self::WalletAnnounceResult(r) => f
+                .debug_tuple("WalletAnnounceResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
             Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
             Self::ConnectPasswordChanged(_) => f.write_str("ConnectPasswordChanged(***)"),
             Self::AddRelay => f.write_str("AddRelay"),

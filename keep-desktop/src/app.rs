@@ -39,7 +39,8 @@ use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
 use crate::screen::unlock::UnlockScreen;
 use crate::screen::wallet::{
-    DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry, WalletScreen,
+    AnnounceState, DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry,
+    WalletScreen,
 };
 use crate::screen::Screen;
 use crate::theme;
@@ -709,7 +710,14 @@ impl App {
             | Message::WalletBeginCoordination
             | Message::WalletCancelSetup
             | Message::WalletSessionStarted(..)
-            | Message::WalletDescriptorProgress(..) => self.handle_wallet_message(message),
+            | Message::WalletDescriptorProgress(..)
+            | Message::WalletStartAnnounce
+            | Message::WalletAnnounceXpubChanged(..)
+            | Message::WalletAnnounceFingerprintChanged(..)
+            | Message::WalletAnnounceLabelChanged(..)
+            | Message::WalletCancelAnnounce
+            | Message::WalletSubmitAnnounce
+            | Message::WalletAnnounceResult(..) => self.handle_wallet_message(message),
 
             Message::RelayUrlChanged(..)
             | Message::ConnectPasswordChanged(..)
@@ -1416,6 +1424,113 @@ impl App {
                 } else if matches!(progress, DescriptorProgress::Contributed) {
                     if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
                         s.phase = SetupPhase::Coordinating(progress);
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletStartAnnounce => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.announce = Some(AnnounceState {
+                        xpub: String::new(),
+                        fingerprint: String::new(),
+                        label: String::new(),
+                        error: None,
+                        submitting: false,
+                    });
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceXpubChanged(v) => {
+                if let Screen::Wallet(WalletScreen {
+                    announce: Some(a), ..
+                }) = &mut self.screen
+                {
+                    a.xpub = v;
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceFingerprintChanged(v) => {
+                if let Screen::Wallet(WalletScreen {
+                    announce: Some(a), ..
+                }) = &mut self.screen
+                {
+                    let filtered: String = v
+                        .chars()
+                        .filter(|c| c.is_ascii_hexdigit())
+                        .take(8)
+                        .collect();
+                    a.fingerprint = filtered;
+                }
+                Task::none()
+            }
+            Message::WalletAnnounceLabelChanged(v) => {
+                if let Screen::Wallet(WalletScreen {
+                    announce: Some(a), ..
+                }) = &mut self.screen
+                {
+                    a.label = v;
+                }
+                Task::none()
+            }
+            Message::WalletCancelAnnounce => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.announce = None;
+                }
+                Task::none()
+            }
+            Message::WalletSubmitAnnounce => {
+                let (xpub, fingerprint, label) = if let Screen::Wallet(WalletScreen {
+                    announce: Some(a),
+                    ..
+                }) = &mut self.screen
+                {
+                    a.submitting = true;
+                    a.error = None;
+                    (
+                        a.xpub.trim().to_string(),
+                        a.fingerprint.trim().to_string(),
+                        a.label.trim().to_string(),
+                    )
+                } else {
+                    return Task::none();
+                };
+
+                let Some(node) = self.get_frost_node() else {
+                    if let Screen::Wallet(WalletScreen {
+                        announce: Some(a), ..
+                    }) = &mut self.screen
+                    {
+                        a.error = Some("Relay not connected".into());
+                        a.submitting = false;
+                    }
+                    return Task::none();
+                };
+
+                let announced = keep_frost_net::AnnouncedXpub {
+                    xpub,
+                    fingerprint,
+                    label: if label.is_empty() { None } else { Some(label) },
+                };
+
+                Task::perform(
+                    async move {
+                        node.announce_xpubs(vec![announced])
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    Message::WalletAnnounceResult,
+                )
+            }
+            Message::WalletAnnounceResult(result) => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    match result {
+                        Ok(()) => s.announce = None,
+                        Err(e) => {
+                            if let Some(a) = &mut s.announce {
+                                a.error = Some(e);
+                                a.submitting = false;
+                            }
+                        }
                     }
                 }
                 Task::none()
