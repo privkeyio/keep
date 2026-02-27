@@ -157,6 +157,7 @@ pub struct App {
     pub(crate) pin_mismatch_confirm: bool,
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
+    import_return_to_nsec: bool,
 }
 
 pub(crate) fn lock_keep(
@@ -564,6 +565,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            import_return_to_nsec: false,
             settings,
             kill_switch,
             tray,
@@ -878,6 +880,7 @@ impl App {
                 Task::none()
             }
             Message::GoToImport => {
+                self.import_return_to_nsec = matches!(self.screen, Screen::NsecKeys(_));
                 self.screen = Screen::Import(ImportScreen::new());
                 Task::none()
             }
@@ -901,6 +904,9 @@ impl App {
                 self.stop_scanner();
                 self.copy_feedback_until = None;
                 if matches!(self.screen, Screen::ExportNcryptsec(_)) {
+                    self.set_nsec_keys_screen();
+                } else if matches!(self.screen, Screen::Import(_)) && self.import_return_to_nsec {
+                    self.import_return_to_nsec = false;
                     self.set_nsec_keys_screen();
                 } else {
                     self.set_share_screen(self.current_shares());
@@ -1876,6 +1882,9 @@ impl App {
                         self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
                     }
                     Some(Err(e)) => {
+                        if let Screen::NsecKeys(s) = &mut self.screen {
+                            s.delete_confirm = None;
+                        }
                         self.set_toast(friendly_err(e), ToastKind::Error);
                     }
                     None => {}
@@ -3345,6 +3354,7 @@ impl App {
             tray_last_bunker: false,
             scanner_rx: None,
             active_coordinations: HashMap::new(),
+            import_return_to_nsec: false,
             settings,
             kill_switch,
             tray: None,
