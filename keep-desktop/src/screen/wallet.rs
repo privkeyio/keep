@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use keep_frost_net::AnnouncedXpub;
@@ -483,10 +482,8 @@ impl WalletScreen {
                 .color(theme::color::TEXT_DIM);
 
             let created = i64::try_from(entry.created_at)
-                .ok()
-                .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| entry.created_at.to_string());
+                .map(keep_core::display::format_timestamp)
+                .unwrap_or_else(|_| entry.created_at.to_string());
             let created_text = text(format!("Created: {created}"))
                 .size(theme::size::SMALL)
                 .color(theme::color::TEXT_MUTED);

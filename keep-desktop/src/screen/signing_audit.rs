@@ -263,9 +263,7 @@ impl SigningAuditScreen {
             );
         }
 
-        let timestamp = chrono::DateTime::from_timestamp(entry.timestamp, 0)
-            .map(|dt| dt.format("%b %d, %Y %H:%M:%S").to_string())
-            .unwrap_or_else(|| entry.timestamp.to_string());
+        let timestamp = keep_core::display::format_timestamp_detailed(entry.timestamp);
 
         let time_text = text(timestamp)
             .size(theme::size::TINY)
@@ -280,10 +278,7 @@ impl SigningAuditScreen {
 }
 
 fn truncate_hex(s: &str) -> String {
-    if s.len() <= 20 || !s.is_ascii() {
-        return s.to_string();
-    }
-    format!("{}...{}", &s[..8], &s[s.len() - 6..])
+    keep_core::display::truncate_str(s, 8, 6)
 }
 
 fn format_request_type(rt: &str) -> String {
