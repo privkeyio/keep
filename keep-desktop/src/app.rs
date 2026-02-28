@@ -185,7 +185,10 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
             "Decryption failed - wrong password or corrupted data".into()
         }
         KeepError::Locked => "Vault is locked".into(),
-        KeepError::Database(ref msg) => format!("Database error: {msg}"),
+        KeepError::Database(msg) => {
+            tracing::warn!("Database error: {msg}");
+            "Database error".into()
+        }
         KeepError::AlreadyExists(_) => "Vault already exists".into(),
         KeepError::NotFound(_) => "Vault not found".into(),
         KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
@@ -201,7 +204,7 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::Io(_) => "File system error".into(),
         _ => {
             tracing::warn!("Unmapped keep error: {e}");
-            format!("{e}")
+            "Operation failed".into()
         }
     }
 }
@@ -1654,6 +1657,10 @@ impl App {
         self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
+        self.frost_last_share = None;
+        self.frost_last_relay_urls = None;
+        self.nostrconnect_pending = None;
+        self.bunker_pending_setup = None;
         self.pin_mismatch = None;
         self.pin_mismatch_confirm = false;
         self.bunker_cert_pin_failed = false;
