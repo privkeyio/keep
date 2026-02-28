@@ -129,6 +129,11 @@ fn run(out: &Output) -> Result<()> {
         Commands::Agent { command } => dispatch_agent(out, &path, command, hidden),
         Commands::Config { command } => dispatch_config(out, &cfg, command),
         Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
+        Commands::Backup { output } => commands::vault::cmd_backup(out, &path, output.as_deref()),
+        Commands::Restore { file, target } => {
+            let target = target.as_deref().unwrap_or(&path);
+            commands::vault::cmd_restore(out, &file, target)
+        }
     }
 }
 

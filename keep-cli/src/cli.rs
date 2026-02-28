@@ -94,6 +94,16 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: Option<MigrateCommands>,
     },
+    Backup {
+        #[arg(short, long, help = "Output file path")]
+        output: Option<PathBuf>,
+    },
+    Restore {
+        #[arg(help = "Backup file to restore from")]
+        file: PathBuf,
+        #[arg(long, help = "Target vault path")]
+        target: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]

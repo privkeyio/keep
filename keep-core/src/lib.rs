@@ -36,6 +36,8 @@
 pub mod audit;
 /// Pluggable storage backends.
 pub mod backend;
+/// Portable encrypted vault backup and restore.
+pub mod backup;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
 /// Display formatting helpers for truncation and timestamps.
@@ -950,6 +952,16 @@ impl Keep {
     /// Exposed for FROST/FrostSigner integration to decrypt stored shares.
     pub fn data_key(&self) -> Result<SecretKey> {
         self.get_data_key()
+    }
+
+    /// Store a pre-encrypted key record directly (for backup restore).
+    pub fn restore_key_record(&self, record: &KeyRecord) -> Result<()> {
+        self.storage.store_key(record)
+    }
+
+    /// Store a pre-encrypted share directly (for backup restore).
+    pub fn restore_stored_share(&self, share: &StoredShare) -> Result<()> {
+        self.storage.store_share(share)
     }
 
     fn audit_event<F>(&mut self, event_type: AuditEventType, builder: F)
