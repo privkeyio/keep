@@ -28,6 +28,7 @@ interface KeepMobileError {
     InitializationFailed(string msg);
     NotSupported(string msg);
     Serialization(string msg);
+    InvalidInput(string msg);
     PubkeyMismatch();
     RateLimited();
     InvalidTimestamp();

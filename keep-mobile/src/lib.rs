@@ -1079,7 +1079,7 @@ impl KeepMobile {
 
     pub fn save_proxy_config(&self, config: ProxyConfigInfo) -> Result<(), KeepMobileError> {
         if config.port == 0 {
-            return Err(KeepMobileError::InvalidRelayUrl {
+            return Err(KeepMobileError::InvalidInput {
                 msg: "proxy port must be non-zero".into(),
             });
         }

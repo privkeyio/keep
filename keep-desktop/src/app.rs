@@ -391,42 +391,44 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
 }
 
 fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
-    match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
+    let global_exists = match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(e) => {
             tracing::warn!("Failed to check existing relay config, skipping migration: {e}");
             return;
         }
-    }
+    };
 
-    let mut config = keep_core::RelayConfig::new_global();
+    if !global_exists {
+        let mut config = keep_core::RelayConfig::new_global();
 
-    let relay_path = keep_path.join("relays.json");
-    if let Ok(contents) = std::fs::read_to_string(&relay_path) {
-        if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
-            if !urls.is_empty() {
-                config.frost_relays = urls;
+        let relay_path = keep_path.join("relays.json");
+        if let Ok(contents) = std::fs::read_to_string(&relay_path) {
+            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                if !urls.is_empty() {
+                    config.frost_relays = urls;
+                }
             }
         }
-    }
 
-    let bunker_path = keep_path.join("bunker-relays.json");
-    if let Ok(contents) = std::fs::read_to_string(&bunker_path) {
-        if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
-            if !urls.is_empty() {
-                config.bunker_relays = urls;
+        let bunker_path = keep_path.join("bunker-relays.json");
+        if let Ok(contents) = std::fs::read_to_string(&bunker_path) {
+            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                if !urls.is_empty() {
+                    config.bunker_relays = urls;
+                }
             }
         }
-    }
 
-    match keep.store_relay_config(&config) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&relay_path);
-            let _ = std::fs::remove_file(&bunker_path);
-        }
-        Err(e) => {
-            tracing::warn!("Failed to migrate global relay config to vault: {e}");
+        match keep.store_relay_config(&config) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&relay_path);
+                let _ = std::fs::remove_file(&bunker_path);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to migrate global relay config to vault: {e}");
+            }
         }
     }
 
@@ -444,7 +446,13 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
                 .unwrap_or(DEFAULT_PROXY_PORT);
             if enabled || port != DEFAULT_PROXY_PORT {
                 let proxy = keep_core::ProxyConfig { enabled, port };
-                let _ = keep.set_proxy_config(&proxy);
+                if let Err(e) = keep.set_proxy_config(&proxy) {
+                    tracing::warn!(
+                        enabled,
+                        port,
+                        "Failed to migrate proxy config to vault: {e}"
+                    );
+                }
             }
         }
     }
@@ -2229,8 +2237,8 @@ impl App {
         match result {
             Ok(shares) => {
                 self.reconcile_kill_switch();
-                self.load_config_from_vault();
                 self.set_share_screen(shares);
+                self.load_config_from_vault();
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }
