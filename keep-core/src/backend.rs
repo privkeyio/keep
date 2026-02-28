@@ -294,8 +294,24 @@ impl RedbBackend {
 
         info!("database file format upgrade complete");
 
-        migration::check_compatibility(&new_db)?;
-        let result = migration::run_migrations(&new_db)?;
+        let migrate_result: Result<migration::MigrationResult> = (|| {
+            migration::check_compatibility(&new_db)?;
+            migration::run_migrations(&new_db)
+        })();
+        let result = match migrate_result {
+            Ok(r) => r,
+            Err(e) => {
+                drop(new_db);
+                let _ = std::fs::remove_file(path);
+                if let Err(re) = std::fs::rename(&backup_path, path) {
+                    error!(
+                        "failed to restore backup after migration failure: {re}; \
+                         backup is at {backup_path:?}"
+                    );
+                }
+                return Err(e);
+            }
+        };
         if result.migrations_run > 0 {
             info!(
                 count = result.migrations_run,
