@@ -114,6 +114,22 @@ pub struct AnnouncedXpubInfo {
     pub label: Option<String>,
 }
 
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error { message: String },
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct KeepLiveState {
+    pub rev: u64,
+    pub connection_status: ConnectionStatus,
+    pub peers: Vec<PeerInfo>,
+    pub pending_requests: Vec<SignRequest>,
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct KeyHealthStatusInfo {
     pub group_pubkey: String,
