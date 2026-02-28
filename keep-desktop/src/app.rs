@@ -299,6 +299,12 @@ pub(crate) fn save_cert_pins(
     }
 }
 
+fn parse_hex_key(hex: &str) -> Option<[u8; 32]> {
+    hex::decode(hex)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+}
+
 fn write_private(path: &std::path::Path, data: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or(path);
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
@@ -444,34 +450,34 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(hex) = name_str
+            let Some(hex) = name_str
                 .strip_prefix("relays-")
                 .and_then(|s| s.strip_suffix(".json"))
-            {
-                if let Ok(bytes) = hex::decode(hex) {
-                    if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                        let mut per_key_config = keep_core::RelayConfig::new(key);
-                        if let Ok(contents) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
-                                per_key_config.frost_relays = urls;
-                            }
-                        }
-                        let bunker_file = keep_path.join(format!("bunker-relays-{hex}.json"));
-                        if let Ok(contents) = std::fs::read_to_string(&bunker_file) {
-                            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
-                                per_key_config.bunker_relays = urls;
-                            }
-                        }
-                        match keep.store_relay_config(&per_key_config) {
-                            Ok(()) => {
-                                let _ = std::fs::remove_file(entry.path());
-                                let _ = std::fs::remove_file(&bunker_file);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to migrate relay config for {hex}: {e}");
-                            }
-                        }
-                    }
+            else {
+                continue;
+            };
+            let Some(key) = parse_hex_key(hex) else {
+                continue;
+            };
+            let mut per_key_config = keep_core::RelayConfig::new(key);
+            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                    per_key_config.frost_relays = urls;
+                }
+            }
+            let bunker_file = keep_path.join(format!("bunker-relays-{hex}.json"));
+            if let Ok(contents) = std::fs::read_to_string(&bunker_file) {
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&contents) {
+                    per_key_config.bunker_relays = urls;
+                }
+            }
+            match keep.store_relay_config(&per_key_config) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(entry.path());
+                    let _ = std::fs::remove_file(&bunker_file);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to migrate relay config for {hex}: {e}");
                 }
             }
         }
@@ -1955,13 +1961,9 @@ impl App {
                 };
                 match delete_result {
                     Some(Ok(())) => {
-                        if let Ok(bytes) = hex::decode(&hex) {
-                            if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                                let guard = lock_keep(&self.keep);
-                                if let Some(keep) = guard.as_ref() {
-                                    let _ = keep.delete_relay_config(&key);
-                                }
-                            }
+                        let guard = lock_keep(&self.keep);
+                        if let Some(keep) = guard.as_ref() {
+                            let _ = keep.delete_relay_config(&pubkey);
                         }
                         self.refresh_shares();
                         self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
@@ -2167,46 +2169,34 @@ impl App {
     }
 
     fn active_group_pubkey_bytes(&self) -> Option<[u8; 32]> {
-        self.active_share_hex
-            .as_ref()
-            .and_then(|hex| hex::decode(hex).ok())
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        self.active_share_hex.as_deref().and_then(parse_hex_key)
+    }
+
+    fn update_relay_config(&self, f: impl FnOnce(&mut keep_core::RelayConfig)) {
+        let guard = lock_keep(&self.keep);
+        let Some(keep) = guard.as_ref() else { return };
+        let key = self
+            .active_group_pubkey_bytes()
+            .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
+        let mut config = keep
+            .get_relay_config(&key)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| keep_core::RelayConfig::new(key));
+        f(&mut config);
+        if let Err(e) = keep.store_relay_config(&config) {
+            tracing::error!("Failed to save relay config: {e}");
+        }
     }
 
     pub(crate) fn save_relay_urls(&self) {
-        let guard = lock_keep(&self.keep);
-        if let Some(keep) = guard.as_ref() {
-            let key = self
-                .active_group_pubkey_bytes()
-                .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
-            let mut config = keep
-                .get_relay_config(&key)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| keep_core::RelayConfig::new(key));
-            config.frost_relays = self.relay_urls.clone();
-            if let Err(e) = keep.store_relay_config(&config) {
-                tracing::error!("Failed to save relay config: {e}");
-            }
-        }
+        let urls = self.relay_urls.clone();
+        self.update_relay_config(|config| config.frost_relays = urls);
     }
 
     pub(crate) fn save_bunker_relays(&self) {
-        let guard = lock_keep(&self.keep);
-        if let Some(keep) = guard.as_ref() {
-            let key = self
-                .active_group_pubkey_bytes()
-                .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
-            let mut config = keep
-                .get_relay_config(&key)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| keep_core::RelayConfig::new(key));
-            config.bunker_relays = self.bunker_relays.clone();
-            if let Err(e) = keep.store_relay_config(&config) {
-                tracing::error!("Failed to save bunker relay config: {e}");
-            }
-        }
+        let relays = self.bunker_relays.clone();
+        self.update_relay_config(|config| config.bunker_relays = relays);
     }
 
     fn save_proxy_config(&self) {
@@ -2248,6 +2238,15 @@ impl App {
         Task::none()
     }
 
+    fn apply_relay_config(&mut self, config: keep_core::RelayConfig) {
+        self.relay_urls = config.frost_relays;
+        self.bunker_relays = if config.bunker_relays.is_empty() {
+            default_bunker_relays()
+        } else {
+            config.bunker_relays
+        };
+    }
+
     fn load_config_from_vault(&mut self) {
         let guard = lock_keep(&self.keep);
         let Some(keep) = guard.as_ref() else {
@@ -2262,13 +2261,7 @@ impl App {
         let relay_config = keep
             .get_relay_config_or_default(&key)
             .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
-        self.relay_urls = relay_config.frost_relays;
-        let bunker = relay_config.bunker_relays;
-        if !bunker.is_empty() {
-            self.bunker_relays = bunker;
-        } else {
-            self.bunker_relays = default_bunker_relays();
-        }
+        self.apply_relay_config(relay_config);
 
         let proxy = keep.get_proxy_config().unwrap_or_default();
         self.proxy_enabled = proxy.enabled;
@@ -2889,23 +2882,13 @@ impl App {
                 self.handle_disconnect_relay();
                 self.stop_bunker();
 
-                {
+                if let Some(key) = parse_hex_key(&pubkey_hex) {
                     let guard = lock_keep(&self.keep);
                     if let Some(keep) = guard.as_ref() {
-                        if let Ok(bytes) = hex::decode(&pubkey_hex) {
-                            if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                                let config = keep
-                                    .get_relay_config_or_default(&key)
-                                    .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
-                                self.relay_urls = config.frost_relays;
-                                let bunker = config.bunker_relays;
-                                if !bunker.is_empty() {
-                                    self.bunker_relays = bunker;
-                                } else {
-                                    self.bunker_relays = default_bunker_relays();
-                                }
-                            }
-                        }
+                        let config = keep
+                            .get_relay_config_or_default(&key)
+                            .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
+                        self.apply_relay_config(config);
                     }
                 }
 
@@ -2921,12 +2904,10 @@ impl App {
                     .iter()
                     .any(|i| i.pubkey_hex == pubkey_hex && matches!(i.kind, IdentityKind::Nsec));
                 if is_nsec {
-                    if let Ok(bytes) = hex::decode(&pubkey_hex) {
-                        if let Ok(pubkey_bytes) = <[u8; 32]>::try_from(bytes) {
-                            let mut guard = lock_keep(&self.keep);
-                            if let Some(keep) = guard.as_mut() {
-                                let _ = keep.keyring_mut().set_primary(pubkey_bytes);
-                            }
+                    if let Some(pubkey_bytes) = parse_hex_key(&pubkey_hex) {
+                        let mut guard = lock_keep(&self.keep);
+                        if let Some(keep) = guard.as_mut() {
+                            let _ = keep.keyring_mut().set_primary(pubkey_bytes);
                         }
                     }
                 }
@@ -3050,15 +3031,12 @@ impl App {
                 };
 
                 if result {
-                    if let Ok(bytes) = hex::decode(&pubkey_hex) {
-                        if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                            let guard = lock_keep(&self.keep);
-                            if let Some(keep) = guard.as_ref() {
-                                let _ = keep.delete_relay_config(&key);
-                            }
+                    if let Some(key) = parse_hex_key(&pubkey_hex) {
+                        let guard = lock_keep(&self.keep);
+                        if let Some(keep) = guard.as_ref() {
+                            let _ = keep.delete_relay_config(&key);
                         }
                     }
-
                     self.refresh_shares();
                     self.set_toast(format!("'{}' deleted", identity.name), ToastKind::Success);
                 }
