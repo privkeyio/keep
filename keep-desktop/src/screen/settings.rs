@@ -168,7 +168,9 @@ impl SettingsScreen {
                 }
                 self.kill_switch_loading = true;
                 self.kill_switch_error = None;
-                Some(Event::KillSwitchDeactivate(self.kill_switch_password.clone()))
+                Some(Event::KillSwitchDeactivate(
+                    self.kill_switch_password.clone(),
+                ))
             }
             Message::CertPinClear(hostname) => Some(Event::CertPinClear(hostname)),
             Message::CertPinClearAllRequest => {

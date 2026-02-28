@@ -103,7 +103,9 @@ pub enum Message {
 pub enum Event {
     StartSetup,
     BeginCoordination,
-    CancelSetup { session_id: Option<[u8; 32]> },
+    CancelSetup {
+        session_id: Option<[u8; 32]>,
+    },
     StartAnnounce,
     SubmitAnnounce {
         xpub: String,
@@ -145,7 +147,11 @@ impl State {
     pub fn update(&mut self, message: Message) -> Option<Event> {
         match message {
             Message::ToggleDetails(i) => {
-                self.expanded = if self.expanded == Some(i) { None } else { Some(i) };
+                self.expanded = if self.expanded == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
                 None
             }
             Message::StartSetup => Some(Event::StartSetup),

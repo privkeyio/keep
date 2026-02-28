@@ -27,9 +27,6 @@ use crate::message::{
     PeerEntry, PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
-use crate::screen::{
-    create, export, export_ncryptsec, import, nsec_keys, relay, scanner, shares, wallet,
-};
 use crate::screen::layout::SidebarState;
 use crate::screen::nsec_keys::NsecKeyEntry;
 use crate::screen::settings::SettingsScreen;
@@ -38,6 +35,9 @@ use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditS
 use crate::screen::unlock;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, WalletEntry};
 use crate::screen::Screen;
+use crate::screen::{
+    create, export, export_ncryptsec, import, nsec_keys, relay, scanner, shares, wallet,
+};
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
 
@@ -821,13 +821,8 @@ impl App {
                             match result {
                                 Ok(r) => r,
                                 Err(payload) => {
-                                    error!(
-                                        "Panic during start fresh: {:?}",
-                                        payload.type_id()
-                                    );
-                                    Err(
-                                        "Internal error; please restart the application".into(),
-                                    )
+                                    error!("Panic during start fresh: {:?}", payload.type_id());
+                                    Err("Internal error; please restart the application".into())
                                 }
                             }
                         })
@@ -962,17 +957,13 @@ impl App {
             return Task::none();
         };
         match event {
-            shares::Event::GoToExport(i) => {
-                self.handle_navigation_message(Message::GoToExport(i))
-            }
+            shares::Event::GoToExport(i) => self.handle_navigation_message(Message::GoToExport(i)),
             shares::Event::GoToCreate => self.handle_navigation_message(Message::GoToCreate),
             shares::Event::GoToImport => self.handle_navigation_message(Message::GoToImport),
             shares::Event::ActivateShare(hex) => {
                 self.handle_identity_message(Message::SwitchIdentity(hex))
             }
-            shares::Event::CopyNpub(npub) => {
-                self.handle_copy_npub(npub)
-            }
+            shares::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
             shares::Event::ConfirmDelete(id) => {
                 self.handle_delete(id);
                 Task::none()
@@ -1702,8 +1693,7 @@ impl App {
         self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
-        self.screen =
-            Screen::ShareList(shares::State::new(shares, self.active_share_hex.clone()));
+        self.screen = Screen::ShareList(shares::State::new(shares, self.active_share_hex.clone()));
     }
 
     fn current_nsec_keys(&self) -> Vec<NsecKeyEntry> {
@@ -1736,13 +1726,9 @@ impl App {
             nsec_keys::Event::ActivateKey(hex) => {
                 self.handle_identity_message(Message::SwitchIdentity(hex))
             }
-            nsec_keys::Event::ExportNcryptsec(hex) => {
-                self.handle_go_to_export_ncryptsec(hex)
-            }
+            nsec_keys::Event::ExportNcryptsec(hex) => self.handle_go_to_export_ncryptsec(hex),
             nsec_keys::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
-            nsec_keys::Event::ConfirmDelete(hex) => {
-                self.handle_nsec_key_delete(hex)
-            }
+            nsec_keys::Event::ConfirmDelete(hex) => self.handle_nsec_key_delete(hex),
         }
     }
 
@@ -2122,11 +2108,7 @@ impl App {
         )
     }
 
-    fn handle_import_nsec(
-        &mut self,
-        data: Zeroizing<String>,
-        name: String,
-    ) -> Task<Message> {
+    fn handle_import_nsec(&mut self, data: Zeroizing<String>, name: String) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2242,19 +2224,15 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    with_keep_blocking(
-                        &keep_arc,
-                        "Internal error during export",
-                        move |keep| {
-                            let ncryptsec = keep
-                                .export_ncryptsec(&pubkey_bytes, &password)
-                                .map_err(friendly_err)?;
-                            Ok(ExportData {
-                                bech32: Zeroizing::new(ncryptsec),
-                                frames: Vec::new(),
-                            })
-                        },
-                    )
+                    with_keep_blocking(&keep_arc, "Internal error during export", move |keep| {
+                        let ncryptsec = keep
+                            .export_ncryptsec(&pubkey_bytes, &password)
+                            .map_err(friendly_err)?;
+                        Ok(ExportData {
+                            bech32: Zeroizing::new(ncryptsec),
+                            frames: Vec::new(),
+                        })
+                    })
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -2263,10 +2241,7 @@ impl App {
         )
     }
 
-    fn handle_ncryptsec_generated(
-        &mut self,
-        result: Result<ExportData, String>,
-    ) -> Task<Message> {
+    fn handle_ncryptsec_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
         match result {
             Ok(data) => {
                 if let Screen::ExportNcryptsec(s) = &mut self.screen {
@@ -2343,12 +2318,7 @@ impl App {
                     }
                     _ => return Task::none(),
                 };
-                Self::load_audit_page(
-                    self.keep.clone(),
-                    offset,
-                    caller,
-                    Message::AuditPageLoaded,
-                )
+                Self::load_audit_page(self.keep.clone(), offset, caller, Message::AuditPageLoaded)
             }
         }
     }
@@ -3290,8 +3260,7 @@ mod tests {
         app.window_visible = true;
         set_settings_screen(&mut app);
 
-        let _task =
-            app.handle_settings_message_new(settings::Message::MinimizeToTrayToggled(true));
+        let _task = app.handle_settings_message_new(settings::Message::MinimizeToTrayToggled(true));
 
         assert!(app.settings.minimize_to_tray);
         assert!(app.window_visible);
@@ -3305,8 +3274,7 @@ mod tests {
         let mut app = App::test_new(s, true);
         set_settings_screen(&mut app);
 
-        let _task =
-            app.handle_settings_message_new(settings::Message::StartMinimizedToggled(true));
+        let _task = app.handle_settings_message_new(settings::Message::StartMinimizedToggled(true));
 
         assert!(app.settings.start_minimized);
     }

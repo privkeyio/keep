@@ -114,9 +114,7 @@ impl State {
             }
             Message::GoBack => Some(Event::GoBack),
             Message::Generate => {
-                if self.loading
-                    || self.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN
-                {
+                if self.loading || self.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
                     return None;
                 }
                 if *self.passphrase != *self.confirm_passphrase {
