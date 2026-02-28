@@ -750,7 +750,7 @@ impl Storage {
         let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
         let decrypted = crypto::decrypt(&encrypted, data_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
-        serde_json::from_slice(decrypted_bytes)
+        serde_json::from_slice(&decrypted_bytes)
             .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))
     }
 

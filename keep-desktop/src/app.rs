@@ -1961,9 +1961,11 @@ impl App {
                 };
                 match delete_result {
                     Some(Ok(())) => {
-                        let guard = lock_keep(&self.keep);
-                        if let Some(keep) = guard.as_ref() {
-                            let _ = keep.delete_relay_config(&pubkey);
+                        {
+                            let guard = lock_keep(&self.keep);
+                            if let Some(keep) = guard.as_ref() {
+                                let _ = keep.delete_relay_config(&pubkey);
+                            }
                         }
                         self.refresh_shares();
                         self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
@@ -2248,22 +2250,24 @@ impl App {
     }
 
     fn load_config_from_vault(&mut self) {
-        let guard = lock_keep(&self.keep);
-        let Some(keep) = guard.as_ref() else {
-            return;
+        let (relay_config, proxy) = {
+            let guard = lock_keep(&self.keep);
+            let Some(keep) = guard.as_ref() else {
+                return;
+            };
+
+            migrate_json_config_to_vault(keep, &self.keep_path);
+
+            let key = self
+                .active_group_pubkey_bytes()
+                .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
+            let relay_config = keep
+                .get_relay_config_or_default(&key)
+                .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
+            let proxy = keep.get_proxy_config().unwrap_or_default();
+            (relay_config, proxy)
         };
-
-        migrate_json_config_to_vault(keep, &self.keep_path);
-
-        let key = self
-            .active_group_pubkey_bytes()
-            .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
-        let relay_config = keep
-            .get_relay_config_or_default(&key)
-            .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
         self.apply_relay_config(relay_config);
-
-        let proxy = keep.get_proxy_config().unwrap_or_default();
         self.proxy_enabled = proxy.enabled;
         self.proxy_port = proxy.port;
     }
@@ -2883,11 +2887,14 @@ impl App {
                 self.stop_bunker();
 
                 if let Some(key) = parse_hex_key(&pubkey_hex) {
-                    let guard = lock_keep(&self.keep);
-                    if let Some(keep) = guard.as_ref() {
-                        let config = keep
-                            .get_relay_config_or_default(&key)
-                            .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
+                    let config = {
+                        let guard = lock_keep(&self.keep);
+                        guard.as_ref().map(|keep| {
+                            keep.get_relay_config_or_default(&key)
+                                .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key))
+                        })
+                    };
+                    if let Some(config) = config {
                         self.apply_relay_config(config);
                     }
                 }
