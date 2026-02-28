@@ -6,7 +6,6 @@ use iced::{Alignment, Element, Length};
 use keep_core::keys::{bytes_to_npub, KeyRecord, KeyType};
 
 use super::{format_timestamp, truncate_npub};
-use crate::message::Message;
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -47,14 +46,34 @@ impl NsecKeyEntry {
     }
 }
 
-pub struct NsecKeysScreen {
-    pub keys: Vec<NsecKeyEntry>,
-    pub active_key_hex: Option<String>,
-    pub delete_confirm: Option<String>,
-    pub expanded: Option<usize>,
+#[derive(Debug, Clone)]
+pub enum Message {
+    ToggleDetails(usize),
+    GoToImport,
+    ActivateKey(String),
+    ExportNcryptsec(String),
+    CopyNpub(String),
+    RequestDelete(String),
+    ConfirmDelete(String),
+    CancelDelete,
 }
 
-impl NsecKeysScreen {
+pub enum Event {
+    GoToImport,
+    ActivateKey(String),
+    ExportNcryptsec(String),
+    CopyNpub(String),
+    ConfirmDelete(String),
+}
+
+pub struct State {
+    keys: Vec<NsecKeyEntry>,
+    active_key_hex: Option<String>,
+    delete_confirm: Option<String>,
+    expanded: Option<usize>,
+}
+
+impl State {
     pub fn new(keys: Vec<NsecKeyEntry>, active_key_hex: Option<String>) -> Self {
         Self {
             keys,
@@ -64,7 +83,47 @@ impl NsecKeysScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn keys(&self) -> &[NsecKeyEntry] {
+        &self.keys
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::ToggleDetails(i) => {
+                self.expanded = if self.expanded == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+                self.delete_confirm = None;
+                None
+            }
+            Message::GoToImport => Some(Event::GoToImport),
+            Message::ActivateKey(hex) => Some(Event::ActivateKey(hex)),
+            Message::ExportNcryptsec(hex) => Some(Event::ExportNcryptsec(hex)),
+            Message::CopyNpub(npub) => Some(Event::CopyNpub(npub)),
+            Message::RequestDelete(hex) => {
+                self.delete_confirm = Some(hex);
+                None
+            }
+            Message::ConfirmDelete(hex) => {
+                if self.delete_confirm.as_deref() != Some(hex.as_str()) {
+                    return None;
+                }
+                Some(Event::ConfirmDelete(hex))
+            }
+            Message::CancelDelete => {
+                self.delete_confirm = None;
+                None
+            }
+        }
+    }
+
+    pub fn clear_delete_confirm(&mut self) {
+        self.delete_confirm = None;
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let title = theme::heading("Nsec Keys");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -141,7 +200,7 @@ impl NsecKeysScreen {
                 .size(theme::size::HEADING)
                 .color(theme::color::TEXT),
         )
-        .on_press(Message::ToggleNsecKeyDetails(i))
+        .on_press(Message::ToggleDetails(i))
         .style(theme::text_button)
         .padding(0);
 
@@ -149,7 +208,7 @@ impl NsecKeysScreen {
 
         if !is_active {
             let activate_btn = button(text("Activate").size(theme::size::SMALL))
-                .on_press(Message::SwitchIdentity(key.pubkey_hex.clone()))
+                .on_press(Message::ActivateKey(key.pubkey_hex.clone()))
                 .style(theme::secondary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 
@@ -157,7 +216,7 @@ impl NsecKeysScreen {
         }
 
         let export_btn = button(text("Export ncryptsec").size(theme::size::SMALL))
-            .on_press(Message::GoToExportNcryptsec(key.pubkey_hex.clone()))
+            .on_press(Message::ExportNcryptsec(key.pubkey_hex.clone()))
             .style(theme::primary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
@@ -223,11 +282,11 @@ impl NsecKeysScreen {
                         .color(theme::color::ERROR),
                     Space::new().width(Length::Fill),
                     button(text("Yes").size(theme::size::BODY))
-                        .on_press(Message::ConfirmDeleteNsecKey(key.pubkey_hex.clone()))
+                        .on_press(Message::ConfirmDelete(key.pubkey_hex.clone()))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("No").size(theme::size::BODY))
-                        .on_press(Message::CancelDeleteNsecKey)
+                        .on_press(Message::CancelDelete)
                         .style(theme::secondary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]
@@ -237,7 +296,7 @@ impl NsecKeysScreen {
                 row![
                     Space::new().width(Length::Fill),
                     button(text("Delete").size(theme::size::BODY))
-                        .on_press(Message::RequestDeleteNsecKey(key.pubkey_hex.clone()))
+                        .on_press(Message::RequestDelete(key.pubkey_hex.clone()))
                         .style(theme::danger_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]

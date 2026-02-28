@@ -1,16 +1,56 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
-use crate::message::{ConnectionStatus, Message, PeerEntry, PendingSignRequest};
+use crate::message::{ConnectionStatus, PeerEntry, PendingSignRequest};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
-pub struct RelayScreen {
-    pub relay_url_input: String,
+#[derive(Clone)]
+pub enum Message {
+    SelectShare(usize),
+    RelayUrlChanged(String),
+    PasswordChanged(Zeroizing<String>),
+    AddRelay,
+    RemoveRelay(usize),
+    Connect,
+    Disconnect,
+    ApproveSign(String),
+    RejectSign(String),
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelectShare(i) => f.debug_tuple("SelectShare").field(i).finish(),
+            Self::RelayUrlChanged(u) => f.debug_tuple("RelayUrlChanged").field(u).finish(),
+            Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
+            Self::AddRelay => f.write_str("AddRelay"),
+            Self::RemoveRelay(i) => f.debug_tuple("RemoveRelay").field(i).finish(),
+            Self::Connect => f.write_str("Connect"),
+            Self::Disconnect => f.write_str("Disconnect"),
+            Self::ApproveSign(id) => f.debug_tuple("ApproveSign").field(id).finish(),
+            Self::RejectSign(id) => f.debug_tuple("RejectSign").field(id).finish(),
+        }
+    }
+}
+
+pub enum Event {
+    AddRelay(String),
+    RemoveRelay(usize),
+    Connect,
+    Disconnect,
+    ApproveSignRequest(String),
+    RejectSignRequest(String),
+}
+
+pub struct State {
+    relay_url_input: String,
     pub relay_urls: Vec<String>,
     pub shares: Vec<ShareEntry>,
     pub selected_share: Option<usize>,
@@ -20,7 +60,7 @@ pub struct RelayScreen {
     pub pending_requests: Vec<PendingSignRequest>,
 }
 
-impl RelayScreen {
+impl State {
     pub fn new(
         shares: Vec<ShareEntry>,
         relay_urls: Vec<String>,
@@ -41,7 +81,42 @@ impl RelayScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::SelectShare(i) => {
+                self.selected_share = Some(i);
+                None
+            }
+            Message::RelayUrlChanged(url) => {
+                self.relay_url_input = url;
+                None
+            }
+            Message::PasswordChanged(p) => {
+                self.connect_password = p;
+                None
+            }
+            Message::AddRelay => {
+                let url = self.relay_url_input.trim().to_string();
+                Some(Event::AddRelay(url))
+            }
+            Message::RemoveRelay(i) => Some(Event::RemoveRelay(i)),
+            Message::Connect => Some(Event::Connect),
+            Message::Disconnect => Some(Event::Disconnect),
+            Message::ApproveSign(id) => Some(Event::ApproveSignRequest(id)),
+            Message::RejectSign(id) => Some(Event::RejectSignRequest(id)),
+        }
+    }
+
+    pub fn relay_added(&mut self, normalized: String) {
+        self.relay_urls.push(normalized);
+        self.relay_url_input.clear();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.relay_url_input.clear();
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let title_row = row![
             theme::heading("FROST Relay"),
             Space::new().width(Length::Fill),
@@ -125,7 +200,7 @@ impl RelayScreen {
                 text(format!("{} #{}", share.name, share.identifier)).size(theme::size::SMALL),
             )
             .style(style)
-            .on_press_maybe((!self.is_active()).then(|| Message::SelectShareForRelay(i)))
+            .on_press_maybe((!self.is_active()).then(|| Message::SelectShare(i)))
             .padding([theme::space::XS, theme::space::MD]);
 
             share_buttons = share_buttons.push(btn);
@@ -192,7 +267,7 @@ impl RelayScreen {
             && !self.relay_urls.is_empty()
             && !self.connect_password.is_empty();
         let password_input = text_input("Vault password", &self.connect_password)
-            .on_input(|s| Message::ConnectPasswordChanged(Zeroizing::new(s)))
+            .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
             .secure(true)
             .size(theme::size::SMALL)
             .width(200);
@@ -204,7 +279,7 @@ impl RelayScreen {
                     .align_x(Alignment::Center),
             )
             .style(theme::primary_button)
-            .on_press_maybe(can_connect.then(|| Message::ConnectRelay))
+            .on_press_maybe(can_connect.then(|| Message::Connect))
             .padding(theme::space::MD)
             .width(200),
         ]
@@ -222,7 +297,7 @@ impl RelayScreen {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::DisconnectRelay)
+            .on_press(Message::Disconnect)
             .style(theme::danger_button)
             .padding(theme::space::MD)
             .width(200)
@@ -308,11 +383,11 @@ impl RelayScreen {
                         .color(theme::color::TEXT_DIM),
                     row![
                         button(text("Approve").size(theme::size::SMALL))
-                            .on_press(Message::ApproveSignRequest(req.id.clone()))
+                            .on_press(Message::ApproveSign(req.id.clone()))
                             .style(theme::primary_button)
                             .padding([theme::space::XS, theme::space::MD]),
                         button(text("Reject").size(theme::size::SMALL))
-                            .on_press(Message::RejectSignRequest(req.id.clone()))
+                            .on_press(Message::RejectSign(req.id.clone()))
                             .style(theme::danger_button)
                             .padding([theme::space::XS, theme::space::MD]),
                     ]

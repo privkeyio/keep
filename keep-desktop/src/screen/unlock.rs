@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::theme;
 
-pub const MIN_PASSWORD_LEN: usize = 8;
+const MIN_PASSWORD_LEN: usize = 8;
 
 #[derive(Clone)]
 pub enum Message {
@@ -45,12 +45,12 @@ pub enum Event {
 }
 
 pub struct State {
-    pub password: Zeroizing<String>,
-    pub confirm_password: Zeroizing<String>,
-    pub error: Option<String>,
-    pub loading: bool,
-    pub vault_exists: bool,
-    pub start_fresh_confirm: bool,
+    password: Zeroizing<String>,
+    confirm_password: Zeroizing<String>,
+    error: Option<String>,
+    loading: bool,
+    vault_exists: bool,
+    start_fresh_confirm: bool,
 }
 
 impl State {

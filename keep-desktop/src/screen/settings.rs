@@ -1,30 +1,72 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length};
 use zeroize::Zeroizing;
 
-use crate::message::Message;
 use crate::theme;
 
-pub struct SettingsScreen {
-    pub auto_lock_secs: u64,
-    pub clipboard_clear_secs: u64,
-    pub vault_path: String,
-    pub proxy_enabled: bool,
-    pub proxy_port: u16,
-    pub proxy_port_input: String,
-    pub kill_switch_active: bool,
-    pub kill_switch_confirm: bool,
-    pub kill_switch_password: Zeroizing<String>,
-    pub kill_switch_loading: bool,
-    pub kill_switch_error: Option<String>,
-    pub minimize_to_tray: bool,
-    pub start_minimized: bool,
-    pub has_tray: bool,
-    pub certificate_pins: Vec<(String, String)>,
-    pub clear_all_pins_confirm: bool,
+#[derive(Clone)]
+pub enum Message {
+    AutoLockChanged(u64),
+    ClipboardClearChanged(u64),
+    ProxyToggled(bool),
+    ProxyPortChanged(String),
+    MinimizeToTrayToggled(bool),
+    StartMinimizedToggled(bool),
+    KillSwitchRequestConfirm,
+    KillSwitchCancelConfirm,
+    KillSwitchActivate,
+    KillSwitchPasswordChanged(Zeroizing<String>),
+    KillSwitchDeactivate,
+    CertPinClear(String),
+    CertPinClearAllRequest,
+    CertPinClearAllConfirm,
+    CertPinClearAllCancel,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AutoLockChanged(v) => f.debug_tuple("AutoLockChanged").field(v).finish(),
+            Self::ClipboardClearChanged(v) => {
+                f.debug_tuple("ClipboardClearChanged").field(v).finish()
+            }
+            Self::ProxyToggled(v) => f.debug_tuple("ProxyToggled").field(v).finish(),
+            Self::ProxyPortChanged(v) => f.debug_tuple("ProxyPortChanged").field(v).finish(),
+            Self::MinimizeToTrayToggled(v) => {
+                f.debug_tuple("MinimizeToTrayToggled").field(v).finish()
+            }
+            Self::StartMinimizedToggled(v) => {
+                f.debug_tuple("StartMinimizedToggled").field(v).finish()
+            }
+            Self::KillSwitchRequestConfirm => f.write_str("KillSwitchRequestConfirm"),
+            Self::KillSwitchCancelConfirm => f.write_str("KillSwitchCancelConfirm"),
+            Self::KillSwitchActivate => f.write_str("KillSwitchActivate"),
+            Self::KillSwitchPasswordChanged(_) => f.write_str("KillSwitchPasswordChanged(***)"),
+            Self::KillSwitchDeactivate => f.write_str("KillSwitchDeactivate"),
+            Self::CertPinClear(h) => f.debug_tuple("CertPinClear").field(h).finish(),
+            Self::CertPinClearAllRequest => f.write_str("CertPinClearAllRequest"),
+            Self::CertPinClearAllConfirm => f.write_str("CertPinClearAllConfirm"),
+            Self::CertPinClearAllCancel => f.write_str("CertPinClearAllCancel"),
+        }
+    }
+}
+
+pub enum Event {
+    AutoLockChanged(u64),
+    ClipboardClearChanged(u64),
+    ProxyToggled(bool),
+    ProxyPortChanged(u16),
+    MinimizeToTrayToggled(bool),
+    StartMinimizedToggled(bool),
+    KillSwitchActivate,
+    KillSwitchDeactivate(Zeroizing<String>),
+    CertPinClear(String),
+    CertPinClearAll,
 }
 
 fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
@@ -37,6 +79,25 @@ fn toggle_button(active: bool, message: Message) -> button::Button<'static, Mess
         .on_press(message)
         .style(style)
         .padding([theme::space::SM, theme::space::MD])
+}
+
+pub struct SettingsScreen {
+    pub auto_lock_secs: u64,
+    pub clipboard_clear_secs: u64,
+    pub vault_path: String,
+    pub proxy_enabled: bool,
+    pub proxy_port: u16,
+    proxy_port_input: String,
+    pub kill_switch_active: bool,
+    kill_switch_confirm: bool,
+    kill_switch_password: Zeroizing<String>,
+    pub kill_switch_loading: bool,
+    pub kill_switch_error: Option<String>,
+    pub minimize_to_tray: bool,
+    pub start_minimized: bool,
+    pub has_tray: bool,
+    pub certificate_pins: Vec<(String, String)>,
+    clear_all_pins_confirm: bool,
 }
 
 impl SettingsScreen {
@@ -73,7 +134,86 @@ impl SettingsScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::AutoLockChanged(secs) => Some(Event::AutoLockChanged(secs)),
+            Message::ClipboardClearChanged(secs) => Some(Event::ClipboardClearChanged(secs)),
+            Message::ProxyToggled(enabled) => Some(Event::ProxyToggled(enabled)),
+            Message::ProxyPortChanged(port_str) => {
+                self.proxy_port_input = port_str.clone();
+                match port_str.parse::<u16>() {
+                    Ok(port) if port > 0 => Some(Event::ProxyPortChanged(port)),
+                    _ => None,
+                }
+            }
+            Message::MinimizeToTrayToggled(v) => Some(Event::MinimizeToTrayToggled(v)),
+            Message::StartMinimizedToggled(v) => Some(Event::StartMinimizedToggled(v)),
+            Message::KillSwitchRequestConfirm => {
+                self.kill_switch_confirm = true;
+                None
+            }
+            Message::KillSwitchCancelConfirm => {
+                self.kill_switch_confirm = false;
+                None
+            }
+            Message::KillSwitchActivate => Some(Event::KillSwitchActivate),
+            Message::KillSwitchPasswordChanged(p) => {
+                self.kill_switch_password = p;
+                None
+            }
+            Message::KillSwitchDeactivate => {
+                if self.kill_switch_password.is_empty() {
+                    self.kill_switch_error = Some("Password required".into());
+                    return None;
+                }
+                self.kill_switch_loading = true;
+                self.kill_switch_error = None;
+                Some(Event::KillSwitchDeactivate(self.kill_switch_password.clone()))
+            }
+            Message::CertPinClear(hostname) => Some(Event::CertPinClear(hostname)),
+            Message::CertPinClearAllRequest => {
+                self.clear_all_pins_confirm = true;
+                None
+            }
+            Message::CertPinClearAllCancel => {
+                self.clear_all_pins_confirm = false;
+                None
+            }
+            Message::CertPinClearAllConfirm => Some(Event::CertPinClearAll),
+        }
+    }
+
+    pub fn kill_switch_activated(&mut self) {
+        self.kill_switch_confirm = false;
+        self.kill_switch_active = true;
+    }
+
+    pub fn kill_switch_deactivated(&mut self) {
+        self.kill_switch_loading = false;
+        self.kill_switch_password = Zeroizing::new(String::new());
+        self.kill_switch_active = false;
+        self.kill_switch_error = None;
+    }
+
+    pub fn kill_switch_deactivate_failed(&mut self, error: String) {
+        self.kill_switch_loading = false;
+        self.kill_switch_password = Zeroizing::new(String::new());
+        self.kill_switch_error = Some(error);
+    }
+
+    pub fn clear_all_pins_done(&mut self) {
+        self.clear_all_pins_confirm = false;
+    }
+
+    pub fn sync_proxy_port(&mut self, port: u16) {
+        self.proxy_port = port;
+        let formatted = port.to_string();
+        if self.proxy_port_input != formatted {
+            self.proxy_port_input = formatted;
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let title = theme::heading("Settings");
 
         let kill_switch_card = self.kill_switch_card();
@@ -222,7 +362,7 @@ impl SettingsScreen {
                     };
                     r.push(
                         button(text(label).size(theme::size::SMALL))
-                            .on_press(Message::SettingsAutoLockChanged(secs))
+                            .on_press(Message::AutoLockChanged(secs))
                             .style(style)
                             .padding([theme::space::SM, theme::space::MD]),
                     )
@@ -257,7 +397,7 @@ impl SettingsScreen {
                     };
                     r.push(
                         button(text(label).size(theme::size::SMALL))
-                            .on_press(Message::SettingsClipboardClearChanged(secs))
+                            .on_press(Message::ClipboardClearChanged(secs))
                             .style(style)
                             .padding([theme::space::SM, theme::space::MD]),
                     )
@@ -280,11 +420,11 @@ impl SettingsScreen {
     fn tray_card(&self) -> Element<'_, Message> {
         let minimize_btn = toggle_button(
             self.minimize_to_tray,
-            Message::SettingsMinimizeToTrayToggled(!self.minimize_to_tray),
+            Message::MinimizeToTrayToggled(!self.minimize_to_tray),
         );
         let start_btn = toggle_button(
             self.start_minimized,
-            Message::SettingsStartMinimizedToggled(!self.start_minimized),
+            Message::StartMinimizedToggled(!self.start_minimized),
         );
 
         container(
@@ -307,7 +447,7 @@ impl SettingsScreen {
 
     fn proxy_card(&self) -> Element<'_, Message> {
         let port_input = text_input("9050", &self.proxy_port_input)
-            .on_input(Message::SettingsProxyPortChanged)
+            .on_input(Message::ProxyPortChanged)
             .size(theme::size::BODY)
             .width(Length::Fixed(100.0));
 
@@ -319,7 +459,7 @@ impl SettingsScreen {
             };
 
         let toggle_btn = button(text(btn_label).size(theme::size::SMALL))
-            .on_press(Message::SettingsProxyToggled(!self.proxy_enabled))
+            .on_press(Message::ProxyToggled(!self.proxy_enabled))
             .style(btn_style)
             .padding([theme::space::SM, theme::space::MD]);
 

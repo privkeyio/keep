@@ -27,16 +27,16 @@ pub fn truncate_npub(npub: &str) -> String {
 
 pub enum Screen {
     Unlock(unlock::State),
-    ShareList(shares::ShareListScreen),
-    Create(create::CreateScreen),
-    Export(Box<export::ExportScreen>),
-    ExportNcryptsec(Box<export_ncryptsec::ExportNcryptsecScreen>),
-    Import(import::ImportScreen),
+    ShareList(shares::State),
+    Create(create::State),
+    Export(Box<export::State>),
+    ExportNcryptsec(Box<export_ncryptsec::State>),
+    Import(import::State),
     Scanner(scanner::ScannerScreen),
-    Wallet(wallet::WalletScreen),
-    Relay(relay::RelayScreen),
-    Bunker(Box<bunker::BunkerScreen>),
-    NsecKeys(nsec_keys::NsecKeysScreen),
+    Wallet(wallet::State),
+    Relay(relay::State),
+    Bunker(Box<bunker::State>),
+    NsecKeys(nsec_keys::State),
     SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
 }
@@ -52,18 +52,20 @@ impl Screen {
     ) -> iced::Element<'a, Message> {
         let (nav, content) = match self {
             Screen::Unlock(s) => return s.view().map(Message::Unlock),
-            Screen::ShareList(s) => (NavItem::Shares, s.view_content()),
-            Screen::Create(s) => (NavItem::Create, s.view_content()),
-            Screen::Export(s) => (NavItem::Shares, s.view_content()),
-            Screen::ExportNcryptsec(s) => (NavItem::NsecKeys, s.view_content()),
-            Screen::Import(s) => (NavItem::Import, s.view_content()),
-            Screen::Scanner(s) => (NavItem::Import, s.view_content()),
-            Screen::Wallet(s) => (NavItem::Wallets, s.view_content()),
-            Screen::Relay(s) => (NavItem::Relay, s.view_content()),
-            Screen::Bunker(s) => (NavItem::Bunker, s.view_content()),
-            Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view_content()),
-            Screen::SigningAudit(s) => (NavItem::Audit, s.view_content()),
-            Screen::Settings(s) => (NavItem::Settings, s.view_content()),
+            Screen::ShareList(s) => (NavItem::Shares, s.view().map(Message::ShareList)),
+            Screen::Create(s) => (NavItem::Create, s.view().map(Message::Create)),
+            Screen::Export(s) => (NavItem::Shares, s.view().map(Message::Export)),
+            Screen::ExportNcryptsec(s) => {
+                (NavItem::NsecKeys, s.view().map(Message::ExportNcryptsec))
+            }
+            Screen::Import(s) => (NavItem::Import, s.view().map(Message::Import)),
+            Screen::Scanner(s) => (NavItem::Import, s.view().map(Message::Scanner)),
+            Screen::Wallet(s) => (NavItem::Wallets, s.view().map(Message::Wallet)),
+            Screen::Relay(s) => (NavItem::Relay, s.view().map(Message::Relay)),
+            Screen::Bunker(s) => (NavItem::Bunker, s.view().map(Message::Bunker)),
+            Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view().map(Message::NsecKeys)),
+            Screen::SigningAudit(s) => (NavItem::Audit, s.view().map(Message::SigningAudit)),
+            Screen::Settings(s) => (NavItem::Settings, s.view().map(Message::Settings)),
         };
         layout::with_sidebar(
             nav,
@@ -82,20 +84,16 @@ impl Screen {
                 s.unlock_failed(error);
             }
             Screen::Create(s) => {
-                s.loading = false;
-                s.error = Some(error);
+                s.create_failed(error);
             }
             Screen::Export(s) => {
-                s.loading = false;
-                s.error = Some(error);
+                s.export_failed(error);
             }
             Screen::ExportNcryptsec(s) => {
-                s.loading = false;
-                s.error = Some(error);
+                s.export_failed(error);
             }
             Screen::Import(s) => {
-                s.loading = false;
-                s.error = Some(error);
+                s.import_failed(error);
             }
             Screen::Scanner(_) => {}
             Screen::Bunker(s) => {

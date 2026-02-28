@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use keep_frost_net::AnnouncedXpub;
-use keep_frost_net::VALID_XPUB_PREFIXES;
+use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, VALID_XPUB_PREFIXES};
 
-use crate::message::Message;
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
@@ -80,7 +79,41 @@ pub struct AnnounceState {
     pub submitting: bool,
 }
 
-pub struct WalletScreen {
+#[derive(Clone, Debug)]
+pub enum Message {
+    ToggleDetails(usize),
+    StartSetup,
+    SelectShare(usize),
+    NetworkChanged(String),
+    ThresholdChanged(String),
+    TimelockChanged(String),
+    AddTier,
+    RemoveTier(usize),
+    BeginCoordination,
+    CancelSetup,
+    StartAnnounce,
+    XpubChanged(String),
+    FingerprintChanged(String),
+    LabelChanged(String),
+    CancelAnnounce,
+    SubmitAnnounce,
+    CopyDescriptor(String),
+}
+
+pub enum Event {
+    StartSetup,
+    BeginCoordination,
+    CancelSetup { session_id: Option<[u8; 32]> },
+    StartAnnounce,
+    SubmitAnnounce {
+        xpub: String,
+        fingerprint: String,
+        label: String,
+    },
+    CopyDescriptor(String),
+}
+
+pub struct State {
     pub descriptors: Vec<WalletEntry>,
     pub expanded: Option<usize>,
     pub setup: Option<SetupState>,
@@ -98,7 +131,7 @@ pub struct SetupState {
     pub session_id: Option<[u8; 32]>,
 }
 
-impl WalletScreen {
+impl State {
     pub fn new(descriptors: Vec<WalletEntry>) -> Self {
         Self {
             descriptors,
@@ -109,7 +142,157 @@ impl WalletScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::ToggleDetails(i) => {
+                self.expanded = if self.expanded == Some(i) { None } else { Some(i) };
+                None
+            }
+            Message::StartSetup => Some(Event::StartSetup),
+            Message::SelectShare(i) => {
+                if let Some(s) = &mut self.setup {
+                    s.selected_share = Some(i);
+                }
+                None
+            }
+            Message::NetworkChanged(n) => {
+                if keep_frost_net::VALID_NETWORKS.contains(&n.as_str()) {
+                    if let Some(s) = &mut self.setup {
+                        s.network = n;
+                    }
+                }
+                None
+            }
+            Message::ThresholdChanged(encoded) => {
+                self.update_tier_field(&encoded, |tier, val| tier.threshold = val);
+                None
+            }
+            Message::TimelockChanged(encoded) => {
+                self.update_tier_field(&encoded, |tier, val| tier.timelock_months = val);
+                None
+            }
+            Message::AddTier => {
+                if let Some(s) = &mut self.setup {
+                    if s.tiers.len() < 5 {
+                        s.tiers.push(TierConfig::default());
+                    }
+                }
+                None
+            }
+            Message::RemoveTier(i) => {
+                if let Some(s) = &mut self.setup {
+                    if s.tiers.len() > 1 && i < s.tiers.len() {
+                        s.tiers.remove(i);
+                    }
+                }
+                None
+            }
+            Message::BeginCoordination => Some(Event::BeginCoordination),
+            Message::CancelSetup => {
+                let session_id = self.setup.as_ref().and_then(|s| s.session_id);
+                self.setup = None;
+                Some(Event::CancelSetup { session_id })
+            }
+            Message::StartAnnounce => Some(Event::StartAnnounce),
+            Message::XpubChanged(v) => {
+                if let Some(a) = &mut self.announce {
+                    a.xpub = v.chars().take(MAX_XPUB_LENGTH).collect();
+                }
+                None
+            }
+            Message::FingerprintChanged(v) => {
+                if let Some(a) = &mut self.announce {
+                    a.fingerprint = v
+                        .chars()
+                        .filter(|c| c.is_ascii_hexdigit())
+                        .take(8)
+                        .collect();
+                }
+                None
+            }
+            Message::LabelChanged(v) => {
+                if let Some(a) = &mut self.announce {
+                    a.label = v.chars().take(MAX_XPUB_LABEL_LENGTH).collect();
+                }
+                None
+            }
+            Message::CancelAnnounce => {
+                self.announce = None;
+                None
+            }
+            Message::SubmitAnnounce => {
+                let Some(a) = &mut self.announce else {
+                    return None;
+                };
+                let xpub = a.xpub.trim().to_string();
+                let fingerprint = a.fingerprint.trim().to_string();
+                let label = a.label.trim().to_string();
+                a.submitting = true;
+                a.error = None;
+                Some(Event::SubmitAnnounce {
+                    xpub,
+                    fingerprint,
+                    label,
+                })
+            }
+            Message::CopyDescriptor(desc) => Some(Event::CopyDescriptor(desc)),
+        }
+    }
+
+    fn update_tier_field(&mut self, encoded: &str, f: impl FnOnce(&mut TierConfig, String)) {
+        if let Some(s) = &mut self.setup {
+            if let Some((idx_str, val)) = encoded.split_once(':') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(tier) = s.tiers.get_mut(idx) {
+                        f(tier, val.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn begin_setup(&mut self, shares: Vec<ShareEntry>) {
+        let selected = if shares.len() == 1 { Some(0) } else { None };
+        self.setup = Some(SetupState {
+            shares,
+            selected_share: selected,
+            network: "signet".into(),
+            tiers: vec![TierConfig::default()],
+            phase: SetupPhase::Configure,
+            error: None,
+            session_id: None,
+        });
+    }
+
+    pub fn begin_announce(&mut self) {
+        self.announce = Some(AnnounceState {
+            xpub: String::new(),
+            fingerprint: String::new(),
+            label: String::new(),
+            error: None,
+            submitting: false,
+        });
+    }
+
+    pub fn announce_submitted(&mut self) {
+        self.announce = None;
+    }
+
+    pub fn announce_failed(&mut self, error: String) {
+        if let Some(a) = &mut self.announce {
+            a.error = Some(error);
+            a.submitting = false;
+        }
+    }
+
+    pub fn announce_not_connected(&mut self) {
+        if let Some(a) = &mut self.announce {
+            a.error = Some("Relay not connected".into());
+            a.submitting = false;
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         if let Some(announce) = &self.announce {
             return self.view_announce(announce);
         }
@@ -121,12 +304,12 @@ impl WalletScreen {
         let setup_btn = button(text("Setup Wallet").size(theme::size::BODY))
             .style(theme::primary_button)
             .padding([theme::space::SM, theme::space::LG])
-            .on_press(Message::WalletStartSetup);
+            .on_press(Message::StartSetup);
 
         let announce_btn = button(text("Announce Recovery Keys").size(theme::size::BODY))
             .style(theme::secondary_button)
             .padding([theme::space::SM, theme::space::LG])
-            .on_press(Message::WalletStartAnnounce);
+            .on_press(Message::StartAnnounce);
 
         let title_row = row![
             theme::heading("Wallet Descriptors"),
@@ -186,7 +369,7 @@ impl WalletScreen {
 
     fn view_configure<'a>(&self, setup: &'a SetupState) -> Element<'a, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
-            .on_press(Message::WalletCancelSetup)
+            .on_press(Message::CancelSetup)
             .style(theme::text_button)
             .padding([theme::space::XS, theme::space::SM]);
 
@@ -214,7 +397,7 @@ impl WalletScreen {
             };
             share_col = share_col.push(
                 button(text(label).size(theme::size::SMALL))
-                    .on_press(Message::WalletSelectShare(i))
+                    .on_press(Message::SelectShare(i))
                     .style(style)
                     .padding([theme::space::XS, theme::space::SM]),
             );
@@ -231,7 +414,7 @@ impl WalletScreen {
             };
             network_row = network_row.push(
                 button(text(*net).size(theme::size::SMALL))
-                    .on_press(Message::WalletNetworkChanged(net.to_string()))
+                    .on_press(Message::NetworkChanged(net.to_string()))
                     .style(style)
                     .padding([theme::space::XS, theme::space::SM]),
             );
@@ -241,12 +424,12 @@ impl WalletScreen {
 
         for (i, tier) in setup.tiers.iter().enumerate() {
             let threshold_input = text_input("2", &tier.threshold)
-                .on_input(move |v| Message::WalletThresholdChanged(format!("{i}:{v}")))
+                .on_input(move |v| Message::ThresholdChanged(format!("{i}:{v}")))
                 .padding(theme::space::SM)
                 .width(60);
 
             let timelock_input = text_input("6", &tier.timelock_months)
-                .on_input(move |v| Message::WalletTimelockChanged(format!("{i}:{v}")))
+                .on_input(move |v| Message::TimelockChanged(format!("{i}:{v}")))
                 .padding(theme::space::SM)
                 .width(60);
 
@@ -269,7 +452,7 @@ impl WalletScreen {
             if setup.tiers.len() > 1 {
                 tier_row = tier_row.push(
                     button(text("Remove").size(theme::size::TINY))
-                        .on_press(Message::WalletRemoveTier(i))
+                        .on_press(Message::RemoveTier(i))
                         .style(theme::danger_button)
                         .padding([2.0, theme::space::SM]),
                 );
@@ -284,7 +467,7 @@ impl WalletScreen {
         }
 
         let add_tier_btn = button(text("+ Add Tier").size(theme::size::SMALL))
-            .on_press(Message::WalletAddTier)
+            .on_press(Message::AddTier)
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::SM]);
 
@@ -305,7 +488,7 @@ impl WalletScreen {
             .style(theme::primary_button)
             .padding(theme::space::MD);
         if can_begin {
-            begin_btn = begin_btn.on_press(Message::WalletBeginCoordination);
+            begin_btn = begin_btn.on_press(Message::BeginCoordination);
         }
 
         let mut content = column![
@@ -337,7 +520,7 @@ impl WalletScreen {
 
     fn view_coordinating(&self, progress: &DescriptorProgress) -> Element<'_, Message> {
         let back_btn = button(text("< Cancel").size(theme::size::BODY))
-            .on_press(Message::WalletCancelSetup)
+            .on_press(Message::CancelSetup)
             .style(theme::text_button)
             .padding([theme::space::XS, theme::space::SM]);
 
@@ -427,7 +610,7 @@ impl WalletScreen {
                 .size(theme::size::HEADING)
                 .color(theme::color::TEXT),
         )
-        .on_press(Message::ToggleWalletDetails(i))
+        .on_press(Message::ToggleDetails(i))
         .style(theme::text_button)
         .padding(0);
 
@@ -510,7 +693,7 @@ impl WalletScreen {
 
     fn view_announce<'a>(&self, state: &'a AnnounceState) -> Element<'a, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
-            .on_press(Message::WalletCancelAnnounce)
+            .on_press(Message::CancelAnnounce)
             .style(theme::text_button)
             .padding([theme::space::XS, theme::space::SM]);
 
@@ -526,16 +709,16 @@ impl WalletScreen {
             .color(theme::color::TEXT_MUTED);
 
         let xpub_input = text_input("tpub...", &state.xpub)
-            .on_input(Message::WalletAnnounceXpubChanged)
+            .on_input(Message::XpubChanged)
             .padding(theme::space::SM);
 
         let fp_input = text_input("8 hex chars", &state.fingerprint)
-            .on_input(Message::WalletAnnounceFingerprintChanged)
+            .on_input(Message::FingerprintChanged)
             .padding(theme::space::SM)
             .width(120);
 
         let label_input = text_input("e.g. coldcard-backup", &state.label)
-            .on_input(Message::WalletAnnounceLabelChanged)
+            .on_input(Message::LabelChanged)
             .padding(theme::space::SM);
 
         let xpub_valid = VALID_XPUB_PREFIXES
@@ -549,7 +732,7 @@ impl WalletScreen {
             .style(theme::primary_button)
             .padding([theme::space::SM, theme::space::LG]);
         if can_submit {
-            submit_btn = submit_btn.on_press(Message::WalletSubmitAnnounce);
+            submit_btn = submit_btn.on_press(Message::SubmitAnnounce);
         }
 
         let mut content = column![

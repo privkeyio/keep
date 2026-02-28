@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, qr_code, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use super::truncate_npub;
 use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
-use crate::message::Message;
 use crate::theme;
 
 fn password_strength(password: &str) -> (&'static str, iced::Color) {
@@ -29,20 +30,53 @@ fn password_strength(password: &str) -> (&'static str, iced::Color) {
     }
 }
 
-pub struct ExportNcryptsecScreen {
-    pub pubkey_hex: String,
-    pub name: String,
-    pub npub: String,
-    pub password: Zeroizing<String>,
-    pub confirm_password: Zeroizing<String>,
-    pub ncryptsec: Option<Zeroizing<String>>,
-    pub qr_data: Option<qr_code::Data>,
-    pub error: Option<String>,
-    pub loading: bool,
+#[derive(Clone)]
+pub enum Message {
+    PasswordChanged(Zeroizing<String>),
+    ConfirmPasswordChanged(Zeroizing<String>),
+    GoBack,
+    Generate,
+    CopyToClipboard(Zeroizing<String>),
+    Reset,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
+            Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
+            Self::GoBack => f.write_str("GoBack"),
+            Self::Generate => f.write_str("Generate"),
+            Self::CopyToClipboard(_) => f.write_str("CopyToClipboard(***)"),
+            Self::Reset => f.write_str("Reset"),
+        }
+    }
+}
+
+pub enum Event {
+    GoBack,
+    Generate {
+        pubkey_hex: String,
+        password: Zeroizing<String>,
+    },
+    CopyToClipboard(Zeroizing<String>),
+    Reset,
+}
+
+pub struct State {
+    pubkey_hex: String,
+    name: String,
+    npub: String,
+    password: Zeroizing<String>,
+    confirm_password: Zeroizing<String>,
+    ncryptsec: Option<Zeroizing<String>>,
+    qr_data: Option<qr_code::Data>,
+    error: Option<String>,
+    loading: bool,
     pub copied: bool,
 }
 
-impl ExportNcryptsecScreen {
+impl State {
     pub fn new(pubkey_hex: String, name: String, npub: String) -> Self {
         Self {
             pubkey_hex,
@@ -55,6 +89,42 @@ impl ExportNcryptsecScreen {
             error: None,
             loading: false,
             copied: false,
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::PasswordChanged(p) => {
+                self.password = p;
+                self.confirm_password = Zeroizing::new(String::new());
+                self.error = None;
+                None
+            }
+            Message::ConfirmPasswordChanged(p) => {
+                self.confirm_password = p;
+                self.error = None;
+                None
+            }
+            Message::GoBack => Some(Event::GoBack),
+            Message::Generate => {
+                if self.loading
+                    || self.password.chars().count() < MIN_EXPORT_PASSPHRASE_LEN
+                {
+                    return None;
+                }
+                if *self.password != *self.confirm_password {
+                    self.error = Some("Passwords do not match".into());
+                    return None;
+                }
+                self.loading = true;
+                self.error = None;
+                Some(Event::Generate {
+                    pubkey_hex: self.pubkey_hex.clone(),
+                    password: self.password.clone(),
+                })
+            }
+            Message::CopyToClipboard(t) => Some(Event::CopyToClipboard(t)),
+            Message::Reset => Some(Event::Reset),
         }
     }
 
@@ -76,7 +146,12 @@ impl ExportNcryptsecScreen {
         self.ncryptsec = Some(ncryptsec);
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn export_failed(&mut self, error: String) {
+        self.loading = false;
+        self.error = Some(error);
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -138,7 +213,7 @@ impl ExportNcryptsecScreen {
                         .style(theme::primary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("Change Password").size(theme::size::BODY))
-                        .on_press(Message::ResetNcryptsec)
+                        .on_press(Message::Reset)
                         .style(theme::secondary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]
@@ -169,7 +244,7 @@ impl ExportNcryptsecScreen {
             let can_generate = password_ok && passwords_match;
 
             let password_input = text_input("Encryption password", &self.password)
-                .on_input(|s| Message::ExportNcryptsecPasswordChanged(Zeroizing::new(s)))
+                .on_input(|s| Message::PasswordChanged(Zeroizing::new(s)))
                 .secure(true)
                 .padding(theme::space::MD)
                 .width(theme::size::INPUT_WIDTH);
@@ -197,8 +272,8 @@ impl ExportNcryptsecScreen {
 
             if password_ok {
                 let confirm_input = text_input("Confirm password", &self.confirm_password)
-                    .on_input(|s| Message::ExportNcryptsecConfirmChanged(Zeroizing::new(s)))
-                    .on_submit_maybe(can_generate.then_some(Message::GenerateNcryptsec))
+                    .on_input(|s| Message::ConfirmPasswordChanged(Zeroizing::new(s)))
+                    .on_submit_maybe(can_generate.then_some(Message::Generate))
                     .secure(true)
                     .padding(theme::space::MD)
                     .width(theme::size::INPUT_WIDTH);
@@ -218,7 +293,7 @@ impl ExportNcryptsecScreen {
             } else {
                 content = content.push(
                     button(text("Encrypt Key").size(theme::size::BODY))
-                        .on_press_maybe(can_generate.then_some(Message::GenerateNcryptsec))
+                        .on_press_maybe(can_generate.then_some(Message::Generate))
                         .style(theme::primary_button)
                         .padding(theme::space::MD),
                 );

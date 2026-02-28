@@ -13,7 +13,7 @@ use crate::app::{
 };
 use crate::message::Message;
 use crate::screen::bunker::{
-    BunkerScreen, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
+    self, ConnectedClient, DurationChoice, LogDisplayEntry, PendingApprovalDisplay,
     DURATION_OPTIONS,
 };
 use crate::screen::Screen;
@@ -123,35 +123,39 @@ pub(crate) struct RunningBunker {
 }
 
 impl App {
-    pub(crate) fn handle_bunker_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::BunkerRelayInputChanged(input) => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.relay_input = input;
+    pub(crate) fn handle_bunker_message(
+        &mut self,
+        msg: crate::screen::bunker::Message,
+    ) -> Task<Message> {
+        let Screen::Bunker(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        use crate::screen::bunker::Event;
+        match event {
+            Event::AddRelay(url) => {
+                if let Err(e) = validate_relay_url(&url) {
+                    self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
+                    return Task::none();
                 }
-                Task::none()
-            }
-            Message::BunkerAddRelay => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    let url = s.relay_input.trim().to_string();
-                    if let Err(e) = validate_relay_url(&url) {
-                        self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
-                        return Task::none();
-                    }
-                    let relay = normalize_relay_url(&url);
+                let relay = normalize_relay_url(&url);
+                if let Screen::Bunker(s) = &self.screen {
                     if s.relays.contains(&relay) || self.bunker_relays.contains(&relay) {
                         return Task::none();
                     }
+                }
+                if let Screen::Bunker(s) = &mut self.screen {
                     if s.relays.len() < 5 {
-                        s.relays.push(relay.clone());
+                        s.relay_added(relay.clone());
                         self.bunker_relays.push(relay);
-                        s.relay_input.clear();
                         self.save_bunker_relays();
                     }
                 }
                 Task::none()
             }
-            Message::BunkerRemoveRelay(i) => {
+            Event::RemoveRelay(i) => {
                 if let Screen::Bunker(s) = &mut self.screen {
                     if i < s.relays.len() {
                         s.relays.remove(i);
@@ -161,12 +165,10 @@ impl App {
                 }
                 Task::none()
             }
-            Message::BunkerStart => self.handle_bunker_start(),
-            Message::BunkerStartResult(result) => self.handle_bunker_start_result(result),
-            Message::BunkerStop => self.handle_bunker_stop(),
-            Message::BunkerApprove | Message::BunkerReject => {
-                let approved = matches!(message, Message::BunkerApprove);
-                if approved && self.is_kill_switch_active() {
+            Event::Start => self.handle_bunker_start(),
+            Event::Stop => self.handle_bunker_stop(),
+            Event::Approve { duration_index } => {
+                if self.is_kill_switch_active() {
                     self.set_toast(
                         "Kill switch is active - signing blocked".into(),
                         ToastKind::Error,
@@ -175,21 +177,13 @@ impl App {
                 }
 
                 if self.nostrconnect_pending.is_some() {
-                    return if approved {
-                        self.handle_nostrconnect_approve()
-                    } else {
-                        self.handle_nostrconnect_reject()
-                    };
+                    return self.handle_nostrconnect_approve();
                 }
 
-                let duration_choice = if let Screen::Bunker(s) = &self.screen {
-                    DURATION_OPTIONS
-                        .get(s.approval_duration)
-                        .map(|(_, d)| *d)
-                        .unwrap_or(DurationChoice::JustThisTime)
-                } else {
-                    DurationChoice::JustThisTime
-                };
+                let duration_choice = DURATION_OPTIONS
+                    .get(duration_index)
+                    .map(|(_, d)| *d)
+                    .unwrap_or(DurationChoice::JustThisTime);
 
                 let app_pubkey = self
                     .bunker_pending_approval
@@ -197,38 +191,49 @@ impl App {
                     .map(|a| a.app_pubkey.clone());
 
                 if let Some(tx) = self.bunker_approval_tx.take() {
-                    let _ = tx.send(approved);
+                    let _ = tx.send(true);
                 }
                 self.bunker_pending_approval = None;
                 if let Screen::Bunker(s) = &mut self.screen {
-                    s.pending_approval = None;
-                    s.approval_duration = 0;
+                    s.approval_cleared();
                 }
 
-                if approved {
-                    if let (Some(hex), Some(ref bunker)) = (app_pubkey, &self.bunker) {
-                        let handler = bunker.handler.clone();
-                        let nip46_duration = match duration_choice {
-                            DurationChoice::JustThisTime => keep_nip46::PermissionDuration::Session,
-                            DurationChoice::Minutes(m) => {
-                                keep_nip46::PermissionDuration::Seconds(m * 60)
+                if let (Some(hex), Some(ref bunker)) = (app_pubkey, &self.bunker) {
+                    let handler = bunker.handler.clone();
+                    let nip46_duration = match duration_choice {
+                        DurationChoice::JustThisTime => keep_nip46::PermissionDuration::Session,
+                        DurationChoice::Minutes(m) => {
+                            keep_nip46::PermissionDuration::Seconds(m * 60)
+                        }
+                        DurationChoice::Forever => keep_nip46::PermissionDuration::Forever,
+                    };
+                    return Task::perform(
+                        async move {
+                            if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
+                                handler.update_client_duration(&pk, nip46_duration).await;
                             }
-                            DurationChoice::Forever => keep_nip46::PermissionDuration::Forever,
-                        };
-                        return Task::perform(
-                            async move {
-                                if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
-                                    handler.update_client_duration(&pk, nip46_duration).await;
-                                }
-                                Ok::<(), String>(())
-                            },
-                            Message::BunkerPermissionUpdated,
-                        );
-                    }
+                            Ok::<(), String>(())
+                        },
+                        Message::BunkerPermissionUpdated,
+                    );
                 }
                 Task::none()
             }
-            Message::BunkerRevokeClient(i) => {
+            Event::Reject => {
+                if self.nostrconnect_pending.is_some() {
+                    return self.handle_nostrconnect_reject();
+                }
+
+                if let Some(tx) = self.bunker_approval_tx.take() {
+                    let _ = tx.send(false);
+                }
+                self.bunker_pending_approval = None;
+                if let Screen::Bunker(s) = &mut self.screen {
+                    s.approval_cleared();
+                }
+                Task::none()
+            }
+            Event::RevokeClient(i) => {
                 let pubkey_hex = if let Screen::Bunker(s) = &self.screen {
                     s.clients.get(i).map(|c| c.pubkey.clone())
                 } else {
@@ -248,37 +253,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::BunkerRevokeResult(result) => {
-                if let Err(e) = result {
-                    if let Screen::Bunker(s) = &mut self.screen {
-                        s.error = Some(e);
-                    }
-                }
-                self.sync_bunker_clients()
-            }
-            Message::BunkerClientsLoaded(clients) => {
-                if let Some(ref mut bunker) = self.bunker {
-                    bunker.clients = clients.clone();
-                }
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.clients = clients;
-                    s.revoke_all_confirm = false;
-                }
-                Task::none()
-            }
-            Message::BunkerConfirmRevokeAll => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.revoke_all_confirm = true;
-                }
-                Task::none()
-            }
-            Message::BunkerCancelRevokeAll => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.revoke_all_confirm = false;
-                }
-                Task::none()
-            }
-            Message::BunkerRevokeAll => {
+            Event::RevokeAll => {
                 if let Some(ref bunker) = self.bunker {
                     let handler = bunker.handler.clone();
                     return Task::perform(
@@ -291,30 +266,14 @@ impl App {
                 }
                 Task::none()
             }
-            Message::BunkerCopyUrl => {
+            Event::CopyUrl => {
                 let Some(url) = self.bunker.as_ref().map(|b| b.url.clone()) else {
                     return Task::none();
                 };
                 self.start_clipboard_timer();
                 iced::clipboard::write(url)
             }
-            Message::BunkerToggleClient(i) => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.expanded_client = if s.expanded_client == Some(i) {
-                        None
-                    } else {
-                        Some(i)
-                    };
-                }
-                Task::none()
-            }
-            Message::BunkerSetApprovalDuration(i) => {
-                if let Screen::Bunker(s) = &mut self.screen {
-                    s.approval_duration = i;
-                }
-                Task::none()
-            }
-            Message::BunkerTogglePermission(client_idx, flag) => {
+            Event::TogglePermission(client_idx, flag) => {
                 let pubkey_hex = if let Screen::Bunker(s) = &self.screen {
                     s.clients
                         .get(client_idx)
@@ -342,21 +301,49 @@ impl App {
                 }
                 Task::none()
             }
-            Message::BunkerPermissionUpdated(result) => {
-                if let Err(e) = result {
-                    if let Screen::Bunker(s) = &mut self.screen {
-                        s.error = Some(e);
-                    }
-                }
-                self.sync_bunker_clients()
-            }
-            _ => Task::none(),
         }
     }
 
-    pub(crate) fn create_bunker_screen(&self) -> BunkerScreen {
+    pub(crate) fn handle_bunker_revoke_result(
+        &mut self,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(e) = result {
+            if let Screen::Bunker(s) = &mut self.screen {
+                s.error = Some(e);
+            }
+        }
+        self.sync_bunker_clients()
+    }
+
+    pub(crate) fn handle_bunker_clients_loaded(
+        &mut self,
+        clients: Vec<ConnectedClient>,
+    ) -> Task<Message> {
+        if let Some(ref mut bunker) = self.bunker {
+            bunker.clients = clients.clone();
+        }
+        if let Screen::Bunker(s) = &mut self.screen {
+            s.clients = clients;
+        }
+        Task::none()
+    }
+
+    pub(crate) fn handle_bunker_permission_updated(
+        &mut self,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(e) = result {
+            if let Screen::Bunker(s) = &mut self.screen {
+                s.error = Some(e);
+            }
+        }
+        self.sync_bunker_clients()
+    }
+
+    pub(crate) fn create_bunker_screen(&self) -> bunker::State {
         if let Some(ref bunker) = self.bunker {
-            BunkerScreen::with_state(
+            bunker::State::with_state(
                 true,
                 Some(bunker.url.clone()),
                 self.bunker_relays.clone(),
@@ -365,7 +352,7 @@ impl App {
                 self.bunker_pending_approval.clone(),
             )
         } else {
-            BunkerScreen::new(self.bunker_relays.clone())
+            bunker::State::new(self.bunker_relays.clone())
         }
     }
 
