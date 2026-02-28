@@ -185,6 +185,7 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
             "Decryption failed - wrong password or corrupted data".into()
         }
         KeepError::Locked => "Vault is locked".into(),
+        KeepError::Database(ref msg) => format!("Database error: {msg}"),
         KeepError::AlreadyExists(_) => "Vault already exists".into(),
         KeepError::NotFound(_) => "Vault not found".into(),
         KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
@@ -200,7 +201,7 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::Io(_) => "File system error".into(),
         _ => {
             tracing::warn!("Unmapped keep error: {e}");
-            "Operation failed".into()
+            format!("{e}")
         }
     }
 }
@@ -803,8 +804,8 @@ impl App {
                         tokio::task::spawn_blocking(move || {
                             let result = std::panic::catch_unwind(AssertUnwindSafe(
                                 || -> Result<(), String> {
-                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                                    keep.unlock(&password).map_err(friendly_err)?;
+                                    let keep = Keep::open(&path).map_err(friendly_err)?;
+                                    keep.verify_password(&password).map_err(friendly_err)?;
                                     drop(keep);
                                     let meta = std::fs::symlink_metadata(&path).map_err(|e| {
                                         format!("Failed to read vault metadata: {e}")

@@ -15,12 +15,16 @@ jobs:
       - uses: actions/checkout@v6
       - name: Build reproducible binary
         run: docker build -f Dockerfile.reproducible -o type=local,dest=./dist .
-      - name: Rename binary
-        run: mv dist/keep keep-linux-x86_64
+      - name: Rename binaries
+        run: |
+          mv dist/keep keep-linux-x86_64
+          mv dist/keep-desktop keep-desktop-linux-x86_64
       - uses: actions/upload-artifact@v6
         with:
           name: linux
-          path: keep-linux-x86_64
+          path: |
+            keep-linux-x86_64
+            keep-desktop-linux-x86_64
 
   build-macos:
     runs-on: macos-latest
@@ -30,11 +34,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
-      - run: mv target/release/keep keep-macos-x86_64
+      - run: |
+          mv target/release/keep keep-macos-x86_64
+          mv target/release/keep-desktop keep-desktop-macos-x86_64
       - uses: actions/upload-artifact@v6
         with:
           name: macos
-          path: keep-macos-x86_64
+          path: |
+            keep-macos-x86_64
+            keep-desktop-macos-x86_64
 
   build-macos-arm:
     runs-on: macos-latest
@@ -48,11 +56,15 @@ jobs:
         with:
           key: macos-arm
       - run: cargo build --release --locked --target aarch64-apple-darwin
-      - run: mv target/aarch64-apple-darwin/release/keep keep-macos-aarch64
+      - run: |
+          mv target/aarch64-apple-darwin/release/keep keep-macos-aarch64
+          mv target/aarch64-apple-darwin/release/keep-desktop keep-desktop-macos-aarch64
       - uses: actions/upload-artifact@v6
         with:
           name: macos-arm
-          path: keep-macos-aarch64
+          path: |
+            keep-macos-aarch64
+            keep-desktop-macos-aarch64
 
   build-windows:
     runs-on: windows-latest
@@ -61,11 +73,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
-      - run: mv target/release/keep.exe keep-windows-x86_64.exe
+      - run: |
+          mv target/release/keep.exe keep-windows-x86_64.exe
+          mv target/release/keep-desktop.exe keep-desktop-windows-x86_64.exe
       - uses: actions/upload-artifact@v6
         with:
           name: windows
-          path: keep-windows-x86_64.exe
+          path: |
+            keep-windows-x86_64.exe
+            keep-desktop-windows-x86_64.exe
 
   release:
     needs: [build-linux, build-macos, build-macos-arm, build-windows]
