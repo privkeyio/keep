@@ -837,6 +837,15 @@ pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()
 pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     debug!("restoring backup");
 
+    const MAX_BACKUP_SIZE: u64 = 64 * 1024 * 1024;
+    let meta = std::fs::metadata(file)?;
+    if meta.len() > MAX_BACKUP_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "backup file too large ({} bytes, max {})",
+            meta.len(),
+            MAX_BACKUP_SIZE
+        )));
+    }
     let backup_data = std::fs::read(file)?;
     let backup_passphrase = get_password("Enter backup passphrase")?;
 

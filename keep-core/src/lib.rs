@@ -956,11 +956,13 @@ impl Keep {
 
     /// Store a pre-encrypted key record directly (for backup restore).
     pub fn restore_key_record(&self, record: &KeyRecord) -> Result<()> {
+        self.get_data_key()?;
         self.storage.store_key(record)
     }
 
     /// Store a pre-encrypted share directly (for backup restore).
     pub fn restore_stored_share(&self, share: &StoredShare) -> Result<()> {
+        self.get_data_key()?;
         self.storage.store_share(share)
     }
 

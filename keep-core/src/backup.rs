@@ -219,6 +219,25 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     let iterations = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
     let parallelism = u32::from_le_bytes([data[52], data[53], data[54], data[55]]);
 
+    const MAX_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB
+    const MAX_ITERATIONS: u32 = 64;
+    const MAX_PARALLELISM: u32 = 16;
+    if memory_kib == 0 || memory_kib > MAX_MEMORY_KIB {
+        return Err(KeepError::InvalidInput(format!(
+            "backup argon2 memory out of range: {memory_kib}"
+        )));
+    }
+    if iterations == 0 || iterations > MAX_ITERATIONS {
+        return Err(KeepError::InvalidInput(format!(
+            "backup argon2 iterations out of range: {iterations}"
+        )));
+    }
+    if parallelism == 0 || parallelism > MAX_PARALLELISM {
+        return Err(KeepError::InvalidInput(format!(
+            "backup argon2 parallelism out of range: {parallelism}"
+        )));
+    }
+
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&data[56..80]);
 
@@ -271,25 +290,19 @@ pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
     })
 }
 
-/// Restore a backup to a new vault at the target path.
-pub fn restore_backup(
-    data: &[u8],
-    passphrase: &str,
-    target: &Path,
-    vault_password: &str,
-) -> Result<()> {
-    let backup = decrypt_backup(data, passphrase)?;
-
-    if target.exists() {
-        return Err(KeepError::AlreadyExists(target.display().to_string()));
-    }
-
-    let keep = Keep::create(target, vault_password)?;
+fn restore_to_path(backup: &VaultBackup, path: &Path, vault_password: &str) -> Result<()> {
+    let keep = Keep::create(path, vault_password)?;
     let data_key = keep.data_key()?;
 
     for bk in &backup.keys {
         let secret_bytes =
             hex::decode(&bk.secret).map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
+        if secret_bytes.len() != 32 {
+            return Err(KeepError::InvalidInput(format!(
+                "invalid secret length: {} (expected 32)",
+                secret_bytes.len()
+            )));
+        }
         let encrypted = crypto::encrypt(&secret_bytes, &data_key)?;
 
         let mut pubkey = [0u8; 32];
@@ -364,6 +377,41 @@ pub fn restore_backup(
     if let Some(proxy) = &backup.config.proxy {
         keep.set_proxy_config(proxy)?;
     }
+
+    Ok(())
+}
+
+/// Restore a backup to a new vault at the target path.
+pub fn restore_backup(
+    data: &[u8],
+    passphrase: &str,
+    target: &Path,
+    vault_password: &str,
+) -> Result<()> {
+    let backup = decrypt_backup(data, passphrase)?;
+
+    if target.exists() {
+        return Err(KeepError::AlreadyExists(target.display().to_string()));
+    }
+
+    let temp_target = target.with_extension("kbak-tmp");
+    if temp_target.exists() {
+        std::fs::remove_dir_all(&temp_target)
+            .map_err(|e| KeepError::Other(format!("failed to clean stale temp restore: {e}")))?;
+    }
+
+    match restore_to_path(&backup, &temp_target, vault_password) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_target);
+            return Err(e);
+        }
+    }
+
+    std::fs::rename(&temp_target, target).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&temp_target);
+        KeepError::Other(format!("failed to finalize restore: {e}"))
+    })?;
 
     Ok(())
 }
