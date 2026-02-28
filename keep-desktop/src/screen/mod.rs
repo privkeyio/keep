@@ -26,7 +26,7 @@ pub fn truncate_npub(npub: &str) -> String {
 }
 
 pub enum Screen {
-    Unlock(unlock::UnlockScreen),
+    Unlock(unlock::State),
     ShareList(shares::ShareListScreen),
     Create(create::CreateScreen),
     Export(Box<export::ExportScreen>),
@@ -51,7 +51,7 @@ impl Screen {
         kill_switch_active: bool,
     ) -> iced::Element<'a, Message> {
         let (nav, content) = match self {
-            Screen::Unlock(s) => return s.view(),
+            Screen::Unlock(s) => return s.view().map(Message::Unlock),
             Screen::ShareList(s) => (NavItem::Shares, s.view_content()),
             Screen::Create(s) => (NavItem::Create, s.view_content()),
             Screen::Export(s) => (NavItem::Shares, s.view_content()),
@@ -79,8 +79,7 @@ impl Screen {
     pub fn set_loading_error(&mut self, error: String) {
         match self {
             Screen::Unlock(s) => {
-                s.loading = false;
-                s.error = Some(error);
+                s.unlock_failed(error);
             }
             Screen::Create(s) => {
                 s.loading = false;

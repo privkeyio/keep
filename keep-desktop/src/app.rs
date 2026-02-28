@@ -37,7 +37,7 @@ use crate::screen::relay::RelayScreen;
 use crate::screen::settings::SettingsScreen;
 use crate::screen::shares::{ShareEntry, ShareListScreen};
 use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
-use crate::screen::unlock::UnlockScreen;
+use crate::screen::unlock;
 use crate::screen::wallet::{
     AnnounceState, DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry,
     WalletScreen,
@@ -72,7 +72,6 @@ const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const DEFAULT_PROXY_PORT: u16 = 9050;
 const PROXY_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
-const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
 pub(crate) const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -574,7 +573,7 @@ impl App {
             Err(_) => match dirs::home_dir() {
                 Some(home) => home.join(".keep"),
                 None => {
-                    let screen = Screen::Unlock(UnlockScreen::with_error(
+                    let screen = Screen::Unlock(unlock::State::with_error(
                         false,
                         "Cannot determine home directory. Set $HOME and restart.".into(),
                     ));
@@ -587,7 +586,7 @@ impl App {
         };
         let vault_exists = keep_path.exists();
         let (settings, tray_migrated) = load_settings(&keep_path);
-        let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
+        let screen = Screen::Unlock(unlock::State::new(vault_exists));
         let start_minimized = settings.start_minimized;
         let mut app = Self::init(keep_path, screen, Vec::new(), settings);
         if tray_migrated {
@@ -613,14 +612,22 @@ impl App {
         match message {
             Message::Tick => self.handle_tick(),
 
-            Message::PasswordChanged(..)
-            | Message::ConfirmPasswordChanged(..)
-            | Message::Unlock
-            | Message::UnlockResult(..)
-            | Message::StartFresh
-            | Message::CancelStartFresh
-            | Message::ConfirmStartFresh
-            | Message::StartFreshResult(..) => self.handle_unlock_message(message),
+            Message::Unlock(msg) => self.handle_unlock_message(msg),
+            Message::UnlockResult(result) => self.handle_shares_result(result),
+            Message::StartFreshResult(result) => {
+                match result {
+                    Ok(()) => {
+                        *lock_keep(&self.keep) = None;
+                        self.screen = Screen::Unlock(unlock::State::new(false));
+                    }
+                    Err(e) => {
+                        if let Screen::Unlock(s) = &mut self.screen {
+                            s.start_fresh_failed(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
 
             Message::GoToCreate
             | Message::GoToImport
@@ -822,52 +829,94 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn handle_unlock_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::PasswordChanged(p) => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.password = p;
-                }
-                Task::none()
+    fn handle_unlock_message(&mut self, msg: unlock::Message) -> Task<Message> {
+        let screen = match &mut self.screen {
+            Screen::Unlock(s) => s,
+            _ => return Task::none(),
+        };
+        let Some(event) = screen.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            unlock::Event::Unlock {
+                password,
+                vault_exists,
+            } => {
+                let path = self.keep_path.clone();
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<_, String> {
+                                    let mut keep = if vault_exists {
+                                        Keep::open(&path).map_err(friendly_err)?
+                                    } else {
+                                        Keep::create(&path, &password).map_err(friendly_err)?
+                                    };
+                                    if vault_exists {
+                                        keep.unlock(&password).map_err(friendly_err)?;
+                                    }
+                                    let shares = collect_shares(&keep)?;
+                                    *lock_keep(&keep_arc) = Some(keep);
+                                    Ok(shares)
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    error!("Panic during unlock: {:?}", payload.type_id());
+                                    Err("Internal error during unlock".to_string())
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::UnlockResult,
+                )
             }
-            Message::ConfirmPasswordChanged(p) => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.confirm_password = p;
-                }
-                Task::none()
+            unlock::Event::StartFresh { password } => {
+                let path = self.keep_path.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<(), String> {
+                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
+                                    keep.unlock(&password).map_err(friendly_err)?;
+                                    drop(keep);
+                                    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                                        format!("Failed to read vault metadata: {e}")
+                                    })?;
+                                    if meta.is_symlink() {
+                                        return Err(
+                                            "Vault path is a symlink; refusing to delete".into()
+                                        );
+                                    }
+                                    std::fs::remove_dir_all(&path)
+                                        .map_err(|e| format!("Failed to remove vault: {e}"))
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    error!(
+                                        "Panic during start fresh: {:?}",
+                                        payload.type_id()
+                                    );
+                                    Err(
+                                        "Internal error; please restart the application".into(),
+                                    )
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::StartFreshResult,
+                )
             }
-            Message::Unlock => self.handle_unlock(),
-            Message::UnlockResult(result) => self.handle_shares_result(result),
-            Message::StartFresh => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.start_fresh_confirm = true;
-                }
-                Task::none()
-            }
-            Message::CancelStartFresh => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.start_fresh_confirm = false;
-                }
-                Task::none()
-            }
-            Message::ConfirmStartFresh => self.handle_start_fresh(),
-            Message::StartFreshResult(result) => {
-                match result {
-                    Ok(()) => {
-                        *lock_keep(&self.keep) = None;
-                        self.screen = Screen::Unlock(UnlockScreen::new(false));
-                    }
-                    Err(e) => {
-                        if let Screen::Unlock(s) = &mut self.screen {
-                            s.loading = false;
-                            s.error = Some(e);
-                            s.start_fresh_confirm = false;
-                        }
-                    }
-                }
-                Task::none()
-            }
-            _ => Task::none(),
         }
     }
 
@@ -1875,7 +1924,7 @@ impl App {
         self.pin_mismatch = None;
         self.pin_mismatch_confirm = false;
         self.bunker_cert_pin_failed = false;
-        self.screen = Screen::Unlock(UnlockScreen::new(true));
+        self.screen = Screen::Unlock(unlock::State::new(true));
         if clear_clipboard {
             iced::clipboard::write(String::new())
         } else {
@@ -2033,118 +2082,6 @@ impl App {
                 self.active_share_hex = None;
             }
         }
-    }
-
-    fn handle_unlock(&mut self) -> Task<Message> {
-        let (password, vault_exists) = match &mut self.screen {
-            Screen::Unlock(s) => {
-                if s.loading {
-                    return Task::none();
-                }
-                if s.password.is_empty() {
-                    s.error = Some("Password required".into());
-                    return Task::none();
-                }
-                if !s.vault_exists && s.password.len() < MIN_PASSWORD_LEN {
-                    s.error = Some(format!(
-                        "Password must be at least {MIN_PASSWORD_LEN} characters"
-                    ));
-                    return Task::none();
-                }
-                if !s.vault_exists && *s.password != *s.confirm_password {
-                    s.error = Some("Passwords do not match".into());
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.password.clone(), s.vault_exists)
-            }
-            _ => return Task::none(),
-        };
-
-        let path = self.keep_path.clone();
-        let keep_arc = self.keep.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
-                            let mut keep = if vault_exists {
-                                Keep::open(&path).map_err(friendly_err)?
-                            } else {
-                                Keep::create(&path, &password).map_err(friendly_err)?
-                            };
-
-                            if vault_exists {
-                                keep.unlock(&password).map_err(friendly_err)?;
-                            }
-
-                            let shares = collect_shares(&keep)?;
-                            *lock_keep(&keep_arc) = Some(keep);
-                            Ok(shares)
-                        }));
-
-                    match result {
-                        Ok(r) => r,
-                        Err(payload) => {
-                            error!("Panic during unlock: {:?}", payload.type_id());
-                            Err("Internal error during unlock".to_string())
-                        }
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())?
-            },
-            Message::UnlockResult,
-        )
-    }
-
-    fn handle_start_fresh(&mut self) -> Task<Message> {
-        let password = match &mut self.screen {
-            Screen::Unlock(s) => {
-                if s.password.is_empty() {
-                    s.error = Some("Enter your vault password to confirm deletion".into());
-                    return Task::none();
-                }
-                if s.loading {
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                s.password.clone()
-            }
-            _ => return Task::none(),
-        };
-        let path = self.keep_path.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
-                            let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                            keep.unlock(&password).map_err(friendly_err)?;
-                            drop(keep);
-                            let meta = std::fs::symlink_metadata(&path)
-                                .map_err(|e| format!("Failed to read vault metadata: {e}"))?;
-                            if meta.is_symlink() {
-                                return Err("Vault path is a symlink; refusing to delete".into());
-                            }
-                            std::fs::remove_dir_all(&path)
-                                .map_err(|e| format!("Failed to remove vault: {e}"))
-                        }));
-                    match result {
-                        Ok(r) => r,
-                        Err(payload) => {
-                            error!("Panic during start fresh: {:?}", payload.type_id());
-                            Err("Internal error; please restart the application".into())
-                        }
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())?
-            },
-            Message::StartFreshResult,
-        )
     }
 
     pub(crate) fn set_toast(&mut self, message: String, kind: ToastKind) {
@@ -3492,7 +3429,7 @@ impl App {
     #[cfg(test)]
     fn test_new(settings: Settings, has_tray: bool) -> Self {
         let keep_path = PathBuf::from("/tmp/keep-test-nonexistent");
-        let screen = Screen::Unlock(crate::screen::unlock::UnlockScreen::new(false));
+        let screen = Screen::Unlock(crate::screen::unlock::State::new(false));
         let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
         Self {
             keep: Arc::new(Mutex::new(None)),

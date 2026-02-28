@@ -107,14 +107,9 @@ pub struct PendingSignRequest {
 #[derive(Clone)]
 pub enum Message {
     // Unlock
-    PasswordChanged(Zeroizing<String>),
-    ConfirmPasswordChanged(Zeroizing<String>),
-    Unlock,
+    Unlock(crate::screen::unlock::Message),
     UnlockResult(Result<Vec<ShareEntry>, String>),
-    StartFresh,
-    ConfirmStartFresh,
     StartFreshResult(Result<(), String>),
-    CancelStartFresh,
 
     // Navigation
     GoToImport,
@@ -422,8 +417,7 @@ pub struct ShareIdentity {
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
-            Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
+            Self::Unlock(msg) => f.debug_tuple("Unlock").field(msg).finish(),
             Self::ExportPassphraseChanged(_) => f.write_str("ExportPassphraseChanged(***)"),
             Self::ExportConfirmPassphraseChanged(_) => {
                 f.write_str("ExportConfirmPassphraseChanged(***)")
@@ -432,15 +426,11 @@ impl fmt::Debug for Message {
             Self::ImportDataChanged(_) => f.write_str("ImportDataChanged(***)"),
             Self::ExportGenerated(_) => f.write_str("ExportGenerated(***)"),
             Self::CopyToClipboard(_) => f.write_str("CopyToClipboard(***)"),
-            Self::Unlock => f.write_str("Unlock"),
             Self::UnlockResult(r) => f
                 .debug_tuple("UnlockResult")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
-            Self::StartFresh => f.write_str("StartFresh"),
-            Self::ConfirmStartFresh => f.write_str("ConfirmStartFresh"),
             Self::StartFreshResult(_) => f.write_str("StartFreshResult(***)"),
-            Self::CancelStartFresh => f.write_str("CancelStartFresh"),
             Self::GoToImport => f.write_str("GoToImport"),
             Self::GoToExport(i) => f.debug_tuple("GoToExport").field(i).finish(),
             Self::GoToCreate => f.write_str("GoToCreate"),
