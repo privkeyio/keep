@@ -209,6 +209,22 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
     }
 }
 
+fn write_private_bytes(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(path);
+    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    (&tmp).write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 fn to_display_entry(e: keep_core::audit::SigningAuditEntry) -> AuditDisplayEntry {
     AuditDisplayEntry {
         timestamp: e.timestamp,
@@ -697,6 +713,15 @@ impl App {
             Message::KillSwitchDeactivateResult(result) => {
                 self.handle_kill_switch_deactivate_result(result)
             }
+
+            Message::BackupResult(result) => self.handle_backup_result(result),
+            Message::RestoreFileLoaded(name, data) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.restore_file_loaded(name, data);
+                }
+                Task::none()
+            }
+            Message::RestoreResult(result) => self.handle_restore_result(result),
 
             Message::CertPinMismatchDismiss
             | Message::CertPinMismatchClearAndRetry
@@ -2783,6 +2808,18 @@ impl App {
                 }
                 return Task::none();
             }
+            Event::BackupExport(passphrase) => {
+                return self.handle_backup_export(passphrase);
+            }
+            Event::RestoreStart => {
+                return self.handle_restore_file_pick();
+            }
+            Event::RestoreSubmit {
+                passphrase,
+                vault_password,
+            } => {
+                return self.handle_restore_submit(passphrase, vault_password);
+            }
             Event::CertPinClearAll => {
                 let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     *pins = keep_frost_net::CertificatePinSet::new();
@@ -2985,6 +3022,151 @@ impl App {
 
     pub(crate) fn is_kill_switch_active(&self) -> bool {
         self.kill_switch.load(Ordering::Acquire)
+    }
+
+    fn handle_backup_export(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_file_name("keep-backup.kbak")
+                    .set_title("Save Vault Backup");
+                let Some(handle) = dialog.save_file().await else {
+                    return Err("Cancelled".into());
+                };
+                let path = handle.path().to_path_buf();
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "backup".into());
+                let backup_data = tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Backup failed", move |keep| {
+                        keep_core::backup::create_backup(keep, &passphrase).map_err(friendly_err)
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+                tokio::task::spawn_blocking(move || write_private_bytes(&path, &backup_data))
+                    .await
+                    .map_err(|_| "Background task failed".to_string())?
+                    .map_err(|e| format!("Failed to write backup: {e}"))?;
+                Ok(filename)
+            },
+            Message::BackupResult,
+        )
+    }
+
+    fn handle_backup_result(&mut self, result: Result<String, String>) -> Task<Message> {
+        match result {
+            Ok(filename) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.backup_completed();
+                }
+                self.set_toast(format!("Backup saved to {filename}"), ToastKind::Success);
+            }
+            Err(ref e) if e == "Cancelled" => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.backup_loading = false;
+                }
+            }
+            Err(e) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.backup_failed(e.clone());
+                }
+                self.set_toast(e, ToastKind::Error);
+            }
+        }
+        Task::none()
+    }
+
+    fn handle_restore_file_pick(&mut self) -> Task<Message> {
+        Task::perform(
+            async {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .add_filter("Keep Backup", &["kbak"])
+                    .set_title("Open Vault Backup");
+                match dialog.pick_file().await {
+                    Some(handle) => {
+                        let meta = std::fs::metadata(handle.path())
+                            .map_err(|e| format!("Failed to read file: {e}"))?;
+                        if meta.len() > keep_core::backup::MAX_BACKUP_SIZE as u64 {
+                            return Err(format!(
+                                "Backup file too large ({} bytes, max {})",
+                                meta.len(),
+                                keep_core::backup::MAX_BACKUP_SIZE
+                            ));
+                        }
+                        let name = handle.file_name();
+                        let data = handle.read().await;
+                        Ok((name, data))
+                    }
+                    None => Err("Cancelled".to_string()),
+                }
+            },
+            |result: Result<(String, Vec<u8>), String>| match result {
+                Ok((name, data)) => Message::RestoreFileLoaded(name, data),
+                Err(_) => Message::Settings(crate::screen::settings::Message::RestoreCancel),
+            },
+        )
+    }
+
+    fn handle_restore_submit(
+        &mut self,
+        passphrase: Zeroizing<String>,
+        vault_password: Zeroizing<String>,
+    ) -> Task<Message> {
+        let file_data = if let Screen::Settings(s) = &self.screen {
+            s.restore_file.as_ref().map(|(_, data)| data.clone())
+        } else {
+            None
+        };
+        let Some(data) = file_data else {
+            return Task::none();
+        };
+        let keep_path = self.keep_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    let restore_dir = keep_path.with_file_name(format!("keep-restored-{ts}"));
+                    let info = keep_core::backup::restore_backup(
+                        &data,
+                        &passphrase,
+                        &restore_dir,
+                        &vault_password,
+                    )
+                    .map_err(friendly_err)?;
+                    Ok(format!(
+                        "Restored {} keys, {} shares, {} descriptors to {}",
+                        info.key_count,
+                        info.share_count,
+                        info.descriptor_count,
+                        restore_dir.display()
+                    ))
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RestoreResult,
+        )
+    }
+
+    fn handle_restore_result(&mut self, result: Result<String, String>) -> Task<Message> {
+        match result {
+            Ok(summary) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.restore_completed();
+                }
+                self.set_toast(summary, ToastKind::Success);
+            }
+            Err(e) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.restore_failed(e.clone());
+                }
+                self.set_toast(e, ToastKind::Error);
+            }
+        }
+        Task::none()
     }
 
     fn handle_window_close(&mut self, id: iced::window::Id) -> Task<Message> {

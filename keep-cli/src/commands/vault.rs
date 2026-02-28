@@ -775,3 +775,120 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()> {
+    debug!("creating backup");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let backup_passphrase =
+        get_password_with_confirm("Enter backup passphrase", "Confirm backup passphrase")?;
+
+    let spinner = out.spinner("Creating backup...");
+    let backup_data = keep_core::backup::create_backup(&keep, backup_passphrase.expose_secret())?;
+    spinner.finish();
+
+    let output_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let filename = format!(
+                "keep-backup-{}.kbak",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            );
+            std::env::current_dir().unwrap_or_default().join(filename)
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&output_path)?;
+        std::io::Write::write_all(&mut file, &backup_data)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&output_path, &backup_data)?;
+
+    let info = keep_core::backup::verify_backup(&backup_data, backup_passphrase.expose_secret())?;
+
+    out.newline();
+    out.success("Backup created successfully!");
+    out.field("File", &output_path.display().to_string());
+    out.field("Size", &format!("{} bytes", backup_data.len()));
+    out.field("Keys", &info.key_count.to_string());
+    out.field("Shares", &info.share_count.to_string());
+    out.field("Descriptors", &info.descriptor_count.to_string());
+
+    info!(
+        path = %output_path.display(),
+        keys = info.key_count,
+        shares = info.share_count,
+        "backup created"
+    );
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(out), fields(file = %file.display(), target = %target.display()))]
+pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
+    debug!("restoring backup");
+
+    let mut file_handle = std::fs::File::open(file)?;
+    let file_len = file_handle.metadata()?.len();
+    if file_len > keep_core::backup::MAX_BACKUP_SIZE as u64 {
+        return Err(KeepError::InvalidInput(format!(
+            "backup file too large ({file_len} bytes, max {})",
+            keep_core::backup::MAX_BACKUP_SIZE
+        )));
+    }
+    let mut backup_data = Vec::with_capacity(file_len as usize);
+    std::io::Read::read_to_end(&mut file_handle, &mut backup_data)?;
+    let backup_passphrase = get_password("Enter backup passphrase")?;
+
+    if target.exists() {
+        return Err(KeepError::AlreadyExists(target.display().to_string()));
+    }
+
+    let vault_password =
+        get_password_with_confirm("Enter new vault password", "Confirm new vault password")?;
+
+    if vault_password.expose_secret().len() < 8 {
+        return Err(KeepError::InvalidInput(
+            "password must be at least 8 characters".into(),
+        ));
+    }
+
+    let spinner = out.spinner("Restoring backup...");
+    let info = keep_core::backup::restore_backup(
+        &backup_data,
+        backup_passphrase.expose_secret(),
+        target,
+        vault_password.expose_secret(),
+    )?;
+    spinner.finish();
+
+    out.newline();
+    out.success("Backup restored successfully!");
+    out.field("Path", &target.display().to_string());
+    out.field("Keys", &info.key_count.to_string());
+    out.field("Shares", &info.share_count.to_string());
+    out.field("Descriptors", &info.descriptor_count.to_string());
+
+    info!(
+        target = %target.display(),
+        keys = info.key_count,
+        shares = info.share_count,
+        "backup restored"
+    );
+
+    Ok(())
+}

@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 use crate::theme;
 
+const MIN_BACKUP_PASSPHRASE: usize = 8;
+
 #[derive(Clone)]
 pub enum Message {
     AutoLockChanged(u64),
@@ -26,6 +28,17 @@ pub enum Message {
     CertPinClearAllRequest,
     CertPinClearAllConfirm,
     CertPinClearAllCancel,
+    BackupStart,
+    BackupPassphraseChanged(Zeroizing<String>),
+    BackupConfirmChanged(Zeroizing<String>),
+    BackupCancel,
+    BackupExport,
+    RestoreStart,
+    RestorePassphraseChanged(Zeroizing<String>),
+    RestorePasswordChanged(Zeroizing<String>),
+    RestorePasswordConfirmChanged(Zeroizing<String>),
+    RestoreCancel,
+    RestoreSubmit,
 }
 
 impl fmt::Debug for Message {
@@ -52,6 +65,19 @@ impl fmt::Debug for Message {
             Self::CertPinClearAllRequest => f.write_str("CertPinClearAllRequest"),
             Self::CertPinClearAllConfirm => f.write_str("CertPinClearAllConfirm"),
             Self::CertPinClearAllCancel => f.write_str("CertPinClearAllCancel"),
+            Self::BackupStart => f.write_str("BackupStart"),
+            Self::BackupPassphraseChanged(_) => f.write_str("BackupPassphraseChanged(***)"),
+            Self::BackupConfirmChanged(_) => f.write_str("BackupConfirmChanged(***)"),
+            Self::BackupCancel => f.write_str("BackupCancel"),
+            Self::BackupExport => f.write_str("BackupExport"),
+            Self::RestoreStart => f.write_str("RestoreStart"),
+            Self::RestorePassphraseChanged(_) => f.write_str("RestorePassphraseChanged(***)"),
+            Self::RestorePasswordChanged(_) => f.write_str("RestorePasswordChanged(***)"),
+            Self::RestorePasswordConfirmChanged(_) => {
+                f.write_str("RestorePasswordConfirmChanged(***)")
+            }
+            Self::RestoreCancel => f.write_str("RestoreCancel"),
+            Self::RestoreSubmit => f.write_str("RestoreSubmit"),
         }
     }
 }
@@ -67,6 +93,12 @@ pub enum Event {
     KillSwitchDeactivate(Zeroizing<String>),
     CertPinClear(String),
     CertPinClearAll,
+    BackupExport(Zeroizing<String>),
+    RestoreStart,
+    RestoreSubmit {
+        passphrase: Zeroizing<String>,
+        vault_password: Zeroizing<String>,
+    },
 }
 
 fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
@@ -98,6 +130,19 @@ pub struct SettingsScreen {
     pub has_tray: bool,
     pub certificate_pins: Vec<(String, String)>,
     clear_all_pins_confirm: bool,
+    backup_active: bool,
+    backup_passphrase: Zeroizing<String>,
+    backup_confirm: Zeroizing<String>,
+    pub backup_loading: bool,
+    backup_error: Option<String>,
+    restore_active: bool,
+    restore_passphrase: Zeroizing<String>,
+    restore_password: Zeroizing<String>,
+    restore_password_confirm: Zeroizing<String>,
+    pub restore_loading: bool,
+    restore_error: Option<String>,
+    pub restore_file: Option<(String, Vec<u8>)>,
+    restore_info: Option<String>,
 }
 
 impl SettingsScreen {
@@ -131,6 +176,19 @@ impl SettingsScreen {
             has_tray,
             certificate_pins,
             clear_all_pins_confirm: false,
+            backup_active: false,
+            backup_passphrase: Zeroizing::new(String::new()),
+            backup_confirm: Zeroizing::new(String::new()),
+            backup_loading: false,
+            backup_error: None,
+            restore_active: false,
+            restore_passphrase: Zeroizing::new(String::new()),
+            restore_password: Zeroizing::new(String::new()),
+            restore_password_confirm: Zeroizing::new(String::new()),
+            restore_loading: false,
+            restore_error: None,
+            restore_file: None,
+            restore_info: None,
         }
     }
 
@@ -185,6 +243,95 @@ impl SettingsScreen {
                 None
             }
             Message::CertPinClearAllConfirm => Some(Event::CertPinClearAll),
+            Message::BackupStart => {
+                self.backup_active = true;
+                self.restore_active = false;
+                self.backup_error = None;
+                None
+            }
+            Message::BackupPassphraseChanged(p) => {
+                self.backup_passphrase = p;
+                None
+            }
+            Message::BackupConfirmChanged(p) => {
+                self.backup_confirm = p;
+                None
+            }
+            Message::BackupCancel => {
+                self.backup_active = false;
+                self.backup_passphrase = Zeroizing::new(String::new());
+                self.backup_confirm = Zeroizing::new(String::new());
+                self.backup_error = None;
+                None
+            }
+            Message::BackupExport => {
+                if self.backup_passphrase.len() < MIN_BACKUP_PASSPHRASE {
+                    self.backup_error = Some(format!(
+                        "Passphrase must be at least {MIN_BACKUP_PASSPHRASE} characters"
+                    ));
+                    return None;
+                }
+                if *self.backup_passphrase != *self.backup_confirm {
+                    self.backup_error = Some("Passphrases do not match".into());
+                    return None;
+                }
+                self.backup_loading = true;
+                self.backup_error = None;
+                Some(Event::BackupExport(self.backup_passphrase.clone()))
+            }
+            Message::RestoreStart => {
+                self.restore_active = false;
+                self.backup_active = false;
+                Some(Event::RestoreStart)
+            }
+            Message::RestorePassphraseChanged(p) => {
+                self.restore_passphrase = p;
+                None
+            }
+            Message::RestorePasswordChanged(p) => {
+                self.restore_password = p;
+                None
+            }
+            Message::RestorePasswordConfirmChanged(p) => {
+                self.restore_password_confirm = p;
+                None
+            }
+            Message::RestoreCancel => {
+                self.restore_active = false;
+                self.restore_passphrase = Zeroizing::new(String::new());
+                self.restore_password = Zeroizing::new(String::new());
+                self.restore_password_confirm = Zeroizing::new(String::new());
+                self.restore_file = None;
+                self.restore_info = None;
+                self.restore_error = None;
+                None
+            }
+            Message::RestoreSubmit => {
+                if self.restore_passphrase.is_empty() {
+                    self.restore_error = Some("Passphrase required".into());
+                    return None;
+                }
+                if self.restore_file.is_none() {
+                    self.restore_error = Some("No backup file loaded".into());
+                    return None;
+                }
+                if self.restore_password.len() < MIN_BACKUP_PASSPHRASE {
+                    self.restore_error = Some(format!(
+                        "Vault password must be at least {MIN_BACKUP_PASSPHRASE} characters"
+                    ));
+                    return None;
+                }
+                if *self.restore_password != *self.restore_password_confirm {
+                    self.restore_error = Some("Vault passwords do not match".into());
+                    return None;
+                }
+                self.restore_loading = true;
+                self.restore_error = None;
+                Some(Event::RestoreSubmit {
+                    passphrase: self.restore_passphrase.clone(),
+                    vault_password: self.restore_password.clone(),
+                })
+            }
         }
     }
 
@@ -210,12 +357,44 @@ impl SettingsScreen {
         self.clear_all_pins_confirm = false;
     }
 
+    pub fn backup_completed(&mut self) {
+        self.backup_active = false;
+        self.backup_loading = false;
+        self.backup_passphrase = Zeroizing::new(String::new());
+        self.backup_confirm = Zeroizing::new(String::new());
+        self.backup_error = None;
+    }
+
+    pub fn backup_failed(&mut self, error: String) {
+        self.backup_loading = false;
+        self.backup_error = Some(error);
+    }
+
+    pub fn restore_file_loaded(&mut self, filename: String, data: Vec<u8>) {
+        self.restore_active = true;
+        self.restore_file = Some((filename, data));
+        self.restore_error = None;
+    }
+
+    pub fn restore_completed(&mut self) {
+        self.restore_active = false;
+        self.restore_loading = false;
+        self.restore_passphrase = Zeroizing::new(String::new());
+        self.restore_password = Zeroizing::new(String::new());
+        self.restore_password_confirm = Zeroizing::new(String::new());
+        self.restore_file = None;
+        self.restore_info = None;
+        self.restore_error = None;
+    }
+
+    pub fn restore_failed(&mut self, error: String) {
+        self.restore_loading = false;
+        self.restore_error = Some(error);
+    }
+
     pub fn sync_proxy_port(&mut self, port: u16) {
         self.proxy_port = port;
-        let formatted = port.to_string();
-        if self.proxy_port_input != formatted {
-            self.proxy_port_input = formatted;
-        }
+        self.proxy_port_input = port.to_string();
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -237,9 +416,11 @@ impl SettingsScreen {
             content = content.push(self.tray_card());
         }
 
+        let backup_card = self.backup_restore_card();
         content = content
             .push(proxy_card)
             .push(cert_pins_card)
+            .push(backup_card)
             .push(info_card);
 
         scrollable(content)
@@ -564,6 +745,157 @@ impl SettingsScreen {
                     .padding([theme::space::SM, theme::space::MD]);
                 col = col.push(clear_all_btn);
             }
+        }
+
+        container(col)
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn backup_restore_card(&self) -> Element<'_, Message> {
+        let mut col = column![
+            theme::label("Vault backup"),
+            theme::muted("Create or restore an encrypted backup of your entire vault"),
+        ]
+        .spacing(theme::space::SM);
+
+        if self.backup_active {
+            let passphrase_input = text_input("Backup passphrase", &self.backup_passphrase)
+                .on_input(|s| Message::BackupPassphraseChanged(Zeroizing::new(s)))
+                .secure(true)
+                .size(theme::size::BODY)
+                .width(theme::size::INPUT_WIDTH);
+
+            let confirm_input = text_input("Confirm passphrase", &self.backup_confirm)
+                .on_input(|s| Message::BackupConfirmChanged(Zeroizing::new(s)))
+                .secure(true)
+                .size(theme::size::BODY)
+                .width(theme::size::INPUT_WIDTH);
+
+            let can_export = !self.backup_loading
+                && self.backup_passphrase.len() >= MIN_BACKUP_PASSPHRASE
+                && *self.backup_passphrase == *self.backup_confirm;
+
+            let mut export_btn = button(text("Export").size(theme::size::SMALL))
+                .style(theme::primary_button)
+                .padding([theme::space::SM, theme::space::MD]);
+            if can_export {
+                export_btn = export_btn.on_press(Message::BackupExport);
+            }
+
+            let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
+                .on_press(Message::BackupCancel)
+                .style(theme::secondary_button)
+                .padding([theme::space::SM, theme::space::MD]);
+
+            col = col.push(passphrase_input).push(confirm_input).push(
+                row![export_btn, cancel_btn]
+                    .spacing(theme::space::SM)
+                    .align_y(iced::Alignment::Center),
+            );
+
+            if self.backup_loading {
+                col = col.push(
+                    text("Creating backup...")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                );
+            }
+
+            if let Some(ref err) = self.backup_error {
+                col = col.push(theme::error_text(err));
+            }
+        } else if self.restore_active {
+            if let Some((ref filename, _)) = self.restore_file {
+                col = col.push(
+                    text(format!("File: {filename}"))
+                        .size(theme::size::BODY)
+                        .color(theme::color::TEXT_MUTED),
+                );
+
+                if let Some(ref info) = self.restore_info {
+                    col = col.push(
+                        text(info)
+                            .size(theme::size::BODY)
+                            .color(theme::color::SUCCESS),
+                    );
+                }
+
+                let passphrase_input = text_input("Backup passphrase", &self.restore_passphrase)
+                    .on_input(|s| Message::RestorePassphraseChanged(Zeroizing::new(s)))
+                    .secure(true)
+                    .size(theme::size::BODY)
+                    .width(theme::size::INPUT_WIDTH);
+
+                let password_input = text_input("New vault password", &self.restore_password)
+                    .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
+                    .secure(true)
+                    .size(theme::size::BODY)
+                    .width(theme::size::INPUT_WIDTH);
+
+                let password_confirm_input =
+                    text_input("Confirm vault password", &self.restore_password_confirm)
+                        .on_input(|s| Message::RestorePasswordConfirmChanged(Zeroizing::new(s)))
+                        .secure(true)
+                        .size(theme::size::BODY)
+                        .width(theme::size::INPUT_WIDTH);
+
+                let can_submit = !self.restore_loading
+                    && !self.restore_passphrase.is_empty()
+                    && !self.restore_password.is_empty()
+                    && !self.restore_password_confirm.is_empty();
+                let mut submit_btn = button(text("Restore").size(theme::size::SMALL))
+                    .style(theme::primary_button)
+                    .padding([theme::space::SM, theme::space::MD]);
+                if can_submit {
+                    submit_btn = submit_btn.on_press(Message::RestoreSubmit);
+                }
+
+                let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
+                    .on_press(Message::RestoreCancel)
+                    .style(theme::secondary_button)
+                    .padding([theme::space::SM, theme::space::MD]);
+
+                col = col
+                    .push(passphrase_input)
+                    .push(password_input)
+                    .push(password_confirm_input)
+                    .push(
+                        row![submit_btn, cancel_btn]
+                            .spacing(theme::space::SM)
+                            .align_y(iced::Alignment::Center),
+                    );
+            }
+
+            if self.restore_loading {
+                col = col.push(
+                    text("Restoring...")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                );
+            }
+
+            if let Some(ref err) = self.restore_error {
+                col = col.push(theme::error_text(err));
+            }
+        } else {
+            let backup_btn = button(text("Create Backup").size(theme::size::SMALL))
+                .on_press(Message::BackupStart)
+                .style(theme::primary_button)
+                .padding([theme::space::SM, theme::space::MD]);
+
+            let restore_btn = button(text("Restore from Backup").size(theme::size::SMALL))
+                .on_press(Message::RestoreStart)
+                .style(theme::secondary_button)
+                .padding([theme::space::SM, theme::space::MD]);
+
+            col = col.push(
+                row![backup_btn, restore_btn]
+                    .spacing(theme::space::SM)
+                    .align_y(iced::Alignment::Center),
+            );
         }
 
         container(col)

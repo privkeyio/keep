@@ -4,10 +4,6 @@
 namespace keep_mobile {
     [Throws=KeepMobileError]
     ParsedBunkerUrl parse_bunker_url(string url);
-
-    string format_timestamp(i64 ts);
-    string format_timestamp_detailed(i64 ts);
-    string truncate_str(string s, u32 prefix_len, u32 suffix_len);
 };
 
 [Error]
