@@ -188,6 +188,11 @@ pub enum Message {
     // Settings
     Settings(crate::screen::settings::Message),
 
+    // Backup / Restore
+    BackupResult(Result<String, String>),
+    RestoreFileLoaded(String, Vec<u8>),
+    RestoreResult(Result<String, String>),
+
     // Certificate pinning (modal overlay, not screen-local)
     CertPinMismatchDismiss,
     CertPinMismatchClearAndRetry,
@@ -418,6 +423,19 @@ impl fmt::Debug for Message {
             }
             Self::CancelDeleteIdentity => f.write_str("CancelDeleteIdentity"),
             Self::Settings(msg) => f.debug_tuple("Settings").field(msg).finish(),
+            Self::BackupResult(r) => f
+                .debug_tuple("BackupResult")
+                .field(&r.as_ref().map(|p| p.as_str()).map_err(|e| e.as_str()))
+                .finish(),
+            Self::RestoreFileLoaded(name, data) => f
+                .debug_tuple("RestoreFileLoaded")
+                .field(name)
+                .field(&data.len())
+                .finish(),
+            Self::RestoreResult(r) => f
+                .debug_tuple("RestoreResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
             Self::NavigateAudit => f.write_str("NavigateAudit"),
             Self::AuditLoaded(r) => f
                 .debug_tuple("AuditLoaded")

@@ -33,6 +33,7 @@ tempfile = "3"
 nokhwa = { version = "0.10", features = ["input-native"] }
 rxing = "0.8"
 image = "0.25"
+rfd = "0.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
