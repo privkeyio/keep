@@ -49,6 +49,62 @@ pub fn truncate_str(s: String, prefix_len: u32, suffix_len: u32) -> String {
     keep_core::display::truncate_str(&s, prefix_len as usize, suffix_len as usize)
 }
 
+#[uniffi::export]
+pub fn is_hex_64(value: String) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[uniffi::export]
+pub fn hex_to_npub(hex: String) -> Option<String> {
+    use nostr_sdk::prelude::{PublicKey, ToBech32};
+    PublicKey::from_hex(&hex)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+}
+
+#[uniffi::export]
+pub fn format_pubkey_display(pubkey: String) -> String {
+    let bech32 = hex_to_npub(pubkey.clone()).unwrap_or(pubkey);
+    keep_core::display::truncate_str(&bech32, 12, 8)
+}
+
+#[uniffi::export]
+pub fn format_event_id_display(event_id: String, relay_url: Option<String>) -> String {
+    use nostr_sdk::prelude::{EventId, Nip19Event, RelayUrl, ToBech32};
+    let nevent = EventId::from_hex(&event_id).ok().and_then(|id| {
+        let mut ev = Nip19Event::new(id);
+        if let Some(url) = relay_url.and_then(|r| RelayUrl::parse(&r).ok()) {
+            ev = ev.relays(vec![url]);
+        }
+        ev.to_bech32().ok()
+    });
+    let display = nevent.unwrap_or(event_id);
+    keep_core::display::truncate_str(&display, 12, 8)
+}
+
+#[uniffi::export]
+pub fn is_valid_nsec_format(nsec: String) -> bool {
+    use nostr_sdk::prelude::{FromBech32, SecretKey};
+    SecretKey::from_bech32(&nsec).is_ok()
+}
+
+#[uniffi::export]
+pub fn nsec_to_hex(nsec: String) -> Option<String> {
+    use nostr_sdk::prelude::{FromBech32, SecretKey};
+    SecretKey::from_bech32(&nsec)
+        .ok()
+        .map(|sk| sk.to_secret_hex())
+}
+
+#[uniffi::export]
+pub fn is_valid_bech32_char(c: String) -> bool {
+    const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    c.len() == 1
+        && c.chars()
+            .next()
+            .is_some_and(|ch| BECH32_CHARSET.contains(ch))
+}
+
 use keep_core::frost::{
     ShareExport, ShareMetadata, SharePackage, ThresholdConfig as CoreThresholdConfig, TrustedDealer,
 };
@@ -101,6 +157,7 @@ const HEALTH_STATUS_KEY_PREFIX: &str = "__keep_health_";
 const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
 const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
 const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
+const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -120,6 +177,12 @@ pub struct RelayConfigInfo {
 pub struct ProxyConfigInfo {
     pub enabled: bool,
     pub port: u16,
+}
+
+#[derive(uniffi::Record)]
+pub struct BunkerConfigInfo {
+    pub enabled: bool,
+    pub authorized_clients: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1158,6 +1221,23 @@ impl KeepMobile {
             port: config.port,
         };
         persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)
+    }
+
+    pub fn get_bunker_config(&self) -> Result<BunkerConfigInfo, KeepMobileError> {
+        let stored = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?;
+        let config = stored.unwrap_or_default();
+        Ok(BunkerConfigInfo {
+            enabled: config.enabled,
+            authorized_clients: config.authorized_clients,
+        })
+    }
+
+    pub fn save_bunker_config(&self, config: BunkerConfigInfo) -> Result<(), KeepMobileError> {
+        let stored = persistence::StoredBunkerConfig {
+            enabled: config.enabled,
+            authorized_clients: config.authorized_clients,
+        };
+        persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
 }
 
