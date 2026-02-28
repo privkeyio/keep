@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
@@ -9,7 +11,7 @@ use crate::theme;
 
 pub const MIN_PASSWORD_LEN: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Message {
     PasswordChanged(Zeroizing<String>),
     ConfirmPasswordChanged(Zeroizing<String>),
@@ -17,6 +19,19 @@ pub enum Message {
     StartFresh,
     CancelStartFresh,
     ConfirmStartFresh,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
+            Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
+            Self::Unlock => f.write_str("Unlock"),
+            Self::StartFresh => f.write_str("StartFresh"),
+            Self::CancelStartFresh => f.write_str("CancelStartFresh"),
+            Self::ConfirmStartFresh => f.write_str("ConfirmStartFresh"),
+        }
+    }
 }
 
 pub enum Event {
