@@ -156,7 +156,10 @@ impl SettingsScreen {
                 self.kill_switch_confirm = false;
                 None
             }
-            Message::KillSwitchActivate => Some(Event::KillSwitchActivate),
+            Message::KillSwitchActivate => {
+                self.kill_switch_confirm = false;
+                Some(Event::KillSwitchActivate)
+            }
             Message::KillSwitchPasswordChanged(p) => {
                 self.kill_switch_password = p;
                 None

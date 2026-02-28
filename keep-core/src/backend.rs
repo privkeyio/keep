@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{PoisonError, RwLock};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::error::{KeepError, Result, StorageError};
 use crate::migration;
@@ -103,6 +103,7 @@ impl RedbBackend {
 
     /// Open an existing database at the given path.
     /// Retries on Windows to handle delayed file handle release.
+    /// Auto-upgrades from older redb file formats.
     pub fn open(path: &Path) -> Result<Self> {
         const MAX_RETRIES: u32 = 10;
         const RETRY_DELAY_MS: u64 = 50;
@@ -120,6 +121,13 @@ impl RedbBackend {
                         );
                     }
                     return Ok(Self { db });
+                }
+                Err(redb::DatabaseError::UpgradeRequired(old_version)) => {
+                    warn!(
+                        old_version,
+                        "redb file format upgrade required, migrating automatically"
+                    );
+                    return Self::upgrade_file_format(path);
                 }
                 Err(e) => {
                     let is_retryable = matches!(
@@ -140,6 +148,178 @@ impl RedbBackend {
         Err(last_err
             .map(|e| e.into())
             .unwrap_or_else(|| StorageError::database("open failed after retries").into()))
+    }
+
+    /// Upgrade from an older redb file format by copying all data.
+    fn upgrade_file_format(path: &Path) -> Result<Self> {
+        let old_db = redb2::Database::open(path).map_err(|e| {
+            StorageError::database(format!("failed to open old database for migration: {e}"))
+        })?;
+
+        let table_names: &[&str] = &[
+            KEYS_TABLE,
+            SHARES_TABLE,
+            DESCRIPTORS_TABLE,
+            RELAY_CONFIGS_TABLE,
+            CONFIG_TABLE,
+            HEALTH_STATUS_TABLE,
+        ];
+
+        type TableEntries = Vec<(Vec<u8>, Vec<u8>)>;
+        let mut table_data: Vec<(&str, TableEntries)> = Vec::new();
+        let old_schema_version;
+        {
+            use redb2::ReadableTable as _;
+
+            let rtxn = old_db
+                .begin_read()
+                .map_err(|e| StorageError::database(format!("failed to read old database: {e}")))?;
+            for &name in table_names {
+                let table_def: redb2::TableDefinition<&[u8], &[u8]> =
+                    redb2::TableDefinition::new(name);
+                match rtxn.open_table(table_def) {
+                    Ok(table) => {
+                        let entries: Vec<(Vec<u8>, Vec<u8>)> = table
+                            .iter()
+                            .map_err(|e| {
+                                StorageError::database(format!(
+                                    "failed to iterate table {name}: {e}"
+                                ))
+                            })?
+                            .map(|r| {
+                                let (k, v) = r.map_err(|e| {
+                                    StorageError::database(format!(
+                                        "failed to read entry in table {name}: {e}"
+                                    ))
+                                })?;
+                                Ok((k.value().to_vec(), v.value().to_vec()))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        info!(
+                            table = name,
+                            count = entries.len(),
+                            "read table for migration"
+                        );
+                        table_data.push((name, entries));
+                    }
+                    Err(redb2::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => {
+                        return Err(StorageError::database(format!(
+                            "failed to open table {name}: {e}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+
+            let metadata_def: redb2::TableDefinition<&str, &[u8]> =
+                redb2::TableDefinition::new("metadata");
+            old_schema_version = match rtxn.open_table(metadata_def) {
+                Ok(table) => table
+                    .get("schema_version")
+                    .map_err(|e| {
+                        StorageError::database(format!(
+                            "failed to read schema_version from old database: {e}"
+                        ))
+                    })?
+                    .and_then(|v| <[u8; 4]>::try_from(v.value()).ok())
+                    .map(u32::from_le_bytes),
+                Err(redb2::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => {
+                    return Err(StorageError::database(format!(
+                        "failed to open metadata table: {e}"
+                    ))
+                    .into());
+                }
+            };
+        }
+        drop(old_db);
+
+        let backup_path = path.with_extension("db.old");
+        if backup_path.exists() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let alt = path.with_extension(format!("db.old.{ts}"));
+            std::fs::rename(&backup_path, &alt).map_err(|e| {
+                StorageError::database(format!(
+                    "failed to move existing backup before migration: {e}"
+                ))
+            })?;
+            warn!(?alt, "moved existing backup aside");
+        }
+        std::fs::rename(path, &backup_path)?;
+        info!(?backup_path, "backed up old database");
+
+        let new_db = Database::create(path).map_err(|e| {
+            if let Err(re) = std::fs::rename(&backup_path, path) {
+                error!(
+                    "failed to restore backup after migration failure: {re}; \
+                     backup is at {backup_path:?}"
+                );
+            }
+            StorageError::database(format!("failed to create new database: {e}"))
+        })?;
+
+        let write_result: Result<()> = (|| {
+            let wtxn = new_db.begin_write()?;
+            for (name, entries) in &table_data {
+                let table_def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
+                let mut table = wtxn.open_table(table_def)?;
+                for (key, value) in entries {
+                    table.insert(key.as_slice(), value.as_slice())?;
+                }
+            }
+            {
+                let metadata: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+                let mut table = wtxn.open_table(metadata)?;
+                let version = old_schema_version.unwrap_or(1);
+                table.insert("schema_version", version.to_le_bytes().as_slice())?;
+            }
+            wtxn.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            drop(new_db);
+            let _ = std::fs::remove_file(path);
+            if let Err(re) = std::fs::rename(&backup_path, path) {
+                error!(
+                    "failed to restore backup after write failure: {re}; \
+                     backup is at {backup_path:?}"
+                );
+            }
+            return Err(e);
+        }
+
+        info!("database file format upgrade complete");
+
+        let migrate_result: Result<migration::MigrationResult> = (|| {
+            migration::check_compatibility(&new_db)?;
+            migration::run_migrations(&new_db)
+        })();
+        let result = match migrate_result {
+            Ok(r) => r,
+            Err(e) => {
+                drop(new_db);
+                let _ = std::fs::remove_file(path);
+                if let Err(re) = std::fs::rename(&backup_path, path) {
+                    error!(
+                        "failed to restore backup after migration failure: {re}; \
+                         backup is at {backup_path:?}"
+                    );
+                }
+                return Err(e);
+            }
+        };
+        if result.migrations_run > 0 {
+            info!(
+                count = result.migrations_run,
+                "schema migration completed after file format upgrade"
+            );
+        }
+
+        Ok(Self { db: new_db })
     }
 
     fn table_def(

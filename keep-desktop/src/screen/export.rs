@@ -106,10 +106,12 @@ impl State {
             Message::PassphraseChanged(p) => {
                 self.passphrase = p;
                 self.confirm_passphrase = Zeroizing::new(String::new());
+                self.error = None;
                 None
             }
             Message::ConfirmPassphraseChanged(p) => {
                 self.confirm_passphrase = p;
+                self.error = None;
                 None
             }
             Message::GoBack => Some(Event::GoBack),

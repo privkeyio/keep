@@ -79,7 +79,7 @@ pub struct AnnounceState {
     pub submitting: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Message {
     ToggleDetails(usize),
     StartSetup,
@@ -98,6 +98,30 @@ pub enum Message {
     CancelAnnounce,
     SubmitAnnounce,
     CopyDescriptor(String),
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToggleDetails(i) => f.debug_tuple("ToggleDetails").field(i).finish(),
+            Self::StartSetup => write!(f, "StartSetup"),
+            Self::SelectShare(i) => f.debug_tuple("SelectShare").field(i).finish(),
+            Self::NetworkChanged(n) => f.debug_tuple("NetworkChanged").field(n).finish(),
+            Self::ThresholdChanged(t) => f.debug_tuple("ThresholdChanged").field(t).finish(),
+            Self::TimelockChanged(t) => f.debug_tuple("TimelockChanged").field(t).finish(),
+            Self::AddTier => write!(f, "AddTier"),
+            Self::RemoveTier(i) => f.debug_tuple("RemoveTier").field(i).finish(),
+            Self::BeginCoordination => write!(f, "BeginCoordination"),
+            Self::CancelSetup => write!(f, "CancelSetup"),
+            Self::StartAnnounce => write!(f, "StartAnnounce"),
+            Self::XpubChanged(_) => write!(f, "XpubChanged(<redacted>)"),
+            Self::FingerprintChanged(_) => write!(f, "FingerprintChanged(<redacted>)"),
+            Self::LabelChanged(l) => f.debug_tuple("LabelChanged").field(l).finish(),
+            Self::CancelAnnounce => write!(f, "CancelAnnounce"),
+            Self::SubmitAnnounce => write!(f, "SubmitAnnounce"),
+            Self::CopyDescriptor(_) => write!(f, "CopyDescriptor(<redacted>)"),
+        }
+    }
 }
 
 pub enum Event {

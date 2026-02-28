@@ -4224,7 +4224,8 @@ dependencies = [
  "memsecurity",
  "proptest",
  "rand 0.10.0",
- "redb",
+ "redb 2.6.3",
+ "redb 3.1.0",
  "scrypt",
  "secrecy",
  "serde",
@@ -4295,7 +4296,7 @@ dependencies = [
  "p384",
  "postcard",
  "rand_core 0.9.5",
- "redb",
+ "redb 3.1.0",
  "serde",
  "serde_json",
  "sha2",
@@ -6981,6 +6982,15 @@ dependencies = [
  "bytemuck",
  "core_maths",
  "font-types",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

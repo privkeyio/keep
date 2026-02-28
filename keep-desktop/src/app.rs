@@ -185,6 +185,10 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
             "Decryption failed - wrong password or corrupted data".into()
         }
         KeepError::Locked => "Vault is locked".into(),
+        KeepError::Database(msg) => {
+            tracing::warn!("Database error: {msg}");
+            "Database error".into()
+        }
         KeepError::AlreadyExists(_) => "Vault already exists".into(),
         KeepError::NotFound(_) => "Vault not found".into(),
         KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
@@ -803,8 +807,8 @@ impl App {
                         tokio::task::spawn_blocking(move || {
                             let result = std::panic::catch_unwind(AssertUnwindSafe(
                                 || -> Result<(), String> {
-                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                                    keep.unlock(&password).map_err(friendly_err)?;
+                                    let keep = Keep::open(&path).map_err(friendly_err)?;
+                                    keep.verify_password(&password).map_err(friendly_err)?;
                                     drop(keep);
                                     let meta = std::fs::symlink_metadata(&path).map_err(|e| {
                                         format!("Failed to read vault metadata: {e}")
@@ -1653,6 +1657,10 @@ impl App {
         self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
+        self.frost_last_share = None;
+        self.frost_last_relay_urls = None;
+        self.nostrconnect_pending = None;
+        self.bunker_pending_setup = None;
         self.pin_mismatch = None;
         self.pin_mismatch_confirm = false;
         self.bunker_cert_pin_failed = false;
