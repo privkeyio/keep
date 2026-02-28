@@ -1027,18 +1027,25 @@ impl KeepMobile {
         if let Some(ref pk) = group_pubkey {
             validate_hex_pubkey(pk)?;
         }
-        let normalize_relays = |urls: Vec<String>, label: &str| -> Result<Vec<String>, KeepMobileError> {
-            if urls.len() > keep_core::relay::MAX_RELAYS {
-                return Err(KeepMobileError::InvalidRelayUrl {
-                    msg: format!("Too many {label} relays (max {})", keep_core::relay::MAX_RELAYS),
-                });
-            }
-            let normalized = dedup_stable(urls.iter().map(|u| keep_core::relay::normalize_relay_url(u)));
-            for url in &normalized {
-                network::validate_relay_url(url)?;
-            }
-            Ok(normalized)
-        };
+        let normalize_relays =
+            |urls: Vec<String>, label: &str| -> Result<Vec<String>, KeepMobileError> {
+                if urls.len() > keep_core::relay::MAX_RELAYS {
+                    return Err(KeepMobileError::InvalidRelayUrl {
+                        msg: format!(
+                            "Too many {label} relays (max {})",
+                            keep_core::relay::MAX_RELAYS
+                        ),
+                    });
+                }
+                let normalized = dedup_stable(
+                    urls.iter()
+                        .map(|u| keep_core::relay::normalize_relay_url(u)),
+                );
+                for url in &normalized {
+                    network::validate_relay_url(url)?;
+                }
+                Ok(normalized)
+            };
         let key = relay_config_key(group_pubkey.as_deref());
         let stored = persistence::StoredRelayConfig {
             frost_relays: normalize_relays(config.frost_relays, "FROST")?,
@@ -1071,6 +1078,11 @@ impl KeepMobile {
     }
 
     pub fn save_proxy_config(&self, config: ProxyConfigInfo) -> Result<(), KeepMobileError> {
+        if config.port == 0 {
+            return Err(KeepMobileError::InvalidRelayUrl {
+                msg: "proxy port must be non-zero".into(),
+            });
+        }
         let stored = persistence::StoredProxyConfig {
             enabled: config.enabled,
             port: config.port,
@@ -1081,7 +1093,10 @@ impl KeepMobile {
 
 fn relay_config_key(group_pubkey: Option<&str>) -> String {
     match group_pubkey {
-        Some(pk) => format!("{RELAY_CONFIG_KEY_PREFIX}{pk}"),
+        Some(pk) => {
+            let canonical = pk.to_ascii_lowercase();
+            format!("{RELAY_CONFIG_KEY_PREFIX}{canonical}")
+        }
         None => RELAY_CONFIG_GLOBAL_KEY.into(),
     }
 }

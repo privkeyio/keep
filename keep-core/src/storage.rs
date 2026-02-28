@@ -756,6 +756,9 @@ impl Storage {
 
     /// Set the proxy configuration in the vault.
     pub fn set_proxy_config(&self, config: &ProxyConfig) -> Result<()> {
+        if config.port == 0 {
+            return Err(KeepError::Other("proxy port must be non-zero".into()));
+        }
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 

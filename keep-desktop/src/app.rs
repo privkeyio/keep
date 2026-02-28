@@ -420,12 +420,15 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
         }
     }
 
-    if let Err(e) = keep.store_relay_config(&config) {
-        tracing::warn!("Failed to migrate global relay config to vault: {e}");
-        return;
+    match keep.store_relay_config(&config) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&relay_path);
+            let _ = std::fs::remove_file(&bunker_path);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to migrate global relay config to vault: {e}");
+        }
     }
-    let _ = std::fs::remove_file(&relay_path);
-    let _ = std::fs::remove_file(&bunker_path);
 
     let settings_path = keep_path.join("settings.json");
     if let Ok(contents) = std::fs::read_to_string(&settings_path) {
