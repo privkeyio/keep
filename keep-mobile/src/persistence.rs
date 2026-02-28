@@ -465,7 +465,11 @@ pub(crate) fn load_relay_config(
                 })?;
             Ok(Some(config))
         }
-        Err(_) => Ok(None),
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load relay config for key {key}: {e}");
+            Err(e)
+        }
     }
 }
 
@@ -492,7 +496,11 @@ pub(crate) fn load_proxy_config(
                 })?;
             Ok(Some(config))
         }
-        Err(_) => Ok(None),
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load proxy config: {e}");
+            Err(e)
+        }
     }
 }
 

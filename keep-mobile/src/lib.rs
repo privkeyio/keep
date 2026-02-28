@@ -1006,6 +1006,9 @@ impl KeepMobile {
         &self,
         group_pubkey: Option<String>,
     ) -> Result<RelayConfigInfo, KeepMobileError> {
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
+        }
         let key = relay_config_key(group_pubkey.as_deref());
         let stored = persistence::load_relay_config(&self.storage, &key)?;
         let config = stored.unwrap_or_default();
@@ -1021,24 +1024,34 @@ impl KeepMobile {
         group_pubkey: Option<String>,
         config: RelayConfigInfo,
     ) -> Result<(), KeepMobileError> {
-        for url in config
-            .frost_relays
-            .iter()
-            .chain(config.profile_relays.iter())
-            .chain(config.bunker_relays.iter())
-        {
-            network::validate_relay_url(url)?;
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
         }
+        let normalize_relays = |urls: Vec<String>, label: &str| -> Result<Vec<String>, KeepMobileError> {
+            if urls.len() > keep_core::relay::MAX_RELAYS {
+                return Err(KeepMobileError::InvalidRelayUrl {
+                    msg: format!("Too many {label} relays (max {})", keep_core::relay::MAX_RELAYS),
+                });
+            }
+            let normalized = dedup_stable(urls.iter().map(|u| keep_core::relay::normalize_relay_url(u)));
+            for url in &normalized {
+                network::validate_relay_url(url)?;
+            }
+            Ok(normalized)
+        };
         let key = relay_config_key(group_pubkey.as_deref());
         let stored = persistence::StoredRelayConfig {
-            frost_relays: config.frost_relays,
-            profile_relays: config.profile_relays,
-            bunker_relays: config.bunker_relays,
+            frost_relays: normalize_relays(config.frost_relays, "FROST")?,
+            profile_relays: normalize_relays(config.profile_relays, "profile")?,
+            bunker_relays: normalize_relays(config.bunker_relays, "bunker")?,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
     pub fn delete_relay_config(&self, group_pubkey: Option<String>) -> Result<(), KeepMobileError> {
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
+        }
         let key = relay_config_key(group_pubkey.as_deref());
         self.storage
             .delete_share_by_key(key)
@@ -1071,6 +1084,11 @@ fn relay_config_key(group_pubkey: Option<&str>) -> String {
         Some(pk) => format!("{RELAY_CONFIG_KEY_PREFIX}{pk}"),
         None => RELAY_CONFIG_GLOBAL_KEY.into(),
     }
+}
+
+fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.filter(|s| seen.insert(s.clone())).collect()
 }
 
 fn clear_descriptor_state(

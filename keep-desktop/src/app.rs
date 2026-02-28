@@ -385,13 +385,13 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
 }
 
 fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
-    if keep
-        .get_relay_config(&keep_core::GLOBAL_RELAY_KEY)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
+    match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Failed to check existing relay config, skipping migration: {e}");
+            return;
+        }
     }
 
     let mut config = keep_core::RelayConfig::new_global();
@@ -418,6 +418,8 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
         tracing::warn!("Failed to migrate global relay config to vault: {e}");
         return;
     }
+    let _ = std::fs::remove_file(&relay_path);
+    let _ = std::fs::remove_file(&bunker_path);
 
     let settings_path = keep_path.join("settings.json");
     if let Ok(contents) = std::fs::read_to_string(&settings_path) {
@@ -429,7 +431,7 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
             let port = json
                 .get("proxy_port")
                 .and_then(|v| v.as_u64())
-                .map(|p| p as u16)
+                .and_then(|p| u16::try_from(p).ok())
                 .unwrap_or(DEFAULT_PROXY_PORT);
             if enabled || port != DEFAULT_PROXY_PORT {
                 let proxy = keep_core::ProxyConfig { enabled, port };
@@ -460,7 +462,15 @@ fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::P
                                 per_key_config.bunker_relays = urls;
                             }
                         }
-                        let _ = keep.store_relay_config(&per_key_config);
+                        match keep.store_relay_config(&per_key_config) {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(entry.path());
+                                let _ = std::fs::remove_file(&bunker_file);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to migrate relay config for {hex}: {e}");
+                            }
+                        }
                     }
                 }
             }
