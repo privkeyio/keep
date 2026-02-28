@@ -28,9 +28,10 @@ pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    AnnouncedXpubInfo, DescriptorProposal, DkgConfig, DkgStatus, FrostGenerationResult,
-    GeneratedShareInfo, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
-    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
+    AnnouncedXpubInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,
+    FrostGenerationResult, GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo,
+    PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
+    WalletDescriptorInfo,
 };
 
 pub fn format_timestamp(ts: i64) -> String {
@@ -153,6 +154,11 @@ pub trait DescriptorCallbacks: Send + Sync {
     ) -> Result<(), KeepMobileError>;
 }
 
+#[uniffi::export(with_foreign)]
+pub trait KeepStateCallback: Send + Sync + 'static {
+    fn on_state_changed(&self, state: KeepLiveState) -> Result<(), KeepMobileError>;
+}
+
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
 }
@@ -212,6 +218,8 @@ pub struct KeepMobile {
     health_callbacks: Arc<RwLock<Option<Arc<dyn HealthCallbacks>>>>,
     descriptor_networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
+    state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
+    state_rev: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct PendingRequest {
@@ -232,6 +240,57 @@ struct DescriptorContext {
     node: Arc<KfpNode>,
     networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
     pending: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
+}
+
+struct StateContext {
+    node: Arc<KfpNode>,
+    pending: Arc<Mutex<Vec<PendingRequest>>>,
+    callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
+    rev: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl StateContext {
+    async fn push(&self, connection_status: &ConnectionStatus) {
+        let Some(cb) = self.callback.read().await.clone() else {
+            return;
+        };
+
+        let peers: Vec<PeerInfo> = self
+            .node
+            .peer_status()
+            .into_iter()
+            .map(|(share_index, status, name)| PeerInfo {
+                share_index,
+                name,
+                status: convert_peer_status(status),
+            })
+            .collect();
+
+        let pending_requests: Vec<SignRequest> = {
+            let guard = self.pending.lock().await;
+            guard.iter().map(|r| r.info.clone()).collect()
+        };
+
+        let rev = self.rev.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        let state = KeepLiveState {
+            rev,
+            connection_status: connection_status.clone(),
+            peers,
+            pending_requests,
+        };
+
+        if let Err(e) = tokio::task::spawn_blocking(move || cb.on_state_changed(state))
+            .await
+            .unwrap_or_else(|e| {
+                Err(KeepMobileError::FrostError {
+                    msg: format!("State callback task panicked: {e}"),
+                })
+            })
+        {
+            tracing::error!("State callback error: {e}");
+        }
+    }
 }
 
 #[uniffi::export]
@@ -282,6 +341,8 @@ impl KeepMobile {
             health_callbacks: Arc::new(RwLock::new(None)),
             descriptor_networks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            state_callback: Arc::new(RwLock::new(None)),
+            state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -753,6 +814,12 @@ impl KeepMobile {
     pub fn set_health_callbacks(&self, callbacks: Arc<dyn HealthCallbacks>) {
         self.runtime.block_on(async {
             *self.health_callbacks.write().await = Some(callbacks);
+        });
+    }
+
+    pub fn set_state_callback(&self, callback: Arc<dyn KeepStateCallback>) {
+        self.runtime.block_on(async {
+            *self.state_callback.write().await = Some(callback);
         });
     }
 
@@ -1262,7 +1329,6 @@ impl KeepMobile {
 
             let event_rx = node.subscribe();
             let node = Arc::new(node);
-            let pending = self.pending_requests.clone();
             let desc_ctx = DescriptorContext {
                 callbacks: self.descriptor_callbacks.clone(),
                 storage: self.storage.clone(),
@@ -1270,8 +1336,14 @@ impl KeepMobile {
                 networks: self.descriptor_networks.clone(),
                 pending: self.pending_contributions.clone(),
             };
+            let state_ctx = StateContext {
+                node: node.clone(),
+                pending: self.pending_requests.clone(),
+                callback: self.state_callback.clone(),
+                rev: self.state_rev.clone(),
+            };
             tokio::spawn(async move {
-                Self::event_listener(event_rx, request_rx, pending, desc_ctx).await;
+                Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
             });
 
             let run_node = node.clone();
@@ -1559,9 +1631,13 @@ impl KeepMobile {
     async fn event_listener(
         mut event_rx: broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
-        pending: Arc<Mutex<Vec<PendingRequest>>>,
         desc: DescriptorContext,
+        state: StateContext,
     ) {
+        // FIXME: connection_status is hardcoded — KfpNodeEvent doesn't
+        // emit connect/disconnect events yet, so we can't track real state.
+        let connection_status = ConnectionStatus::Connected;
+        state.push(&connection_status).await;
         loop {
             tokio::select! {
                 result = event_rx.recv() => {
@@ -1569,7 +1645,10 @@ impl KeepMobile {
                         Ok(KfpNodeEvent::SignatureComplete { session_id, .. })
                         | Ok(KfpNodeEvent::SigningFailed { session_id, .. }) => {
                             let id = hex::encode(session_id);
-                            pending.lock().await.retain(|r| r.info.id != id);
+                            let mut guard = state.pending.lock().await;
+                            guard.retain(|r| r.info.id != id);
+                            drop(guard);
+                            state.push(&connection_status).await;
                         }
                         Ok(KfpNodeEvent::DescriptorContributionNeeded {
                             session_id,
@@ -1721,8 +1800,14 @@ impl KeepMobile {
                                 }
                             }
                         }
+                        Ok(KfpNodeEvent::PeerDiscovered { .. })
+                        | Ok(KfpNodeEvent::PeerOffline { .. }) => {
+                            state.push(&connection_status).await;
+                        }
                         Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            state.push(&connection_status).await;
+                        }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1730,7 +1815,7 @@ impl KeepMobile {
                     let Some((session, response_tx)) = result else {
                         break;
                     };
-                    let mut guard = pending.lock().await;
+                    let mut guard = state.pending.lock().await;
                     if guard.len() >= MAX_PENDING_REQUESTS {
                         let _ = response_tx.send(false).await;
                         continue;
@@ -1750,6 +1835,8 @@ impl KeepMobile {
                         },
                         response_tx,
                     });
+                    drop(guard);
+                    state.push(&connection_status).await;
                 }
             }
         }
