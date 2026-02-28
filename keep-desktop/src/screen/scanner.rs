@@ -8,7 +8,6 @@ use std::sync::Arc;
 use iced::widget::{button, column, container, image as iced_image, row, text, Space};
 use iced::{Alignment, Element, Length};
 
-use crate::message::Message;
 use crate::theme;
 
 const MAX_SHARE_LENGTH: usize = 8192;
@@ -21,6 +20,17 @@ fn is_valid_bech32_payload(prefix: &str, data: &str) -> bool {
             .bytes()
             .all(|b| BECH32_CHARSET.contains(&b))
         && data.len() > prefix.len()
+}
+
+#[derive(Clone, Debug)]
+pub enum Message {
+    Close,
+    Retry,
+}
+
+pub enum Event {
+    Close,
+    Retry,
 }
 
 pub struct ScannerScreen {
@@ -48,6 +58,13 @@ impl ScannerScreen {
             total_expected: None,
             status: ScannerStatus::Initializing,
             camera_active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::Close => Some(Event::Close),
+            Message::Retry => Some(Event::Retry),
         }
     }
 
@@ -118,9 +135,9 @@ impl ScannerScreen {
         None
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
-            .on_press(Message::ScannerClose)
+            .on_press(Message::Close)
             .style(theme::text_button)
             .padding([theme::space::XS, theme::space::SM]);
 
@@ -167,7 +184,7 @@ impl ScannerScreen {
         if matches!(self.status, ScannerStatus::Error(_)) {
             content = content.push(
                 button(text("Retry").size(theme::size::BODY))
-                    .on_press(Message::ScannerRetry)
+                    .on_press(Message::Retry)
                     .style(theme::primary_button)
                     .padding(theme::space::MD),
             );

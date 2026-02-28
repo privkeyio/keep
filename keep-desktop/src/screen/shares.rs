@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Length};
 use keep_core::keys::bytes_to_npub;
 
 use super::{format_timestamp, truncate_npub};
-use crate::message::{Message, ShareIdentity};
+use crate::message::ShareIdentity;
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -55,14 +55,36 @@ impl ShareEntry {
     }
 }
 
-pub struct ShareListScreen {
-    pub shares: Vec<ShareEntry>,
-    pub active_share_hex: Option<String>,
-    pub delete_confirm: Option<ShareIdentity>,
-    pub expanded: Option<usize>,
+#[derive(Debug, Clone)]
+pub enum Message {
+    ToggleDetails(usize),
+    GoToExport(usize),
+    GoToCreate,
+    GoToImport,
+    ActivateShare(String),
+    CopyNpub(String),
+    RequestDelete(ShareIdentity),
+    ConfirmDelete(ShareIdentity),
+    CancelDelete,
 }
 
-impl ShareListScreen {
+pub enum Event {
+    GoToExport(usize),
+    GoToCreate,
+    GoToImport,
+    ActivateShare(String),
+    CopyNpub(String),
+    ConfirmDelete(ShareIdentity),
+}
+
+pub struct State {
+    shares: Vec<ShareEntry>,
+    active_share_hex: Option<String>,
+    delete_confirm: Option<ShareIdentity>,
+    expanded: Option<usize>,
+}
+
+impl State {
     pub fn new(shares: Vec<ShareEntry>, active_share_hex: Option<String>) -> Self {
         Self {
             shares,
@@ -72,7 +94,52 @@ impl ShareListScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn refresh(&mut self, shares: Vec<ShareEntry>, active_share_hex: Option<String>) {
+        self.shares = shares;
+        self.active_share_hex = active_share_hex;
+        self.delete_confirm = None;
+        self.expanded = None;
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::ToggleDetails(i) => {
+                self.expanded = if self.expanded == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+                None
+            }
+            Message::GoToExport(i) => Some(Event::GoToExport(i)),
+            Message::GoToCreate => Some(Event::GoToCreate),
+            Message::GoToImport => Some(Event::GoToImport),
+            Message::ActivateShare(hex) => Some(Event::ActivateShare(hex)),
+            Message::CopyNpub(npub) => Some(Event::CopyNpub(npub)),
+            Message::RequestDelete(id) => {
+                self.delete_confirm = Some(id);
+                None
+            }
+            Message::ConfirmDelete(id) => {
+                if self.delete_confirm.as_ref() == Some(&id) {
+                    self.delete_confirm = None;
+                    Some(Event::ConfirmDelete(id))
+                } else {
+                    None
+                }
+            }
+            Message::CancelDelete => {
+                self.delete_confirm = None;
+                None
+            }
+        }
+    }
+
+    pub fn clear_delete_confirm(&mut self) {
+        self.delete_confirm = None;
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let title = theme::heading("FROST Shares");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -193,7 +260,7 @@ impl ShareListScreen {
                 .size(theme::size::HEADING)
                 .color(theme::color::TEXT),
         )
-        .on_press(Message::ToggleShareDetails(i))
+        .on_press(Message::ToggleDetails(i))
         .style(theme::text_button)
         .padding(0);
 
@@ -201,7 +268,7 @@ impl ShareListScreen {
 
         if !is_active {
             let activate_btn = button(text("Activate").size(theme::size::SMALL))
-                .on_press(Message::SetActiveShare(share.group_pubkey_hex.clone()))
+                .on_press(Message::ActivateShare(share.group_pubkey_hex.clone()))
                 .style(theme::secondary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 

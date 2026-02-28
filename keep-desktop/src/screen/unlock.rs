@@ -1,23 +1,59 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
-use crate::message::Message;
 use crate::theme;
 
-pub struct UnlockScreen {
-    pub password: Zeroizing<String>,
-    pub confirm_password: Zeroizing<String>,
-    pub error: Option<String>,
-    pub loading: bool,
-    pub vault_exists: bool,
-    pub start_fresh_confirm: bool,
+const MIN_PASSWORD_LEN: usize = 8;
+
+#[derive(Clone)]
+pub enum Message {
+    PasswordChanged(Zeroizing<String>),
+    ConfirmPasswordChanged(Zeroizing<String>),
+    Unlock,
+    StartFresh,
+    CancelStartFresh,
+    ConfirmStartFresh,
 }
 
-impl UnlockScreen {
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PasswordChanged(_) => f.write_str("PasswordChanged(***)"),
+            Self::ConfirmPasswordChanged(_) => f.write_str("ConfirmPasswordChanged(***)"),
+            Self::Unlock => f.write_str("Unlock"),
+            Self::StartFresh => f.write_str("StartFresh"),
+            Self::CancelStartFresh => f.write_str("CancelStartFresh"),
+            Self::ConfirmStartFresh => f.write_str("ConfirmStartFresh"),
+        }
+    }
+}
+
+pub enum Event {
+    Unlock {
+        password: Zeroizing<String>,
+        vault_exists: bool,
+    },
+    StartFresh {
+        password: Zeroizing<String>,
+    },
+}
+
+pub struct State {
+    password: Zeroizing<String>,
+    confirm_password: Zeroizing<String>,
+    error: Option<String>,
+    loading: bool,
+    vault_exists: bool,
+    start_fresh_confirm: bool,
+}
+
+impl State {
     pub fn new(vault_exists: bool) -> Self {
         Self {
             password: Zeroizing::new(String::new()),
@@ -33,6 +69,80 @@ impl UnlockScreen {
         let mut s = Self::new(vault_exists);
         s.error = Some(error);
         s
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::PasswordChanged(p) => {
+                self.password = p;
+                None
+            }
+            Message::ConfirmPasswordChanged(p) => {
+                self.confirm_password = p;
+                None
+            }
+            Message::Unlock => {
+                if self.loading {
+                    return None;
+                }
+                if self.password.is_empty() {
+                    self.error = Some("Password required".into());
+                    return None;
+                }
+                if !self.vault_exists && self.password.len() < MIN_PASSWORD_LEN {
+                    self.error = Some(format!(
+                        "Password must be at least {MIN_PASSWORD_LEN} characters"
+                    ));
+                    return None;
+                }
+                if !self.vault_exists && *self.password != *self.confirm_password {
+                    self.error = Some("Passwords do not match".into());
+                    return None;
+                }
+                self.loading = true;
+                self.error = None;
+                Some(Event::Unlock {
+                    password: self.password.clone(),
+                    vault_exists: self.vault_exists,
+                })
+            }
+            Message::StartFresh => {
+                self.start_fresh_confirm = true;
+                None
+            }
+            Message::CancelStartFresh => {
+                self.start_fresh_confirm = false;
+                None
+            }
+            Message::ConfirmStartFresh => {
+                if !self.start_fresh_confirm {
+                    return None;
+                }
+                if self.password.is_empty() {
+                    self.error = Some("Enter your vault password to confirm deletion".into());
+                    return None;
+                }
+                if self.loading {
+                    return None;
+                }
+                self.loading = true;
+                self.error = None;
+                Some(Event::StartFresh {
+                    password: self.password.clone(),
+                })
+            }
+        }
+    }
+
+    pub fn unlock_failed(&mut self, error: String) {
+        self.loading = false;
+        self.error = Some(error);
+    }
+
+    pub fn start_fresh_failed(&mut self, error: String) {
+        self.loading = false;
+        self.error = Some(error);
+        self.start_fresh_confirm = false;
     }
 
     pub fn view(&self) -> Element<'_, Message> {

@@ -27,25 +27,19 @@ use crate::message::{
     PeerEntry, PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
-use crate::screen::create::CreateScreen;
-use crate::screen::export::ExportScreen;
-use crate::screen::export_ncryptsec::ExportNcryptsecScreen;
-use crate::screen::import::{ImportMode, ImportScreen};
 use crate::screen::layout::SidebarState;
-use crate::screen::nsec_keys::{NsecKeyEntry, NsecKeysScreen};
-use crate::screen::relay::RelayScreen;
+use crate::screen::nsec_keys::NsecKeyEntry;
 use crate::screen::settings::SettingsScreen;
-use crate::screen::shares::{ShareEntry, ShareListScreen};
+use crate::screen::shares::ShareEntry;
 use crate::screen::signing_audit::{AuditDisplayEntry, ChainStatus, SigningAuditScreen};
-use crate::screen::unlock::UnlockScreen;
-use crate::screen::wallet::{
-    AnnounceState, DescriptorProgress, SetupPhase, SetupState, TierConfig, WalletEntry,
-    WalletScreen,
-};
+use crate::screen::unlock;
+use crate::screen::wallet::{DescriptorProgress, SetupPhase, WalletEntry};
 use crate::screen::Screen;
+use crate::screen::{
+    create, export, export_ncryptsec, import, nsec_keys, relay, scanner, shares, wallet,
+};
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
-use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH};
 
 static PENDING_NOSTRCONNECT: OnceLock<Mutex<Option<NostrConnectRequest>>> = OnceLock::new();
 
@@ -72,7 +66,6 @@ const AUTO_LOCK_SECS: u64 = 300;
 const CLIPBOARD_CLEAR_SECS: u64 = 30;
 const DEFAULT_PROXY_PORT: u16 = 9050;
 const PROXY_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
-const MIN_PASSWORD_LEN: usize = 8;
 pub const MIN_EXPORT_PASSPHRASE_LEN: usize = 15;
 const TOAST_DURATION_SECS: u64 = 5;
 pub(crate) const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -574,7 +567,7 @@ impl App {
             Err(_) => match dirs::home_dir() {
                 Some(home) => home.join(".keep"),
                 None => {
-                    let screen = Screen::Unlock(UnlockScreen::with_error(
+                    let screen = Screen::Unlock(unlock::State::with_error(
                         false,
                         "Cannot determine home directory. Set $HOME and restart.".into(),
                     ));
@@ -587,7 +580,7 @@ impl App {
         };
         let vault_exists = keep_path.exists();
         let (settings, tray_migrated) = load_settings(&keep_path);
-        let screen = Screen::Unlock(UnlockScreen::new(vault_exists));
+        let screen = Screen::Unlock(unlock::State::new(vault_exists));
         let start_minimized = settings.start_minimized;
         let mut app = Self::init(keep_path, screen, Vec::new(), settings);
         if tray_migrated {
@@ -613,14 +606,22 @@ impl App {
         match message {
             Message::Tick => self.handle_tick(),
 
-            Message::PasswordChanged(..)
-            | Message::ConfirmPasswordChanged(..)
-            | Message::Unlock
-            | Message::UnlockResult(..)
-            | Message::StartFresh
-            | Message::CancelStartFresh
-            | Message::ConfirmStartFresh
-            | Message::StartFreshResult(..) => self.handle_unlock_message(message),
+            Message::Unlock(msg) => self.handle_unlock_message(msg),
+            Message::UnlockResult(result) => self.handle_shares_result(result),
+            Message::StartFreshResult(result) => {
+                match result {
+                    Ok(()) => {
+                        *lock_keep(&self.keep) = None;
+                        self.screen = Screen::Unlock(unlock::State::new(false));
+                    }
+                    Err(e) => {
+                        if let Screen::Unlock(s) = &mut self.screen {
+                            s.start_fresh_failed(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
 
             Message::GoToCreate
             | Message::GoToImport
@@ -629,119 +630,58 @@ impl App {
             | Message::NavigateNsecKeys
             | Message::GoBack
             | Message::NavigateWallets
-            | Message::WalletsLoaded(..)
             | Message::NavigateRelay
             | Message::NavigateBunker
             | Message::NavigateSettings
             | Message::Lock => self.handle_navigation_message(message),
 
-            Message::ToggleShareDetails(..)
-            | Message::SetActiveShare(..)
-            | Message::RequestDelete(..)
-            | Message::ConfirmDelete(..)
-            | Message::CancelDelete => self.handle_share_list_message(message),
+            Message::ShareList(msg) => self.handle_share_list_message(msg),
 
-            Message::ToggleNsecKeyDetails(..)
-            | Message::RequestDeleteNsecKey(..)
-            | Message::ConfirmDeleteNsecKey(..)
-            | Message::CancelDeleteNsecKey => self.handle_nsec_keys_message(message),
+            Message::NsecKeys(msg) => self.handle_nsec_keys_message(msg),
 
-            Message::CreateNameChanged(..)
-            | Message::CreateThresholdChanged(..)
-            | Message::CreateTotalChanged(..)
-            | Message::CreateKeyset
-            | Message::CreateResult(..) => self.handle_create_message(message),
+            Message::Create(msg) => self.handle_create_message(msg),
+            Message::CreateResult(result) => self.handle_create_result(result),
 
-            Message::ExportPassphraseChanged(..)
-            | Message::ExportConfirmPassphraseChanged(..)
-            | Message::GenerateExport
-            | Message::ExportGenerated(..)
-            | Message::AdvanceQrFrame
-            | Message::CopyToClipboard(..)
-            | Message::ResetExport => self.handle_export_message(message),
+            Message::Export(msg) => self.handle_export_message(msg),
+            Message::ExportGenerated(result) => self.handle_export_generated(result),
 
-            Message::GoToExportNcryptsec(..)
-            | Message::ExportNcryptsecPasswordChanged(..)
-            | Message::ExportNcryptsecConfirmChanged(..)
-            | Message::GenerateNcryptsec
-            | Message::NcryptsecGenerated(..)
-            | Message::ResetNcryptsec => self.handle_ncryptsec_export_message(message),
+            Message::GoToExportNcryptsec(hex) => self.handle_go_to_export_ncryptsec(hex),
+            Message::ExportNcryptsec(msg) => self.handle_ncryptsec_export_message(msg),
+            Message::NcryptsecGenerated(result) => self.handle_ncryptsec_generated(result),
 
-            Message::ImportDataChanged(..)
-            | Message::ImportPassphraseChanged(..)
-            | Message::ImportNameChanged(..)
-            | Message::ImportToggleVisibility
-            | Message::ImportShare
-            | Message::ImportNsec
-            | Message::ImportNcryptsec
-            | Message::ImportResult(..)
-            | Message::ImportNsecResult(..)
-            | Message::ImportNcryptsecResult(..) => self.handle_import_message(message),
+            Message::Import(msg) => self.handle_import_message(msg),
+            Message::ImportResult(result) => self.handle_import_result(result),
+            Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
+            Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
 
-            Message::ScannerOpen
-            | Message::ScannerClose
-            | Message::ScannerRetry
-            | Message::ScannerPoll => self.handle_scanner_message(message),
+            Message::Scanner(msg) => self.handle_scanner_message(msg),
+            Message::ScannerPoll => {
+                self.drain_scanner_events();
+                Task::none()
+            }
 
-            Message::CopyNpub(..)
-            | Message::CopyDescriptor(..)
-            | Message::ToggleWalletDetails(..)
-            | Message::WalletStartSetup
-            | Message::WalletSelectShare(..)
-            | Message::WalletNetworkChanged(..)
-            | Message::WalletThresholdChanged(..)
-            | Message::WalletTimelockChanged(..)
-            | Message::WalletAddTier
-            | Message::WalletRemoveTier(..)
-            | Message::WalletBeginCoordination
-            | Message::WalletCancelSetup
+            Message::Wallet(msg) => self.handle_wallet_message(msg),
+            Message::WalletsLoaded(..)
             | Message::WalletSessionStarted(..)
             | Message::WalletDescriptorProgress(..)
-            | Message::WalletStartAnnounce
-            | Message::WalletAnnounceXpubChanged(..)
-            | Message::WalletAnnounceFingerprintChanged(..)
-            | Message::WalletAnnounceLabelChanged(..)
-            | Message::WalletCancelAnnounce
-            | Message::WalletSubmitAnnounce
-            | Message::WalletAnnounceResult(..) => self.handle_wallet_message(message),
+            | Message::WalletAnnounceResult(..) => self.handle_wallet_global_message(message),
 
-            Message::RelayUrlChanged(..)
-            | Message::ConnectPasswordChanged(..)
-            | Message::AddRelay
-            | Message::RemoveRelay(..)
-            | Message::SelectShareForRelay(..)
-            | Message::ConnectRelay
-            | Message::DisconnectRelay
-            | Message::ConnectRelayResult(..)
-            | Message::ApproveSignRequest(..)
-            | Message::RejectSignRequest(..) => self.handle_relay_message(message),
+            Message::Relay(msg) => self.handle_relay_message(msg),
+            Message::ConnectRelayResult(result) => self.handle_connect_relay_result(result),
 
-            Message::BunkerRelayInputChanged(..)
-            | Message::BunkerAddRelay
-            | Message::BunkerRemoveRelay(..)
-            | Message::BunkerStart
-            | Message::BunkerStartResult(..)
-            | Message::BunkerStop
-            | Message::BunkerApprove
-            | Message::BunkerReject
-            | Message::BunkerRevokeClient(..)
-            | Message::BunkerConfirmRevokeAll
-            | Message::BunkerCancelRevokeAll
-            | Message::BunkerRevokeAll
-            | Message::BunkerCopyUrl
-            | Message::BunkerRevokeResult(..)
-            | Message::BunkerClientsLoaded(..)
-            | Message::BunkerToggleClient(..)
-            | Message::BunkerTogglePermission(..)
-            | Message::BunkerSetApprovalDuration(..)
-            | Message::BunkerPermissionUpdated(..) => self.handle_bunker_message(message),
+            Message::Bunker(msg) => self.handle_bunker_message(msg),
+            Message::BunkerStartResult(result) => self.handle_bunker_start_result(result),
+            Message::BunkerRevokeResult(result) => self.handle_bunker_revoke_result(result),
+            Message::BunkerClientsLoaded(clients) => self.handle_bunker_clients_loaded(clients),
+            Message::BunkerPermissionUpdated(result) => {
+                self.handle_bunker_permission_updated(result)
+            }
 
+            Message::SigningAudit(msg) => self.handle_signing_audit_message(msg),
             Message::NavigateAudit
             | Message::AuditLoaded(..)
             | Message::AuditPageLoaded(..)
-            | Message::AuditChainVerified(..)
-            | Message::AuditFilterChanged(..)
-            | Message::AuditLoadMore => self.handle_audit_message(message),
+            | Message::AuditChainVerified(..) => self.handle_audit_message(message),
 
             Message::ToggleIdentitySwitcher
             | Message::SwitchIdentity(..)
@@ -749,25 +689,12 @@ impl App {
             | Message::ConfirmDeleteIdentity(..)
             | Message::CancelDeleteIdentity => self.handle_identity_message(message),
 
-            Message::SettingsAutoLockChanged(..)
-            | Message::SettingsClipboardClearChanged(..)
-            | Message::SettingsProxyToggled(..)
-            | Message::SettingsProxyPortChanged(..)
-            | Message::SettingsMinimizeToTrayToggled(..)
-            | Message::SettingsStartMinimizedToggled(..) => self.handle_settings_message(message),
+            Message::Settings(msg) => self.handle_settings_message_new(msg),
+            Message::KillSwitchDeactivateResult(result) => {
+                self.handle_kill_switch_deactivate_result(result)
+            }
 
-            Message::KillSwitchRequestConfirm
-            | Message::KillSwitchCancelConfirm
-            | Message::KillSwitchActivate
-            | Message::KillSwitchPasswordChanged(..)
-            | Message::KillSwitchDeactivate
-            | Message::KillSwitchDeactivateResult(..) => self.handle_kill_switch_message(message),
-
-            Message::CertPinClear(..)
-            | Message::CertPinClearAllRequest
-            | Message::CertPinClearAllConfirm
-            | Message::CertPinClearAllCancel
-            | Message::CertPinMismatchDismiss
+            Message::CertPinMismatchDismiss
             | Message::CertPinMismatchClearAndRetry
             | Message::CertPinMismatchConfirmClear => self.handle_cert_pin_message(message),
 
@@ -822,70 +749,107 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn handle_unlock_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::PasswordChanged(p) => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.password = p;
-                }
-                Task::none()
+    fn handle_unlock_message(&mut self, msg: unlock::Message) -> Task<Message> {
+        let screen = match &mut self.screen {
+            Screen::Unlock(s) => s,
+            _ => return Task::none(),
+        };
+        let Some(event) = screen.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            unlock::Event::Unlock {
+                password,
+                vault_exists,
+            } => {
+                let path = self.keep_path.clone();
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<_, String> {
+                                    let mut keep = if vault_exists {
+                                        Keep::open(&path).map_err(friendly_err)?
+                                    } else {
+                                        Keep::create(&path, &password).map_err(friendly_err)?
+                                    };
+                                    if vault_exists {
+                                        keep.unlock(&password).map_err(friendly_err)?;
+                                    }
+                                    let shares = collect_shares(&keep)?;
+                                    *lock_keep(&keep_arc) = Some(keep);
+                                    Ok(shares)
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    error!("Panic during unlock: {:?}", payload.type_id());
+                                    Err("Internal error during unlock".to_string())
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::UnlockResult,
+                )
             }
-            Message::ConfirmPasswordChanged(p) => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.confirm_password = p;
-                }
-                Task::none()
+            unlock::Event::StartFresh { password } => {
+                let path = self.keep_path.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(
+                                || -> Result<(), String> {
+                                    let mut keep = Keep::open(&path).map_err(friendly_err)?;
+                                    keep.unlock(&password).map_err(friendly_err)?;
+                                    drop(keep);
+                                    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                                        format!("Failed to read vault metadata: {e}")
+                                    })?;
+                                    if meta.is_symlink() {
+                                        return Err(
+                                            "Vault path is a symlink; refusing to delete".into()
+                                        );
+                                    }
+                                    std::fs::remove_dir_all(&path)
+                                        .map_err(|e| format!("Failed to remove vault: {e}"))
+                                },
+                            ));
+                            match result {
+                                Ok(r) => r,
+                                Err(payload) => {
+                                    error!("Panic during start fresh: {:?}", payload.type_id());
+                                    Err("Internal error; please restart the application".into())
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::StartFreshResult,
+                )
             }
-            Message::Unlock => self.handle_unlock(),
-            Message::UnlockResult(result) => self.handle_shares_result(result),
-            Message::StartFresh => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.start_fresh_confirm = true;
-                }
-                Task::none()
-            }
-            Message::CancelStartFresh => {
-                if let Screen::Unlock(s) = &mut self.screen {
-                    s.start_fresh_confirm = false;
-                }
-                Task::none()
-            }
-            Message::ConfirmStartFresh => self.handle_start_fresh(),
-            Message::StartFreshResult(result) => {
-                match result {
-                    Ok(()) => {
-                        *lock_keep(&self.keep) = None;
-                        self.screen = Screen::Unlock(UnlockScreen::new(false));
-                    }
-                    Err(e) => {
-                        if let Screen::Unlock(s) = &mut self.screen {
-                            s.loading = false;
-                            s.error = Some(e);
-                            s.start_fresh_confirm = false;
-                        }
-                    }
-                }
-                Task::none()
-            }
-            _ => Task::none(),
         }
     }
 
     fn handle_navigation_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::GoToCreate => {
-                self.screen = Screen::Create(CreateScreen::new());
+                self.screen = Screen::Create(create::State::new());
                 Task::none()
             }
             Message::GoToImport => {
                 self.import_return_to_nsec = matches!(self.screen, Screen::NsecKeys(_));
-                self.screen = Screen::Import(ImportScreen::new());
+                self.screen = Screen::Import(import::State::new());
                 Task::none()
             }
             Message::GoToExport(index) => {
                 let shares = self.current_shares();
                 if let Some(share) = shares.get(index).cloned() {
-                    self.screen = Screen::Export(Box::new(ExportScreen::new(share)));
+                    self.screen = Screen::Export(Box::new(export::State::new(share)));
                 }
                 Task::none()
             }
@@ -942,24 +906,11 @@ impl App {
                     Message::WalletsLoaded,
                 )
             }
-            Message::WalletsLoaded(result) => {
-                match result {
-                    Ok(entries) => {
-                        let mut ws = WalletScreen::new(entries);
-                        ws.peer_xpubs = self.peer_xpubs.clone();
-                        self.screen = Screen::Wallet(ws);
-                    }
-                    Err(e) => {
-                        self.set_toast(e, ToastKind::Error);
-                    }
-                }
-                Task::none()
-            }
             Message::NavigateRelay => {
                 if matches!(self.screen, Screen::Relay(_)) {
                     return Task::none();
                 }
-                self.screen = Screen::Relay(RelayScreen::new(
+                self.screen = Screen::Relay(relay::State::new(
                     self.current_shares(),
                     self.relay_urls.clone(),
                     self.frost_status.clone(),
@@ -998,190 +949,130 @@ impl App {
         }
     }
 
-    fn handle_share_list_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ToggleShareDetails(i) => {
-                if let Screen::ShareList(s) = &mut self.screen {
-                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
-                }
-                Task::none()
-            }
-            Message::SetActiveShare(hex) => {
+    fn handle_share_list_message(&mut self, msg: shares::Message) -> Task<Message> {
+        let Screen::ShareList(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            shares::Event::GoToExport(i) => self.handle_navigation_message(Message::GoToExport(i)),
+            shares::Event::GoToCreate => self.handle_navigation_message(Message::GoToCreate),
+            shares::Event::GoToImport => self.handle_navigation_message(Message::GoToImport),
+            shares::Event::ActivateShare(hex) => {
                 self.handle_identity_message(Message::SwitchIdentity(hex))
             }
-            Message::RequestDelete(id) => {
-                if let Screen::ShareList(s) = &mut self.screen {
-                    s.delete_confirm = Some(id);
-                }
-                Task::none()
-            }
-            Message::ConfirmDelete(id) => {
+            shares::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
+            shares::Event::ConfirmDelete(id) => {
                 self.handle_delete(id);
                 Task::none()
             }
-            Message::CancelDelete => {
-                if let Screen::ShareList(s) = &mut self.screen {
-                    s.delete_confirm = None;
-                }
-                Task::none()
-            }
-            _ => Task::none(),
         }
     }
 
-    fn handle_create_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::CreateNameChanged(n) => {
-                if let Screen::Create(s) = &mut self.screen {
-                    s.name = n;
-                }
-                Task::none()
-            }
-            Message::CreateThresholdChanged(t) => {
-                if let Screen::Create(s) = &mut self.screen {
-                    s.threshold = t;
-                }
-                Task::none()
-            }
-            Message::CreateTotalChanged(t) => {
-                if let Screen::Create(s) = &mut self.screen {
-                    s.total = t;
-                }
-                Task::none()
-            }
-            Message::CreateKeyset => self.handle_create_keyset(),
-            Message::CreateResult(result) => match result {
-                Ok(shares) => {
-                    self.set_share_screen(shares);
-                    self.set_toast(
-                        "Keyset created! Tap a share and use Export QR to send it to your phone."
-                            .into(),
-                        ToastKind::Success,
-                    );
-                    Task::none()
-                }
-                Err(e) => {
-                    self.screen.set_loading_error(e);
-                    Task::none()
-                }
-            },
-            _ => Task::none(),
+    fn handle_create_message(&mut self, msg: create::Message) -> Task<Message> {
+        let Screen::Create(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            create::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            create::Event::Create {
+                name,
+                threshold,
+                total,
+            } => self.handle_create_keyset_validated(name, threshold, total),
         }
     }
 
-    fn handle_export_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ExportPassphraseChanged(p) => {
-                if let Screen::Export(s) = &mut self.screen {
-                    s.passphrase = p;
-                    s.confirm_passphrase = Zeroizing::new(String::new());
-                }
+    fn handle_create_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
+        match result {
+            Ok(shares) => {
+                self.set_share_screen(shares);
+                self.set_toast(
+                    "Keyset created! Tap a share and use Export QR to send it to your phone."
+                        .into(),
+                    ToastKind::Success,
+                );
                 Task::none()
             }
-            Message::ExportConfirmPassphraseChanged(p) => {
-                if let Screen::Export(s) = &mut self.screen {
-                    s.confirm_passphrase = p;
-                }
+            Err(e) => {
+                self.screen.set_loading_error(e);
                 Task::none()
             }
-            Message::GenerateExport => self.handle_generate_export(),
-            Message::ExportGenerated(result) => self.handle_export_generated(result),
-            Message::AdvanceQrFrame => {
-                if let Screen::Export(s) = &mut self.screen {
-                    s.advance_frame();
-                }
-                Task::none()
+        }
+    }
+
+    fn handle_export_message(&mut self, msg: export::Message) -> Task<Message> {
+        let Screen::Export(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            export::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            export::Event::Generate { share, passphrase } => {
+                self.handle_generate_export_validated(share, passphrase)
             }
-            Message::CopyToClipboard(t) => {
-                self.start_clipboard_timer();
-                self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
-                match &mut self.screen {
-                    Screen::Export(s) => s.copied = true,
-                    Screen::ExportNcryptsec(s) => s.copied = true,
-                    _ => {}
-                }
-                let plain = (*t).clone();
-                iced::clipboard::write(plain)
-            }
-            Message::ResetExport => {
+            export::Event::CopyToClipboard(t) => self.handle_copy_sensitive(t),
+            export::Event::Reset => {
                 self.copy_feedback_until = None;
                 if let Screen::Export(s) = &mut self.screen {
                     s.reset();
                 }
                 Task::none()
             }
-            _ => Task::none(),
         }
     }
 
-    fn handle_import_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ImportDataChanged(d) => {
-                if let Screen::Import(s) = &mut self.screen {
-                    let trimmed = d.trim();
-                    let new_mode = ImportScreen::detect_mode(trimmed);
-                    if new_mode != s.mode {
-                        s.passphrase = Zeroizing::new(String::new());
-                    }
-                    s.mode = new_mode;
-                    s.npub_preview = if s.mode == ImportMode::Nsec {
-                        keep_core::keys::NostrKeypair::from_nsec(trimmed)
-                            .ok()
-                            .map(|kp| kp.to_npub())
-                    } else {
-                        None
-                    };
-                    s.data = d;
-                }
-                Task::none()
-            }
-            Message::ImportPassphraseChanged(p) => {
-                if let Screen::Import(s) = &mut self.screen {
-                    s.passphrase = p;
-                }
-                Task::none()
-            }
-            Message::ImportNameChanged(n) => {
-                if let Screen::Import(s) = &mut self.screen {
-                    if n.chars().count() <= 64 {
-                        s.name = n;
-                    }
-                }
-                Task::none()
-            }
-            Message::ImportToggleVisibility => {
-                if let Screen::Import(s) = &mut self.screen {
-                    s.nsec_visible = !s.nsec_visible;
-                }
-                Task::none()
-            }
-            Message::ImportShare => self.handle_import(),
-            Message::ImportNsec => self.handle_import_nsec(),
-            Message::ImportNcryptsec => self.handle_import_ncryptsec(),
-            Message::ImportResult(result) => self.handle_import_result(result),
-            Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
-            Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
-            _ => Task::none(),
-        }
-    }
-
-    fn handle_scanner_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ScannerOpen | Message::ScannerRetry => {
+    fn handle_import_message(&mut self, msg: import::Message) -> Task<Message> {
+        let Screen::Import(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            import::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            import::Event::ScannerOpen => {
                 self.stop_scanner();
                 self.open_scanner();
                 Task::none()
             }
-            Message::ScannerClose => {
+            import::Event::ImportShare { data, passphrase } => {
+                self.handle_import_share(data, passphrase)
+            }
+            import::Event::ImportNsec { data, name } => self.handle_import_nsec(data, name),
+            import::Event::ImportNcryptsec {
+                data,
+                password,
+                name,
+            } => self.handle_import_ncryptsec(data, password, name),
+        }
+    }
+
+    fn handle_scanner_message(&mut self, msg: scanner::Message) -> Task<Message> {
+        let Screen::Scanner(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            scanner::Event::Close => {
                 self.stop_scanner();
-                self.screen = Screen::Import(ImportScreen::new());
+                self.screen = Screen::Import(import::State::new());
                 Task::none()
             }
-            Message::ScannerPoll => {
-                self.drain_scanner_events();
+            scanner::Event::Retry => {
+                self.stop_scanner();
+                self.open_scanner();
                 Task::none()
             }
-            _ => Task::none(),
         }
     }
 
@@ -1250,18 +1141,7 @@ impl App {
                         if let Some(result) = s.process_qr_content(&content) {
                             s.stop_camera();
                             self.scanner_rx = None;
-                            let mut import = ImportScreen::new();
-                            let trimmed = result.trim();
-                            let mode = ImportScreen::detect_mode(trimmed);
-                            import.npub_preview = if mode == ImportMode::Nsec {
-                                keep_core::keys::NostrKeypair::from_nsec(trimmed)
-                                    .ok()
-                                    .map(|kp| kp.to_npub())
-                            } else {
-                                None
-                            };
-                            import.mode = mode;
-                            import.data = Zeroizing::new(result);
+                            let import = import::State::with_data(result);
                             self.screen = Screen::Import(import);
                         }
                     }
@@ -1273,203 +1153,45 @@ impl App {
         }
     }
 
-    fn handle_wallet_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::CopyNpub(npub) => iced::clipboard::write(npub),
-            Message::CopyDescriptor(desc) => iced::clipboard::write(desc),
-            Message::ToggleWalletDetails(i) => {
-                if let Screen::Wallet(s) = &mut self.screen {
-                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
-                }
-                Task::none()
-            }
-            Message::WalletStartSetup => {
+    fn handle_wallet_message(&mut self, msg: wallet::Message) -> Task<Message> {
+        let Screen::Wallet(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            wallet::Event::StartSetup => {
                 let shares = self.current_shares();
-                let selected = if shares.len() == 1 { Some(0) } else { None };
                 if let Screen::Wallet(s) = &mut self.screen {
-                    s.setup = Some(SetupState {
-                        shares,
-                        selected_share: selected,
-                        network: "signet".into(),
-                        tiers: vec![TierConfig::default()],
-                        phase: SetupPhase::Configure,
-                        error: None,
-                        session_id: None,
-                    });
+                    s.begin_setup(shares);
                 }
                 Task::none()
             }
-            Message::WalletSelectShare(i) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    s.selected_share = Some(i);
-                }
-                Task::none()
-            }
-            Message::WalletNetworkChanged(n) => {
-                if keep_frost_net::VALID_NETWORKS.contains(&n.as_str()) {
-                    if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                        s.network = n;
-                    }
-                }
-                Task::none()
-            }
-            Message::WalletThresholdChanged(encoded) => {
-                self.update_tier_field(&encoded, |tier, val| tier.threshold = val);
-                Task::none()
-            }
-            Message::WalletTimelockChanged(encoded) => {
-                self.update_tier_field(&encoded, |tier, val| tier.timelock_months = val);
-                Task::none()
-            }
-            Message::WalletAddTier => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    if s.tiers.len() < 5 {
-                        s.tiers.push(TierConfig::default());
-                    }
-                }
-                Task::none()
-            }
-            Message::WalletRemoveTier(i) => {
-                if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                    if s.tiers.len() > 1 && i < s.tiers.len() {
-                        s.tiers.remove(i);
-                    }
-                }
-                Task::none()
-            }
-            Message::WalletBeginCoordination => self.begin_descriptor_coordination(),
-            Message::WalletSessionStarted(result) => {
-                match result {
-                    Ok((session_id, group_pubkey, network, _expected_participants)) => {
-                        let on_wallet_screen = matches!(
-                            self.screen,
-                            Screen::Wallet(WalletScreen { setup: Some(_), .. })
-                        );
-                        if !on_wallet_screen {
-                            if let Some(node) = self.get_frost_node() {
-                                node.cancel_descriptor_session(&session_id);
-                            }
-                        } else if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
-                            if let Some(node) = self.get_frost_node() {
-                                node.cancel_descriptor_session(&session_id);
-                            }
-                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
-                                &mut self.screen
-                            {
-                                s.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
-                                    "Too many active coordinations".to_string(),
-                                ));
-                            }
-                        } else {
-                            self.active_coordinations.insert(
-                                session_id,
-                                ActiveCoordination {
-                                    group_pubkey,
-                                    network,
-                                    is_initiator: true,
-                                },
-                            );
-                            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
-                                &mut self.screen
-                            {
-                                s.session_id = Some(session_id);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) =
-                            &mut self.screen
-                        {
-                            s.phase =
-                                SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
-                            s.error = Some(e);
-                        }
-                    }
-                }
-                Task::none()
-            }
-            Message::WalletCancelSetup => {
-                if let Screen::Wallet(s) = &mut self.screen {
-                    let session_id = s.setup.as_ref().and_then(|st| st.session_id);
-                    s.setup = None;
-                    if let Some(sid) = session_id {
-                        self.active_coordinations.remove(&sid);
-                        if let Some(node) = self.get_frost_node() {
-                            node.cancel_descriptor_session(&sid);
-                        }
-                    }
-                }
-                Task::none()
-            }
-            Message::WalletDescriptorProgress(progress, session_id) => {
+            wallet::Event::BeginCoordination => self.begin_descriptor_coordination(),
+            wallet::Event::CancelSetup { session_id } => {
                 if let Some(sid) = session_id {
-                    if matches!(progress, DescriptorProgress::Failed(_)) {
-                        self.active_coordinations.remove(&sid);
-                    }
-                    self.update_wallet_setup(&sid, |setup| {
-                        setup.phase = SetupPhase::Coordinating(progress);
-                    });
-                } else if matches!(progress, DescriptorProgress::Contributed) {
-                    if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-                        s.phase = SetupPhase::Coordinating(progress);
+                    self.active_coordinations.remove(&sid);
+                    if let Some(node) = self.get_frost_node() {
+                        node.cancel_descriptor_session(&sid);
                     }
                 }
                 Task::none()
             }
-            Message::WalletStartAnnounce => {
+            wallet::Event::StartAnnounce => {
                 if let Screen::Wallet(s) = &mut self.screen {
-                    s.announce = Some(AnnounceState {
-                        xpub: String::new(),
-                        fingerprint: String::new(),
-                        label: String::new(),
-                        error: None,
-                        submitting: false,
-                    });
+                    s.begin_announce();
                 }
                 Task::none()
             }
-            Message::WalletAnnounceXpubChanged(v) => {
-                if let Some(a) = self.announce_state_mut() {
-                    a.xpub = v.chars().take(MAX_XPUB_LENGTH).collect();
-                }
-                Task::none()
-            }
-            Message::WalletAnnounceFingerprintChanged(v) => {
-                if let Some(a) = self.announce_state_mut() {
-                    a.fingerprint = v
-                        .chars()
-                        .filter(|c| c.is_ascii_hexdigit())
-                        .take(8)
-                        .collect();
-                }
-                Task::none()
-            }
-            Message::WalletAnnounceLabelChanged(v) => {
-                if let Some(a) = self.announce_state_mut() {
-                    a.label = v.chars().take(MAX_XPUB_LABEL_LENGTH).collect();
-                }
-                Task::none()
-            }
-            Message::WalletCancelAnnounce => {
-                if let Screen::Wallet(s) = &mut self.screen {
-                    s.announce = None;
-                }
-                Task::none()
-            }
-            Message::WalletSubmitAnnounce => {
-                let Some(a) = self.announce_state_mut() else {
-                    return Task::none();
-                };
-                a.submitting = true;
-                a.error = None;
-                let xpub = a.xpub.trim().to_string();
-                let fingerprint = a.fingerprint.trim().to_string();
-                let label = a.label.trim().to_string();
-
+            wallet::Event::SubmitAnnounce {
+                xpub,
+                fingerprint,
+                label,
+            } => {
                 let Some(node) = self.get_frost_node() else {
-                    if let Some(a) = self.announce_state_mut() {
-                        a.error = Some("Relay not connected".into());
-                        a.submitting = false;
+                    if let Screen::Wallet(s) = &mut self.screen {
+                        s.announce_not_connected();
                     }
                     return Task::none();
                 };
@@ -1489,17 +1211,100 @@ impl App {
                     Message::WalletAnnounceResult,
                 )
             }
+            wallet::Event::CopyDescriptor(desc) => iced::clipboard::write(desc),
+        }
+    }
+
+    fn handle_wallet_global_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::WalletsLoaded(result) => {
+                match result {
+                    Ok(wallets) => {
+                        let mut ws = wallet::State::new(wallets);
+                        ws.peer_xpubs = self.peer_xpubs.clone();
+                        self.screen = Screen::Wallet(ws);
+                    }
+                    Err(e) => {
+                        self.set_toast(e, ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletSessionStarted(result) => {
+                match result {
+                    Ok((session_id, group_pubkey, network, _expected_participants)) => {
+                        let on_wallet_screen = matches!(
+                            self.screen,
+                            Screen::Wallet(wallet::State { setup: Some(_), .. })
+                        );
+                        if !on_wallet_screen {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                        } else if self.active_coordinations.len() >= MAX_ACTIVE_COORDINATIONS {
+                            if let Some(node) = self.get_frost_node() {
+                                node.cancel_descriptor_session(&session_id);
+                            }
+                            if let Screen::Wallet(wallet::State { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
+                                s.phase = SetupPhase::Coordinating(DescriptorProgress::Failed(
+                                    "Too many active coordinations".to_string(),
+                                ));
+                            }
+                        } else {
+                            self.active_coordinations.insert(
+                                session_id,
+                                ActiveCoordination {
+                                    group_pubkey,
+                                    network,
+                                    is_initiator: true,
+                                },
+                            );
+                            if let Screen::Wallet(wallet::State { setup: Some(s), .. }) =
+                                &mut self.screen
+                            {
+                                s.session_id = Some(session_id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::Wallet(wallet::State { setup: Some(s), .. }) =
+                            &mut self.screen
+                        {
+                            s.phase =
+                                SetupPhase::Coordinating(DescriptorProgress::Failed(e.clone()));
+                            s.error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::WalletDescriptorProgress(progress, session_id) => {
+                if let Some(sid) = session_id {
+                    if matches!(progress, DescriptorProgress::Failed(_)) {
+                        self.active_coordinations.remove(&sid);
+                    }
+                    self.update_wallet_setup(&sid, |setup| {
+                        setup.phase = SetupPhase::Coordinating(progress);
+                    });
+                } else if matches!(progress, DescriptorProgress::Contributed) {
+                    if let Screen::Wallet(wallet::State { setup: Some(s), .. }) = &mut self.screen {
+                        s.phase = SetupPhase::Coordinating(progress);
+                    }
+                }
+                Task::none()
+            }
             Message::WalletAnnounceResult(result) => {
                 match result {
                     Ok(()) => {
                         if let Screen::Wallet(s) = &mut self.screen {
-                            s.announce = None;
+                            s.announce_submitted();
                         }
                     }
                     Err(e) => {
-                        if let Some(a) = self.announce_state_mut() {
-                            a.error = Some(e);
-                            a.submitting = false;
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.announce_failed(e);
                         }
                     }
                 }
@@ -1509,23 +1314,11 @@ impl App {
         }
     }
 
-    fn update_tier_field(&mut self, encoded: &str, f: impl FnOnce(&mut TierConfig, String)) {
-        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
-            if let Some((idx_str, val)) = encoded.split_once(':') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if let Some(tier) = s.tiers.get_mut(idx) {
-                        f(tier, val.to_string());
-                    }
-                }
-            }
-        }
-    }
-
     fn begin_descriptor_coordination(&mut self) -> Task<Message> {
         use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
 
         let (share, network, policy) = match &mut self.screen {
-            Screen::Wallet(WalletScreen { setup: Some(s), .. }) => {
+            Screen::Wallet(wallet::State { setup: Some(s), .. }) => {
                 let Some(idx) = s.selected_share else {
                     s.error = Some("Select a share".into());
                     return Task::none();
@@ -1574,14 +1367,14 @@ impl App {
         };
 
         if !matches!(self.frost_status, ConnectionStatus::Connected) {
-            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+            if let Screen::Wallet(wallet::State { setup: Some(s), .. }) = &mut self.screen {
                 s.error = Some("Connect to relay first".into());
             }
             return Task::none();
         }
 
         let Some(node) = self.get_frost_node() else {
-            if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+            if let Screen::Wallet(wallet::State { setup: Some(s), .. }) = &mut self.screen {
                 s.error = Some("Relay node not available".into());
             }
             return Task::none();
@@ -1589,7 +1382,7 @@ impl App {
 
         let expected_total = keep_frost_net::participant_indices(&policy).len();
 
-        if let Screen::Wallet(WalletScreen { setup: Some(s), .. }) = &mut self.screen {
+        if let Screen::Wallet(wallet::State { setup: Some(s), .. }) = &mut self.screen {
             s.phase = SetupPhase::Coordinating(DescriptorProgress::WaitingContributions {
                 received: 1,
                 expected: expected_total,
@@ -1626,34 +1419,30 @@ impl App {
         )
     }
 
-    fn handle_relay_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::RelayUrlChanged(url) => {
-                if let Screen::Relay(s) = &mut self.screen {
-                    s.relay_url_input = url;
-                }
-                Task::none()
-            }
-            Message::ConnectPasswordChanged(p) => {
-                if let Screen::Relay(s) = &mut self.screen {
-                    s.connect_password = p;
-                }
-                Task::none()
-            }
-            Message::AddRelay => {
-                let url = match &self.screen {
-                    Screen::Relay(s) => s.relay_url_input.trim().to_string(),
-                    _ => return Task::none(),
-                };
+    fn handle_relay_message(&mut self, msg: relay::Message) -> Task<Message> {
+        let Screen::Relay(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            relay::Event::AddRelay(url) => {
                 if self.relay_urls.len() >= MAX_RELAYS {
                     self.set_toast(
                         format!("Maximum of {MAX_RELAYS} relays allowed"),
                         ToastKind::Error,
                     );
+                    if let Screen::Relay(s) = &mut self.screen {
+                        s.clear_input();
+                    }
                     return Task::none();
                 }
                 if let Err(e) = validate_relay_url(&url) {
                     self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
+                    if let Screen::Relay(s) = &mut self.screen {
+                        s.clear_input();
+                    }
                     return Task::none();
                 }
                 let normalized = normalize_relay_url(&url);
@@ -1661,16 +1450,15 @@ impl App {
                 if is_new {
                     self.relay_urls.push(normalized.clone());
                     self.save_relay_urls();
-                }
-                if let Screen::Relay(s) = &mut self.screen {
-                    if is_new {
-                        s.relay_urls.push(normalized);
+                    if let Screen::Relay(s) = &mut self.screen {
+                        s.relay_added(normalized);
                     }
-                    s.relay_url_input.clear();
+                } else if let Screen::Relay(s) = &mut self.screen {
+                    s.clear_input();
                 }
                 Task::none()
             }
-            Message::RemoveRelay(i) => {
+            relay::Event::RemoveRelay(i) => {
                 if let Screen::Relay(s) = &mut self.screen {
                     if i < s.relay_urls.len() {
                         s.relay_urls.remove(i);
@@ -1680,27 +1468,19 @@ impl App {
                 }
                 Task::none()
             }
-            Message::SelectShareForRelay(i) => {
-                if let Screen::Relay(s) = &mut self.screen {
-                    s.selected_share = Some(i);
-                }
-                Task::none()
-            }
-            Message::ConnectRelay => self.handle_connect_relay(),
-            Message::DisconnectRelay => {
+            relay::Event::Connect => self.handle_connect_relay(),
+            relay::Event::Disconnect => {
                 self.handle_disconnect_relay();
                 Task::none()
             }
-            Message::ConnectRelayResult(result) => self.handle_connect_relay_result(result),
-            Message::ApproveSignRequest(id) => {
+            relay::Event::ApproveSignRequest(id) => {
                 self.respond_to_sign_request(&id, true);
                 Task::none()
             }
-            Message::RejectSignRequest(id) => {
+            relay::Event::RejectSignRequest(id) => {
                 self.respond_to_sign_request(&id, false);
                 Task::none()
             }
-            _ => Task::none(),
         }
     }
 
@@ -1842,7 +1622,8 @@ impl App {
         if let Screen::Export(s) = &self.screen {
             if s.is_animated() {
                 subs.push(
-                    iced::time::every(Duration::from_millis(800)).map(|_| Message::AdvanceQrFrame),
+                    iced::time::every(Duration::from_millis(800))
+                        .map(|_| Message::Export(export::Message::AdvanceFrame)),
                 );
             }
         }
@@ -1875,7 +1656,7 @@ impl App {
         self.pin_mismatch = None;
         self.pin_mismatch_confirm = false;
         self.bunker_cert_pin_failed = false;
-        self.screen = Screen::Unlock(UnlockScreen::new(true));
+        self.screen = Screen::Unlock(unlock::State::new(true));
         if clear_clipboard {
             iced::clipboard::write(String::new())
         } else {
@@ -1903,9 +1684,7 @@ impl App {
         if matches!(self.screen, Screen::NsecKeys(_)) {
             self.set_nsec_keys_screen();
         } else if let Screen::ShareList(s) = &mut self.screen {
-            s.shares = shares;
-            s.active_share_hex = self.active_share_hex.clone();
-            s.delete_confirm = None;
+            s.refresh(shares, self.active_share_hex.clone());
         }
     }
 
@@ -1914,8 +1693,7 @@ impl App {
         self.cached_nsec_count = self.current_nsec_keys().len();
         self.resolve_active_share(&shares);
         self.refresh_identities(&shares);
-        self.screen =
-            Screen::ShareList(ShareListScreen::new(shares, self.active_share_hex.clone()));
+        self.screen = Screen::ShareList(shares::State::new(shares, self.active_share_hex.clone()));
     }
 
     fn current_nsec_keys(&self) -> Vec<NsecKeyEntry> {
@@ -1933,77 +1711,68 @@ impl App {
     fn set_nsec_keys_screen(&mut self) {
         let keys = self.current_nsec_keys();
         self.cached_nsec_count = keys.len();
-        self.screen = Screen::NsecKeys(NsecKeysScreen::new(keys, self.active_share_hex.clone()));
+        self.screen = Screen::NsecKeys(nsec_keys::State::new(keys, self.active_share_hex.clone()));
     }
 
-    fn handle_nsec_keys_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ToggleNsecKeyDetails(i) => {
-                if let Screen::NsecKeys(s) = &mut self.screen {
-                    s.expanded = if s.expanded == Some(i) { None } else { Some(i) };
-                    s.delete_confirm = None;
-                }
-                Task::none()
+    fn handle_nsec_keys_message(&mut self, msg: nsec_keys::Message) -> Task<Message> {
+        let Screen::NsecKeys(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            nsec_keys::Event::GoToImport => self.handle_navigation_message(Message::GoToImport),
+            nsec_keys::Event::ActivateKey(hex) => {
+                self.handle_identity_message(Message::SwitchIdentity(hex))
             }
-            Message::RequestDeleteNsecKey(hex) => {
-                if let Screen::NsecKeys(s) = &mut self.screen {
-                    s.delete_confirm = Some(hex);
-                }
-                Task::none()
-            }
-            Message::ConfirmDeleteNsecKey(hex) => {
-                let Screen::NsecKeys(s) = &self.screen else {
-                    return Task::none();
-                };
-                if s.delete_confirm.as_deref() != Some(hex.as_str()) {
-                    return Task::none();
-                }
-                let Some(key) = s.keys.iter().find(|k| k.pubkey_hex == hex) else {
-                    return Task::none();
-                };
-                let (pubkey, name) = (key.pubkey, key.name.clone());
-                if self.active_share_hex.as_deref() == Some(hex.as_str()) {
-                    self.handle_disconnect_relay();
-                    self.stop_bunker();
-                }
-                let delete_result = {
-                    let mut guard = lock_keep(&self.keep);
-                    guard.as_mut().map(|keep| keep.delete_key(&pubkey))
-                };
-                match delete_result {
-                    Some(Ok(())) => {
-                        {
-                            let guard = lock_keep(&self.keep);
-                            if let Some(keep) = guard.as_ref() {
-                                let _ = keep.delete_relay_config(&pubkey);
-                            }
-                        }
-                        self.refresh_shares();
-                        self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
-                    }
-                    Some(Err(e)) => {
-                        if let Screen::NsecKeys(s) = &mut self.screen {
-                            s.delete_confirm = None;
-                        }
-                        self.set_toast(friendly_err(e), ToastKind::Error);
-                    }
-                    None => {
-                        if let Screen::NsecKeys(s) = &mut self.screen {
-                            s.delete_confirm = None;
-                        }
-                        self.set_toast("Vault locked or unavailable".into(), ToastKind::Error);
-                    }
-                }
-                Task::none()
-            }
-            Message::CancelDeleteNsecKey => {
-                if let Screen::NsecKeys(s) = &mut self.screen {
-                    s.delete_confirm = None;
-                }
-                Task::none()
-            }
-            _ => Task::none(),
+            nsec_keys::Event::ExportNcryptsec(hex) => self.handle_go_to_export_ncryptsec(hex),
+            nsec_keys::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
+            nsec_keys::Event::ConfirmDelete(hex) => self.handle_nsec_key_delete(hex),
         }
+    }
+
+    fn handle_nsec_key_delete(&mut self, hex: String) -> Task<Message> {
+        let Screen::NsecKeys(s) = &self.screen else {
+            return Task::none();
+        };
+        let Some(key) = s.keys().iter().find(|k| k.pubkey_hex == hex) else {
+            return Task::none();
+        };
+        let (pubkey, name) = (key.pubkey, key.name.clone());
+        if self.active_share_hex.as_deref() == Some(hex.as_str()) {
+            self.handle_disconnect_relay();
+            self.stop_bunker();
+        }
+        let delete_result = {
+            let mut guard = lock_keep(&self.keep);
+            guard.as_mut().map(|keep| keep.delete_key(&pubkey))
+        };
+        match delete_result {
+            Some(Ok(())) => {
+                {
+                    let guard = lock_keep(&self.keep);
+                    if let Some(keep) = guard.as_ref() {
+                        let _ = keep.delete_relay_config(&pubkey);
+                    }
+                }
+                self.refresh_shares();
+                self.set_toast(format!("'{name}' deleted"), ToastKind::Success);
+            }
+            Some(Err(e)) => {
+                if let Screen::NsecKeys(s) = &mut self.screen {
+                    s.clear_delete_confirm();
+                }
+                self.set_toast(friendly_err(e), ToastKind::Error);
+            }
+            None => {
+                if let Screen::NsecKeys(s) = &mut self.screen {
+                    s.clear_delete_confirm();
+                }
+                self.set_toast("Vault locked or unavailable".into(), ToastKind::Error);
+            }
+        }
+        Task::none()
     }
 
     fn resolve_active_share(&mut self, shares: &[ShareEntry]) {
@@ -2033,118 +1802,6 @@ impl App {
                 self.active_share_hex = None;
             }
         }
-    }
-
-    fn handle_unlock(&mut self) -> Task<Message> {
-        let (password, vault_exists) = match &mut self.screen {
-            Screen::Unlock(s) => {
-                if s.loading {
-                    return Task::none();
-                }
-                if s.password.is_empty() {
-                    s.error = Some("Password required".into());
-                    return Task::none();
-                }
-                if !s.vault_exists && s.password.len() < MIN_PASSWORD_LEN {
-                    s.error = Some(format!(
-                        "Password must be at least {MIN_PASSWORD_LEN} characters"
-                    ));
-                    return Task::none();
-                }
-                if !s.vault_exists && *s.password != *s.confirm_password {
-                    s.error = Some("Passwords do not match".into());
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.password.clone(), s.vault_exists)
-            }
-            _ => return Task::none(),
-        };
-
-        let path = self.keep_path.clone();
-        let keep_arc = self.keep.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
-                            let mut keep = if vault_exists {
-                                Keep::open(&path).map_err(friendly_err)?
-                            } else {
-                                Keep::create(&path, &password).map_err(friendly_err)?
-                            };
-
-                            if vault_exists {
-                                keep.unlock(&password).map_err(friendly_err)?;
-                            }
-
-                            let shares = collect_shares(&keep)?;
-                            *lock_keep(&keep_arc) = Some(keep);
-                            Ok(shares)
-                        }));
-
-                    match result {
-                        Ok(r) => r,
-                        Err(payload) => {
-                            error!("Panic during unlock: {:?}", payload.type_id());
-                            Err("Internal error during unlock".to_string())
-                        }
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())?
-            },
-            Message::UnlockResult,
-        )
-    }
-
-    fn handle_start_fresh(&mut self) -> Task<Message> {
-        let password = match &mut self.screen {
-            Screen::Unlock(s) => {
-                if s.password.is_empty() {
-                    s.error = Some("Enter your vault password to confirm deletion".into());
-                    return Task::none();
-                }
-                if s.loading {
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                s.password.clone()
-            }
-            _ => return Task::none(),
-        };
-        let path = self.keep_path.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
-                            let mut keep = Keep::open(&path).map_err(friendly_err)?;
-                            keep.unlock(&password).map_err(friendly_err)?;
-                            drop(keep);
-                            let meta = std::fs::symlink_metadata(&path)
-                                .map_err(|e| format!("Failed to read vault metadata: {e}"))?;
-                            if meta.is_symlink() {
-                                return Err("Vault path is a symlink; refusing to delete".into());
-                            }
-                            std::fs::remove_dir_all(&path)
-                                .map_err(|e| format!("Failed to remove vault: {e}"))
-                        }));
-                    match result {
-                        Ok(r) => r,
-                        Err(payload) => {
-                            error!("Panic during start fresh: {:?}", payload.type_id());
-                            Err("Internal error; please restart the application".into())
-                        }
-                    }
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())?
-            },
-            Message::StartFreshResult,
-        )
     }
 
     pub(crate) fn set_toast(&mut self, message: String, kind: ToastKind) {
@@ -2332,48 +1989,19 @@ impl App {
             Ok(()) => self.refresh_shares(),
             Err(e) => {
                 if let Screen::ShareList(s) = &mut self.screen {
-                    s.delete_confirm = None;
+                    s.clear_delete_confirm();
                 }
                 self.set_toast(friendly_err(e), ToastKind::Error);
             }
         }
     }
 
-    fn handle_create_keyset(&mut self) -> Task<Message> {
-        let (name, threshold, total) = match &mut self.screen {
-            Screen::Create(s) => {
-                if s.loading {
-                    return Task::none();
-                }
-                let threshold: u16 = match s.threshold.parse() {
-                    Ok(v) if (2..=255).contains(&v) => v,
-                    _ => {
-                        s.error = Some("Threshold must be between 2 and 255".into());
-                        return Task::none();
-                    }
-                };
-                let total: u16 = match s.total.parse() {
-                    Ok(v) if v >= threshold && v <= 255 => v,
-                    _ => {
-                        s.error = Some(format!("Total must be between {threshold} and 255"));
-                        return Task::none();
-                    }
-                };
-                if s.name.is_empty() {
-                    s.error = Some("Name is required".into());
-                    return Task::none();
-                }
-                if s.name.len() > 64 {
-                    s.error = Some("Name must be 64 characters or fewer".into());
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.name.clone(), threshold, total)
-            }
-            _ => return Task::none(),
-        };
-
+    fn handle_create_keyset_validated(
+        &mut self,
+        name: String,
+        threshold: u16,
+        total: u16,
+    ) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2395,23 +2023,15 @@ impl App {
         )
     }
 
-    fn handle_generate_export(&mut self) -> Task<Message> {
-        let (share, passphrase) = match &mut self.screen {
-            Screen::Export(s) => {
-                if s.loading || s.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
-                    return Task::none();
-                }
-                if *s.passphrase != *s.confirm_passphrase {
-                    s.error = Some("Passphrases do not match".into());
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.share.clone(), s.passphrase.clone())
-            }
-            _ => return Task::none(),
-        };
+    fn handle_copy_npub(&self, npub: String) -> Task<Message> {
+        iced::clipboard::write(npub)
+    }
 
+    fn handle_generate_export_validated(
+        &mut self,
+        share: ShareEntry,
+        passphrase: Zeroizing<String>,
+    ) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2440,6 +2060,17 @@ impl App {
         )
     }
 
+    fn handle_copy_sensitive(&mut self, data: Zeroizing<String>) -> Task<Message> {
+        self.start_clipboard_timer();
+        self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
+        match &mut self.screen {
+            Screen::Export(s) => s.copied = true,
+            Screen::ExportNcryptsec(s) => s.copied = true,
+            _ => {}
+        }
+        iced::clipboard::write((*data).clone())
+    }
+
     fn handle_export_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
         match result {
             Ok(data) => {
@@ -2452,19 +2083,11 @@ impl App {
         Task::none()
     }
 
-    fn handle_import(&mut self) -> Task<Message> {
-        let (data, passphrase) = match &mut self.screen {
-            Screen::Import(s) => {
-                if s.loading || s.data.is_empty() || s.passphrase.is_empty() {
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.data.clone(), s.passphrase.clone())
-            }
-            _ => return Task::none(),
-        };
-
+    fn handle_import_share(
+        &mut self,
+        data: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+    ) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2485,19 +2108,7 @@ impl App {
         )
     }
 
-    fn handle_import_nsec(&mut self) -> Task<Message> {
-        let (data, name) = match &mut self.screen {
-            Screen::Import(s) => {
-                if s.loading || s.data.is_empty() || s.name.trim().is_empty() {
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.data.clone(), s.name.clone())
-            }
-            _ => return Task::none(),
-        };
-
+    fn handle_import_nsec(&mut self, data: Zeroizing<String>, name: String) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2534,23 +2145,12 @@ impl App {
         Task::none()
     }
 
-    fn handle_import_ncryptsec(&mut self) -> Task<Message> {
-        let (data, password, name) = match &mut self.screen {
-            Screen::Import(s) => {
-                if s.loading
-                    || s.data.is_empty()
-                    || s.passphrase.is_empty()
-                    || s.name.trim().is_empty()
-                {
-                    return Task::none();
-                }
-                s.loading = true;
-                s.error = None;
-                (s.data.clone(), s.passphrase.clone(), s.name.clone())
-            }
-            _ => return Task::none(),
-        };
-
+    fn handle_import_ncryptsec(
+        &mut self,
+        data: Zeroizing<String>,
+        password: Zeroizing<String>,
+        name: String,
+    ) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2571,102 +2171,86 @@ impl App {
         )
     }
 
-    fn handle_ncryptsec_export_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::GoToExportNcryptsec(pubkey_hex) => {
-                let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex);
-                if let Some(id) = identity {
-                    self.screen = Screen::ExportNcryptsec(Box::new(ExportNcryptsecScreen::new(
-                        id.pubkey_hex.clone(),
-                        id.name.clone(),
-                        id.npub.clone(),
-                    )));
-                }
-                Task::none()
-            }
-            Message::ExportNcryptsecPasswordChanged(p) => {
-                if let Screen::ExportNcryptsec(s) = &mut self.screen {
-                    s.password = p;
-                    s.confirm_password = Zeroizing::new(String::new());
-                    s.error = None;
-                }
-                Task::none()
-            }
-            Message::ExportNcryptsecConfirmChanged(p) => {
-                if let Screen::ExportNcryptsec(s) = &mut self.screen {
-                    s.confirm_password = p;
-                    s.error = None;
-                }
-                Task::none()
-            }
-            Message::GenerateNcryptsec => {
-                let (pubkey_hex, password) = match &mut self.screen {
-                    Screen::ExportNcryptsec(s) => {
-                        if s.loading || s.password.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
-                            return Task::none();
-                        }
-                        if *s.password != *s.confirm_password {
-                            s.error = Some("Passwords do not match".into());
-                            return Task::none();
-                        }
-                        s.loading = true;
-                        s.error = None;
-                        (s.pubkey_hex.clone(), s.password.clone())
-                    }
-                    _ => return Task::none(),
-                };
+    fn handle_go_to_export_ncryptsec(&mut self, pubkey_hex: String) -> Task<Message> {
+        let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex);
+        if let Some(id) = identity {
+            self.screen = Screen::ExportNcryptsec(Box::new(export_ncryptsec::State::new(
+                id.pubkey_hex.clone(),
+                id.name.clone(),
+                id.npub.clone(),
+            )));
+        }
+        Task::none()
+    }
 
-                let Some(pubkey_bytes) = hex::decode(&pubkey_hex)
-                    .ok()
-                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                else {
-                    self.screen.set_loading_error("Invalid public key".into());
-                    return Task::none();
-                };
-
-                let keep_arc = self.keep.clone();
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            with_keep_blocking(
-                                &keep_arc,
-                                "Internal error during export",
-                                move |keep| {
-                                    let ncryptsec = keep
-                                        .export_ncryptsec(&pubkey_bytes, &password)
-                                        .map_err(friendly_err)?;
-                                    Ok(ExportData {
-                                        bech32: Zeroizing::new(ncryptsec),
-                                        frames: Vec::new(),
-                                    })
-                                },
-                            )
-                        })
-                        .await
-                        .map_err(|_| "Background task failed".to_string())?
-                    },
-                    Message::NcryptsecGenerated,
-                )
-            }
-            Message::NcryptsecGenerated(Ok(data)) => {
-                if let Screen::ExportNcryptsec(s) = &mut self.screen {
-                    s.set_result(data.bech32);
-                }
-                Task::none()
-            }
-            Message::NcryptsecGenerated(Err(e)) => {
-                self.screen.set_loading_error(e);
-                Task::none()
-            }
-            Message::ResetNcryptsec => {
+    fn handle_ncryptsec_export_message(&mut self, msg: export_ncryptsec::Message) -> Task<Message> {
+        let Screen::ExportNcryptsec(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            export_ncryptsec::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            export_ncryptsec::Event::Generate {
+                pubkey_hex,
+                password,
+            } => self.handle_generate_ncryptsec(pubkey_hex, password),
+            export_ncryptsec::Event::CopyToClipboard(t) => self.handle_copy_sensitive(t),
+            export_ncryptsec::Event::Reset => {
                 self.copy_feedback_until = None;
                 if let Screen::ExportNcryptsec(s) = &mut self.screen {
                     s.reset();
                 }
                 Task::none()
             }
-            _ => Task::none(),
         }
+    }
+
+    fn handle_generate_ncryptsec(
+        &mut self,
+        pubkey_hex: String,
+        password: Zeroizing<String>,
+    ) -> Task<Message> {
+        let Some(pubkey_bytes) = hex::decode(&pubkey_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            self.screen.set_loading_error("Invalid public key".into());
+            return Task::none();
+        };
+
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Internal error during export", move |keep| {
+                        let ncryptsec = keep
+                            .export_ncryptsec(&pubkey_bytes, &password)
+                            .map_err(friendly_err)?;
+                        Ok(ExportData {
+                            bech32: Zeroizing::new(ncryptsec),
+                            frames: Vec::new(),
+                        })
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::NcryptsecGenerated,
+        )
+    }
+
+    fn handle_ncryptsec_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
+        match result {
+            Ok(data) => {
+                if let Screen::ExportNcryptsec(s) = &mut self.screen {
+                    s.set_result(data.bech32);
+                }
+            }
+            Err(e) => self.screen.set_loading_error(e),
+        }
+        Task::none()
     }
 
     fn load_audit_page(
@@ -2701,6 +2285,42 @@ impl App {
             },
             on_done,
         )
+    }
+
+    fn handle_signing_audit_message(
+        &mut self,
+        msg: crate::screen::signing_audit::Message,
+    ) -> Task<Message> {
+        let Screen::SigningAudit(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            crate::screen::signing_audit::Event::FilterChanged(caller) => {
+                if let Screen::SigningAudit(s) = &mut self.screen {
+                    s.selected_caller = caller.clone();
+                    s.entries.clear();
+                    s.loading = true;
+                    s.has_more = false;
+                }
+                Self::load_audit_page(self.keep.clone(), 0, caller, Message::AuditLoaded)
+            }
+            crate::screen::signing_audit::Event::LoadMore => {
+                let (offset, caller) = match &mut self.screen {
+                    Screen::SigningAudit(s) => {
+                        if s.loading || !s.has_more {
+                            return Task::none();
+                        }
+                        s.loading = true;
+                        (s.entries.len(), s.selected_caller.clone())
+                    }
+                    _ => return Task::none(),
+                };
+                Self::load_audit_page(self.keep.clone(), offset, caller, Message::AuditPageLoaded)
+            }
+        }
     }
 
     fn handle_audit_message(&mut self, message: Message) -> Task<Message> {
@@ -2767,15 +2387,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AuditFilterChanged(caller) => {
-                if let Screen::SigningAudit(s) = &mut self.screen {
-                    s.selected_caller = caller.clone();
-                    s.entries.clear();
-                    s.loading = true;
-                    s.has_more = false;
-                }
-                Self::load_audit_page(self.keep.clone(), 0, caller, Message::AuditLoaded)
-            }
             Message::AuditPageLoaded(result) => {
                 match result {
                     Ok(data) => {
@@ -2793,19 +2404,6 @@ impl App {
                     }
                 }
                 Task::none()
-            }
-            Message::AuditLoadMore => {
-                let (offset, caller) = match &mut self.screen {
-                    Screen::SigningAudit(s) => {
-                        if s.loading || !s.has_more {
-                            return Task::none();
-                        }
-                        s.loading = true;
-                        (s.entries.len(), s.selected_caller.clone())
-                    }
-                    _ => return Task::none(),
-                };
-                Self::load_audit_page(self.keep.clone(), offset, caller, Message::AuditPageLoaded)
             }
             _ => Task::none(),
         }
@@ -2937,13 +2535,13 @@ impl App {
                 let shares = self.current_shares();
                 match &self.screen {
                     Screen::ShareList(_) => {
-                        self.screen = Screen::ShareList(ShareListScreen::new(
+                        self.screen = Screen::ShareList(shares::State::new(
                             shares,
                             self.active_share_hex.clone(),
                         ));
                     }
                     Screen::Relay(_) => {
-                        self.screen = Screen::Relay(RelayScreen::new(
+                        self.screen = Screen::Relay(relay::State::new(
                             shares,
                             self.relay_urls.clone(),
                             self.frost_status.clone(),
@@ -3069,18 +2667,34 @@ impl App {
         }
     }
 
-    fn handle_settings_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::SettingsAutoLockChanged(secs) => {
+    fn handle_settings_message_new(
+        &mut self,
+        msg: crate::screen::settings::Message,
+    ) -> Task<Message> {
+        use crate::screen::settings::Event;
+        let Screen::Settings(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            Event::AutoLockChanged(secs) => {
                 self.settings.auto_lock_secs = secs;
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.auto_lock_secs = secs;
+                }
             }
-            Message::SettingsClipboardClearChanged(secs) => {
+            Event::ClipboardClearChanged(secs) => {
                 self.settings.clipboard_clear_secs = secs;
                 if secs == 0 {
                     self.clipboard_clear_at = None;
                 }
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.clipboard_clear_secs = secs;
+                }
             }
-            Message::SettingsProxyToggled(enabled) => {
+            Event::ProxyToggled(enabled) => {
                 self.proxy_enabled = enabled;
                 let frost_active = matches!(
                     self.frost_status,
@@ -3106,28 +2720,25 @@ impl App {
                         ToastKind::Success,
                     );
                 }
+                save_settings(&self.keep_path, &self.settings);
                 return Task::batch(tasks);
             }
-            Message::SettingsProxyPortChanged(port_str) => {
+            Event::ProxyPortChanged(port) => {
+                self.proxy_port = port;
+                self.save_proxy_config();
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.proxy_port_input = port_str.clone();
+                    s.sync_proxy_port(self.proxy_port);
                 }
-                match port_str.parse::<u16>() {
-                    Ok(port) if port > 0 => {
-                        self.proxy_port = port;
-                        self.save_proxy_config();
-                    }
-                    _ => return Task::none(),
-                }
-                self.sync_settings_screen();
                 return Task::none();
             }
-            Message::SettingsMinimizeToTrayToggled(v) => {
+            Event::MinimizeToTrayToggled(v) => {
                 self.settings.minimize_to_tray = v;
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.minimize_to_tray = v;
+                }
                 if !v && !self.window_visible {
                     self.window_visible = true;
                     save_settings(&self.keep_path, &self.settings);
-                    self.sync_settings_screen();
                     return iced::window::oldest().and_then(|id| {
                         Task::batch([
                             iced::window::set_mode(id, iced::window::Mode::Windowed),
@@ -3136,34 +2747,19 @@ impl App {
                     });
                 }
             }
-            Message::SettingsStartMinimizedToggled(v) => {
+            Event::StartMinimizedToggled(v) => {
                 self.settings.start_minimized = v;
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.start_minimized = v;
+                }
             }
-            _ => return Task::none(),
-        }
-        save_settings(&self.keep_path, &self.settings);
-        self.sync_settings_screen();
-        Task::none()
-    }
-
-    fn sync_settings_screen(&mut self) {
-        if let Screen::Settings(s) = &mut self.screen {
-            s.auto_lock_secs = self.settings.auto_lock_secs;
-            s.clipboard_clear_secs = self.settings.clipboard_clear_secs;
-            s.proxy_enabled = self.proxy_enabled;
-            s.proxy_port = self.proxy_port;
-            s.minimize_to_tray = self.settings.minimize_to_tray;
-            s.start_minimized = self.settings.start_minimized;
-            let formatted = self.proxy_port.to_string();
-            if s.proxy_port_input != formatted {
-                s.proxy_port_input = formatted;
+            Event::KillSwitchActivate => {
+                return self.handle_kill_switch_activate();
             }
-        }
-    }
-
-    fn handle_cert_pin_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::CertPinClear(hostname) => {
+            Event::KillSwitchDeactivate(password) => {
+                return self.handle_kill_switch_deactivate(password);
+            }
+            Event::CertPinClear(hostname) => {
                 let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     pins.remove_pin(&hostname);
                     save_cert_pins(&self.keep_path, &pins);
@@ -3177,18 +2773,9 @@ impl App {
                 } else {
                     self.set_toast("Failed to clear pin".into(), ToastKind::Error);
                 }
+                return Task::none();
             }
-            Message::CertPinClearAllRequest => {
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.clear_all_pins_confirm = true;
-                }
-            }
-            Message::CertPinClearAllCancel => {
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.clear_all_pins_confirm = false;
-                }
-            }
-            Message::CertPinClearAllConfirm => {
+            Event::CertPinClearAll => {
                 let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
                     *pins = keep_frost_net::CertificatePinSet::new();
                     save_cert_pins(&self.keep_path, &pins);
@@ -3199,13 +2786,28 @@ impl App {
                 if ok {
                     self.sync_cert_pins_to_screen();
                     if let Screen::Settings(s) = &mut self.screen {
-                        s.clear_all_pins_confirm = false;
+                        s.clear_all_pins_done();
                     }
                     self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
                 } else {
                     self.set_toast("Failed to clear pins".into(), ToastKind::Error);
                 }
+                return Task::none();
             }
+        }
+        save_settings(&self.keep_path, &self.settings);
+        Task::none()
+    }
+
+    fn sync_cert_pins_to_screen(&mut self) {
+        let entries = self.cert_pin_display_entries();
+        if let Screen::Settings(s) = &mut self.screen {
+            s.certificate_pins = entries;
+        }
+    }
+
+    fn handle_cert_pin_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::CertPinMismatchDismiss => {
                 self.pin_mismatch = None;
                 self.pin_mismatch_confirm = false;
@@ -3259,121 +2861,87 @@ impl App {
         entries
     }
 
-    fn sync_cert_pins_to_screen(&mut self) {
-        let entries = self.cert_pin_display_entries();
-        if let Screen::Settings(s) = &mut self.screen {
-            s.certificate_pins = entries;
+    fn handle_kill_switch_activate(&mut self) -> Task<Message> {
+        let vault_err = {
+            let mut guard = lock_keep(&self.keep);
+            guard
+                .as_mut()
+                .and_then(|keep| keep.set_kill_switch(true).err())
+        };
+        if let Some(e) = vault_err {
+            self.set_toast(friendly_err(e), ToastKind::Error);
+            return Task::none();
         }
+        self.settings.kill_switch_active = true;
+        save_settings(&self.keep_path, &self.settings);
+        self.kill_switch.store(true, Ordering::Release);
+
+        self.log_kill_switch_event(true);
+        self.handle_disconnect_relay();
+        self.stop_bunker();
+
+        if let Screen::Settings(s) = &mut self.screen {
+            s.kill_switch_activated();
+        }
+        self.set_toast(
+            "Kill switch activated - all signing blocked".into(),
+            ToastKind::Success,
+        );
+        Task::none()
     }
 
-    fn handle_kill_switch_message(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::KillSwitchRequestConfirm | Message::KillSwitchCancelConfirm => {
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.kill_switch_confirm = matches!(message, Message::KillSwitchRequestConfirm);
-                }
-            }
-            Message::KillSwitchActivate => {
-                let vault_err = {
+    fn handle_kill_switch_deactivate(&mut self, password: Zeroizing<String>) -> Task<Message> {
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let guard = lock_keep(&keep_arc);
+                    match guard.as_ref() {
+                        None => Err("Vault is locked".to_string()),
+                        Some(keep) => keep.verify_password(&password).map_err(friendly_err),
+                    }
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::KillSwitchDeactivateResult,
+        )
+    }
+
+    fn handle_kill_switch_deactivate_result(
+        &mut self,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(()) => {
+                {
                     let mut guard = lock_keep(&self.keep);
-                    guard
-                        .as_mut()
-                        .and_then(|keep| keep.set_kill_switch(true).err())
-                };
-                if let Some(e) = vault_err {
-                    self.set_toast(friendly_err(e), ToastKind::Error);
-                    return Task::none();
+                    if let Some(keep) = guard.as_mut() {
+                        if let Err(e) = keep.set_kill_switch(false) {
+                            if let Screen::Settings(s) = &mut self.screen {
+                                s.kill_switch_deactivate_failed(friendly_err(e));
+                            }
+                            return Task::none();
+                        }
+                    }
                 }
-                self.settings.kill_switch_active = true;
+                self.kill_switch.store(false, Ordering::Release);
+                self.settings.kill_switch_active = false;
                 save_settings(&self.keep_path, &self.settings);
-                self.kill_switch.store(true, Ordering::Release);
-
-                self.log_kill_switch_event(true);
-                self.handle_disconnect_relay();
-                self.stop_bunker();
-
+                self.log_kill_switch_event(false);
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.kill_switch_confirm = false;
-                    s.kill_switch_active = true;
+                    s.kill_switch_deactivated();
                 }
                 self.set_toast(
-                    "Kill switch activated - all signing blocked".into(),
+                    "Kill switch deactivated - signing re-enabled".into(),
                     ToastKind::Success,
                 );
             }
-            Message::KillSwitchPasswordChanged(p) => {
+            Err(e) => {
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.kill_switch_password = p;
+                    s.kill_switch_deactivate_failed(e);
                 }
             }
-            Message::KillSwitchDeactivate => {
-                let password = if let Screen::Settings(s) = &mut self.screen {
-                    if s.kill_switch_password.is_empty() {
-                        s.kill_switch_error = Some("Password required".into());
-                        return Task::none();
-                    }
-                    s.kill_switch_loading = true;
-                    s.kill_switch_error = None;
-                    s.kill_switch_password.clone()
-                } else {
-                    return Task::none();
-                };
-
-                let keep_arc = self.keep.clone();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let guard = lock_keep(&keep_arc);
-                            match guard.as_ref() {
-                                None => Err("Vault is locked".to_string()),
-                                Some(keep) => keep.verify_password(&password).map_err(friendly_err),
-                            }
-                        })
-                        .await
-                        .map_err(|_| "Background task failed".to_string())?
-                    },
-                    Message::KillSwitchDeactivateResult,
-                );
-            }
-            Message::KillSwitchDeactivateResult(result) => {
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.kill_switch_loading = false;
-                    s.kill_switch_password = Zeroizing::new(String::new());
-                }
-                match result {
-                    Ok(()) => {
-                        {
-                            let mut guard = lock_keep(&self.keep);
-                            if let Some(keep) = guard.as_mut() {
-                                if let Err(e) = keep.set_kill_switch(false) {
-                                    if let Screen::Settings(s) = &mut self.screen {
-                                        s.kill_switch_error = Some(friendly_err(e));
-                                    }
-                                    return Task::none();
-                                }
-                            }
-                        }
-                        self.kill_switch.store(false, Ordering::Release);
-                        self.settings.kill_switch_active = false;
-                        save_settings(&self.keep_path, &self.settings);
-                        self.log_kill_switch_event(false);
-                        if let Screen::Settings(s) = &mut self.screen {
-                            s.kill_switch_active = false;
-                            s.kill_switch_error = None;
-                        }
-                        self.set_toast(
-                            "Kill switch deactivated - signing re-enabled".into(),
-                            ToastKind::Success,
-                        );
-                    }
-                    Err(e) => {
-                        if let Screen::Settings(s) = &mut self.screen {
-                            s.kill_switch_error = Some(e);
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
         Task::none()
     }
@@ -3492,7 +3060,7 @@ impl App {
     #[cfg(test)]
     fn test_new(settings: Settings, has_tray: bool) -> Self {
         let keep_path = PathBuf::from("/tmp/keep-test-nonexistent");
-        let screen = Screen::Unlock(crate::screen::unlock::UnlockScreen::new(false));
+        let screen = Screen::Unlock(crate::screen::unlock::State::new(false));
         let kill_switch = Arc::new(AtomicBool::new(settings.kill_switch_active));
         Self {
             keep: Arc::new(Mutex::new(None)),
@@ -3635,14 +3203,33 @@ mod tests {
         assert!(app.window_visible);
     }
 
+    fn set_settings_screen(app: &mut App) {
+        use crate::screen::settings::SettingsScreen;
+        app.screen = Screen::Settings(SettingsScreen::new(
+            app.settings.auto_lock_secs,
+            app.settings.clipboard_clear_secs,
+            app.keep_path.display().to_string(),
+            app.proxy_enabled,
+            app.proxy_port,
+            app.settings.kill_switch_active,
+            app.settings.minimize_to_tray,
+            app.settings.start_minimized,
+            false,
+            Vec::new(),
+        ));
+    }
+
     #[test]
     fn disable_minimize_to_tray_while_hidden_reappears_window() {
-        let mut settings = default_settings();
-        settings.minimize_to_tray = true;
-        let mut app = App::test_new(settings, true);
+        use crate::screen::settings;
+        let mut s = default_settings();
+        s.minimize_to_tray = true;
+        let mut app = App::test_new(s, true);
         app.window_visible = false;
+        set_settings_screen(&mut app);
 
-        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(false));
+        let _task =
+            app.handle_settings_message_new(settings::Message::MinimizeToTrayToggled(false));
 
         assert!(app.window_visible);
         assert!(!app.settings.minimize_to_tray);
@@ -3650,12 +3237,15 @@ mod tests {
 
     #[test]
     fn disable_minimize_to_tray_while_visible_no_change() {
-        let mut settings = default_settings();
-        settings.minimize_to_tray = true;
-        let mut app = App::test_new(settings, true);
+        use crate::screen::settings;
+        let mut s = default_settings();
+        s.minimize_to_tray = true;
+        let mut app = App::test_new(s, true);
         app.window_visible = true;
+        set_settings_screen(&mut app);
 
-        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(false));
+        let _task =
+            app.handle_settings_message_new(settings::Message::MinimizeToTrayToggled(false));
 
         assert!(app.window_visible);
         assert!(!app.settings.minimize_to_tray);
@@ -3663,12 +3253,14 @@ mod tests {
 
     #[test]
     fn enable_minimize_to_tray_setting() {
-        let mut settings = default_settings();
-        settings.minimize_to_tray = false;
-        let mut app = App::test_new(settings, true);
+        use crate::screen::settings;
+        let mut s = default_settings();
+        s.minimize_to_tray = false;
+        let mut app = App::test_new(s, true);
         app.window_visible = true;
+        set_settings_screen(&mut app);
 
-        let _task = app.handle_settings_message(Message::SettingsMinimizeToTrayToggled(true));
+        let _task = app.handle_settings_message_new(settings::Message::MinimizeToTrayToggled(true));
 
         assert!(app.settings.minimize_to_tray);
         assert!(app.window_visible);
@@ -3676,22 +3268,27 @@ mod tests {
 
     #[test]
     fn enable_start_minimized_setting() {
-        let mut settings = default_settings();
-        settings.start_minimized = false;
-        let mut app = App::test_new(settings, true);
+        use crate::screen::settings;
+        let mut s = default_settings();
+        s.start_minimized = false;
+        let mut app = App::test_new(s, true);
+        set_settings_screen(&mut app);
 
-        let _task = app.handle_settings_message(Message::SettingsStartMinimizedToggled(true));
+        let _task = app.handle_settings_message_new(settings::Message::StartMinimizedToggled(true));
 
         assert!(app.settings.start_minimized);
     }
 
     #[test]
     fn disable_start_minimized_setting() {
-        let mut settings = default_settings();
-        settings.start_minimized = true;
-        let mut app = App::test_new(settings, true);
+        use crate::screen::settings;
+        let mut s = default_settings();
+        s.start_minimized = true;
+        let mut app = App::test_new(s, true);
+        set_settings_screen(&mut app);
 
-        let _task = app.handle_settings_message(Message::SettingsStartMinimizedToggled(false));
+        let _task =
+            app.handle_settings_message_new(settings::Message::StartMinimizedToggled(false));
 
         assert!(!app.settings.start_minimized);
     }

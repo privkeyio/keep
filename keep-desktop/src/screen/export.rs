@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, qr_code, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
 use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
-use crate::message::Message;
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
@@ -32,6 +33,41 @@ fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
     }
 }
 
+#[derive(Clone)]
+pub enum Message {
+    PassphraseChanged(Zeroizing<String>),
+    ConfirmPassphraseChanged(Zeroizing<String>),
+    GoBack,
+    Generate,
+    AdvanceFrame,
+    CopyToClipboard(Zeroizing<String>),
+    Reset,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PassphraseChanged(_) => f.write_str("PassphraseChanged(***)"),
+            Self::ConfirmPassphraseChanged(_) => f.write_str("ConfirmPassphraseChanged(***)"),
+            Self::GoBack => f.write_str("GoBack"),
+            Self::Generate => f.write_str("Generate"),
+            Self::AdvanceFrame => f.write_str("AdvanceFrame"),
+            Self::CopyToClipboard(_) => f.write_str("CopyToClipboard(***)"),
+            Self::Reset => f.write_str("Reset"),
+        }
+    }
+}
+
+pub enum Event {
+    GoBack,
+    Generate {
+        share: ShareEntry,
+        passphrase: Zeroizing<String>,
+    },
+    CopyToClipboard(Zeroizing<String>),
+    Reset,
+}
+
 pub enum QrDisplay {
     Single(qr_code::Data),
     Animated {
@@ -40,18 +76,18 @@ pub enum QrDisplay {
     },
 }
 
-pub struct ExportScreen {
-    pub share: ShareEntry,
-    pub passphrase: Zeroizing<String>,
-    pub confirm_passphrase: Zeroizing<String>,
-    pub bech32: Option<Zeroizing<String>>,
-    pub qr_display: Option<QrDisplay>,
-    pub error: Option<String>,
-    pub loading: bool,
+pub struct State {
+    share: ShareEntry,
+    passphrase: Zeroizing<String>,
+    confirm_passphrase: Zeroizing<String>,
+    bech32: Option<Zeroizing<String>>,
+    qr_display: Option<QrDisplay>,
+    error: Option<String>,
+    loading: bool,
     pub copied: bool,
 }
 
-impl ExportScreen {
+impl State {
     pub fn new(share: ShareEntry) -> Self {
         Self {
             share,
@@ -62,6 +98,42 @@ impl ExportScreen {
             error: None,
             loading: false,
             copied: false,
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::PassphraseChanged(p) => {
+                self.passphrase = p;
+                self.confirm_passphrase = Zeroizing::new(String::new());
+                None
+            }
+            Message::ConfirmPassphraseChanged(p) => {
+                self.confirm_passphrase = p;
+                None
+            }
+            Message::GoBack => Some(Event::GoBack),
+            Message::Generate => {
+                if self.loading || self.passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_LEN {
+                    return None;
+                }
+                if *self.passphrase != *self.confirm_passphrase {
+                    self.error = Some("Passphrases do not match".into());
+                    return None;
+                }
+                self.loading = true;
+                self.error = None;
+                Some(Event::Generate {
+                    share: self.share.clone(),
+                    passphrase: self.passphrase.clone(),
+                })
+            }
+            Message::AdvanceFrame => {
+                self.advance_frame();
+                None
+            }
+            Message::CopyToClipboard(t) => Some(Event::CopyToClipboard(t)),
+            Message::Reset => Some(Event::Reset),
         }
     }
 
@@ -106,7 +178,12 @@ impl ExportScreen {
         }
     }
 
-    pub fn advance_frame(&mut self) {
+    pub fn export_failed(&mut self, error: String) {
+        self.loading = false;
+        self.error = Some(error);
+    }
+
+    fn advance_frame(&mut self) {
         if let Some(QrDisplay::Animated { frames, current }) = &mut self.qr_display {
             *current = (*current + 1) % frames.len();
         }
@@ -116,7 +193,7 @@ impl ExportScreen {
         matches!(self.qr_display, Some(QrDisplay::Animated { .. }))
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let back_btn = button(text("< Back").size(theme::size::BODY))
             .on_press(Message::GoBack)
             .style(theme::text_button)
@@ -193,7 +270,7 @@ impl ExportScreen {
                         .style(theme::primary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                     button(text("Change Passphrase").size(theme::size::BODY))
-                        .on_press(Message::ResetExport)
+                        .on_press(Message::Reset)
                         .style(theme::secondary_button)
                         .padding([theme::space::XS, theme::space::MD]),
                 ]
@@ -230,7 +307,7 @@ impl ExportScreen {
             let can_generate = passphrase_ok && passphrases_match;
 
             let passphrase_input = text_input("Encryption passphrase", &self.passphrase)
-                .on_input(|s| Message::ExportPassphraseChanged(Zeroizing::new(s)))
+                .on_input(|s| Message::PassphraseChanged(Zeroizing::new(s)))
                 .secure(true)
                 .padding(theme::space::MD)
                 .width(theme::size::INPUT_WIDTH);
@@ -258,8 +335,8 @@ impl ExportScreen {
 
             if passphrase_ok {
                 let confirm_input = text_input("Confirm passphrase", &self.confirm_passphrase)
-                    .on_input(|s| Message::ExportConfirmPassphraseChanged(Zeroizing::new(s)))
-                    .on_submit_maybe(can_generate.then_some(Message::GenerateExport))
+                    .on_input(|s| Message::ConfirmPassphraseChanged(Zeroizing::new(s)))
+                    .on_submit_maybe(can_generate.then_some(Message::Generate))
                     .secure(true)
                     .padding(theme::space::MD)
                     .width(theme::size::INPUT_WIDTH);
@@ -281,7 +358,7 @@ impl ExportScreen {
                     .style(theme::primary_button)
                     .padding(theme::space::MD);
                 if can_generate {
-                    btn = btn.on_press(Message::GenerateExport);
+                    btn = btn.on_press(Message::Generate);
                 }
                 content = content.push(btn);
             }

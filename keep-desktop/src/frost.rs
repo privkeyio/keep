@@ -21,7 +21,7 @@ use crate::app::{
     RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
 };
 use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
-use crate::screen::relay::RelayScreen;
+use crate::screen::relay;
 use crate::screen::shares::ShareEntry;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState, WalletEntry};
 use crate::screen::Screen;
@@ -650,7 +650,7 @@ impl App {
         iced::Task::batch(tasks)
     }
 
-    pub(crate) fn relay_screen_mut(&mut self) -> Option<&mut RelayScreen> {
+    pub(crate) fn relay_screen_mut(&mut self) -> Option<&mut relay::State> {
         if let Screen::Relay(s) = &mut self.screen {
             Some(s)
         } else {
@@ -660,16 +660,6 @@ impl App {
 
     pub(crate) fn get_frost_node(&self) -> Option<Arc<KfpNode>> {
         self.frost_node.lock().ok()?.clone()
-    }
-
-    pub(crate) fn announce_state_mut(
-        &mut self,
-    ) -> Option<&mut crate::screen::wallet::AnnounceState> {
-        if let Screen::Wallet(ws) = &mut self.screen {
-            ws.announce.as_mut()
-        } else {
-            None
-        }
     }
 
     pub(crate) fn update_wallet_setup(

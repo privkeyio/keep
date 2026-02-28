@@ -6,7 +6,6 @@ use std::fmt;
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, Space};
 use iced::{Alignment, Element, Length};
 
-use crate::message::Message;
 use crate::theme;
 
 const PAGE_SIZE: usize = 50;
@@ -42,6 +41,17 @@ pub enum ChainStatus {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+pub enum Message {
+    FilterChanged(Option<String>),
+    LoadMore,
+}
+
+pub enum Event {
+    FilterChanged(Option<String>),
+    LoadMore,
+}
+
 pub struct SigningAuditScreen {
     pub entries: Vec<AuditDisplayEntry>,
     pub chain_status: ChainStatus,
@@ -67,11 +77,18 @@ impl SigningAuditScreen {
         }
     }
 
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::FilterChanged(caller) => Some(Event::FilterChanged(caller)),
+            Message::LoadMore => Some(Event::LoadMore),
+        }
+    }
+
     pub fn page_size() -> usize {
         PAGE_SIZE
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let title = theme::heading("Signing History");
         let subtitle = theme::muted("View past signing requests and decisions");
 
@@ -118,7 +135,7 @@ impl SigningAuditScreen {
                         .width(Length::Fill)
                         .align_x(Alignment::Center),
                 )
-                .on_press_maybe((!self.loading).then_some(Message::AuditLoadMore))
+                .on_press_maybe((!self.loading).then_some(Message::LoadMore))
                 .style(theme::secondary_button)
                 .padding([theme::space::SM, theme::space::LG])
                 .width(Length::Fill);
@@ -176,7 +193,7 @@ impl SigningAuditScreen {
         };
 
         let picker = pick_list(options, selected, |opt: CallerOption| {
-            Message::AuditFilterChanged(opt.full)
+            Message::FilterChanged(opt.full)
         })
         .text_size(theme::size::SMALL)
         .width(Length::Fixed(250.0));

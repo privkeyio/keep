@@ -6,7 +6,6 @@ use std::collections::VecDeque;
 use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
-use crate::message::Message;
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -81,23 +80,55 @@ pub enum DurationChoice {
     Forever,
 }
 
-pub struct BunkerScreen {
+#[derive(Clone, Debug)]
+pub enum Message {
+    RelayInputChanged(String),
+    AddRelay,
+    RemoveRelay(usize),
+    Start,
+    Stop,
+    Approve,
+    Reject,
+    RevokeClient(usize),
+    ConfirmRevokeAll,
+    CancelRevokeAll,
+    RevokeAll,
+    CopyUrl,
+    ToggleClient(usize),
+    TogglePermission(usize, u32),
+    SetApprovalDuration(usize),
+}
+
+pub enum Event {
+    AddRelay(String),
+    RemoveRelay(usize),
+    Start,
+    Stop,
+    Approve { duration_index: usize },
+    Reject,
+    RevokeClient(usize),
+    RevokeAll,
+    CopyUrl,
+    TogglePermission(usize, u32),
+}
+
+pub struct State {
     pub running: bool,
     pub url: Option<String>,
     pub qr_data: Option<qr_code::Data>,
     pub relays: Vec<String>,
-    pub relay_input: String,
+    relay_input: String,
     pub clients: Vec<ConnectedClient>,
     pub log: VecDeque<LogDisplayEntry>,
     pub pending_approval: Option<PendingApprovalDisplay>,
-    pub revoke_all_confirm: bool,
+    revoke_all_confirm: bool,
     pub starting: bool,
     pub error: Option<String>,
-    pub expanded_client: Option<usize>,
-    pub approval_duration: usize,
+    expanded_client: Option<usize>,
+    approval_duration: usize,
 }
 
-impl BunkerScreen {
+impl State {
     pub fn new(relays: Vec<String>) -> Self {
         Self {
             running: false,
@@ -142,7 +173,70 @@ impl BunkerScreen {
         }
     }
 
-    pub fn view_content(&self) -> Element<'_, Message> {
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::RelayInputChanged(input) => {
+                self.relay_input = input;
+                None
+            }
+            Message::AddRelay => {
+                let url = self.relay_input.trim().to_string();
+                Some(Event::AddRelay(url))
+            }
+            Message::RemoveRelay(i) => Some(Event::RemoveRelay(i)),
+            Message::Start => Some(Event::Start),
+            Message::Stop => Some(Event::Stop),
+            Message::Approve => Some(Event::Approve {
+                duration_index: self.approval_duration,
+            }),
+            Message::Reject => Some(Event::Reject),
+            Message::RevokeClient(i) => Some(Event::RevokeClient(i)),
+            Message::ConfirmRevokeAll => {
+                self.revoke_all_confirm = true;
+                None
+            }
+            Message::CancelRevokeAll => {
+                self.revoke_all_confirm = false;
+                None
+            }
+            Message::RevokeAll => {
+                if self.revoke_all_confirm {
+                    self.revoke_all_confirm = false;
+                    Some(Event::RevokeAll)
+                } else {
+                    None
+                }
+            }
+            Message::CopyUrl => Some(Event::CopyUrl),
+            Message::ToggleClient(i) => {
+                self.expanded_client = if self.expanded_client == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+                None
+            }
+            Message::TogglePermission(client_idx, flag) => {
+                Some(Event::TogglePermission(client_idx, flag))
+            }
+            Message::SetApprovalDuration(i) => {
+                self.approval_duration = i;
+                None
+            }
+        }
+    }
+
+    pub fn relay_added(&mut self, normalized: String) {
+        self.relays.push(normalized);
+        self.relay_input.clear();
+    }
+
+    pub fn approval_cleared(&mut self) {
+        self.pending_approval = None;
+        self.approval_duration = 0;
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
         let title = theme::heading("Nostr Connect");
 
         let mut content = column![title].spacing(theme::space::MD);
@@ -209,7 +303,7 @@ impl BunkerScreen {
                     .width(Length::Shrink)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::BunkerStop)
+            .on_press(Message::Stop)
             .style(theme::danger_button)
             .padding([theme::space::XS, theme::space::LG])
         } else {
@@ -221,7 +315,7 @@ impl BunkerScreen {
             .style(theme::primary_button)
             .padding([theme::space::XS, theme::space::LG]);
             if !self.starting && !self.relays.is_empty() {
-                btn = btn.on_press(Message::BunkerStart);
+                btn = btn.on_press(Message::Start);
             }
             btn
         };
@@ -264,7 +358,7 @@ impl BunkerScreen {
             .color(theme::color::TEXT_MUTED);
 
         let copy_btn = button(text("Copy URL").size(theme::size::SMALL))
-            .on_press(Message::BunkerCopyUrl)
+            .on_press(Message::CopyUrl)
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::MD]);
 
@@ -295,7 +389,7 @@ impl BunkerScreen {
                 .style(theme::text_button)
                 .padding([2.0, theme::space::SM]);
             if !self.running {
-                remove_btn = remove_btn.on_press(Message::BunkerRemoveRelay(i));
+                remove_btn = remove_btn.on_press(Message::RemoveRelay(i));
             }
 
             relay_list = relay_list.push(
@@ -327,15 +421,15 @@ impl BunkerScreen {
                 .style(theme::primary_button)
                 .padding([theme::space::XS, theme::space::MD]);
             if can_add {
-                add_btn = add_btn.on_press(Message::BunkerAddRelay);
+                add_btn = add_btn.on_press(Message::AddRelay);
             }
 
             let mut input = text_input("wss://relay.example.com", &self.relay_input)
-                .on_input(Message::BunkerRelayInputChanged)
+                .on_input(Message::RelayInputChanged)
                 .size(theme::size::SMALL)
                 .width(Length::Fill);
             if can_add {
-                input = input.on_submit(Message::BunkerAddRelay);
+                input = input.on_submit(Message::AddRelay);
             }
 
             card = card.push(
@@ -388,12 +482,12 @@ impl BunkerScreen {
                     ]
                     .spacing(2.0),
                 )
-                .on_press(Message::BunkerToggleClient(i))
+                .on_press(Message::ToggleClient(i))
                 .style(theme::text_button)
                 .padding([theme::space::XS, 0.0])
                 .width(Length::Fill),
                 button(text("Revoke").size(theme::size::TINY))
-                    .on_press(Message::BunkerRevokeClient(i))
+                    .on_press(Message::RevokeClient(i))
                     .style(theme::danger_button)
                     .padding([2.0, theme::space::SM]),
             ]
@@ -441,7 +535,7 @@ impl BunkerScreen {
                                 text(if enabled { "Deny" } else { "Allow" })
                                     .size(theme::size::TINY),
                             )
-                            .on_press(Message::BunkerTogglePermission(i, flag))
+                            .on_press(Message::TogglePermission(i, flag))
                             .style(if enabled {
                                 theme::secondary_button
                             } else {
@@ -483,11 +577,11 @@ impl BunkerScreen {
                     .color(theme::color::ERROR),
                 Space::new().width(Length::Fill),
                 button(text("Yes").size(theme::size::BODY))
-                    .on_press(Message::BunkerRevokeAll)
+                    .on_press(Message::RevokeAll)
                     .style(theme::danger_button)
                     .padding([theme::space::XS, theme::space::MD]),
                 button(text("No").size(theme::size::BODY))
-                    .on_press(Message::BunkerCancelRevokeAll)
+                    .on_press(Message::CancelRevokeAll)
                     .style(theme::secondary_button)
                     .padding([theme::space::XS, theme::space::MD]),
             ]
@@ -497,7 +591,7 @@ impl BunkerScreen {
             row![
                 Space::new().width(Length::Fill),
                 button(text("Revoke All").size(theme::size::SMALL))
-                    .on_press(Message::BunkerConfirmRevokeAll)
+                    .on_press(Message::ConfirmRevokeAll)
                     .style(theme::danger_button)
                     .padding([theme::space::XS, theme::space::MD]),
             ]
@@ -576,7 +670,7 @@ impl BunkerScreen {
             };
             duration_row = duration_row.push(
                 button(text(*label).size(theme::size::TINY))
-                    .on_press(Message::BunkerSetApprovalDuration(idx))
+                    .on_press(Message::SetApprovalDuration(idx))
                     .style(style)
                     .padding([2.0, theme::space::SM]),
             );
@@ -589,7 +683,7 @@ impl BunkerScreen {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::BunkerApprove)
+            .on_press(Message::Approve)
             .style(theme::primary_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),
@@ -598,7 +692,7 @@ impl BunkerScreen {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::BunkerReject)
+            .on_press(Message::Reject)
             .style(theme::danger_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),
