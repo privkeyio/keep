@@ -1207,18 +1207,23 @@ fn derive_audit_hmac_key(keys: &Keys, group_pubkey: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
 
     #[tokio::test]
     async fn test_node_creation() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await.to_string();
+
         let config = ThresholdConfig::two_of_three();
         let dealer = TrustedDealer::new(config);
         let (mut shares, _) = dealer.generate("test").unwrap();
 
         let share = shares.remove(0);
-        let result = KfpNode::new(share, vec!["wss://relay.damus.io".into()]).await;
+        let result = KfpNode::new(share, vec![relay_url]).await;
         assert!(result.is_ok());
 
         let node = result.unwrap();
