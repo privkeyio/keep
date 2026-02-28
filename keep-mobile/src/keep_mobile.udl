@@ -28,6 +28,7 @@ interface KeepMobileError {
     InitializationFailed(string msg);
     NotSupported(string msg);
     Serialization(string msg);
+    InvalidInput(string msg);
     PubkeyMismatch();
     RateLimited();
     InvalidTimestamp();
@@ -173,6 +174,17 @@ dictionary AnnouncedXpubInfo {
     string? label;
 };
 
+dictionary RelayConfigInfo {
+    sequence<string> frost_relays;
+    sequence<string> profile_relays;
+    sequence<string> bunker_relays;
+};
+
+dictionary ProxyConfigInfo {
+    boolean enabled;
+    u16 port;
+};
+
 [Trait, WithForeign]
 interface DescriptorCallbacks {
     [Throws=KeepMobileError]
@@ -290,6 +302,21 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void wallet_announce_xpubs(sequence<AnnouncedXpubInfo> xpubs);
+
+    [Throws=KeepMobileError]
+    RelayConfigInfo get_relay_config(string? group_pubkey);
+
+    [Throws=KeepMobileError]
+    void save_relay_config(string? group_pubkey, RelayConfigInfo config);
+
+    [Throws=KeepMobileError]
+    void delete_relay_config(string? group_pubkey);
+
+    [Throws=KeepMobileError]
+    ProxyConfigInfo get_proxy_config();
+
+    [Throws=KeepMobileError]
+    void save_proxy_config(ProxyConfigInfo config);
 };
 
 dictionary ParsedBunkerUrl {

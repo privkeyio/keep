@@ -16,6 +16,29 @@ use crate::{
     HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
 };
 
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct StoredRelayConfig {
+    pub(crate) frost_relays: Vec<String>,
+    pub(crate) profile_relays: Vec<String>,
+    #[serde(default)]
+    pub(crate) bunker_relays: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct StoredProxyConfig {
+    pub(crate) enabled: bool,
+    pub(crate) port: u16,
+}
+
+impl Default for StoredProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 9050,
+        }
+    }
+}
+
 pub(crate) fn load_policy(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<PolicyBundle, KeepMobileError> {
@@ -428,4 +451,66 @@ pub(crate) fn load_health_statuses(storage: &Arc<dyn SecureStorage>) -> Vec<KeyH
         let _ = persist_health_index(storage, &live_keys);
     }
     results
+}
+
+pub(crate) fn load_relay_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<Option<StoredRelayConfig>, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let config: StoredRelayConfig =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize relay config: {e}"),
+                })?;
+            Ok(Some(config))
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load relay config for key {key}: {e}");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn persist_relay_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    config: &StoredRelayConfig,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(config).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize relay config: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("relay_config"))
+}
+
+pub(crate) fn load_proxy_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<Option<StoredProxyConfig>, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let config: StoredProxyConfig =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize proxy config: {e}"),
+                })?;
+            Ok(Some(config))
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load proxy config: {e}");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn persist_proxy_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    config: &StoredProxyConfig,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(config).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize proxy config: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("proxy_config"))
 }

@@ -53,6 +53,9 @@ pub enum KeepMobileError {
     #[error("Serialization error")]
     Serialization { msg: String },
 
+    #[error("Invalid input: {msg}")]
+    InvalidInput { msg: String },
+
     #[error("Pubkey mismatch")]
     PubkeyMismatch,
 
@@ -73,9 +76,6 @@ pub enum KeepMobileError {
 
     #[error("Policy signature verification failed")]
     PolicySignatureInvalid,
-
-    #[error("Invalid input: {msg}")]
-    InvalidInput { msg: String },
 
     #[error("Certificate pin mismatch")]
     CertificatePinMismatch {

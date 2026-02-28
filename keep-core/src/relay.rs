@@ -5,6 +5,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+/// Sentinel key for global (non-group-specific) relay configuration.
+pub const GLOBAL_RELAY_KEY: [u8; 32] = [0u8; 32];
+
 /// Maximum number of relays per category per share.
 pub const MAX_RELAYS: usize = 10;
 
@@ -23,6 +26,9 @@ pub struct RelayConfig {
     pub frost_relays: Vec<String>,
     /// Profile / NIP-46 relay URLs.
     pub profile_relays: Vec<String>,
+    /// NIP-46 bunker relay URLs.
+    #[serde(default)]
+    pub bunker_relays: Vec<String>,
 }
 
 impl RelayConfig {
@@ -32,7 +38,13 @@ impl RelayConfig {
             group_pubkey,
             frost_relays: Vec::new(),
             profile_relays: Vec::new(),
+            bunker_relays: Vec::new(),
         }
+    }
+
+    /// Create a global relay config using the sentinel key with default FROST relays.
+    pub fn new_global() -> Self {
+        Self::with_defaults(GLOBAL_RELAY_KEY)
     }
 
     /// Create a relay config with default FROST relays.
@@ -41,6 +53,7 @@ impl RelayConfig {
             group_pubkey,
             frost_relays: default_frost_relays(),
             profile_relays: Vec::new(),
+            bunker_relays: Vec::new(),
         }
     }
 }

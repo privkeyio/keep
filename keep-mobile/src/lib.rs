@@ -94,12 +94,28 @@ const DESCRIPTOR_INDEX_KEY: &str = "__keep_descriptor_index_v1";
 const DESCRIPTOR_KEY_PREFIX: &str = "__keep_descriptor_";
 const HEALTH_STATUS_INDEX_KEY: &str = "__keep_health_index_v1";
 const HEALTH_STATUS_KEY_PREFIX: &str = "__keep_health_";
+const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
+const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
+const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
 pub struct CertificatePin {
     pub hostname: String,
     pub spki_hash: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct RelayConfigInfo {
+    pub frost_relays: Vec<String>,
+    pub profile_relays: Vec<String>,
+    pub bunker_relays: Vec<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct ProxyConfigInfo {
+    pub enabled: bool,
+    pub port: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -985,6 +1001,109 @@ impl KeepMobile {
             }))
         })
     }
+
+    pub fn get_relay_config(
+        &self,
+        group_pubkey: Option<String>,
+    ) -> Result<RelayConfigInfo, KeepMobileError> {
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
+        }
+        let key = relay_config_key(group_pubkey.as_deref());
+        let stored = persistence::load_relay_config(&self.storage, &key)?;
+        let config = stored.unwrap_or_default();
+        Ok(RelayConfigInfo {
+            frost_relays: config.frost_relays,
+            profile_relays: config.profile_relays,
+            bunker_relays: config.bunker_relays,
+        })
+    }
+
+    pub fn save_relay_config(
+        &self,
+        group_pubkey: Option<String>,
+        config: RelayConfigInfo,
+    ) -> Result<(), KeepMobileError> {
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
+        }
+        let normalize_relays =
+            |urls: Vec<String>, label: &str| -> Result<Vec<String>, KeepMobileError> {
+                if urls.len() > keep_core::relay::MAX_RELAYS {
+                    return Err(KeepMobileError::InvalidRelayUrl {
+                        msg: format!(
+                            "Too many {label} relays (max {})",
+                            keep_core::relay::MAX_RELAYS
+                        ),
+                    });
+                }
+                let normalized = dedup_stable(
+                    urls.iter()
+                        .map(|u| keep_core::relay::normalize_relay_url(u)),
+                );
+                for url in &normalized {
+                    network::validate_relay_url(url)?;
+                }
+                Ok(normalized)
+            };
+        let key = relay_config_key(group_pubkey.as_deref());
+        let stored = persistence::StoredRelayConfig {
+            frost_relays: normalize_relays(config.frost_relays, "FROST")?,
+            profile_relays: normalize_relays(config.profile_relays, "profile")?,
+            bunker_relays: normalize_relays(config.bunker_relays, "bunker")?,
+        };
+        persistence::persist_relay_config(&self.storage, &key, &stored)
+    }
+
+    pub fn delete_relay_config(&self, group_pubkey: Option<String>) -> Result<(), KeepMobileError> {
+        if let Some(ref pk) = group_pubkey {
+            validate_hex_pubkey(pk)?;
+        }
+        let key = relay_config_key(group_pubkey.as_deref());
+        self.storage
+            .delete_share_by_key(key)
+            .map_err(|e| KeepMobileError::StorageError {
+                msg: format!("failed to delete relay config: {e}"),
+            })?;
+        Ok(())
+    }
+
+    pub fn get_proxy_config(&self) -> Result<ProxyConfigInfo, KeepMobileError> {
+        let stored = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?;
+        let config = stored.unwrap_or_default();
+        Ok(ProxyConfigInfo {
+            enabled: config.enabled,
+            port: config.port,
+        })
+    }
+
+    pub fn save_proxy_config(&self, config: ProxyConfigInfo) -> Result<(), KeepMobileError> {
+        if config.port == 0 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "proxy port must be non-zero".into(),
+            });
+        }
+        let stored = persistence::StoredProxyConfig {
+            enabled: config.enabled,
+            port: config.port,
+        };
+        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)
+    }
+}
+
+fn relay_config_key(group_pubkey: Option<&str>) -> String {
+    match group_pubkey {
+        Some(pk) => {
+            let canonical = pk.to_ascii_lowercase();
+            format!("{RELAY_CONFIG_KEY_PREFIX}{canonical}")
+        }
+        None => RELAY_CONFIG_GLOBAL_KEY.into(),
+    }
+}
+
+fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.filter(|s| seen.insert(s.clone())).collect()
 }
 
 fn clear_descriptor_state(

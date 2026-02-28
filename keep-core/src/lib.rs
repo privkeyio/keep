@@ -77,7 +77,8 @@ use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
-pub use crate::relay::RelayConfig;
+pub use crate::relay::{RelayConfig, GLOBAL_RELAY_KEY};
+pub use crate::storage::ProxyConfig;
 use crate::storage::Storage;
 pub use crate::wallet::WalletDescriptor;
 
@@ -726,6 +727,7 @@ impl Keep {
             group_pubkey: config.group_pubkey,
             frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
             profile_relays: normalize_relays(&config.profile_relays, "profile")?,
+            bunker_relays: normalize_relays(&config.bunker_relays, "bunker")?,
         };
         self.storage.store_relay_config(&normalized_config)
     }
@@ -779,6 +781,22 @@ impl Keep {
             return Err(KeepError::Locked);
         }
         self.storage.set_kill_switch(active)
+    }
+
+    /// Get the proxy configuration.
+    pub fn get_proxy_config(&self) -> Result<ProxyConfig> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.get_proxy_config()
+    }
+
+    /// Set the proxy configuration.
+    pub fn set_proxy_config(&self, config: &ProxyConfig) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.set_proxy_config(config)
     }
 
     /// Get a FROST share by group public key.

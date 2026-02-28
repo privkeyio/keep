@@ -20,6 +20,25 @@ use crate::relay::RelayConfig;
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
+use serde::{Deserialize, Serialize};
+
+/// SOCKS5 proxy configuration stored in the vault.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Whether the proxy is enabled.
+    pub enabled: bool,
+    /// The proxy port (host is always 127.0.0.1).
+    pub port: u16,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 9050,
+        }
+    }
+}
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 const MIN_PASSWORD_LEN: usize = 8;
@@ -719,6 +738,41 @@ impl Storage {
         Ok(())
     }
 
+    /// Get the proxy configuration from the vault.
+    pub fn get_proxy_config(&self) -> Result<ProxyConfig> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let Some(encrypted_bytes) = backend.get(CONFIG_TABLE, b"proxy_config")? else {
+            return Ok(ProxyConfig::default());
+        };
+
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        serde_json::from_slice(&decrypted_bytes)
+            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))
+    }
+
+    /// Set the proxy configuration in the vault.
+    pub fn set_proxy_config(&self, config: &ProxyConfig) -> Result<()> {
+        if config.port == 0 {
+            return Err(KeepError::InvalidInput(
+                "proxy port must be non-zero".into(),
+            ));
+        }
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let serialized = serde_json::to_vec(config)
+            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        let encrypted_bytes = encrypted.to_bytes();
+
+        backend.put(CONFIG_TABLE, b"proxy_config", &encrypted_bytes)?;
+        Ok(())
+    }
+
     /// Store a key health status record.
     pub fn store_health_status(&self, status: &KeyHealthStatus) -> Result<()> {
         debug!(
@@ -995,5 +1049,73 @@ mod tests {
         let mut bad_parallelism_low = valid_bytes;
         bad_parallelism_low[124..128].copy_from_slice(&0u32.to_le_bytes());
         assert!(Header::from_bytes(&bad_parallelism_low).is_err());
+    }
+
+    #[test]
+    fn proxy_config_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let storage = Storage::create(&path, "testpassword", Default::default()).unwrap();
+
+        let config = ProxyConfig {
+            enabled: true,
+            port: 9051,
+        };
+        storage.set_proxy_config(&config).unwrap();
+        let loaded = storage.get_proxy_config().unwrap();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.port, 9051);
+    }
+
+    #[test]
+    fn proxy_config_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let storage = Storage::create(&path, "testpassword", Default::default()).unwrap();
+
+        let loaded = storage.get_proxy_config().unwrap();
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.port, 9050);
+    }
+
+    #[test]
+    fn relay_config_bunker_relays_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let storage = Storage::create(&path, "testpassword", Default::default()).unwrap();
+
+        let key = [1u8; 32];
+        let mut config = RelayConfig::new(key);
+        config.bunker_relays = vec!["wss://relay.nsec.app/".into()];
+        storage.store_relay_config(&config).unwrap();
+
+        let loaded = storage.get_relay_config(&key).unwrap().unwrap();
+        assert_eq!(loaded.bunker_relays, vec!["wss://relay.nsec.app/"]);
+    }
+
+    #[test]
+    fn relay_config_bunker_relays_backward_compat() {
+        let json = r#"{"group_pubkey":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"frost_relays":[],"profile_relays":[]}"#;
+        let config: RelayConfig = serde_json::from_str(json).unwrap();
+        assert!(config.bunker_relays.is_empty());
+    }
+
+    #[test]
+    fn global_relay_key_sentinel() {
+        use crate::relay::GLOBAL_RELAY_KEY;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let storage = Storage::create(&path, "testpassword", Default::default()).unwrap();
+
+        let global = RelayConfig::new_global();
+        storage.store_relay_config(&global).unwrap();
+
+        let loaded = storage
+            .get_relay_config(&GLOBAL_RELAY_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.frost_relays.is_empty());
+        assert_eq!(loaded.group_pubkey, GLOBAL_RELAY_KEY);
     }
 }
