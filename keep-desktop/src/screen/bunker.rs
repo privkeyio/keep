@@ -199,7 +199,14 @@ impl State {
                 self.revoke_all_confirm = false;
                 None
             }
-            Message::RevokeAll => Some(Event::RevokeAll),
+            Message::RevokeAll => {
+                if self.revoke_all_confirm {
+                    self.revoke_all_confirm = false;
+                    Some(Event::RevokeAll)
+                } else {
+                    None
+                }
+            }
             Message::CopyUrl => Some(Event::CopyUrl),
             Message::ToggleClient(i) => {
                 self.expanded_client = if self.expanded_client == Some(i) {

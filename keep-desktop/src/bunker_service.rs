@@ -136,6 +136,9 @@ impl App {
         use crate::screen::bunker::Event;
         match event {
             Event::AddRelay(url) => {
+                if s.starting || s.running {
+                    return Task::none();
+                }
                 if let Err(e) = validate_relay_url(&url) {
                     self.set_toast(format!("Invalid relay URL: {e}"), ToastKind::Error);
                     return Task::none();
@@ -156,6 +159,9 @@ impl App {
                 Task::none()
             }
             Event::RemoveRelay(i) => {
+                if s.starting || s.running {
+                    return Task::none();
+                }
                 if let Screen::Bunker(s) = &mut self.screen {
                     if i < s.relays.len() {
                         s.relays.remove(i);

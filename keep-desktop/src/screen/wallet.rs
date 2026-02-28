@@ -233,6 +233,10 @@ impl State {
                 let xpub = a.xpub.trim().to_string();
                 let fingerprint = a.fingerprint.trim().to_string();
                 let label = a.label.trim().to_string();
+                if xpub.is_empty() || fingerprint.is_empty() || label.is_empty() {
+                    a.error = Some("All fields are required".into());
+                    return None;
+                }
                 a.submitting = true;
                 a.error = None;
                 Some(Event::SubmitAnnounce {

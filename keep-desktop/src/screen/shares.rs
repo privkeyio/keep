@@ -98,6 +98,7 @@ impl State {
         self.shares = shares;
         self.active_share_hex = active_share_hex;
         self.delete_confirm = None;
+        self.expanded = None;
     }
 
     pub fn update(&mut self, message: Message) -> Option<Event> {
@@ -119,7 +120,14 @@ impl State {
                 self.delete_confirm = Some(id);
                 None
             }
-            Message::ConfirmDelete(id) => Some(Event::ConfirmDelete(id)),
+            Message::ConfirmDelete(id) => {
+                if self.delete_confirm.as_ref() == Some(&id) {
+                    self.delete_confirm = None;
+                    Some(Event::ConfirmDelete(id))
+                } else {
+                    None
+                }
+            }
             Message::CancelDelete => {
                 self.delete_confirm = None;
                 None

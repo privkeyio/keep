@@ -115,6 +115,9 @@ impl State {
                 None
             }
             Message::ConfirmStartFresh => {
+                if !self.start_fresh_confirm {
+                    return None;
+                }
                 if self.password.is_empty() {
                     self.error = Some("Enter your vault password to confirm deletion".into());
                     return None;
