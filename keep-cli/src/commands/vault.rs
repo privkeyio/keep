@@ -790,12 +790,6 @@ pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()
     let backup_passphrase =
         get_password_with_confirm("Enter backup passphrase", "Confirm backup passphrase")?;
 
-    if backup_passphrase.expose_secret().len() < 8 {
-        return Err(KeepError::InvalidInput(
-            "passphrase must be at least 8 characters".into(),
-        ));
-    }
-
     let spinner = out.spinner("Creating backup...");
     let backup_data = keep_core::backup::create_backup(&keep, backup_passphrase.expose_secret())?;
     spinner.finish();
@@ -811,6 +805,17 @@ pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()
         }
     };
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&output_path)?;
+        std::io::Write::write_all(&mut file, &backup_data)?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&output_path, &backup_data)?;
 
     let info = keep_core::backup::verify_backup(&backup_data, backup_passphrase.expose_secret())?;
@@ -837,29 +842,17 @@ pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()
 pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     debug!("restoring backup");
 
-    const MAX_BACKUP_SIZE: u64 = 64 * 1024 * 1024;
-    let meta = std::fs::metadata(file)?;
-    if meta.len() > MAX_BACKUP_SIZE {
+    let mut file_handle = std::fs::File::open(file)?;
+    let file_len = file_handle.metadata()?.len();
+    if file_len > keep_core::backup::MAX_BACKUP_SIZE as u64 {
         return Err(KeepError::InvalidInput(format!(
-            "backup file too large ({} bytes, max {})",
-            meta.len(),
-            MAX_BACKUP_SIZE
+            "backup file too large ({file_len} bytes, max {})",
+            keep_core::backup::MAX_BACKUP_SIZE
         )));
     }
-    let backup_data = std::fs::read(file)?;
+    let mut backup_data = Vec::with_capacity(file_len as usize);
+    std::io::Read::read_to_end(&mut file_handle, &mut backup_data)?;
     let backup_passphrase = get_password("Enter backup passphrase")?;
-
-    let spinner = out.spinner("Verifying backup...");
-    let info = keep_core::backup::verify_backup(&backup_data, backup_passphrase.expose_secret())?;
-    spinner.finish();
-
-    out.newline();
-    out.header("Backup contents");
-    out.field("Created", &info.created_at);
-    out.field("Keys", &info.key_count.to_string());
-    out.field("Shares", &info.share_count.to_string());
-    out.field("Descriptors", &info.descriptor_count.to_string());
-    out.newline();
 
     if target.exists() {
         return Err(KeepError::AlreadyExists(target.display().to_string()));
@@ -875,7 +868,7 @@ pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     }
 
     let spinner = out.spinner("Restoring backup...");
-    keep_core::backup::restore_backup(
+    let info = keep_core::backup::restore_backup(
         &backup_data,
         backup_passphrase.expose_secret(),
         target,
@@ -886,6 +879,9 @@ pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     out.newline();
     out.success("Backup restored successfully!");
     out.field("Path", &target.display().to_string());
+    out.field("Keys", &info.key_count.to_string());
+    out.field("Shares", &info.share_count.to_string());
+    out.field("Descriptors", &info.descriptor_count.to_string());
 
     info!(
         target = %target.display(),

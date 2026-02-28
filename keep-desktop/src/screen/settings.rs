@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::theme;
 
-const MIN_BACKUP_PASSPHRASE: usize = 15;
+const MIN_BACKUP_PASSPHRASE: usize = 8;
 
 #[derive(Clone)]
 pub enum Message {
@@ -35,6 +35,8 @@ pub enum Message {
     BackupExport,
     RestoreStart,
     RestorePassphraseChanged(Zeroizing<String>),
+    RestorePasswordChanged(Zeroizing<String>),
+    RestorePasswordConfirmChanged(Zeroizing<String>),
     RestoreCancel,
     RestoreSubmit,
 }
@@ -70,6 +72,10 @@ impl fmt::Debug for Message {
             Self::BackupExport => f.write_str("BackupExport"),
             Self::RestoreStart => f.write_str("RestoreStart"),
             Self::RestorePassphraseChanged(_) => f.write_str("RestorePassphraseChanged(***)"),
+            Self::RestorePasswordChanged(_) => f.write_str("RestorePasswordChanged(***)"),
+            Self::RestorePasswordConfirmChanged(_) => {
+                f.write_str("RestorePasswordConfirmChanged(***)")
+            }
             Self::RestoreCancel => f.write_str("RestoreCancel"),
             Self::RestoreSubmit => f.write_str("RestoreSubmit"),
         }
@@ -89,7 +95,10 @@ pub enum Event {
     CertPinClearAll,
     BackupExport(Zeroizing<String>),
     RestoreStart,
-    RestoreSubmit(Zeroizing<String>),
+    RestoreSubmit {
+        passphrase: Zeroizing<String>,
+        vault_password: Zeroizing<String>,
+    },
 }
 
 fn toggle_button(active: bool, message: Message) -> button::Button<'static, Message> {
@@ -128,6 +137,8 @@ pub struct SettingsScreen {
     backup_error: Option<String>,
     restore_active: bool,
     restore_passphrase: Zeroizing<String>,
+    restore_password: Zeroizing<String>,
+    restore_password_confirm: Zeroizing<String>,
     pub restore_loading: bool,
     restore_error: Option<String>,
     pub restore_file: Option<(String, Vec<u8>)>,
@@ -172,6 +183,8 @@ impl SettingsScreen {
             backup_error: None,
             restore_active: false,
             restore_passphrase: Zeroizing::new(String::new()),
+            restore_password: Zeroizing::new(String::new()),
+            restore_password_confirm: Zeroizing::new(String::new()),
             restore_loading: false,
             restore_error: None,
             restore_file: None,
@@ -275,9 +288,19 @@ impl SettingsScreen {
                 self.restore_passphrase = p;
                 None
             }
+            Message::RestorePasswordChanged(p) => {
+                self.restore_password = p;
+                None
+            }
+            Message::RestorePasswordConfirmChanged(p) => {
+                self.restore_password_confirm = p;
+                None
+            }
             Message::RestoreCancel => {
                 self.restore_active = false;
                 self.restore_passphrase = Zeroizing::new(String::new());
+                self.restore_password = Zeroizing::new(String::new());
+                self.restore_password_confirm = Zeroizing::new(String::new());
                 self.restore_file = None;
                 self.restore_info = None;
                 self.restore_error = None;
@@ -292,9 +315,22 @@ impl SettingsScreen {
                     self.restore_error = Some("No backup file loaded".into());
                     return None;
                 }
+                if self.restore_password.len() < MIN_BACKUP_PASSPHRASE {
+                    self.restore_error = Some(format!(
+                        "Vault password must be at least {MIN_BACKUP_PASSPHRASE} characters"
+                    ));
+                    return None;
+                }
+                if *self.restore_password != *self.restore_password_confirm {
+                    self.restore_error = Some("Vault passwords do not match".into());
+                    return None;
+                }
                 self.restore_loading = true;
                 self.restore_error = None;
-                Some(Event::RestoreSubmit(self.restore_passphrase.clone()))
+                Some(Event::RestoreSubmit {
+                    passphrase: self.restore_passphrase.clone(),
+                    vault_password: self.restore_password.clone(),
+                })
             }
         }
     }
@@ -344,6 +380,8 @@ impl SettingsScreen {
         self.restore_active = false;
         self.restore_loading = false;
         self.restore_passphrase = Zeroizing::new(String::new());
+        self.restore_password = Zeroizing::new(String::new());
+        self.restore_password_confirm = Zeroizing::new(String::new());
         self.restore_file = None;
         self.restore_info = None;
         self.restore_error = None;
@@ -356,10 +394,7 @@ impl SettingsScreen {
 
     pub fn sync_proxy_port(&mut self, port: u16) {
         self.proxy_port = port;
-        let formatted = port.to_string();
-        if self.proxy_port_input != formatted {
-            self.proxy_port_input = formatted;
-        }
+        self.proxy_port_input = port.to_string();
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -741,7 +776,7 @@ impl SettingsScreen {
 
             let can_export = !self.backup_loading
                 && self.backup_passphrase.len() >= MIN_BACKUP_PASSPHRASE
-                && !self.backup_confirm.is_empty();
+                && *self.backup_passphrase == *self.backup_confirm;
 
             let mut export_btn = button(text("Export").size(theme::size::SMALL))
                 .style(theme::primary_button)
@@ -794,8 +829,24 @@ impl SettingsScreen {
                     .size(theme::size::BODY)
                     .width(theme::size::INPUT_WIDTH);
 
-                let can_submit = !self.restore_loading && !self.restore_passphrase.is_empty();
-                let mut submit_btn = button(text("Verify & Restore").size(theme::size::SMALL))
+                let password_input = text_input("New vault password", &self.restore_password)
+                    .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
+                    .secure(true)
+                    .size(theme::size::BODY)
+                    .width(theme::size::INPUT_WIDTH);
+
+                let password_confirm_input =
+                    text_input("Confirm vault password", &self.restore_password_confirm)
+                        .on_input(|s| Message::RestorePasswordConfirmChanged(Zeroizing::new(s)))
+                        .secure(true)
+                        .size(theme::size::BODY)
+                        .width(theme::size::INPUT_WIDTH);
+
+                let can_submit = !self.restore_loading
+                    && !self.restore_passphrase.is_empty()
+                    && !self.restore_password.is_empty()
+                    && !self.restore_password_confirm.is_empty();
+                let mut submit_btn = button(text("Restore").size(theme::size::SMALL))
                     .style(theme::primary_button)
                     .padding([theme::space::SM, theme::space::MD]);
                 if can_submit {
@@ -807,11 +858,15 @@ impl SettingsScreen {
                     .style(theme::secondary_button)
                     .padding([theme::space::SM, theme::space::MD]);
 
-                col = col.push(passphrase_input).push(
-                    row![submit_btn, cancel_btn]
-                        .spacing(theme::space::SM)
-                        .align_y(iced::Alignment::Center),
-                );
+                col = col
+                    .push(passphrase_input)
+                    .push(password_input)
+                    .push(password_confirm_input)
+                    .push(
+                        row![submit_btn, cancel_btn]
+                            .spacing(theme::space::SM)
+                            .align_y(iced::Alignment::Center),
+                    );
             }
 
             if self.restore_loading {

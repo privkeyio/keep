@@ -209,6 +209,22 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
     }
 }
 
+fn write_private_bytes(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(path);
+    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    (&tmp).write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 fn to_display_entry(e: keep_core::audit::SigningAuditEntry) -> AuditDisplayEntry {
     AuditDisplayEntry {
         timestamp: e.timestamp,
@@ -2798,8 +2814,11 @@ impl App {
             Event::RestoreStart => {
                 return self.handle_restore_file_pick();
             }
-            Event::RestoreSubmit(passphrase) => {
-                return self.handle_restore_submit(passphrase);
+            Event::RestoreSubmit {
+                passphrase,
+                vault_password,
+            } => {
+                return self.handle_restore_submit(passphrase, vault_password);
             }
             Event::CertPinClearAll => {
                 let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
@@ -3016,6 +3035,10 @@ impl App {
                     return Err("Cancelled".into());
                 };
                 let path = handle.path().to_path_buf();
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "backup".into());
                 let backup_data = tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Backup failed", move |keep| {
                         keep_core::backup::create_backup(keep, &passphrase).map_err(friendly_err)
@@ -3023,13 +3046,10 @@ impl App {
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
-                tokio::fs::write(&path, &backup_data)
+                tokio::task::spawn_blocking(move || write_private_bytes(&path, &backup_data))
                     .await
+                    .map_err(|_| "Background task failed".to_string())?
                     .map_err(|e| format!("Failed to write backup: {e}"))?;
-                let filename = path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "backup".into());
                 Ok(filename)
             },
             Message::BackupResult,
@@ -3067,6 +3087,15 @@ impl App {
                     .set_title("Open Vault Backup");
                 match dialog.pick_file().await {
                     Some(handle) => {
+                        let meta = std::fs::metadata(handle.path())
+                            .map_err(|e| format!("Failed to read file: {e}"))?;
+                        if meta.len() > keep_core::backup::MAX_BACKUP_SIZE as u64 {
+                            return Err(format!(
+                                "Backup file too large ({} bytes, max {})",
+                                meta.len(),
+                                keep_core::backup::MAX_BACKUP_SIZE
+                            ));
+                        }
                         let name = handle.file_name();
                         let data = handle.read().await;
                         Ok((name, data))
@@ -3081,7 +3110,11 @@ impl App {
         )
     }
 
-    fn handle_restore_submit(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
+    fn handle_restore_submit(
+        &mut self,
+        passphrase: Zeroizing<String>,
+        vault_password: Zeroizing<String>,
+    ) -> Task<Message> {
         let file_data = if let Screen::Settings(s) = &self.screen {
             s.restore_file.as_ref().map(|(_, data)| data.clone())
         } else {
@@ -3094,20 +3127,13 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let info = keep_core::backup::verify_backup(&data, &passphrase)
-                        .map_err(friendly_err)?;
-                    let restore_dir = keep_path.with_file_name("keep-restored");
-                    if restore_dir.exists() {
-                        return Err(format!(
-                            "Restore target already exists: {}",
-                            restore_dir.display()
-                        ));
-                    }
-                    keep_core::backup::restore_backup(
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    let restore_dir = keep_path.with_file_name(format!("keep-restored-{ts}"));
+                    let info = keep_core::backup::restore_backup(
                         &data,
                         &passphrase,
                         &restore_dir,
-                        &passphrase,
+                        &vault_password,
                     )
                     .map_err(friendly_err)?;
                     Ok(format!(

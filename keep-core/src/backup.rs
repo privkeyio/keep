@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::crypto::{self, Argon2Params, EncryptedData, NONCE_SIZE, SALT_SIZE};
 use crate::entropy;
@@ -17,9 +18,24 @@ use crate::storage::ProxyConfig;
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 use crate::Keep;
 
+fn decode_hex_32(hex_str: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes =
+        hex::decode(hex_str).map_err(|e| KeepError::Other(format!("hex decode {label}: {e}")))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        KeepError::InvalidInput(format!(
+            "invalid {label} length: {} (expected 32)",
+            bytes.len()
+        ))
+    })
+}
+
 const MAGIC: &[u8; 8] = b"KEEPBACK";
 const VERSION: u16 = 1;
 const HEADER_SIZE: usize = 224;
+const MIN_PASSPHRASE_LEN: usize = 8;
+
+/// Maximum backup file size (64 MiB).
+pub const MAX_BACKUP_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct VaultBackup {
@@ -98,6 +114,11 @@ fn string_to_key_type(s: &str) -> Result<KeyType> {
 
 /// Create an encrypted backup of all vault data.
 pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
+    if passphrase.len() < MIN_PASSPHRASE_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "passphrase must be at least {MIN_PASSPHRASE_LEN} characters"
+        )));
+    }
     if !keep.is_unlocked() {
         return Err(KeepError::Locked);
     }
@@ -161,14 +182,14 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
         },
     };
 
-    let json_bytes = serde_json::to_vec(&backup)
+    let mut json_bytes = serde_json::to_vec(&backup)
         .map_err(|e| KeepError::Other(format!("backup serialization failed: {e}")))?;
 
-    let content_hash = crypto::blake2b_256(&json_bytes);
     let salt: [u8; SALT_SIZE] = entropy::random_bytes();
     let params = Argon2Params::DEFAULT;
     let key = crypto::derive_key(passphrase.as_bytes(), &salt, params)?;
     let encrypted = crypto::encrypt(&json_bytes, &key)?;
+    json_bytes.zeroize();
 
     let mut output = Vec::with_capacity(HEADER_SIZE + encrypted.to_bytes().len());
 
@@ -181,7 +202,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     output.extend_from_slice(&params.iterations.to_le_bytes()); // [48..52]
     output.extend_from_slice(&params.parallelism.to_le_bytes()); // [52..56]
     output.extend_from_slice(&encrypted.nonce); // [56..80]
-    output.extend_from_slice(&content_hash); // [80..112]
+    output.extend_from_slice(&[0u8; 32]); // [80..112] reserved
     output.extend_from_slice(&[0u8; 112]); // [112..224] padding
 
     output.extend_from_slice(&encrypted.ciphertext);
@@ -193,12 +214,17 @@ struct ParsedHeader {
     salt: [u8; SALT_SIZE],
     params: Argon2Params,
     nonce: [u8; NONCE_SIZE],
-    content_hash: [u8; 32],
 }
 
 fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     if data.len() < HEADER_SIZE {
         return Err(KeepError::InvalidInput("backup file too small".into()));
+    }
+    if data.len() > MAX_BACKUP_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "backup file too large ({} bytes, max {MAX_BACKUP_SIZE})",
+            data.len()
+        )));
     }
 
     if &data[0..8] != MAGIC {
@@ -212,12 +238,21 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
         )));
     }
 
+    let flags = u16::from_le_bytes([data[10], data[11]]);
+    if flags != 0 {
+        return Err(KeepError::InvalidInput(format!(
+            "unsupported backup flags: {flags}"
+        )));
+    }
+
     let mut salt = [0u8; SALT_SIZE];
     salt.copy_from_slice(&data[12..44]);
 
-    let memory_kib = u32::from_le_bytes([data[44], data[45], data[46], data[47]]);
-    let iterations = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
-    let parallelism = u32::from_le_bytes([data[52], data[53], data[54], data[55]]);
+    let le32 =
+        |offset: usize| -> u32 { u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) };
+    let memory_kib = le32(44);
+    let iterations = le32(48);
+    let parallelism = le32(52);
 
     const MAX_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB
     const MAX_ITERATIONS: u32 = 64;
@@ -241,9 +276,6 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&data[56..80]);
 
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(&data[80..112]);
-
     Ok(ParsedHeader {
         salt,
         params: Argon2Params {
@@ -252,7 +284,6 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
             parallelism,
         },
         nonce,
-        content_hash,
     })
 }
 
@@ -268,14 +299,7 @@ fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<VaultBackup> {
     let decrypted = crypto::decrypt(&encrypted, &key)?;
     let json_bytes = decrypted.as_slice()?;
 
-    let actual_hash = crypto::blake2b_256(&json_bytes);
-    if actual_hash != header.content_hash {
-        return Err(KeepError::InvalidInput(
-            "backup content hash mismatch".into(),
-        ));
-    }
-
-    serde_json::from_slice(&json_bytes)
+    serde_json::from_slice(json_bytes.as_ref())
         .map_err(|e| KeepError::Other(format!("backup deserialization failed: {e}")))
 }
 
@@ -295,23 +319,9 @@ fn restore_to_path(backup: &VaultBackup, path: &Path, vault_password: &str) -> R
     let data_key = keep.data_key()?;
 
     for bk in &backup.keys {
-        let secret_bytes =
-            hex::decode(&bk.secret).map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
-        if secret_bytes.len() != 32 {
-            return Err(KeepError::InvalidInput(format!(
-                "invalid secret length: {} (expected 32)",
-                secret_bytes.len()
-            )));
-        }
-        let encrypted = crypto::encrypt(&secret_bytes, &data_key)?;
-
-        let mut pubkey = [0u8; 32];
-        let pubkey_bytes =
-            hex::decode(&bk.pubkey).map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
-        if pubkey_bytes.len() != 32 {
-            return Err(KeepError::InvalidInput("invalid pubkey length".into()));
-        }
-        pubkey.copy_from_slice(&pubkey_bytes);
+        let secret = decode_hex_32(&bk.secret, "secret")?;
+        let encrypted = crypto::encrypt(&secret, &data_key)?;
+        let pubkey = decode_hex_32(&bk.pubkey, "pubkey")?;
 
         let record = KeyRecord {
             id: crypto::blake2b_256(&pubkey),
@@ -328,21 +338,13 @@ fn restore_to_path(backup: &VaultBackup, path: &Path, vault_password: &str) -> R
 
     for bs in &backup.shares {
         let key_package_bytes = hex::decode(&bs.key_package)
-            .map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
+            .map_err(|e| KeepError::Other(format!("hex decode key_package: {e}")))?;
         let encrypted = crypto::encrypt(&key_package_bytes, &data_key)?;
 
         let pubkey_package = hex::decode(&bs.pubkey_package)
-            .map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
+            .map_err(|e| KeepError::Other(format!("hex decode pubkey_package: {e}")))?;
 
-        let mut group_pubkey = [0u8; 32];
-        let gp_bytes = hex::decode(&bs.group_pubkey)
-            .map_err(|e| KeepError::Other(format!("hex decode: {e}")))?;
-        if gp_bytes.len() != 32 {
-            return Err(KeepError::InvalidInput(
-                "invalid group pubkey length".into(),
-            ));
-        }
-        group_pubkey.copy_from_slice(&gp_bytes);
+        let group_pubkey = decode_hex_32(&bs.group_pubkey, "group pubkey")?;
 
         let share = StoredShare {
             metadata: crate::frost::ShareMetadata {
@@ -378,6 +380,7 @@ fn restore_to_path(backup: &VaultBackup, path: &Path, vault_password: &str) -> R
         keep.set_proxy_config(proxy)?;
     }
 
+    drop(keep);
     Ok(())
 }
 
@@ -387,25 +390,34 @@ pub fn restore_backup(
     passphrase: &str,
     target: &Path,
     vault_password: &str,
-) -> Result<()> {
+) -> Result<BackupInfo> {
     let backup = decrypt_backup(data, passphrase)?;
+
+    let info = BackupInfo {
+        key_count: backup.keys.len(),
+        share_count: backup.shares.len(),
+        descriptor_count: backup.wallet_descriptors.len(),
+        created_at: backup.created_at.clone(),
+    };
 
     if target.exists() {
         return Err(KeepError::AlreadyExists(target.display().to_string()));
     }
 
-    let temp_target = target.with_extension("kbak-tmp");
-    if temp_target.exists() {
-        std::fs::remove_dir_all(&temp_target)
-            .map_err(|e| KeepError::Other(format!("failed to clean stale temp restore: {e}")))?;
-    }
+    let rand_suffix: [u8; 8] = entropy::random_bytes();
+    let temp_name = format!(
+        "{}.restore-{}",
+        target
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vault".into()),
+        hex::encode(rand_suffix)
+    );
+    let temp_target = target.with_file_name(temp_name);
 
-    match restore_to_path(&backup, &temp_target, vault_password) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&temp_target);
-            return Err(e);
-        }
+    if let Err(e) = restore_to_path(&backup, &temp_target, vault_password) {
+        let _ = std::fs::remove_dir_all(&temp_target);
+        return Err(e);
     }
 
     std::fs::rename(&temp_target, target).map_err(|e| {
@@ -413,7 +425,7 @@ pub fn restore_backup(
         KeepError::Other(format!("failed to finalize restore: {e}"))
     })?;
 
-    Ok(())
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -434,22 +446,23 @@ mod tests {
         let mut keep = create_test_keep(&vault_path);
         keep.generate_key("test-key").expect("generate key");
 
-        let backup_data = create_backup(&keep, "backup-pass").unwrap();
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
         assert!(backup_data.len() > HEADER_SIZE);
 
-        let info = verify_backup(&backup_data, "backup-pass").unwrap();
+        let info = verify_backup(&backup_data, "backup-passphrase-ok").unwrap();
         assert_eq!(info.key_count, 1);
         assert_eq!(info.share_count, 0);
         assert_eq!(info.descriptor_count, 0);
 
         let restore_path = dir.path().join("restored");
-        restore_backup(
+        let info = restore_backup(
             &backup_data,
-            "backup-pass",
+            "backup-passphrase-ok",
             &restore_path,
             "new-password-123",
         )
         .unwrap();
+        assert_eq!(info.key_count, 1);
 
         let mut restored = Keep::open(&restore_path).unwrap();
         restored.unlock("new-password-123").unwrap();
@@ -464,9 +477,19 @@ mod tests {
         let vault_path = dir.path().join("source");
         let keep = create_test_keep(&vault_path);
 
-        let backup_data = create_backup(&keep, "correct-pass").unwrap();
-        let result = verify_backup(&backup_data, "wrong-pass");
+        let backup_data = create_backup(&keep, "correct-passphrase").unwrap();
+        let result = verify_backup(&backup_data, "wrong-passphrase");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_short_passphrase_rejected() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("source");
+        let keep = create_test_keep(&vault_path);
+        let result = create_backup(&keep, "short");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least"));
     }
 
     #[test]
