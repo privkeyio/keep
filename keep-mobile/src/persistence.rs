@@ -514,3 +514,41 @@ pub(crate) fn persist_proxy_config(
     })?;
     storage.store_share_by_key(key.into(), data, storage_metadata("proxy_config"))
 }
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct StoredBunkerConfig {
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) authorized_clients: Vec<String>,
+}
+
+pub(crate) fn load_bunker_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<Option<StoredBunkerConfig>, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let config: StoredBunkerConfig =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize bunker config: {e}"),
+                })?;
+            Ok(Some(config))
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load bunker config: {e}");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn persist_bunker_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    config: &StoredBunkerConfig,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(config).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize bunker config: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("bunker_config"))
+}
