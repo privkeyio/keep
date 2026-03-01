@@ -20,7 +20,7 @@ keep-nip46 = { path = "../keep-nip46" }
 clap = { version = "4.5", features = ["derive"] }
 dialoguer = "0.11"
 indicatif = "0.17"
-console = "0.15"
+console = "0.16"
 
 ratatui = "0.30"
 crossterm = "0.29"
