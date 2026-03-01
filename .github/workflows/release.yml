@@ -19,7 +19,7 @@ jobs:
         run: |
           mv dist/keep keep-linux-x86_64
           mv dist/keep-desktop keep-desktop-linux-x86_64
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: |
@@ -37,7 +37,7 @@ jobs:
       - run: |
           mv target/release/keep keep-macos-x86_64
           mv target/release/keep-desktop keep-desktop-macos-x86_64
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: |
@@ -59,7 +59,7 @@ jobs:
       - run: |
           mv target/aarch64-apple-darwin/release/keep keep-macos-aarch64
           mv target/aarch64-apple-darwin/release/keep-desktop keep-desktop-macos-aarch64
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-arm
           path: |
@@ -76,7 +76,7 @@ jobs:
       - run: |
           mv target/release/keep.exe keep-windows-x86_64.exe
           mv target/release/keep-desktop.exe keep-desktop-windows-x86_64.exe
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -87,7 +87,7 @@ jobs:
     needs: [build-linux, build-macos, build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
