@@ -121,7 +121,7 @@ impl std::fmt::Debug for BackupShare {
             .field("group_pubkey", &self.group_pubkey)
             .field("name", &self.name)
             .field("key_package", &"[REDACTED]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
