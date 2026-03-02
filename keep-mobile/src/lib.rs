@@ -1256,8 +1256,9 @@ impl KeepMobile {
 
     pub fn create_backup(&self, passphrase: String) -> Result<Vec<u8>, KeepMobileError> {
         use keep_core::backup::{self, BackupConfig, BackupShare as CoreBackupShare};
+        let passphrase = Zeroizing::new(passphrase);
 
-        if passphrase.len() < backup::MIN_PASSPHRASE_LEN {
+        if passphrase.chars().count() < backup::MIN_PASSPHRASE_LEN {
             return Err(KeepMobileError::InvalidInput {
                 msg: format!(
                     "Passphrase must be at least {} characters",
@@ -1297,24 +1298,29 @@ impl KeepMobile {
         }
 
         let descriptors = persistence::load_descriptors(&self.storage);
-        let core_descriptors: Vec<keep_core::wallet::WalletDescriptor> = descriptors
-            .iter()
-            .map(|d| {
-                let mut group_pubkey = [0u8; 32];
-                if let Ok(bytes) = hex::decode(&d.group_pubkey) {
-                    if bytes.len() == 32 {
-                        group_pubkey.copy_from_slice(&bytes);
-                    }
+        let mut core_descriptors = Vec::with_capacity(descriptors.len());
+        for d in &descriptors {
+            let bytes = hex::decode(&d.group_pubkey).map_err(|e| {
+                KeepMobileError::BackupError {
+                    msg: format!("hex decode descriptor group_pubkey: {e}"),
                 }
-                keep_core::wallet::WalletDescriptor {
-                    group_pubkey,
-                    external_descriptor: d.external_descriptor.clone(),
-                    internal_descriptor: d.internal_descriptor.clone(),
-                    network: d.network.clone(),
-                    created_at: d.created_at,
+            })?;
+            let group_pubkey = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                KeepMobileError::BackupError {
+                    msg: format!(
+                        "invalid descriptor group_pubkey length: {} (expected 32)",
+                        bytes.len()
+                    ),
                 }
-            })
-            .collect();
+            })?;
+            core_descriptors.push(keep_core::wallet::WalletDescriptor {
+                group_pubkey,
+                external_descriptor: d.external_descriptor.clone(),
+                internal_descriptor: d.internal_descriptor.clone(),
+                network: d.network.clone(),
+                created_at: d.created_at,
+            });
+        }
 
         let mut relay_configs = Vec::new();
         for meta in &all_share_meta {
@@ -1333,24 +1339,28 @@ impl KeepMobile {
         }
 
         let health_infos = persistence::load_health_statuses(&self.storage);
-        let core_health: Vec<keep_core::wallet::KeyHealthStatus> = health_infos
-            .iter()
-            .map(|h| {
-                let mut group_pubkey = [0u8; 32];
-                if let Ok(bytes) = hex::decode(&h.group_pubkey) {
-                    if bytes.len() == 32 {
-                        group_pubkey.copy_from_slice(&bytes);
-                    }
+        let mut core_health = Vec::with_capacity(health_infos.len());
+        for h in &health_infos {
+            let bytes =
+                hex::decode(&h.group_pubkey).map_err(|e| KeepMobileError::BackupError {
+                    msg: format!("hex decode health group_pubkey: {e}"),
+                })?;
+            let group_pubkey = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                KeepMobileError::BackupError {
+                    msg: format!(
+                        "invalid health group_pubkey length: {} (expected 32)",
+                        bytes.len()
+                    ),
                 }
-                keep_core::wallet::KeyHealthStatus {
-                    group_pubkey,
-                    share_index: h.share_index,
-                    last_check_timestamp: h.last_check_timestamp,
-                    responsive: h.responsive,
-                    created_at: Some(h.created_at),
-                }
-            })
-            .collect();
+            })?;
+            core_health.push(keep_core::wallet::KeyHealthStatus {
+                group_pubkey,
+                share_index: h.share_index,
+                last_check_timestamp: h.last_check_timestamp,
+                responsive: h.responsive,
+                created_at: Some(h.created_at),
+            });
+        }
 
         let proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
             .unwrap_or_default();
@@ -1387,6 +1397,16 @@ impl KeepMobile {
         data: Vec<u8>,
         passphrase: String,
     ) -> Result<BackupInfo, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
+        if data.len() > keep_core::backup::MAX_BACKUP_SIZE {
+            return Err(KeepMobileError::BackupError {
+                msg: format!(
+                    "backup too large ({} bytes, max {})",
+                    data.len(),
+                    keep_core::backup::MAX_BACKUP_SIZE
+                ),
+            });
+        }
         let decrypted = keep_core::backup::decrypt_backup(&data, &passphrase)
             .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
         Ok(BackupInfo {
@@ -1402,6 +1422,16 @@ impl KeepMobile {
         data: Vec<u8>,
         passphrase: String,
     ) -> Result<BackupInfo, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
+        if data.len() > keep_core::backup::MAX_BACKUP_SIZE {
+            return Err(KeepMobileError::BackupError {
+                msg: format!(
+                    "backup too large ({} bytes, max {})",
+                    data.len(),
+                    keep_core::backup::MAX_BACKUP_SIZE
+                ),
+            });
+        }
         let decrypted = keep_core::backup::decrypt_backup(&data, &passphrase)
             .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
 
@@ -1427,6 +1457,15 @@ impl KeepMobile {
                 hex::decode(&bs.group_pubkey).map_err(|e| KeepMobileError::BackupError {
                     msg: format!("hex decode group_pubkey: {e}"),
                 })?;
+            let group_pubkey_32 =
+                <[u8; 32]>::try_from(group_pubkey_bytes.as_slice()).map_err(|_| {
+                    KeepMobileError::BackupError {
+                        msg: format!(
+                            "invalid group pubkey length: {} (expected 32)",
+                            group_pubkey_bytes.len()
+                        ),
+                    }
+                })?;
 
             let group_hex = bs.group_pubkey.to_ascii_lowercase();
             if first_group_hex.is_none() {
@@ -1445,18 +1484,7 @@ impl KeepMobile {
                 identifier: bs.identifier,
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
-                group_pubkey: {
-                    let bytes = hex::decode(&bs.group_pubkey).map_err(|e| {
-                        KeepMobileError::BackupError {
-                            msg: format!("hex decode group_pubkey: {e}"),
-                        }
-                    })?;
-                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                        KeepMobileError::BackupError {
-                            msg: "invalid group pubkey length".into(),
-                        }
-                    })?
-                },
+                group_pubkey: group_pubkey_32,
                 name: bs.name.clone(),
                 created_at: bs.created_at,
                 last_used: bs.last_used,

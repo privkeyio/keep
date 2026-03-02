@@ -51,7 +51,7 @@ struct VaultBackup {
 }
 
 /// A key entry in a backup file.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BackupKey {
     /// Hex-encoded public key.
     pub pubkey: String,
@@ -70,7 +70,7 @@ pub struct BackupKey {
 }
 
 /// A FROST share entry in a backup file.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BackupShare {
     /// Share identifier index.
     pub identifier: u16,
@@ -101,6 +101,28 @@ pub struct BackupConfig {
     pub kill_switch: bool,
     /// Optional proxy configuration.
     pub proxy: Option<ProxyConfig>,
+}
+
+impl std::fmt::Debug for BackupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupKey")
+            .field("pubkey", &self.pubkey)
+            .field("key_type", &self.key_type)
+            .field("name", &self.name)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BackupShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupShare")
+            .field("identifier", &self.identifier)
+            .field("group_pubkey", &self.group_pubkey)
+            .field("name", &self.name)
+            .field("key_package", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Summary information about a backup file.
@@ -163,7 +185,7 @@ pub fn create_backup_from_data(
     config: BackupConfig,
     passphrase: &str,
 ) -> Result<Vec<u8>> {
-    if passphrase.len() < MIN_PASSPHRASE_LEN {
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         return Err(KeepError::InvalidInput(format!(
             "passphrase must be at least {MIN_PASSPHRASE_LEN} characters"
         )));
