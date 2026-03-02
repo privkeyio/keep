@@ -28,7 +28,7 @@ pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    AnnouncedXpubInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,
+    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,
     FrostGenerationResult, GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo,
     PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
     WalletDescriptorInfo,
@@ -97,6 +97,11 @@ pub fn nsec_to_hex(nsec: String) -> Option<String> {
 }
 
 #[uniffi::export]
+pub fn backup_min_passphrase_length() -> u32 {
+    keep_core::backup::MIN_PASSPHRASE_LEN as u32
+}
+
+#[uniffi::export]
 pub fn is_valid_bech32_char(c: String) -> bool {
     const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
     c.len() == 1
@@ -158,6 +163,7 @@ const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
 const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
 const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
+const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -1201,6 +1207,14 @@ impl KeepMobile {
         Ok(())
     }
 
+    pub fn get_kill_switch(&self) -> Result<bool, KeepMobileError> {
+        persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
+    }
+
+    pub fn set_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
+        persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
+    }
+
     pub fn get_proxy_config(&self) -> Result<ProxyConfigInfo, KeepMobileError> {
         let stored = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?;
         let config = stored.unwrap_or_default();
@@ -1239,6 +1253,312 @@ impl KeepMobile {
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
+
+    pub fn create_backup(&self, passphrase: String) -> Result<Vec<u8>, KeepMobileError> {
+        use keep_core::backup::{self, BackupConfig, BackupShare as CoreBackupShare};
+        let passphrase = Zeroizing::new(passphrase);
+
+        if passphrase.chars().count() < backup::MIN_PASSPHRASE_LEN {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!(
+                    "Passphrase must be at least {} characters",
+                    backup::MIN_PASSPHRASE_LEN
+                ),
+            });
+        }
+
+        let all_share_meta = self.storage.list_all_shares();
+        let mut backup_shares = Vec::with_capacity(all_share_meta.len());
+
+        for meta in &all_share_meta {
+            let group_hex = hex::encode(&meta.group_pubkey);
+            let data = self.storage.load_share_by_key(group_hex.clone())?;
+            let stored: StoredShareData =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("Failed to deserialize share data: {e}"),
+                })?;
+            let share_meta: keep_core::frost::ShareMetadata =
+                serde_json::from_str(&stored.metadata_json).map_err(|e| {
+                    KeepMobileError::StorageError {
+                        msg: format!("Failed to deserialize share metadata: {e}"),
+                    }
+                })?;
+            backup_shares.push(CoreBackupShare {
+                identifier: share_meta.identifier,
+                threshold: share_meta.threshold,
+                total_shares: share_meta.total_shares,
+                group_pubkey: hex::encode(share_meta.group_pubkey),
+                name: share_meta.name,
+                created_at: share_meta.created_at,
+                last_used: share_meta.last_used,
+                sign_count: share_meta.sign_count,
+                key_package: hex::encode(&stored.key_package_bytes),
+                pubkey_package: hex::encode(&stored.pubkey_package_bytes),
+            });
+        }
+
+        let descriptors = persistence::load_descriptors(&self.storage);
+        let mut core_descriptors = Vec::with_capacity(descriptors.len());
+        for d in &descriptors {
+            let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;
+            let group_pubkey = bytes_to_32(&bytes, "descriptor group_pubkey")?;
+            core_descriptors.push(keep_core::wallet::WalletDescriptor {
+                group_pubkey,
+                external_descriptor: d.external_descriptor.clone(),
+                internal_descriptor: d.internal_descriptor.clone(),
+                network: d.network.clone(),
+                created_at: d.created_at,
+            });
+        }
+
+        let mut relay_configs = Vec::new();
+        for meta in &all_share_meta {
+            let group_hex = hex::encode(&meta.group_pubkey);
+            let key = relay_config_key(Some(&group_hex));
+            if let Ok(Some(stored)) = persistence::load_relay_config(&self.storage, &key) {
+                let group_pubkey = bytes_to_32(&meta.group_pubkey, "relay group_pubkey")?;
+                relay_configs.push(keep_core::relay::RelayConfig {
+                    group_pubkey,
+                    frost_relays: stored.frost_relays,
+                    profile_relays: stored.profile_relays,
+                    bunker_relays: stored.bunker_relays,
+                });
+            }
+        }
+
+        let health_infos = persistence::load_health_statuses(&self.storage);
+        let mut core_health = Vec::with_capacity(health_infos.len());
+        for h in &health_infos {
+            let bytes = decode_hex(&h.group_pubkey, "health group_pubkey")?;
+            let group_pubkey = bytes_to_32(&bytes, "health group_pubkey")?;
+            core_health.push(keep_core::wallet::KeyHealthStatus {
+                group_pubkey,
+                share_index: h.share_index,
+                last_check_timestamp: h.last_check_timestamp,
+                responsive: h.responsive,
+                created_at: Some(h.created_at),
+            });
+        }
+
+        let proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+        let core_proxy = if proxy.enabled {
+            Some(keep_core::storage::ProxyConfig {
+                enabled: proxy.enabled,
+                port: proxy.port,
+            })
+        } else {
+            None
+        };
+
+        let kill_switch = persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)?;
+
+        let config = BackupConfig {
+            kill_switch,
+            proxy: core_proxy,
+        };
+
+        backup::create_backup_from_data(
+            Vec::new(),
+            backup_shares,
+            core_descriptors,
+            relay_configs,
+            core_health,
+            config,
+            &passphrase,
+        )
+        .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
+    }
+
+    pub fn verify_backup(
+        &self,
+        data: Vec<u8>,
+        passphrase: String,
+    ) -> Result<BackupInfo, KeepMobileError> {
+        let decrypted = decrypt_backup_data(&data, &passphrase)?;
+        Ok(backup_info(&decrypted))
+    }
+
+    pub fn restore_backup(
+        &self,
+        data: Vec<u8>,
+        passphrase: String,
+    ) -> Result<BackupInfo, KeepMobileError> {
+        let decrypted = decrypt_backup_data(&data, &passphrase)?;
+        let info = backup_info(&decrypted);
+
+        let mut first_group_hex: Option<String> = None;
+
+        for bs in &decrypted.shares {
+            let key_package_bytes = decode_hex(&bs.key_package, "key_package")?;
+            let pubkey_package_bytes = decode_hex(&bs.pubkey_package, "pubkey_package")?;
+            let group_pubkey_bytes = decode_hex(&bs.group_pubkey, "group_pubkey")?;
+            let group_pubkey_32 = bytes_to_32(&group_pubkey_bytes, "group pubkey")?;
+
+            let group_hex = bs.group_pubkey.to_ascii_lowercase();
+            if first_group_hex.is_none() {
+                first_group_hex = Some(group_hex.clone());
+            }
+
+            let metadata = ShareMetadataInfo {
+                name: bs.name.clone(),
+                identifier: bs.identifier,
+                threshold: bs.threshold,
+                total_shares: bs.total_shares,
+                group_pubkey: group_pubkey_bytes,
+            };
+
+            let share_meta = keep_core::frost::ShareMetadata {
+                identifier: bs.identifier,
+                threshold: bs.threshold,
+                total_shares: bs.total_shares,
+                group_pubkey: group_pubkey_32,
+                name: bs.name.clone(),
+                created_at: bs.created_at,
+                last_used: bs.last_used,
+                sign_count: bs.sign_count,
+            };
+
+            let stored = StoredShareData {
+                metadata_json: serde_json::to_string(&share_meta)
+                    .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
+                key_package_bytes,
+                pubkey_package_bytes,
+            };
+
+            let serialized = serde_json::to_vec(&stored)
+                .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata)?;
+        }
+
+        for bk in &decrypted.keys {
+            let secret_bytes = decode_hex(&bk.secret, "key secret")?;
+
+            let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&secret_bytes)
+                .map_err(|e| KeepMobileError::BackupError {
+                    msg: format!("nsec conversion: {e}"),
+                })?;
+
+            let (metadata_info, stored) =
+                Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, bk.name.clone())
+                    .map_err(|e| KeepMobileError::BackupError {
+                        msg: format!("nsec share data: {e}"),
+                    })?;
+
+            let group_hex = hex::encode(&metadata_info.group_pubkey);
+            if first_group_hex.is_none() {
+                first_group_hex = Some(group_hex.clone());
+            }
+
+            let serialized = serde_json::to_vec(&stored)
+                .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata_info)?;
+        }
+
+        for wd in &decrypted.wallet_descriptors {
+            let desc_info = WalletDescriptorInfo {
+                group_pubkey: hex::encode(wd.group_pubkey),
+                external_descriptor: wd.external_descriptor.clone(),
+                internal_descriptor: wd.internal_descriptor.clone(),
+                network: wd.network.clone(),
+                created_at: wd.created_at,
+            };
+            persistence::persist_descriptor(&self.storage, &desc_info)?;
+        }
+
+        for rc in &decrypted.relay_configs {
+            let group_hex = hex::encode(rc.group_pubkey);
+            let key = relay_config_key(Some(&group_hex));
+            let stored_relay = persistence::StoredRelayConfig {
+                frost_relays: rc.frost_relays.clone(),
+                profile_relays: rc.profile_relays.clone(),
+                bunker_relays: rc.bunker_relays.clone(),
+            };
+            persistence::persist_relay_config(&self.storage, &key, &stored_relay)?;
+        }
+
+        for hs in &decrypted.health_statuses {
+            let health_info = KeyHealthStatusInfo {
+                group_pubkey: hex::encode(hs.group_pubkey),
+                share_index: hs.share_index,
+                last_check_timestamp: hs.last_check_timestamp,
+                responsive: hs.responsive,
+                created_at: hs.created_at.unwrap_or(hs.last_check_timestamp),
+                is_stale: false,
+                is_critical: false,
+            };
+            persistence::persist_health_status(&self.storage, &health_info)?;
+        }
+
+        if let Some(proxy) = &decrypted.config.proxy {
+            let stored_proxy = persistence::StoredProxyConfig {
+                enabled: proxy.enabled,
+                port: proxy.port,
+            };
+            persistence::persist_proxy_config(
+                &self.storage,
+                PROXY_CONFIG_STORAGE_KEY,
+                &stored_proxy,
+            )?;
+        }
+
+        persistence::persist_kill_switch(
+            &self.storage,
+            KILL_SWITCH_STORAGE_KEY,
+            decrypted.config.kill_switch,
+        )?;
+
+        if self.storage.get_active_share_key().is_none() {
+            if let Some(group_hex) = first_group_hex {
+                let _ = self.storage.set_active_share_key(Some(group_hex));
+            }
+        }
+
+        Ok(info)
+    }
+}
+
+fn decrypt_backup_data(
+    data: &[u8],
+    passphrase: &str,
+) -> Result<keep_core::backup::DecryptedBackup, KeepMobileError> {
+    let passphrase = Zeroizing::new(passphrase.to_owned());
+    if data.len() > keep_core::backup::MAX_BACKUP_SIZE {
+        return Err(KeepMobileError::BackupError {
+            msg: format!(
+                "backup too large ({} bytes, max {})",
+                data.len(),
+                keep_core::backup::MAX_BACKUP_SIZE
+            ),
+        });
+    }
+    keep_core::backup::decrypt_backup(data, &passphrase)
+        .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
+}
+
+fn backup_info(decrypted: &keep_core::backup::DecryptedBackup) -> BackupInfo {
+    BackupInfo {
+        key_count: decrypted.keys.len() as u32,
+        share_count: decrypted.shares.len() as u32,
+        descriptor_count: decrypted.wallet_descriptors.len() as u32,
+        created_at: decrypted.created_at.clone(),
+    }
+}
+
+fn decode_hex(hex_str: &str, label: &str) -> Result<Vec<u8>, KeepMobileError> {
+    hex::decode(hex_str).map_err(|e| KeepMobileError::BackupError {
+        msg: format!("hex decode {label}: {e}"),
+    })
+}
+
+fn bytes_to_32(bytes: &[u8], label: &str) -> Result<[u8; 32], KeepMobileError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| KeepMobileError::BackupError {
+        msg: format!("invalid {label} length: {} (expected 32)", bytes.len()),
+    })
 }
 
 fn relay_config_key(group_pubkey: Option<&str>) -> String {

@@ -32,7 +32,8 @@ fn decode_hex_32(hex_str: &str, label: &str) -> Result<[u8; 32]> {
 const MAGIC: &[u8; 8] = b"KEEPBACK";
 const VERSION: u16 = 1;
 const HEADER_SIZE: usize = 224;
-const MIN_PASSPHRASE_LEN: usize = 8;
+/// Minimum passphrase length for backup encryption.
+pub const MIN_PASSPHRASE_LEN: usize = 8;
 
 /// Maximum backup file size (64 MiB).
 pub const MAX_BACKUP_SIZE: usize = 64 * 1024 * 1024;
@@ -49,35 +50,79 @@ struct VaultBackup {
     config: BackupConfig,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BackupKey {
-    pubkey: String,
-    key_type: String,
-    name: String,
-    created_at: i64,
-    last_used: Option<i64>,
-    sign_count: u64,
-    secret: String,
+/// A key entry in a backup file.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BackupKey {
+    /// Hex-encoded public key.
+    pub pubkey: String,
+    /// Key type string (e.g. "Nostr", "Bitcoin").
+    pub key_type: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Unix timestamp when the key was created.
+    pub created_at: i64,
+    /// Unix timestamp when the key was last used.
+    pub last_used: Option<i64>,
+    /// Number of signatures produced.
+    pub sign_count: u64,
+    /// Hex-encoded secret key bytes.
+    pub secret: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BackupShare {
-    identifier: u16,
-    threshold: u16,
-    total_shares: u16,
-    group_pubkey: String,
-    name: String,
-    created_at: i64,
-    last_used: Option<i64>,
-    sign_count: u64,
-    key_package: String,
-    pubkey_package: String,
+/// A FROST share entry in a backup file.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BackupShare {
+    /// Share identifier index.
+    pub identifier: u16,
+    /// Signing threshold.
+    pub threshold: u16,
+    /// Total number of shares.
+    pub total_shares: u16,
+    /// Hex-encoded group public key.
+    pub group_pubkey: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Unix timestamp when the share was created.
+    pub created_at: i64,
+    /// Unix timestamp when the share was last used.
+    pub last_used: Option<i64>,
+    /// Number of signatures produced.
+    pub sign_count: u64,
+    /// Hex-encoded serialized key package.
+    pub key_package: String,
+    /// Hex-encoded serialized public key package.
+    pub pubkey_package: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BackupConfig {
-    kill_switch: bool,
-    proxy: Option<ProxyConfig>,
+/// Configuration stored in a backup file.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BackupConfig {
+    /// Whether the kill switch is enabled.
+    pub kill_switch: bool,
+    /// Optional proxy configuration.
+    pub proxy: Option<ProxyConfig>,
+}
+
+impl std::fmt::Debug for BackupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupKey")
+            .field("pubkey", &self.pubkey)
+            .field("key_type", &self.key_type)
+            .field("name", &self.name)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BackupShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupShare")
+            .field("identifier", &self.identifier)
+            .field("group_pubkey", &self.group_pubkey)
+            .field("name", &self.name)
+            .field("key_package", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Summary information about a backup file.
@@ -89,6 +134,24 @@ pub struct BackupInfo {
     pub share_count: usize,
     /// Number of wallet descriptors in the backup.
     pub descriptor_count: usize,
+    /// ISO-8601 timestamp when the backup was created.
+    pub created_at: String,
+}
+
+/// Decrypted backup data with all vault contents.
+pub struct DecryptedBackup {
+    /// Standalone keys.
+    pub keys: Vec<BackupKey>,
+    /// FROST shares.
+    pub shares: Vec<BackupShare>,
+    /// Wallet descriptors.
+    pub wallet_descriptors: Vec<WalletDescriptor>,
+    /// Relay configurations.
+    pub relay_configs: Vec<RelayConfig>,
+    /// Key health statuses.
+    pub health_statuses: Vec<KeyHealthStatus>,
+    /// Backup configuration (kill switch, proxy).
+    pub config: BackupConfig,
     /// ISO-8601 timestamp when the backup was created.
     pub created_at: String,
 }
@@ -112,13 +175,62 @@ fn string_to_key_type(s: &str) -> Result<KeyType> {
     }
 }
 
-/// Create an encrypted backup of all vault data.
-pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
-    if passphrase.len() < MIN_PASSPHRASE_LEN {
+/// Create an encrypted backup from pre-gathered data.
+pub fn create_backup_from_data(
+    keys: Vec<BackupKey>,
+    shares: Vec<BackupShare>,
+    wallet_descriptors: Vec<WalletDescriptor>,
+    relay_configs: Vec<RelayConfig>,
+    health_statuses: Vec<KeyHealthStatus>,
+    config: BackupConfig,
+    passphrase: &str,
+) -> Result<Vec<u8>> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         return Err(KeepError::InvalidInput(format!(
             "passphrase must be at least {MIN_PASSPHRASE_LEN} characters"
         )));
     }
+
+    let backup = VaultBackup {
+        version: VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        keys,
+        shares,
+        wallet_descriptors,
+        relay_configs,
+        health_statuses,
+        config,
+    };
+
+    let mut json_bytes = serde_json::to_vec(&backup)
+        .map_err(|e| KeepError::Other(format!("backup serialization failed: {e}")))?;
+
+    let salt: [u8; SALT_SIZE] = entropy::random_bytes();
+    let params = Argon2Params::DEFAULT;
+    let key = crypto::derive_key(passphrase.as_bytes(), &salt, params)?;
+    let encrypted = crypto::encrypt(&json_bytes, &key)?;
+    json_bytes.zeroize();
+
+    let mut output = Vec::with_capacity(HEADER_SIZE + encrypted.to_bytes().len());
+
+    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(&VERSION.to_le_bytes());
+    output.extend_from_slice(&0u16.to_le_bytes());
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&params.memory_kib.to_le_bytes());
+    output.extend_from_slice(&params.iterations.to_le_bytes());
+    output.extend_from_slice(&params.parallelism.to_le_bytes());
+    output.extend_from_slice(&encrypted.nonce);
+    output.extend_from_slice(&[0u8; 32]);
+    output.extend_from_slice(&[0u8; 112]);
+
+    output.extend_from_slice(&encrypted.ciphertext);
+
+    Ok(output)
+}
+
+/// Create an encrypted backup of all vault data.
+pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     if !keep.is_unlocked() {
         return Err(KeepError::Locked);
     }
@@ -168,46 +280,18 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let kill_switch = keep.get_kill_switch()?;
     let proxy = keep.get_proxy_config()?;
 
-    let backup = VaultBackup {
-        version: VERSION,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        keys: backup_keys,
-        shares: backup_shares,
-        wallet_descriptors: descriptors,
+    create_backup_from_data(
+        backup_keys,
+        backup_shares,
+        descriptors,
         relay_configs,
         health_statuses,
-        config: BackupConfig {
+        BackupConfig {
             kill_switch,
             proxy: if proxy.enabled { Some(proxy) } else { None },
         },
-    };
-
-    let mut json_bytes = serde_json::to_vec(&backup)
-        .map_err(|e| KeepError::Other(format!("backup serialization failed: {e}")))?;
-
-    let salt: [u8; SALT_SIZE] = entropy::random_bytes();
-    let params = Argon2Params::DEFAULT;
-    let key = crypto::derive_key(passphrase.as_bytes(), &salt, params)?;
-    let encrypted = crypto::encrypt(&json_bytes, &key)?;
-    json_bytes.zeroize();
-
-    let mut output = Vec::with_capacity(HEADER_SIZE + encrypted.to_bytes().len());
-
-    // Header: 224 bytes
-    output.extend_from_slice(MAGIC); // [0..8]
-    output.extend_from_slice(&VERSION.to_le_bytes()); // [8..10]
-    output.extend_from_slice(&0u16.to_le_bytes()); // [10..12] flags
-    output.extend_from_slice(&salt); // [12..44]
-    output.extend_from_slice(&params.memory_kib.to_le_bytes()); // [44..48]
-    output.extend_from_slice(&params.iterations.to_le_bytes()); // [48..52]
-    output.extend_from_slice(&params.parallelism.to_le_bytes()); // [52..56]
-    output.extend_from_slice(&encrypted.nonce); // [56..80]
-    output.extend_from_slice(&[0u8; 32]); // [80..112] reserved
-    output.extend_from_slice(&[0u8; 112]); // [112..224] padding
-
-    output.extend_from_slice(&encrypted.ciphertext);
-
-    Ok(output)
+        passphrase,
+    )
 }
 
 struct ParsedHeader {
@@ -287,7 +371,8 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     })
 }
 
-fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<VaultBackup> {
+/// Decrypt a backup file and return its contents.
+pub fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<DecryptedBackup> {
     let header = parse_header(data)?;
     let key = crypto::derive_key(passphrase.as_bytes(), &header.salt, header.params)?;
 
@@ -299,22 +384,32 @@ fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<VaultBackup> {
     let decrypted = crypto::decrypt(&encrypted, &key)?;
     let json_bytes = decrypted.as_slice()?;
 
-    serde_json::from_slice(json_bytes.as_ref())
-        .map_err(|e| KeepError::Other(format!("backup deserialization failed: {e}")))
+    let vault: VaultBackup = serde_json::from_slice(json_bytes.as_ref())
+        .map_err(|e| KeepError::Other(format!("backup deserialization failed: {e}")))?;
+
+    Ok(DecryptedBackup {
+        keys: vault.keys,
+        shares: vault.shares,
+        wallet_descriptors: vault.wallet_descriptors,
+        relay_configs: vault.relay_configs,
+        health_statuses: vault.health_statuses,
+        config: vault.config,
+        created_at: vault.created_at,
+    })
 }
 
 /// Verify a backup file and return summary information.
 pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
-    let backup = decrypt_backup(data, passphrase)?;
+    let decrypted = decrypt_backup(data, passphrase)?;
     Ok(BackupInfo {
-        key_count: backup.keys.len(),
-        share_count: backup.shares.len(),
-        descriptor_count: backup.wallet_descriptors.len(),
-        created_at: backup.created_at,
+        key_count: decrypted.keys.len(),
+        share_count: decrypted.shares.len(),
+        descriptor_count: decrypted.wallet_descriptors.len(),
+        created_at: decrypted.created_at,
     })
 }
 
-fn restore_to_path(backup: &VaultBackup, path: &Path, vault_password: &str) -> Result<()> {
+fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) -> Result<()> {
     let keep = Keep::create(path, vault_password)?;
     let data_key = keep.data_key()?;
 

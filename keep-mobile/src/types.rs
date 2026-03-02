@@ -131,6 +131,14 @@ pub struct KeepLiveState {
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
+pub struct BackupInfo {
+    pub key_count: u32,
+    pub share_count: u32,
+    pub descriptor_count: u32,
+    pub created_at: String,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct KeyHealthStatusInfo {
     pub group_pubkey: String,
     pub share_index: u16,

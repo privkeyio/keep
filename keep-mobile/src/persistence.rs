@@ -552,3 +552,34 @@ pub(crate) fn persist_bunker_config(
     })?;
     storage.store_share_by_key(key.into(), data, storage_metadata("bunker_config"))
 }
+
+pub(crate) fn load_kill_switch(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<bool, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let enabled: bool =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize kill switch: {e}"),
+                })?;
+            Ok(enabled)
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(false),
+        Err(e) => {
+            tracing::warn!("failed to load kill switch: {e}");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn persist_kill_switch(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    enabled: bool,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(&enabled).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize kill switch: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("kill_switch"))
+}
