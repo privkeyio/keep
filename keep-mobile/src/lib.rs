@@ -97,6 +97,11 @@ pub fn nsec_to_hex(nsec: String) -> Option<String> {
 }
 
 #[uniffi::export]
+pub fn backup_min_passphrase_length() -> u32 {
+    keep_core::backup::MIN_PASSPHRASE_LEN as u32
+}
+
+#[uniffi::export]
 pub fn is_valid_bech32_char(c: String) -> bool {
     const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
     c.len() == 1
@@ -158,6 +163,7 @@ const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
 const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
 const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
+const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -1201,6 +1207,14 @@ impl KeepMobile {
         Ok(())
     }
 
+    pub fn get_kill_switch(&self) -> Result<bool, KeepMobileError> {
+        persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
+    }
+
+    pub fn set_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
+        persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
+    }
+
     pub fn get_proxy_config(&self) -> Result<ProxyConfigInfo, KeepMobileError> {
         let stored = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?;
         let config = stored.unwrap_or_default();
@@ -1240,11 +1254,7 @@ impl KeepMobile {
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
 
-    pub fn create_backup(
-        &self,
-        passphrase: String,
-        kill_switch: bool,
-    ) -> Result<Vec<u8>, KeepMobileError> {
+    pub fn create_backup(&self, passphrase: String) -> Result<Vec<u8>, KeepMobileError> {
         use keep_core::backup::{self, BackupConfig, BackupShare as CoreBackupShare};
 
         if passphrase.len() < backup::MIN_PASSPHRASE_LEN {
@@ -1352,6 +1362,8 @@ impl KeepMobile {
         } else {
             None
         };
+
+        let kill_switch = persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)?;
 
         let config = BackupConfig {
             kill_switch,
@@ -1540,6 +1552,12 @@ impl KeepMobile {
                 &stored_proxy,
             )?;
         }
+
+        persistence::persist_kill_switch(
+            &self.storage,
+            KILL_SWITCH_STORAGE_KEY,
+            decrypted.config.kill_switch,
+        )?;
 
         if self.storage.get_active_share_key().is_none() {
             if let Some(group_hex) = first_group_hex {
