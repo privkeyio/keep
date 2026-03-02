@@ -44,7 +44,7 @@ hex = "0.4"
 base64 = "0.22"
 thiserror = "1.0"
 fs2 = "0.4"
-chrono = { version = "0.4.39", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 dirs = "6.0"
 tracing = "0.1"
 
