@@ -1520,7 +1520,6 @@ impl KeepMobile {
 
         Ok(info)
     }
-
 }
 
 fn decrypt_backup_data(
