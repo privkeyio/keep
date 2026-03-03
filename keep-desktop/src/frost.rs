@@ -283,12 +283,21 @@ pub(crate) async fn setup_frost_node(
         if let Some(keep) = guard.as_ref() {
             if let Ok(Some(config)) = keep.get_relay_config(&share_entry.group_pubkey) {
                 for entry in &config.peer_policies {
-                    if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
-                        node.set_peer_policy(
-                            keep_frost_net::PeerPolicy::new(pubkey)
-                                .allow_send(entry.allow_send)
-                                .allow_receive(entry.allow_receive),
-                        );
+                    match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
+                        Ok(pubkey) => {
+                            node.set_peer_policy(
+                                keep_frost_net::PeerPolicy::new(pubkey)
+                                    .allow_send(entry.allow_send)
+                                    .allow_receive(entry.allow_receive),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pubkey_hex = %entry.pubkey_hex,
+                                %e,
+                                "Skipping invalid peer policy from vault"
+                            );
+                        }
                     }
                 }
             }
