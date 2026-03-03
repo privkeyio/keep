@@ -28,46 +28,8 @@ pub fn recover_nsec(
     }
 
     let mut key_packages = Vec::with_capacity(share_data.len());
-    let mut group_pubkey: Option<String> = None;
-    let mut seen_identifiers: Vec<u16> = Vec::new();
 
-    let parse_result: Result<()> = (|| {
-        for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
-            let export = ShareExport::parse(data.as_ref())
-                .map_err(|_| KeepError::Frost("Invalid share format".into()))?;
-
-            match &group_pubkey {
-                None => group_pubkey = Some(export.group_pubkey.clone()),
-                Some(gp) if *gp != export.group_pubkey => {
-                    return Err(KeepError::Frost(
-                        "All shares must belong to the same group".into(),
-                    ));
-                }
-                _ => {}
-            }
-
-            if seen_identifiers.contains(&export.identifier) {
-                return Err(KeepError::Frost(
-                    "Duplicate share \u{2014} each share must be unique".into(),
-                ));
-            }
-            seen_identifiers.push(export.identifier);
-
-            let share = export
-                .to_share(passphrase.as_ref(), "recovery")
-                .map_err(|_| {
-                    KeepError::Frost("Failed to decrypt share (wrong passphrase?)".into())
-                })?;
-            key_packages.push(
-                share
-                    .key_package()
-                    .map_err(|_| KeepError::Frost("Invalid share data".into()))?,
-            );
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = parse_result {
+    if let Err(e) = decrypt_shares(share_data, passphrases, &mut key_packages) {
         key_packages.zeroize();
         return Err(e);
     }
@@ -110,4 +72,45 @@ pub fn recover_nsec(
     }
 
     Ok(Zeroizing::new(keypair.to_nsec()))
+}
+
+fn decrypt_shares(
+    share_data: &[impl AsRef<str>],
+    passphrases: &[impl AsRef<str>],
+    key_packages: &mut Vec<frost_secp256k1_tr::keys::KeyPackage>,
+) -> Result<()> {
+    let mut group_pubkey: Option<String> = None;
+    let mut seen_identifiers: Vec<u16> = Vec::new();
+
+    for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
+        let export = ShareExport::parse(data.as_ref())
+            .map_err(|_| KeepError::Frost("Invalid share format".into()))?;
+
+        match &group_pubkey {
+            None => group_pubkey = Some(export.group_pubkey.clone()),
+            Some(gp) if *gp != export.group_pubkey => {
+                return Err(KeepError::Frost(
+                    "All shares must belong to the same group".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        if seen_identifiers.contains(&export.identifier) {
+            return Err(KeepError::Frost(
+                "Duplicate share \u{2014} each share must be unique".into(),
+            ));
+        }
+        seen_identifiers.push(export.identifier);
+
+        let share = export
+            .to_share(passphrase.as_ref(), "recovery")
+            .map_err(|_| KeepError::Frost("Failed to decrypt share (wrong passphrase?)".into()))?;
+        key_packages.push(
+            share
+                .key_package()
+                .map_err(|_| KeepError::Frost("Invalid share data".into()))?,
+        );
+    }
+    Ok(())
 }

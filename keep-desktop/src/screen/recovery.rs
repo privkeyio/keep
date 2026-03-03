@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
@@ -130,16 +130,10 @@ impl State {
                 }
             }
             Message::Recover => {
-                let ready = !self.loading
-                    && (self.share_inputs.len() as u16) >= self.threshold
-                    && self.share_inputs.iter().all(|s| !s.trim().is_empty())
-                    && self.passphrase_inputs.iter().all(|p| !p.is_empty());
-                if !ready {
+                if !self.can_recover() {
                     return None;
                 }
-                self.recovered_nsec = None;
-                self.clear_deadline = None;
-                self.nsec_visible = false;
+                self.clear_nsec();
                 self.loading = true;
                 self.error = None;
                 Some(Event::Recover {
@@ -157,21 +151,30 @@ impl State {
                 .as_ref()
                 .map(|nsec| Event::CopyToClipboard(nsec.clone())),
             Message::ClearNsec => {
-                self.recovered_nsec = None;
-                self.clear_deadline = None;
-                self.nsec_visible = false;
+                self.clear_nsec();
                 None
             }
             Message::AutoClearTick => {
                 if self.clear_deadline.is_some_and(|d| Instant::now() >= d) {
-                    self.recovered_nsec = None;
-                    self.clear_deadline = None;
-                    self.nsec_visible = false;
+                    self.clear_nsec();
                 }
                 None
             }
             Message::GoBack => Some(Event::GoBack),
         }
+    }
+
+    fn can_recover(&self) -> bool {
+        !self.loading
+            && (self.share_inputs.len() as u16) >= self.threshold
+            && self.share_inputs.iter().all(|s| !s.trim().is_empty())
+            && self.passphrase_inputs.iter().all(|p| !p.is_empty())
+    }
+
+    fn clear_nsec(&mut self) {
+        self.recovered_nsec = None;
+        self.clear_deadline = None;
+        self.nsec_visible = false;
     }
 
     pub fn has_active_timer(&self) -> bool {
@@ -194,7 +197,7 @@ impl State {
 
     pub fn recovery_succeeded(&mut self, nsec: Zeroizing<String>) {
         self.recovered_nsec = Some(nsec);
-        self.clear_deadline = Some(Instant::now() + std::time::Duration::from_secs(60));
+        self.clear_deadline = Some(Instant::now() + Duration::from_secs(60));
         self.loading = false;
         self.vault_slot = false;
         for input in &mut self.share_inputs {
@@ -309,10 +312,7 @@ impl State {
 
         content = content.push(Space::new().height(theme::space::MD));
 
-        let can_recover = !self.loading
-            && self.share_inputs.len() >= self.threshold as usize
-            && self.share_inputs.iter().all(|s| !s.trim().is_empty())
-            && self.passphrase_inputs.iter().all(|p| !p.is_empty());
+        let can_recover = self.can_recover();
 
         if self.loading {
             content = content.push(theme::label("Recovering..."));
