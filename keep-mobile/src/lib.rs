@@ -331,7 +331,7 @@ impl StateContext {
             .node
             .peer_status()
             .into_iter()
-            .map(|(share_index, status, name)| PeerInfo {
+            .map(|(share_index, status, name, _pubkey)| PeerInfo {
                 share_index,
                 name,
                 status: convert_peer_status(status),
@@ -524,7 +524,7 @@ impl KeepMobile {
 
             node.peer_status()
                 .into_iter()
-                .map(|(share_index, status, name)| PeerInfo {
+                .map(|(share_index, status, name, _pubkey)| PeerInfo {
                     share_index,
                     name,
                     status: convert_peer_status(status),

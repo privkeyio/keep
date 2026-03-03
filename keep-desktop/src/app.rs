@@ -1798,6 +1798,23 @@ impl App {
                 self.respond_to_sign_request(&id, false);
                 Task::none()
             }
+            relay::Event::SetPeerPolicy {
+                pubkey_hex,
+                allow_send,
+                allow_receive,
+            } => {
+                if let Some(node) = self.get_frost_node() {
+                    if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
+                        use keep_frost_net::PeerPolicy;
+                        node.set_peer_policy(
+                            PeerPolicy::new(pubkey)
+                                .allow_send(allow_send)
+                                .allow_receive(allow_receive),
+                        );
+                    }
+                }
+                Task::none()
+            }
         }
     }
 

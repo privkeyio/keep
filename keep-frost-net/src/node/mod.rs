@@ -510,12 +510,12 @@ impl KfpNode {
         self.peers.read().online_count()
     }
 
-    pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>)> {
+    pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
         self.peers
             .read()
             .all_peers()
             .iter()
-            .map(|p| (p.share_index, p.status.clone(), p.name.clone()))
+            .map(|p| (p.share_index, p.status.clone(), p.name.clone(), p.pubkey))
             .collect()
     }
 

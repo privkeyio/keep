@@ -94,6 +94,29 @@ pub struct PeerEntry {
     pub share_index: u16,
     pub name: Option<String>,
     pub online: bool,
+    pub pubkey_hex: String,
+    pub allow_send: bool,
+    pub allow_receive: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum EventLogType {
+    PeerJoined,
+    PeerLeft,
+    SignRequest,
+    SignComplete,
+    SignFailed,
+    EcdhComplete,
+    EcdhFailed,
+    Descriptor,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventLogEntry {
+    pub timestamp: u64,
+    pub event_type: EventLogType,
+    pub description: String,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +255,7 @@ pub enum FrostNodeMsg {
     NewSignRequest(PendingSignRequest),
     SignRequestRemoved(String),
     StatusChanged(ConnectionStatus),
+    EventLog(EventLogEntry),
     DescriptorContributionNeeded {
         session_id: [u8; 32],
         network: String,
@@ -281,6 +305,7 @@ impl fmt::Debug for FrostNodeMsg {
             Self::NewSignRequest(_) => f.write_str("NewSignRequest"),
             Self::SignRequestRemoved(id) => f.debug_tuple("SignRequestRemoved").field(id).finish(),
             Self::StatusChanged(s) => f.debug_tuple("StatusChanged").field(s).finish(),
+            Self::EventLog(_) => f.write_str("EventLog"),
             Self::DescriptorContributionNeeded { session_id, .. } => f
                 .debug_struct("DescriptorContributionNeeded")
                 .field("session_id", &hex::encode(session_id))
