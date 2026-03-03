@@ -1206,8 +1206,15 @@ impl App {
         &mut self,
         result: Result<Zeroizing<String>, String>,
     ) -> Task<Message> {
-        let Screen::Recovery(s) = &mut self.screen else {
-            return Task::none();
+        let s = match &mut self.screen {
+            Screen::Recovery(s) => s,
+            _ => {
+                if let Some((ref mut state, _)) = self.scanner_recovery {
+                    state
+                } else {
+                    return Task::none();
+                }
+            }
         };
         match result {
             Ok(nsec) => s.recovery_succeeded(nsec),

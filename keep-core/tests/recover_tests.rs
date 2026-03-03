@@ -5,6 +5,12 @@
 
 use keep_core::frost::{recover_nsec, ShareExport, ThresholdConfig, TrustedDealer};
 
+fn group_pubkey_from_export(bech32: &str) -> [u8; 32] {
+    let export = ShareExport::parse(bech32).unwrap();
+    let bytes = hex::decode(&export.group_pubkey).unwrap();
+    <[u8; 32]>::try_from(bytes.as_slice()).unwrap()
+}
+
 fn export_shares(passphrase: &str) -> Vec<String> {
     let config = ThresholdConfig::two_of_three();
     let dealer = TrustedDealer::new(config);
@@ -72,6 +78,28 @@ fn recover_nsec_mismatched_groups() {
     let result = recover_nsec(&mixed, &[passphrase, passphrase], None);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("same group"));
+}
+
+#[test]
+fn recover_nsec_expected_pubkey_match() {
+    let passphrase = "test-passphrase";
+    let exports = export_shares(passphrase);
+    let group_pk = group_pubkey_from_export(&exports[0]);
+
+    let nsec = recover_nsec(&exports[..2], &[passphrase; 2], Some(&group_pk)).unwrap();
+    assert!(nsec.starts_with("nsec1"));
+}
+
+#[test]
+fn recover_nsec_expected_pubkey_mismatch() {
+    let passphrase = "test-passphrase";
+    let exports_a = export_shares(passphrase);
+    let exports_b = export_shares(passphrase);
+    let wrong_pk = group_pubkey_from_export(&exports_b[0]);
+
+    let result = recover_nsec(&exports_a[..2], &[passphrase; 2], Some(&wrong_pk));
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("match"));
 }
 
 #[test]
