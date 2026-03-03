@@ -49,6 +49,7 @@ pub enum Event {
     Recover {
         share_data: Vec<Zeroizing<String>>,
         passphrases: Vec<Zeroizing<String>>,
+        expected_group_pubkey: [u8; 32],
     },
     CopyToClipboard(Zeroizing<String>),
 }
@@ -60,6 +61,7 @@ pub struct State {
     threshold: u16,
     total_shares: u16,
     group_display: String,
+    group_pubkey: [u8; 32],
     recovered_nsec: Option<Zeroizing<String>>,
     clear_deadline: Option<Instant>,
     nsec_visible: bool,
@@ -68,7 +70,12 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(threshold: u16, total_shares: u16, group_display: String) -> Self {
+    pub fn new(
+        threshold: u16,
+        total_shares: u16,
+        group_display: String,
+        group_pubkey: [u8; 32],
+    ) -> Self {
         let count = threshold as usize;
         Self {
             share_inputs: vec![Zeroizing::new(String::new()); count],
@@ -77,6 +84,7 @@ impl State {
             threshold,
             total_shares,
             group_display,
+            group_pubkey,
             recovered_nsec: None,
             clear_deadline: None,
             nsec_visible: false,
@@ -128,11 +136,15 @@ impl State {
                 if !ready {
                     return None;
                 }
+                self.recovered_nsec = None;
+                self.clear_deadline = None;
+                self.nsec_visible = false;
                 self.loading = true;
                 self.error = None;
                 Some(Event::Recover {
                     share_data: self.share_inputs.clone(),
                     passphrases: self.passphrase_inputs.clone(),
+                    expected_group_pubkey: self.group_pubkey,
                 })
             }
             Message::ToggleNsecVisibility => {

@@ -157,6 +157,7 @@ pub struct App {
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
     scanner_recovery: Option<(recovery::State, usize)>,
+    last_recovery_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
 }
@@ -571,6 +572,7 @@ impl App {
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             scanner_recovery: None,
+            last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
@@ -1009,8 +1011,12 @@ impl App {
                 group_pubkey,
                 identifier,
             } => {
-                self.screen =
-                    Screen::Recovery(recovery::State::new(threshold, total_shares, group_display));
+                self.screen = Screen::Recovery(recovery::State::new(
+                    threshold,
+                    total_shares,
+                    group_display,
+                    group_pubkey,
+                ));
                 let keep_arc = self.keep.clone();
                 Task::perform(
                     async move {
@@ -1152,7 +1158,8 @@ impl App {
             recovery::Event::Recover {
                 share_data,
                 passphrases,
-            } => self.handle_recover_nsec(share_data, passphrases),
+                expected_group_pubkey,
+            } => self.handle_recover_nsec(share_data, passphrases, expected_group_pubkey),
             recovery::Event::CopyToClipboard(text) => self.handle_copy_sensitive(text),
         }
     }
@@ -1161,12 +1168,32 @@ impl App {
         &mut self,
         share_data: Vec<Zeroizing<String>>,
         passphrases: Vec<Zeroizing<String>>,
+        expected_group_pubkey: [u8; 32],
     ) -> Task<Message> {
+        const RECOVERY_COOLDOWN: Duration = Duration::from_secs(5);
+        if self
+            .last_recovery_attempt
+            .is_some_and(|t| t.elapsed() < RECOVERY_COOLDOWN)
+        {
+            if let Screen::Recovery(s) = &mut self.screen {
+                s.recovery_failed("Please wait before trying again".to_string());
+            }
+            return Task::none();
+        }
+        self.last_recovery_attempt = Some(Instant::now());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    keep_core::frost::recover_nsec(&share_data, &passphrases)
-                        .map_err(|e| e.to_string())
+                    let nsec = keep_core::frost::recover_nsec(&share_data, &passphrases)
+                        .map_err(|e| e.to_string())?;
+                    let keypair = keep_core::keys::NostrKeypair::from_nsec(&nsec)
+                        .map_err(|e| e.to_string())?;
+                    if *keypair.public_bytes() != expected_group_pubkey {
+                        return Err(
+                            "Recovered key does not match expected group".to_string()
+                        );
+                    }
+                    Ok(nsec)
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -3421,6 +3448,7 @@ impl App {
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             scanner_recovery: None,
+            last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
