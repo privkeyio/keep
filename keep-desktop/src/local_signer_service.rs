@@ -196,9 +196,6 @@ impl App {
                     log: VecDeque::new(),
                 });
 
-                self.settings.local_signer_auto_start = true;
-                save_settings(&self.keep_path, &self.settings);
-
                 if let Screen::LocalSigner(s) = &mut self.screen {
                     s.running = true;
                     s.starting = false;
@@ -226,6 +223,7 @@ impl App {
 
         if let Some(ls) = self.local_signer.take() {
             ls.handle.abort();
+            let _ = std::fs::remove_file(&ls.socket_path);
         }
     }
 
@@ -362,11 +360,12 @@ impl App {
                 };
                 if let (Some(id), Some(ref ls)) = (client_id, &self.local_signer) {
                     let handler = ls.handler.clone();
+                    let cid = id.clone();
                     return Task::perform(
                         async move {
                             let app_pubkey = keep_nip46::LocalServer::pseudo_pubkey_for(&id);
                             handler.revoke_client(&app_pubkey).await;
-                            Ok::<(), String>(())
+                            Ok::<String, String>(cid)
                         },
                         Message::LocalSignerRevokeResult,
                     );

@@ -93,6 +93,12 @@ impl LocalServer {
         let _ = std::fs::remove_file(&self.socket_path);
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(KeepError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    .map_err(KeepError::Io)?;
+            }
         }
 
         let listener = tokio::net::UnixListener::bind(&self.socket_path)
@@ -101,10 +107,11 @@ impl LocalServer {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
+            std::fs::set_permissions(
                 &self.socket_path,
                 std::fs::Permissions::from_mode(0o600),
-            );
+            )
+            .map_err(KeepError::Io)?;
         }
 
         info!(path = %self.socket_path.display(), "local signer listening");
@@ -139,17 +146,16 @@ async fn handle_connection(
     let client_id = next_client_id();
     let app_pubkey = LocalServer::pseudo_pubkey_for(&client_id);
 
-    if let Some(ref cb) = callbacks {
-        cb.on_connect(&client_id, &client_id);
-    }
-
-    let perms = "get_public_key,sign_event,nip44_encrypt,nip44_decrypt,nip04_encrypt,nip04_decrypt";
     if let Err(e) = handler
-        .register_client(app_pubkey, client_id.clone(), Some(perms))
+        .register_client(app_pubkey, client_id.clone(), Some("get_public_key"))
         .await
     {
         warn!(error = %e, client = %client_id, "failed to register local client");
         return Ok(());
+    }
+
+    if let Some(ref cb) = callbacks {
+        cb.on_connect(&client_id, &client_id);
     }
 
     let user_pubkey = handler
@@ -178,6 +184,26 @@ async fn handle_connection(
             }
         };
 
+        if request.id.len() > 64
+            || !request
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            let err = r#"{"id":"","error":"invalid request ID"}"#;
+            let _ = write_half.write_all(err.as_bytes()).await;
+            let _ = write_half.write_all(b"\n").await;
+            continue;
+        }
+
+        const MAX_NIP46_PARAMS: usize = 10;
+        if request.params.len() > MAX_NIP46_PARAMS {
+            let err = r#"{"id":"","error":"too many request params"}"#;
+            let _ = write_half.write_all(err.as_bytes()).await;
+            let _ = write_half.write_all(b"\n").await;
+            continue;
+        }
+
         let method = request.method.clone();
         let response = dispatch_request(
             &handler,
@@ -204,6 +230,7 @@ async fn handle_connection(
         }
     }
 
+    handler.revoke_client(&app_pubkey).await;
     info!(client = %client_id, "local client disconnected");
     Ok(())
 }

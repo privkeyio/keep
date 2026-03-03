@@ -183,7 +183,7 @@ pub enum Message {
     NavigateLocalSigner,
     LocalSigner(crate::screen::local_signer::Message),
     LocalSignerStartResult(Result<String, String>),
-    LocalSignerRevokeResult(Result<(), String>),
+    LocalSignerRevokeResult(Result<String, String>),
 
     // Signing Audit
     NavigateAudit,

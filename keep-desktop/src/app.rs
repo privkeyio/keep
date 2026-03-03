@@ -735,9 +735,19 @@ impl App {
                 self.handle_local_signer_start_result(result)
             }
             Message::LocalSignerRevokeResult(result) => {
-                if let Err(e) = result {
-                    if let Screen::LocalSigner(s) = &mut self.screen {
-                        s.error = Some(e);
+                match result {
+                    Ok(client_id) => {
+                        if let Some(ref mut ls) = self.local_signer {
+                            ls.clients.retain(|c| c.client_id != client_id);
+                        }
+                        if let Screen::LocalSigner(s) = &mut self.screen {
+                            s.clients.retain(|c| c.client_id != client_id);
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::LocalSigner(s) = &mut self.screen {
+                            s.error = Some(e);
+                        }
                     }
                 }
                 Task::none()
