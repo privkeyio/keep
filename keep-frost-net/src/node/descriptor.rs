@@ -111,7 +111,7 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_receive_from(&p.pubkey))
+                .filter(|p| self.can_send_to(&p.pubkey))
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -161,6 +161,12 @@ impl KfpNode {
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor proposals"
+            )));
         }
 
         if !payload.is_within_replay_window(self.replay_window_secs) {
@@ -358,6 +364,12 @@ impl KfpNode {
             return Ok(());
         }
 
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor contributions"
+            )));
+        }
+
         if !payload.is_within_replay_window(self.replay_window_secs) {
             return Err(FrostNetError::ReplayDetected(
                 "Descriptor contribution outside replay window".into(),
@@ -440,7 +452,7 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_receive_from(&p.pubkey))
+                .filter(|p| self.can_send_to(&p.pubkey))
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -486,6 +498,12 @@ impl KfpNode {
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor finalizations"
+            )));
         }
 
         if !payload.is_within_replay_window(self.replay_window_secs) {
@@ -749,6 +767,12 @@ impl KfpNode {
             return Ok(());
         }
 
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor nacks"
+            )));
+        }
+
         if !payload.is_within_replay_window(self.replay_window_secs) {
             return Err(FrostNetError::ReplayDetected(
                 "Descriptor NACK outside replay window".into(),
@@ -811,6 +835,12 @@ impl KfpNode {
     ) -> Result<()> {
         if payload.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor acks"
+            )));
         }
 
         if !payload.is_within_replay_window(self.replay_window_secs) {

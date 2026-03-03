@@ -8,11 +8,13 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input,
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
-use crate::message::{ConnectionStatus, EventLogEntry, EventLogType, PeerEntry, PendingSignRequest};
+use crate::message::{
+    ConnectionStatus, EventLogEntry, EventLogType, PeerEntry, PendingSignRequest,
+};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
-const MAX_EVENT_LOG: usize = 200;
+pub(crate) const MAX_EVENT_LOG: usize = 200;
 
 #[derive(Clone)]
 pub enum Message {
@@ -83,6 +85,7 @@ impl State {
         status: ConnectionStatus,
         peers: Vec<PeerEntry>,
         pending_requests: Vec<PendingSignRequest>,
+        event_log: VecDeque<EventLogEntry>,
     ) -> Self {
         let selected = if shares.len() == 1 { Some(0) } else { None };
         Self {
@@ -94,7 +97,7 @@ impl State {
             status,
             peers,
             pending_requests,
-            event_log: VecDeque::new(),
+            event_log,
             event_log_visible: true,
         }
     }
@@ -133,27 +136,19 @@ impl State {
                 self.event_log_visible = !self.event_log_visible;
                 None
             }
-            Message::TogglePeerSend(share_index) => {
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.share_index == share_index) {
+            Message::TogglePeerSend(idx) | Message::TogglePeerReceive(idx) => {
+                let is_send = matches!(message, Message::TogglePeerSend(_));
+                let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
+                if is_send {
                     peer.allow_send = !peer.allow_send;
-                    return Some(Event::SetPeerPolicy {
-                        pubkey_hex: peer.pubkey_hex.clone(),
-                        allow_send: peer.allow_send,
-                        allow_receive: peer.allow_receive,
-                    });
-                }
-                None
-            }
-            Message::TogglePeerReceive(share_index) => {
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.share_index == share_index) {
+                } else {
                     peer.allow_receive = !peer.allow_receive;
-                    return Some(Event::SetPeerPolicy {
-                        pubkey_hex: peer.pubkey_hex.clone(),
-                        allow_send: peer.allow_send,
-                        allow_receive: peer.allow_receive,
-                    });
                 }
-                None
+                Some(Event::SetPeerPolicy {
+                    pubkey_hex: peer.pubkey_hex.clone(),
+                    allow_send: peer.allow_send,
+                    allow_receive: peer.allow_receive,
+                })
             }
         }
     }
@@ -207,6 +202,21 @@ impl State {
             .into()
     }
 
+    fn badge_style(
+        color: iced::Color,
+        radius: f32,
+    ) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+        move |_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(iced::Color { a: 0.15, ..color })),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: radius.into(),
+            },
+            ..Default::default()
+        }
+    }
+
     fn status_badge(&self) -> Element<'_, Message> {
         let (label, color) = match &self.status {
             ConnectionStatus::Disconnected => ("Disconnected", theme::color::TEXT_DIM),
@@ -216,15 +226,7 @@ impl State {
         };
 
         container(text(label).size(theme::size::SMALL).color(color))
-            .style(move |_: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color { a: 0.15, ..color })),
-                border: iced::Border {
-                    color,
-                    width: 1.0,
-                    radius: 12.0.into(),
-                },
-                ..Default::default()
-            })
+            .style(Self::badge_style(color, 12.0))
             .padding([2.0, theme::space::SM])
             .into()
     }
@@ -360,11 +362,7 @@ impl State {
         }
     }
 
-    fn policy_toggle(
-        label_text: &str,
-        enabled: bool,
-        on_press: Message,
-    ) -> Element<'_, Message> {
+    fn policy_toggle(label_text: &str, enabled: bool, on_press: Message) -> Element<'_, Message> {
         let (style, indicator): (
             fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
             &str,
@@ -373,13 +371,11 @@ impl State {
         } else {
             (theme::secondary_button, "OFF")
         };
-        button(
-            text(format!("{label_text} {indicator}")).size(theme::size::TINY),
-        )
-        .style(style)
-        .on_press(on_press)
-        .padding([2.0, theme::space::SM])
-        .into()
+        button(text(format!("{label_text} {indicator}")).size(theme::size::TINY))
+            .style(style)
+            .on_press(on_press)
+            .padding([2.0, theme::space::SM])
+            .into()
     }
 
     fn peers_section(&self) -> Element<'_, Message> {
@@ -491,10 +487,12 @@ impl State {
                 );
             } else {
                 for entry in self.event_log.iter().rev() {
-                    let ts =
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(entry.timestamp as i64, 0)
-                            .map(|dt| dt.format("%H:%M:%S").to_string())
-                            .unwrap_or_default();
+                    let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        i64::try_from(entry.timestamp).unwrap_or(0),
+                        0,
+                    )
+                    .map(|dt| dt.format("%H:%M:%S").to_string())
+                    .unwrap_or_default();
 
                     let (badge_text, badge_color) = Self::event_type_badge(&entry.event_type);
 
@@ -502,24 +500,9 @@ impl State {
                         text(ts)
                             .size(theme::size::TINY)
                             .color(theme::color::TEXT_DIM),
-                        container(
-                            text(badge_text)
-                                .size(theme::size::TINY)
-                                .color(badge_color),
-                        )
-                        .style(move |_: &iced::Theme| iced::widget::container::Style {
-                            background: Some(iced::Background::Color(iced::Color {
-                                a: 0.15,
-                                ..badge_color
-                            })),
-                            border: iced::Border {
-                                color: badge_color,
-                                width: 1.0,
-                                radius: 4.0.into(),
-                            },
-                            ..Default::default()
-                        })
-                        .padding([1.0, theme::space::XS]),
+                        container(text(badge_text).size(theme::size::TINY).color(badge_color),)
+                            .style(Self::badge_style(badge_color, 4.0))
+                            .padding([1.0, theme::space::XS]),
                         text(&entry.description)
                             .size(theme::size::TINY)
                             .color(theme::color::TEXT_MUTED),
@@ -531,8 +514,7 @@ impl State {
                 }
             }
 
-            section =
-                section.push(scrollable(log_list).height(Length::Fixed(200.0)));
+            section = section.push(scrollable(log_list).height(Length::Fixed(200.0)));
         }
 
         container(section)
@@ -546,9 +528,12 @@ impl State {
         let mut request_list = column![].spacing(theme::space::SM);
 
         for req in &self.pending_requests {
-            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(req.timestamp as i64, 0)
-                .map(|dt| dt.format("%H:%M:%S").to_string())
-                .unwrap_or_default();
+            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                i64::try_from(req.timestamp).unwrap_or(0),
+                0,
+            )
+            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
 
             let source = if req.from_peer == 0 {
                 "Signing request".to_string()
