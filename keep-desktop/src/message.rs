@@ -145,7 +145,7 @@ pub enum Message {
 
     // Recovery
     Recovery(crate::screen::recovery::Message),
-    RecoveryResult(Result<String, String>),
+    RecoveryResult(Result<Zeroizing<String>, String>),
 
     // Import
     Import(crate::screen::import::Message),

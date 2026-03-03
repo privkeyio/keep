@@ -1125,10 +1125,11 @@ impl App {
 
                     let mut key_packages = Vec::with_capacity(share_data.len());
                     let mut group_pubkey: Option<String> = None;
+                    let mut seen_identifiers: Vec<u16> = Vec::new();
 
                     for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
-                        let export =
-                            ShareExport::parse(data).map_err(|e| format!("Invalid share: {e}"))?;
+                        let export = ShareExport::parse(data)
+                            .map_err(|_| "Invalid share format".to_string())?;
 
                         match &group_pubkey {
                             None => group_pubkey = Some(export.group_pubkey.clone()),
@@ -1138,23 +1139,46 @@ impl App {
                             _ => {}
                         }
 
+                        if seen_identifiers.contains(&export.identifier) {
+                            return Err(
+                                "Duplicate share detected \u{2014} each share must be unique"
+                                    .to_string(),
+                            );
+                        }
+                        seen_identifiers.push(export.identifier);
+
                         let share = export
                             .to_share(passphrase.as_str(), "recovery")
-                            .map_err(|e| format!("Failed to decrypt share: {e}"))?;
-                        key_packages.push(share.key_package().map_err(|e| format!("{e}"))?);
+                            .map_err(|_| "Failed to decrypt share (wrong passphrase?)".to_string())?;
+                        key_packages.push(
+                            share
+                                .key_package()
+                                .map_err(|_| "Invalid share data".to_string())?,
+                        );
                     }
 
-                    let signing_key = frost_secp256k1_tr::keys::reconstruct(&key_packages)
-                        .map_err(|e| format!("Reconstruction failed: {e}"))?;
+                    let reconstruct_result =
+                        frost_secp256k1_tr::keys::reconstruct(&key_packages);
+                    key_packages.zeroize();
+
+                    let signing_key = reconstruct_result
+                        .map_err(|_| "Reconstruction failed".to_string())?;
 
                     let mut secret_bytes: Vec<u8> = signing_key.serialize();
-                    let mut secret_arr = <[u8; 32]>::try_from(secret_bytes.as_slice())
-                        .map_err(|_| "Invalid secret key length".to_string())?;
+                    let secret_arr_result = <[u8; 32]>::try_from(secret_bytes.as_slice());
+                    if secret_arr_result.is_err() {
+                        secret_bytes.zeroize();
+                        return Err("Invalid secret key length".to_string());
+                    }
+                    let mut secret_arr = secret_arr_result.unwrap();
                     secret_bytes.zeroize();
 
-                    let keypair = keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr)
-                        .map_err(|e| format!("{e}"))?;
-                    Ok(keypair.to_nsec())
+                    let keypair_result =
+                        keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr);
+                    match keypair_result {
+                        Ok(keypair) => Ok(Zeroizing::new(keypair.to_nsec())),
+                        Err(_) => Err("Failed to derive key".to_string()),
+                    }
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -1163,7 +1187,10 @@ impl App {
         )
     }
 
-    fn handle_recovery_result(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_recovery_result(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+    ) -> Task<Message> {
         let Screen::Recovery(s) = &mut self.screen else {
             return Task::none();
         };

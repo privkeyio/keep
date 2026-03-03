@@ -145,9 +145,15 @@ impl State {
         }
     }
 
-    pub fn recovery_succeeded(&mut self, nsec: String) {
-        self.recovered_nsec = Some(Zeroizing::new(nsec));
+    pub fn recovery_succeeded(&mut self, nsec: Zeroizing<String>) {
+        self.recovered_nsec = Some(nsec);
         self.loading = false;
+        for input in &mut self.share_inputs {
+            *input = Zeroizing::new(String::new());
+        }
+        for input in &mut self.passphrase_inputs {
+            *input = Zeroizing::new(String::new());
+        }
     }
 
     pub fn recovery_failed(&mut self, error: String) {
