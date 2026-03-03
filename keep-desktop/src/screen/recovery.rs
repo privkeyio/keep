@@ -15,6 +15,7 @@ pub enum Message {
     PassphraseChanged(usize, Zeroizing<String>),
     AddShareInput,
     RemoveShareInput(usize),
+    ScanShare(usize),
     Recover,
     ToggleNsecVisibility,
     CopyNsec,
@@ -29,6 +30,7 @@ impl fmt::Debug for Message {
             Self::PassphraseChanged(i, _) => f.debug_tuple("PassphraseChanged").field(i).finish(),
             Self::AddShareInput => f.write_str("AddShareInput"),
             Self::RemoveShareInput(i) => f.debug_tuple("RemoveShareInput").field(i).finish(),
+            Self::ScanShare(i) => f.debug_tuple("ScanShare").field(i).finish(),
             Self::Recover => f.write_str("Recover"),
             Self::ToggleNsecVisibility => f.write_str("ToggleNsecVisibility"),
             Self::CopyNsec => f.write_str("CopyNsec"),
@@ -40,6 +42,7 @@ impl fmt::Debug for Message {
 
 pub enum Event {
     GoBack,
+    ScanShare(usize),
     Recover {
         share_data: Vec<Zeroizing<String>>,
         passphrases: Vec<Zeroizing<String>>,
@@ -105,6 +108,13 @@ impl State {
                 }
                 None
             }
+            Message::ScanShare(i) => {
+                if i < self.share_inputs.len() {
+                    Some(Event::ScanShare(i))
+                } else {
+                    None
+                }
+            }
             Message::Recover => {
                 let ready = !self.loading
                     && (self.share_inputs.len() as u16) >= self.threshold
@@ -134,6 +144,12 @@ impl State {
                 None
             }
             Message::GoBack => Some(Event::GoBack),
+        }
+    }
+
+    pub fn set_share_input(&mut self, slot: usize, data: Zeroizing<String>) {
+        if let Some(input) = self.share_inputs.get_mut(slot) {
+            *input = data;
         }
     }
 
@@ -228,6 +244,14 @@ impl State {
             let mut share_row = row![share_input, pass_input]
                 .spacing(theme::space::SM)
                 .align_y(Alignment::Center);
+
+            if !is_vault {
+                let scan_btn = button(text("Scan").size(theme::size::SMALL))
+                    .on_press(Message::ScanShare(i))
+                    .style(theme::secondary_button)
+                    .padding([theme::space::XS, theme::space::SM]);
+                share_row = share_row.push(scan_btn);
+            }
 
             if self.share_inputs.len() > 1 && !is_vault {
                 let remove_btn = button(text("x").size(theme::size::SMALL))

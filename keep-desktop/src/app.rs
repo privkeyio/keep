@@ -156,6 +156,7 @@ pub struct App {
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
+    scanner_recovery: Option<(recovery::State, usize)>,
     cached_share_count: usize,
     cached_nsec_count: usize,
 }
@@ -569,6 +570,7 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            scanner_recovery: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
@@ -1131,6 +1133,17 @@ impl App {
         };
         match event {
             recovery::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            recovery::Event::ScanShare(slot) => {
+                if let Screen::Recovery(state) = std::mem::replace(
+                    &mut self.screen,
+                    Screen::ShareList(shares::State::new(vec![], None)),
+                ) {
+                    self.scanner_recovery = Some((state, slot));
+                }
+                self.stop_scanner();
+                self.open_scanner();
+                Task::none()
+            }
             recovery::Event::Recover {
                 share_data,
                 passphrases,
@@ -1194,7 +1207,11 @@ impl App {
         match event {
             scanner::Event::Close => {
                 self.stop_scanner();
-                self.screen = Screen::Import(import::State::new());
+                if let Some((state, _)) = self.scanner_recovery.take() {
+                    self.screen = Screen::Recovery(state);
+                } else {
+                    self.screen = Screen::Import(import::State::new());
+                }
                 Task::none()
             }
             scanner::Event::Retry => {
@@ -1270,8 +1287,13 @@ impl App {
                         if let Some(result) = s.process_qr_content(&content) {
                             s.stop_camera();
                             self.scanner_rx = None;
-                            let import = import::State::with_data(result);
-                            self.screen = Screen::Import(import);
+                            if let Some((mut state, slot)) = self.scanner_recovery.take() {
+                                state.set_share_input(slot, Zeroizing::new(result));
+                                self.screen = Screen::Recovery(state);
+                            } else {
+                                let import = import::State::with_data(result);
+                                self.screen = Screen::Import(import);
+                            }
                         }
                     }
                 }
@@ -3393,6 +3415,7 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            scanner_recovery: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
