@@ -734,8 +734,7 @@ impl Keep {
                 .peer_policies
                 .iter()
                 .filter(|p| {
-                    p.pubkey_hex.len() == 64
-                        && p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+                    p.pubkey_hex.len() == 64 && p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
                 })
                 .map(|p| relay::PeerPolicyEntry {
                     pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
