@@ -1120,72 +1120,8 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    use zeroize::Zeroize;
-
-                    let mut key_packages = Vec::with_capacity(share_data.len());
-                    let mut group_pubkey: Option<String> = None;
-                    let mut seen_identifiers: Vec<u16> = Vec::new();
-
-                    let parse_result: Result<(), String> = (|| {
-                        for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
-                            let export = ShareExport::parse(data)
-                                .map_err(|_| "Invalid share format".to_string())?;
-
-                            match &group_pubkey {
-                                None => group_pubkey = Some(export.group_pubkey.clone()),
-                                Some(gp) if *gp != export.group_pubkey => {
-                                    return Err(
-                                        "All shares must belong to the same group".to_string(),
-                                    );
-                                }
-                                _ => {}
-                            }
-
-                            if seen_identifiers.contains(&export.identifier) {
-                                return Err(
-                                    "Duplicate share detected \u{2014} each share must be unique"
-                                        .to_string(),
-                                );
-                            }
-                            seen_identifiers.push(export.identifier);
-
-                            let share = export.to_share(passphrase.as_str(), "recovery").map_err(
-                                |_| "Failed to decrypt share (wrong passphrase?)".to_string(),
-                            )?;
-                            key_packages.push(
-                                share
-                                    .key_package()
-                                    .map_err(|_| "Invalid share data".to_string())?,
-                            );
-                        }
-                        Ok(())
-                    })();
-
-                    if let Err(e) = parse_result {
-                        key_packages.zeroize();
-                        return Err(e);
-                    }
-
-                    let reconstruct_result =
-                        frost_secp256k1_tr::keys::reconstruct(&key_packages);
-                    key_packages.zeroize();
-
-                    let signing_key = reconstruct_result
-                        .map_err(|_| "Reconstruction failed".to_string())?;
-
-                    let mut secret_bytes: Vec<u8> = signing_key.serialize();
-                    let Ok(mut secret_arr) = <[u8; 32]>::try_from(secret_bytes.as_slice()) else {
-                        secret_bytes.zeroize();
-                        return Err("Invalid secret key length".to_string());
-                    };
-                    secret_bytes.zeroize();
-
-                    let keypair_result =
-                        keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr);
-                    secret_arr.zeroize();
-                    keypair_result
-                        .map(|kp| Zeroizing::new(kp.to_nsec()))
-                        .map_err(|_| "Failed to derive key".to_string())
+                    keep_core::frost::recover_nsec(&share_data, &passphrases)
+                        .map_err(|e| e.to_string())
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
