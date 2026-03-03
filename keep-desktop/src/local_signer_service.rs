@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iced::Task;
@@ -85,6 +86,8 @@ pub(crate) struct LocalSignerSetup {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
+pub(crate) type PendingSetup = (Arc<Mutex<Option<LocalSignerSetup>>>, Arc<AtomicBool>);
+
 pub(crate) struct RunningLocalSigner {
     pub socket_path: String,
     pub handler: Arc<keep_nip46::SignerHandler>,
@@ -123,8 +126,9 @@ impl App {
         let keep_arc = self.keep.clone();
         let kill_switch = self.kill_switch.clone();
         let socket_path = self.local_signer_socket_path();
+        let cancelled = Arc::new(AtomicBool::new(false));
         let setup_arc: Arc<Mutex<Option<LocalSignerSetup>>> = Arc::new(Mutex::new(None));
-        self.local_signer_pending_setup = Some(setup_arc.clone());
+        self.local_signer_pending_setup = Some((setup_arc.clone(), cancelled.clone()));
 
         Task::perform(
             async move {
@@ -132,6 +136,10 @@ impl App {
                     .await
                     .map_err(|_| "Background task failed".to_string())?
                     .map_err(|e| e.to_string())?;
+
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("Startup cancelled".to_string());
+                }
 
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
@@ -146,6 +154,10 @@ impl App {
                 let server =
                     keep_nip46::LocalServer::new(keyring, socket_path, Some(callbacks), config)
                         .map_err(|e| format!("Failed to start local signer: {e}"))?;
+
+                if cancelled.load(Ordering::Acquire) {
+                    return Err("Startup cancelled".to_string());
+                }
 
                 let handler = server.handler();
                 let handle = tokio::spawn(async move {
@@ -175,7 +187,7 @@ impl App {
                 let setup = self
                     .local_signer_pending_setup
                     .take()
-                    .and_then(|arc| arc.lock().ok().and_then(|mut g| g.take()));
+                    .and_then(|(arc, _)| arc.lock().ok().and_then(|mut g| g.take()));
 
                 let Some(setup) = setup else {
                     if let Screen::LocalSigner(s) = &mut self.screen {
@@ -221,7 +233,9 @@ impl App {
     }
 
     pub(crate) fn stop_local_signer(&mut self) {
-        self.local_signer_pending_setup = None;
+        if let Some((_, cancelled)) = self.local_signer_pending_setup.take() {
+            cancelled.store(true, Ordering::Release);
+        }
 
         if let Some(tx) = self.local_signer_approval_tx.take() {
             let _ = tx.send(false);

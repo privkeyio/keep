@@ -150,8 +150,7 @@ pub struct App {
     pub(crate) local_signer_pending_approval:
         Option<crate::screen::local_signer::PendingApprovalDisplay>,
     #[cfg(unix)]
-    pub(crate) local_signer_pending_setup:
-        Option<Arc<Mutex<Option<crate::local_signer_service::LocalSignerSetup>>>>,
+    pub(crate) local_signer_pending_setup: Option<crate::local_signer_service::PendingSetup>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) proxy_enabled: bool,
     pub(crate) proxy_port: u16,
