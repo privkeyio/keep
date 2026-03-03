@@ -1127,34 +1127,44 @@ impl App {
                     let mut group_pubkey: Option<String> = None;
                     let mut seen_identifiers: Vec<u16> = Vec::new();
 
-                    for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
-                        let export = ShareExport::parse(data)
-                            .map_err(|_| "Invalid share format".to_string())?;
+                    let loop_result: Result<(), String> = (|| {
+                        for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
+                            let export = ShareExport::parse(data)
+                                .map_err(|_| "Invalid share format".to_string())?;
 
-                        match &group_pubkey {
-                            None => group_pubkey = Some(export.group_pubkey.clone()),
-                            Some(gp) if *gp != export.group_pubkey => {
-                                return Err("All shares must belong to the same group".to_string());
+                            match &group_pubkey {
+                                None => group_pubkey = Some(export.group_pubkey.clone()),
+                                Some(gp) if *gp != export.group_pubkey => {
+                                    return Err(
+                                        "All shares must belong to the same group".to_string(),
+                                    );
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        }
 
-                        if seen_identifiers.contains(&export.identifier) {
-                            return Err(
-                                "Duplicate share detected \u{2014} each share must be unique"
-                                    .to_string(),
+                            if seen_identifiers.contains(&export.identifier) {
+                                return Err(
+                                    "Duplicate share detected \u{2014} each share must be unique"
+                                        .to_string(),
+                                );
+                            }
+                            seen_identifiers.push(export.identifier);
+
+                            let share = export.to_share(passphrase.as_str(), "recovery").map_err(
+                                |_| "Failed to decrypt share (wrong passphrase?)".to_string(),
+                            )?;
+                            key_packages.push(
+                                share
+                                    .key_package()
+                                    .map_err(|_| "Invalid share data".to_string())?,
                             );
                         }
-                        seen_identifiers.push(export.identifier);
+                        Ok(())
+                    })();
 
-                        let share = export
-                            .to_share(passphrase.as_str(), "recovery")
-                            .map_err(|_| "Failed to decrypt share (wrong passphrase?)".to_string())?;
-                        key_packages.push(
-                            share
-                                .key_package()
-                                .map_err(|_| "Invalid share data".to_string())?,
-                        );
+                    if let Err(e) = loop_result {
+                        key_packages.zeroize();
+                        return Err(e);
                     }
 
                     let reconstruct_result =
@@ -1175,6 +1185,7 @@ impl App {
 
                     let keypair_result =
                         keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr);
+                    secret_arr.zeroize();
                     match keypair_result {
                         Ok(keypair) => Ok(Zeroizing::new(keypair.to_nsec())),
                         Err(_) => Err("Failed to derive key".to_string()),
