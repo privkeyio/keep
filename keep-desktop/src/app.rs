@@ -3922,6 +3922,7 @@ mod tests {
         assert_eq!(parsed.clipboard_clear_secs, 10);
         assert!(!parsed.minimize_to_tray);
         assert!(parsed.start_minimized);
+        assert!(!parsed.local_signer_auto_start);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub(crate) enum LocalSignerEvent {
         display: PendingApprovalDisplay,
         response_tx: std::sync::mpsc::Sender<bool>,
     },
+    ApprovalTimeout,
     Connected {
         client_id: String,
         name: String,
@@ -65,10 +66,13 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         {
             return false;
         }
-        tokio::task::block_in_place(|| {
-            response_rx
-                .recv_timeout(BUNKER_APPROVAL_TIMEOUT)
-                .unwrap_or(false)
+        let tx = self.tx.clone();
+        tokio::task::block_in_place(|| match response_rx.recv_timeout(BUNKER_APPROVAL_TIMEOUT) {
+            Ok(approved) => approved,
+            Err(_) => {
+                let _ = tx.send(LocalSignerEvent::ApprovalTimeout);
+                false
+            }
         })
     }
 
@@ -165,6 +169,11 @@ impl App {
                         tracing::error!(error = %e, "local signer error");
                     }
                 });
+
+                if cancelled.load(Ordering::Acquire) {
+                    handle.abort();
+                    return Err("Startup cancelled".to_string());
+                }
 
                 let mut guard = setup_arc.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(LocalSignerSetup {
@@ -364,6 +373,13 @@ impl App {
                     self.local_signer_approval_tx = Some(response_tx);
                     if let Screen::LocalSigner(s) = &mut self.screen {
                         s.pending_approval = Some(display);
+                    }
+                }
+                LocalSignerEvent::ApprovalTimeout => {
+                    self.local_signer_approval_tx = None;
+                    self.local_signer_pending_approval = None;
+                    if let Screen::LocalSigner(s) = &mut self.screen {
+                        s.approval_cleared();
                     }
                 }
             }
