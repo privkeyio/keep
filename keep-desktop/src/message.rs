@@ -143,6 +143,10 @@ pub enum Message {
     ExportNcryptsec(crate::screen::export_ncryptsec::Message),
     NcryptsecGenerated(Result<ExportData, String>),
 
+    // Recovery
+    Recovery(crate::screen::recovery::Message),
+    RecoveryResult(Result<String, String>),
+
     // Import
     Import(crate::screen::import::Message),
     ImportResult(Result<(Vec<ShareEntry>, String), String>),
@@ -345,6 +349,11 @@ impl fmt::Debug for Message {
             Self::Export(msg) => f.debug_tuple("Export").field(msg).finish(),
             Self::ExportNcryptsec(msg) => f.debug_tuple("ExportNcryptsec").field(msg).finish(),
             Self::Import(msg) => f.debug_tuple("Import").field(msg).finish(),
+            Self::Recovery(msg) => f.debug_tuple("Recovery").field(msg).finish(),
+            Self::RecoveryResult(r) => f
+                .debug_tuple("RecoveryResult")
+                .field(&r.as_ref().map(|_| "***").map_err(|e| e.as_str()))
+                .finish(),
             Self::ExportGenerated(_) => f.write_str("ExportGenerated(***)"),
             Self::UnlockResult(r) => f
                 .debug_tuple("UnlockResult")

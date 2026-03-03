@@ -63,6 +63,7 @@ pub enum Message {
     GoToImport,
     ActivateShare(String),
     CopyNpub(String),
+    GoToRecover(usize),
     RequestDelete(ShareIdentity),
     ConfirmDelete(ShareIdentity),
     CancelDelete,
@@ -74,6 +75,11 @@ pub enum Event {
     GoToImport,
     ActivateShare(String),
     CopyNpub(String),
+    GoToRecover {
+        threshold: u16,
+        total_shares: u16,
+        group_display: String,
+    },
     ConfirmDelete(ShareIdentity),
 }
 
@@ -114,6 +120,17 @@ impl State {
             Message::GoToExport(i) => Some(Event::GoToExport(i)),
             Message::GoToCreate => Some(Event::GoToCreate),
             Message::GoToImport => Some(Event::GoToImport),
+            Message::GoToRecover(i) => {
+                if let Some(share) = self.shares.get(i) {
+                    Some(Event::GoToRecover {
+                        threshold: share.threshold,
+                        total_shares: share.total_shares,
+                        group_display: share.truncated_npub(),
+                    })
+                } else {
+                    None
+                }
+            }
             Message::ActivateShare(hex) => Some(Event::ActivateShare(hex)),
             Message::CopyNpub(npub) => Some(Event::CopyNpub(npub)),
             Message::RequestDelete(id) => {
@@ -361,6 +378,10 @@ impl State {
             } else {
                 row![
                     Space::new().width(Length::Fill),
+                    button(text("Recover nsec").size(theme::size::BODY))
+                        .on_press(Message::GoToRecover(i))
+                        .style(theme::secondary_button)
+                        .padding([theme::space::XS, theme::space::MD]),
                     button(text("Delete").size(theme::size::BODY))
                         .on_press(Message::RequestDelete(share_id))
                         .style(theme::danger_button)

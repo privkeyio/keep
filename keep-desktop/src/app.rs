@@ -36,7 +36,7 @@ use crate::screen::unlock;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, WalletEntry};
 use crate::screen::Screen;
 use crate::screen::{
-    create, export, export_ncryptsec, import, nsec_keys, relay, scanner, shares, wallet,
+    create, export, export_ncryptsec, import, nsec_keys, recovery, relay, scanner, shares, wallet,
 };
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
@@ -670,6 +670,8 @@ impl App {
             Message::NcryptsecGenerated(result) => self.handle_ncryptsec_generated(result),
 
             Message::Import(msg) => self.handle_import_message(msg),
+            Message::Recovery(msg) => self.handle_recovery_message(msg),
+            Message::RecoveryResult(result) => self.handle_recovery_result(result),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
             Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
@@ -992,6 +994,15 @@ impl App {
             shares::Event::ActivateShare(hex) => {
                 self.handle_identity_message(Message::SwitchIdentity(hex))
             }
+            shares::Event::GoToRecover {
+                threshold,
+                total_shares,
+                group_display,
+            } => {
+                self.screen =
+                    Screen::Recovery(recovery::State::new(threshold, total_shares, group_display));
+                Task::none()
+            }
             shares::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
             shares::Event::ConfirmDelete(id) => {
                 self.handle_delete(id);
@@ -1081,6 +1092,90 @@ impl App {
                 password,
                 name,
             } => self.handle_import_ncryptsec(data, password, name),
+        }
+    }
+
+    fn handle_recovery_message(&mut self, msg: recovery::Message) -> Task<Message> {
+        let Screen::Recovery(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            recovery::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            recovery::Event::Recover {
+                share_data,
+                passphrases,
+            } => self.handle_recover_nsec(share_data, passphrases),
+            recovery::Event::CopyToClipboard(text) => self.handle_copy_sensitive(text),
+        }
+    }
+
+    fn handle_recover_nsec(
+        &mut self,
+        share_data: Vec<Zeroizing<String>>,
+        passphrases: Vec<Zeroizing<String>>,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    use keep_core::frost::ShareExport;
+                    use zeroize::Zeroize;
+
+                    let mut key_packages = Vec::with_capacity(share_data.len());
+                    let mut group_pubkey: Option<String> = None;
+
+                    for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
+                        let export =
+                            ShareExport::parse(data).map_err(|e| format!("Invalid share: {e}"))?;
+
+                        match &group_pubkey {
+                            None => group_pubkey = Some(export.group_pubkey.clone()),
+                            Some(gp) if *gp != export.group_pubkey => {
+                                return Err("All shares must belong to the same group".to_string());
+                            }
+                            _ => {}
+                        }
+
+                        let share = export
+                            .to_share(passphrase.as_str(), "recovery")
+                            .map_err(|e| format!("Failed to decrypt share: {e}"))?;
+                        key_packages.push(share.key_package().map_err(|e| format!("{e}"))?);
+                    }
+
+                    let signing_key = frost_secp256k1_tr::keys::reconstruct(&key_packages)
+                        .map_err(|e| format!("Reconstruction failed: {e}"))?;
+
+                    let mut secret_bytes: Vec<u8> = signing_key.serialize();
+                    let mut secret_arr = <[u8; 32]>::try_from(secret_bytes.as_slice())
+                        .map_err(|_| "Invalid secret key length".to_string())?;
+                    secret_bytes.zeroize();
+
+                    let keypair = keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr)
+                        .map_err(|e| format!("{e}"))?;
+                    Ok(keypair.to_nsec())
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RecoveryResult,
+        )
+    }
+
+    fn handle_recovery_result(&mut self, result: Result<String, String>) -> Task<Message> {
+        let Screen::Recovery(s) = &mut self.screen else {
+            return Task::none();
+        };
+        match result {
+            Ok(nsec) => {
+                s.recovery_succeeded(nsec);
+                Task::none()
+            }
+            Err(e) => {
+                s.recovery_failed(e);
+                Task::none()
+            }
         }
     }
 
