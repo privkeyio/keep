@@ -97,9 +97,7 @@ pub(crate) struct RunningLocalSigner {
 impl App {
     pub(crate) fn local_signer_socket_path(&self) -> PathBuf {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            let p = PathBuf::from(runtime).join("keep");
-            let _ = std::fs::create_dir_all(&p);
-            p.join("signer.sock")
+            PathBuf::from(runtime).join("keep").join("signer.sock")
         } else {
             self.keep_path.join("signer.sock")
         }
@@ -113,7 +111,7 @@ impl App {
             );
             return Task::none();
         }
-        if self.local_signer.is_some() {
+        if self.local_signer.is_some() || self.local_signer_pending_setup.is_some() {
             return Task::none();
         }
 
@@ -180,15 +178,19 @@ impl App {
                     .and_then(|arc| arc.lock().ok().and_then(|mut g| g.take()));
 
                 let Some(setup) = setup else {
-                    self.set_toast(
-                        "Internal error: local signer setup missing".into(),
-                        ToastKind::Error,
-                    );
                     if let Screen::LocalSigner(s) = &mut self.screen {
                         s.starting = false;
                     }
                     return Task::none();
                 };
+
+                if self.is_kill_switch_active() {
+                    setup.handle.abort();
+                    if let Screen::LocalSigner(s) = &mut self.screen {
+                        s.starting = false;
+                    }
+                    return Task::none();
+                }
 
                 self.local_signer = Some(RunningLocalSigner {
                     socket_path: socket_path.clone(),
@@ -219,6 +221,8 @@ impl App {
     }
 
     pub(crate) fn stop_local_signer(&mut self) {
+        self.local_signer_pending_setup = None;
+
         if let Some(tx) = self.local_signer_approval_tx.take() {
             let _ = tx.send(false);
         }
@@ -430,7 +434,13 @@ fn action_to_request_type(action: &str) -> SigningRequestType {
         "nip44_decrypt" => SigningRequestType::Nip44Decrypt,
         "get_public_key" => SigningRequestType::GetPublicKey,
         "connect" => SigningRequestType::Connect,
-        _ => SigningRequestType::SignEvent,
+        other => {
+            tracing::warn!(
+                action = other,
+                "unknown NIP-46 action, mapping to SignEvent"
+            );
+            SigningRequestType::SignEvent
+        }
     }
 }
 

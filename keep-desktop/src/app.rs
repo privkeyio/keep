@@ -142,10 +142,14 @@ pub struct App {
     pub(crate) bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
+    #[cfg(unix)]
     pub(crate) local_signer: Option<crate::local_signer_service::RunningLocalSigner>,
+    #[cfg(unix)]
     pub(crate) local_signer_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
+    #[cfg(unix)]
     pub(crate) local_signer_pending_approval:
         Option<crate::screen::local_signer::PendingApprovalDisplay>,
+    #[cfg(unix)]
     pub(crate) local_signer_pending_setup:
         Option<Arc<Mutex<Option<crate::local_signer_service::LocalSignerSetup>>>>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
@@ -574,9 +578,13 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            #[cfg(unix)]
             local_signer: None,
+            #[cfg(unix)]
             local_signer_approval_tx: None,
+            #[cfg(unix)]
             local_signer_pending_approval: None,
+            #[cfg(unix)]
             local_signer_pending_setup: None,
             nostrconnect_pending: None,
             proxy_enabled: false,
@@ -679,9 +687,10 @@ impl App {
             | Message::NavigateWallets
             | Message::NavigateRelay
             | Message::NavigateBunker
-            | Message::NavigateLocalSigner
             | Message::NavigateSettings
             | Message::Lock => self.handle_navigation_message(message),
+            #[cfg(unix)]
+            Message::NavigateLocalSigner => self.handle_navigation_message(message),
 
             Message::ShareList(msg) => self.handle_share_list_message(msg),
 
@@ -730,10 +739,13 @@ impl App {
                 self.handle_bunker_permission_updated(result)
             }
 
+            #[cfg(unix)]
             Message::LocalSigner(msg) => self.handle_local_signer_message(msg),
+            #[cfg(unix)]
             Message::LocalSignerStartResult(result) => {
                 self.handle_local_signer_start_result(result)
             }
+            #[cfg(unix)]
             Message::LocalSignerRevokeResult(result) => {
                 self.handle_local_signer_revoke_result(result)
             }
@@ -814,6 +826,7 @@ impl App {
         }
         let frost_task = self.drain_frost_events();
         self.poll_bunker_events();
+        #[cfg(unix)]
         self.poll_local_signer_events();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
@@ -1021,6 +1034,7 @@ impl App {
                 self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
                 Task::none()
             }
+            #[cfg(unix)]
             Message::NavigateLocalSigner => {
                 if matches!(self.screen, Screen::LocalSigner(_)) {
                     return Task::none();
@@ -1939,6 +1953,7 @@ impl App {
         self.stop_scanner();
         self.handle_disconnect_relay();
         self.stop_bunker();
+        #[cfg(unix)]
         self.stop_local_signer();
 
         let mut guard = lock_keep(&self.keep);
@@ -2216,6 +2231,7 @@ impl App {
                 if self.settings.bunker_auto_start && !self.settings.kill_switch_active {
                     tasks.push(self.handle_bunker_start());
                 }
+                #[cfg(unix)]
                 if self.settings.local_signer_auto_start && !self.settings.kill_switch_active {
                     tasks.push(self.handle_local_signer_start());
                 }
@@ -3234,6 +3250,7 @@ impl App {
         self.log_kill_switch_event(true);
         self.handle_disconnect_relay();
         self.stop_bunker();
+        #[cfg(unix)]
         self.stop_local_signer();
 
         if let Screen::Settings(s) = &mut self.screen {
@@ -3487,6 +3504,7 @@ impl App {
         } else {
             self.handle_disconnect_relay();
             self.stop_bunker();
+            #[cfg(unix)]
             self.stop_local_signer();
             iced::exit()
         }
@@ -3519,6 +3537,7 @@ impl App {
     fn handle_tray_quit(&mut self) -> Task<Message> {
         self.handle_disconnect_relay();
         self.stop_bunker();
+        #[cfg(unix)]
         self.stop_local_signer();
         iced::exit()
     }
@@ -3595,9 +3614,13 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            #[cfg(unix)]
             local_signer: None,
+            #[cfg(unix)]
             local_signer_approval_tx: None,
+            #[cfg(unix)]
             local_signer_pending_approval: None,
+            #[cfg(unix)]
             local_signer_pending_setup: None,
             nostrconnect_pending: None,
             proxy_enabled: false,

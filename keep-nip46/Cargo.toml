@@ -21,6 +21,7 @@ url.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
+rand.workspace = true
 sha2 = "0.10"
 zeroize.workspace = true
 

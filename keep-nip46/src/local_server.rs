@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
@@ -24,7 +25,8 @@ use crate::rate_limit::RateLimitConfig;
 use crate::server::dispatch_request;
 use crate::types::{LogEvent, ServerCallbacks};
 
-static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_CONNECTIONS: usize = 32;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct LocalServerConfig {
     pub max_request_json_size: usize,
@@ -129,6 +131,17 @@ impl LocalServer {
                     let (stream, _addr) = result
                         .map_err(|e| NetworkError::relay(format!("accept: {e}")))?;
 
+                    if connections.len() >= MAX_CONNECTIONS {
+                        warn!("max connections ({MAX_CONNECTIONS}) reached, rejecting");
+                        drop(stream);
+                        continue;
+                    }
+
+                    #[cfg(unix)]
+                    if let Ok(cred) = stream.peer_cred() {
+                        info!(pid = ?cred.pid(), uid = ?cred.uid(), "local client connecting");
+                    }
+
                     let handler = self.handler.clone();
                     let callbacks = self.callbacks.clone();
                     let max_size = self.max_request_size;
@@ -146,12 +159,13 @@ impl LocalServer {
 }
 
 fn next_client_id() -> String {
-    format!("local-{}", CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed))
+    let id: u128 = rand::random();
+    format!("local-{id:032x}")
 }
 
-async fn write_line(w: &mut OwnedWriteHalf, data: &[u8]) {
-    let _ = w.write_all(data).await;
-    let _ = w.write_all(b"\n").await;
+async fn write_line(w: &mut OwnedWriteHalf, data: &[u8]) -> std::io::Result<()> {
+    w.write_all(data).await?;
+    w.write_all(b"\n").await
 }
 
 async fn handle_connection(
@@ -175,10 +189,13 @@ async fn handle_connection(
         cb.on_connect(&client_id, &client_id);
     }
 
-    let user_pubkey = handler
-        .our_pubkey()
-        .await
-        .map_err(|e| KeepError::Runtime(format!("no signing key: {e}")))?;
+    let user_pubkey = match handler.our_pubkey().await {
+        Ok(pk) => pk,
+        Err(e) => {
+            handler.revoke_client(&app_pubkey).await;
+            return Err(KeepError::Runtime(format!("no signing key: {e}")));
+        }
+    };
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -188,8 +205,14 @@ async fn handle_connection(
         buf.clear();
         let mut total = 0usize;
         let too_large = loop {
-            let available = match reader.fill_buf().await {
-                Ok([]) => {
+            let fill = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
+            let available = match fill {
+                Err(_) => {
+                    info!(client = %client_id, "idle timeout, disconnecting");
+                    handler.revoke_client(&app_pubkey).await;
+                    return Ok(());
+                }
+                Ok(Ok([])) => {
                     if total == 0 {
                         handler.revoke_client(&app_pubkey).await;
                         info!(client = %client_id, "local client disconnected");
@@ -197,8 +220,8 @@ async fn handle_connection(
                     }
                     break false;
                 }
-                Ok(b) => b,
-                Err(_) => {
+                Ok(Ok(b)) => b,
+                Ok(Err(_)) => {
                     handler.revoke_client(&app_pubkey).await;
                     return Ok(());
                 }
@@ -212,12 +235,13 @@ async fn handle_connection(
             total += len;
             if total > max_size {
                 reader.consume(len);
-                // Drain remaining bytes until newline
                 loop {
-                    let rest = match reader.fill_buf().await {
-                        Ok([]) => break,
-                        Ok(b) => b,
+                    let drain = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
+                    let rest = match drain {
                         Err(_) => break,
+                        Ok(Ok([])) => break,
+                        Ok(Ok(b)) => b,
+                        Ok(Err(_)) => break,
                     };
                     if let Some(pos) = rest.iter().position(|&b| b == b'\n') {
                         reader.consume(pos + 1);
@@ -231,14 +255,23 @@ async fn handle_connection(
             buf.extend_from_slice(available);
             reader.consume(len);
         };
+        macro_rules! reply_or_disconnect {
+            ($w:expr, $data:expr) => {
+                if write_line($w, $data).await.is_err() {
+                    handler.revoke_client(&app_pubkey).await;
+                    return Ok(());
+                }
+            };
+        }
+
         if too_large {
-            write_line(&mut write_half, br#"{"id":"","error":"request too large"}"#).await;
+            reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"request too large"}"#);
             continue;
         }
         let line = match std::str::from_utf8(&buf) {
             Ok(s) => s,
             Err(_) => {
-                write_line(&mut write_half, br#"{"id":"","error":"invalid request"}"#).await;
+                reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"invalid request"}"#);
                 continue;
             }
         };
@@ -246,7 +279,7 @@ async fn handle_connection(
         let request: crate::types::Nip46Request = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(_) => {
-                write_line(&mut write_half, br#"{"id":"","error":"invalid JSON"}"#).await;
+                reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"invalid JSON"}"#);
                 continue;
             }
         };
@@ -257,21 +290,19 @@ async fn handle_connection(
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
-            write_line(
+            reply_or_disconnect!(
                 &mut write_half,
-                br#"{"id":"","error":"invalid request ID"}"#,
-            )
-            .await;
+                br#"{"id":"","error":"invalid request ID"}"#
+            );
             continue;
         }
 
         const MAX_NIP46_PARAMS: usize = 10;
         if request.params.len() > MAX_NIP46_PARAMS {
-            write_line(
+            reply_or_disconnect!(
                 &mut write_half,
-                br#"{"id":"","error":"too many request params"}"#,
-            )
-            .await;
+                br#"{"id":"","error":"too many request params"}"#
+            );
             continue;
         }
 
@@ -289,7 +320,10 @@ async fn handle_connection(
         }
 
         if let Ok(json) = serde_json::to_string(&response) {
-            write_line(&mut write_half, json.as_bytes()).await;
+            if write_line(&mut write_half, json.as_bytes()).await.is_err() {
+                handler.revoke_client(&app_pubkey).await;
+                return Ok(());
+            }
         }
     }
 }

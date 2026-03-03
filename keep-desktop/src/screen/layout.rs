@@ -37,6 +37,7 @@ pub enum NavItem {
     Wallets,
     Relay,
     Bunker,
+    #[cfg(unix)]
     LocalSigner,
     Audit,
     Settings,
@@ -110,6 +111,7 @@ pub fn with_sidebar<'a>(
             NavItem::Bunker,
             NavBadge::None,
         ),
+        #[cfg(unix)]
         (
             "Local Signer",
             Message::NavigateLocalSigner,
