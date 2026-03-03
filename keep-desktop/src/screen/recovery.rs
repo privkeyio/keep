@@ -115,7 +115,8 @@ impl State {
                 None
             }
             Message::RemoveShareInput(i) => {
-                if self.share_inputs.len() > 1 && i < self.share_inputs.len() {
+                let is_vault = self.vault_slot && i == 0;
+                if self.share_inputs.len() > 1 && i < self.share_inputs.len() && !is_vault {
                     self.share_inputs.remove(i);
                     self.passphrase_inputs.remove(i);
                 }
@@ -195,6 +196,7 @@ impl State {
         self.recovered_nsec = Some(nsec);
         self.clear_deadline = Some(Instant::now() + std::time::Duration::from_secs(60));
         self.loading = false;
+        self.vault_slot = false;
         for input in &mut self.share_inputs {
             *input = Zeroizing::new(String::new());
         }
