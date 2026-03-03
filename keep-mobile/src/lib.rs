@@ -1392,6 +1392,12 @@ impl KeepMobile {
 
         let mut first_group_hex: Option<String> = None;
 
+        let mut prepared_shares: Vec<(String, Vec<u8>, ShareMetadataInfo)> = Vec::new();
+        let mut prepared_keys: Vec<(String, Vec<u8>, ShareMetadataInfo)> = Vec::new();
+        let mut prepared_descriptors: Vec<WalletDescriptorInfo> = Vec::new();
+        let mut prepared_relays: Vec<(String, persistence::StoredRelayConfig)> = Vec::new();
+        let mut prepared_health: Vec<KeyHealthStatusInfo> = Vec::new();
+
         for bs in &decrypted.shares {
             let key_package_bytes = decode_hex(&bs.key_package, "key_package")?;
             let pubkey_package_bytes = decode_hex(&bs.pubkey_package, "pubkey_package")?;
@@ -1432,16 +1438,17 @@ impl KeepMobile {
             let serialized = serde_json::to_vec(&stored)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-            self.storage
-                .store_share_by_key(group_hex, serialized, metadata)?;
+            prepared_shares.push((group_hex, serialized, metadata));
         }
 
         for bk in &decrypted.keys {
-            let secret_bytes = decode_hex(&bk.secret, "key secret")?;
+            let secret_bytes = Zeroizing::new(decode_hex(&bk.secret, "key secret")?);
 
-            let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&secret_bytes)
-                .map_err(|e| KeepMobileError::BackupError {
-                    msg: format!("nsec conversion: {e}"),
+            let (key_package, pubkey_package, vk_bytes) =
+                Self::build_nsec_packages(&secret_bytes).map_err(|e| {
+                    KeepMobileError::BackupError {
+                        msg: format!("nsec conversion: {e}"),
+                    }
                 })?;
 
             let (metadata_info, stored) =
@@ -1458,34 +1465,31 @@ impl KeepMobile {
             let serialized = serde_json::to_vec(&stored)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-            self.storage
-                .store_share_by_key(group_hex, serialized, metadata_info)?;
+            prepared_keys.push((group_hex, serialized, metadata_info));
         }
 
         for wd in &decrypted.wallet_descriptors {
-            let desc_info = WalletDescriptorInfo {
+            prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),
                 internal_descriptor: wd.internal_descriptor.clone(),
                 network: wd.network.clone(),
                 created_at: wd.created_at,
-            };
-            persistence::persist_descriptor(&self.storage, &desc_info)?;
+            });
         }
 
         for rc in &decrypted.relay_configs {
             let group_hex = hex::encode(rc.group_pubkey);
-            let key = relay_config_key(Some(&group_hex));
             let stored_relay = persistence::StoredRelayConfig {
                 frost_relays: rc.frost_relays.clone(),
                 profile_relays: rc.profile_relays.clone(),
                 bunker_relays: rc.bunker_relays.clone(),
             };
-            persistence::persist_relay_config(&self.storage, &key, &stored_relay)?;
+            prepared_relays.push((group_hex, stored_relay));
         }
 
         for hs in &decrypted.health_statuses {
-            let health_info = KeyHealthStatusInfo {
+            prepared_health.push(KeyHealthStatusInfo {
                 group_pubkey: hex::encode(hs.group_pubkey),
                 share_index: hs.share_index,
                 last_check_timestamp: hs.last_check_timestamp,
@@ -1493,8 +1497,30 @@ impl KeepMobile {
                 created_at: hs.created_at.unwrap_or(hs.last_check_timestamp),
                 is_stale: false,
                 is_critical: false,
-            };
-            persistence::persist_health_status(&self.storage, &health_info)?;
+            });
+        }
+
+        for (group_hex, serialized, metadata) in prepared_shares {
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata)?;
+        }
+
+        for (group_hex, serialized, metadata_info) in prepared_keys {
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata_info)?;
+        }
+
+        for desc_info in &prepared_descriptors {
+            persistence::persist_descriptor(&self.storage, desc_info)?;
+        }
+
+        for (group_hex, stored_relay) in &prepared_relays {
+            let key = relay_config_key(Some(group_hex));
+            persistence::persist_relay_config(&self.storage, &key, stored_relay)?;
+        }
+
+        for health_info in &prepared_health {
+            persistence::persist_health_status(&self.storage, health_info)?;
         }
 
         if let Some(proxy) = &decrypted.config.proxy {

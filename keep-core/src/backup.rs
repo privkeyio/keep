@@ -51,7 +51,7 @@ struct VaultBackup {
 }
 
 /// A key entry in a backup file.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize)]
 pub struct BackupKey {
     /// Hex-encoded public key.
     pub pubkey: String,
@@ -69,8 +69,14 @@ pub struct BackupKey {
     pub secret: String,
 }
 
+impl Drop for BackupKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 /// A FROST share entry in a backup file.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize)]
 pub struct BackupShare {
     /// Share identifier index.
     pub identifier: u16,
@@ -92,6 +98,12 @@ pub struct BackupShare {
     pub key_package: String,
     /// Hex-encoded serialized public key package.
     pub pubkey_package: String,
+}
+
+impl Drop for BackupShare {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 /// Configuration stored in a backup file.
@@ -334,13 +346,21 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     let mut salt = [0u8; SALT_SIZE];
     salt.copy_from_slice(&data[12..44]);
 
-    let le32 =
-        |offset: usize| -> u32 { u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) };
-    let memory_kib = le32(44);
-    let iterations = le32(48);
-    let parallelism = le32(52);
+    let le32 = |offset: usize| -> Result<u32> {
+        let slice = data
+            .get(offset..offset + 4)
+            .ok_or_else(|| KeepError::InvalidInput("backup header truncated".into()))?;
+        Ok(u32::from_le_bytes(
+            slice
+                .try_into()
+                .map_err(|_| KeepError::InvalidInput("backup header truncated".into()))?,
+        ))
+    };
+    let memory_kib = le32(44)?;
+    let iterations = le32(48)?;
+    let parallelism = le32(52)?;
 
-    const MAX_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB
+    const MAX_MEMORY_KIB: u32 = 256 * 1024; // 256 MiB
     const MAX_ITERATIONS: u32 = 64;
     const MAX_PARALLELISM: u32 = 16;
     if memory_kib == 0 || memory_kib > MAX_MEMORY_KIB {

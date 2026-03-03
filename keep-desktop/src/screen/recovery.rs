@@ -198,7 +198,7 @@ impl State {
 
     pub fn recovery_succeeded(&mut self, nsec: Zeroizing<String>) {
         self.recovered_nsec = Some(nsec);
-        self.clear_deadline = Some(Instant::now() + Duration::from_secs(60));
+        self.clear_deadline = Some(Instant::now() + Duration::from_secs(30));
         self.loading = false;
         self.vault_slot = false;
         self.error = None;
