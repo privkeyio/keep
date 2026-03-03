@@ -4155,7 +4155,6 @@ dependencies = [
  "bitcoin",
  "chrono",
  "dirs",
- "frost-secp256k1-tr",
  "gtk",
  "hex",
  "iced",
