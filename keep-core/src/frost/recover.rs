@@ -42,7 +42,7 @@ pub fn recover_nsec(
 
     let mut secret_bytes: Vec<u8> = signing_key.serialize();
     let sk_size = std::mem::size_of_val(&signing_key);
-    let sk_ptr = &signing_key as *const _ as *mut u8;
+    let sk_ptr = std::ptr::addr_of!(signing_key) as *mut u8;
     #[allow(forgetting_copy_types)]
     std::mem::forget(signing_key);
     #[allow(unsafe_code)]

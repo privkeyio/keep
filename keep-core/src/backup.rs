@@ -350,11 +350,8 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
         let slice = data
             .get(offset..offset + 4)
             .ok_or_else(|| KeepError::InvalidInput("backup header truncated".into()))?;
-        Ok(u32::from_le_bytes(
-            slice
-                .try_into()
-                .map_err(|_| KeepError::InvalidInput("backup header truncated".into()))?,
-        ))
+        // unwrap: .get() guarantees exactly 4 bytes
+        Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     };
     let memory_kib = le32(44)?;
     let iterations = le32(48)?;

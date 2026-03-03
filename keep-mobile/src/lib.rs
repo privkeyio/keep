@@ -1444,11 +1444,9 @@ impl KeepMobile {
         for bk in &decrypted.keys {
             let secret_bytes = Zeroizing::new(decode_hex(&bk.secret, "key secret")?);
 
-            let (key_package, pubkey_package, vk_bytes) =
-                Self::build_nsec_packages(&secret_bytes).map_err(|e| {
-                    KeepMobileError::BackupError {
-                        msg: format!("nsec conversion: {e}"),
-                    }
+            let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&secret_bytes)
+                .map_err(|e| KeepMobileError::BackupError {
+                    msg: format!("nsec conversion: {e}"),
                 })?;
 
             let (metadata_info, stored) =
@@ -1510,17 +1508,17 @@ impl KeepMobile {
                 .store_share_by_key(group_hex, serialized, metadata_info)?;
         }
 
-        for desc_info in &prepared_descriptors {
-            persistence::persist_descriptor(&self.storage, desc_info)?;
+        for desc_info in prepared_descriptors {
+            persistence::persist_descriptor(&self.storage, &desc_info)?;
         }
 
-        for (group_hex, stored_relay) in &prepared_relays {
-            let key = relay_config_key(Some(group_hex));
-            persistence::persist_relay_config(&self.storage, &key, stored_relay)?;
+        for (group_hex, stored_relay) in prepared_relays {
+            let key = relay_config_key(Some(&group_hex));
+            persistence::persist_relay_config(&self.storage, &key, &stored_relay)?;
         }
 
-        for health_info in &prepared_health {
-            persistence::persist_health_status(&self.storage, health_info)?;
+        for health_info in prepared_health {
+            persistence::persist_health_status(&self.storage, &health_info)?;
         }
 
         if let Some(proxy) = &decrypted.config.proxy {
