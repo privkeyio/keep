@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -200,6 +201,7 @@ impl State {
         self.clear_deadline = Some(Instant::now() + Duration::from_secs(60));
         self.loading = false;
         self.vault_slot = false;
+        self.error = None;
         for input in &mut self.share_inputs {
             *input = Zeroizing::new(String::new());
         }
@@ -326,10 +328,10 @@ impl State {
         }
 
         if let Some(nsec) = &self.recovered_nsec {
-            let display = if self.nsec_visible {
-                nsec.as_str().to_string()
+            let display: Cow<'_, str> = if self.nsec_visible {
+                Cow::Borrowed(nsec.as_str())
             } else {
-                "\u{2022}".repeat(24)
+                Cow::Owned("\u{2022}".repeat(24))
             };
 
             let toggle_label = if self.nsec_visible { "Hide" } else { "Reveal" };
