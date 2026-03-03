@@ -52,9 +52,11 @@ pub fn recover_nsec(
             }
             seen_identifiers.push(export.identifier);
 
-            let share = export.to_share(passphrase.as_ref(), "recovery").map_err(|_| {
-                KeepError::Frost("Failed to decrypt share (wrong passphrase?)".into())
-            })?;
+            let share = export
+                .to_share(passphrase.as_ref(), "recovery")
+                .map_err(|_| {
+                    KeepError::Frost("Failed to decrypt share (wrong passphrase?)".into())
+                })?;
             key_packages.push(
                 share
                     .key_package()

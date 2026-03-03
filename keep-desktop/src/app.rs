@@ -1189,9 +1189,7 @@ impl App {
                     let keypair = keep_core::keys::NostrKeypair::from_nsec(&nsec)
                         .map_err(|e| e.to_string())?;
                     if *keypair.public_bytes() != expected_group_pubkey {
-                        return Err(
-                            "Recovered key does not match expected group".to_string()
-                        );
+                        return Err("Recovered key does not match expected group".to_string());
                     }
                     Ok(nsec)
                 })

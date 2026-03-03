@@ -162,10 +162,7 @@ impl State {
                 None
             }
             Message::AutoClearTick => {
-                if self
-                    .clear_deadline
-                    .is_some_and(|d| Instant::now() >= d)
-                {
+                if self.clear_deadline.is_some_and(|d| Instant::now() >= d) {
                     self.recovered_nsec = None;
                     self.clear_deadline = None;
                     self.nsec_visible = false;
@@ -365,9 +362,12 @@ impl State {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let secs = remaining.as_secs();
                 result_section = result_section.push(
-                    text(format!("Auto-clears in {}s \u{2014} copy to a secure password manager", secs))
-                        .size(theme::size::SMALL)
-                        .color(theme::color::WARNING),
+                    text(format!(
+                        "Auto-clears in {}s \u{2014} copy to a secure password manager",
+                        secs
+                    ))
+                    .size(theme::size::SMALL)
+                    .color(theme::color::WARNING),
                 );
             }
 
