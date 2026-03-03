@@ -250,7 +250,7 @@ fn sanitize_notification_field(input: &str) -> String {
     }
 }
 
-pub fn send_bunker_approval_notification(
+pub fn send_approval_notification(
     app_name: &str,
     method: &str,
     show_tx: Option<&mpsc::Sender<TrayEvent>>,
@@ -258,7 +258,7 @@ pub fn send_bunker_approval_notification(
     let safe_app = sanitize_notification_field(app_name);
     let safe_method = sanitize_notification_field(method);
     send_notification(
-        "Bunker Approval Required",
+        "Approval Required",
         &format!("{safe_app} requests: {safe_method}"),
         show_tx,
     );

@@ -479,7 +479,7 @@ impl Server {
         debug!(method = %request.method, app_id, "NIP-46 request");
 
         let method = request.method.clone();
-        let response = Self::dispatch_request(
+        let response = dispatch_request(
             handler,
             keys.public_key(),
             app_pubkey,
@@ -525,151 +525,153 @@ impl Server {
 
         Ok(())
     }
+}
 
-    async fn dispatch_request(
-        handler: &SignerHandler,
-        user_pubkey: PublicKey,
-        app_pubkey: PublicKey,
-        request: Nip46Request,
-        max_event_json_size: usize,
-    ) -> Nip46Response {
-        let id = request.id.clone();
+pub(crate) async fn dispatch_request(
+    handler: &SignerHandler,
+    user_pubkey: PublicKey,
+    app_pubkey: PublicKey,
+    request: Nip46Request,
+    max_event_json_size: usize,
+) -> Nip46Response {
+    let id = request.id.clone();
 
-        match request.method.as_str() {
-            "connect" => {
-                let our_pubkey = request
-                    .params
-                    .first()
-                    .and_then(|s| PublicKey::from_hex(s).ok());
-                let secret = request.params.get(1).cloned();
-                let permissions = request.params.get(2).cloned();
-                match handler
-                    .handle_connect(app_pubkey, our_pubkey, secret, permissions)
-                    .await
-                {
-                    Ok(()) => Nip46Response::ok(id, "ack"),
-                    Err(e) => {
-                        warn!(error = %e, "connect failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
-                    }
-                }
-            }
-            "get_public_key" => match handler.handle_get_public_key(app_pubkey).await {
-                Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
+    match request.method.as_str() {
+        "connect" => {
+            let our_pubkey = request
+                .params
+                .first()
+                .and_then(|s| PublicKey::from_hex(s).ok());
+            let secret = request.params.get(1).cloned();
+            let permissions = request.params.get(2).cloned();
+            match handler
+                .handle_connect(app_pubkey, our_pubkey, secret, permissions)
+                .await
+            {
+                Ok(()) => Nip46Response::ok(id, "ack"),
                 Err(e) => {
-                    warn!(error = %e, "get_public_key failed");
+                    warn!(error = %e, "connect failed");
                     Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
                 }
-            },
-            "sign_event" => {
-                let event_json = match request.params.first() {
-                    Some(json) => json,
-                    None => return Nip46Response::error(id, "Missing event parameter"),
-                };
-
-                if event_json.len() > max_event_json_size {
-                    return Nip46Response::error(id, "Event JSON too large");
-                }
-
-                let partial: PartialEvent = match serde_json::from_str(event_json) {
-                    Ok(p) => p,
-                    Err(_) => return Nip46Response::error(id, "Invalid event format"),
-                };
-
-                if partial.created_at < 0 {
-                    return Nip46Response::error(id, "Invalid created_at timestamp");
-                }
-
-                let max_future = Timestamp::now().as_secs() + 86_400;
-                if partial.created_at as u64 > max_future {
-                    return Nip46Response::error(id, "created_at timestamp too far in the future");
-                }
-
-                let mut tags = Vec::with_capacity(partial.tags.len());
-                for t in &partial.tags {
-                    match Tag::parse(t) {
-                        Ok(tag) => tags.push(tag),
-                        Err(_) => return Nip46Response::error(id, "Invalid tag in event"),
-                    }
-                }
-
-                let unsigned = UnsignedEvent::new(
-                    user_pubkey,
-                    Timestamp::from(partial.created_at as u64),
-                    Kind::from(partial.kind),
-                    tags,
-                    &partial.content,
-                );
-
-                match handler.handle_sign_event(app_pubkey, unsigned).await {
-                    Ok(event) => match serde_json::to_string(&event) {
-                        Ok(json) => Nip46Response::ok(id, &json),
-                        Err(e) => {
-                            warn!(error = %e, "sign_event serialization failed");
-                            Nip46Response::error(id, "Serialization failed")
-                        }
-                    },
-                    Err(e) => {
-                        warn!(error = %e, "sign_event failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
-                    }
-                }
             }
-            "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt" => {
-                if request.params.len() < 2 {
-                    return Nip46Response::error(id, "Missing parameters");
-                }
-                let peer = match PublicKey::from_hex(&request.params[0]) {
-                    Ok(pk) => pk,
-                    Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
-                };
-                let result = match request.method.as_str() {
-                    "nip44_encrypt" => {
-                        handler
-                            .handle_nip44_encrypt(app_pubkey, peer, &request.params[1])
-                            .await
-                    }
-                    "nip44_decrypt" => {
-                        handler
-                            .handle_nip44_decrypt(app_pubkey, peer, &request.params[1])
-                            .await
-                    }
-                    "nip04_encrypt" => {
-                        handler
-                            .handle_nip04_encrypt(app_pubkey, peer, &request.params[1])
-                            .await
-                    }
-                    "nip04_decrypt" => {
-                        handler
-                            .handle_nip04_decrypt(app_pubkey, peer, &request.params[1])
-                            .await
-                    }
-                    _ => unreachable!(),
-                };
-                match result {
-                    Ok(data) => Nip46Response::ok(id, &data),
-                    Err(e) => {
-                        warn!(error = %e, method = %request.method, "encryption method failed");
-                        Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
-                    }
-                }
-            }
-            "switch_relays" => match handler.handle_switch_relays(app_pubkey).await {
-                Ok(Some(relays)) => match serde_json::to_string(&relays) {
-                    Ok(json) => Nip46Response::ok(id, &json),
-                    Err(_) => Nip46Response::error(id, "Serialization failed"),
-                },
-                Ok(None) => Nip46Response::ok(id, "null"),
-                Err(e) => {
-                    warn!(error = %e, "switch_relays failed");
-                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
-                }
-            },
-            "ping" => Nip46Response::ok(id, "pong"),
-            _ => Nip46Response::error(id, "Unknown method"),
         }
-    }
+        "get_public_key" => match handler.handle_get_public_key(app_pubkey).await {
+            Ok(pk) => Nip46Response::ok(id, &pk.to_hex()),
+            Err(e) => {
+                warn!(error = %e, "get_public_key failed");
+                Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+            }
+        },
+        "sign_event" => {
+            let event_json = match request.params.first() {
+                Some(json) => json,
+                None => return Nip46Response::error(id, "Missing event parameter"),
+            };
 
+            if event_json.len() > max_event_json_size {
+                return Nip46Response::error(id, "Event JSON too large");
+            }
+
+            let partial: PartialEvent = match serde_json::from_str(event_json) {
+                Ok(p) => p,
+                Err(_) => return Nip46Response::error(id, "Invalid event format"),
+            };
+
+            if partial.created_at < 0 {
+                return Nip46Response::error(id, "Invalid created_at timestamp");
+            }
+
+            let max_future = Timestamp::now().as_secs() + 86_400;
+            if partial.created_at as u64 > max_future {
+                return Nip46Response::error(id, "created_at timestamp too far in the future");
+            }
+
+            let mut tags = Vec::with_capacity(partial.tags.len());
+            for t in &partial.tags {
+                match Tag::parse(t) {
+                    Ok(tag) => tags.push(tag),
+                    Err(_) => return Nip46Response::error(id, "Invalid tag in event"),
+                }
+            }
+
+            let unsigned = UnsignedEvent::new(
+                user_pubkey,
+                Timestamp::from(partial.created_at as u64),
+                Kind::from(partial.kind),
+                tags,
+                &partial.content,
+            );
+
+            match handler.handle_sign_event(app_pubkey, unsigned).await {
+                Ok(event) => match serde_json::to_string(&event) {
+                    Ok(json) => Nip46Response::ok(id, &json),
+                    Err(e) => {
+                        warn!(error = %e, "sign_event serialization failed");
+                        Nip46Response::error(id, "Serialization failed")
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "sign_event failed");
+                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                }
+            }
+        }
+        "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt" => {
+            if request.params.len() < 2 {
+                return Nip46Response::error(id, "Missing parameters");
+            }
+            let peer = match PublicKey::from_hex(&request.params[0]) {
+                Ok(pk) => pk,
+                Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
+            };
+            let result = match request.method.as_str() {
+                "nip44_encrypt" => {
+                    handler
+                        .handle_nip44_encrypt(app_pubkey, peer, &request.params[1])
+                        .await
+                }
+                "nip44_decrypt" => {
+                    handler
+                        .handle_nip44_decrypt(app_pubkey, peer, &request.params[1])
+                        .await
+                }
+                "nip04_encrypt" => {
+                    handler
+                        .handle_nip04_encrypt(app_pubkey, peer, &request.params[1])
+                        .await
+                }
+                "nip04_decrypt" => {
+                    handler
+                        .handle_nip04_decrypt(app_pubkey, peer, &request.params[1])
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(data) => Nip46Response::ok(id, &data),
+                Err(e) => {
+                    warn!(error = %e, method = %request.method, "encryption method failed");
+                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                }
+            }
+        }
+        "switch_relays" => match handler.handle_switch_relays(app_pubkey).await {
+            Ok(Some(relays)) => match serde_json::to_string(&relays) {
+                Ok(json) => Nip46Response::ok(id, &json),
+                Err(_) => Nip46Response::error(id, "Serialization failed"),
+            },
+            Ok(None) => Nip46Response::ok(id, "null"),
+            Err(e) => {
+                warn!(error = %e, "switch_relays failed");
+                Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+            }
+        },
+        "ping" => Nip46Response::ok(id, "pong"),
+        _ => Nip46Response::error(id, "Unknown method"),
+    }
+}
+
+impl Server {
     pub fn handler(&self) -> Arc<SignerHandler> {
         self.handler.clone()
     }

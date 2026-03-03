@@ -8,6 +8,8 @@ pub mod export;
 pub mod export_ncryptsec;
 pub mod import;
 pub mod layout;
+#[cfg(unix)]
+pub mod local_signer;
 pub mod nsec_keys;
 pub mod recovery;
 pub mod relay;
@@ -39,6 +41,8 @@ pub enum Screen {
     Wallet(wallet::State),
     Relay(relay::State),
     Bunker(Box<bunker::State>),
+    #[cfg(unix)]
+    LocalSigner(local_signer::State),
     NsecKeys(nsec_keys::State),
     SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
@@ -68,6 +72,8 @@ impl Screen {
             Screen::Wallet(s) => (NavItem::Wallets, s.view().map(Message::Wallet)),
             Screen::Relay(s) => (NavItem::Relay, s.view().map(Message::Relay)),
             Screen::Bunker(s) => (NavItem::Bunker, s.view().map(Message::Bunker)),
+            #[cfg(unix)]
+            Screen::LocalSigner(s) => (NavItem::LocalSigner, s.view().map(Message::LocalSigner)),
             Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view().map(Message::NsecKeys)),
             Screen::SigningAudit(s) => (NavItem::Audit, s.view().map(Message::SigningAudit)),
             Screen::Settings(s) => (NavItem::Settings, s.view().map(Message::Settings)),
@@ -111,6 +117,11 @@ impl Screen {
             }
             Screen::Distribute(s) => {
                 s.set_error(error);
+            }
+            #[cfg(unix)]
+            Screen::LocalSigner(s) => {
+                s.starting = false;
+                s.error = Some(error);
             }
             Screen::ShareList(_)
             | Screen::NsecKeys(_)

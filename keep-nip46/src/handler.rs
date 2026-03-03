@@ -243,7 +243,7 @@ impl SignerHandler {
         }
     }
 
-    async fn our_pubkey(&self) -> Result<PublicKey> {
+    pub(crate) async fn our_pubkey(&self) -> Result<PublicKey> {
         if let Some(ref net_frost) = self.network_frost_signer {
             Ok(PublicKey::from_slice(net_frost.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?)

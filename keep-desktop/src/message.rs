@@ -179,6 +179,16 @@ pub enum Message {
     BunkerClientsLoaded(Vec<crate::screen::bunker::ConnectedClient>),
     BunkerPermissionUpdated(Result<(), String>),
 
+    // Local Signer
+    #[cfg(unix)]
+    NavigateLocalSigner,
+    #[cfg(unix)]
+    LocalSigner(crate::screen::local_signer::Message),
+    #[cfg(unix)]
+    LocalSignerStartResult(Result<String, String>),
+    #[cfg(unix)]
+    LocalSignerRevokeResult(Result<String, String>),
+
     // Signing Audit
     NavigateAudit,
     SigningAudit(crate::screen::signing_audit::Message),
@@ -427,6 +437,17 @@ impl fmt::Debug for Message {
                 .field(&c.len())
                 .finish(),
             Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
+            #[cfg(unix)]
+            Self::NavigateLocalSigner => f.write_str("NavigateLocalSigner"),
+            #[cfg(unix)]
+            Self::LocalSigner(msg) => f.debug_tuple("LocalSigner").field(msg).finish(),
+            #[cfg(unix)]
+            Self::LocalSignerStartResult(r) => f
+                .debug_tuple("LocalSignerStartResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            #[cfg(unix)]
+            Self::LocalSignerRevokeResult(_) => f.write_str("LocalSignerRevokeResult"),
             Self::ToggleIdentitySwitcher => f.write_str("ToggleIdentitySwitcher"),
             Self::SwitchIdentity(k) => f.debug_tuple("SwitchIdentity").field(k).finish(),
             Self::RequestDeleteIdentity(k) => {

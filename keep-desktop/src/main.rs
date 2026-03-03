@@ -7,6 +7,8 @@
 mod app;
 mod bunker_service;
 mod frost;
+#[cfg(unix)]
+mod local_signer_service;
 mod message;
 mod nostrconnect;
 mod screen;
