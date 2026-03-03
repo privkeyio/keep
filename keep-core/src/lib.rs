@@ -730,18 +730,25 @@ impl Keep {
             frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
             profile_relays: normalize_relays(&config.profile_relays, "profile")?,
             bunker_relays: normalize_relays(&config.bunker_relays, "bunker")?,
-            peer_policies: config
-                .peer_policies
-                .iter()
-                .filter(|p| {
-                    p.pubkey_hex.len() == 64 && p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
-                })
-                .map(|p| relay::PeerPolicyEntry {
-                    pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
-                    allow_send: p.allow_send,
-                    allow_receive: p.allow_receive,
-                })
-                .collect(),
+            peer_policies: {
+                let mut policies = Vec::with_capacity(config.peer_policies.len());
+                for p in &config.peer_policies {
+                    if p.pubkey_hex.len() != 64
+                        || !p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Invalid peer policy pubkey: {}",
+                            p.pubkey_hex
+                        )));
+                    }
+                    policies.push(relay::PeerPolicyEntry {
+                        pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
+                        allow_send: p.allow_send,
+                        allow_receive: p.allow_receive,
+                    });
+                }
+                policies
+            },
         };
         self.storage.store_relay_config(&normalized_config)
     }

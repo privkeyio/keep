@@ -5,6 +5,7 @@ use std::fmt;
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length};
+use keep_core::backup::BackupInfo;
 use zeroize::Zeroizing;
 
 use crate::theme;
@@ -37,6 +38,7 @@ pub enum Message {
     RestorePassphraseChanged(Zeroizing<String>),
     RestorePasswordChanged(Zeroizing<String>),
     RestorePasswordConfirmChanged(Zeroizing<String>),
+    RestoreVerify,
     RestoreCancel,
     RestoreSubmit,
 }
@@ -76,6 +78,7 @@ impl fmt::Debug for Message {
             Self::RestorePasswordConfirmChanged(_) => {
                 f.write_str("RestorePasswordConfirmChanged(***)")
             }
+            Self::RestoreVerify => f.write_str("RestoreVerify"),
             Self::RestoreCancel => f.write_str("RestoreCancel"),
             Self::RestoreSubmit => f.write_str("RestoreSubmit"),
         }
@@ -95,6 +98,7 @@ pub enum Event {
     CertPinClearAll,
     BackupExport(Zeroizing<String>),
     RestoreStart,
+    RestoreVerify(Zeroizing<String>),
     RestoreSubmit {
         passphrase: Zeroizing<String>,
         vault_password: Zeroizing<String>,
@@ -135,14 +139,16 @@ pub struct SettingsScreen {
     backup_confirm: Zeroizing<String>,
     pub backup_loading: bool,
     backup_error: Option<String>,
+    backup_summary: Option<BackupInfo>,
     restore_active: bool,
     restore_passphrase: Zeroizing<String>,
     restore_password: Zeroizing<String>,
     restore_password_confirm: Zeroizing<String>,
     pub restore_loading: bool,
+    pub restore_verify_loading: bool,
     restore_error: Option<String>,
     pub restore_file: Option<(String, Vec<u8>)>,
-    restore_info: Option<String>,
+    restore_verified: Option<BackupInfo>,
 }
 
 impl SettingsScreen {
@@ -181,14 +187,16 @@ impl SettingsScreen {
             backup_confirm: Zeroizing::new(String::new()),
             backup_loading: false,
             backup_error: None,
+            backup_summary: None,
             restore_active: false,
             restore_passphrase: Zeroizing::new(String::new()),
             restore_password: Zeroizing::new(String::new()),
             restore_password_confirm: Zeroizing::new(String::new()),
             restore_loading: false,
+            restore_verify_loading: false,
             restore_error: None,
             restore_file: None,
-            restore_info: None,
+            restore_verified: None,
         }
     }
 
@@ -247,6 +255,8 @@ impl SettingsScreen {
                 self.backup_active = true;
                 self.restore_active = false;
                 self.backup_error = None;
+                self.backup_summary = None;
+                self.restore_verified = None;
                 None
             }
             Message::BackupPassphraseChanged(p) => {
@@ -282,6 +292,10 @@ impl SettingsScreen {
             Message::RestoreStart => {
                 self.restore_active = false;
                 self.backup_active = false;
+                self.backup_summary = None;
+                self.restore_verified = None;
+                self.restore_verify_loading = false;
+                self.restore_loading = false;
                 Some(Event::RestoreStart)
             }
             Message::RestorePassphraseChanged(p) => {
@@ -296,14 +310,29 @@ impl SettingsScreen {
                 self.restore_password_confirm = p;
                 None
             }
+            Message::RestoreVerify => {
+                if self.restore_passphrase.is_empty() {
+                    self.restore_error = Some("Passphrase required".into());
+                    return None;
+                }
+                if self.restore_file.is_none() {
+                    self.restore_error = Some("No backup file loaded".into());
+                    return None;
+                }
+                self.restore_verify_loading = true;
+                self.restore_error = None;
+                Some(Event::RestoreVerify(self.restore_passphrase.clone()))
+            }
             Message::RestoreCancel => {
                 self.restore_active = false;
                 self.restore_passphrase = Zeroizing::new(String::new());
                 self.restore_password = Zeroizing::new(String::new());
                 self.restore_password_confirm = Zeroizing::new(String::new());
                 self.restore_file = None;
-                self.restore_info = None;
+                self.restore_verified = None;
                 self.restore_error = None;
+                self.restore_verify_loading = false;
+                self.restore_loading = false;
                 None
             }
             Message::RestoreSubmit => {
@@ -357,12 +386,13 @@ impl SettingsScreen {
         self.clear_all_pins_confirm = false;
     }
 
-    pub fn backup_completed(&mut self) {
+    pub fn backup_completed(&mut self, info: BackupInfo) {
         self.backup_active = false;
         self.backup_loading = false;
         self.backup_passphrase = Zeroizing::new(String::new());
         self.backup_confirm = Zeroizing::new(String::new());
         self.backup_error = None;
+        self.backup_summary = Some(info);
     }
 
     pub fn backup_failed(&mut self, error: String) {
@@ -370,20 +400,36 @@ impl SettingsScreen {
         self.backup_error = Some(error);
     }
 
+    pub fn can_accept_restore_result(&self) -> bool {
+        self.restore_active && self.restore_file.is_some()
+    }
+
     pub fn restore_file_loaded(&mut self, filename: String, data: Vec<u8>) {
         self.restore_active = true;
         self.restore_file = Some((filename, data));
+        self.restore_verified = None;
         self.restore_error = None;
     }
 
-    pub fn restore_completed(&mut self) {
+    pub fn restore_verified(&mut self, info: BackupInfo) {
+        self.restore_verify_loading = false;
+        self.restore_verified = Some(info);
+        self.restore_error = None;
+    }
+
+    pub fn restore_verify_failed(&mut self, error: String) {
+        self.restore_verify_loading = false;
+        self.restore_error = Some(error);
+    }
+
+    pub fn restore_completed(&mut self, info: BackupInfo) {
         self.restore_active = false;
         self.restore_loading = false;
         self.restore_passphrase = Zeroizing::new(String::new());
         self.restore_password = Zeroizing::new(String::new());
         self.restore_password_confirm = Zeroizing::new(String::new());
         self.restore_file = None;
-        self.restore_info = None;
+        self.restore_verified = Some(info);
         self.restore_error = None;
     }
 
@@ -754,6 +800,33 @@ impl SettingsScreen {
             .into()
     }
 
+    fn backup_summary_card(info: &BackupInfo) -> Element<'_, Message> {
+        let size_str = if info.file_size >= 1_048_576 {
+            format!("{:.1} MB", info.file_size as f64 / 1_048_576.0)
+        } else if info.file_size >= 1024 {
+            format!("{:.1} KB", info.file_size as f64 / 1024.0)
+        } else {
+            format!("{} B", info.file_size)
+        };
+        container(
+            column![
+                text("Backup Summary")
+                    .size(theme::size::BODY)
+                    .color(theme::color::TEXT_MUTED),
+                text(format!("Keys: {}", info.key_count)).size(theme::size::SMALL),
+                text(format!("Shares: {}", info.share_count)).size(theme::size::SMALL),
+                text(format!("Descriptors: {}", info.descriptor_count)).size(theme::size::SMALL),
+                text(format!("Size: {size_str}")).size(theme::size::SMALL),
+                text(format!("Created: {}", info.created_at)).size(theme::size::SMALL),
+            ]
+            .spacing(theme::space::XS),
+        )
+        .style(theme::card_style)
+        .padding(theme::space::MD)
+        .width(Length::Fill)
+        .into()
+    }
+
     fn backup_restore_card(&self) -> Element<'_, Message> {
         let mut col = column![
             theme::label("Vault backup"),
@@ -815,72 +888,103 @@ impl SettingsScreen {
                         .color(theme::color::TEXT_MUTED),
                 );
 
-                if let Some(ref info) = self.restore_info {
-                    col = col.push(
-                        text(info)
-                            .size(theme::size::BODY)
-                            .color(theme::color::SUCCESS),
-                    );
-                }
+                if let Some(ref info) = self.restore_verified {
+                    col = col.push(Self::backup_summary_card(info));
 
-                let passphrase_input = text_input("Backup passphrase", &self.restore_passphrase)
-                    .on_input(|s| Message::RestorePassphraseChanged(Zeroizing::new(s)))
-                    .secure(true)
-                    .size(theme::size::BODY)
-                    .width(theme::size::INPUT_WIDTH);
-
-                let password_input = text_input("New vault password", &self.restore_password)
-                    .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
-                    .secure(true)
-                    .size(theme::size::BODY)
-                    .width(theme::size::INPUT_WIDTH);
-
-                let password_confirm_input =
-                    text_input("Confirm vault password", &self.restore_password_confirm)
-                        .on_input(|s| Message::RestorePasswordConfirmChanged(Zeroizing::new(s)))
+                    let password_input = text_input("New vault password", &self.restore_password)
+                        .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
                         .secure(true)
                         .size(theme::size::BODY)
                         .width(theme::size::INPUT_WIDTH);
 
-                let can_submit = !self.restore_loading
-                    && !self.restore_passphrase.is_empty()
-                    && !self.restore_password.is_empty()
-                    && !self.restore_password_confirm.is_empty();
-                let mut submit_btn = button(text("Restore").size(theme::size::SMALL))
-                    .style(theme::primary_button)
-                    .padding([theme::space::SM, theme::space::MD]);
-                if can_submit {
-                    submit_btn = submit_btn.on_press(Message::RestoreSubmit);
-                }
+                    let password_confirm_input =
+                        text_input("Confirm vault password", &self.restore_password_confirm)
+                            .on_input(|s| Message::RestorePasswordConfirmChanged(Zeroizing::new(s)))
+                            .secure(true)
+                            .size(theme::size::BODY)
+                            .width(theme::size::INPUT_WIDTH);
 
-                let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
-                    .on_press(Message::RestoreCancel)
-                    .style(theme::secondary_button)
-                    .padding([theme::space::SM, theme::space::MD]);
+                    let can_submit = !self.restore_loading
+                        && self.restore_password.len() >= MIN_BACKUP_PASSPHRASE
+                        && *self.restore_password == *self.restore_password_confirm;
+                    let mut submit_btn = button(text("Restore").size(theme::size::SMALL))
+                        .style(theme::danger_button)
+                        .padding([theme::space::SM, theme::space::MD]);
+                    if can_submit {
+                        submit_btn = submit_btn.on_press(Message::RestoreSubmit);
+                    }
 
-                col = col
-                    .push(passphrase_input)
-                    .push(password_input)
-                    .push(password_confirm_input)
-                    .push(
+                    let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
+                        .on_press(Message::RestoreCancel)
+                        .style(theme::secondary_button)
+                        .padding([theme::space::SM, theme::space::MD]);
+
+                    col = col.push(password_input).push(password_confirm_input).push(
                         row![submit_btn, cancel_btn]
                             .spacing(theme::space::SM)
                             .align_y(iced::Alignment::Center),
                     );
-            }
+                } else {
+                    let passphrase_input =
+                        text_input("Backup passphrase", &self.restore_passphrase)
+                            .on_input(|s| Message::RestorePassphraseChanged(Zeroizing::new(s)))
+                            .secure(true)
+                            .size(theme::size::BODY)
+                            .width(theme::size::INPUT_WIDTH);
 
-            if self.restore_loading {
+                    let can_verify =
+                        !self.restore_verify_loading && !self.restore_passphrase.is_empty();
+                    let mut verify_btn = button(text("Verify").size(theme::size::SMALL))
+                        .style(theme::primary_button)
+                        .padding([theme::space::SM, theme::space::MD]);
+                    if can_verify {
+                        verify_btn = verify_btn.on_press(Message::RestoreVerify);
+                    }
+
+                    let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
+                        .on_press(Message::RestoreCancel)
+                        .style(theme::secondary_button)
+                        .padding([theme::space::SM, theme::space::MD]);
+
+                    col = col.push(passphrase_input).push(
+                        row![verify_btn, cancel_btn]
+                            .spacing(theme::space::SM)
+                            .align_y(iced::Alignment::Center),
+                    );
+                }
+
+                if self.restore_verify_loading {
+                    col = col.push(
+                        text("Verifying...")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
+                    );
+                }
+
+                if self.restore_loading {
+                    col = col.push(
+                        text("Restoring...")
+                            .size(theme::size::SMALL)
+                            .color(theme::color::TEXT_MUTED),
+                    );
+                }
+
+                if let Some(ref err) = self.restore_error {
+                    col = col.push(theme::error_text(err));
+                }
+            }
+        } else {
+            if let Some(ref info) = self.backup_summary {
+                col = col.push(Self::backup_summary_card(info));
+            } else if let Some(ref info) = self.restore_verified {
+                col = col.push(Self::backup_summary_card(info));
                 col = col.push(
-                    text("Restoring...")
-                        .size(theme::size::SMALL)
-                        .color(theme::color::TEXT_MUTED),
+                    text("Restore complete")
+                        .size(theme::size::BODY)
+                        .color(theme::color::SUCCESS),
                 );
             }
 
-            if let Some(ref err) = self.restore_error {
-                col = col.push(theme::error_text(err));
-            }
-        } else {
             let backup_btn = button(text("Create Backup").size(theme::size::SMALL))
                 .on_press(Message::BackupStart)
                 .style(theme::primary_button)

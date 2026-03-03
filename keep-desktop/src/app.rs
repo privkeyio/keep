@@ -13,6 +13,7 @@ use keep_nip46::NostrConnectRequest;
 
 use iced::widget::{button, column, container, row, text};
 use iced::{Background, Element, Length, Subscription, Task};
+use keep_core::backup::BackupInfo;
 use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
 use keep_core::Keep;
@@ -777,6 +778,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::RestoreVerified(result) => self.handle_restore_verified(result),
             Message::RestoreResult(result) => self.handle_restore_result(result),
 
             Message::CertPinMismatchDismiss
@@ -1808,9 +1810,9 @@ impl App {
                 allow_send,
                 allow_receive,
             } => {
-                if let Some(node) = self.get_frost_node() {
-                    match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
-                        Ok(pubkey) => {
+                match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
+                    Ok(pubkey) => {
+                        if let Some(node) = self.get_frost_node() {
                             use keep_frost_net::PeerPolicy;
                             node.set_peer_policy(
                                 PeerPolicy::new(pubkey)
@@ -1818,16 +1820,14 @@ impl App {
                                     .allow_receive(allow_receive),
                             );
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                pubkey_hex, %e, "Failed to parse peer pubkey for policy"
-                            );
-                        }
+                        self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
                     }
-                } else {
-                    tracing::warn!("No frost node available to apply peer policy");
+                    Err(e) => {
+                        tracing::warn!(
+                            pubkey_hex, %e, "Failed to parse peer pubkey for policy"
+                        );
+                    }
                 }
-                self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
                 Task::none()
             }
         }
@@ -3193,6 +3193,9 @@ impl App {
             Event::RestoreStart => {
                 return self.handle_restore_file_pick();
             }
+            Event::RestoreVerify(passphrase) => {
+                return self.handle_restore_verify(passphrase);
+            }
             Event::RestoreSubmit {
                 passphrase,
                 vault_password,
@@ -3420,9 +3423,14 @@ impl App {
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "backup".into());
-                let backup_data = tokio::task::spawn_blocking(move || {
+                let pass = passphrase.clone();
+                let (backup_data, info) = tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Backup failed", move |keep| {
-                        keep_core::backup::create_backup(keep, &passphrase).map_err(friendly_err)
+                        let data = keep_core::backup::create_backup(keep, &passphrase)
+                            .map_err(friendly_err)?;
+                        let info =
+                            keep_core::backup::verify_backup(&data, &pass).map_err(friendly_err)?;
+                        Ok((data, info))
                     })
                 })
                 .await
@@ -3431,17 +3439,20 @@ impl App {
                     .await
                     .map_err(|_| "Background task failed".to_string())?
                     .map_err(|e| format!("Failed to write backup: {e}"))?;
-                Ok(filename)
+                Ok((filename, info))
             },
             Message::BackupResult,
         )
     }
 
-    fn handle_backup_result(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_backup_result(
+        &mut self,
+        result: Result<(String, BackupInfo), String>,
+    ) -> Task<Message> {
         match result {
-            Ok(filename) => {
+            Ok((filename, info)) => {
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.backup_completed();
+                    s.backup_completed(info);
                 }
                 self.set_toast(format!("Backup saved to {filename}"), ToastKind::Success);
             }
@@ -3491,6 +3502,44 @@ impl App {
         )
     }
 
+    fn handle_restore_verify(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
+        let Screen::Settings(s) = &self.screen else {
+            return Task::none();
+        };
+        let Some((_, data)) = s.restore_file.as_ref() else {
+            return Task::none();
+        };
+        let data = data.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    keep_core::backup::verify_backup(&data, &passphrase).map_err(friendly_err)
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RestoreVerified,
+        )
+    }
+
+    fn handle_restore_verified(&mut self, result: Result<BackupInfo, String>) -> Task<Message> {
+        let Screen::Settings(s) = &mut self.screen else {
+            return Task::none();
+        };
+        if !s.can_accept_restore_result() {
+            return Task::none();
+        }
+        match result {
+            Ok(info) => s.restore_verified(info),
+            Err(e) => {
+                let toast_msg = e.clone();
+                s.restore_verify_failed(e);
+                self.set_toast(toast_msg, ToastKind::Error);
+            }
+        }
+        Task::none()
+    }
+
     fn handle_restore_submit(
         &mut self,
         passphrase: Zeroizing<String>,
@@ -3517,13 +3566,14 @@ impl App {
                         &vault_password,
                     )
                     .map_err(friendly_err)?;
-                    Ok(format!(
+                    let summary = format!(
                         "Restored {} keys, {} shares, {} descriptors to {}",
                         info.key_count,
                         info.share_count,
                         info.descriptor_count,
                         restore_dir.display()
-                    ))
+                    );
+                    Ok((summary, info))
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -3532,19 +3582,30 @@ impl App {
         )
     }
 
-    fn handle_restore_result(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_restore_result(
+        &mut self,
+        result: Result<(String, BackupInfo), String>,
+    ) -> Task<Message> {
+        if let Screen::Settings(s) = &self.screen {
+            if !s.can_accept_restore_result() {
+                return Task::none();
+            }
+        } else {
+            return Task::none();
+        }
         match result {
-            Ok(summary) => {
+            Ok((summary, info)) => {
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_completed();
+                    s.restore_completed(info);
                 }
                 self.set_toast(summary, ToastKind::Success);
             }
             Err(e) => {
+                let toast_msg = e.clone();
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_failed(e.clone());
+                    s.restore_failed(e);
                 }
-                self.set_toast(e, ToastKind::Error);
+                self.set_toast(toast_msg, ToastKind::Error);
             }
         }
         Task::none()

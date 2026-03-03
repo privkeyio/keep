@@ -136,6 +136,7 @@ pub struct BackupInfo {
     pub share_count: u32,
     pub descriptor_count: u32,
     pub created_at: String,
+    pub file_size: u64,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

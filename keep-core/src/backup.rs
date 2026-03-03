@@ -126,7 +126,7 @@ impl std::fmt::Debug for BackupShare {
 }
 
 /// Summary information about a backup file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackupInfo {
     /// Number of keys in the backup.
     pub key_count: usize,
@@ -136,6 +136,8 @@ pub struct BackupInfo {
     pub descriptor_count: usize,
     /// ISO-8601 timestamp when the backup was created.
     pub created_at: String,
+    /// Size of the backup file in bytes.
+    pub file_size: usize,
 }
 
 /// Decrypted backup data with all vault contents.
@@ -400,12 +402,14 @@ pub fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<DecryptedBackup> 
 
 /// Verify a backup file and return summary information.
 pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
+    let file_size = data.len();
     let decrypted = decrypt_backup(data, passphrase)?;
     Ok(BackupInfo {
         key_count: decrypted.keys.len(),
         share_count: decrypted.shares.len(),
         descriptor_count: decrypted.wallet_descriptors.len(),
         created_at: decrypted.created_at,
+        file_size,
     })
 }
 
@@ -493,6 +497,7 @@ pub fn restore_backup(
         share_count: backup.shares.len(),
         descriptor_count: backup.wallet_descriptors.len(),
         created_at: backup.created_at.clone(),
+        file_size: data.len(),
     };
 
     if target.exists() {

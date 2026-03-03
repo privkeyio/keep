@@ -639,7 +639,7 @@ impl KfpNode {
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
-                .filter(|p| self.can_send_to(&p.pubkey))
+                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
                 .collect();
 
             if eligible_peers.len() + 1 < threshold {

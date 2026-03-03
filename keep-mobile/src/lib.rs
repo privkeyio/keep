@@ -1376,8 +1376,9 @@ impl KeepMobile {
         data: Vec<u8>,
         passphrase: String,
     ) -> Result<BackupInfo, KeepMobileError> {
+        let file_size = data.len();
         let decrypted = decrypt_backup_data(&data, &passphrase)?;
-        Ok(backup_info(&decrypted))
+        Ok(backup_info(&decrypted, file_size))
     }
 
     pub fn restore_backup(
@@ -1385,8 +1386,9 @@ impl KeepMobile {
         data: Vec<u8>,
         passphrase: String,
     ) -> Result<BackupInfo, KeepMobileError> {
+        let file_size = data.len();
         let decrypted = decrypt_backup_data(&data, &passphrase)?;
-        let info = backup_info(&decrypted);
+        let info = backup_info(&decrypted, file_size);
 
         let mut first_group_hex: Option<String> = None;
 
@@ -1541,12 +1543,13 @@ fn decrypt_backup_data(
         .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
 }
 
-fn backup_info(decrypted: &keep_core::backup::DecryptedBackup) -> BackupInfo {
+fn backup_info(decrypted: &keep_core::backup::DecryptedBackup, file_size: usize) -> BackupInfo {
     BackupInfo {
         key_count: decrypted.keys.len() as u32,
         share_count: decrypted.shares.len() as u32,
         descriptor_count: decrypted.wallet_descriptors.len() as u32,
         created_at: decrypted.created_at.clone(),
+        file_size: file_size as u64,
     }
 }
 
