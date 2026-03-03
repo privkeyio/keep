@@ -79,6 +79,8 @@ pub enum Event {
         threshold: u16,
         total_shares: u16,
         group_display: String,
+        group_pubkey: [u8; 32],
+        identifier: u16,
     },
     ConfirmDelete(ShareIdentity),
 }
@@ -124,6 +126,8 @@ impl State {
                 threshold: share.threshold,
                 total_shares: share.total_shares,
                 group_display: share.truncated_npub(),
+                group_pubkey: share.group_pubkey,
+                identifier: share.identifier,
             }),
             Message::ActivateShare(hex) => Some(Event::ActivateShare(hex)),
             Message::CopyNpub(npub) => Some(Event::CopyNpub(npub)),

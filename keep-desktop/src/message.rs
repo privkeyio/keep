@@ -146,6 +146,7 @@ pub enum Message {
     // Recovery
     Recovery(crate::screen::recovery::Message),
     RecoveryResult(Result<Zeroizing<String>, String>),
+    VaultShareExported(Result<(Zeroizing<String>, Zeroizing<String>), String>),
 
     // Import
     Import(crate::screen::import::Message),
@@ -470,6 +471,7 @@ impl fmt::Debug for Message {
             Self::CertPinMismatchDismiss => f.write_str("CertPinMismatchDismiss"),
             Self::CertPinMismatchClearAndRetry => f.write_str("CertPinMismatchClearAndRetry"),
             Self::CertPinMismatchConfirmClear => f.write_str("CertPinMismatchConfirmClear"),
+            Self::VaultShareExported(_) => f.write_str("VaultShareExported(***)"),
         }
     }
 }

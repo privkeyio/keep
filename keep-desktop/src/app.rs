@@ -672,6 +672,7 @@ impl App {
             Message::Import(msg) => self.handle_import_message(msg),
             Message::Recovery(msg) => self.handle_recovery_message(msg),
             Message::RecoveryResult(result) => self.handle_recovery_result(result),
+            Message::VaultShareExported(result) => self.handle_vault_share_exported(result),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
             Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
@@ -998,10 +999,36 @@ impl App {
                 threshold,
                 total_shares,
                 group_display,
+                group_pubkey,
+                identifier,
             } => {
                 self.screen =
                     Screen::Recovery(recovery::State::new(threshold, total_shares, group_display));
-                Task::none()
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let passphrase = "keep-internal-recovery";
+                            with_keep_blocking(
+                                &keep_arc,
+                                "Failed to export vault share",
+                                move |keep| {
+                                    let export = keep
+                                        .frost_export_share(&group_pubkey, identifier, passphrase)
+                                        .map_err(|e| e.to_string())?;
+                                    let bech32 = export
+                                        .to_bech32()
+                                        .map(Zeroizing::new)
+                                        .map_err(|e| e.to_string())?;
+                                    Ok((bech32, Zeroizing::new(passphrase.to_string())))
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::VaultShareExported,
+                )
             }
             shares::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
             shares::Event::ConfirmDelete(id) => {
@@ -1140,6 +1167,19 @@ impl App {
         match result {
             Ok(nsec) => s.recovery_succeeded(nsec),
             Err(e) => s.recovery_failed(e),
+        }
+        Task::none()
+    }
+
+    fn handle_vault_share_exported(
+        &mut self,
+        result: Result<(Zeroizing<String>, Zeroizing<String>), String>,
+    ) -> Task<Message> {
+        let Screen::Recovery(s) = &mut self.screen else {
+            return Task::none();
+        };
+        if let Ok((bech32, passphrase)) = result {
+            s.set_vault_share(bech32, passphrase);
         }
         Task::none()
     }

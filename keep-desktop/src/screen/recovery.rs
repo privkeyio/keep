@@ -50,6 +50,7 @@ pub enum Event {
 pub struct State {
     share_inputs: Vec<Zeroizing<String>>,
     passphrase_inputs: Vec<Zeroizing<String>>,
+    vault_slot: bool,
     threshold: u16,
     total_shares: u16,
     group_display: String,
@@ -65,6 +66,7 @@ impl State {
         Self {
             share_inputs: vec![Zeroizing::new(String::new()); count],
             passphrase_inputs: vec![Zeroizing::new(String::new()); count],
+            vault_slot: false,
             threshold,
             total_shares,
             group_display,
@@ -135,6 +137,14 @@ impl State {
         }
     }
 
+    pub fn set_vault_share(&mut self, bech32: Zeroizing<String>, passphrase: Zeroizing<String>) {
+        if !self.share_inputs.is_empty() {
+            self.share_inputs[0] = bech32;
+            self.passphrase_inputs[0] = passphrase;
+            self.vault_slot = true;
+        }
+    }
+
     pub fn recovery_succeeded(&mut self, nsec: Zeroizing<String>) {
         self.recovered_nsec = Some(nsec);
         self.loading = false;
@@ -183,26 +193,43 @@ impl State {
             .spacing(theme::space::XS);
 
         for i in 0..self.share_inputs.len() {
-            let label = text(format!("Share {}", i + 1))
-                .size(theme::size::SMALL)
-                .color(theme::color::TEXT);
+            let is_vault = self.vault_slot && i == 0;
 
-            let share_input = text_input("kshare1...", &self.share_inputs[i])
-                .on_input(move |s| Message::ShareInputChanged(i, Zeroizing::new(s)))
+            let label_text = if is_vault {
+                format!("Share {} (from vault)", i + 1)
+            } else {
+                format!("Share {}", i + 1)
+            };
+            let label = text(label_text)
+                .size(theme::size::SMALL)
+                .color(if is_vault {
+                    theme::color::SUCCESS
+                } else {
+                    theme::color::TEXT
+                });
+
+            let mut share_input = text_input("kshare1...", &self.share_inputs[i])
                 .padding(theme::space::MD)
                 .width(Length::Fill);
+            if !is_vault {
+                share_input =
+                    share_input.on_input(move |s| Message::ShareInputChanged(i, Zeroizing::new(s)));
+            }
 
-            let pass_input = text_input("Passphrase", &self.passphrase_inputs[i])
-                .on_input(move |s| Message::PassphraseChanged(i, Zeroizing::new(s)))
+            let mut pass_input = text_input("Passphrase", &self.passphrase_inputs[i])
                 .secure(true)
                 .padding(theme::space::MD)
                 .width(Length::Fill);
+            if !is_vault {
+                pass_input =
+                    pass_input.on_input(move |s| Message::PassphraseChanged(i, Zeroizing::new(s)));
+            }
 
             let mut share_row = row![share_input, pass_input]
                 .spacing(theme::space::SM)
                 .align_y(Alignment::Center);
 
-            if self.share_inputs.len() > 1 {
+            if self.share_inputs.len() > 1 && !is_vault {
                 let remove_btn = button(text("x").size(theme::size::SMALL))
                     .on_press(Message::RemoveShareInput(i))
                     .style(theme::text_button)
