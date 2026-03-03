@@ -109,6 +109,8 @@ pub(crate) struct ActiveCoordination {
     pub is_initiator: bool,
 }
 
+type VaultShareResult = Result<(Zeroizing<String>, Zeroizing<String>), String>;
+
 pub struct App {
     pub(crate) keep: Arc<Mutex<Option<Keep>>>,
     pub(crate) keep_path: PathBuf,
@@ -158,6 +160,7 @@ pub struct App {
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
     scanner_recovery: Option<(recovery::State, usize)>,
+    pending_vault_share: Option<VaultShareResult>,
     last_recovery_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
@@ -573,6 +576,7 @@ impl App {
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             scanner_recovery: None,
+            pending_vault_share: None,
             last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
@@ -754,6 +758,11 @@ impl App {
         if let Screen::Recovery(s) = &mut self.screen {
             if s.has_active_timer() {
                 s.update(recovery::Message::AutoClearTick);
+            }
+        }
+        if let Some((ref mut state, _)) = self.scanner_recovery {
+            if state.has_active_timer() {
+                state.update(recovery::Message::AutoClearTick);
             }
         }
         if self.copy_feedback_until.is_some_and(|t| now >= t) {
@@ -1228,6 +1237,7 @@ impl App {
         result: Result<(Zeroizing<String>, Zeroizing<String>), String>,
     ) -> Task<Message> {
         let Screen::Recovery(s) = &mut self.screen else {
+            self.pending_vault_share = Some(result);
             return Task::none();
         };
         match result {
@@ -1238,6 +1248,22 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    fn consume_pending_vault_share(&mut self) {
+        if let Some(result) = self.pending_vault_share.take() {
+            if let Screen::Recovery(s) = &mut self.screen {
+                match result {
+                    Ok((bech32, passphrase)) => s.set_vault_share(bech32, passphrase),
+                    Err(e) => {
+                        error!("Vault share auto-export failed: {e}");
+                        s.recovery_failed(
+                            "Could not auto-export vault share; add it manually".to_string(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn handle_scanner_message(&mut self, msg: scanner::Message) -> Task<Message> {
@@ -1252,7 +1278,10 @@ impl App {
                 self.stop_scanner();
                 if let Some((state, _)) = self.scanner_recovery.take() {
                     self.screen = Screen::Recovery(state);
+                    self.consume_pending_vault_share();
                 } else {
+                    self.scanner_recovery = None;
+                    self.pending_vault_share = None;
                     self.screen = Screen::Import(import::State::new());
                 }
                 Task::none()
@@ -1333,6 +1362,7 @@ impl App {
                             if let Some((mut state, slot)) = self.scanner_recovery.take() {
                                 state.set_share_input(slot, Zeroizing::new(result));
                                 self.screen = Screen::Recovery(state);
+                                self.consume_pending_vault_share();
                             } else {
                                 let import = import::State::with_data(result);
                                 self.screen = Screen::Import(import);
@@ -1848,6 +1878,7 @@ impl App {
         self.toast = None;
         self.toast_dismiss_at = None;
         self.scanner_recovery = None;
+        self.pending_vault_share = None;
         self.frost_last_share = None;
         self.frost_last_relay_urls = None;
         self.nostrconnect_pending = None;
@@ -3460,6 +3491,7 @@ impl App {
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
             scanner_recovery: None,
+            pending_vault_share: None,
             last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
