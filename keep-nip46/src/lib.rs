@@ -8,6 +8,7 @@ pub mod bunker;
 pub mod error;
 pub mod frost_signer;
 pub mod handler;
+#[cfg(unix)]
 pub mod local_server;
 pub mod permissions;
 pub mod rate_limit;
@@ -21,8 +22,9 @@ pub use bunker::{
 pub use error::Result;
 pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;
+#[cfg(unix)]
+pub use local_server::{LocalServer, LocalServerConfig};
 pub use permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 pub use rate_limit::{RateLimitConfig, RateLimiter};
-pub use local_server::{LocalServer, LocalServerConfig};
 pub use server::{Server, ServerConfig};
 pub use types::{ApprovalRequest, LogEvent, ServerCallbacks};

@@ -8,7 +8,10 @@ use std::sync::Arc;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use keep_core::error::{KeepError, NetworkError, Result};
@@ -92,13 +95,18 @@ impl LocalServer {
     pub async fn run(self) -> Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent).map_err(KeepError::Io)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                use std::fs::DirBuilder;
+                use std::os::unix::fs::DirBuilderExt;
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
                     .map_err(KeepError::Io)?;
             }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(parent).map_err(KeepError::Io)?;
         }
 
         let listener = tokio::net::UnixListener::bind(&self.socket_path)
@@ -107,28 +115,32 @@ impl LocalServer {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .map_err(KeepError::Io)?;
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(KeepError::Io)?;
         }
 
         info!(path = %self.socket_path.display(), "local signer listening");
 
+        let mut connections = JoinSet::new();
+
         loop {
-            let (stream, _addr) = listener.accept().await
-                .map_err(|e| NetworkError::relay(format!("accept: {e}")))?;
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _addr) = result
+                        .map_err(|e| NetworkError::relay(format!("accept: {e}")))?;
 
-            let handler = self.handler.clone();
-            let callbacks = self.callbacks.clone();
-            let max_size = self.max_request_size;
+                    let handler = self.handler.clone();
+                    let callbacks = self.callbacks.clone();
+                    let max_size = self.max_request_size;
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, handler, callbacks, max_size).await {
-                    warn!(error = %e, "local client connection error");
+                    connections.spawn(async move {
+                        if let Err(e) = handle_connection(stream, handler, callbacks, max_size).await {
+                            warn!(error = %e, "local client connection error");
+                        }
+                    });
                 }
-            });
+                Some(_) = connections.join_next() => {}
+            }
         }
     }
 }
@@ -137,8 +149,13 @@ fn next_client_id() -> String {
     format!("local-{}", CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+async fn write_line(w: &mut OwnedWriteHalf, data: &[u8]) {
+    let _ = w.write_all(data).await;
+    let _ = w.write_all(b"\n").await;
+}
+
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
+    stream: UnixStream,
     handler: Arc<SignerHandler>,
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     max_size: usize,
@@ -164,22 +181,72 @@ async fn handle_connection(
         .map_err(|e| KeepError::Runtime(format!("no signing key: {e}")))?;
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
+    let mut buf = Vec::with_capacity(1024);
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.len() > max_size {
-            let err = r#"{"id":"","error":"request too large"}"#;
-            let _ = write_half.write_all(err.as_bytes()).await;
-            let _ = write_half.write_all(b"\n").await;
+    loop {
+        buf.clear();
+        let mut total = 0usize;
+        let too_large = loop {
+            let available = match reader.fill_buf().await {
+                Ok([]) => {
+                    if total == 0 {
+                        handler.revoke_client(&app_pubkey).await;
+                        info!(client = %client_id, "local client disconnected");
+                        return Ok(());
+                    }
+                    break false;
+                }
+                Ok(b) => b,
+                Err(_) => {
+                    handler.revoke_client(&app_pubkey).await;
+                    return Ok(());
+                }
+            };
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..pos]);
+                reader.consume(pos + 1);
+                break buf.len() > max_size;
+            }
+            let len = available.len();
+            total += len;
+            if total > max_size {
+                reader.consume(len);
+                // Drain remaining bytes until newline
+                loop {
+                    let rest = match reader.fill_buf().await {
+                        Ok([]) => break,
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    if let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+                        reader.consume(pos + 1);
+                        break;
+                    }
+                    let n = rest.len();
+                    reader.consume(n);
+                }
+                break true;
+            }
+            buf.extend_from_slice(available);
+            reader.consume(len);
+        };
+        if too_large {
+            write_line(&mut write_half, br#"{"id":"","error":"request too large"}"#).await;
             continue;
         }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s,
+            Err(_) => {
+                write_line(&mut write_half, br#"{"id":"","error":"invalid request"}"#).await;
+                continue;
+            }
+        };
 
-        let request: crate::types::Nip46Request = match serde_json::from_str(&line) {
+        let request: crate::types::Nip46Request = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(_) => {
-                let err = r#"{"id":"","error":"invalid JSON"}"#;
-                let _ = write_half.write_all(err.as_bytes()).await;
-                let _ = write_half.write_all(b"\n").await;
+                write_line(&mut write_half, br#"{"id":"","error":"invalid JSON"}"#).await;
                 continue;
             }
         };
@@ -190,29 +257,26 @@ async fn handle_connection(
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
-            let err = r#"{"id":"","error":"invalid request ID"}"#;
-            let _ = write_half.write_all(err.as_bytes()).await;
-            let _ = write_half.write_all(b"\n").await;
+            write_line(
+                &mut write_half,
+                br#"{"id":"","error":"invalid request ID"}"#,
+            )
+            .await;
             continue;
         }
 
         const MAX_NIP46_PARAMS: usize = 10;
         if request.params.len() > MAX_NIP46_PARAMS {
-            let err = r#"{"id":"","error":"too many request params"}"#;
-            let _ = write_half.write_all(err.as_bytes()).await;
-            let _ = write_half.write_all(b"\n").await;
+            write_line(
+                &mut write_half,
+                br#"{"id":"","error":"too many request params"}"#,
+            )
+            .await;
             continue;
         }
 
         let method = request.method.clone();
-        let response = dispatch_request(
-            &handler,
-            user_pubkey,
-            app_pubkey,
-            request,
-            max_size,
-        )
-        .await;
+        let response = dispatch_request(&handler, user_pubkey, app_pubkey, request, max_size).await;
 
         let success = response.error.is_none();
         if let Some(ref cb) = callbacks {
@@ -225,12 +289,7 @@ async fn handle_connection(
         }
 
         if let Ok(json) = serde_json::to_string(&response) {
-            let _ = write_half.write_all(json.as_bytes()).await;
-            let _ = write_half.write_all(b"\n").await;
+            write_line(&mut write_half, json.as_bytes()).await;
         }
     }
-
-    handler.revoke_client(&app_pubkey).await;
-    info!(client = %client_id, "local client disconnected");
-    Ok(())
 }

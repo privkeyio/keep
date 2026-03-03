@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use iced::Task;
 
+use keep_core::audit::{SigningAuditEntry, SigningDecision, SigningRequestType};
+
 use crate::app::{
-    save_settings, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES,
+    lock_keep, save_settings, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES,
 };
 use crate::bunker_service::extract_keyring;
 use crate::message::Message;
@@ -143,8 +145,9 @@ impl App {
                     ..Default::default()
                 };
                 let socket_path_str = socket_path.display().to_string();
-                let server = keep_nip46::LocalServer::new(keyring, socket_path, Some(callbacks), config)
-                    .map_err(|e| format!("Failed to start local signer: {e}"))?;
+                let server =
+                    keep_nip46::LocalServer::new(keyring, socket_path, Some(callbacks), config)
+                        .map_err(|e| format!("Failed to start local signer: {e}"))?;
 
                 let handler = server.handler();
                 let handle = tokio::spawn(async move {
@@ -227,6 +230,38 @@ impl App {
         }
     }
 
+    fn resolve_local_signer_approval(&mut self, approved: bool) {
+        if let Some(tx) = self.local_signer_approval_tx.take() {
+            let _ = tx.send(approved);
+        }
+        self.local_signer_pending_approval = None;
+        if let Screen::LocalSigner(s) = &mut self.screen {
+            s.approval_cleared();
+        }
+    }
+
+    pub(crate) fn handle_local_signer_revoke_result(
+        &mut self,
+        result: Result<String, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(client_id) => {
+                if let Some(ref mut ls) = self.local_signer {
+                    ls.clients.retain(|c| c.client_id != client_id);
+                }
+                if let Screen::LocalSigner(s) = &mut self.screen {
+                    s.clients.retain(|c| c.client_id != client_id);
+                }
+            }
+            Err(e) => {
+                if let Screen::LocalSigner(s) = &mut self.screen {
+                    s.error = Some(e);
+                }
+            }
+        }
+        Task::none()
+    }
+
     pub(crate) fn handle_local_signer_stop(&mut self) -> Task<Message> {
         self.stop_local_signer();
         self.settings.local_signer_auto_start = false;
@@ -260,10 +295,7 @@ impl App {
                         continue;
                     };
                     if !ls.clients.iter().any(|c| c.client_id == client_id) {
-                        let client = ConnectedClient {
-                            client_id,
-                            name,
-                        };
+                        let client = ConnectedClient { client_id, name };
                         ls.clients.push(client.clone());
                         if let Screen::LocalSigner(s) = &mut self.screen {
                             s.clients.push(client);
@@ -275,6 +307,7 @@ impl App {
                     action,
                     success,
                 } => {
+                    log_to_signing_audit(&self.keep, &app, &action, success);
                     let Some(ref mut ls) = self.local_signer else {
                         continue;
                     };
@@ -300,6 +333,14 @@ impl App {
                 } => {
                     if let Some(prev_tx) = self.local_signer_approval_tx.take() {
                         let _ = prev_tx.send(false);
+                    }
+                    if !self.window_visible {
+                        let tx = self.tray.as_ref().map(|t| &t.event_tx);
+                        crate::tray::send_approval_notification(
+                            &display.app_name,
+                            &display.method,
+                            tx,
+                        );
                     }
                     self.local_signer_pending_approval = Some(display.clone());
                     self.local_signer_approval_tx = Some(response_tx);
@@ -333,48 +374,29 @@ impl App {
                     );
                     return Task::none();
                 }
-                if let Some(tx) = self.local_signer_approval_tx.take() {
-                    let _ = tx.send(true);
-                }
-                self.local_signer_pending_approval = None;
-                if let Screen::LocalSigner(s) = &mut self.screen {
-                    s.approval_cleared();
-                }
+                self.resolve_local_signer_approval(true);
                 Task::none()
             }
             Event::Reject => {
-                if let Some(tx) = self.local_signer_approval_tx.take() {
-                    let _ = tx.send(false);
-                }
-                self.local_signer_pending_approval = None;
-                if let Screen::LocalSigner(s) = &mut self.screen {
-                    s.approval_cleared();
-                }
+                self.resolve_local_signer_approval(false);
                 Task::none()
             }
-            Event::RevokeClient(i) => {
-                let client_id = if let Screen::LocalSigner(s) = &self.screen {
-                    s.clients.get(i).map(|c| c.client_id.clone())
-                } else {
-                    None
+            Event::RevokeClient(client_id) => {
+                let Some(ref ls) = self.local_signer else {
+                    return Task::none();
                 };
-                if let (Some(id), Some(ref ls)) = (client_id, &self.local_signer) {
-                    let handler = ls.handler.clone();
-                    let cid = id.clone();
-                    return Task::perform(
-                        async move {
-                            let app_pubkey = keep_nip46::LocalServer::pseudo_pubkey_for(&id);
-                            handler.revoke_client(&app_pubkey).await;
-                            Ok::<String, String>(cid)
-                        },
-                        Message::LocalSignerRevokeResult,
-                    );
-                }
-                Task::none()
+                let handler = ls.handler.clone();
+                Task::perform(
+                    async move {
+                        let app_pubkey = keep_nip46::LocalServer::pseudo_pubkey_for(&client_id);
+                        handler.revoke_client(&app_pubkey).await;
+                        Ok::<String, String>(client_id)
+                    },
+                    Message::LocalSignerRevokeResult,
+                )
             }
             Event::CopyPath => {
-                let Some(path) = self.local_signer.as_ref().map(|ls| ls.socket_path.clone())
-                else {
+                let Some(path) = self.local_signer.as_ref().map(|ls| ls.socket_path.clone()) else {
                     return Task::none();
                 };
                 self.start_clipboard_timer();
@@ -396,5 +418,41 @@ impl App {
         } else {
             local_signer::State::new()
         }
+    }
+}
+
+fn action_to_request_type(action: &str) -> SigningRequestType {
+    match action {
+        "sign_event" => SigningRequestType::SignEvent,
+        "nip04_encrypt" => SigningRequestType::Nip04Encrypt,
+        "nip04_decrypt" => SigningRequestType::Nip04Decrypt,
+        "nip44_encrypt" => SigningRequestType::Nip44Encrypt,
+        "nip44_decrypt" => SigningRequestType::Nip44Decrypt,
+        "get_public_key" => SigningRequestType::GetPublicKey,
+        "connect" => SigningRequestType::Connect,
+        _ => SigningRequestType::SignEvent,
+    }
+}
+
+fn log_to_signing_audit(
+    keep: &Arc<Mutex<Option<keep_core::Keep>>>,
+    app: &str,
+    action: &str,
+    success: bool,
+) {
+    let request_type = action_to_request_type(action);
+    let decision = if success {
+        SigningDecision::Approved
+    } else {
+        SigningDecision::Denied
+    };
+    let mut guard = lock_keep(keep);
+    let Some(keep) = guard.as_mut() else {
+        return;
+    };
+    let prev_hash = keep.signing_audit_last_hash().unwrap_or([0u8; 32]);
+    let entry = SigningAuditEntry::new(request_type, decision, false, app.into(), prev_hash);
+    if let Err(e) = keep.signing_audit_log(entry) {
+        tracing::warn!("Failed to log local signer audit entry: {e}");
     }
 }

@@ -35,7 +35,7 @@ pub enum Message {
     Stop,
     Approve,
     Reject,
-    RevokeClient(usize),
+    RevokeClient(String),
     CopyPath,
 }
 
@@ -44,7 +44,7 @@ pub enum Event {
     Stop,
     Approve,
     Reject,
-    RevokeClient(usize),
+    RevokeClient(String),
     CopyPath,
 }
 
@@ -249,7 +249,7 @@ impl State {
 
     fn clients_card(&self) -> Element<'_, Message> {
         let mut client_list = column![].spacing(theme::space::SM);
-        for (i, client) in self.clients.iter().enumerate() {
+        for client in &self.clients {
             let header = row![
                 text(&client.name)
                     .size(theme::size::SMALL)
@@ -260,7 +260,7 @@ impl State {
                     .color(theme::color::TEXT_DIM),
                 Space::new().width(Length::Fill),
                 button(text("Revoke").size(theme::size::TINY))
-                    .on_press(Message::RevokeClient(i))
+                    .on_press(Message::RevokeClient(client.client_id.clone()))
                     .style(theme::danger_button)
                     .padding([2.0, theme::space::SM]),
             ]

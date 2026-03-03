@@ -735,22 +735,7 @@ impl App {
                 self.handle_local_signer_start_result(result)
             }
             Message::LocalSignerRevokeResult(result) => {
-                match result {
-                    Ok(client_id) => {
-                        if let Some(ref mut ls) = self.local_signer {
-                            ls.clients.retain(|c| c.client_id != client_id);
-                        }
-                        if let Screen::LocalSigner(s) = &mut self.screen {
-                            s.clients.retain(|c| c.client_id != client_id);
-                        }
-                    }
-                    Err(e) => {
-                        if let Screen::LocalSigner(s) = &mut self.screen {
-                            s.error = Some(e);
-                        }
-                    }
-                }
-                Task::none()
+                self.handle_local_signer_revoke_result(result)
             }
 
             Message::SigningAudit(msg) => self.handle_signing_audit_message(msg),
@@ -2227,11 +2212,15 @@ impl App {
                 if let Some(request) = take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }
+                let mut tasks = Vec::new();
                 if self.settings.bunker_auto_start && !self.settings.kill_switch_active {
-                    return self.handle_bunker_start();
+                    tasks.push(self.handle_bunker_start());
                 }
                 if self.settings.local_signer_auto_start && !self.settings.kill_switch_active {
-                    return self.handle_local_signer_start();
+                    tasks.push(self.handle_local_signer_start());
+                }
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
                 }
             }
             Err(e) => self.screen.set_loading_error(e),
@@ -3567,7 +3556,7 @@ impl App {
     pub(crate) fn notify_bunker_approval(&self, display: &PendingApprovalDisplay) {
         if !self.window_visible {
             let tx = self.tray.as_ref().map(|t| &t.event_tx);
-            crate::tray::send_bunker_approval_notification(&display.app_name, &display.method, tx);
+            crate::tray::send_approval_notification(&display.app_name, &display.method, tx);
         }
     }
 
@@ -3903,6 +3892,7 @@ mod tests {
             minimize_to_tray: false,
             start_minimized: true,
             bunker_auto_start: false,
+            local_signer_auto_start: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();

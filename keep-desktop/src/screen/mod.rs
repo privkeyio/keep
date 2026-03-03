@@ -70,9 +70,7 @@ impl Screen {
             Screen::Wallet(s) => (NavItem::Wallets, s.view().map(Message::Wallet)),
             Screen::Relay(s) => (NavItem::Relay, s.view().map(Message::Relay)),
             Screen::Bunker(s) => (NavItem::Bunker, s.view().map(Message::Bunker)),
-            Screen::LocalSigner(s) => {
-                (NavItem::LocalSigner, s.view().map(Message::LocalSigner))
-            }
+            Screen::LocalSigner(s) => (NavItem::LocalSigner, s.view().map(Message::LocalSigner)),
             Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view().map(Message::NsecKeys)),
             Screen::SigningAudit(s) => (NavItem::Audit, s.view().map(Message::SigningAudit)),
             Screen::Settings(s) => (NavItem::Settings, s.view().map(Message::Settings)),
