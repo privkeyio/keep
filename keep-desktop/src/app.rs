@@ -13,6 +13,7 @@ use keep_nip46::NostrConnectRequest;
 
 use iced::widget::{button, column, container, row, text};
 use iced::{Background, Element, Length, Subscription, Task};
+use keep_core::backup::BackupInfo;
 use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
 use keep_core::Keep;
@@ -777,6 +778,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::RestoreVerified(result) => self.handle_restore_verified(result),
             Message::RestoreResult(result) => self.handle_restore_result(result),
 
             Message::CertPinMismatchDismiss
@@ -3193,6 +3195,9 @@ impl App {
             Event::RestoreStart => {
                 return self.handle_restore_file_pick();
             }
+            Event::RestoreVerify(passphrase) => {
+                return self.handle_restore_verify(passphrase);
+            }
             Event::RestoreSubmit {
                 passphrase,
                 vault_password,
@@ -3420,6 +3425,7 @@ impl App {
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "backup".into());
+                let pass = passphrase.clone();
                 let backup_data = tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Backup failed", move |keep| {
                         keep_core::backup::create_backup(keep, &passphrase).map_err(friendly_err)
@@ -3427,21 +3433,30 @@ impl App {
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
+                let verify_data = backup_data.clone();
+                let info = tokio::task::spawn_blocking(move || {
+                    keep_core::backup::verify_backup(&verify_data, &pass).map_err(friendly_err)
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
                 tokio::task::spawn_blocking(move || write_private_bytes(&path, &backup_data))
                     .await
                     .map_err(|_| "Background task failed".to_string())?
                     .map_err(|e| format!("Failed to write backup: {e}"))?;
-                Ok(filename)
+                Ok((filename, info))
             },
             Message::BackupResult,
         )
     }
 
-    fn handle_backup_result(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_backup_result(
+        &mut self,
+        result: Result<(String, BackupInfo), String>,
+    ) -> Task<Message> {
         match result {
-            Ok(filename) => {
+            Ok((filename, info)) => {
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.backup_completed();
+                    s.backup_completed(info);
                 }
                 self.set_toast(format!("Backup saved to {filename}"), ToastKind::Success);
             }
@@ -3491,6 +3506,44 @@ impl App {
         )
     }
 
+    fn handle_restore_verify(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
+        let file_data = if let Screen::Settings(s) = &self.screen {
+            s.restore_file.as_ref().map(|(_, data)| data.clone())
+        } else {
+            None
+        };
+        let Some(data) = file_data else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    keep_core::backup::verify_backup(&data, &passphrase).map_err(friendly_err)
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RestoreVerified,
+        )
+    }
+
+    fn handle_restore_verified(&mut self, result: Result<BackupInfo, String>) -> Task<Message> {
+        match result {
+            Ok(info) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.restore_verified(info);
+                }
+            }
+            Err(e) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.restore_verify_failed(e.clone());
+                }
+                self.set_toast(e, ToastKind::Error);
+            }
+        }
+        Task::none()
+    }
+
     fn handle_restore_submit(
         &mut self,
         passphrase: Zeroizing<String>,
@@ -3517,13 +3570,14 @@ impl App {
                         &vault_password,
                     )
                     .map_err(friendly_err)?;
-                    Ok(format!(
+                    let summary = format!(
                         "Restored {} keys, {} shares, {} descriptors to {}",
                         info.key_count,
                         info.share_count,
                         info.descriptor_count,
                         restore_dir.display()
-                    ))
+                    );
+                    Ok((summary, info))
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -3532,11 +3586,14 @@ impl App {
         )
     }
 
-    fn handle_restore_result(&mut self, result: Result<String, String>) -> Task<Message> {
+    fn handle_restore_result(
+        &mut self,
+        result: Result<(String, BackupInfo), String>,
+    ) -> Task<Message> {
         match result {
-            Ok(summary) => {
+            Ok((summary, info)) => {
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_completed();
+                    s.restore_completed(info);
                 }
                 self.set_toast(summary, ToastKind::Success);
             }

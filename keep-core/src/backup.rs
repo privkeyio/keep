@@ -126,7 +126,7 @@ impl std::fmt::Debug for BackupShare {
 }
 
 /// Summary information about a backup file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackupInfo {
     /// Number of keys in the backup.
     pub key_count: usize,

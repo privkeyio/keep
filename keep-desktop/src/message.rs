@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use keep_core::backup::BackupInfo;
 use keep_frost_net::AnnouncedXpub;
 use zeroize::Zeroizing;
 
@@ -230,9 +231,10 @@ pub enum Message {
     Settings(crate::screen::settings::Message),
 
     // Backup / Restore
-    BackupResult(Result<String, String>),
+    BackupResult(Result<(String, BackupInfo), String>),
     RestoreFileLoaded(String, Vec<u8>),
-    RestoreResult(Result<String, String>),
+    RestoreVerified(Result<BackupInfo, String>),
+    RestoreResult(Result<(String, BackupInfo), String>),
 
     // Certificate pinning (modal overlay, not screen-local)
     CertPinMismatchDismiss,
@@ -485,16 +487,20 @@ impl fmt::Debug for Message {
             Self::Settings(msg) => f.debug_tuple("Settings").field(msg).finish(),
             Self::BackupResult(r) => f
                 .debug_tuple("BackupResult")
-                .field(&r.as_ref().map(|p| p.as_str()).map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|(p, _)| p.as_str()).map_err(|e| e.as_str()))
                 .finish(),
             Self::RestoreFileLoaded(name, data) => f
                 .debug_tuple("RestoreFileLoaded")
                 .field(name)
                 .field(&data.len())
                 .finish(),
+            Self::RestoreVerified(r) => f
+                .debug_tuple("RestoreVerified")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
             Self::RestoreResult(r) => f
                 .debug_tuple("RestoreResult")
-                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .field(&r.as_ref().map(|(_, _)| "ok").map_err(|e| e.as_str()))
                 .finish(),
             Self::NavigateAudit => f.write_str("NavigateAudit"),
             Self::AuditLoaded(r) => f
