@@ -1,18 +1,37 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use zeroize::Zeroizing;
 
 use crate::theme;
 
-#[derive(Debug, Clone)]
+const MIN_NSEC_LEN: usize = 60;
+
+#[derive(Clone)]
 pub enum Message {
     NameChanged(String),
     ThresholdChanged(String),
     TotalChanged(String),
+    NsecChanged(Zeroizing<String>),
     GoBack,
     Create,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameChanged(_) => f.write_str("NameChanged"),
+            Self::ThresholdChanged(_) => f.write_str("ThresholdChanged"),
+            Self::TotalChanged(_) => f.write_str("TotalChanged"),
+            Self::NsecChanged(_) => f.write_str("NsecChanged(***)"),
+            Self::GoBack => f.write_str("GoBack"),
+            Self::Create => f.write_str("Create"),
+        }
+    }
 }
 
 pub enum Event {
@@ -21,6 +40,7 @@ pub enum Event {
         name: String,
         threshold: u16,
         total: u16,
+        nsec: Option<Zeroizing<String>>,
     },
 }
 
@@ -28,33 +48,45 @@ pub struct State {
     name: String,
     threshold: String,
     total: String,
+    nsec: Zeroizing<String>,
     error: Option<String>,
     loading: bool,
+    existing_names: Vec<String>,
 }
 
 impl State {
-    pub fn new() -> Self {
+    pub fn new(existing_names: Vec<String>) -> Self {
         Self {
             name: String::new(),
             threshold: "2".into(),
             total: "3".into(),
+            nsec: Zeroizing::new(String::new()),
             error: None,
             loading: false,
+            existing_names,
         }
     }
 
     pub fn update(&mut self, message: Message) -> Option<Event> {
         match message {
             Message::NameChanged(n) => {
-                self.name = n;
+                self.name = n.chars().filter(|c| !c.is_control()).collect();
+                self.error = None;
                 None
             }
             Message::ThresholdChanged(t) => {
                 self.threshold = t;
+                self.error = None;
                 None
             }
             Message::TotalChanged(t) => {
                 self.total = t;
+                self.error = None;
+                None
+            }
+            Message::NsecChanged(n) => {
+                self.nsec = n;
+                self.error = None;
                 None
             }
             Message::GoBack => Some(Event::GoBack),
@@ -71,8 +103,27 @@ impl State {
                     _ => return None,
                 };
                 let total: u16 = match self.total.parse() {
-                    Ok(v) if v >= threshold && v <= 255 => v,
+                    Ok(v) if (threshold..=255).contains(&v) => v,
                     _ => return None,
+                };
+                let name_lower = name.to_lowercase();
+                if self
+                    .existing_names
+                    .iter()
+                    .any(|n| n.to_lowercase() == name_lower)
+                {
+                    self.error = Some("A keyset with this name already exists".into());
+                    return None;
+                }
+                let nsec = if self.nsec.trim().is_empty() {
+                    None
+                } else {
+                    let trimmed = self.nsec.trim();
+                    if !trimmed.starts_with("nsec1") || trimmed.len() < MIN_NSEC_LEN {
+                        self.error = Some("Invalid nsec: must start with nsec1".into());
+                        return None;
+                    }
+                    Some(self.nsec.clone())
                 };
                 self.loading = true;
                 self.error = None;
@@ -80,6 +131,7 @@ impl State {
                     name,
                     threshold,
                     total,
+                    nsec,
                 })
             }
         }
@@ -133,7 +185,13 @@ impl State {
         .spacing(theme::space::SM)
         .align_y(Alignment::Center);
 
-        let name_valid = !self.name.is_empty() && self.name.len() <= 64;
+        let name_trimmed = self.name.trim();
+        let name_duplicate = !name_trimmed.is_empty()
+            && self
+                .existing_names
+                .iter()
+                .any(|n| n.trim().eq_ignore_ascii_case(name_trimmed));
+        let name_valid = !name_trimmed.is_empty() && name_trimmed.len() <= 64 && !name_duplicate;
         let threshold_val: Option<u16> = self
             .threshold
             .parse()
@@ -141,7 +199,10 @@ impl State {
             .filter(|v| (2..=255).contains(v));
         let total_val: Option<u16> = self.total.parse().ok().filter(|&v| v <= 255);
         let total_valid = matches!((threshold_val, total_val), (Some(t), Some(n)) if n >= t);
-        let can_create = name_valid && threshold_val.is_some() && total_valid;
+        let nsec_trimmed = self.nsec.trim();
+        let nsec_valid = nsec_trimmed.is_empty()
+            || (nsec_trimmed.starts_with("nsec1") && nsec_trimmed.len() >= MIN_NSEC_LEN);
+        let can_create = name_valid && threshold_val.is_some() && total_valid && nsec_valid;
 
         let mut content = column![
             header,
@@ -155,8 +216,10 @@ impl State {
         ]
         .spacing(theme::space::XS);
 
-        if self.name.len() > 64 {
+        if name_trimmed.len() > 64 {
             content = content.push(theme::error_text("Name must be 64 characters or fewer"));
+        } else if name_duplicate {
+            content = content.push(theme::error_text("A keyset with this name already exists"));
         }
         if !self.threshold.is_empty() && threshold_val.is_none() {
             content = content.push(theme::error_text("Threshold must be between 2 and 255"));
@@ -194,6 +257,23 @@ impl State {
             content = content.push(
                 theme::muted("Choose how many devices are needed to sign (threshold) out of the total number of shares."),
             );
+        }
+
+        content = content.push(Space::new().height(theme::space::MD));
+        content = content.push(theme::label("Existing Key (optional)"));
+        content = content.push(
+            text("Paste an nsec to split an existing Nostr identity into threshold shares")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED),
+        );
+        let nsec_input = text_input("nsec1... (leave blank to generate fresh)", &self.nsec)
+            .on_input(|s| Message::NsecChanged(Zeroizing::new(s)))
+            .secure(true)
+            .padding(theme::space::MD)
+            .width(theme::size::INPUT_WIDTH);
+        content = content.push(nsec_input);
+        if !nsec_trimmed.is_empty() && !nsec_valid {
+            content = content.push(theme::error_text("Must be a valid nsec1... bech32 string"));
         }
 
         content = content.push(Space::new().height(theme::space::SM));

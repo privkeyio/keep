@@ -3,6 +3,7 @@
 
 pub mod bunker;
 pub mod create;
+pub mod distribute;
 pub mod export;
 pub mod export_ncryptsec;
 pub mod import;
@@ -30,6 +31,7 @@ pub enum Screen {
     Unlock(unlock::State),
     ShareList(shares::State),
     Create(create::State),
+    Distribute(distribute::State),
     Export(Box<export::State>),
     ExportNcryptsec(Box<export_ncryptsec::State>),
     Import(import::State),
@@ -56,6 +58,7 @@ impl Screen {
             Screen::Unlock(s) => return s.view().map(Message::Unlock),
             Screen::ShareList(s) => (NavItem::Shares, s.view().map(Message::ShareList)),
             Screen::Create(s) => (NavItem::Create, s.view().map(Message::Create)),
+            Screen::Distribute(s) => (NavItem::Create, s.view().map(Message::Distribute)),
             Screen::Export(s) => (NavItem::Shares, s.view().map(Message::Export)),
             Screen::ExportNcryptsec(s) => {
                 (NavItem::NsecKeys, s.view().map(Message::ExportNcryptsec))
@@ -105,6 +108,9 @@ impl Screen {
             }
             Screen::Recovery(s) => {
                 s.recovery_failed(error);
+            }
+            Screen::Distribute(s) => {
+                s.set_error(error);
             }
             Screen::ShareList(_)
             | Screen::NsecKeys(_)

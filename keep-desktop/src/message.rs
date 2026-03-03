@@ -134,6 +134,9 @@ pub enum Message {
     Create(crate::screen::create::Message),
     CreateResult(Result<Vec<ShareEntry>, String>),
 
+    // Distribute shares (post-creation)
+    Distribute(crate::screen::distribute::Message),
+
     // Export
     Export(crate::screen::export::Message),
     ExportGenerated(Result<ExportData, String>),
@@ -379,6 +382,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("CreateResult")
                 .field(&r.as_ref().map(|v| v.len()).map_err(|e| e.as_str()))
                 .finish(),
+            Self::Distribute(msg) => f.debug_tuple("Distribute").field(msg).finish(),
             Self::GoToExportNcryptsec(k) => f.debug_tuple("GoToExportNcryptsec").field(k).finish(),
             Self::NcryptsecGenerated(_) => f.write_str("NcryptsecGenerated(***)"),
             Self::ImportResult(r) => f
