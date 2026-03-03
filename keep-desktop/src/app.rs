@@ -3586,6 +3586,13 @@ impl App {
         &mut self,
         result: Result<(String, BackupInfo), String>,
     ) -> Task<Message> {
+        if let Screen::Settings(s) = &self.screen {
+            if !s.can_accept_restore_result() {
+                return Task::none();
+            }
+        } else {
+            return Task::none();
+        }
         match result {
             Ok((summary, info)) => {
                 if let Screen::Settings(s) = &mut self.screen {
@@ -3594,10 +3601,11 @@ impl App {
                 self.set_toast(summary, ToastKind::Success);
             }
             Err(e) => {
+                let toast_msg = e.clone();
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_failed(e.clone());
+                    s.restore_failed(e);
                 }
-                self.set_toast(e, ToastKind::Error);
+                self.set_toast(toast_msg, ToastKind::Error);
             }
         }
         Task::none()
