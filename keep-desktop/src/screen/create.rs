@@ -71,18 +71,22 @@ impl State {
         match message {
             Message::NameChanged(n) => {
                 self.name = n.chars().filter(|c| !c.is_control()).collect();
+                self.error = None;
                 None
             }
             Message::ThresholdChanged(t) => {
                 self.threshold = t;
+                self.error = None;
                 None
             }
             Message::TotalChanged(t) => {
                 self.total = t;
+                self.error = None;
                 None
             }
             Message::NsecChanged(n) => {
                 self.nsec = n;
+                self.error = None;
                 None
             }
             Message::GoBack => Some(Event::GoBack),
@@ -186,8 +190,8 @@ impl State {
             && self
                 .existing_names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case(name_trimmed));
-        let name_valid = !self.name.is_empty() && self.name.len() <= 64 && !name_duplicate;
+                .any(|n| n.trim().eq_ignore_ascii_case(name_trimmed));
+        let name_valid = !name_trimmed.is_empty() && name_trimmed.len() <= 64 && !name_duplicate;
         let threshold_val: Option<u16> = self
             .threshold
             .parse()
@@ -212,7 +216,7 @@ impl State {
         ]
         .spacing(theme::space::XS);
 
-        if self.name.len() > 64 {
+        if name_trimmed.len() > 64 {
             content = content.push(theme::error_text("Name must be 64 characters or fewer"));
         } else if name_duplicate {
             content = content.push(theme::error_text("A keyset with this name already exists"));

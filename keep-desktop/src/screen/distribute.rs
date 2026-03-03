@@ -58,9 +58,10 @@ impl State {
     pub fn update(&mut self, message: Message) -> Option<Event> {
         match message {
             Message::ExportQr(index) => self.shares.get(index).cloned().map(Event::ExportQr),
-            Message::Finish => {
-                (self.exported.len() as u16 >= self.threshold).then_some(Event::Finish)
-            }
+            Message::Finish => (self.threshold > 0
+                && !self.exported.is_empty()
+                && self.exported.len() as u16 >= self.threshold)
+                .then_some(Event::Finish),
         }
     }
 

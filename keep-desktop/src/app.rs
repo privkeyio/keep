@@ -1106,8 +1106,9 @@ impl App {
     fn handle_create_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
-                self.cached_share_count = shares.len();
-                self.refresh_identities(&shares);
+                let all_shares = self.current_shares();
+                self.cached_share_count = all_shares.len();
+                self.refresh_identities(&all_shares);
                 self.screen = Screen::Distribute(distribute::State::new(shares));
                 Task::none()
             }
@@ -2296,8 +2297,14 @@ impl App {
                                 let pubkey =
                                     keep.import_nsec(nsec.trim(), &name).map_err(friendly_err)?;
                                 if let Err(e) = keep.frost_split(&name, threshold, total) {
-                                    let _ = keep.delete_key(&pubkey);
-                                    return Err(friendly_err(e));
+                                    let split_err = friendly_err(e);
+                                    if let Err(del_err) = keep.delete_key(&pubkey) {
+                                        return Err(format!(
+                                            "{split_err} (rollback also failed: {})",
+                                            friendly_err(del_err)
+                                        ));
+                                    }
+                                    return Err(split_err);
                                 }
                             } else {
                                 keep.frost_generate(threshold, total, &name)
