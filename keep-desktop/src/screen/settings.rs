@@ -400,6 +400,10 @@ impl SettingsScreen {
         self.backup_error = Some(error);
     }
 
+    pub fn can_accept_restore_result(&self) -> bool {
+        self.restore_active && self.restore_file.is_some()
+    }
+
     pub fn restore_file_loaded(&mut self, filename: String, data: Vec<u8>) {
         self.restore_active = true;
         self.restore_file = Some((filename, data));
@@ -799,8 +803,10 @@ impl SettingsScreen {
     fn backup_summary_card(info: &BackupInfo) -> Element<'_, Message> {
         let size_str = if info.file_size >= 1_048_576 {
             format!("{:.1} MB", info.file_size as f64 / 1_048_576.0)
-        } else {
+        } else if info.file_size >= 1024 {
             format!("{:.1} KB", info.file_size as f64 / 1024.0)
+        } else {
+            format!("{} B", info.file_size)
         };
         container(
             column![

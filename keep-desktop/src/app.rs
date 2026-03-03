@@ -3523,17 +3523,17 @@ impl App {
     }
 
     fn handle_restore_verified(&mut self, result: Result<BackupInfo, String>) -> Task<Message> {
+        let Screen::Settings(s) = &mut self.screen else {
+            return Task::none();
+        };
+        if !s.can_accept_restore_result() {
+            return Task::none();
+        }
         match result {
-            Ok(info) => {
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_verified(info);
-                }
-            }
+            Ok(info) => s.restore_verified(info),
             Err(e) => {
                 let toast_msg = e.clone();
-                if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_verify_failed(e);
-                }
+                s.restore_verify_failed(e);
                 self.set_toast(toast_msg, ToastKind::Error);
             }
         }

@@ -279,7 +279,7 @@ pub(crate) async fn setup_frost_node(
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
 
-    {
+    let peer_policies = {
         let guard = keep_arc
             .lock()
             .map_err(|_| String::from("Keep mutex poisoned while loading peer policies"))?;
@@ -287,31 +287,31 @@ pub(crate) async fn setup_frost_node(
             .as_ref()
             .ok_or_else(|| String::from("Keep not available while loading peer policies"))?;
         match keep.get_relay_config(&share_entry.group_pubkey) {
-            Ok(Some(config)) => {
-                for entry in &config.peer_policies {
-                    match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
-                        Ok(pubkey) => {
-                            node.set_peer_policy(
-                                keep_frost_net::PeerPolicy::new(pubkey)
-                                    .allow_send(entry.allow_send)
-                                    .allow_receive(entry.allow_receive),
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                pubkey_hex = %entry.pubkey_hex,
-                                %e,
-                                "Skipping invalid peer policy from vault"
-                            );
-                        }
-                    }
-                }
-            }
+            Ok(Some(config)) => config.peer_policies,
             Ok(None) => {
                 tracing::debug!("No peer policies stored for this share");
+                Vec::new()
             }
             Err(e) => {
                 return Err(format!("Failed to load peer policies: {e}").into());
+            }
+        }
+    };
+    for entry in &peer_policies {
+        match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
+            Ok(pubkey) => {
+                node.set_peer_policy(
+                    keep_frost_net::PeerPolicy::new(pubkey)
+                        .allow_send(entry.allow_send)
+                        .allow_receive(entry.allow_receive),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pubkey_hex = %entry.pubkey_hex,
+                    %e,
+                    "Skipping invalid peer policy from vault"
+                );
             }
         }
     }
