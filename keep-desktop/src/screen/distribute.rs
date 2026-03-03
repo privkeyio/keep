@@ -27,6 +27,7 @@ pub struct State {
     total: u16,
     npub: String,
     exported: HashSet<u16>,
+    error: Option<String>,
 }
 
 impl State {
@@ -49,11 +50,16 @@ impl State {
             total,
             npub,
             exported: HashSet::new(),
+            error: None,
         }
     }
 
     pub fn mark_exported(&mut self, identifier: u16) {
         self.exported.insert(identifier);
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
     }
 
     pub fn update(&mut self, message: Message) -> Option<Event> {
@@ -133,19 +139,40 @@ impl State {
             content = content.push(Space::new().height(theme::space::XS));
         }
 
+        if let Some(err) = &self.error {
+            content = content.push(
+                text(err.as_str())
+                    .size(theme::size::SMALL)
+                    .color(theme::color::ERROR),
+            );
+        }
+
         content = content.push(Space::new().height(theme::space::MD));
 
+        let exported_count = self.exported.len() as u16;
         let all_exported = self.shares.iter().all(|s| self.exported.contains(&s.identifier));
+        let enough_exported = exported_count >= self.threshold;
+
         let finish_label = if all_exported {
-            "Finish"
+            "Finish".to_string()
+        } else if enough_exported {
+            format!(
+                "Finish ({} of {} exported — remaining shares will be lost)",
+                exported_count, self.total
+            )
         } else {
-            "Finish (some shares not exported)"
+            format!(
+                "Export at least {} shares to finish ({} of {} exported)",
+                self.threshold, exported_count, self.total
+            )
         };
 
-        let finish_btn = button(text(finish_label).size(theme::size::BODY))
-            .on_press(Message::Finish)
+        let mut finish_btn = button(text(finish_label).size(theme::size::BODY))
             .style(theme::primary_button)
             .padding(theme::space::MD);
+        if enough_exported {
+            finish_btn = finish_btn.on_press(Message::Finish);
+        }
 
         content = content.push(finish_btn);
 

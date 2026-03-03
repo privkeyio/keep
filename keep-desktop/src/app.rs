@@ -894,6 +894,10 @@ impl App {
     }
 
     fn handle_navigation_message(&mut self, message: Message) -> Task<Message> {
+        if !matches!(message, Message::GoBack) {
+            self.distribute_state = None;
+            self.distribute_export_id = None;
+        }
         match message {
             Message::GoToCreate => {
                 self.screen = Screen::Create(create::State::new());
@@ -2286,10 +2290,13 @@ impl App {
                         "Internal error during keyset creation",
                         move |keep| {
                             if let Some(nsec) = nsec {
-                                keep.import_nsec(nsec.trim(), &name)
+                                let pubkey = keep
+                                    .import_nsec(nsec.trim(), &name)
                                     .map_err(friendly_err)?;
-                                keep.frost_split(&name, threshold, total)
-                                    .map_err(friendly_err)?;
+                                if let Err(e) = keep.frost_split(&name, threshold, total) {
+                                    let _ = keep.delete_key(&pubkey);
+                                    return Err(friendly_err(e));
+                                }
                             } else {
                                 keep.frost_generate(threshold, total, &name)
                                     .map_err(friendly_err)?;

@@ -109,8 +109,10 @@ impl Screen {
             Screen::Recovery(s) => {
                 s.recovery_failed(error);
             }
-            Screen::Distribute(_)
-            | Screen::ShareList(_)
+            Screen::Distribute(s) => {
+                s.set_error(error);
+            }
+            Screen::ShareList(_)
             | Screen::NsecKeys(_)
             | Screen::Wallet(_)
             | Screen::Relay(_)

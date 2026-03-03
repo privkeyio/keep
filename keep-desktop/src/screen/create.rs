@@ -66,7 +66,7 @@ impl State {
     pub fn update(&mut self, message: Message) -> Option<Event> {
         match message {
             Message::NameChanged(n) => {
-                self.name = n;
+                self.name = n.chars().filter(|c| !c.is_control()).collect();
                 None
             }
             Message::ThresholdChanged(t) => {
@@ -101,6 +101,11 @@ impl State {
                 let nsec = if self.nsec.trim().is_empty() {
                     None
                 } else {
+                    let trimmed = self.nsec.trim();
+                    if !trimmed.starts_with("nsec1") || trimmed.len() < 60 {
+                        self.error = Some("Invalid nsec: must start with nsec1".into());
+                        return None;
+                    }
                     Some(self.nsec.clone())
                 };
                 self.loading = true;
@@ -171,7 +176,10 @@ impl State {
             .filter(|v| (2..=255).contains(v));
         let total_val: Option<u16> = self.total.parse().ok().filter(|&v| v <= 255);
         let total_valid = matches!((threshold_val, total_val), (Some(t), Some(n)) if n >= t);
-        let can_create = name_valid && threshold_val.is_some() && total_valid;
+        let nsec_trimmed = self.nsec.trim();
+        let nsec_valid = nsec_trimmed.is_empty()
+            || (nsec_trimmed.starts_with("nsec1") && nsec_trimmed.len() >= 60);
+        let can_create = name_valid && threshold_val.is_some() && total_valid && nsec_valid;
 
         let mut content = column![
             header,
@@ -240,6 +248,9 @@ impl State {
                 .padding(theme::space::MD)
                 .width(theme::size::INPUT_WIDTH);
         content = content.push(nsec_input);
+        if !nsec_trimmed.is_empty() && !nsec_valid {
+            content = content.push(theme::error_text("Must be a valid nsec1... bech32 string"));
+        }
 
         content = content.push(Space::new().height(theme::space::SM));
 
