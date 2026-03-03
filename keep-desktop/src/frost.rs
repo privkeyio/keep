@@ -279,9 +279,15 @@ pub(crate) async fn setup_frost_node(
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
 
-    if let Ok(guard) = keep_arc.lock() {
-        if let Some(keep) = guard.as_ref() {
-            if let Ok(Some(config)) = keep.get_relay_config(&share_entry.group_pubkey) {
+    {
+        let guard = keep_arc
+            .lock()
+            .map_err(|_| String::from("Keep mutex poisoned while loading peer policies"))?;
+        let keep = guard
+            .as_ref()
+            .ok_or_else(|| String::from("Keep not available while loading peer policies"))?;
+        match keep.get_relay_config(&share_entry.group_pubkey) {
+            Ok(Some(config)) => {
                 for entry in &config.peer_policies {
                     match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
                         Ok(pubkey) => {
@@ -300,6 +306,12 @@ pub(crate) async fn setup_frost_node(
                         }
                     }
                 }
+            }
+            Ok(None) => {
+                tracing::debug!("No peer policies stored for this share");
+            }
+            Err(e) => {
+                return Err(format!("Failed to load peer policies: {e}").into());
             }
         }
     }

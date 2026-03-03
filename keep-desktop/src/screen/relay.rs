@@ -136,14 +136,18 @@ impl State {
                 self.event_log_visible = !self.event_log_visible;
                 None
             }
-            Message::TogglePeerSend(idx) | Message::TogglePeerReceive(idx) => {
-                let is_send = matches!(message, Message::TogglePeerSend(_));
+            Message::TogglePeerSend(idx) => {
                 let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
-                if is_send {
-                    peer.allow_send = !peer.allow_send;
-                } else {
-                    peer.allow_receive = !peer.allow_receive;
-                }
+                peer.allow_send = !peer.allow_send;
+                Some(Event::SetPeerPolicy {
+                    pubkey_hex: peer.pubkey_hex.clone(),
+                    allow_send: peer.allow_send,
+                    allow_receive: peer.allow_receive,
+                })
+            }
+            Message::TogglePeerReceive(idx) => {
+                let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
+                peer.allow_receive = !peer.allow_receive;
                 Some(Event::SetPeerPolicy {
                     pubkey_hex: peer.pubkey_hex.clone(),
                     allow_send: peer.allow_send,

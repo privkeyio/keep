@@ -1810,9 +1810,9 @@ impl App {
                 allow_send,
                 allow_receive,
             } => {
-                if let Some(node) = self.get_frost_node() {
-                    match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
-                        Ok(pubkey) => {
+                match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
+                    Ok(pubkey) => {
+                        if let Some(node) = self.get_frost_node() {
                             use keep_frost_net::PeerPolicy;
                             node.set_peer_policy(
                                 PeerPolicy::new(pubkey)
@@ -1820,16 +1820,14 @@ impl App {
                                     .allow_receive(allow_receive),
                             );
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                pubkey_hex, %e, "Failed to parse peer pubkey for policy"
-                            );
-                        }
+                        self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
                     }
-                } else {
-                    tracing::warn!("No frost node available to apply peer policy");
+                    Err(e) => {
+                        tracing::warn!(
+                            pubkey_hex, %e, "Failed to parse peer pubkey for policy"
+                        );
+                    }
                 }
-                self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
                 Task::none()
             }
         }
@@ -3426,16 +3424,14 @@ impl App {
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "backup".into());
                 let pass = passphrase.clone();
-                let backup_data = tokio::task::spawn_blocking(move || {
+                let (backup_data, info) = tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Backup failed", move |keep| {
-                        keep_core::backup::create_backup(keep, &passphrase).map_err(friendly_err)
+                        let data = keep_core::backup::create_backup(keep, &passphrase)
+                            .map_err(friendly_err)?;
+                        let info =
+                            keep_core::backup::verify_backup(&data, &pass).map_err(friendly_err)?;
+                        Ok((data, info))
                     })
-                })
-                .await
-                .map_err(|_| "Background task failed".to_string())??;
-                let verify_data = backup_data.clone();
-                let info = tokio::task::spawn_blocking(move || {
-                    keep_core::backup::verify_backup(&verify_data, &pass).map_err(friendly_err)
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
@@ -3507,14 +3503,13 @@ impl App {
     }
 
     fn handle_restore_verify(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
-        let file_data = if let Screen::Settings(s) = &self.screen {
-            s.restore_file.as_ref().map(|(_, data)| data.clone())
-        } else {
-            None
-        };
-        let Some(data) = file_data else {
+        let Screen::Settings(s) = &self.screen else {
             return Task::none();
         };
+        let Some((_, data)) = s.restore_file.as_ref() else {
+            return Task::none();
+        };
+        let data = data.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -3535,10 +3530,11 @@ impl App {
                 }
             }
             Err(e) => {
+                let toast_msg = e.clone();
                 if let Screen::Settings(s) = &mut self.screen {
-                    s.restore_verify_failed(e.clone());
+                    s.restore_verify_failed(e);
                 }
-                self.set_toast(e, ToastKind::Error);
+                self.set_toast(toast_msg, ToastKind::Error);
             }
         }
         Task::none()

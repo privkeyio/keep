@@ -256,6 +256,7 @@ impl SettingsScreen {
                 self.restore_active = false;
                 self.backup_error = None;
                 self.backup_summary = None;
+                self.restore_verified = None;
                 None
             }
             Message::BackupPassphraseChanged(p) => {
@@ -292,6 +293,9 @@ impl SettingsScreen {
                 self.restore_active = false;
                 self.backup_active = false;
                 self.backup_summary = None;
+                self.restore_verified = None;
+                self.restore_verify_loading = false;
+                self.restore_loading = false;
                 Some(Event::RestoreStart)
             }
             Message::RestorePassphraseChanged(p) => {
@@ -327,6 +331,8 @@ impl SettingsScreen {
                 self.restore_file = None;
                 self.restore_verified = None;
                 self.restore_error = None;
+                self.restore_verify_loading = false;
+                self.restore_loading = false;
                 None
             }
             Message::RestoreSubmit => {
@@ -791,6 +797,11 @@ impl SettingsScreen {
     }
 
     fn backup_summary_card(info: &BackupInfo) -> Element<'_, Message> {
+        let size_str = if info.file_size >= 1_048_576 {
+            format!("{:.1} MB", info.file_size as f64 / 1_048_576.0)
+        } else {
+            format!("{:.1} KB", info.file_size as f64 / 1024.0)
+        };
         container(
             column![
                 text("Backup Summary")
@@ -799,6 +810,7 @@ impl SettingsScreen {
                 text(format!("Keys: {}", info.key_count)).size(theme::size::SMALL),
                 text(format!("Shares: {}", info.share_count)).size(theme::size::SMALL),
                 text(format!("Descriptors: {}", info.descriptor_count)).size(theme::size::SMALL),
+                text(format!("Size: {size_str}")).size(theme::size::SMALL),
                 text(format!("Created: {}", info.created_at)).size(theme::size::SMALL),
             ]
             .spacing(theme::space::XS),
@@ -873,18 +885,15 @@ impl SettingsScreen {
                 if let Some(ref info) = self.restore_verified {
                     col = col.push(Self::backup_summary_card(info));
 
-                    let password_input =
-                        text_input("New vault password", &self.restore_password)
-                            .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
-                            .secure(true)
-                            .size(theme::size::BODY)
-                            .width(theme::size::INPUT_WIDTH);
+                    let password_input = text_input("New vault password", &self.restore_password)
+                        .on_input(|s| Message::RestorePasswordChanged(Zeroizing::new(s)))
+                        .secure(true)
+                        .size(theme::size::BODY)
+                        .width(theme::size::INPUT_WIDTH);
 
                     let password_confirm_input =
                         text_input("Confirm vault password", &self.restore_password_confirm)
-                            .on_input(|s| {
-                                Message::RestorePasswordConfirmChanged(Zeroizing::new(s))
-                            })
+                            .on_input(|s| Message::RestorePasswordConfirmChanged(Zeroizing::new(s)))
                             .secure(true)
                             .size(theme::size::BODY)
                             .width(theme::size::INPUT_WIDTH);
@@ -912,15 +921,13 @@ impl SettingsScreen {
                 } else {
                     let passphrase_input =
                         text_input("Backup passphrase", &self.restore_passphrase)
-                            .on_input(|s| {
-                                Message::RestorePassphraseChanged(Zeroizing::new(s))
-                            })
+                            .on_input(|s| Message::RestorePassphraseChanged(Zeroizing::new(s)))
                             .secure(true)
                             .size(theme::size::BODY)
                             .width(theme::size::INPUT_WIDTH);
 
-                    let can_verify = !self.restore_verify_loading
-                        && !self.restore_passphrase.is_empty();
+                    let can_verify =
+                        !self.restore_verify_loading && !self.restore_passphrase.is_empty();
                     let mut verify_btn = button(text("Verify").size(theme::size::SMALL))
                         .style(theme::primary_button)
                         .padding([theme::space::SM, theme::space::MD]);
