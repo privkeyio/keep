@@ -79,7 +79,7 @@ use crate::error::{KeepError, Result};
 use crate::frost::{ShareExport, SharePackage, StoredShare, ThresholdConfig, TrustedDealer};
 use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
-pub use crate::relay::{RelayConfig, GLOBAL_RELAY_KEY};
+pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
 use crate::storage::Storage;
 pub use crate::wallet::WalletDescriptor;
@@ -730,6 +730,18 @@ impl Keep {
             frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
             profile_relays: normalize_relays(&config.profile_relays, "profile")?,
             bunker_relays: normalize_relays(&config.bunker_relays, "bunker")?,
+            peer_policies: config
+                .peer_policies
+                .iter()
+                .filter(|p| {
+                    p.pubkey_hex.len() == 64 && p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+                })
+                .map(|p| relay::PeerPolicyEntry {
+                    pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
+                    allow_send: p.allow_send,
+                    allow_receive: p.allow_receive,
+                })
+                .collect(),
         };
         self.storage.store_relay_config(&normalized_config)
     }

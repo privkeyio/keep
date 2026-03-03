@@ -280,7 +280,7 @@ pub fn cmd_frost_network_peers(
         } else {
             out.table_header(&[("SHARE", 8), ("STATUS", 10), ("NAME", 20)]);
 
-            for (share_index, peer_status, name) in status {
+            for (share_index, peer_status, name, _pubkey) in status {
                 use keep_frost_net::PeerStatus;
                 let status_str = match peer_status {
                     PeerStatus::Online => "Online",

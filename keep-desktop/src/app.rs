@@ -24,8 +24,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
 use crate::message::{
-    AuditLoadResult, ConnectionStatus, ExportData, FrostNodeMsg, Identity, IdentityKind, Message,
-    PeerEntry, PendingSignRequest, ShareIdentity,
+    AuditLoadResult, ConnectionStatus, EventLogEntry, ExportData, FrostNodeMsg, Identity,
+    IdentityKind, Message, PeerEntry, PendingSignRequest, ShareIdentity,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::layout::SidebarState;
@@ -131,6 +131,8 @@ pub struct App {
     pub(crate) relay_urls: Vec<String>,
     pub(crate) frost_status: ConnectionStatus,
     pub(crate) frost_peers: Vec<PeerEntry>,
+    pub(crate) frost_event_log: VecDeque<EventLogEntry>,
+    pub(crate) saved_peer_policies: Vec<keep_core::PeerPolicyEntry>,
     pub(crate) pending_sign_display: Vec<PendingSignRequest>,
     pub(crate) frost_reconnect_attempts: u32,
     pub(crate) frost_reconnect_at: Option<Instant>,
@@ -566,6 +568,8 @@ impl App {
             relay_urls,
             frost_status: ConnectionStatus::Disconnected,
             frost_peers: Vec::new(),
+            frost_event_log: VecDeque::new(),
+            saved_peer_policies: Vec::new(),
             pending_sign_display: Vec::new(),
             frost_reconnect_attempts: 0,
             frost_reconnect_at: None,
@@ -1023,6 +1027,7 @@ impl App {
                     self.frost_status.clone(),
                     self.frost_peers.clone(),
                     self.pending_sign_display.clone(),
+                    self.frost_event_log.clone(),
                 ));
                 Task::none()
             }
@@ -1798,6 +1803,33 @@ impl App {
                 self.respond_to_sign_request(&id, false);
                 Task::none()
             }
+            relay::Event::SetPeerPolicy {
+                pubkey_hex,
+                allow_send,
+                allow_receive,
+            } => {
+                if let Some(node) = self.get_frost_node() {
+                    match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
+                        Ok(pubkey) => {
+                            use keep_frost_net::PeerPolicy;
+                            node.set_peer_policy(
+                                PeerPolicy::new(pubkey)
+                                    .allow_send(allow_send)
+                                    .allow_receive(allow_receive),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pubkey_hex, %e, "Failed to parse peer pubkey for policy"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!("No frost node available to apply peer policy");
+                }
+                self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
+                Task::none()
+            }
         }
     }
 
@@ -2191,6 +2223,26 @@ impl App {
         self.update_relay_config(|config| config.frost_relays = urls);
     }
 
+    fn save_peer_policy(&self, pubkey_hex: &str, allow_send: bool, allow_receive: bool) {
+        let hex = pubkey_hex.to_string();
+        self.update_relay_config(|config| {
+            if let Some(existing) = config
+                .peer_policies
+                .iter_mut()
+                .find(|p| p.pubkey_hex == hex)
+            {
+                existing.allow_send = allow_send;
+                existing.allow_receive = allow_receive;
+            } else {
+                config.peer_policies.push(keep_core::PeerPolicyEntry {
+                    pubkey_hex: hex,
+                    allow_send,
+                    allow_receive,
+                });
+            }
+        });
+    }
+
     pub(crate) fn save_bunker_relays(&self) {
         let relays = self.bunker_relays.clone();
         self.update_relay_config(|config| config.bunker_relays = relays);
@@ -2250,6 +2302,7 @@ impl App {
         } else {
             config.bunker_relays
         };
+        self.saved_peer_policies = config.peer_policies;
     }
 
     fn load_config_from_vault(&mut self) {
@@ -2905,6 +2958,7 @@ impl App {
                             self.frost_status.clone(),
                             self.frost_peers.clone(),
                             self.pending_sign_display.clone(),
+                            self.frost_event_log.clone(),
                         ));
                     }
                     Screen::Bunker(_) => {
@@ -3602,6 +3656,8 @@ impl App {
             relay_urls: Vec::new(),
             frost_status: ConnectionStatus::Disconnected,
             frost_peers: Vec::new(),
+            frost_event_log: VecDeque::new(),
+            saved_peer_policies: Vec::new(),
             pending_sign_display: Vec::new(),
             frost_reconnect_attempts: 0,
             frost_reconnect_at: None,

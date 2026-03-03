@@ -20,7 +20,10 @@ use crate::app::{
     RATE_LIMIT_PER_PEER, RATE_LIMIT_WINDOW_SECS, RECONNECT_BASE_MS, RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_MS, SIGNING_RESPONSE_TIMEOUT,
 };
-use crate::message::{ConnectionStatus, FrostNodeMsg, Message, PeerEntry, PendingSignRequest};
+use crate::message::{
+    ConnectionStatus, EventLogEntry, EventLogType, FrostNodeMsg, Message, PeerEntry,
+    PendingSignRequest,
+};
 use crate::screen::relay;
 use crate::screen::shares::ShareEntry;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, SetupState, WalletEntry};
@@ -119,6 +122,14 @@ pub(crate) struct FrostChannels {
     pub events: Arc<Mutex<VecDeque<FrostNodeMsg>>>,
     pub pending_requests: Arc<Mutex<Vec<PendingRequestEntry>>>,
     pub shutdown: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+fn truncate_peer_string(s: &str) -> &str {
+    let max = 200;
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 fn push_frost_event(queue: &Mutex<VecDeque<FrostNodeMsg>>, event: FrostNodeMsg) {
@@ -267,6 +278,31 @@ pub(crate) async fn setup_frost_node(
     )
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if let Ok(guard) = keep_arc.lock() {
+        if let Some(keep) = guard.as_ref() {
+            if let Ok(Some(config)) = keep.get_relay_config(&share_entry.group_pubkey) {
+                for entry in &config.peer_policies {
+                    match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
+                        Ok(pubkey) => {
+                            node.set_peer_policy(
+                                keep_frost_net::PeerPolicy::new(pubkey)
+                                    .allow_send(entry.allow_send)
+                                    .allow_receive(entry.allow_receive),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pubkey_hex = %entry.pubkey_hex,
+                                %e,
+                                "Skipping invalid peer policy from vault"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let (request_tx, request_rx) = mpsc::channel(32);
     let hooks = Arc::new(DesktopSigningHooks {
@@ -430,6 +466,39 @@ fn check_rate_limit(
     true
 }
 
+fn push_log(
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    now_secs: u64,
+    event_type: EventLogType,
+    description: String,
+) {
+    push_frost_event(
+        frost_events,
+        FrostNodeMsg::EventLog(EventLogEntry {
+            timestamp: now_secs,
+            event_type,
+            description,
+        }),
+    );
+}
+
+fn build_peer_entries(node: &KfpNode) -> Vec<PeerEntry> {
+    node.peer_status()
+        .into_iter()
+        .map(|(share_index, status, name, pubkey)| {
+            let policy = node.get_peer_policy(&pubkey);
+            PeerEntry {
+                share_index,
+                name,
+                online: status == PeerStatus::Online,
+                pubkey_hex: pubkey.to_hex(),
+                allow_send: policy.as_ref().is_none_or(|p| p.allow_send),
+                allow_receive: policy.as_ref().is_none_or(|p| p.allow_receive),
+            }
+        })
+        .collect()
+}
+
 pub(crate) async fn frost_event_listener(
     mut event_rx: tokio::sync::broadcast::Receiver<KfpNodeEvent>,
     mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
@@ -444,30 +513,53 @@ pub(crate) async fn frost_event_listener(
     loop {
         tokio::select! {
             result = event_rx.recv() => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                macro_rules! log {
+                    ($ty:expr, $desc:expr) => {
+                        push_log(&frost_events, now_secs, $ty, $desc)
+                    };
+                }
+
                 match result {
-                    Ok(KfpNodeEvent::PeerDiscovered { .. })
-                    | Ok(KfpNodeEvent::PeerOffline { .. }) => {
-                        let peers: Vec<PeerEntry> = node
-                            .peer_status()
-                            .into_iter()
-                            .map(|(share_index, status, name)| PeerEntry {
-                                share_index,
-                                name,
-                                online: status == PeerStatus::Online,
-                            })
-                            .collect();
+                    Ok(KfpNodeEvent::PeerDiscovered { share_index, ref name }) => {
+                        let label = name.as_deref().unwrap_or("Unknown");
+                        log!(EventLogType::PeerJoined, format!("Peer #{share_index} ({label}) joined"));
+                        let peers = build_peer_entries(&node);
                         push_frost_event(&frost_events, FrostNodeMsg::PeerUpdate(peers));
                     }
-                    Ok(KfpNodeEvent::SignatureComplete { session_id, .. })
-                    | Ok(KfpNodeEvent::SigningFailed { session_id, .. }) => {
+                    Ok(KfpNodeEvent::PeerOffline { share_index }) => {
+                        log!(EventLogType::PeerLeft, format!("Peer #{share_index} went offline"));
+                        let peers = build_peer_entries(&node);
+                        push_frost_event(&frost_events, FrostNodeMsg::PeerUpdate(peers));
+                    }
+                    Ok(KfpNodeEvent::SigningStarted { session_id }) => {
+                        log!(EventLogType::SignRequest, format!("Signing started: {}", &hex::encode(session_id)[..8]));
+                    }
+                    Ok(KfpNodeEvent::SignatureComplete { session_id, .. }) => {
+                        log!(EventLogType::SignComplete, format!("Signature complete: {}", &hex::encode(session_id)[..8]));
                         let id = hex::encode(session_id);
                         if let Ok(mut guard) = pending_requests.lock() {
                             guard.retain(|r| r.info.id != id);
                         }
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::SignRequestRemoved(id),
-                        );
+                        push_frost_event(&frost_events, FrostNodeMsg::SignRequestRemoved(id));
+                    }
+                    Ok(KfpNodeEvent::SigningFailed { session_id, ref error }) => {
+                        log!(EventLogType::SignFailed, format!("Signing failed: {}", truncate_peer_string(error)));
+                        let id = hex::encode(session_id);
+                        if let Ok(mut guard) = pending_requests.lock() {
+                            guard.retain(|r| r.info.id != id);
+                        }
+                        push_frost_event(&frost_events, FrostNodeMsg::SignRequestRemoved(id));
+                    }
+                    Ok(KfpNodeEvent::EcdhComplete { session_id, .. }) => {
+                        log!(EventLogType::EcdhComplete, format!("ECDH complete: {}", &hex::encode(session_id)[..8]));
+                    }
+                    Ok(KfpNodeEvent::EcdhFailed { session_id, ref error }) => {
+                        log!(EventLogType::EcdhFailed, format!("ECDH failed ({}): {}", &hex::encode(session_id)[..8], truncate_peer_string(error)));
                     }
                     Ok(KfpNodeEvent::DescriptorContributionNeeded {
                         session_id,
@@ -475,6 +567,7 @@ pub(crate) async fn frost_event_listener(
                         initiator_pubkey,
                         ..
                     }) => {
+                        log!(EventLogType::Descriptor, format!("Descriptor contribution needed ({network})"));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorContributionNeeded {
@@ -488,6 +581,7 @@ pub(crate) async fn frost_event_listener(
                         session_id,
                         share_index,
                     }) => {
+                        log!(EventLogType::Descriptor, format!("Peer #{share_index} contributed to descriptor"));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorContributed {
@@ -497,6 +591,7 @@ pub(crate) async fn frost_event_listener(
                         );
                     }
                     Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
+                        log!(EventLogType::Descriptor, "Descriptor ready for finalization".to_string());
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorReady { session_id },
@@ -508,6 +603,7 @@ pub(crate) async fn frost_event_listener(
                         internal_descriptor,
                         ..
                     }) => {
+                        log!(EventLogType::Descriptor, "Descriptor complete".to_string());
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorComplete {
@@ -523,6 +619,7 @@ pub(crate) async fn frost_event_listener(
                         ack_count,
                         expected_acks,
                     }) => {
+                        log!(EventLogType::Descriptor, format!("Descriptor ack from #{share_index} ({ack_count}/{expected_acks})"));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorAcked {
@@ -538,6 +635,7 @@ pub(crate) async fn frost_event_listener(
                         share_index,
                         reason,
                     }) => {
+                        log!(EventLogType::Error, format!("Descriptor nack from #{share_index}: {}", truncate_peer_string(&reason)));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorNacked {
@@ -548,6 +646,7 @@ pub(crate) async fn frost_event_listener(
                         );
                     }
                     Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
+                        log!(EventLogType::Error, format!("Descriptor failed: {}", truncate_peer_string(&error)));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorFailed { session_id, error },
@@ -557,6 +656,7 @@ pub(crate) async fn frost_event_listener(
                         share_index,
                         recovery_xpubs,
                     }) => {
+                        log!(EventLogType::Descriptor, format!("Peer #{share_index} announced {} xpub(s)", recovery_xpubs.len()));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::XpubAnnounced {
@@ -570,6 +670,11 @@ pub(crate) async fn frost_event_listener(
                         unresponsive,
                         ..
                     }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "Health check: {} responsive, {} unresponsive",
+                            responsive.len(),
+                            unresponsive.len()
+                        ));
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::HealthCheckComplete {
@@ -578,7 +683,9 @@ pub(crate) async fn frost_event_listener(
                             },
                         );
                     }
-                    Ok(_) => {}
+                    Ok(KfpNodeEvent::DescriptorProposed { .. }) => {
+                        log!(EventLogType::Descriptor, "Descriptor proposed".to_string());
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -698,6 +805,15 @@ impl App {
                 self.pending_sign_display.retain(|r| r.id != id);
                 if let Some(s) = self.relay_screen_mut() {
                     s.pending_requests.retain(|r| r.id != id);
+                }
+            }
+            FrostNodeMsg::EventLog(entry) => {
+                if self.frost_event_log.len() >= crate::screen::relay::MAX_EVENT_LOG {
+                    self.frost_event_log.pop_front();
+                }
+                self.frost_event_log.push_back(entry.clone());
+                if let Some(s) = self.relay_screen_mut() {
+                    s.push_event(entry);
                 }
             }
             FrostNodeMsg::StatusChanged(status) => {

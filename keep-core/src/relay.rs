@@ -17,6 +17,17 @@ pub const MAX_RELAY_URL_LENGTH: usize = 256;
 /// Range of seconds to randomly tweak event timestamps for privacy.
 pub const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
 
+/// Per-peer send/receive policy entry, stored alongside relay configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerPolicyEntry {
+    /// Nostr public key as hex string.
+    pub pubkey_hex: String,
+    /// Whether to allow sending messages to this peer.
+    pub allow_send: bool,
+    /// Whether to allow receiving messages from this peer.
+    pub allow_receive: bool,
+}
+
 /// Relay configuration for a FROST share, keyed by group public key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -29,6 +40,9 @@ pub struct RelayConfig {
     /// NIP-46 bunker relay URLs.
     #[serde(default)]
     pub bunker_relays: Vec<String>,
+    /// Per-peer send/receive policies.
+    #[serde(default)]
+    pub peer_policies: Vec<PeerPolicyEntry>,
 }
 
 impl RelayConfig {
@@ -39,6 +53,7 @@ impl RelayConfig {
             frost_relays: Vec::new(),
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
+            peer_policies: Vec::new(),
         }
     }
 
@@ -54,6 +69,7 @@ impl RelayConfig {
             frost_relays: default_frost_relays(),
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
+            peer_policies: Vec::new(),
         }
     }
 }

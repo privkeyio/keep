@@ -510,12 +510,12 @@ impl KfpNode {
         self.peers.read().online_count()
     }
 
-    pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>)> {
+    pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
         self.peers
             .read()
             .all_peers()
             .iter()
-            .map(|p| (p.share_index, p.status.clone(), p.name.clone()))
+            .map(|p| (p.share_index, p.status.clone(), p.name.clone(), p.pubkey))
             .collect()
     }
 
@@ -534,11 +534,10 @@ impl KfpNode {
     pub async fn announce_xpubs(&self, recovery_xpubs: Vec<AnnouncedXpub>) -> Result<()> {
         let peer_pubkeys: Vec<PublicKey> = {
             let peers = self.peers.read();
-            let policies = self.policies.read();
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
+                .filter(|p| self.can_send_to(&p.pubkey))
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -596,12 +595,18 @@ impl KfpNode {
         *self.hooks.write() = hooks;
     }
 
+    pub(crate) fn can_send_to(&self, pubkey: &PublicKey) -> bool {
+        self.policies
+            .read()
+            .get(pubkey)
+            .is_none_or(|p| p.allow_send)
+    }
+
     pub(crate) fn can_receive_from(&self, pubkey: &PublicKey) -> bool {
         self.policies
             .read()
             .get(pubkey)
-            .map(|p| p.allow_receive)
-            .unwrap_or(true)
+            .is_none_or(|p| p.allow_receive)
     }
 
     pub(crate) fn cleanup_session_on_hook_failure(&self, session_id: &[u8; 32]) {
@@ -631,11 +636,10 @@ impl KfpNode {
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         let selected_peers: Vec<Peer> = {
             let peers = self.peers.read();
-            let policies = self.policies.read();
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
-                .filter(|p| policies.get(&p.pubkey).is_none_or(|pol| pol.allow_send))
+                .filter(|p| self.can_send_to(&p.pubkey))
                 .collect();
 
             if eligible_peers.len() + 1 < threshold {

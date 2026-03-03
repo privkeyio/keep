@@ -1101,6 +1101,36 @@ mod tests {
     }
 
     #[test]
+    fn relay_config_peer_policies_backward_compat() {
+        let json = r#"{"group_pubkey":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"frost_relays":[],"profile_relays":[]}"#;
+        let config: RelayConfig = serde_json::from_str(json).unwrap();
+        assert!(config.peer_policies.is_empty());
+    }
+
+    #[test]
+    fn relay_config_peer_policies_roundtrip() {
+        use crate::relay::PeerPolicyEntry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let storage = Storage::create(&path, "testpassword", Default::default()).unwrap();
+
+        let mut config = RelayConfig::new([2u8; 32]);
+        config.peer_policies.push(PeerPolicyEntry {
+            pubkey_hex: "ab".repeat(32),
+            allow_send: false,
+            allow_receive: true,
+        });
+        storage.store_relay_config(&config).unwrap();
+
+        let loaded = storage.get_relay_config(&[2u8; 32]).unwrap().unwrap();
+        assert_eq!(loaded.peer_policies.len(), 1);
+        assert_eq!(loaded.peer_policies[0].pubkey_hex, "ab".repeat(32));
+        assert!(!loaded.peer_policies[0].allow_send);
+        assert!(loaded.peer_policies[0].allow_receive);
+    }
+
+    #[test]
     fn global_relay_key_sentinel() {
         use crate::relay::GLOBAL_RELAY_KEY;
 

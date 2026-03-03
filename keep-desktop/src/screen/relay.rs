@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::VecDeque;
 use std::fmt;
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use zeroize::Zeroizing;
 
-use crate::message::{ConnectionStatus, PeerEntry, PendingSignRequest};
+use crate::message::{
+    ConnectionStatus, EventLogEntry, EventLogType, PeerEntry, PendingSignRequest,
+};
 use crate::screen::shares::ShareEntry;
 use crate::theme;
+
+pub(crate) const MAX_EVENT_LOG: usize = 200;
 
 #[derive(Clone)]
 pub enum Message {
@@ -22,6 +27,9 @@ pub enum Message {
     Disconnect,
     ApproveSign(String),
     RejectSign(String),
+    TogglePeerSend(u16),
+    TogglePeerReceive(u16),
+    ToggleEventLog,
 }
 
 impl fmt::Debug for Message {
@@ -36,6 +44,9 @@ impl fmt::Debug for Message {
             Self::Disconnect => f.write_str("Disconnect"),
             Self::ApproveSign(id) => f.debug_tuple("ApproveSign").field(id).finish(),
             Self::RejectSign(id) => f.debug_tuple("RejectSign").field(id).finish(),
+            Self::TogglePeerSend(i) => f.debug_tuple("TogglePeerSend").field(i).finish(),
+            Self::TogglePeerReceive(i) => f.debug_tuple("TogglePeerReceive").field(i).finish(),
+            Self::ToggleEventLog => f.write_str("ToggleEventLog"),
         }
     }
 }
@@ -47,6 +58,11 @@ pub enum Event {
     Disconnect,
     ApproveSignRequest(String),
     RejectSignRequest(String),
+    SetPeerPolicy {
+        pubkey_hex: String,
+        allow_send: bool,
+        allow_receive: bool,
+    },
 }
 
 pub struct State {
@@ -58,6 +74,8 @@ pub struct State {
     pub status: ConnectionStatus,
     pub peers: Vec<PeerEntry>,
     pub pending_requests: Vec<PendingSignRequest>,
+    pub event_log: VecDeque<EventLogEntry>,
+    pub event_log_visible: bool,
 }
 
 impl State {
@@ -67,6 +85,7 @@ impl State {
         status: ConnectionStatus,
         peers: Vec<PeerEntry>,
         pending_requests: Vec<PendingSignRequest>,
+        event_log: VecDeque<EventLogEntry>,
     ) -> Self {
         let selected = if shares.len() == 1 { Some(0) } else { None };
         Self {
@@ -78,7 +97,16 @@ impl State {
             status,
             peers,
             pending_requests,
+            event_log,
+            event_log_visible: true,
         }
+    }
+
+    pub fn push_event(&mut self, entry: EventLogEntry) {
+        if self.event_log.len() >= MAX_EVENT_LOG {
+            self.event_log.pop_front();
+        }
+        self.event_log.push_back(entry);
     }
 
     pub fn update(&mut self, message: Message) -> Option<Event> {
@@ -104,6 +132,24 @@ impl State {
             Message::Disconnect => Some(Event::Disconnect),
             Message::ApproveSign(id) => Some(Event::ApproveSignRequest(id)),
             Message::RejectSign(id) => Some(Event::RejectSignRequest(id)),
+            Message::ToggleEventLog => {
+                self.event_log_visible = !self.event_log_visible;
+                None
+            }
+            Message::TogglePeerSend(idx) | Message::TogglePeerReceive(idx) => {
+                let is_send = matches!(message, Message::TogglePeerSend(_));
+                let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
+                if is_send {
+                    peer.allow_send = !peer.allow_send;
+                } else {
+                    peer.allow_receive = !peer.allow_receive;
+                }
+                Some(Event::SetPeerPolicy {
+                    pubkey_hex: peer.pubkey_hex.clone(),
+                    allow_send: peer.allow_send,
+                    allow_receive: peer.allow_receive,
+                })
+            }
         }
     }
 
@@ -142,6 +188,7 @@ impl State {
 
             if matches!(self.status, ConnectionStatus::Connected) {
                 content = content.push(self.peers_section());
+                content = content.push(self.event_log_section());
                 if !self.pending_requests.is_empty() {
                     content = content.push(self.signing_requests_section());
                 }
@@ -155,6 +202,21 @@ impl State {
             .into()
     }
 
+    fn badge_style(
+        color: iced::Color,
+        radius: f32,
+    ) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+        move |_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(iced::Color { a: 0.15, ..color })),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: radius.into(),
+            },
+            ..Default::default()
+        }
+    }
+
     fn status_badge(&self) -> Element<'_, Message> {
         let (label, color) = match &self.status {
             ConnectionStatus::Disconnected => ("Disconnected", theme::color::TEXT_DIM),
@@ -164,15 +226,7 @@ impl State {
         };
 
         container(text(label).size(theme::size::SMALL).color(color))
-            .style(move |_: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color { a: 0.15, ..color })),
-                border: iced::Border {
-                    color,
-                    width: 1.0,
-                    radius: 12.0.into(),
-                },
-                ..Default::default()
-            })
+            .style(Self::badge_style(color, 12.0))
             .padding([2.0, theme::space::SM])
             .into()
     }
@@ -308,6 +362,22 @@ impl State {
         }
     }
 
+    fn policy_toggle(label_text: &str, enabled: bool, on_press: Message) -> Element<'_, Message> {
+        let (style, indicator): (
+            fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
+            &str,
+        ) = if enabled {
+            (theme::primary_button, "ON")
+        } else {
+            (theme::secondary_button, "OFF")
+        };
+        button(text(format!("{label_text} {indicator}")).size(theme::size::TINY))
+            .style(style)
+            .on_press(on_press)
+            .padding([2.0, theme::space::SM])
+            .into()
+    }
+
     fn peers_section(&self) -> Element<'_, Message> {
         let online_count = self.peers.iter().filter(|p| p.online).count();
 
@@ -328,16 +398,27 @@ impl State {
                 };
                 let name = peer.name.as_deref().unwrap_or("Unknown");
 
-                peer_list = peer_list.push(
-                    row![
-                        text(dot).size(theme::size::SMALL).color(color),
-                        text(format!("#{} {name}", peer.share_index))
-                            .size(theme::size::SMALL)
-                            .color(theme::color::TEXT_MUTED),
-                    ]
-                    .spacing(theme::space::SM)
-                    .align_y(Alignment::Center),
-                );
+                let peer_row = row![
+                    text(dot).size(theme::size::SMALL).color(color),
+                    text(format!("#{} {name}", peer.share_index))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                    Space::new().width(Length::Fill),
+                    Self::policy_toggle(
+                        "Send",
+                        peer.allow_send,
+                        Message::TogglePeerSend(peer.share_index),
+                    ),
+                    Self::policy_toggle(
+                        "Recv",
+                        peer.allow_receive,
+                        Message::TogglePeerReceive(peer.share_index),
+                    ),
+                ]
+                .spacing(theme::space::SM)
+                .align_y(Alignment::Center);
+
+                peer_list = peer_list.push(peer_row);
             }
         }
 
@@ -352,13 +433,107 @@ impl State {
             .into()
     }
 
+    fn event_type_badge(event_type: &EventLogType) -> (&'static str, iced::Color) {
+        match event_type {
+            EventLogType::PeerJoined => ("PEER+", theme::color::SUCCESS),
+            EventLogType::PeerLeft => ("PEER-", theme::color::TEXT_DIM),
+            EventLogType::SignRequest => ("SIGN", theme::color::WARNING),
+            EventLogType::SignComplete => ("SIGN OK", theme::color::SUCCESS),
+            EventLogType::SignFailed => ("SIGN ERR", theme::color::ERROR),
+            EventLogType::EcdhComplete => ("ECDH", theme::color::SUCCESS),
+            EventLogType::EcdhFailed => ("ECDH ERR", theme::color::ERROR),
+            EventLogType::Descriptor => ("DESC", theme::color::PRIMARY),
+            EventLogType::Error => ("ERROR", theme::color::ERROR),
+        }
+    }
+
+    fn event_log_section(&self) -> Element<'_, Message> {
+        let toggle_label = if self.event_log_visible {
+            "Event Log ▾"
+        } else {
+            "Event Log ▸"
+        };
+
+        let header = row![
+            button(
+                text(toggle_label)
+                    .size(theme::size::BODY)
+                    .color(theme::color::TEXT),
+            )
+            .style(|_: &iced::Theme, _: iced::widget::button::Status| {
+                iced::widget::button::Style {
+                    background: None,
+                    ..Default::default()
+                }
+            })
+            .on_press(Message::ToggleEventLog),
+            Space::new().width(Length::Fill),
+            text(format!("{} events", self.event_log.len()))
+                .size(theme::size::TINY)
+                .color(theme::color::TEXT_DIM),
+        ]
+        .align_y(Alignment::Center);
+
+        let mut section = column![header].spacing(theme::space::SM);
+
+        if self.event_log_visible {
+            let mut log_list = column![].spacing(2.0);
+
+            if self.event_log.is_empty() {
+                log_list = log_list.push(
+                    text("No events yet")
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                );
+            } else {
+                for entry in self.event_log.iter().rev() {
+                    let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        i64::try_from(entry.timestamp).unwrap_or(0),
+                        0,
+                    )
+                    .map(|dt| dt.format("%H:%M:%S").to_string())
+                    .unwrap_or_default();
+
+                    let (badge_text, badge_color) = Self::event_type_badge(&entry.event_type);
+
+                    let log_row = row![
+                        text(ts)
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                        container(text(badge_text).size(theme::size::TINY).color(badge_color),)
+                            .style(Self::badge_style(badge_color, 4.0))
+                            .padding([1.0, theme::space::XS]),
+                        text(&entry.description)
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_MUTED),
+                    ]
+                    .spacing(theme::space::SM)
+                    .align_y(Alignment::Center);
+
+                    log_list = log_list.push(log_row);
+                }
+            }
+
+            section = section.push(scrollable(log_list).height(Length::Fixed(200.0)));
+        }
+
+        container(section)
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn signing_requests_section(&self) -> Element<'_, Message> {
         let mut request_list = column![].spacing(theme::space::SM);
 
         for req in &self.pending_requests {
-            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(req.timestamp as i64, 0)
-                .map(|dt| dt.format("%H:%M:%S").to_string())
-                .unwrap_or_default();
+            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                i64::try_from(req.timestamp).unwrap_or(0),
+                0,
+            )
+            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
 
             let source = if req.from_peer == 0 {
                 "Signing request".to_string()
