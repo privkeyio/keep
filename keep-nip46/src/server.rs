@@ -479,7 +479,7 @@ impl Server {
         debug!(method = %request.method, app_id, "NIP-46 request");
 
         let method = request.method.clone();
-        let response = Self::dispatch_request(
+        let response = dispatch_request(
             handler,
             keys.public_key(),
             app_pubkey,
@@ -526,13 +526,15 @@ impl Server {
         Ok(())
     }
 
-    async fn dispatch_request(
-        handler: &SignerHandler,
-        user_pubkey: PublicKey,
-        app_pubkey: PublicKey,
-        request: Nip46Request,
-        max_event_json_size: usize,
-    ) -> Nip46Response {
+}
+
+pub(crate) async fn dispatch_request(
+    handler: &SignerHandler,
+    user_pubkey: PublicKey,
+    app_pubkey: PublicKey,
+    request: Nip46Request,
+    max_event_json_size: usize,
+) -> Nip46Response {
         let id = request.id.clone();
 
         match request.method.as_str() {
@@ -670,6 +672,7 @@ impl Server {
         }
     }
 
+impl Server {
     pub fn handler(&self) -> Arc<SignerHandler> {
         self.handler.clone()
     }

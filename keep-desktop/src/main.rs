@@ -7,6 +7,7 @@
 mod app;
 mod bunker_service;
 mod frost;
+mod local_signer_service;
 mod message;
 mod nostrconnect;
 mod screen;

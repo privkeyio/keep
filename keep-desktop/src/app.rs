@@ -142,6 +142,12 @@ pub struct App {
     pub(crate) bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
+    pub(crate) local_signer: Option<crate::local_signer_service::RunningLocalSigner>,
+    pub(crate) local_signer_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
+    pub(crate) local_signer_pending_approval:
+        Option<crate::screen::local_signer::PendingApprovalDisplay>,
+    pub(crate) local_signer_pending_setup:
+        Option<Arc<Mutex<Option<crate::local_signer_service::LocalSignerSetup>>>>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) proxy_enabled: bool,
     pub(crate) proxy_port: u16,
@@ -359,6 +365,8 @@ pub struct Settings {
     pub start_minimized: bool,
     #[serde(default)]
     pub bunker_auto_start: bool,
+    #[serde(default)]
+    pub local_signer_auto_start: bool,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -378,6 +386,7 @@ impl Default for Settings {
             minimize_to_tray: false,
             start_minimized: false,
             bunker_auto_start: false,
+            local_signer_auto_start: false,
         }
     }
 }
@@ -565,6 +574,10 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            local_signer: None,
+            local_signer_approval_tx: None,
+            local_signer_pending_approval: None,
+            local_signer_pending_setup: None,
             nostrconnect_pending: None,
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
@@ -666,6 +679,7 @@ impl App {
             | Message::NavigateWallets
             | Message::NavigateRelay
             | Message::NavigateBunker
+            | Message::NavigateLocalSigner
             | Message::NavigateSettings
             | Message::Lock => self.handle_navigation_message(message),
 
@@ -714,6 +728,19 @@ impl App {
             Message::BunkerClientsLoaded(clients) => self.handle_bunker_clients_loaded(clients),
             Message::BunkerPermissionUpdated(result) => {
                 self.handle_bunker_permission_updated(result)
+            }
+
+            Message::LocalSigner(msg) => self.handle_local_signer_message(msg),
+            Message::LocalSignerStartResult(result) => {
+                self.handle_local_signer_start_result(result)
+            }
+            Message::LocalSignerRevokeResult(result) => {
+                if let Err(e) = result {
+                    if let Screen::LocalSigner(s) = &mut self.screen {
+                        s.error = Some(e);
+                    }
+                }
+                Task::none()
             }
 
             Message::SigningAudit(msg) => self.handle_signing_audit_message(msg),
@@ -792,6 +819,7 @@ impl App {
         }
         let frost_task = self.drain_frost_events();
         self.poll_bunker_events();
+        self.poll_local_signer_events();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
         let mut tasks: Vec<_> = tray_events
@@ -996,6 +1024,13 @@ impl App {
                     return Task::none();
                 }
                 self.screen = Screen::Bunker(Box::new(self.create_bunker_screen()));
+                Task::none()
+            }
+            Message::NavigateLocalSigner => {
+                if matches!(self.screen, Screen::LocalSigner(_)) {
+                    return Task::none();
+                }
+                self.screen = Screen::LocalSigner(self.create_local_signer_screen());
                 Task::none()
             }
             Message::NavigateSettings => {
@@ -1909,6 +1944,7 @@ impl App {
         self.stop_scanner();
         self.handle_disconnect_relay();
         self.stop_bunker();
+        self.stop_local_signer();
 
         let mut guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_mut() {
@@ -2183,6 +2219,9 @@ impl App {
                 }
                 if self.settings.bunker_auto_start && !self.settings.kill_switch_active {
                     return self.handle_bunker_start();
+                }
+                if self.settings.local_signer_auto_start && !self.settings.kill_switch_active {
+                    return self.handle_local_signer_start();
                 }
             }
             Err(e) => self.screen.set_loading_error(e),
@@ -3196,6 +3235,7 @@ impl App {
         self.log_kill_switch_event(true);
         self.handle_disconnect_relay();
         self.stop_bunker();
+        self.stop_local_signer();
 
         if let Screen::Settings(s) = &mut self.screen {
             s.kill_switch_activated();
@@ -3448,6 +3488,7 @@ impl App {
         } else {
             self.handle_disconnect_relay();
             self.stop_bunker();
+            self.stop_local_signer();
             iced::exit()
         }
     }
@@ -3479,6 +3520,7 @@ impl App {
     fn handle_tray_quit(&mut self) -> Task<Message> {
         self.handle_disconnect_relay();
         self.stop_bunker();
+        self.stop_local_signer();
         iced::exit()
     }
 
@@ -3554,6 +3596,10 @@ impl App {
             bunker_approval_tx: None,
             bunker_pending_approval: None,
             bunker_pending_setup: None,
+            local_signer: None,
+            local_signer_approval_tx: None,
+            local_signer_pending_approval: None,
+            local_signer_pending_setup: None,
             nostrconnect_pending: None,
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,

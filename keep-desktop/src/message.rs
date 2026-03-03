@@ -179,6 +179,12 @@ pub enum Message {
     BunkerClientsLoaded(Vec<crate::screen::bunker::ConnectedClient>),
     BunkerPermissionUpdated(Result<(), String>),
 
+    // Local Signer
+    NavigateLocalSigner,
+    LocalSigner(crate::screen::local_signer::Message),
+    LocalSignerStartResult(Result<String, String>),
+    LocalSignerRevokeResult(Result<(), String>),
+
     // Signing Audit
     NavigateAudit,
     SigningAudit(crate::screen::signing_audit::Message),
@@ -427,6 +433,13 @@ impl fmt::Debug for Message {
                 .field(&c.len())
                 .finish(),
             Self::BunkerPermissionUpdated(_) => f.write_str("BunkerPermissionUpdated"),
+            Self::NavigateLocalSigner => f.write_str("NavigateLocalSigner"),
+            Self::LocalSigner(msg) => f.debug_tuple("LocalSigner").field(msg).finish(),
+            Self::LocalSignerStartResult(r) => f
+                .debug_tuple("LocalSignerStartResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::LocalSignerRevokeResult(_) => f.write_str("LocalSignerRevokeResult"),
             Self::ToggleIdentitySwitcher => f.write_str("ToggleIdentitySwitcher"),
             Self::SwitchIdentity(k) => f.debug_tuple("SwitchIdentity").field(k).finish(),
             Self::RequestDeleteIdentity(k) => {
