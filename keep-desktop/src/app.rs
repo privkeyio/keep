@@ -16,9 +16,10 @@ use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
 use keep_core::Keep;
+use rand::RngExt as _;
 use tokio::sync::mpsc;
 use tracing::error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
@@ -1021,19 +1022,22 @@ impl App {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let passphrase = "keep-internal-recovery";
+                            let mut passphrase_bytes = [0u8; 32];
+                            rand::rng().fill(&mut passphrase_bytes[..]);
+                            let passphrase = Zeroizing::new(hex::encode(passphrase_bytes));
+                            passphrase_bytes.zeroize();
                             with_keep_blocking(
                                 &keep_arc,
                                 "Failed to export vault share",
                                 move |keep| {
                                     let export = keep
-                                        .frost_export_share(&group_pubkey, identifier, passphrase)
+                                        .frost_export_share(&group_pubkey, identifier, &passphrase)
                                         .map_err(|e| e.to_string())?;
                                     let bech32 = export
                                         .to_bech32()
                                         .map(Zeroizing::new)
                                         .map_err(|e| e.to_string())?;
-                                    Ok((bech32, Zeroizing::new(passphrase.to_string())))
+                                    Ok((bech32, passphrase))
                                 },
                             )
                         })
@@ -1184,14 +1188,12 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let nsec = keep_core::frost::recover_nsec(&share_data, &passphrases)
-                        .map_err(|e| e.to_string())?;
-                    let keypair = keep_core::keys::NostrKeypair::from_nsec(&nsec)
-                        .map_err(|e| e.to_string())?;
-                    if *keypair.public_bytes() != expected_group_pubkey {
-                        return Err("Recovered key does not match expected group".to_string());
-                    }
-                    Ok(nsec)
+                    keep_core::frost::recover_nsec(
+                        &share_data,
+                        &passphrases,
+                        Some(&expected_group_pubkey),
+                    )
+                    .map_err(|e| e.to_string())
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -1221,8 +1223,12 @@ impl App {
         let Screen::Recovery(s) = &mut self.screen else {
             return Task::none();
         };
-        if let Ok((bech32, passphrase)) = result {
-            s.set_vault_share(bech32, passphrase);
+        match result {
+            Ok((bech32, passphrase)) => s.set_vault_share(bech32, passphrase),
+            Err(e) => {
+                error!("Vault share auto-export failed: {e}");
+                s.recovery_failed("Could not auto-export vault share; add it manually".to_string());
+            }
         }
         Task::none()
     }
@@ -1834,6 +1840,7 @@ impl App {
         self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
+        self.scanner_recovery = None;
         self.frost_last_share = None;
         self.frost_last_relay_urls = None;
         self.nostrconnect_pending = None;

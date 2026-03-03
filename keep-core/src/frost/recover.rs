@@ -16,6 +16,7 @@ use super::transport::ShareExport;
 pub fn recover_nsec(
     share_data: &[impl AsRef<str>],
     passphrases: &[impl AsRef<str>],
+    expected_group_pubkey: Option<&[u8; 32]>,
 ) -> Result<Zeroizing<String>> {
     if share_data.len() != passphrases.len() {
         return Err(KeepError::InvalidInput(
@@ -78,6 +79,16 @@ pub fn recover_nsec(
         reconstruct_result.map_err(|_| KeepError::Frost("Reconstruction failed".into()))?;
 
     let mut secret_bytes: Vec<u8> = signing_key.serialize();
+    // SigningKey doesn't impl Zeroize; best-effort zero its stack memory.
+    let sk_size = std::mem::size_of_val(&signing_key);
+    let sk_ptr = &signing_key as *const _ as *mut u8;
+    #[allow(forgetting_copy_types)]
+    std::mem::forget(signing_key);
+    #[allow(unsafe_code)]
+    unsafe {
+        std::ptr::write_bytes(sk_ptr, 0, sk_size);
+    }
+
     let Ok(mut secret_arr) = <[u8; 32]>::try_from(secret_bytes.as_slice()) else {
         secret_bytes.zeroize();
         return Err(KeepError::Frost("Invalid secret key length".into()));
@@ -87,7 +98,16 @@ pub fn recover_nsec(
     let keypair_result = NostrKeypair::from_secret_bytes(&mut secret_arr);
     secret_arr.zeroize();
 
-    keypair_result
-        .map(|kp| Zeroizing::new(kp.to_nsec()))
-        .map_err(|_| KeepError::Frost("Failed to derive Nostr key".into()))
+    let keypair =
+        keypair_result.map_err(|_| KeepError::Frost("Failed to derive Nostr key".into()))?;
+
+    if let Some(expected) = expected_group_pubkey {
+        if keypair.public_bytes() != expected {
+            return Err(KeepError::Frost(
+                "Recovered key does not match expected group".into(),
+            ));
+        }
+    }
+
+    Ok(Zeroizing::new(keypair.to_nsec()))
 }

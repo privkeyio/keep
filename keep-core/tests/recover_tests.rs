@@ -27,7 +27,7 @@ fn recover_nsec_two_of_three() {
     let exports = export_shares(passphrase);
     let passphrases = vec![passphrase; 2];
 
-    let nsec = recover_nsec(&exports[..2], &passphrases).unwrap();
+    let nsec = recover_nsec(&exports[..2], &passphrases, None).unwrap();
     assert!(nsec.starts_with("nsec1"));
 }
 
@@ -37,16 +37,16 @@ fn recover_nsec_all_shares() {
     let exports = export_shares(passphrase);
     let passphrases = vec![passphrase; 3];
 
-    let nsec_all = recover_nsec(&exports, &passphrases).unwrap();
+    let nsec_all = recover_nsec(&exports, &passphrases, None).unwrap();
 
-    let nsec_two = recover_nsec(&exports[..2], &[passphrase; 2]).unwrap();
+    let nsec_two = recover_nsec(&exports[..2], &[passphrase; 2], None).unwrap();
     assert_eq!(*nsec_all, *nsec_two);
 }
 
 #[test]
 fn recover_nsec_wrong_passphrase() {
     let exports = export_shares("correct");
-    let result = recover_nsec(&exports[..2], &["wrong", "wrong"]);
+    let result = recover_nsec(&exports[..2], &["wrong", "wrong"], None);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("decrypt"));
 }
@@ -57,7 +57,7 @@ fn recover_nsec_duplicate_shares() {
     let exports = export_shares(passphrase);
     let dupes = vec![exports[0].clone(), exports[0].clone()];
 
-    let result = recover_nsec(&dupes, &[passphrase, passphrase]);
+    let result = recover_nsec(&dupes, &[passphrase, passphrase], None);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Duplicate"));
 }
@@ -69,7 +69,7 @@ fn recover_nsec_mismatched_groups() {
     let exports_b = export_shares(passphrase);
 
     let mixed = vec![exports_a[0].clone(), exports_b[1].clone()];
-    let result = recover_nsec(&mixed, &[passphrase, passphrase]);
+    let result = recover_nsec(&mixed, &[passphrase, passphrase], None);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("same group"));
 }
@@ -79,6 +79,6 @@ fn recover_nsec_below_threshold() {
     let passphrase = "test-passphrase";
     let exports = export_shares(passphrase);
 
-    let result = recover_nsec(&exports[..1], &[passphrase]);
+    let result = recover_nsec(&exports[..1], &[passphrase], None);
     assert!(result.is_err());
 }
