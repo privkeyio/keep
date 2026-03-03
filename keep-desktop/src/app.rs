@@ -900,7 +900,12 @@ impl App {
         }
         match message {
             Message::GoToCreate => {
-                self.screen = Screen::Create(create::State::new());
+                let existing_names: Vec<String> = self
+                    .current_shares()
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                self.screen = Screen::Create(create::State::new(existing_names));
                 Task::none()
             }
             Message::GoToImport => {
@@ -927,10 +932,8 @@ impl App {
             Message::GoBack => {
                 self.stop_scanner();
                 self.copy_feedback_until = None;
-                if let Some(mut dist_state) = self.distribute_state.take() {
-                    if let Some(id) = self.distribute_export_id.take() {
-                        dist_state.mark_exported(id);
-                    }
+                if let Some(dist_state) = self.distribute_state.take() {
+                    self.distribute_export_id = None;
                     self.screen = Screen::Distribute(dist_state);
                     return Task::none();
                 }
@@ -2290,9 +2293,8 @@ impl App {
                         "Internal error during keyset creation",
                         move |keep| {
                             if let Some(nsec) = nsec {
-                                let pubkey = keep
-                                    .import_nsec(nsec.trim(), &name)
-                                    .map_err(friendly_err)?;
+                                let pubkey =
+                                    keep.import_nsec(nsec.trim(), &name).map_err(friendly_err)?;
                                 if let Err(e) = keep.frost_split(&name, threshold, total) {
                                     let _ = keep.delete_key(&pubkey);
                                     return Err(friendly_err(e));
@@ -2301,7 +2303,9 @@ impl App {
                                 keep.frost_generate(threshold, total, &name)
                                     .map_err(friendly_err)?;
                             }
-                            collect_shares(keep)
+                            collect_shares(keep).map(|shares| {
+                                shares.into_iter().filter(|s| s.name == name).collect()
+                            })
                         },
                     )
                 })
@@ -2363,6 +2367,11 @@ impl App {
     fn handle_export_generated(&mut self, result: Result<ExportData, String>) -> Task<Message> {
         match result {
             Ok(data) => {
+                if let Some(id) = self.distribute_export_id.take() {
+                    if let Some(state) = &mut self.distribute_state {
+                        state.mark_exported(id);
+                    }
+                }
                 if let Screen::Export(s) = &mut self.screen {
                     s.set_export(data.bech32, data.frames);
                 }

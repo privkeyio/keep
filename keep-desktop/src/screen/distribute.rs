@@ -34,14 +34,7 @@ impl State {
     pub fn new(shares: Vec<ShareEntry>) -> Self {
         let (name, threshold, total, npub) = shares
             .first()
-            .map(|s| {
-                (
-                    s.name.clone(),
-                    s.threshold,
-                    s.total_shares,
-                    s.npub.clone(),
-                )
-            })
+            .map(|s| (s.name.clone(), s.threshold, s.total_shares, s.npub.clone()))
             .unwrap_or_default();
         Self {
             shares,
@@ -65,7 +58,9 @@ impl State {
     pub fn update(&mut self, message: Message) -> Option<Event> {
         match message {
             Message::ExportQr(index) => self.shares.get(index).cloned().map(Event::ExportQr),
-            Message::Finish => Some(Event::Finish),
+            Message::Finish => {
+                (self.exported.len() as u16 >= self.threshold).then_some(Event::Finish)
+            }
         }
     }
 
@@ -102,11 +97,7 @@ impl State {
 
         for (i, share) in self.shares.iter().enumerate() {
             let exported = self.exported.contains(&share.identifier);
-            let status_text = if exported {
-                "Exported"
-            } else {
-                "Not exported"
-            };
+            let status_text = if exported { "Exported" } else { "Not exported" };
             let status_color = if exported {
                 theme::color::SUCCESS
             } else {
@@ -122,7 +113,7 @@ impl State {
                     .size(theme::size::SMALL)
                     .color(status_color)
                     .width(Length::Fill),
-                button(text("Export QR").size(theme::size::BODY))
+                button(text("Export").size(theme::size::BODY))
                     .on_press(Message::ExportQr(i))
                     .style(theme::secondary_button)
                     .padding([theme::space::XS, theme::space::MD]),
@@ -150,7 +141,10 @@ impl State {
         content = content.push(Space::new().height(theme::space::MD));
 
         let exported_count = self.exported.len() as u16;
-        let all_exported = self.shares.iter().all(|s| self.exported.contains(&s.identifier));
+        let all_exported = self
+            .shares
+            .iter()
+            .all(|s| self.exported.contains(&s.identifier));
         let enough_exported = exported_count >= self.threshold;
 
         let finish_label = if all_exported {

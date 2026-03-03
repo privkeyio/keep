@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 use crate::theme;
 
+const MIN_NSEC_LEN: usize = 60;
+
 #[derive(Clone)]
 pub enum Message {
     NameChanged(String),
@@ -49,10 +51,11 @@ pub struct State {
     nsec: Zeroizing<String>,
     error: Option<String>,
     loading: bool,
+    existing_names: Vec<String>,
 }
 
 impl State {
-    pub fn new() -> Self {
+    pub fn new(existing_names: Vec<String>) -> Self {
         Self {
             name: String::new(),
             threshold: "2".into(),
@@ -60,6 +63,7 @@ impl State {
             nsec: Zeroizing::new(String::new()),
             error: None,
             loading: false,
+            existing_names,
         }
     }
 
@@ -95,14 +99,23 @@ impl State {
                     _ => return None,
                 };
                 let total: u16 = match self.total.parse() {
-                    Ok(v) if v >= threshold && v <= 255 => v,
+                    Ok(v) if (threshold..=255).contains(&v) => v,
                     _ => return None,
                 };
+                let name_lower = name.to_lowercase();
+                if self
+                    .existing_names
+                    .iter()
+                    .any(|n| n.to_lowercase() == name_lower)
+                {
+                    self.error = Some("A keyset with this name already exists".into());
+                    return None;
+                }
                 let nsec = if self.nsec.trim().is_empty() {
                     None
                 } else {
                     let trimmed = self.nsec.trim();
-                    if !trimmed.starts_with("nsec1") || trimmed.len() < 60 {
+                    if !trimmed.starts_with("nsec1") || trimmed.len() < MIN_NSEC_LEN {
                         self.error = Some("Invalid nsec: must start with nsec1".into());
                         return None;
                     }
@@ -168,7 +181,13 @@ impl State {
         .spacing(theme::space::SM)
         .align_y(Alignment::Center);
 
-        let name_valid = !self.name.is_empty() && self.name.len() <= 64;
+        let name_trimmed = self.name.trim();
+        let name_duplicate = !name_trimmed.is_empty()
+            && self
+                .existing_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name_trimmed));
+        let name_valid = !self.name.is_empty() && self.name.len() <= 64 && !name_duplicate;
         let threshold_val: Option<u16> = self
             .threshold
             .parse()
@@ -178,7 +197,7 @@ impl State {
         let total_valid = matches!((threshold_val, total_val), (Some(t), Some(n)) if n >= t);
         let nsec_trimmed = self.nsec.trim();
         let nsec_valid = nsec_trimmed.is_empty()
-            || (nsec_trimmed.starts_with("nsec1") && nsec_trimmed.len() >= 60);
+            || (nsec_trimmed.starts_with("nsec1") && nsec_trimmed.len() >= MIN_NSEC_LEN);
         let can_create = name_valid && threshold_val.is_some() && total_valid && nsec_valid;
 
         let mut content = column![
@@ -195,6 +214,8 @@ impl State {
 
         if self.name.len() > 64 {
             content = content.push(theme::error_text("Name must be 64 characters or fewer"));
+        } else if name_duplicate {
+            content = content.push(theme::error_text("A keyset with this name already exists"));
         }
         if !self.threshold.is_empty() && threshold_val.is_none() {
             content = content.push(theme::error_text("Threshold must be between 2 and 255"));
@@ -241,12 +262,11 @@ impl State {
                 .size(theme::size::SMALL)
                 .color(theme::color::TEXT_MUTED),
         );
-        let nsec_input =
-            text_input("nsec1... (leave blank to generate fresh)", &self.nsec)
-                .on_input(|s| Message::NsecChanged(Zeroizing::new(s)))
-                .secure(true)
-                .padding(theme::space::MD)
-                .width(theme::size::INPUT_WIDTH);
+        let nsec_input = text_input("nsec1... (leave blank to generate fresh)", &self.nsec)
+            .on_input(|s| Message::NsecChanged(Zeroizing::new(s)))
+            .secure(true)
+            .padding(theme::space::MD)
+            .width(theme::size::INPUT_WIDTH);
         content = content.push(nsec_input);
         if !nsec_trimmed.is_empty() && !nsec_valid {
             content = content.push(theme::error_text("Must be a valid nsec1... bech32 string"));
