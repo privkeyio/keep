@@ -748,6 +748,11 @@ impl App {
             self.clipboard_clear_at = None;
             return iced::clipboard::write(String::new());
         }
+        if let Screen::Recovery(s) = &mut self.screen {
+            if s.has_active_timer() {
+                s.update(recovery::Message::AutoClearTick);
+            }
+        }
         if self.copy_feedback_until.is_some_and(|t| now >= t) {
             self.copy_feedback_until = None;
             match &mut self.screen {

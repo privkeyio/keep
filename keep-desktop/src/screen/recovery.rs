@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::fmt;
+use std::time::Instant;
 
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
@@ -20,6 +21,7 @@ pub enum Message {
     ToggleNsecVisibility,
     CopyNsec,
     ClearNsec,
+    AutoClearTick,
     GoBack,
 }
 
@@ -35,6 +37,7 @@ impl fmt::Debug for Message {
             Self::ToggleNsecVisibility => f.write_str("ToggleNsecVisibility"),
             Self::CopyNsec => f.write_str("CopyNsec"),
             Self::ClearNsec => f.write_str("ClearNsec"),
+            Self::AutoClearTick => f.write_str("AutoClearTick"),
             Self::GoBack => f.write_str("GoBack"),
         }
     }
@@ -58,6 +61,7 @@ pub struct State {
     total_shares: u16,
     group_display: String,
     recovered_nsec: Option<Zeroizing<String>>,
+    clear_deadline: Option<Instant>,
     nsec_visible: bool,
     loading: bool,
     error: Option<String>,
@@ -74,6 +78,7 @@ impl State {
             total_shares,
             group_display,
             recovered_nsec: None,
+            clear_deadline: None,
             nsec_visible: false,
             loading: false,
             error: None,
@@ -140,11 +145,27 @@ impl State {
                 .map(|nsec| Event::CopyToClipboard(nsec.clone())),
             Message::ClearNsec => {
                 self.recovered_nsec = None;
+                self.clear_deadline = None;
                 self.nsec_visible = false;
+                None
+            }
+            Message::AutoClearTick => {
+                if self
+                    .clear_deadline
+                    .is_some_and(|d| Instant::now() >= d)
+                {
+                    self.recovered_nsec = None;
+                    self.clear_deadline = None;
+                    self.nsec_visible = false;
+                }
                 None
             }
             Message::GoBack => Some(Event::GoBack),
         }
+    }
+
+    pub fn has_active_timer(&self) -> bool {
+        self.clear_deadline.is_some()
     }
 
     pub fn set_share_input(&mut self, slot: usize, data: Zeroizing<String>) {
@@ -163,6 +184,7 @@ impl State {
 
     pub fn recovery_succeeded(&mut self, nsec: Zeroizing<String>) {
         self.recovered_nsec = Some(nsec);
+        self.clear_deadline = Some(Instant::now() + std::time::Duration::from_secs(60));
         self.loading = false;
         for input in &mut self.share_inputs {
             *input = Zeroizing::new(String::new());
@@ -315,7 +337,7 @@ impl State {
                 .style(theme::danger_button)
                 .padding([theme::space::XS, theme::space::SM]);
 
-            let result_section = column![
+            let mut result_section = column![
                 Space::new().height(theme::space::MD),
                 theme::label("Recovered nsec"),
                 text(display)
@@ -326,6 +348,16 @@ impl State {
                     .align_y(Alignment::Center),
             ]
             .spacing(theme::space::XS);
+
+            if let Some(deadline) = self.clear_deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let secs = remaining.as_secs();
+                result_section = result_section.push(
+                    text(format!("Auto-clears in {}s \u{2014} copy to a secure password manager", secs))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::WARNING),
+                );
+            }
 
             content = content.push(result_section);
         }
