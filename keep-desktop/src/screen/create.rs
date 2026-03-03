@@ -1,18 +1,35 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
+
 use iced::widget::{button, column, container, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use zeroize::Zeroizing;
 
 use crate::theme;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Message {
     NameChanged(String),
     ThresholdChanged(String),
     TotalChanged(String),
+    NsecChanged(Zeroizing<String>),
     GoBack,
     Create,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameChanged(_) => f.write_str("NameChanged"),
+            Self::ThresholdChanged(_) => f.write_str("ThresholdChanged"),
+            Self::TotalChanged(_) => f.write_str("TotalChanged"),
+            Self::NsecChanged(_) => f.write_str("NsecChanged(***)"),
+            Self::GoBack => f.write_str("GoBack"),
+            Self::Create => f.write_str("Create"),
+        }
+    }
 }
 
 pub enum Event {
@@ -21,6 +38,7 @@ pub enum Event {
         name: String,
         threshold: u16,
         total: u16,
+        nsec: Option<Zeroizing<String>>,
     },
 }
 
@@ -28,6 +46,7 @@ pub struct State {
     name: String,
     threshold: String,
     total: String,
+    nsec: Zeroizing<String>,
     error: Option<String>,
     loading: bool,
 }
@@ -38,6 +57,7 @@ impl State {
             name: String::new(),
             threshold: "2".into(),
             total: "3".into(),
+            nsec: Zeroizing::new(String::new()),
             error: None,
             loading: false,
         }
@@ -57,6 +77,10 @@ impl State {
                 self.total = t;
                 None
             }
+            Message::NsecChanged(n) => {
+                self.nsec = n;
+                None
+            }
             Message::GoBack => Some(Event::GoBack),
             Message::Create => {
                 if self.loading {
@@ -74,12 +98,18 @@ impl State {
                     Ok(v) if v >= threshold && v <= 255 => v,
                     _ => return None,
                 };
+                let nsec = if self.nsec.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.nsec.clone())
+                };
                 self.loading = true;
                 self.error = None;
                 Some(Event::Create {
                     name,
                     threshold,
                     total,
+                    nsec,
                 })
             }
         }
@@ -195,6 +225,21 @@ impl State {
                 theme::muted("Choose how many devices are needed to sign (threshold) out of the total number of shares."),
             );
         }
+
+        content = content.push(Space::new().height(theme::space::MD));
+        content = content.push(theme::label("Existing Key (optional)"));
+        content = content.push(
+            text("Paste an nsec to split an existing Nostr identity into threshold shares")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED),
+        );
+        let nsec_input =
+            text_input("nsec1... (leave blank to generate fresh)", &self.nsec)
+                .on_input(|s| Message::NsecChanged(Zeroizing::new(s)))
+                .secure(true)
+                .padding(theme::space::MD)
+                .width(theme::size::INPUT_WIDTH);
+        content = content.push(nsec_input);
 
         content = content.push(Space::new().height(theme::space::SM));
 

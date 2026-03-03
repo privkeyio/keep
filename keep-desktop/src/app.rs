@@ -37,7 +37,8 @@ use crate::screen::unlock;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, WalletEntry};
 use crate::screen::Screen;
 use crate::screen::{
-    create, export, export_ncryptsec, import, nsec_keys, recovery, relay, scanner, shares, wallet,
+    create, distribute, export, export_ncryptsec, import, nsec_keys, recovery, relay, scanner,
+    shares, wallet,
 };
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
@@ -159,6 +160,8 @@ pub struct App {
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
+    distribute_state: Option<distribute::State>,
+    distribute_export_id: Option<u16>,
     scanner_recovery: Option<(recovery::State, usize)>,
     pending_vault_share: Option<VaultShareResult>,
     last_recovery_attempt: Option<Instant>,
@@ -575,6 +578,8 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            distribute_state: None,
+            distribute_export_id: None,
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
@@ -670,6 +675,8 @@ impl App {
 
             Message::Create(msg) => self.handle_create_message(msg),
             Message::CreateResult(result) => self.handle_create_result(result),
+
+            Message::Distribute(msg) => self.handle_distribute_message(msg),
 
             Message::Export(msg) => self.handle_export_message(msg),
             Message::ExportGenerated(result) => self.handle_export_generated(result),
@@ -916,6 +923,13 @@ impl App {
             Message::GoBack => {
                 self.stop_scanner();
                 self.copy_feedback_until = None;
+                if let Some(mut dist_state) = self.distribute_state.take() {
+                    if let Some(id) = self.distribute_export_id.take() {
+                        dist_state.mark_exported(id);
+                    }
+                    self.screen = Screen::Distribute(dist_state);
+                    return Task::none();
+                }
                 let return_to_nsec = matches!(self.screen, Screen::ExportNcryptsec(_))
                     || (matches!(self.screen, Screen::Import(_)) && self.import_return_to_nsec);
                 if return_to_nsec {
@@ -1077,23 +1091,51 @@ impl App {
                 name,
                 threshold,
                 total,
-            } => self.handle_create_keyset_validated(name, threshold, total),
+                nsec,
+            } => self.handle_create_keyset_validated(name, threshold, total, nsec),
         }
     }
 
     fn handle_create_result(&mut self, result: Result<Vec<ShareEntry>, String>) -> Task<Message> {
         match result {
             Ok(shares) => {
-                self.set_share_screen(shares);
-                self.set_toast(
-                    "Keyset created! Tap a share and use Export QR to send it to your phone."
-                        .into(),
-                    ToastKind::Success,
-                );
+                self.cached_share_count = shares.len();
+                self.refresh_identities(&shares);
+                self.screen = Screen::Distribute(distribute::State::new(shares));
                 Task::none()
             }
             Err(e) => {
                 self.screen.set_loading_error(e);
+                Task::none()
+            }
+        }
+    }
+
+    fn handle_distribute_message(&mut self, msg: distribute::Message) -> Task<Message> {
+        let Screen::Distribute(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            distribute::Event::ExportQr(share) => {
+                let identifier = share.identifier;
+                if let Screen::Distribute(state) = std::mem::replace(
+                    &mut self.screen,
+                    Screen::ShareList(shares::State::new(vec![], None)),
+                ) {
+                    self.distribute_state = Some(state);
+                }
+                self.distribute_export_id = Some(identifier);
+                self.screen = Screen::Export(Box::new(export::State::new(share)));
+                Task::none()
+            }
+            distribute::Event::Finish => {
+                self.distribute_state = None;
+                self.distribute_export_id = None;
+                self.set_share_screen(self.current_shares());
+                self.set_toast("Keyset created!".into(), ToastKind::Success);
                 Task::none()
             }
         }
@@ -1878,6 +1920,8 @@ impl App {
         self.toast = None;
         self.toast_dismiss_at = None;
         self.scanner_recovery = None;
+        self.distribute_state = None;
+        self.distribute_export_id = None;
         self.pending_vault_share = None;
         self.frost_last_share = None;
         self.frost_last_relay_urls = None;
@@ -2231,6 +2275,7 @@ impl App {
         name: String,
         threshold: u16,
         total: u16,
+        nsec: Option<Zeroizing<String>>,
     ) -> Task<Message> {
         let keep_arc = self.keep.clone();
         Task::perform(
@@ -2240,8 +2285,15 @@ impl App {
                         &keep_arc,
                         "Internal error during keyset creation",
                         move |keep| {
-                            keep.frost_generate(threshold, total, &name)
-                                .map_err(friendly_err)?;
+                            if let Some(nsec) = nsec {
+                                keep.import_nsec(nsec.trim(), &name)
+                                    .map_err(friendly_err)?;
+                                keep.frost_split(&name, threshold, total)
+                                    .map_err(friendly_err)?;
+                            } else {
+                                keep.frost_generate(threshold, total, &name)
+                                    .map_err(friendly_err)?;
+                            }
                             collect_shares(keep)
                         },
                     )
@@ -3490,6 +3542,8 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            distribute_state: None,
+            distribute_export_id: None,
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
