@@ -16,9 +16,10 @@ use iced::{Background, Element, Length, Subscription, Task};
 use keep_core::frost::ShareExport;
 use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
 use keep_core::Keep;
+use rand::RngExt as _;
 use tokio::sync::mpsc;
 use tracing::error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
@@ -36,7 +37,7 @@ use crate::screen::unlock;
 use crate::screen::wallet::{DescriptorProgress, SetupPhase, WalletEntry};
 use crate::screen::Screen;
 use crate::screen::{
-    create, export, export_ncryptsec, import, nsec_keys, relay, scanner, shares, wallet,
+    create, export, export_ncryptsec, import, nsec_keys, recovery, relay, scanner, shares, wallet,
 };
 use crate::theme;
 use crate::tray::{TrayEvent, TrayState};
@@ -108,6 +109,8 @@ pub(crate) struct ActiveCoordination {
     pub is_initiator: bool,
 }
 
+type VaultShareResult = Result<(Zeroizing<String>, Zeroizing<String>), String>;
+
 pub struct App {
     pub(crate) keep: Arc<Mutex<Option<Keep>>>,
     pub(crate) keep_path: PathBuf,
@@ -156,6 +159,9 @@ pub struct App {
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     import_return_to_nsec: bool,
+    scanner_recovery: Option<(recovery::State, usize)>,
+    pending_vault_share: Option<VaultShareResult>,
+    last_recovery_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
 }
@@ -569,6 +575,9 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            scanner_recovery: None,
+            pending_vault_share: None,
+            last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
@@ -670,6 +679,9 @@ impl App {
             Message::NcryptsecGenerated(result) => self.handle_ncryptsec_generated(result),
 
             Message::Import(msg) => self.handle_import_message(msg),
+            Message::Recovery(msg) => self.handle_recovery_message(msg),
+            Message::RecoveryResult(result) => self.handle_recovery_result(result),
+            Message::VaultShareExported(result) => self.handle_vault_share_exported(result),
             Message::ImportResult(result) => self.handle_import_result(result),
             Message::ImportNsecResult(result) => self.handle_import_nsec_result(result),
             Message::ImportNcryptsecResult(result) => self.handle_import_nsec_result(result),
@@ -742,6 +754,16 @@ impl App {
         if self.clipboard_clear_at.is_some_and(|t| now >= t) {
             self.clipboard_clear_at = None;
             return iced::clipboard::write(String::new());
+        }
+        if let Screen::Recovery(s) = &mut self.screen {
+            if s.has_active_timer() {
+                s.update(recovery::Message::AutoClearTick);
+            }
+        }
+        if let Some((ref mut state, _)) = self.scanner_recovery {
+            if state.has_active_timer() {
+                state.update(recovery::Message::AutoClearTick);
+            }
         }
         if self.copy_feedback_until.is_some_and(|t| now >= t) {
             self.copy_feedback_until = None;
@@ -992,6 +1014,48 @@ impl App {
             shares::Event::ActivateShare(hex) => {
                 self.handle_identity_message(Message::SwitchIdentity(hex))
             }
+            shares::Event::GoToRecover {
+                threshold,
+                total_shares,
+                group_display,
+                group_pubkey,
+                identifier,
+            } => {
+                self.screen = Screen::Recovery(recovery::State::new(
+                    threshold,
+                    total_shares,
+                    group_display,
+                    group_pubkey,
+                ));
+                let keep_arc = self.keep.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let mut passphrase_bytes = [0u8; 32];
+                            rand::rng().fill(&mut passphrase_bytes[..]);
+                            let passphrase = Zeroizing::new(hex::encode(passphrase_bytes));
+                            passphrase_bytes.zeroize();
+                            with_keep_blocking(
+                                &keep_arc,
+                                "Failed to export vault share",
+                                move |keep| {
+                                    let export = keep
+                                        .frost_export_share(&group_pubkey, identifier, &passphrase)
+                                        .map_err(|e| e.to_string())?;
+                                    let bech32 = export
+                                        .to_bech32()
+                                        .map(Zeroizing::new)
+                                        .map_err(|e| e.to_string())?;
+                                    Ok((bech32, passphrase))
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|_| "Background task failed".to_string())?
+                    },
+                    Message::VaultShareExported,
+                )
+            }
             shares::Event::CopyNpub(npub) => self.handle_copy_npub(npub),
             shares::Event::ConfirmDelete(id) => {
                 self.handle_delete(id);
@@ -1084,6 +1148,124 @@ impl App {
         }
     }
 
+    fn handle_recovery_message(&mut self, msg: recovery::Message) -> Task<Message> {
+        let Screen::Recovery(s) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(event) = s.update(msg) else {
+            return Task::none();
+        };
+        match event {
+            recovery::Event::GoBack => self.handle_navigation_message(Message::GoBack),
+            recovery::Event::ScanShare(slot) => {
+                if let Screen::Recovery(state) = std::mem::replace(
+                    &mut self.screen,
+                    Screen::ShareList(shares::State::new(vec![], None)),
+                ) {
+                    self.scanner_recovery = Some((state, slot));
+                }
+                self.stop_scanner();
+                self.open_scanner();
+                Task::none()
+            }
+            recovery::Event::Recover {
+                share_data,
+                passphrases,
+                expected_group_pubkey,
+            } => self.handle_recover_nsec(share_data, passphrases, expected_group_pubkey),
+            recovery::Event::CopyToClipboard(text) => self.handle_copy_sensitive(text),
+        }
+    }
+
+    fn handle_recover_nsec(
+        &mut self,
+        share_data: Vec<Zeroizing<String>>,
+        passphrases: Vec<Zeroizing<String>>,
+        expected_group_pubkey: [u8; 32],
+    ) -> Task<Message> {
+        const RECOVERY_COOLDOWN: Duration = Duration::from_secs(5);
+        if self
+            .last_recovery_attempt
+            .is_some_and(|t| t.elapsed() < RECOVERY_COOLDOWN)
+        {
+            if let Screen::Recovery(s) = &mut self.screen {
+                s.recovery_failed("Please wait before trying again".to_string());
+            }
+            return Task::none();
+        }
+        self.last_recovery_attempt = Some(Instant::now());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    keep_core::frost::recover_nsec(
+                        &share_data,
+                        &passphrases,
+                        Some(&expected_group_pubkey),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())?
+            },
+            Message::RecoveryResult,
+        )
+    }
+
+    fn handle_recovery_result(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+    ) -> Task<Message> {
+        let s = match &mut self.screen {
+            Screen::Recovery(s) => s,
+            _ => {
+                if let Some((ref mut state, _)) = self.scanner_recovery {
+                    state
+                } else {
+                    return Task::none();
+                }
+            }
+        };
+        match result {
+            Ok(nsec) => s.recovery_succeeded(nsec),
+            Err(e) => s.recovery_failed(e),
+        }
+        Task::none()
+    }
+
+    fn handle_vault_share_exported(
+        &mut self,
+        result: Result<(Zeroizing<String>, Zeroizing<String>), String>,
+    ) -> Task<Message> {
+        let Screen::Recovery(s) = &mut self.screen else {
+            self.pending_vault_share = Some(result);
+            return Task::none();
+        };
+        match result {
+            Ok((bech32, passphrase)) => s.set_vault_share(bech32, passphrase),
+            Err(e) => {
+                error!("Vault share auto-export failed: {e}");
+                s.recovery_failed("Could not auto-export vault share; add it manually".to_string());
+            }
+        }
+        Task::none()
+    }
+
+    fn consume_pending_vault_share(&mut self) {
+        if let Some(result) = self.pending_vault_share.take() {
+            if let Screen::Recovery(s) = &mut self.screen {
+                match result {
+                    Ok((bech32, passphrase)) => s.set_vault_share(bech32, passphrase),
+                    Err(e) => {
+                        error!("Vault share auto-export failed: {e}");
+                        s.recovery_failed(
+                            "Could not auto-export vault share; add it manually".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_scanner_message(&mut self, msg: scanner::Message) -> Task<Message> {
         let Screen::Scanner(s) = &mut self.screen else {
             return Task::none();
@@ -1094,7 +1276,14 @@ impl App {
         match event {
             scanner::Event::Close => {
                 self.stop_scanner();
-                self.screen = Screen::Import(import::State::new());
+                if let Some((state, _)) = self.scanner_recovery.take() {
+                    self.screen = Screen::Recovery(state);
+                    self.consume_pending_vault_share();
+                } else {
+                    self.scanner_recovery = None;
+                    self.pending_vault_share = None;
+                    self.screen = Screen::Import(import::State::new());
+                }
                 Task::none()
             }
             scanner::Event::Retry => {
@@ -1170,8 +1359,14 @@ impl App {
                         if let Some(result) = s.process_qr_content(&content) {
                             s.stop_camera();
                             self.scanner_rx = None;
-                            let import = import::State::with_data(result);
-                            self.screen = Screen::Import(import);
+                            if let Some((mut state, slot)) = self.scanner_recovery.take() {
+                                state.set_share_input(slot, Zeroizing::new(result));
+                                self.screen = Screen::Recovery(state);
+                                self.consume_pending_vault_share();
+                            } else {
+                                let import = import::State::with_data(result);
+                                self.screen = Screen::Import(import);
+                            }
                         }
                     }
                 }
@@ -1682,6 +1877,8 @@ impl App {
         self.delete_identity_confirm = None;
         self.toast = None;
         self.toast_dismiss_at = None;
+        self.scanner_recovery = None;
+        self.pending_vault_share = None;
         self.frost_last_share = None;
         self.frost_last_relay_urls = None;
         self.nostrconnect_pending = None;
@@ -3293,6 +3490,9 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             import_return_to_nsec: false,
+            scanner_recovery: None,
+            pending_vault_share: None,
+            last_recovery_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,

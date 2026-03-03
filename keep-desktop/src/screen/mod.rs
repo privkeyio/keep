@@ -8,6 +8,7 @@ pub mod export_ncryptsec;
 pub mod import;
 pub mod layout;
 pub mod nsec_keys;
+pub mod recovery;
 pub mod relay;
 pub mod scanner;
 pub mod settings;
@@ -39,6 +40,7 @@ pub enum Screen {
     NsecKeys(nsec_keys::State),
     SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
+    Recovery(recovery::State),
 }
 
 impl Screen {
@@ -66,6 +68,7 @@ impl Screen {
             Screen::NsecKeys(s) => (NavItem::NsecKeys, s.view().map(Message::NsecKeys)),
             Screen::SigningAudit(s) => (NavItem::Audit, s.view().map(Message::SigningAudit)),
             Screen::Settings(s) => (NavItem::Settings, s.view().map(Message::Settings)),
+            Screen::Recovery(s) => (NavItem::Shares, s.view().map(Message::Recovery)),
         };
         layout::with_sidebar(
             nav,
@@ -99,6 +102,9 @@ impl Screen {
             Screen::Bunker(s) => {
                 s.starting = false;
                 s.error = Some(error);
+            }
+            Screen::Recovery(s) => {
+                s.recovery_failed(error);
             }
             Screen::ShareList(_)
             | Screen::NsecKeys(_)
