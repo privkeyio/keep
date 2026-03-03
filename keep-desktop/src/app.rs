@@ -1120,14 +1120,13 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    use keep_core::frost::ShareExport;
                     use zeroize::Zeroize;
 
                     let mut key_packages = Vec::with_capacity(share_data.len());
                     let mut group_pubkey: Option<String> = None;
                     let mut seen_identifiers: Vec<u16> = Vec::new();
 
-                    let loop_result: Result<(), String> = (|| {
+                    let parse_result: Result<(), String> = (|| {
                         for (data, passphrase) in share_data.iter().zip(passphrases.iter()) {
                             let export = ShareExport::parse(data)
                                 .map_err(|_| "Invalid share format".to_string())?;
@@ -1162,7 +1161,7 @@ impl App {
                         Ok(())
                     })();
 
-                    if let Err(e) = loop_result {
+                    if let Err(e) = parse_result {
                         key_packages.zeroize();
                         return Err(e);
                     }
@@ -1175,21 +1174,18 @@ impl App {
                         .map_err(|_| "Reconstruction failed".to_string())?;
 
                     let mut secret_bytes: Vec<u8> = signing_key.serialize();
-                    let secret_arr_result = <[u8; 32]>::try_from(secret_bytes.as_slice());
-                    if secret_arr_result.is_err() {
+                    let Ok(mut secret_arr) = <[u8; 32]>::try_from(secret_bytes.as_slice()) else {
                         secret_bytes.zeroize();
                         return Err("Invalid secret key length".to_string());
-                    }
-                    let mut secret_arr = secret_arr_result.unwrap();
+                    };
                     secret_bytes.zeroize();
 
                     let keypair_result =
                         keep_core::keys::NostrKeypair::from_secret_bytes(&mut secret_arr);
                     secret_arr.zeroize();
-                    match keypair_result {
-                        Ok(keypair) => Ok(Zeroizing::new(keypair.to_nsec())),
-                        Err(_) => Err("Failed to derive key".to_string()),
-                    }
+                    keypair_result
+                        .map(|kp| Zeroizing::new(kp.to_nsec()))
+                        .map_err(|_| "Failed to derive key".to_string())
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())?
@@ -1206,15 +1202,10 @@ impl App {
             return Task::none();
         };
         match result {
-            Ok(nsec) => {
-                s.recovery_succeeded(nsec);
-                Task::none()
-            }
-            Err(e) => {
-                s.recovery_failed(e);
-                Task::none()
-            }
+            Ok(nsec) => s.recovery_succeeded(nsec),
+            Err(e) => s.recovery_failed(e),
         }
+        Task::none()
     }
 
     fn handle_scanner_message(&mut self, msg: scanner::Message) -> Task<Message> {

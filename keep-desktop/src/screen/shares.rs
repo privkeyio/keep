@@ -120,17 +120,11 @@ impl State {
             Message::GoToExport(i) => Some(Event::GoToExport(i)),
             Message::GoToCreate => Some(Event::GoToCreate),
             Message::GoToImport => Some(Event::GoToImport),
-            Message::GoToRecover(i) => {
-                if let Some(share) = self.shares.get(i) {
-                    Some(Event::GoToRecover {
-                        threshold: share.threshold,
-                        total_shares: share.total_shares,
-                        group_display: share.truncated_npub(),
-                    })
-                } else {
-                    None
-                }
-            }
+            Message::GoToRecover(i) => self.shares.get(i).map(|share| Event::GoToRecover {
+                threshold: share.threshold,
+                total_shares: share.total_shares,
+                group_display: share.truncated_npub(),
+            }),
             Message::ActivateShare(hex) => Some(Event::ActivateShare(hex)),
             Message::CopyNpub(npub) => Some(Event::CopyNpub(npub)),
             Message::RequestDelete(id) => {

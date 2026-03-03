@@ -97,25 +97,18 @@ impl State {
                 None
             }
             Message::RemoveShareInput(i) => {
-                if self.share_inputs.len() > 1 {
-                    if i < self.share_inputs.len() {
-                        self.share_inputs.remove(i);
-                        self.passphrase_inputs.remove(i);
-                    }
+                if self.share_inputs.len() > 1 && i < self.share_inputs.len() {
+                    self.share_inputs.remove(i);
+                    self.passphrase_inputs.remove(i);
                 }
                 None
             }
             Message::Recover => {
-                if self.loading {
-                    return None;
-                }
-                if (self.share_inputs.len() as u16) < self.threshold {
-                    return None;
-                }
-                if self.share_inputs.iter().any(|s| s.trim().is_empty()) {
-                    return None;
-                }
-                if self.passphrase_inputs.iter().any(|p| p.is_empty()) {
+                let ready = !self.loading
+                    && (self.share_inputs.len() as u16) >= self.threshold
+                    && self.share_inputs.iter().all(|s| !s.trim().is_empty())
+                    && self.passphrase_inputs.iter().all(|p| !p.is_empty());
+                if !ready {
                     return None;
                 }
                 self.loading = true;
@@ -129,13 +122,10 @@ impl State {
                 self.nsec_visible = !self.nsec_visible;
                 None
             }
-            Message::CopyNsec => {
-                if let Some(nsec) = &self.recovered_nsec {
-                    Some(Event::CopyToClipboard(nsec.clone()))
-                } else {
-                    None
-                }
-            }
+            Message::CopyNsec => self
+                .recovered_nsec
+                .as_ref()
+                .map(|nsec| Event::CopyToClipboard(nsec.clone())),
             Message::ClearNsec => {
                 self.recovered_nsec = None;
                 self.nsec_visible = false;
@@ -197,15 +187,13 @@ impl State {
                 .size(theme::size::SMALL)
                 .color(theme::color::TEXT);
 
-            let idx = i;
             let share_input = text_input("kshare1...", &self.share_inputs[i])
-                .on_input(move |s| Message::ShareInputChanged(idx, Zeroizing::new(s)))
+                .on_input(move |s| Message::ShareInputChanged(i, Zeroizing::new(s)))
                 .padding(theme::space::MD)
                 .width(Length::Fill);
 
-            let idx = i;
             let pass_input = text_input("Passphrase", &self.passphrase_inputs[i])
-                .on_input(move |s| Message::PassphraseChanged(idx, Zeroizing::new(s)))
+                .on_input(move |s| Message::PassphraseChanged(i, Zeroizing::new(s)))
                 .secure(true)
                 .padding(theme::space::MD)
                 .width(Length::Fill);
