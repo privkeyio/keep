@@ -613,6 +613,32 @@ impl SignerHandler {
         Ok(())
     }
 
+    pub async fn restore_client(
+        &self,
+        pubkey: PublicKey,
+        name: String,
+        permissions: Permission,
+        auto_kinds: HashSet<Kind>,
+        duration: PermissionDuration,
+        connected_at: Timestamp,
+    ) {
+        if matches!(duration, PermissionDuration::Session) {
+            return;
+        }
+        let mut pm = self.permissions.lock().await;
+        if !pm.ensure_capacity(&pubkey) {
+            let app_id = &pubkey.to_hex()[..8];
+            tracing::warn!(app_id, "restore_client: capacity full, skipping");
+            return;
+        }
+        let mut app = AppPermission::new(pubkey, name);
+        app.permissions = permissions & Permission::ALL;
+        app.auto_approve_kinds = auto_kinds;
+        app.duration = duration;
+        app.connected_at = connected_at;
+        pm.insert(app);
+    }
+
     pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {
         let mut pm = self.permissions.lock().await;
         pm.set_permissions(pubkey, permissions);

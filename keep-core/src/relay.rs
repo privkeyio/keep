@@ -17,6 +17,34 @@ pub const MAX_RELAY_URL_LENGTH: usize = 256;
 /// Range of seconds to randomly tweak event timestamps for privacy.
 pub const TIMESTAMP_TWEAK_RANGE: std::ops::Range<u64> = 0..5;
 
+/// Duration for stored bunker client permissions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StoredPermissionDuration {
+    /// Lasts only for the current session (not persisted across restarts).
+    Session,
+    /// Expires after a number of seconds from `connected_at`.
+    Seconds(u64),
+    /// Never expires.
+    Forever,
+}
+
+/// Persisted permission state for a connected bunker (NIP-46) client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredBunkerPermission {
+    /// Client's Nostr public key as hex.
+    pub pubkey_hex: String,
+    /// Display name of the client app.
+    pub name: String,
+    /// Permission bitflags (matches `keep_nip46::Permission` bits).
+    pub permissions: u32,
+    /// Event kinds that skip user approval for `sign_event`.
+    pub auto_approve_kinds: Vec<u16>,
+    /// How long the permission grant lasts.
+    pub duration: StoredPermissionDuration,
+    /// Unix timestamp when the client first connected.
+    pub connected_at: u64,
+}
+
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerPolicyEntry {
@@ -43,6 +71,9 @@ pub struct RelayConfig {
     /// Per-peer send/receive policies.
     #[serde(default)]
     pub peer_policies: Vec<PeerPolicyEntry>,
+    /// Persisted bunker client permission grants.
+    #[serde(default)]
+    pub bunker_permissions: Vec<StoredBunkerPermission>,
 }
 
 impl RelayConfig {
@@ -54,6 +85,7 @@ impl RelayConfig {
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
+            bunker_permissions: Vec::new(),
         }
     }
 
@@ -70,6 +102,7 @@ impl RelayConfig {
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
+            bunker_permissions: Vec::new(),
         }
     }
 }

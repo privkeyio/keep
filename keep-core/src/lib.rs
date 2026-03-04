@@ -763,6 +763,50 @@ impl Keep {
                 }
                 policies
             },
+            bunker_permissions: {
+                const MAX_BUNKER_APPS: usize = 100;
+                const MAX_NAME_LEN: usize = 256;
+                const MAX_AUTO_KINDS: usize = 64;
+                const VALID_PERMISSION_MASK: u32 = 0b00111111;
+                if config.bunker_permissions.len() > MAX_BUNKER_APPS {
+                    return Err(KeepError::InvalidInput(format!(
+                        "Too many bunker permissions: {} (max {MAX_BUNKER_APPS})",
+                        config.bunker_permissions.len()
+                    )));
+                }
+                let mut perms = Vec::with_capacity(config.bunker_permissions.len());
+                for bp in &config.bunker_permissions {
+                    if bp.pubkey_hex.len() != 64
+                        || !bp.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Invalid bunker permission pubkey: {}",
+                            bp.pubkey_hex
+                        )));
+                    }
+                    if bp.name.len() > MAX_NAME_LEN {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Bunker app name too long: {} (max {MAX_NAME_LEN})",
+                            bp.name.len()
+                        )));
+                    }
+                    if bp.auto_approve_kinds.len() > MAX_AUTO_KINDS {
+                        return Err(KeepError::InvalidInput(format!(
+                            "Too many auto-approve kinds: {} (max {MAX_AUTO_KINDS})",
+                            bp.auto_approve_kinds.len()
+                        )));
+                    }
+                    perms.push(relay::StoredBunkerPermission {
+                        pubkey_hex: bp.pubkey_hex.to_ascii_lowercase(),
+                        name: bp.name.clone(),
+                        permissions: bp.permissions & VALID_PERMISSION_MASK,
+                        auto_approve_kinds: bp.auto_approve_kinds.clone(),
+                        duration: bp.duration.clone(),
+                        connected_at: bp.connected_at,
+                    });
+                }
+                perms
+            },
         };
         self.storage.store_relay_config(&normalized_config)
     }

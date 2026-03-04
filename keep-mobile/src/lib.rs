@@ -1186,10 +1186,21 @@ impl KeepMobile {
                 Ok(normalized)
             };
         let key = relay_config_key(group_pubkey.as_deref());
+        let existing = match persistence::load_relay_config(&self.storage, &key) {
+            Ok(Some(c)) => c,
+            Ok(None) => persistence::StoredRelayConfig::default(),
+            Err(e) => {
+                return Err(KeepMobileError::StorageError {
+                    msg: format!("failed to load existing relay config: {e}"),
+                });
+            }
+        };
         let stored = persistence::StoredRelayConfig {
             frost_relays: normalize_relays(config.frost_relays, "FROST")?,
             profile_relays: normalize_relays(config.profile_relays, "profile")?,
             bunker_relays: normalize_relays(config.bunker_relays, "bunker")?,
+            peer_policies: existing.peer_policies,
+            bunker_permissions: existing.bunker_permissions,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
@@ -1322,7 +1333,8 @@ impl KeepMobile {
                     frost_relays: stored.frost_relays,
                     profile_relays: stored.profile_relays,
                     bunker_relays: stored.bunker_relays,
-                    peer_policies: Vec::new(),
+                    peer_policies: stored.peer_policies,
+                    bunker_permissions: stored.bunker_permissions,
                 });
             }
         }
@@ -1491,6 +1503,8 @@ impl KeepMobile {
                 frost_relays: rc.frost_relays.clone(),
                 profile_relays: rc.profile_relays.clone(),
                 bunker_relays: rc.bunker_relays.clone(),
+                peer_policies: rc.peer_policies.clone(),
+                bunker_permissions: rc.bunker_permissions.clone(),
             };
             prepared_relays.push((group_hex, stored_relay));
         }
