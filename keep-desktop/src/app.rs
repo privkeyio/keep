@@ -2508,20 +2508,27 @@ impl App {
         Task::none()
     }
 
-    fn handle_import_share(
-        &mut self,
-        data: Zeroizing<String>,
-        passphrase: Zeroizing<String>,
-    ) -> Task<Message> {
+    fn check_import_cooldown(&mut self) -> bool {
         if self
             .last_import_attempt
             .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
         {
             self.screen
                 .set_loading_error("Please wait before trying again".to_string());
-            return Task::none();
+            return false;
         }
         self.last_import_attempt = Some(Instant::now());
+        true
+    }
+
+    fn handle_import_share(
+        &mut self,
+        data: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+    ) -> Task<Message> {
+        if !self.check_import_cooldown() {
+            return Task::none();
+        }
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2543,15 +2550,9 @@ impl App {
     }
 
     fn handle_import_nsec(&mut self, data: Zeroizing<String>, name: String) -> Task<Message> {
-        if self
-            .last_import_attempt
-            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
-        {
-            self.screen
-                .set_loading_error("Please wait before trying again".to_string());
+        if !self.check_import_cooldown() {
             return Task::none();
         }
-        self.last_import_attempt = Some(Instant::now());
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2594,15 +2595,9 @@ impl App {
         password: Zeroizing<String>,
         name: String,
     ) -> Task<Message> {
-        if self
-            .last_import_attempt
-            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
-        {
-            self.screen
-                .set_loading_error("Please wait before trying again".to_string());
+        if !self.check_import_cooldown() {
             return Task::none();
         }
-        self.last_import_attempt = Some(Instant::now());
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
