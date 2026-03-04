@@ -81,6 +81,7 @@ pub(crate) const RECONNECT_BASE_MS: u64 = 200;
 pub(crate) const RECONNECT_MAX_MS: u64 = 30_000;
 pub(crate) const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 pub(crate) const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 pub(crate) const MAX_ACTIVE_COORDINATIONS: usize = 64;
 
@@ -2512,7 +2513,6 @@ impl App {
         data: Zeroizing<String>,
         passphrase: Zeroizing<String>,
     ) -> Task<Message> {
-        const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
         if self
             .last_import_attempt
             .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
@@ -2543,6 +2543,15 @@ impl App {
     }
 
     fn handle_import_nsec(&mut self, data: Zeroizing<String>, name: String) -> Task<Message> {
+        if self
+            .last_import_attempt
+            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
+        {
+            self.screen
+                .set_loading_error("Please wait before trying again".to_string());
+            return Task::none();
+        }
+        self.last_import_attempt = Some(Instant::now());
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2585,7 +2594,6 @@ impl App {
         password: Zeroizing<String>,
         name: String,
     ) -> Task<Message> {
-        const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
         if self
             .last_import_attempt
             .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
