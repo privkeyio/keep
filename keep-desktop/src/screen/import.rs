@@ -284,7 +284,11 @@ impl State {
             Message::ContinueToDecrypt => {
                 self.error = None;
                 if let Some(info) = &self.parsed_info {
-                    self.name = format!("Share {}", info.identifier);
+                    self.name = if let Some(gm) = &self.group_match {
+                        format!("{} share {}", gm.name, info.identifier)
+                    } else {
+                        format!("Share {}", info.identifier)
+                    };
                 }
                 self.frost_step = FrostStep::Decrypt;
                 None
