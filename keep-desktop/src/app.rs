@@ -81,6 +81,7 @@ pub(crate) const RECONNECT_BASE_MS: u64 = 200;
 pub(crate) const RECONNECT_MAX_MS: u64 = 30_000;
 pub(crate) const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 pub(crate) const BUNKER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 pub(crate) const MAX_ACTIVE_COORDINATIONS: usize = 64;
 
@@ -177,6 +178,7 @@ pub struct App {
     scanner_recovery: Option<(recovery::State, usize)>,
     pending_vault_share: Option<VaultShareResult>,
     last_recovery_attempt: Option<Instant>,
+    last_import_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
 }
@@ -608,6 +610,7 @@ impl App {
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
+            last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
@@ -951,7 +954,7 @@ impl App {
             }
             Message::GoToImport => {
                 self.import_return_to_nsec = matches!(self.screen, Screen::NsecKeys(_));
-                self.screen = Screen::Import(import::State::new());
+                self.screen = Screen::Import(import::State::new(self.build_import_summaries()));
                 Task::none()
             }
             Message::GoToExport(index) => {
@@ -1236,9 +1239,11 @@ impl App {
                 self.open_scanner();
                 Task::none()
             }
-            import::Event::ImportShare { data, passphrase } => {
-                self.handle_import_share(data, passphrase)
-            }
+            import::Event::ImportShare {
+                data,
+                passphrase,
+                name,
+            } => self.handle_import_share(data, passphrase, name),
             import::Event::ImportNsec { data, name } => self.handle_import_nsec(data, name),
             import::Event::ImportNcryptsec {
                 data,
@@ -1382,7 +1387,7 @@ impl App {
                 } else {
                     self.scanner_recovery = None;
                     self.pending_vault_share = None;
-                    self.screen = Screen::Import(import::State::new());
+                    self.screen = Screen::Import(import::State::new(self.build_import_summaries()));
                 }
                 Task::none()
             }
@@ -1464,7 +1469,8 @@ impl App {
                                 self.screen = Screen::Recovery(state);
                                 self.consume_pending_vault_share();
                             } else {
-                                let import = import::State::with_data(result);
+                                let import =
+                                    import::State::with_data(result, self.build_import_summaries());
                                 self.screen = Screen::Import(import);
                             }
                         }
@@ -2034,6 +2040,17 @@ impl App {
         })
     }
 
+    fn build_import_summaries(&self) -> Vec<import::ExistingShareSummary> {
+        self.current_shares()
+            .iter()
+            .map(|s| import::ExistingShareSummary {
+                group_pubkey_hex: s.group_pubkey_hex.clone(),
+                name: s.name.clone(),
+                identifier: s.identifier,
+            })
+            .collect()
+    }
+
     fn refresh_shares(&mut self) {
         let shares = self.current_shares();
         self.cached_share_count = shares.len();
@@ -2494,19 +2511,35 @@ impl App {
         Task::none()
     }
 
+    fn check_import_cooldown(&mut self) -> bool {
+        if self
+            .last_import_attempt
+            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
+        {
+            self.screen
+                .set_loading_error("Please wait before trying again".to_string());
+            return false;
+        }
+        self.last_import_attempt = Some(Instant::now());
+        true
+    }
+
     fn handle_import_share(
         &mut self,
         data: Zeroizing<String>,
         passphrase: Zeroizing<String>,
+        name: String,
     ) -> Task<Message> {
+        if !self.check_import_cooldown() {
+            return Task::none();
+        }
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let export = ShareExport::parse(&data).map_err(friendly_err)?;
-                        let name = format!("imported-{}", export.identifier);
-                        keep.frost_import_share(&export, &passphrase)
+                        keep.frost_import_share(&export, &passphrase, &name)
                             .map_err(friendly_err)?;
                         let shares = collect_shares(keep)?;
                         Ok((shares, name))
@@ -2520,6 +2553,9 @@ impl App {
     }
 
     fn handle_import_nsec(&mut self, data: Zeroizing<String>, name: String) -> Task<Message> {
+        if !self.check_import_cooldown() {
+            return Task::none();
+        }
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2562,6 +2598,9 @@ impl App {
         password: Zeroizing<String>,
         name: String,
     ) -> Task<Message> {
+        if !self.check_import_cooldown() {
+            return Task::none();
+        }
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -3756,6 +3795,7 @@ impl App {
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
+            last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,

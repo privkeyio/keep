@@ -270,7 +270,8 @@ pub fn cmd_frost_import(out: &Output, path: &Path) -> Result<()> {
     let import_password = get_password("Enter share passphrase")?;
 
     let spinner = out.spinner("Decrypting and importing share...");
-    keep.frost_import_share(&export, import_password.expose_secret())?;
+    let name = format!("imported-{}", export.identifier);
+    keep.frost_import_share(&export, import_password.expose_secret(), &name)?;
     spinner.finish();
 
     out.newline();

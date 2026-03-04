@@ -510,12 +510,26 @@ impl Keep {
     }
 
     /// Import a FROST share from an encrypted export.
-    pub fn frost_import_share(&mut self, export: &ShareExport, passphrase: &str) -> Result<()> {
+    pub fn frost_import_share(
+        &mut self,
+        export: &ShareExport,
+        passphrase: &str,
+        name: &str,
+    ) -> Result<()> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepError::InvalidInput("name cannot be empty".into()));
+        }
+        if name.chars().count() > 64 {
+            return Err(KeepError::InvalidInput(
+                "name must be 64 characters or fewer".into(),
+            ));
+        }
 
-        let share = export.to_share(passphrase, &format!("imported-{}", export.identifier))?;
+        let share = export.to_share(passphrase, name)?;
         let data_key = self.get_data_key()?;
         let stored = StoredShare::encrypt(&share, &data_key)?;
         self.storage.store_share(&stored)?;
