@@ -198,7 +198,7 @@ impl State {
         let npub = bytes_to_npub(&arr);
         Some(ParsedShareInfo {
             group_npub_truncated: truncate_npub(&npub),
-            group_pubkey_hex: export.group_pubkey,
+            group_pubkey_hex: export.group_pubkey.to_ascii_lowercase(),
             identifier: export.identifier,
             threshold: export.threshold,
             total: export.total,
