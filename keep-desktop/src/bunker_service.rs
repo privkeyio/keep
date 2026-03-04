@@ -449,7 +449,9 @@ impl App {
             guard
                 .as_ref()
                 .and_then(|k| {
-                    let key = self.active_group_pubkey_bytes().unwrap_or(keep_core::relay::GLOBAL_RELAY_KEY);
+                    let key = self
+                        .active_group_pubkey_bytes()
+                        .unwrap_or(keep_core::relay::GLOBAL_RELAY_KEY);
                     k.get_relay_config(&key).ok().flatten()
                 })
                 .map(|c| c.bunker_permissions)
@@ -746,9 +748,7 @@ impl App {
                 .collect();
             let duration = match &perm.duration {
                 StoredPermissionDuration::Session => keep_nip46::PermissionDuration::Session,
-                StoredPermissionDuration::Seconds(s) => {
-                    keep_nip46::PermissionDuration::Seconds(*s)
-                }
+                StoredPermissionDuration::Seconds(s) => keep_nip46::PermissionDuration::Seconds(*s),
                 StoredPermissionDuration::Forever => keep_nip46::PermissionDuration::Forever,
             };
             handler

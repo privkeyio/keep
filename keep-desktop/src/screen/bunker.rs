@@ -624,11 +624,7 @@ impl State {
                 }
                 perm_toggles = perm_toggles.push(kinds_row);
 
-                let kind_input_val = self
-                    .kind_inputs
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_default();
+                let kind_input_val = self.kind_inputs.get(i).cloned().unwrap_or_default();
                 let can_add = kind_input_val.trim().parse::<u16>().is_ok();
                 let mut add_kind_btn = button(text("Add").size(theme::size::TINY))
                     .style(theme::primary_button)
@@ -694,7 +690,11 @@ impl State {
                         } else if remaining < 3600 {
                             format!("Expires in {}m", remaining / 60)
                         } else if remaining < 86400 {
-                            format!("Expires in {}h {}m", remaining / 3600, (remaining % 3600) / 60)
+                            format!(
+                                "Expires in {}h {}m",
+                                remaining / 3600,
+                                (remaining % 3600) / 60
+                            )
                         } else {
                             format!("Expires in {}d", remaining / 86400)
                         };
