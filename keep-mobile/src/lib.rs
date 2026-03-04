@@ -1399,7 +1399,7 @@ impl KeepMobile {
         let mut prepared_health: Vec<KeyHealthStatusInfo> = Vec::new();
 
         for bs in &decrypted.shares {
-            let key_package_bytes = decode_hex(&bs.key_package, "key_package")?;
+            let mut key_package_bytes = Zeroizing::new(decode_hex(&bs.key_package, "key_package")?);
             let pubkey_package_bytes = decode_hex(&bs.pubkey_package, "pubkey_package")?;
             let group_pubkey_bytes = decode_hex(&bs.group_pubkey, "group_pubkey")?;
             let group_pubkey_32 = bytes_to_32(&group_pubkey_bytes, "group pubkey")?;
@@ -1431,7 +1431,7 @@ impl KeepMobile {
             let stored = StoredShareData {
                 metadata_json: serde_json::to_string(&share_meta)
                     .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-                key_package_bytes,
+                key_package_bytes: std::mem::take(&mut *key_package_bytes),
                 pubkey_package_bytes,
             };
 
@@ -1499,11 +1499,21 @@ impl KeepMobile {
         }
 
         for (group_hex, serialized, metadata) in prepared_shares {
+            if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
+                return Err(KeepMobileError::BackupError {
+                    msg: format!("share already exists for group {group_hex}"),
+                });
+            }
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata)?;
         }
 
         for (group_hex, serialized, metadata_info) in prepared_keys {
+            if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
+                return Err(KeepMobileError::BackupError {
+                    msg: format!("key already exists for group {group_hex}"),
+                });
+            }
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata_info)?;
         }

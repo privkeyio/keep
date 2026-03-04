@@ -170,6 +170,13 @@ pub struct DecryptedBackup {
     pub created_at: String,
 }
 
+impl Drop for DecryptedBackup {
+    fn drop(&mut self) {
+        self.keys.zeroize();
+        self.shares.zeroize();
+    }
+}
+
 fn key_type_to_string(kt: &KeyType) -> String {
     match kt {
         KeyType::Nostr => "Nostr".into(),
@@ -357,17 +364,19 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     let iterations = le32(48)?;
     let parallelism = le32(52)?;
 
+    const MIN_MEMORY_KIB: u32 = 65_536; // 64 MiB
     const MAX_MEMORY_KIB: u32 = 256 * 1024; // 256 MiB
+    const MIN_ITERATIONS: u32 = 2;
     const MAX_ITERATIONS: u32 = 64;
     const MAX_PARALLELISM: u32 = 16;
-    if memory_kib == 0 || memory_kib > MAX_MEMORY_KIB {
+    if memory_kib < MIN_MEMORY_KIB || memory_kib > MAX_MEMORY_KIB {
         return Err(KeepError::InvalidInput(format!(
-            "backup argon2 memory out of range: {memory_kib}"
+            "backup argon2 memory out of range: {memory_kib} KiB (min {MIN_MEMORY_KIB}, max {MAX_MEMORY_KIB})"
         )));
     }
-    if iterations == 0 || iterations > MAX_ITERATIONS {
+    if iterations < MIN_ITERATIONS || iterations > MAX_ITERATIONS {
         return Err(KeepError::InvalidInput(format!(
-            "backup argon2 iterations out of range: {iterations}"
+            "backup argon2 iterations out of range: {iterations} (min {MIN_ITERATIONS}, max {MAX_ITERATIONS})"
         )));
     }
     if parallelism == 0 || parallelism > MAX_PARALLELISM {
@@ -425,7 +434,7 @@ pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
         key_count: decrypted.keys.len(),
         share_count: decrypted.shares.len(),
         descriptor_count: decrypted.wallet_descriptors.len(),
-        created_at: decrypted.created_at,
+        created_at: decrypted.created_at.clone(),
         file_size,
     })
 }

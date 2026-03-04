@@ -40,22 +40,13 @@ pub fn recover_nsec(
     let signing_key =
         reconstruct_result.map_err(|_| KeepError::Frost("Reconstruction failed".into()))?;
 
-    let mut secret_bytes: Vec<u8> = signing_key.serialize();
-    let sk_size = std::mem::size_of_val(&signing_key);
-    let sk_ptr = std::ptr::addr_of!(signing_key) as *mut u8;
-    #[allow(forgetting_copy_types)]
-    std::mem::forget(signing_key);
-    #[allow(unsafe_code)]
-    unsafe {
-        std::ptr::write_bytes(sk_ptr, 0, sk_size);
-        std::hint::black_box(sk_ptr);
-    }
+    let secret_bytes = Zeroizing::new(signing_key.serialize());
+    let _ = signing_key;
 
     let Ok(mut secret_arr) = <[u8; 32]>::try_from(secret_bytes.as_slice()) else {
-        secret_bytes.zeroize();
         return Err(KeepError::Frost("Invalid secret key length".into()));
     };
-    secret_bytes.zeroize();
+    drop(secret_bytes);
 
     let keypair_result = NostrKeypair::from_secret_bytes(&mut secret_arr);
     secret_arr.zeroize();
