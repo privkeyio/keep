@@ -177,6 +177,7 @@ pub struct App {
     scanner_recovery: Option<(recovery::State, usize)>,
     pending_vault_share: Option<VaultShareResult>,
     last_recovery_attempt: Option<Instant>,
+    last_import_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
 }
@@ -608,6 +609,7 @@ impl App {
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
+            last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,
@@ -2510,6 +2512,16 @@ impl App {
         data: Zeroizing<String>,
         passphrase: Zeroizing<String>,
     ) -> Task<Message> {
+        const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
+        if self
+            .last_import_attempt
+            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
+        {
+            self.screen
+                .set_loading_error("Please wait before trying again".to_string());
+            return Task::none();
+        }
+        self.last_import_attempt = Some(Instant::now());
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -2573,6 +2585,16 @@ impl App {
         password: Zeroizing<String>,
         name: String,
     ) -> Task<Message> {
+        const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
+        if self
+            .last_import_attempt
+            .is_some_and(|t| t.elapsed() < IMPORT_COOLDOWN)
+        {
+            self.screen
+                .set_loading_error("Please wait before trying again".to_string());
+            return Task::none();
+        }
+        self.last_import_attempt = Some(Instant::now());
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
@@ -3767,6 +3789,7 @@ impl App {
             scanner_recovery: None,
             pending_vault_share: None,
             last_recovery_attempt: None,
+            last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
             settings,

@@ -27,7 +27,7 @@ fn detail_row<'a>(label: &str, value: &str) -> Element<'a, Message> {
     .into()
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ImportMode {
     Unknown,
     FrostShare,
@@ -235,7 +235,7 @@ impl State {
                     self.passphrase = Zeroizing::new(String::new());
                     self.frost_step = FrostStep::Input;
                 }
-                self.mode = new_mode.clone();
+                self.mode = new_mode;
                 self.npub_preview = if self.mode == ImportMode::Nsec {
                     keep_core::keys::NostrKeypair::from_nsec(trimmed)
                         .ok()
@@ -427,11 +427,7 @@ impl State {
             match self.mode {
                 ImportMode::Nsec => {
                     if let Some(npub) = &self.npub_preview {
-                        let truncated = if npub.is_ascii() && npub.len() > 20 {
-                            format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
-                        } else {
-                            npub.clone()
-                        };
+                        let truncated = truncate_npub(npub);
                         content = content.push(
                             text(format!("Public key: {truncated}"))
                                 .size(theme::size::BODY)
@@ -562,29 +558,7 @@ impl State {
                         .padding(theme::space::MD),
                 );
             }
-            ImportMode::Unknown => {
-                content = content
-                    .push(Space::new().height(theme::space::MD))
-                    .push(theme::label("Passphrase"))
-                    .push(
-                        text("Enter the passphrase used when exporting the share")
-                            .size(theme::size::SMALL)
-                            .color(theme::color::TEXT_MUTED),
-                    )
-                    .push(
-                        text_input("Decryption passphrase", &self.passphrase)
-                            .on_input(|s| Message::PassphraseChanged(Zeroizing::new(s)))
-                            .secure(true)
-                            .padding(theme::space::MD)
-                            .width(theme::size::INPUT_WIDTH),
-                    )
-                    .push(Space::new().height(theme::space::MD))
-                    .push(
-                        button(text("Import").size(theme::size::BODY))
-                            .style(theme::primary_button)
-                            .padding(theme::space::MD),
-                    );
-            }
+            ImportMode::Unknown => {}
         }
 
         if let Some(err) = &self.error {
