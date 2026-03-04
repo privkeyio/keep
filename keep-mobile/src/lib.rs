@@ -1498,22 +1498,27 @@ impl KeepMobile {
             });
         }
 
-        for (group_hex, serialized, metadata) in prepared_shares {
+        for (group_hex, _, _) in &prepared_shares {
             if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
                 return Err(KeepMobileError::BackupError {
                     msg: format!("share already exists for group {group_hex}"),
                 });
             }
-            self.storage
-                .store_share_by_key(group_hex, serialized, metadata)?;
         }
-
-        for (group_hex, serialized, metadata_info) in prepared_keys {
+        for (group_hex, _, _) in &prepared_keys {
             if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
                 return Err(KeepMobileError::BackupError {
                     msg: format!("key already exists for group {group_hex}"),
                 });
             }
+        }
+
+        for (group_hex, serialized, metadata) in prepared_shares {
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata)?;
+        }
+
+        for (group_hex, serialized, metadata_info) in prepared_keys {
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata_info)?;
         }
