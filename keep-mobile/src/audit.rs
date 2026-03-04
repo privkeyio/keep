@@ -23,13 +23,13 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditEventType {
-    Sign,
-    SignFailed,
-    FrostSign,
-    FrostSignFailed,
-    ShareImport,
-    ShareExport,
-    ShareDelete,
+    Sign = 0,
+    SignFailed = 1,
+    FrostSign = 2,
+    FrostSignFailed = 3,
+    ShareImport = 4,
+    ShareExport = 5,
+    ShareDelete = 6,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -132,6 +132,7 @@ impl AuditEntry {
 pub trait AuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
     fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError>;
+    fn load_last_entry(&self) -> Result<Option<String>, KeepMobileError>;
     fn entry_count(&self) -> Result<u32, KeepMobileError>;
     fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError>;
 }
@@ -146,17 +147,9 @@ pub struct AuditLog {
 impl AuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn AuditStorage>) -> Result<Self, KeepMobileError> {
-        let entries = storage.load_entries(None)?;
-
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
-
-        let last_hash = if let Some(last_json) = entries.last() {
+        let last_hash = if let Some(last_json) = storage.load_last_entry()? {
             let entry: AuditEntry =
-                serde_json::from_str(last_json).map_err(|e| KeepMobileError::Serialization {
+                serde_json::from_str(&last_json).map_err(|e| KeepMobileError::Serialization {
                     msg: format!("Invalid audit entry: {e}"),
                 })?;
             entry
@@ -183,19 +176,19 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let entry_count = self.storage.entry_count()? as usize;
-        if entry_count >= MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log full: {entry_count} entries (max {MAX_AUDIT_ENTRIES})"),
-            });
-        }
-
         let mut last_hash = self
             .last_hash
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
+
+        let entry_count = self.storage.entry_count()? as usize;
+        if entry_count >= MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Audit log full: {entry_count} entries (max {MAX_AUDIT_ENTRIES})"),
+            });
+        }
 
         let mut entry = AuditEntry::new(event_type, *last_hash);
         if let Some(pk) = pubkey {
@@ -276,6 +269,18 @@ impl AuditLog {
     pub fn entry_count(&self) -> Result<u32, KeepMobileError> {
         self.storage.entry_count()
     }
+
+    pub fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
+        let mut last_hash = self
+            .last_hash
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Lock poisoned".into(),
+            })?;
+        self.storage.clear_entries(confirm)?;
+        *last_hash = [0u8; 32];
+        Ok(())
+    }
 }
 
 const MAX_CALLER_LENGTH: usize = 256;
@@ -283,15 +288,15 @@ const MAX_REASON_LENGTH: usize = 4096;
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SigningRequestType {
-    Connect,
-    GetPublicKey,
-    SignEvent,
-    Nip04Encrypt,
-    Nip04Decrypt,
-    Nip44Encrypt,
-    Nip44Decrypt,
-    Disconnect,
-    KillSwitch,
+    Connect = 0,
+    GetPublicKey = 1,
+    SignEvent = 2,
+    Nip04Encrypt = 3,
+    Nip04Decrypt = 4,
+    Nip44Encrypt = 5,
+    Nip44Decrypt = 6,
+    Disconnect = 7,
+    KillSwitch = 8,
 }
 
 impl std::fmt::Display for SigningRequestType {
@@ -312,8 +317,8 @@ impl std::fmt::Display for SigningRequestType {
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SigningDecision {
-    Approved,
-    Denied,
+    Approved = 0,
+    Denied = 1,
 }
 
 impl std::fmt::Display for SigningDecision {
@@ -387,8 +392,7 @@ impl SigningAuditEntry {
         data.push(self.request_type as u8);
         data.push(self.decision as u8);
         data.push(self.was_automatic as u8);
-        let caller_len = self.caller.len() as u32;
-        data.extend_from_slice(&caller_len.to_le_bytes());
+        data.extend_from_slice(&(self.caller.len() as u32).to_le_bytes());
         data.extend_from_slice(self.caller.as_bytes());
         match &self.caller_name {
             Some(s) => {
@@ -398,11 +402,12 @@ impl SigningAuditEntry {
             }
             None => data.push(0),
         }
-        if let Some(kind) = self.event_kind {
-            data.push(1);
-            data.extend_from_slice(&kind.to_le_bytes());
-        } else {
-            data.push(0);
+        match self.event_kind {
+            Some(kind) => {
+                data.push(1);
+                data.extend_from_slice(&kind.to_le_bytes());
+            }
+            None => data.push(0),
         }
         match &self.reason {
             Some(s) => {
@@ -444,7 +449,9 @@ pub trait SigningAuditStorage: Send + Sync {
         caller_filter: Option<String>,
     ) -> Result<Vec<String>, KeepMobileError>;
     fn distinct_callers(&self) -> Result<Vec<String>, KeepMobileError>;
+    fn load_last_entry(&self) -> Result<Option<String>, KeepMobileError>;
     fn entry_count(&self) -> Result<u32, KeepMobileError>;
+    fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError>;
 }
 
 #[derive(uniffi::Object)]
@@ -457,17 +464,9 @@ pub struct SigningAuditLog {
 impl SigningAuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn SigningAuditStorage>) -> Result<Self, KeepMobileError> {
-        let entries = storage.load_entries(None)?;
-
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
-
-        let last_hash = if let Some(last_json) = entries.last() {
+        let last_hash = if let Some(last_json) = storage.load_last_entry()? {
             let entry: SigningAuditEntry =
-                serde_json::from_str(last_json).map_err(|e| KeepMobileError::Serialization {
+                serde_json::from_str(&last_json).map_err(|e| KeepMobileError::Serialization {
                     msg: format!("Invalid signing audit entry: {e}"),
                 })?;
             entry
@@ -498,6 +497,13 @@ impl SigningAuditLog {
         event_kind: Option<u32>,
         reason: Option<String>,
     ) -> Result<(), KeepMobileError> {
+        let mut last_hash = self
+            .last_hash
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Lock poisoned".into(),
+            })?;
+
         let entry_count = self.storage.entry_count()? as usize;
         if entry_count >= MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
@@ -506,13 +512,6 @@ impl SigningAuditLog {
                 ),
             });
         }
-
-        let mut last_hash = self
-            .last_hash
-            .lock()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Lock poisoned".into(),
-            })?;
 
         let mut entry =
             SigningAuditEntry::new(request_type, decision, was_automatic, &caller, *last_hash);
@@ -617,6 +616,18 @@ impl SigningAuditLog {
     pub fn get_entry_count(&self) -> Result<u32, KeepMobileError> {
         self.storage.entry_count()
     }
+
+    pub fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
+        let mut last_hash = self
+            .last_hash
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Lock poisoned".into(),
+            })?;
+        self.storage.clear_entries(confirm)?;
+        *last_hash = [0u8; 32];
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +665,10 @@ mod tests {
                     .collect()),
                 None => Ok(entries.clone()),
             }
+        }
+
+        fn load_last_entry(&self) -> Result<Option<String>, KeepMobileError> {
+            Ok(self.entries.lock().unwrap().last().cloned())
         }
 
         fn entry_count(&self) -> Result<u32, KeepMobileError> {
@@ -811,8 +826,22 @@ mod tests {
             Ok(callers)
         }
 
+        fn load_last_entry(&self) -> Result<Option<String>, KeepMobileError> {
+            Ok(self.entries.lock().unwrap().last().cloned())
+        }
+
         fn entry_count(&self) -> Result<u32, KeepMobileError> {
             Ok(self.entries.lock().unwrap().len() as u32)
+        }
+
+        fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
+            if confirm != "CLEAR_ALL_ENTRIES" {
+                return Err(KeepMobileError::StorageError {
+                    msg: "Confirmation string must be 'CLEAR_ALL_ENTRIES'".into(),
+                });
+            }
+            self.entries.lock().unwrap().clear();
+            Ok(())
         }
     }
 
