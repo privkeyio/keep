@@ -284,8 +284,11 @@ impl State {
             Message::ContinueToDecrypt => {
                 self.error = None;
                 if let Some(info) = &self.parsed_info {
+                    let suffix = format!(" share {}", info.identifier);
                     self.name = if let Some(gm) = &self.group_match {
-                        format!("{} share {}", gm.name, info.identifier)
+                        let max_prefix = 64 - suffix.chars().count();
+                        let prefix: String = gm.name.chars().take(max_prefix).collect();
+                        format!("{prefix}{suffix}")
                     } else {
                         format!("Share {}", info.identifier)
                     };
