@@ -147,6 +147,15 @@ pub fn is_valid_bech32_char(c: String) -> bool {
 }
 
 #[uniffi::export]
+pub fn generate_animated_frames(bech32_data: String, max_bytes: u32) -> Result<Vec<String>, KeepMobileError> {
+    let export = keep_core::frost::ShareExport::from_bech32(&bech32_data)
+        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+    export
+        .to_animated_frames(max_bytes as usize)
+        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })
+}
+
+#[uniffi::export]
 pub fn reassemble_animated_frames(frames: Vec<String>) -> Result<String, KeepMobileError> {
     let export = keep_core::frost::ShareExport::from_animated_frames(&frames)
         .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;

@@ -348,10 +348,10 @@ impl ShareExport {
         sorted.sort_by_key(|(idx, _)| *idx);
 
         let full_bytes: Vec<u8> = sorted.into_iter().flat_map(|(_, data)| data).collect();
-        let full_json = String::from_utf8(full_bytes)
+        let full_str = String::from_utf8(full_bytes)
             .map_err(|_| KeepError::Frost("Invalid UTF-8 in assembled frames".into()))?;
 
-        Self::from_json(&full_json)
+        Self::from_json(&full_str).or_else(|_| Self::from_bech32(&full_str))
     }
 }
 
