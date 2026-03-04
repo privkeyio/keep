@@ -194,7 +194,7 @@ pub struct BunkerConfigInfo {
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
     metadata_json: String,
-    key_package_bytes: Vec<u8>,
+    key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
 }
 
@@ -1381,6 +1381,12 @@ impl KeepMobile {
         Ok(backup_info(&decrypted, file_size))
     }
 
+    /// Restore a backup into the current mobile storage.
+    ///
+    /// Persistence is **not atomic**: shares, descriptors, relay configs, and
+    /// health statuses are written sequentially via `SecureStorage`. A failure
+    /// partway through may leave partial state. Callers should treat a
+    /// returned error as "possibly partially restored" and retry or clean up.
     pub fn restore_backup(
         &self,
         data: Vec<u8>,
@@ -1431,7 +1437,10 @@ impl KeepMobile {
             let stored = StoredShareData {
                 metadata_json: serde_json::to_string(&share_meta)
                     .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-                key_package_bytes: std::mem::take(&mut *key_package_bytes),
+                key_package_bytes: std::mem::replace(
+                    &mut key_package_bytes,
+                    Zeroizing::new(Vec::new()),
+                ),
                 pubkey_package_bytes,
             };
 
@@ -1935,11 +1944,11 @@ impl KeepMobile {
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&metadata)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-            key_package_bytes: key_package.serialize().map_err(|e| {
+            key_package_bytes: Zeroizing::new(key_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
                 }
-            })?,
+            })?),
             pubkey_package_bytes: pubkey_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
@@ -2033,13 +2042,15 @@ impl KeepMobile {
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-            key_package_bytes: share
-                .key_package()
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
-                .serialize()
-                .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {e}"),
-                })?,
+            key_package_bytes: Zeroizing::new(
+                share
+                    .key_package()
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+                    .serialize()
+                    .map_err(|e| KeepMobileError::FrostError {
+                        msg: format!("Serialization failed: {e}"),
+                    })?,
+            ),
             pubkey_package_bytes: share
                 .pubkey_package()
                 .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
