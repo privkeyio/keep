@@ -624,6 +624,8 @@ impl SignerHandler {
     ) {
         let mut pm = self.permissions.lock().await;
         if !pm.ensure_capacity(&pubkey) {
+            let app_id = &pubkey.to_hex()[..8];
+            tracing::warn!(app_id, "restore_client: capacity full, skipping");
             return;
         }
         let mut app = AppPermission::new(pubkey, name);
@@ -631,7 +633,7 @@ impl SignerHandler {
         app.auto_approve_kinds = auto_kinds;
         app.duration = duration;
         app.connected_at = connected_at;
-        pm.insert(pubkey, app);
+        pm.insert(app);
     }
 
     pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {

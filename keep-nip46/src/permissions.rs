@@ -95,12 +95,13 @@ impl PermissionManager {
 
     #[allow(dead_code)]
     pub fn grant(&mut self, pubkey: PublicKey, name: String, permissions: Permission) {
+        let masked = permissions & Permission::ALL;
         if let Some(app) = self.apps.get_mut(&pubkey) {
-            app.permissions |= permissions;
+            app.permissions |= masked;
             app.last_used = Timestamp::now();
         } else {
             let mut app = AppPermission::new(pubkey, name);
-            app.permissions = permissions;
+            app.permissions = masked;
             self.apps.insert(pubkey, app);
         }
     }
@@ -246,8 +247,10 @@ impl PermissionManager {
         }
     }
 
-    pub fn insert(&mut self, pubkey: PublicKey, app: AppPermission) {
-        self.apps.insert(pubkey, app);
+    pub(crate) fn insert(&mut self, mut app: AppPermission) {
+        app.permissions &= Permission::ALL;
+        let key = app.pubkey;
+        self.apps.insert(key, app);
     }
 
     pub fn set_auto_approve_kinds_for_app(&mut self, pubkey: &PublicKey, kinds: HashSet<Kind>) {

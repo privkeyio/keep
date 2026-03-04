@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
@@ -20,32 +20,41 @@ pub struct ConnectedClient {
     pub connected_at: u64,
 }
 
+const PERM_FLAGS: &[(&str, u32)] = &[
+    (
+        "get_public_key",
+        keep_nip46::Permission::GET_PUBLIC_KEY.bits(),
+    ),
+    ("sign_event", keep_nip46::Permission::SIGN_EVENT.bits()),
+    (
+        "nip04_encrypt",
+        keep_nip46::Permission::NIP04_ENCRYPT.bits(),
+    ),
+    (
+        "nip04_decrypt",
+        keep_nip46::Permission::NIP04_DECRYPT.bits(),
+    ),
+    (
+        "nip44_encrypt",
+        keep_nip46::Permission::NIP44_ENCRYPT.bits(),
+    ),
+    (
+        "nip44_decrypt",
+        keep_nip46::Permission::NIP44_DECRYPT.bits(),
+    ),
+];
+
 impl ConnectedClient {
     pub fn truncated_pubkey(&self) -> String {
         keep_core::display::truncate_str(&self.pubkey, 8, 6)
     }
 
     pub fn permission_labels(&self) -> Vec<&'static str> {
-        let mut labels = Vec::new();
-        if self.permissions & 0b00000001 != 0 {
-            labels.push("get_public_key");
-        }
-        if self.permissions & 0b00000010 != 0 {
-            labels.push("sign_event");
-        }
-        if self.permissions & 0b00000100 != 0 {
-            labels.push("nip04_encrypt");
-        }
-        if self.permissions & 0b00001000 != 0 {
-            labels.push("nip04_decrypt");
-        }
-        if self.permissions & 0b00010000 != 0 {
-            labels.push("nip44_encrypt");
-        }
-        if self.permissions & 0b00100000 != 0 {
-            labels.push("nip44_decrypt");
-        }
-        labels
+        PERM_FLAGS
+            .iter()
+            .filter(|(_, flag)| self.permissions & flag != 0)
+            .map(|(label, _)| *label)
+            .collect()
     }
 }
 
@@ -82,6 +91,16 @@ pub enum DurationChoice {
     Forever,
 }
 
+impl DurationChoice {
+    pub fn to_nip46(self) -> keep_nip46::PermissionDuration {
+        match self {
+            Self::JustThisTime => keep_nip46::PermissionDuration::Session,
+            Self::Minutes(m) => keep_nip46::PermissionDuration::Seconds(m * 60),
+            Self::Forever => keep_nip46::PermissionDuration::Forever,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     RelayInputChanged(String),
@@ -99,8 +118,8 @@ pub enum Message {
     ToggleClient(usize),
     TogglePermission(usize, u32),
     SetApprovalDuration(usize),
-    KindInputChanged(usize, String),
-    AddKind(usize),
+    KindInputChanged(String, String),
+    AddKind(String),
     RemoveKind(usize, u16),
     SetClientDuration(usize, usize),
 }
@@ -134,7 +153,7 @@ pub struct State {
     pub error: Option<String>,
     expanded_client: Option<usize>,
     approval_duration: usize,
-    kind_inputs: Vec<String>,
+    kind_inputs: HashMap<String, String>,
 }
 
 impl State {
@@ -153,7 +172,7 @@ impl State {
             error: None,
             expanded_client: None,
             approval_duration: 0,
-            kind_inputs: Vec::new(),
+            kind_inputs: HashMap::new(),
         }
     }
 
@@ -180,7 +199,7 @@ impl State {
             error: None,
             expanded_client: None,
             approval_duration: 0,
-            kind_inputs: Vec::new(),
+            kind_inputs: HashMap::new(),
         }
     }
 
@@ -234,34 +253,25 @@ impl State {
                 self.approval_duration = i;
                 None
             }
-            Message::KindInputChanged(client_idx, input) => {
-                while self.kind_inputs.len() <= client_idx {
-                    self.kind_inputs.push(String::new());
-                }
-                self.kind_inputs[client_idx] = input;
+            Message::KindInputChanged(pubkey, input) => {
+                self.kind_inputs.insert(pubkey, input);
                 None
             }
-            Message::AddKind(client_idx) => {
-                let input = self
-                    .kind_inputs
-                    .get(client_idx)
-                    .cloned()
-                    .unwrap_or_default();
+            Message::AddKind(pubkey) => {
+                let input = self.kind_inputs.get(&pubkey).cloned().unwrap_or_default();
+                let client_idx = self.clients.iter().position(|c| c.pubkey == pubkey);
                 if let Ok(kind) = input.trim().parse::<u16>() {
-                    if let Some(client) = self.clients.get_mut(client_idx) {
+                    if let Some(idx) = client_idx {
+                        let client = &mut self.clients[idx];
                         if !client.auto_approve_kinds.contains(&kind) {
                             client.auto_approve_kinds.push(kind);
                             let kinds = client.auto_approve_kinds.clone();
-                            if let Some(s) = self.kind_inputs.get_mut(client_idx) {
-                                s.clear();
-                            }
-                            return Some(Event::UpdateAutoApproveKinds(client_idx, kinds));
+                            self.kind_inputs.remove(&pubkey);
+                            return Some(Event::UpdateAutoApproveKinds(idx, kinds));
                         }
                     }
                 }
-                if let Some(s) = self.kind_inputs.get_mut(client_idx) {
-                    s.clear();
-                }
+                self.kind_inputs.remove(&pubkey);
                 None
             }
             Message::RemoveKind(client_idx, kind) => {
@@ -547,15 +557,7 @@ impl State {
 
             if is_expanded {
                 let mut perm_toggles = column![].spacing(theme::space::XS);
-                let perm_flags = [
-                    ("get_public_key", 0b00000001u32),
-                    ("sign_event", 0b00000010),
-                    ("nip04_encrypt", 0b00000100),
-                    ("nip04_decrypt", 0b00001000),
-                    ("nip44_encrypt", 0b00010000),
-                    ("nip44_decrypt", 0b00100000),
-                ];
-                for (label, flag) in perm_flags {
+                for &(label, flag) in PERM_FLAGS {
                     let enabled = client.permissions & flag != 0;
                     let badge_style = if enabled {
                         theme::badge_style
@@ -599,7 +601,6 @@ impl State {
                     );
                 }
 
-                // Auto-approve kinds editor
                 perm_toggles = perm_toggles.push(
                     text("Auto-approve kinds")
                         .size(theme::size::TINY)
@@ -624,21 +625,26 @@ impl State {
                 }
                 perm_toggles = perm_toggles.push(kinds_row);
 
-                let kind_input_val = self.kind_inputs.get(i).cloned().unwrap_or_default();
+                let kind_input_val = self
+                    .kind_inputs
+                    .get(&client.pubkey)
+                    .cloned()
+                    .unwrap_or_default();
                 let can_add = kind_input_val.trim().parse::<u16>().is_ok();
+                let pk = client.pubkey.clone();
+                let pk2 = client.pubkey.clone();
                 let mut add_kind_btn = button(text("Add").size(theme::size::TINY))
                     .style(theme::primary_button)
                     .padding([2.0, theme::space::SM]);
                 if can_add {
-                    add_kind_btn = add_kind_btn.on_press(Message::AddKind(i));
+                    add_kind_btn = add_kind_btn.on_press(Message::AddKind(pk.clone()));
                 }
-                let ci = i;
                 let mut kind_input = text_input("Kind number", &kind_input_val)
-                    .on_input(move |s| Message::KindInputChanged(ci, s))
+                    .on_input(move |s| Message::KindInputChanged(pk2.clone(), s))
                     .size(theme::size::TINY)
                     .width(100.0);
                 if can_add {
-                    kind_input = kind_input.on_submit(Message::AddKind(i));
+                    kind_input = kind_input.on_submit(Message::AddKind(pk));
                 }
                 perm_toggles = perm_toggles.push(
                     row![kind_input, add_kind_btn]
@@ -646,7 +652,6 @@ impl State {
                         .align_y(Alignment::Center),
                 );
 
-                // Per-client duration selector
                 let mut duration_row = row![
                     text("Duration:")
                         .size(theme::size::TINY)
@@ -655,10 +660,12 @@ impl State {
                 ]
                 .align_y(Alignment::Center);
 
-                for (idx, (label, _)) in DURATION_OPTIONS.iter().enumerate() {
-                    let is_current = client.duration == *label
-                        || (idx == 0 && client.duration == "Session")
-                        || (idx == DURATION_OPTIONS.len() - 1 && client.duration == "Forever");
+                for (idx, (label, choice)) in DURATION_OPTIONS.iter().enumerate() {
+                    let is_current = match choice {
+                        DurationChoice::JustThisTime => client.duration == "Session",
+                        DurationChoice::Forever => client.duration == "Forever",
+                        DurationChoice::Minutes(m) => client.duration_seconds == Some(*m * 60),
+                    };
                     let style = if is_current {
                         theme::primary_button
                     } else {
@@ -676,7 +683,6 @@ impl State {
                     scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
                 ));
 
-                // Expiry countdown
                 if let Some(secs) = client.duration_seconds {
                     let expires_at = client.connected_at.saturating_add(secs);
                     let now = std::time::SystemTime::now()
@@ -792,11 +798,22 @@ impl State {
         }
 
         if let Some(ref content) = approval.event_content {
-            let preview = if content.chars().count() > 200 {
-                let truncated: String = content.chars().take(200).collect();
+            let sanitized: String = content
+                .chars()
+                .filter(|c| {
+                    !matches!(c,
+                        '\u{200B}'..='\u{200F}' |
+                        '\u{202A}'..='\u{202E}' |
+                        '\u{2066}'..='\u{2069}' |
+                        '\u{FEFF}'
+                    ) && (!c.is_control() || matches!(c, '\n' | '\t'))
+                })
+                .collect();
+            let preview = if sanitized.chars().count() > 200 {
+                let truncated: String = sanitized.chars().take(200).collect();
                 format!("{truncated}...")
             } else {
-                content.clone()
+                sanitized
             };
             details = details.push(
                 text(preview)

@@ -833,7 +833,7 @@ impl App {
             return Task::batch([frost_task, reconnect_task]);
         }
         let frost_task = self.drain_frost_events();
-        self.poll_bunker_events();
+        let bunker_task = self.poll_bunker_events();
         #[cfg(unix)]
         self.poll_local_signer_events();
         self.sync_tray_status();
@@ -848,6 +848,7 @@ impl App {
             })
             .collect();
         tasks.push(frost_task);
+        tasks.push(bunker_task);
         Task::batch(tasks)
     }
 
@@ -2224,11 +2225,14 @@ impl App {
         let key = self
             .active_group_pubkey_bytes()
             .unwrap_or(keep_core::GLOBAL_RELAY_KEY);
-        let mut config = keep
-            .get_relay_config(&key)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| keep_core::RelayConfig::new(key));
+        let mut config = match keep.get_relay_config(&key) {
+            Ok(Some(c)) => c,
+            Ok(None) => keep_core::RelayConfig::new(key),
+            Err(e) => {
+                tracing::error!("Failed to read relay config: {e}");
+                return;
+            }
+        };
         f(&mut config);
         if let Err(e) = keep.store_relay_config(&config) {
             tracing::error!("Failed to save relay config: {e}");

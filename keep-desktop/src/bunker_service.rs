@@ -57,7 +57,6 @@ pub(crate) enum BunkerEvent {
     },
     Connected {
         pubkey: String,
-        name: String,
     },
 }
 
@@ -101,10 +100,9 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         })
     }
 
-    fn on_connect(&self, pubkey: &str, name: &str) {
+    fn on_connect(&self, pubkey: &str, _name: &str) {
         let _ = self.tx.send(BunkerEvent::Connected {
             pubkey: pubkey.to_string(),
-            name: name.to_string(),
         });
     }
 }
@@ -208,13 +206,7 @@ impl App {
 
                 if let (Some(hex), Some(ref bunker)) = (app_pubkey, &self.bunker) {
                     let handler = bunker.handler.clone();
-                    let nip46_duration = match duration_choice {
-                        DurationChoice::JustThisTime => keep_nip46::PermissionDuration::Session,
-                        DurationChoice::Minutes(m) => {
-                            keep_nip46::PermissionDuration::Seconds(m * 60)
-                        }
-                        DurationChoice::Forever => keep_nip46::PermissionDuration::Forever,
-                    };
+                    let nip46_duration = duration_choice.to_nip46();
                     return Task::perform(
                         async move {
                             if let Ok(pk) = nostr_sdk::PublicKey::from_hex(&hex) {
@@ -310,17 +302,11 @@ impl App {
                     None
                 };
                 if let (Some(hex), Some(ref bunker)) = (pubkey_hex, &self.bunker) {
-                    let duration_choice = DURATION_OPTIONS
+                    let nip46_duration = DURATION_OPTIONS
                         .get(duration_idx)
                         .map(|(_, d)| *d)
-                        .unwrap_or(DurationChoice::JustThisTime);
-                    let nip46_duration = match duration_choice {
-                        DurationChoice::JustThisTime => keep_nip46::PermissionDuration::Session,
-                        DurationChoice::Minutes(m) => {
-                            keep_nip46::PermissionDuration::Seconds(m * 60)
-                        }
-                        DurationChoice::Forever => keep_nip46::PermissionDuration::Forever,
-                    };
+                        .unwrap_or(DurationChoice::JustThisTime)
+                        .to_nip46();
                     let handler = bunker.handler.clone();
                     return Task::perform(
                         async move {
@@ -575,6 +561,7 @@ impl App {
                     s.url = Some(url);
                     s.error = None;
                 }
+                return self.sync_bunker_clients();
             }
             Err(crate::message::ConnectionError::PinMismatch(mismatch)) => {
                 self.bunker_pending_setup = None;
@@ -621,38 +608,27 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn poll_bunker_events(&mut self) {
+    pub(crate) fn poll_bunker_events(&mut self) -> Task<Message> {
         let events: Vec<BunkerEvent> = {
             let Some(ref bunker) = self.bunker else {
-                return;
+                return Task::none();
             };
             let Ok(rx) = bunker.event_rx.lock() else {
-                return;
+                return Task::none();
             };
             rx.try_iter().collect()
         };
 
+        let mut needs_sync = false;
         for event in events {
             match event {
-                BunkerEvent::Connected { pubkey, name } => {
-                    let Some(ref mut bunker) = self.bunker else {
-                        continue;
-                    };
-                    if !bunker.clients.iter().any(|c| c.pubkey == pubkey) {
-                        let client = ConnectedClient {
-                            pubkey,
-                            name,
-                            permissions: keep_nip46::Permission::DEFAULT.bits(),
-                            auto_approve_kinds: Vec::new(),
-                            request_count: 0,
-                            duration: "Forever".into(),
-                            duration_seconds: None,
-                            connected_at: nostr_sdk::Timestamp::now().as_secs(),
-                        };
-                        bunker.clients.push(client.clone());
-                        if let Screen::Bunker(s) = &mut self.screen {
-                            s.clients.push(client);
-                        }
+                BunkerEvent::Connected { pubkey } => {
+                    let already_known = self
+                        .bunker
+                        .as_ref()
+                        .is_some_and(|b| b.clients.iter().any(|c| c.pubkey == pubkey));
+                    if !already_known {
+                        needs_sync = true;
                     }
                 }
                 BunkerEvent::Log {
@@ -695,6 +671,11 @@ impl App {
                 }
             }
         }
+        if needs_sync {
+            self.sync_bunker_clients()
+        } else {
+            Task::none()
+        }
     }
 
     pub(crate) fn sync_bunker_permissions_to_vault(&self) {
@@ -704,18 +685,18 @@ impl App {
         let stored: Vec<StoredBunkerPermission> = bunker
             .clients
             .iter()
+            .filter(|c| c.duration != "Session")
             .map(|c| StoredBunkerPermission {
                 pubkey_hex: c.pubkey.clone(),
                 name: c.name.clone(),
                 permissions: c.permissions,
                 auto_approve_kinds: c.auto_approve_kinds.clone(),
                 duration: match c.duration.as_str() {
-                    "Session" => StoredPermissionDuration::Session,
                     "Forever" => StoredPermissionDuration::Forever,
                     _ => c
                         .duration_seconds
                         .map(StoredPermissionDuration::Seconds)
-                        .unwrap_or(StoredPermissionDuration::Forever),
+                        .unwrap_or(StoredPermissionDuration::Session),
                 },
                 connected_at: c.connected_at,
             })

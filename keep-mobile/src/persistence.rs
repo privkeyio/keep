@@ -22,6 +22,10 @@ pub(crate) struct StoredRelayConfig {
     pub(crate) profile_relays: Vec<String>,
     #[serde(default)]
     pub(crate) bunker_relays: Vec<String>,
+    #[serde(default)]
+    pub(crate) peer_policies: Vec<keep_core::relay::PeerPolicyEntry>,
+    #[serde(default)]
+    pub(crate) bunker_permissions: Vec<keep_core::relay::StoredBunkerPermission>,
 }
 
 #[derive(Serialize, Deserialize)]
