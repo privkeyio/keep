@@ -356,12 +356,12 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     const MIN_ITERATIONS: u32 = 2;
     const MAX_ITERATIONS: u32 = 64;
     const MAX_PARALLELISM: u32 = 16;
-    if memory_kib < MIN_MEMORY_KIB || memory_kib > MAX_MEMORY_KIB {
+    if !(MIN_MEMORY_KIB..=MAX_MEMORY_KIB).contains(&memory_kib) {
         return Err(KeepError::InvalidInput(format!(
             "backup argon2 memory out of range: {memory_kib} KiB (min {MIN_MEMORY_KIB}, max {MAX_MEMORY_KIB})"
         )));
     }
-    if iterations < MIN_ITERATIONS || iterations > MAX_ITERATIONS {
+    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
         return Err(KeepError::InvalidInput(format!(
             "backup argon2 iterations out of range: {iterations} (min {MIN_ITERATIONS}, max {MAX_ITERATIONS})"
         )));
