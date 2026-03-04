@@ -951,7 +951,7 @@ impl App {
             }
             Message::GoToImport => {
                 self.import_return_to_nsec = matches!(self.screen, Screen::NsecKeys(_));
-                self.screen = Screen::Import(import::State::new());
+                self.screen = Screen::Import(import::State::new(self.build_import_summaries()));
                 Task::none()
             }
             Message::GoToExport(index) => {
@@ -1382,7 +1382,7 @@ impl App {
                 } else {
                     self.scanner_recovery = None;
                     self.pending_vault_share = None;
-                    self.screen = Screen::Import(import::State::new());
+                    self.screen = Screen::Import(import::State::new(self.build_import_summaries()));
                 }
                 Task::none()
             }
@@ -1464,7 +1464,7 @@ impl App {
                                 self.screen = Screen::Recovery(state);
                                 self.consume_pending_vault_share();
                             } else {
-                                let import = import::State::with_data(result);
+                                let import = import::State::with_data(result, self.build_import_summaries());
                                 self.screen = Screen::Import(import);
                             }
                         }
@@ -2032,6 +2032,17 @@ impl App {
             error!("Failed to list shares: {e}");
             Vec::new()
         })
+    }
+
+    fn build_import_summaries(&self) -> Vec<import::ExistingShareSummary> {
+        self.current_shares()
+            .iter()
+            .map(|s| import::ExistingShareSummary {
+                group_pubkey_hex: s.group_pubkey_hex.clone(),
+                name: s.name.clone(),
+                identifier: s.identifier,
+            })
+            .collect()
     }
 
     fn refresh_shares(&mut self) {
