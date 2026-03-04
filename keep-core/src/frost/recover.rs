@@ -41,13 +41,10 @@ pub fn recover_nsec(
         reconstruct_result.map_err(|_| KeepError::Frost("Reconstruction failed".into()))?;
 
     let secret_bytes = Zeroizing::new(signing_key.serialize());
-    // signing_key is Copy so we cannot zero the stack slot without unsafe.
-    // The secret material is captured in secret_bytes (Zeroizing) above.
 
     let Ok(mut secret_arr) = <[u8; 32]>::try_from(secret_bytes.as_slice()) else {
         return Err(KeepError::Frost("Invalid secret key length".into()));
     };
-    drop(secret_bytes);
 
     let keypair_result = NostrKeypair::from_secret_bytes(&mut secret_arr);
     secret_arr.zeroize();

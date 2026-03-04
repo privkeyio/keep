@@ -1498,17 +1498,10 @@ impl KeepMobile {
             });
         }
 
-        for (group_hex, _, _) in &prepared_shares {
+        for (group_hex, _, _) in prepared_shares.iter().chain(prepared_keys.iter()) {
             if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
                 return Err(KeepMobileError::BackupError {
-                    msg: format!("share already exists for group {group_hex}"),
-                });
-            }
-        }
-        for (group_hex, _, _) in &prepared_keys {
-            if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
-                return Err(KeepMobileError::BackupError {
-                    msg: format!("key already exists for group {group_hex}"),
+                    msg: format!("key/share already exists for group {group_hex}"),
                 });
             }
         }

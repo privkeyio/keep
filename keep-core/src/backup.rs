@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, NONCE_SIZE, SALT_SIZE};
 use crate::entropy;
@@ -51,7 +51,7 @@ struct VaultBackup {
 }
 
 /// A key entry in a backup file.
-#[derive(Serialize, Deserialize, Clone, Zeroize)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct BackupKey {
     /// Hex-encoded public key.
     pub pubkey: String,
@@ -69,14 +69,8 @@ pub struct BackupKey {
     pub secret: String,
 }
 
-impl Drop for BackupKey {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
 /// A FROST share entry in a backup file.
-#[derive(Serialize, Deserialize, Clone, Zeroize)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct BackupShare {
     /// Share identifier index.
     pub identifier: u16,
@@ -98,12 +92,6 @@ pub struct BackupShare {
     pub key_package: String,
     /// Hex-encoded serialized public key package.
     pub pubkey_package: String,
-}
-
-impl Drop for BackupShare {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
 }
 
 /// Configuration stored in a backup file.
@@ -357,7 +345,6 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
         let slice = data
             .get(offset..offset + 4)
             .ok_or_else(|| KeepError::InvalidInput("backup header truncated".into()))?;
-        // unwrap: .get() guarantees exactly 4 bytes
         Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     };
     let memory_kib = le32(44)?;
