@@ -697,13 +697,15 @@ impl KfpNode {
 
             for (idx, contrib) in &payload.contributions {
                 if !session.contributions().contains_key(idx) {
-                    if let Err(e) = session.add_contribution(
+                    session.add_contribution(
                         *idx,
                         contrib.account_xpub.clone(),
                         contrib.fingerprint.clone(),
-                    ) {
-                        debug!("Failed to add forwarded contribution for share {idx}: {e}");
-                    }
+                    ).map_err(|e| {
+                        FrostNetError::Session(
+                            format!("Failed to add contribution for share {idx}: {e}"),
+                        )
+                    })?;
                 }
             }
 
