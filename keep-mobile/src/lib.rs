@@ -1323,6 +1323,7 @@ impl KeepMobile {
                     profile_relays: stored.profile_relays,
                     bunker_relays: stored.bunker_relays,
                     peer_policies: Vec::new(),
+                    bunker_permissions: Vec::new(),
                 });
             }
         }

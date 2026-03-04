@@ -112,7 +112,7 @@ impl PermissionManager {
             .retain(|_, app| !app.duration.is_expired(app.connected_at));
     }
 
-    fn ensure_capacity(&mut self, pubkey: &PublicKey) -> bool {
+    pub fn ensure_capacity(&mut self, pubkey: &PublicKey) -> bool {
         if self.apps.len() < Self::MAX_CONNECTED_APPS || self.apps.contains_key(pubkey) {
             return true;
         }
@@ -244,6 +244,10 @@ impl PermissionManager {
             }
             app.last_used = Timestamp::now();
         }
+    }
+
+    pub fn insert(&mut self, pubkey: PublicKey, app: AppPermission) {
+        self.apps.insert(pubkey, app);
     }
 
     pub fn set_auto_approve_kinds_for_app(&mut self, pubkey: &PublicKey, kinds: HashSet<Kind>) {

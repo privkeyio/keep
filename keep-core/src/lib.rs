@@ -763,6 +763,7 @@ impl Keep {
                 }
                 policies
             },
+            bunker_permissions: config.bunker_permissions.clone(),
         };
         self.storage.store_relay_config(&normalized_config)
     }

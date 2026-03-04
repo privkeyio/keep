@@ -2214,11 +2214,11 @@ impl App {
         }
     }
 
-    fn active_group_pubkey_bytes(&self) -> Option<[u8; 32]> {
+    pub(crate) fn active_group_pubkey_bytes(&self) -> Option<[u8; 32]> {
         self.active_share_hex.as_deref().and_then(parse_hex_key)
     }
 
-    fn update_relay_config(&self, f: impl FnOnce(&mut keep_core::RelayConfig)) {
+    pub(crate) fn update_relay_config(&self, f: impl FnOnce(&mut keep_core::RelayConfig)) {
         let guard = lock_keep(&self.keep);
         let Some(keep) = guard.as_ref() else { return };
         let key = self

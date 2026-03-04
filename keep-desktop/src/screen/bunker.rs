@@ -16,6 +16,8 @@ pub struct ConnectedClient {
     pub auto_approve_kinds: Vec<u16>,
     pub request_count: u64,
     pub duration: String,
+    pub duration_seconds: Option<u64>,
+    pub connected_at: u64,
 }
 
 impl ConnectedClient {
@@ -97,6 +99,10 @@ pub enum Message {
     ToggleClient(usize),
     TogglePermission(usize, u32),
     SetApprovalDuration(usize),
+    KindInputChanged(usize, String),
+    AddKind(usize),
+    RemoveKind(usize, u16),
+    SetClientDuration(usize, usize),
 }
 
 pub enum Event {
@@ -110,6 +116,8 @@ pub enum Event {
     RevokeAll,
     CopyUrl,
     TogglePermission(usize, u32),
+    UpdateAutoApproveKinds(usize, Vec<u16>),
+    SetClientDuration(usize, usize),
 }
 
 pub struct State {
@@ -126,6 +134,7 @@ pub struct State {
     pub error: Option<String>,
     expanded_client: Option<usize>,
     approval_duration: usize,
+    kind_inputs: Vec<String>,
 }
 
 impl State {
@@ -144,6 +153,7 @@ impl State {
             error: None,
             expanded_client: None,
             approval_duration: 0,
+            kind_inputs: Vec::new(),
         }
     }
 
@@ -170,6 +180,7 @@ impl State {
             error: None,
             expanded_client: None,
             approval_duration: 0,
+            kind_inputs: Vec::new(),
         }
     }
 
@@ -222,6 +233,47 @@ impl State {
             Message::SetApprovalDuration(i) => {
                 self.approval_duration = i;
                 None
+            }
+            Message::KindInputChanged(client_idx, input) => {
+                while self.kind_inputs.len() <= client_idx {
+                    self.kind_inputs.push(String::new());
+                }
+                self.kind_inputs[client_idx] = input;
+                None
+            }
+            Message::AddKind(client_idx) => {
+                let input = self
+                    .kind_inputs
+                    .get(client_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Ok(kind) = input.trim().parse::<u16>() {
+                    if let Some(client) = self.clients.get_mut(client_idx) {
+                        if !client.auto_approve_kinds.contains(&kind) {
+                            client.auto_approve_kinds.push(kind);
+                            let kinds = client.auto_approve_kinds.clone();
+                            if let Some(s) = self.kind_inputs.get_mut(client_idx) {
+                                s.clear();
+                            }
+                            return Some(Event::UpdateAutoApproveKinds(client_idx, kinds));
+                        }
+                    }
+                }
+                if let Some(s) = self.kind_inputs.get_mut(client_idx) {
+                    s.clear();
+                }
+                None
+            }
+            Message::RemoveKind(client_idx, kind) => {
+                if let Some(client) = self.clients.get_mut(client_idx) {
+                    client.auto_approve_kinds.retain(|&k| k != kind);
+                    let kinds = client.auto_approve_kinds.clone();
+                    return Some(Event::UpdateAutoApproveKinds(client_idx, kinds));
+                }
+                None
+            }
+            Message::SetClientDuration(client_idx, duration_idx) => {
+                Some(Event::SetClientDuration(client_idx, duration_idx))
             }
         }
     }
@@ -547,17 +599,117 @@ impl State {
                     );
                 }
 
-                if !client.auto_approve_kinds.is_empty() {
-                    let kinds_str: Vec<String> = client
-                        .auto_approve_kinds
-                        .iter()
-                        .map(|k| k.to_string())
-                        .collect();
-                    perm_toggles = perm_toggles.push(
-                        text(format!("Auto-approve kinds: {}", kinds_str.join(", ")))
-                            .size(theme::size::TINY)
-                            .color(theme::color::TEXT_MUTED),
+                // Auto-approve kinds editor
+                perm_toggles = perm_toggles.push(
+                    text("Auto-approve kinds")
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT),
+                );
+
+                let mut kinds_row = row![].spacing(4.0).align_y(Alignment::Center);
+                for &kind in &client.auto_approve_kinds {
+                    kinds_row = kinds_row.push(
+                        button(text(format!("{kind} x")).size(theme::size::TINY))
+                            .on_press(Message::RemoveKind(i, kind))
+                            .style(theme::secondary_button)
+                            .padding([2.0, theme::space::SM]),
                     );
+                }
+                if client.auto_approve_kinds.is_empty() {
+                    kinds_row = kinds_row.push(
+                        text("None")
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                    );
+                }
+                perm_toggles = perm_toggles.push(kinds_row);
+
+                let kind_input_val = self
+                    .kind_inputs
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default();
+                let can_add = kind_input_val.trim().parse::<u16>().is_ok();
+                let mut add_kind_btn = button(text("Add").size(theme::size::TINY))
+                    .style(theme::primary_button)
+                    .padding([2.0, theme::space::SM]);
+                if can_add {
+                    add_kind_btn = add_kind_btn.on_press(Message::AddKind(i));
+                }
+                let ci = i;
+                let mut kind_input = text_input("Kind number", &kind_input_val)
+                    .on_input(move |s| Message::KindInputChanged(ci, s))
+                    .size(theme::size::TINY)
+                    .width(100.0);
+                if can_add {
+                    kind_input = kind_input.on_submit(Message::AddKind(i));
+                }
+                perm_toggles = perm_toggles.push(
+                    row![kind_input, add_kind_btn]
+                        .spacing(theme::space::SM)
+                        .align_y(Alignment::Center),
+                );
+
+                // Per-client duration selector
+                let mut duration_row = row![
+                    text("Duration:")
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT),
+                    Space::new().width(theme::space::SM),
+                ]
+                .align_y(Alignment::Center);
+
+                for (idx, (label, _)) in DURATION_OPTIONS.iter().enumerate() {
+                    let is_current = client.duration == *label
+                        || (idx == 0 && client.duration == "Session")
+                        || (idx == DURATION_OPTIONS.len() - 1 && client.duration == "Forever");
+                    let style = if is_current {
+                        theme::primary_button
+                    } else {
+                        theme::secondary_button
+                    };
+                    duration_row = duration_row.push(
+                        button(text(*label).size(theme::size::TINY))
+                            .on_press(Message::SetClientDuration(i, idx))
+                            .style(style)
+                            .padding([2.0, theme::space::SM]),
+                    );
+                    duration_row = duration_row.push(Space::new().width(2.0));
+                }
+                perm_toggles = perm_toggles.push(scrollable(duration_row).direction(
+                    scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
+                ));
+
+                // Expiry countdown
+                if let Some(secs) = client.duration_seconds {
+                    let expires_at = client.connected_at.saturating_add(secs);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if now < expires_at {
+                        let remaining = expires_at - now;
+                        let display = if remaining < 60 {
+                            format!("Expires in {remaining}s")
+                        } else if remaining < 3600 {
+                            format!("Expires in {}m", remaining / 60)
+                        } else if remaining < 86400 {
+                            format!("Expires in {}h {}m", remaining / 3600, (remaining % 3600) / 60)
+                        } else {
+                            format!("Expires in {}d", remaining / 86400)
+                        };
+                        perm_toggles = perm_toggles.push(
+                            text(display)
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_MUTED),
+                        );
+                    } else {
+                        perm_toggles = perm_toggles.push(
+                            text("Expired")
+                                .size(theme::size::TINY)
+                                .color(theme::color::ERROR),
+                        );
+                    }
                 }
 
                 let detail = container(perm_toggles)
