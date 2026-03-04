@@ -244,8 +244,9 @@ impl State {
                 );
             }
 
-            let display = if bech32.len() > 80 {
-                format!("{}...", &bech32[..80])
+            let display = if bech32.chars().count() > 80 {
+                let truncated: String = bech32.chars().take(80).collect();
+                format!("{truncated}...")
             } else {
                 bech32.to_string()
             };

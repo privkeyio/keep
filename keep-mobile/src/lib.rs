@@ -194,7 +194,7 @@ pub struct BunkerConfigInfo {
 #[derive(Serialize, Deserialize)]
 struct StoredShareData {
     metadata_json: String,
-    key_package_bytes: Vec<u8>,
+    key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
 }
 
@@ -1381,6 +1381,12 @@ impl KeepMobile {
         Ok(backup_info(&decrypted, file_size))
     }
 
+    /// Restore a backup into the current mobile storage.
+    ///
+    /// Persistence is **not atomic**: shares, descriptors, relay configs, and
+    /// health statuses are written sequentially via `SecureStorage`. A failure
+    /// partway through may leave partial state. Callers should treat a
+    /// returned error as "possibly partially restored" and retry or clean up.
     pub fn restore_backup(
         &self,
         data: Vec<u8>,
@@ -1392,8 +1398,14 @@ impl KeepMobile {
 
         let mut first_group_hex: Option<String> = None;
 
+        let mut prepared_shares: Vec<(String, Vec<u8>, ShareMetadataInfo)> = Vec::new();
+        let mut prepared_keys: Vec<(String, Vec<u8>, ShareMetadataInfo)> = Vec::new();
+        let mut prepared_descriptors: Vec<WalletDescriptorInfo> = Vec::new();
+        let mut prepared_relays: Vec<(String, persistence::StoredRelayConfig)> = Vec::new();
+        let mut prepared_health: Vec<KeyHealthStatusInfo> = Vec::new();
+
         for bs in &decrypted.shares {
-            let key_package_bytes = decode_hex(&bs.key_package, "key_package")?;
+            let mut key_package_bytes = Zeroizing::new(decode_hex(&bs.key_package, "key_package")?);
             let pubkey_package_bytes = decode_hex(&bs.pubkey_package, "pubkey_package")?;
             let group_pubkey_bytes = decode_hex(&bs.group_pubkey, "group_pubkey")?;
             let group_pubkey_32 = bytes_to_32(&group_pubkey_bytes, "group pubkey")?;
@@ -1425,19 +1437,21 @@ impl KeepMobile {
             let stored = StoredShareData {
                 metadata_json: serde_json::to_string(&share_meta)
                     .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-                key_package_bytes,
+                key_package_bytes: std::mem::replace(
+                    &mut key_package_bytes,
+                    Zeroizing::new(Vec::new()),
+                ),
                 pubkey_package_bytes,
             };
 
             let serialized = serde_json::to_vec(&stored)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-            self.storage
-                .store_share_by_key(group_hex, serialized, metadata)?;
+            prepared_shares.push((group_hex, serialized, metadata));
         }
 
         for bk in &decrypted.keys {
-            let secret_bytes = decode_hex(&bk.secret, "key secret")?;
+            let secret_bytes = Zeroizing::new(decode_hex(&bk.secret, "key secret")?);
 
             let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&secret_bytes)
                 .map_err(|e| KeepMobileError::BackupError {
@@ -1458,34 +1472,31 @@ impl KeepMobile {
             let serialized = serde_json::to_vec(&stored)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-            self.storage
-                .store_share_by_key(group_hex, serialized, metadata_info)?;
+            prepared_keys.push((group_hex, serialized, metadata_info));
         }
 
         for wd in &decrypted.wallet_descriptors {
-            let desc_info = WalletDescriptorInfo {
+            prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),
                 internal_descriptor: wd.internal_descriptor.clone(),
                 network: wd.network.clone(),
                 created_at: wd.created_at,
-            };
-            persistence::persist_descriptor(&self.storage, &desc_info)?;
+            });
         }
 
         for rc in &decrypted.relay_configs {
             let group_hex = hex::encode(rc.group_pubkey);
-            let key = relay_config_key(Some(&group_hex));
             let stored_relay = persistence::StoredRelayConfig {
                 frost_relays: rc.frost_relays.clone(),
                 profile_relays: rc.profile_relays.clone(),
                 bunker_relays: rc.bunker_relays.clone(),
             };
-            persistence::persist_relay_config(&self.storage, &key, &stored_relay)?;
+            prepared_relays.push((group_hex, stored_relay));
         }
 
         for hs in &decrypted.health_statuses {
-            let health_info = KeyHealthStatusInfo {
+            prepared_health.push(KeyHealthStatusInfo {
                 group_pubkey: hex::encode(hs.group_pubkey),
                 share_index: hs.share_index,
                 last_check_timestamp: hs.last_check_timestamp,
@@ -1493,7 +1504,37 @@ impl KeepMobile {
                 created_at: hs.created_at.unwrap_or(hs.last_check_timestamp),
                 is_stale: false,
                 is_critical: false,
-            };
+            });
+        }
+
+        for (group_hex, _, _) in prepared_shares.iter().chain(prepared_keys.iter()) {
+            if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
+                return Err(KeepMobileError::BackupError {
+                    msg: format!("key/share already exists for group {group_hex}"),
+                });
+            }
+        }
+
+        for (group_hex, serialized, metadata) in prepared_shares {
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata)?;
+        }
+
+        for (group_hex, serialized, metadata_info) in prepared_keys {
+            self.storage
+                .store_share_by_key(group_hex, serialized, metadata_info)?;
+        }
+
+        for desc_info in prepared_descriptors {
+            persistence::persist_descriptor(&self.storage, &desc_info)?;
+        }
+
+        for (group_hex, stored_relay) in prepared_relays {
+            let key = relay_config_key(Some(&group_hex));
+            persistence::persist_relay_config(&self.storage, &key, &stored_relay)?;
+        }
+
+        for health_info in prepared_health {
             persistence::persist_health_status(&self.storage, &health_info)?;
         }
 
@@ -1903,11 +1944,11 @@ impl KeepMobile {
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&metadata)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-            key_package_bytes: key_package.serialize().map_err(|e| {
+            key_package_bytes: Zeroizing::new(key_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
                 }
-            })?,
+            })?),
             pubkey_package_bytes: pubkey_package.serialize().map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
@@ -2001,13 +2042,15 @@ impl KeepMobile {
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
-            key_package_bytes: share
-                .key_package()
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
-                .serialize()
-                .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {e}"),
-                })?,
+            key_package_bytes: Zeroizing::new(
+                share
+                    .key_package()
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+                    .serialize()
+                    .map_err(|e| KeepMobileError::FrostError {
+                        msg: format!("Serialization failed: {e}"),
+                    })?,
+            ),
             pubkey_package_bytes: share
                 .pubkey_package()
                 .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?

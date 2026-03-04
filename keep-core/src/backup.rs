@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::crypto::{self, Argon2Params, EncryptedData, NONCE_SIZE, SALT_SIZE};
 use crate::entropy;
@@ -51,7 +51,7 @@ struct VaultBackup {
 }
 
 /// A key entry in a backup file.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct BackupKey {
     /// Hex-encoded public key.
     pub pubkey: String,
@@ -70,7 +70,7 @@ pub struct BackupKey {
 }
 
 /// A FROST share entry in a backup file.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct BackupShare {
     /// Share identifier index.
     pub identifier: u16,
@@ -156,6 +156,13 @@ pub struct DecryptedBackup {
     pub config: BackupConfig,
     /// ISO-8601 timestamp when the backup was created.
     pub created_at: String,
+}
+
+impl Drop for DecryptedBackup {
+    fn drop(&mut self) {
+        self.keys.zeroize();
+        self.shares.zeroize();
+    }
 }
 
 fn key_type_to_string(kt: &KeyType) -> String {
@@ -334,23 +341,29 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader> {
     let mut salt = [0u8; SALT_SIZE];
     salt.copy_from_slice(&data[12..44]);
 
-    let le32 =
-        |offset: usize| -> u32 { u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) };
-    let memory_kib = le32(44);
-    let iterations = le32(48);
-    let parallelism = le32(52);
+    let le32 = |offset: usize| -> Result<u32> {
+        let slice = data
+            .get(offset..offset + 4)
+            .ok_or_else(|| KeepError::InvalidInput("backup header truncated".into()))?;
+        Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    };
+    let memory_kib = le32(44)?;
+    let iterations = le32(48)?;
+    let parallelism = le32(52)?;
 
-    const MAX_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB
+    const MIN_MEMORY_KIB: u32 = 65_536; // 64 MiB
+    const MAX_MEMORY_KIB: u32 = 256 * 1024; // 256 MiB
+    const MIN_ITERATIONS: u32 = 2;
     const MAX_ITERATIONS: u32 = 64;
     const MAX_PARALLELISM: u32 = 16;
-    if memory_kib == 0 || memory_kib > MAX_MEMORY_KIB {
+    if !(MIN_MEMORY_KIB..=MAX_MEMORY_KIB).contains(&memory_kib) {
         return Err(KeepError::InvalidInput(format!(
-            "backup argon2 memory out of range: {memory_kib}"
+            "backup argon2 memory out of range: {memory_kib} KiB (min {MIN_MEMORY_KIB}, max {MAX_MEMORY_KIB})"
         )));
     }
-    if iterations == 0 || iterations > MAX_ITERATIONS {
+    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
         return Err(KeepError::InvalidInput(format!(
-            "backup argon2 iterations out of range: {iterations}"
+            "backup argon2 iterations out of range: {iterations} (min {MIN_ITERATIONS}, max {MAX_ITERATIONS})"
         )));
     }
     if parallelism == 0 || parallelism > MAX_PARALLELISM {
@@ -408,7 +421,7 @@ pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
         key_count: decrypted.keys.len(),
         share_count: decrypted.shares.len(),
         descriptor_count: decrypted.wallet_descriptors.len(),
-        created_at: decrypted.created_at,
+        created_at: decrypted.created_at.clone(),
         file_size,
     })
 }

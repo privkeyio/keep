@@ -46,7 +46,7 @@ frost-secp256k1-tr = "2.2"
 bitcoin = { version = "0.32", features = ["serde"] }
 
 # Secure memory
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+zeroize = { version = "1.8", features = ["zeroize_derive", "serde"] }
 secrecy = "0.10"
 subtle = "2.5"
 

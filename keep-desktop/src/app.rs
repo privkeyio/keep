@@ -3558,7 +3558,9 @@ impl App {
             async move {
                 tokio::task::spawn_blocking(move || {
                     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-                    let restore_dir = keep_path.with_file_name(format!("keep-restored-{ts}"));
+                    let suffix: u32 = rand::random();
+                    let restore_dir =
+                        keep_path.with_file_name(format!("keep-restored-{ts}-{suffix:08x}"));
                     let info = keep_core::backup::restore_backup(
                         &data,
                         &passphrase,

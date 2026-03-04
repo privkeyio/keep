@@ -694,6 +694,23 @@ impl KfpNode {
                     "Session not found for finalize".into(),
                 ));
             };
+
+            for (idx, contrib) in &payload.contributions {
+                if !session.contributions().contains_key(idx) {
+                    session
+                        .add_contribution(
+                            *idx,
+                            contrib.account_xpub.clone(),
+                            contrib.fingerprint.clone(),
+                        )
+                        .map_err(|e| {
+                            FrostNetError::Session(format!(
+                                "Failed to add contribution for share {idx}: {e}"
+                            ))
+                        })?;
+                }
+            }
+
             session.set_finalized(FinalizedDescriptor {
                 external: payload.external_descriptor.clone(),
                 internal: payload.internal_descriptor.clone(),
