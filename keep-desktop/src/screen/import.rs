@@ -106,6 +106,7 @@ pub enum Event {
     ImportShare {
         data: Zeroizing<String>,
         passphrase: Zeroizing<String>,
+        name: String,
     },
     ImportNsec {
         data: Zeroizing<String>,
@@ -282,6 +283,9 @@ impl State {
             }
             Message::ContinueToDecrypt => {
                 self.error = None;
+                if let Some(info) = &self.parsed_info {
+                    self.name = format!("Share {}", info.identifier);
+                }
                 self.frost_step = FrostStep::Decrypt;
                 None
             }
@@ -298,7 +302,11 @@ impl State {
                 None
             }
             Message::ImportShare => {
-                if self.loading || self.data.is_empty() || self.passphrase.is_empty() {
+                if self.loading
+                    || self.data.is_empty()
+                    || self.passphrase.is_empty()
+                    || self.name.trim().is_empty()
+                {
                     return None;
                 }
                 self.loading = true;
@@ -306,6 +314,7 @@ impl State {
                 Some(Event::ImportShare {
                     data: self.data.clone(),
                     passphrase: self.passphrase.clone(),
+                    name: self.name.clone(),
                 })
             }
             Message::ImportNsec => {
@@ -700,7 +709,14 @@ impl State {
         .size(theme::size::SMALL)
         .color(theme::color::TEXT_MUTED);
 
-        let can_import = !self.passphrase.is_empty();
+        let has_passphrase = !self.passphrase.is_empty();
+        let has_name = !self.name.trim().is_empty();
+        let can_import = has_passphrase && has_name;
+
+        let name_input = text_input("Share name", &self.name)
+            .on_input(Message::NameChanged)
+            .padding(theme::space::MD)
+            .width(theme::size::INPUT_WIDTH);
 
         let passphrase_input = text_input("Decryption passphrase", &self.passphrase)
             .on_input(|s| Message::PassphraseChanged(Zeroizing::new(s)))
@@ -713,6 +729,12 @@ impl State {
             header,
             summary,
             Space::new().height(theme::space::LG),
+            theme::label("Share Name"),
+            text("A label for this share in your vault")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED),
+            name_input,
+            Space::new().height(theme::space::MD),
             theme::label("Passphrase"),
             text("Enter the passphrase used when exporting the share")
                 .size(theme::size::SMALL)

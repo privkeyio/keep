@@ -1239,9 +1239,11 @@ impl App {
                 self.open_scanner();
                 Task::none()
             }
-            import::Event::ImportShare { data, passphrase } => {
-                self.handle_import_share(data, passphrase)
-            }
+            import::Event::ImportShare {
+                data,
+                passphrase,
+                name,
+            } => self.handle_import_share(data, passphrase, name),
             import::Event::ImportNsec { data, name } => self.handle_import_nsec(data, name),
             import::Event::ImportNcryptsec {
                 data,
@@ -2525,6 +2527,7 @@ impl App {
         &mut self,
         data: Zeroizing<String>,
         passphrase: Zeroizing<String>,
+        name: String,
     ) -> Task<Message> {
         if !self.check_import_cooldown() {
             return Task::none();
@@ -2535,8 +2538,7 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Internal error during import", move |keep| {
                         let export = ShareExport::parse(&data).map_err(friendly_err)?;
-                        let name = format!("imported-{}", export.identifier);
-                        keep.frost_import_share(&export, &passphrase)
+                        keep.frost_import_share(&export, &passphrase, &name)
                             .map_err(friendly_err)?;
                         let shares = collect_shares(keep)?;
                         Ok((shares, name))
