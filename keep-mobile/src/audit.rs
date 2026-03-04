@@ -93,13 +93,25 @@ impl AuditEntry {
     fn compute_hash(&self) -> [u8; 32] {
         let mut data = Vec::new();
         data.extend_from_slice(&self.timestamp.to_le_bytes());
-        data.extend_from_slice(&(self.event_type as u8).to_le_bytes());
-        if let Some(ref pk) = self.pubkey {
-            data.extend_from_slice(pk.as_bytes());
+        data.push(self.event_type as u8);
+        match &self.pubkey {
+            Some(pk) => {
+                data.push(1);
+                let len = (pk.len() as u32).to_le_bytes();
+                data.extend_from_slice(&len);
+                data.extend_from_slice(pk.as_bytes());
+            }
+            None => data.push(0),
         }
         data.push(self.success as u8);
-        if let Some(ref d) = self.details {
-            data.extend_from_slice(d.as_bytes());
+        match &self.details {
+            Some(d) => {
+                data.push(1);
+                let len = (d.len() as u32).to_le_bytes();
+                data.extend_from_slice(&len);
+                data.extend_from_slice(d.as_bytes());
+            }
+            None => data.push(0),
         }
         data.extend_from_slice(&self.prev_hash);
         blake2b_256(&data)
@@ -120,8 +132,8 @@ impl AuditEntry {
 pub trait AuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
     fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError>;
-    /// Privileged operation: callers must ensure proper authorization before invoking.
-    fn clear_entries(&self) -> Result<(), KeepMobileError>;
+    fn entry_count(&self) -> Result<u32, KeepMobileError>;
+    fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError>;
 }
 
 #[derive(uniffi::Object)]
@@ -171,7 +183,7 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let entry_count = self.storage.load_entries(None)?.len();
+        let entry_count = self.storage.entry_count()? as usize;
         if entry_count >= MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
                 msg: format!("Audit log full: {entry_count} entries (max {MAX_AUDIT_ENTRIES})"),
@@ -262,9 +274,7 @@ impl AuditLog {
     }
 
     pub fn entry_count(&self) -> Result<u32, KeepMobileError> {
-        let entries = self.storage.load_entries(None)?;
-        let count = entries.len().min(MAX_AUDIT_ENTRIES);
-        Ok(count as u32)
+        self.storage.entry_count()
     }
 }
 
@@ -377,14 +387,13 @@ impl SigningAuditEntry {
         data.push(self.request_type as u8);
         data.push(self.decision as u8);
         data.push(self.was_automatic as u8);
-        let caller_len = u32::try_from(self.caller.len()).expect("caller too long for hash");
+        let caller_len = self.caller.len() as u32;
         data.extend_from_slice(&caller_len.to_le_bytes());
         data.extend_from_slice(self.caller.as_bytes());
         match &self.caller_name {
             Some(s) => {
                 data.push(1);
-                let len = u32::try_from(s.len()).expect("string too long for hash");
-                data.extend_from_slice(&len.to_le_bytes());
+                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 data.extend_from_slice(s.as_bytes());
             }
             None => data.push(0),
@@ -398,8 +407,7 @@ impl SigningAuditEntry {
         match &self.reason {
             Some(s) => {
                 data.push(1);
-                let len = u32::try_from(s.len()).expect("string too long for hash");
-                data.extend_from_slice(&len.to_le_bytes());
+                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 data.extend_from_slice(s.as_bytes());
             }
             None => data.push(0),
@@ -479,6 +487,7 @@ impl SigningAuditLog {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn log_event(
         &self,
         request_type: SigningRequestType,
@@ -571,7 +580,12 @@ impl SigningAuditLog {
         }
 
         let mut prev_hash = [0u8; 32];
-        let count = entries.len() as u32;
+        let count: u32 = entries
+            .len()
+            .try_into()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Entry count exceeds u32".into(),
+            })?;
 
         for json in entries {
             let entry: SigningAuditEntry =
@@ -642,7 +656,16 @@ mod tests {
             }
         }
 
-        fn clear_entries(&self) -> Result<(), KeepMobileError> {
+        fn entry_count(&self) -> Result<u32, KeepMobileError> {
+            Ok(self.entries.lock().unwrap().len() as u32)
+        }
+
+        fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
+            if confirm != "CLEAR_ALL_ENTRIES" {
+                return Err(KeepMobileError::StorageError {
+                    msg: "Confirmation string must be 'CLEAR_ALL_ENTRIES'".into(),
+                });
+            }
             self.entries.lock().unwrap().clear();
             Ok(())
         }
@@ -761,7 +784,7 @@ mod tests {
                 .iter()
                 .rev()
                 .filter(|json| {
-                    caller_filter.as_ref().map_or(true, |filter| {
+                    caller_filter.as_ref().is_none_or(|filter| {
                         serde_json::from_str::<SigningAuditEntry>(json)
                             .map(|e| e.caller == *filter)
                             .unwrap_or(false)
