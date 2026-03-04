@@ -147,11 +147,15 @@ pub fn is_valid_bech32_char(c: String) -> bool {
 }
 
 #[uniffi::export]
-pub fn generate_animated_frames(bech32_data: String, max_bytes: u32) -> Result<Vec<String>, KeepMobileError> {
+pub fn generate_animated_frames(
+    bech32_data: String,
+    max_bytes: u32,
+) -> Result<Vec<String>, KeepMobileError> {
     let export = keep_core::frost::ShareExport::from_bech32(&bech32_data)
         .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+    let max = (max_bytes as usize).max(50);
     export
-        .to_animated_frames(max_bytes as usize)
+        .to_animated_frames(max)
         .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })
 }
 
@@ -161,7 +165,10 @@ pub fn reassemble_animated_frames(frames: Vec<String>) -> Result<String, KeepMob
         .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
     export
         .to_bech32()
-        .or_else(|_| export.to_json())
+        .or_else(|e| {
+            tracing::warn!("bech32 encoding failed, falling back to JSON: {e}");
+            export.to_json()
+        })
         .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })
 }
 
