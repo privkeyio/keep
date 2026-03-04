@@ -271,7 +271,6 @@ impl State {
                         }
                     }
                 }
-                self.kind_inputs.remove(&pubkey);
                 None
             }
             Message::RemoveKind(client_idx, kind) => {

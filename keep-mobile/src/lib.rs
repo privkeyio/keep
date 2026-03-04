@@ -1186,10 +1186,15 @@ impl KeepMobile {
                 Ok(normalized)
             };
         let key = relay_config_key(group_pubkey.as_deref());
-        let existing = persistence::load_relay_config(&self.storage, &key)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let existing = match persistence::load_relay_config(&self.storage, &key) {
+            Ok(Some(c)) => c,
+            Ok(None) => persistence::StoredRelayConfig::default(),
+            Err(e) => {
+                return Err(KeepMobileError::StorageError {
+                    msg: format!("failed to load existing relay config: {e}"),
+                });
+            }
+        };
         let stored = persistence::StoredRelayConfig {
             frost_relays: normalize_relays(config.frost_relays, "FROST")?,
             profile_relays: normalize_relays(config.profile_relays, "profile")?,

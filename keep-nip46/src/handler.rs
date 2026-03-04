@@ -622,6 +622,9 @@ impl SignerHandler {
         duration: PermissionDuration,
         connected_at: Timestamp,
     ) {
+        if matches!(duration, PermissionDuration::Session) {
+            return;
+        }
         let mut pm = self.permissions.lock().await;
         if !pm.ensure_capacity(&pubkey) {
             let app_id = &pubkey.to_hex()[..8];
