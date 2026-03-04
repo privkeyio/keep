@@ -268,6 +268,343 @@ impl AuditLog {
     }
 }
 
+const MAX_CALLER_LENGTH: usize = 256;
+const MAX_REASON_LENGTH: usize = 4096;
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SigningRequestType {
+    Connect,
+    GetPublicKey,
+    SignEvent,
+    Nip04Encrypt,
+    Nip04Decrypt,
+    Nip44Encrypt,
+    Nip44Decrypt,
+    Disconnect,
+    KillSwitch,
+}
+
+impl std::fmt::Display for SigningRequestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect => write!(f, "connect"),
+            Self::GetPublicKey => write!(f, "get_public_key"),
+            Self::SignEvent => write!(f, "sign_event"),
+            Self::Nip04Encrypt => write!(f, "nip04_encrypt"),
+            Self::Nip04Decrypt => write!(f, "nip04_decrypt"),
+            Self::Nip44Encrypt => write!(f, "nip44_encrypt"),
+            Self::Nip44Decrypt => write!(f, "nip44_decrypt"),
+            Self::Disconnect => write!(f, "disconnect"),
+            Self::KillSwitch => write!(f, "kill_switch"),
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SigningDecision {
+    Approved,
+    Denied,
+}
+
+impl std::fmt::Display for SigningDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approved => write!(f, "approved"),
+            Self::Denied => write!(f, "denied"),
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone, Debug, Serialize, Deserialize)]
+pub struct SigningAuditEntry {
+    pub timestamp: i64,
+    pub request_type: SigningRequestType,
+    pub decision: SigningDecision,
+    pub was_automatic: bool,
+    pub caller: String,
+    pub caller_name: Option<String>,
+    pub event_kind: Option<u32>,
+    pub reason: Option<String>,
+    pub prev_hash: Vec<u8>,
+    pub hash: Vec<u8>,
+}
+
+impl SigningAuditEntry {
+    fn new(
+        request_type: SigningRequestType,
+        decision: SigningDecision,
+        was_automatic: bool,
+        caller: &str,
+        prev_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            timestamp: chrono::Utc::now().timestamp(),
+            request_type,
+            decision,
+            was_automatic,
+            caller: truncate_str(caller, MAX_CALLER_LENGTH).to_string(),
+            caller_name: None,
+            event_kind: None,
+            reason: None,
+            prev_hash: prev_hash.to_vec(),
+            hash: vec![0u8; 32],
+        }
+    }
+
+    fn with_caller_name(mut self, name: &str) -> Self {
+        self.caller_name = Some(truncate_str(name, MAX_CALLER_LENGTH).to_string());
+        self
+    }
+
+    fn with_event_kind(mut self, kind: u32) -> Self {
+        self.event_kind = Some(kind);
+        self
+    }
+
+    fn with_reason(mut self, reason: &str) -> Self {
+        self.reason = Some(truncate_str(reason, MAX_REASON_LENGTH).to_string());
+        self
+    }
+
+    fn finalize(mut self) -> Self {
+        self.hash = self.compute_hash().to_vec();
+        self
+    }
+
+    fn compute_hash(&self) -> [u8; 32] {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data.push(self.request_type as u8);
+        data.push(self.decision as u8);
+        data.push(self.was_automatic as u8);
+        let caller_len = u32::try_from(self.caller.len()).expect("caller too long for hash");
+        data.extend_from_slice(&caller_len.to_le_bytes());
+        data.extend_from_slice(self.caller.as_bytes());
+        match &self.caller_name {
+            Some(s) => {
+                data.push(1);
+                let len = u32::try_from(s.len()).expect("string too long for hash");
+                data.extend_from_slice(&len.to_le_bytes());
+                data.extend_from_slice(s.as_bytes());
+            }
+            None => data.push(0),
+        }
+        if let Some(kind) = self.event_kind {
+            data.push(1);
+            data.extend_from_slice(&kind.to_le_bytes());
+        } else {
+            data.push(0);
+        }
+        match &self.reason {
+            Some(s) => {
+                data.push(1);
+                let len = u32::try_from(s.len()).expect("string too long for hash");
+                data.extend_from_slice(&len.to_le_bytes());
+                data.extend_from_slice(s.as_bytes());
+            }
+            None => data.push(0),
+        }
+        data.extend_from_slice(&self.prev_hash);
+        blake2b_256(&data)
+    }
+
+    fn verify(&self, prev_hash: &[u8]) -> bool {
+        if prev_hash.len() != 32 || self.prev_hash.len() != 32 || self.hash.len() != 32 {
+            return false;
+        }
+        let prev_hash_match = self.prev_hash.ct_eq(prev_hash);
+        let computed = self.compute_hash();
+        let hash_match = self.hash.ct_eq(&computed);
+        (prev_hash_match & hash_match).into()
+    }
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ChainStatus {
+    pub verified: bool,
+    pub entry_count: u32,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait SigningAuditStorage: Send + Sync {
+    fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
+    fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError>;
+    fn load_entries_page(
+        &self,
+        offset: u32,
+        limit: u32,
+        caller_filter: Option<String>,
+    ) -> Result<Vec<String>, KeepMobileError>;
+    fn distinct_callers(&self) -> Result<Vec<String>, KeepMobileError>;
+    fn entry_count(&self) -> Result<u32, KeepMobileError>;
+}
+
+#[derive(uniffi::Object)]
+pub struct SigningAuditLog {
+    storage: std::sync::Arc<dyn SigningAuditStorage>,
+    last_hash: std::sync::Mutex<[u8; 32]>,
+}
+
+#[uniffi::export]
+impl SigningAuditLog {
+    #[uniffi::constructor]
+    pub fn new(storage: std::sync::Arc<dyn SigningAuditStorage>) -> Result<Self, KeepMobileError> {
+        let entries = storage.load_entries(None)?;
+
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
+
+        let last_hash = if let Some(last_json) = entries.last() {
+            let entry: SigningAuditEntry =
+                serde_json::from_str(last_json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid signing audit entry: {e}"),
+                })?;
+            entry
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| KeepMobileError::Serialization {
+                    msg: "Invalid hash length".into(),
+                })?
+        } else {
+            [0u8; 32]
+        };
+
+        Ok(Self {
+            storage,
+            last_hash: std::sync::Mutex::new(last_hash),
+        })
+    }
+
+    pub fn log_event(
+        &self,
+        request_type: SigningRequestType,
+        decision: SigningDecision,
+        was_automatic: bool,
+        caller: String,
+        caller_name: Option<String>,
+        event_kind: Option<u32>,
+        reason: Option<String>,
+    ) -> Result<(), KeepMobileError> {
+        let entry_count = self.storage.entry_count()? as usize;
+        if entry_count >= MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "Signing audit log full: {entry_count} entries (max {MAX_AUDIT_ENTRIES})"
+                ),
+            });
+        }
+
+        let mut last_hash = self
+            .last_hash
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Lock poisoned".into(),
+            })?;
+
+        let mut entry =
+            SigningAuditEntry::new(request_type, decision, was_automatic, &caller, *last_hash);
+        if let Some(name) = caller_name {
+            entry = entry.with_caller_name(&name);
+        }
+        if let Some(kind) = event_kind {
+            entry = entry.with_event_kind(kind);
+        }
+        if let Some(r) = reason {
+            entry = entry.with_reason(&r);
+        }
+        entry = entry.finalize();
+
+        let entry_json = serde_json::to_string(&entry)
+            .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
+
+        let new_hash: [u8; 32] =
+            entry
+                .hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| KeepMobileError::Serialization {
+                    msg: "Invalid hash length".into(),
+                })?;
+
+        self.storage.store_entry(entry_json)?;
+        *last_hash = new_hash;
+
+        Ok(())
+    }
+
+    pub fn get_entries(
+        &self,
+        offset: u32,
+        limit: u32,
+        caller_filter: Option<String>,
+    ) -> Result<Vec<SigningAuditEntry>, KeepMobileError> {
+        let entry_jsons = self
+            .storage
+            .load_entries_page(offset, limit, caller_filter)?;
+
+        let mut entries = Vec::with_capacity(entry_jsons.len());
+        for json in entry_jsons {
+            let entry: SigningAuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid signing audit entry: {e}"),
+                })?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    pub fn get_distinct_callers(&self) -> Result<Vec<String>, KeepMobileError> {
+        self.storage.distinct_callers()
+    }
+
+    pub fn verify_chain(&self) -> Result<ChainStatus, KeepMobileError> {
+        let entries = self.storage.load_entries(None)?;
+
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
+
+        let mut prev_hash = [0u8; 32];
+        let count = entries.len() as u32;
+
+        for json in entries {
+            let entry: SigningAuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid signing audit entry: {e}"),
+                })?;
+            if !entry.verify(&prev_hash) {
+                return Ok(ChainStatus {
+                    verified: false,
+                    entry_count: count,
+                });
+            }
+            prev_hash =
+                entry
+                    .hash
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| KeepMobileError::Serialization {
+                        msg: "Invalid hash length".into(),
+                    })?;
+        }
+
+        Ok(ChainStatus {
+            verified: true,
+            entry_count: count,
+        })
+    }
+
+    pub fn get_entry_count(&self) -> Result<u32, KeepMobileError> {
+        self.storage.entry_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +716,202 @@ mod tests {
         let storage2: Arc<dyn AuditStorage> = mock;
         let log2 = AuditLog::new(storage2).unwrap();
         assert!(!log2.verify_chain().unwrap());
+    }
+
+    struct MockSigningStorage {
+        entries: Mutex<Vec<String>>,
+    }
+
+    impl MockSigningStorage {
+        fn new() -> Self {
+            Self {
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SigningAuditStorage for MockSigningStorage {
+        fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError> {
+            self.entries.lock().unwrap().push(entry_json);
+            Ok(())
+        }
+
+        fn load_entries(&self, limit: Option<u32>) -> Result<Vec<String>, KeepMobileError> {
+            let entries = self.entries.lock().unwrap();
+            match limit {
+                Some(n) => Ok(entries
+                    .iter()
+                    .rev()
+                    .take(n as usize)
+                    .rev()
+                    .cloned()
+                    .collect()),
+                None => Ok(entries.clone()),
+            }
+        }
+
+        fn load_entries_page(
+            &self,
+            offset: u32,
+            limit: u32,
+            caller_filter: Option<String>,
+        ) -> Result<Vec<String>, KeepMobileError> {
+            let entries = self.entries.lock().unwrap();
+            let filtered: Vec<_> = entries
+                .iter()
+                .rev()
+                .filter(|json| {
+                    caller_filter.as_ref().map_or(true, |filter| {
+                        serde_json::from_str::<SigningAuditEntry>(json)
+                            .map(|e| e.caller == *filter)
+                            .unwrap_or(false)
+                    })
+                })
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(filtered)
+        }
+
+        fn distinct_callers(&self) -> Result<Vec<String>, KeepMobileError> {
+            let entries = self.entries.lock().unwrap();
+            let mut seen = std::collections::HashSet::new();
+            let mut callers = Vec::new();
+            for json in entries.iter().rev() {
+                if let Ok(entry) = serde_json::from_str::<SigningAuditEntry>(json) {
+                    if seen.insert(entry.caller.clone()) {
+                        callers.push(entry.caller);
+                    }
+                }
+            }
+            Ok(callers)
+        }
+
+        fn entry_count(&self) -> Result<u32, KeepMobileError> {
+            Ok(self.entries.lock().unwrap().len() as u32)
+        }
+    }
+
+    #[test]
+    fn test_signing_audit_chain_verification() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app1".into(),
+            Some("Test App".into()),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        log.log_event(
+            SigningRequestType::Nip44Encrypt,
+            SigningDecision::Denied,
+            true,
+            "app2".into(),
+            None,
+            None,
+            Some("rate limited".into()),
+        )
+        .unwrap();
+
+        let status = log.verify_chain().unwrap();
+        assert!(status.verified);
+        assert_eq!(status.entry_count, 2);
+    }
+
+    #[test]
+    fn test_signing_audit_pagination() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        for i in 0..10 {
+            let caller = if i % 3 == 0 { "app_a" } else { "app_b" };
+            log.log_event(
+                SigningRequestType::SignEvent,
+                SigningDecision::Approved,
+                false,
+                caller.into(),
+                None,
+                Some(1),
+                None,
+            )
+            .unwrap();
+        }
+
+        let page = log.get_entries(0, 3, None).unwrap();
+        assert_eq!(page.len(), 3);
+
+        let filtered = log.get_entries(0, 100, Some("app_a".into())).unwrap();
+        assert_eq!(filtered.len(), 4);
+    }
+
+    #[test]
+    fn test_signing_audit_distinct_callers() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        for caller in &["app_a", "app_b", "app_a", "app_c"] {
+            log.log_event(
+                SigningRequestType::Connect,
+                SigningDecision::Approved,
+                false,
+                caller.to_string(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let callers = log.get_distinct_callers().unwrap();
+        assert_eq!(callers.len(), 3);
+    }
+
+    #[test]
+    fn test_signing_audit_tamper_detection() {
+        let mock = Arc::new(MockSigningStorage::new());
+        let storage: Arc<dyn SigningAuditStorage> =
+            Arc::clone(&mock) as Arc<dyn SigningAuditStorage>;
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app1".into(),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Denied,
+            true,
+            "app1".into(),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        {
+            let mut entries = mock.entries.lock().unwrap();
+            if let Some(first) = entries.first_mut() {
+                let mut entry: SigningAuditEntry = serde_json::from_str(first).unwrap();
+                entry.was_automatic = true;
+                *first = serde_json::to_string(&entry).unwrap();
+            }
+        }
+
+        let storage2: Arc<dyn SigningAuditStorage> = mock;
+        let log2 = SigningAuditLog::new(storage2).unwrap();
+        let status = log2.verify_chain().unwrap();
+        assert!(!status.verified);
     }
 }

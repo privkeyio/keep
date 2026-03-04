@@ -16,7 +16,10 @@ mod storage;
 mod types;
 mod velocity;
 
-pub use audit::{AuditEntry, AuditEventType, AuditLog, AuditStorage};
+pub use audit::{
+    AuditEntry, AuditEventType, AuditLog, AuditStorage, ChainStatus, SigningAuditEntry,
+    SigningAuditLog, SigningAuditStorage, SigningDecision, SigningRequestType,
+};
 pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
 pub use error::KeepMobileError;
 pub use nip46::{
@@ -102,12 +105,55 @@ pub fn backup_min_passphrase_length() -> u32 {
 }
 
 #[uniffi::export]
+pub fn recover_nsec(
+    share_data: Vec<String>,
+    passphrases: Vec<String>,
+    expected_group_pubkey: Option<Vec<u8>>,
+) -> Result<String, KeepMobileError> {
+    use zeroize::Zeroize;
+
+    let group_pk = expected_group_pubkey
+        .as_ref()
+        .map(|v| {
+            <[u8; 32]>::try_from(v.as_slice()).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "expected_group_pubkey must be 32 bytes".into(),
+            })
+        })
+        .transpose()?;
+
+    let result = keep_core::frost::recover_nsec(&share_data, &passphrases, group_pk.as_ref());
+
+    let mut share_data = share_data;
+    let mut passphrases = passphrases;
+    for s in &mut share_data {
+        s.zeroize();
+    }
+    for p in &mut passphrases {
+        p.zeroize();
+    }
+
+    result
+        .map(|z| z.to_string())
+        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+}
+
+#[uniffi::export]
 pub fn is_valid_bech32_char(c: String) -> bool {
     const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
     c.len() == 1
         && c.chars()
             .next()
             .is_some_and(|ch| BECH32_CHARSET.contains(ch))
+}
+
+#[uniffi::export]
+pub fn reassemble_animated_frames(frames: Vec<String>) -> Result<String, KeepMobileError> {
+    let export = keep_core::frost::ShareExport::from_animated_frames(&frames)
+        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+    export
+        .to_bech32()
+        .or_else(|_| export.to_json())
+        .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })
 }
 
 use keep_core::frost::{
