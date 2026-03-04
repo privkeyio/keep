@@ -1469,7 +1469,8 @@ impl App {
                                 self.screen = Screen::Recovery(state);
                                 self.consume_pending_vault_share();
                             } else {
-                                let import = import::State::with_data(result, self.build_import_summaries());
+                                let import =
+                                    import::State::with_data(result, self.build_import_summaries());
                                 self.screen = Screen::Import(import);
                             }
                         }

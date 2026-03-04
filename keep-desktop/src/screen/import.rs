@@ -566,7 +566,11 @@ impl State {
                 content = content.push(Space::new().height(theme::space::MD));
                 content = content.push(
                     button(text("Continue").size(theme::size::BODY))
-                        .on_press_maybe(self.parsed_info.is_some().then_some(Message::ContinueToVerify))
+                        .on_press_maybe(
+                            self.parsed_info
+                                .is_some()
+                                .then_some(Message::ContinueToVerify),
+                        )
                         .style(theme::primary_button)
                         .padding(theme::space::MD),
                 );
@@ -613,10 +617,7 @@ impl State {
                 .color(theme::color::TEXT),
             Space::new().height(theme::space::SM),
             detail_row("Group", &info.group_npub_truncated),
-            detail_row(
-                "Share",
-                &format!("{} of {}", info.identifier, info.total),
-            ),
+            detail_row("Share", &format!("{} of {}", info.identifier, info.total),),
             detail_row(
                 "Threshold",
                 &format!("{} of {} required to sign", info.threshold, info.total),
