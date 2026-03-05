@@ -12,7 +12,6 @@ unmaintained = "workspace"
 [licenses]
 confidence-threshold = 0.8
 allow = [
-    "AGPL-3.0-or-later",
     "MIT",
     "MITNFA",
     "Apache-2.0",

@@ -165,4 +165,4 @@ agent = Agent(role="Social Manager", tools=tools)
 
 ## License
 
-AGPL-3.0
+MIT

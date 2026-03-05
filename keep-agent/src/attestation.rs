@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use crate::error::{AgentError, Result};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use crate::error::{BitcoinError, Result};
 use crate::recovery::{RecoveryOutput, TierInfo};
 use bitcoin::key::Secp256k1;

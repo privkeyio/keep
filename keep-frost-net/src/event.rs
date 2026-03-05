@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use nostr_sdk::prelude::*;
 
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;

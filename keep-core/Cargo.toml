@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Core library for Keep - sovereign key management for Nostr and Bitcoin"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 
 [features]
 default = []

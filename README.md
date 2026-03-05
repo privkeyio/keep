@@ -56,4 +56,4 @@ Pure Rust with `#![forbid(unsafe_code)]`. Keys are derived with Argon2id, encryp
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[MIT](LICENSE)
