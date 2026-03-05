@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, Instant};

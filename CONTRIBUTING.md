@@ -89,4 +89,4 @@ All PRs require review before merging. Reviewers check:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under AGPL-3.0-or-later.
+By contributing, you agree that your contributions will be licensed under the MIT license.

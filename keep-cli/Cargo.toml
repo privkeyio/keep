@@ -3,7 +3,7 @@ name = "keep-cli"
 version = "0.3.0"
 edition = "2021"
 description = "CLI for Keep - sovereign key management for Nostr and Bitcoin"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 
 [[bin]]
 name = "keep"

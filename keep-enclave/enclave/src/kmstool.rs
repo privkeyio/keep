@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use crate::aws_credentials::AwsCredentials;
 use crate::error::{EnclaveError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};

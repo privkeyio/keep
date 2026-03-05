@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Element, Length};

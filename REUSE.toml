@@ -7,88 +7,88 @@ SPDX-PackageDownloadLocation = "https://github.com/privkeyio/keep"
 path = "**.md"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "**.toml"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "Cargo.lock"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = ".gitignore"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = ".env.example"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "deploy/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-agent-py/**.py"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-agent-ts/**.ts"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-agent-ts/**.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = ".github/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "**/Cargo.lock"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-agent-ts/**.js"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-agent-ts/lib/**.js"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-enclave/build/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = "keep-enclave/enclaver.yaml"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 PrivKey LLC"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-License-Identifier = "MIT"

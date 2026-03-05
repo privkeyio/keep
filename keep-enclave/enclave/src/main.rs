@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 // SAFETY: We use `deny(unsafe_code)` instead of `forbid(unsafe_code)` to allow a single,
 // reviewed exception in the `mlock` module. That module uses unsafe code for:
