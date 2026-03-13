@@ -4207,7 +4207,7 @@ dependencies = [
  "hex",
  "k256",
  "keep-core",
- "nix 0.29.0",
+ "nix 0.31.1",
  "p384",
  "postcard",
  "rand_core 0.9.5",
@@ -5093,6 +5093,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "cfg_aliases",
  "libc",
+ "memoffset 0.9.1",
 ]
 
 [[package]]
