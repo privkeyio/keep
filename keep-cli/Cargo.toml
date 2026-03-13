@@ -70,7 +70,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-uuid = { version = "1.0", features = ["v4", "serde"], optional = true }
+uuid = { version = "1.22", features = ["v4", "serde"], optional = true }
 
 [features]
 default = []
