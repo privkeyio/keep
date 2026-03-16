@@ -162,17 +162,22 @@ mod mlock {
         pub fn new(mut data: Vec<u8>) -> Self {
             let len = data.len();
             let capacity = data.capacity();
+
+            if capacity == 0 {
+                return Self {
+                    ptr: NonNull::dangling(),
+                    len: 0,
+                    capacity: 0,
+                    locked: false,
+                };
+            }
+
             let raw_ptr = data.as_mut_ptr();
             std::mem::forget(data);
 
             // SAFETY: Vec guarantees a valid, non-null pointer for non-zero capacity.
-            // For zero-capacity Vec, we use NonNull::dangling() which is valid for zero-sized access.
-            let ptr = NonNull::new(raw_ptr).unwrap_or(NonNull::dangling());
-            let locked = if capacity > 0 {
-                try_mlock(ptr.as_ptr(), capacity)
-            } else {
-                false
-            };
+            let ptr = NonNull::new(raw_ptr).expect("non-zero capacity Vec had null pointer");
+            let locked = try_mlock(ptr.as_ptr(), capacity);
 
             Self {
                 ptr,
