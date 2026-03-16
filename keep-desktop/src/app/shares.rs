@@ -485,10 +485,14 @@ impl App {
         }
         let result = {
             let mut guard = lock_keep(&self.keep);
-            let Some(keep) = guard.as_mut() else {
-                return;
-            };
-            keep.frost_delete_share(&id.group_pubkey, id.identifier)
+            match guard.as_mut() {
+                Some(keep) => Ok(keep.frost_delete_share(&id.group_pubkey, id.identifier)),
+                None => Err("Vault is locked".to_string()),
+            }
+        };
+        let result = match result {
+            Ok(inner) => inner.map_err(friendly_err),
+            Err(e) => Err(e),
         };
         match result {
             Ok(()) => self.refresh_shares(),
@@ -496,7 +500,7 @@ impl App {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.clear_delete_confirm();
                 }
-                self.set_toast(friendly_err(e), ToastKind::Error);
+                self.set_toast(e, ToastKind::Error);
             }
         }
     }

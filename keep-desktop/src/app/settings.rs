@@ -299,16 +299,18 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok(()) => {
-                {
+                let result = {
                     let mut guard = lock_keep(&self.keep);
-                    if let Some(keep) = guard.as_mut() {
-                        if let Err(e) = keep.set_kill_switch(false) {
-                            if let Screen::Settings(s) = &mut self.screen {
-                                s.kill_switch_deactivate_failed(friendly_err(e));
-                            }
-                            return Task::none();
-                        }
+                    match guard.as_mut() {
+                        None => Err("Vault is locked".to_string()),
+                        Some(keep) => keep.set_kill_switch(false).map_err(friendly_err),
                     }
+                };
+                if let Err(e) = result {
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.kill_switch_deactivate_failed(e);
+                    }
+                    return Task::none();
                 }
                 self.kill_switch.store(false, Ordering::Release);
                 self.settings.kill_switch_active = false;

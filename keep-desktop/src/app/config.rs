@@ -77,6 +77,7 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
 }
 
 pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
+    let mut migrated = false;
     let global_exists = match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
         Ok(Some(_)) => true,
         Ok(None) => false,
@@ -109,6 +110,7 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
 
         match keep.store_relay_config(&config) {
             Ok(()) => {
+                migrated = true;
                 let _ = std::fs::remove_file(&relay_path);
                 let _ = std::fs::remove_file(&bunker_path);
             }
@@ -132,12 +134,13 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
                 .unwrap_or(DEFAULT_PROXY_PORT);
             if enabled || port != DEFAULT_PROXY_PORT {
                 let proxy = keep_core::ProxyConfig { enabled, port };
-                if let Err(e) = keep.set_proxy_config(&proxy) {
-                    tracing::warn!(
+                match keep.set_proxy_config(&proxy) {
+                    Ok(()) => migrated = true,
+                    Err(e) => tracing::warn!(
                         enabled,
                         port,
                         "Failed to migrate proxy config to vault: {e}"
-                    );
+                    ),
                 }
             }
         }
@@ -170,6 +173,7 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
             }
             match keep.store_relay_config(&per_key_config) {
                 Ok(()) => {
+                    migrated = true;
                     let _ = std::fs::remove_file(entry.path());
                     let _ = std::fs::remove_file(&bunker_file);
                 }
@@ -180,5 +184,7 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
         }
     }
 
-    tracing::info!("Migrated relay/proxy config from JSON files to vault");
+    if migrated {
+        tracing::info!("Migrated relay/proxy config from JSON files to vault");
+    }
 }
