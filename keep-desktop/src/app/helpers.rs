@@ -124,8 +124,7 @@ impl App {
     pub(super) fn set_nsec_keys_screen(&mut self) {
         let keys = self.current_nsec_keys();
         self.cached_nsec_count = keys.len();
-        self.screen =
-            Screen::NsecKeys(nsec_keys::State::new(keys, self.active_share_hex.clone()));
+        self.screen = Screen::NsecKeys(nsec_keys::State::new(keys, self.active_share_hex.clone()));
     }
 
     pub(super) fn resolve_active_share(&mut self, shares: &[ShareEntry]) {
@@ -145,8 +144,7 @@ impl App {
         }
 
         let first = shares.first().map(|s| s.group_pubkey_hex.as_str());
-        let all_same_group =
-            first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
+        let all_same_group = first.is_some_and(|f| shares.iter().all(|s| s.group_pubkey_hex == f));
         let new_key = if all_same_group { first } else { None };
 
         match keep.set_active_share_key(new_key) {
@@ -221,12 +219,7 @@ impl App {
         self.update_relay_config(|config| config.frost_relays = urls);
     }
 
-    pub(super) fn save_peer_policy(
-        &self,
-        pubkey_hex: &str,
-        allow_send: bool,
-        allow_receive: bool,
-    ) {
+    pub(super) fn save_peer_policy(&self, pubkey_hex: &str, allow_send: bool, allow_receive: bool) {
         let hex = pubkey_hex.to_string();
         self.update_relay_config(|config| {
             if let Some(existing) = config

@@ -14,8 +14,8 @@ use crate::screen::{
 };
 
 use super::{
-    collect_shares, friendly_err, lock_keep, with_keep_blocking, App, ToastKind,
-    IMPORT_COOLDOWN, TOAST_DURATION_SECS,
+    collect_shares, friendly_err, lock_keep, with_keep_blocking, App, ToastKind, IMPORT_COOLDOWN,
+    TOAST_DURATION_SECS,
 };
 
 impl App {
@@ -27,9 +27,7 @@ impl App {
             return Task::none();
         };
         match event {
-            shares::Event::GoToExport(i) => {
-                self.handle_navigation_message(Message::GoToExport(i))
-            }
+            shares::Event::GoToExport(i) => self.handle_navigation_message(Message::GoToExport(i)),
             shares::Event::GoToCreate => self.handle_navigation_message(Message::GoToCreate),
             shares::Event::GoToImport => self.handle_navigation_message(Message::GoToImport),
             shares::Event::ActivateShare(hex) => {
@@ -61,11 +59,7 @@ impl App {
                                 "Failed to export vault share",
                                 move |keep| {
                                     let export = keep
-                                        .frost_export_share(
-                                            &group_pubkey,
-                                            identifier,
-                                            &passphrase,
-                                        )
+                                        .frost_export_share(&group_pubkey, identifier, &passphrase)
                                         .map_err(|e| e.to_string())?;
                                     let bech32 = export
                                         .to_bech32()
@@ -126,10 +120,7 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_distribute_message(
-        &mut self,
-        msg: distribute::Message,
-    ) -> Task<Message> {
+    pub(crate) fn handle_distribute_message(&mut self, msg: distribute::Message) -> Task<Message> {
         let Screen::Distribute(s) = &mut self.screen else {
             return Task::none();
         };
@@ -592,10 +583,7 @@ impl App {
         )
     }
 
-    pub(crate) fn handle_copy_sensitive(
-        &mut self,
-        data: Zeroizing<String>,
-    ) -> Task<Message> {
+    pub(crate) fn handle_copy_sensitive(&mut self, data: Zeroizing<String>) -> Task<Message> {
         self.start_clipboard_timer();
         self.copy_feedback_until = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
         match &mut self.screen {
@@ -740,10 +728,7 @@ impl App {
         )
     }
 
-    pub(crate) fn handle_go_to_export_ncryptsec(
-        &mut self,
-        pubkey_hex: String,
-    ) -> Task<Message> {
+    pub(crate) fn handle_go_to_export_ncryptsec(&mut self, pubkey_hex: String) -> Task<Message> {
         let identity = self.identities.iter().find(|i| i.pubkey_hex == pubkey_hex);
         if let Some(id) = identity {
             self.screen = Screen::ExportNcryptsec(Box::new(export_ncryptsec::State::new(
@@ -831,10 +816,7 @@ impl App {
         Task::none()
     }
 
-    pub(crate) fn handle_nsec_keys_message(
-        &mut self,
-        msg: nsec_keys::Message,
-    ) -> Task<Message> {
+    pub(crate) fn handle_nsec_keys_message(&mut self, msg: nsec_keys::Message) -> Task<Message> {
         let Screen::NsecKeys(s) = &mut self.screen else {
             return Task::none();
         };

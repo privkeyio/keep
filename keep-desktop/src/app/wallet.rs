@@ -169,8 +169,8 @@ impl App {
     }
 
     pub(crate) fn begin_descriptor_coordination(&mut self) -> Task<Message> {
-        use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
         use crate::message::ConnectionStatus;
+        use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
 
         let (share, network, policy) = match &mut self.screen {
             Screen::Wallet(wallet::State { setup: Some(s), .. }) => {

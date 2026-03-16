@@ -76,10 +76,7 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
     }
 }
 
-pub(crate) fn migrate_json_config_to_vault(
-    keep: &keep_core::Keep,
-    keep_path: &std::path::Path,
-) {
+pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
     let global_exists = match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
         Ok(Some(_)) => true,
         Ok(None) => false,

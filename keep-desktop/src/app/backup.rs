@@ -105,10 +105,7 @@ impl App {
         )
     }
 
-    pub(crate) fn handle_restore_verify(
-        &mut self,
-        passphrase: Zeroizing<String>,
-    ) -> Task<Message> {
+    pub(crate) fn handle_restore_verify(&mut self, passphrase: Zeroizing<String>) -> Task<Message> {
         let Screen::Settings(s) = &self.screen else {
             return Task::none();
         };

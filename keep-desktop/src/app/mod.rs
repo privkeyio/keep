@@ -14,8 +14,8 @@ mod util;
 mod wallet;
 
 pub use config::Settings;
-pub use util::set_pending_nostrconnect;
 pub(crate) use config::{load_settings, save_settings};
+pub use util::set_pending_nostrconnect;
 pub(crate) use util::{
     collect_shares, default_bunker_relays, friendly_err, load_cert_pins, lock_keep, parse_hex_key,
     save_cert_pins, take_pending_nostrconnect, to_display_entry, with_keep_blocking,
@@ -41,8 +41,7 @@ use zeroize::Zeroizing;
 use crate::bunker_service::{BunkerSetup, RunningBunker};
 use crate::frost::PendingRequestEntry;
 use crate::message::{
-    ConnectionStatus, EventLogEntry, FrostNodeMsg, Identity, Message, PeerEntry,
-    PendingSignRequest,
+    ConnectionStatus, EventLogEntry, FrostNodeMsg, Identity, Message, PeerEntry, PendingSignRequest,
 };
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::layout::SidebarState;

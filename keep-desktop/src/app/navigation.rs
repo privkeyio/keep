@@ -2,8 +2,8 @@ use iced::Task;
 
 use crate::message::Message;
 use crate::screen::settings::SettingsScreen;
-use crate::screen::{create, import, relay};
 use crate::screen::Screen;
+use crate::screen::{create, import, relay};
 
 use super::{lock_keep, App};
 
@@ -33,7 +33,8 @@ impl App {
             Message::GoToExport(index) => {
                 let shares = self.current_shares();
                 if let Some(share) = shares.get(index).cloned() {
-                    self.screen = Screen::Export(Box::new(crate::screen::export::State::new(share)));
+                    self.screen =
+                        Screen::Export(Box::new(crate::screen::export::State::new(share)));
                 }
                 Task::none()
             }
@@ -194,7 +195,10 @@ impl App {
         let Some(ref tray) = self.tray else {
             return;
         };
-        let connected = matches!(self.frost_status, crate::message::ConnectionStatus::Connected);
+        let connected = matches!(
+            self.frost_status,
+            crate::message::ConnectionStatus::Connected
+        );
         if connected != self.tray_last_connected {
             tray.update_status(connected);
             self.tray_last_connected = connected;

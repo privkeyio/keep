@@ -490,9 +490,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("BackupResult")
                 .field(&r.as_ref().map(|(p, _)| p.as_str()).map_err(|e| e.as_str()))
                 .finish(),
-            Self::RestorePickFailed(e) => {
-                f.debug_tuple("RestorePickFailed").field(e).finish()
-            }
+            Self::RestorePickFailed(e) => f.debug_tuple("RestorePickFailed").field(e).finish(),
             Self::RestoreFileLoaded(name, data) => f
                 .debug_tuple("RestoreFileLoaded")
                 .field(name)
