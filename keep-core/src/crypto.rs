@@ -483,8 +483,8 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 /// threshold ECDH, where the shared secret is computed via distributed
 /// key operations rather than from a single private key.
 pub mod nip44 {
-    use chacha20::cipher::{KeyIvInit, StreamCipher};
-    use chacha20::XChaCha20;
+    use chacha20::cipher::StreamCipher;
+    use chacha20::{KeyIvInit, XChaCha20};
     use hkdf::Hkdf;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -573,8 +573,8 @@ pub mod nip44 {
 
         let mut ciphertext = padded;
         let mut cipher = XChaCha20::new(
-            chacha_key.as_ref().into(),
-            chacha_nonce[..24].as_ref().into(),
+            (&*chacha_key).into(),
+            <&[u8; 24]>::try_from(&chacha_nonce[..24]).unwrap().into(),
         );
         cipher.apply_keystream(&mut ciphertext);
 
@@ -628,8 +628,8 @@ pub mod nip44 {
 
         let mut plaintext = ciphertext.to_vec();
         let mut cipher = XChaCha20::new(
-            chacha_key.as_ref().into(),
-            chacha_nonce[..24].as_ref().into(),
+            (&*chacha_key).into(),
+            <&[u8; 24]>::try_from(&chacha_nonce[..24]).unwrap().into(),
         );
         cipher.apply_keystream(&mut plaintext);
 
