@@ -574,7 +574,9 @@ pub mod nip44 {
         let mut ciphertext = padded;
         let mut cipher = XChaCha20::new(
             (&*chacha_key).into(),
-            <&[u8; 24]>::try_from(&chacha_nonce[..24]).unwrap().into(),
+            <&[u8; 24]>::try_from(&chacha_nonce[..24])
+                .expect("chacha_nonce is 32 bytes; first 24 always valid")
+                .into(),
         );
         cipher.apply_keystream(&mut ciphertext);
 
@@ -629,7 +631,9 @@ pub mod nip44 {
         let mut plaintext = ciphertext.to_vec();
         let mut cipher = XChaCha20::new(
             (&*chacha_key).into(),
-            <&[u8; 24]>::try_from(&chacha_nonce[..24]).unwrap().into(),
+            <&[u8; 24]>::try_from(&chacha_nonce[..24])
+                .expect("chacha_nonce is 32 bytes; first 24 always valid")
+                .into(),
         );
         cipher.apply_keystream(&mut plaintext);
 
