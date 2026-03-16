@@ -310,19 +310,14 @@ impl App {
 
     pub(crate) fn log_kill_switch_event(&self, activated: bool) {
         use keep_core::audit::{SigningAuditEntry, SigningDecision, SigningRequestType};
-        let decision = if activated {
-            SigningDecision::Denied
+        let (decision, reason) = if activated {
+            (SigningDecision::Denied, "activated")
         } else {
-            SigningDecision::Approved
+            (SigningDecision::Approved, "deactivated")
         };
         let mut guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_mut() {
             let hash = keep.signing_audit_last_hash().unwrap_or([0u8; 32]);
-            let reason = if activated {
-                "activated"
-            } else {
-                "deactivated"
-            };
             let entry = SigningAuditEntry::new(
                 SigningRequestType::KillSwitch,
                 decision,

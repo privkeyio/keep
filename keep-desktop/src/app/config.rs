@@ -52,7 +52,7 @@ pub(crate) fn settings_path(keep_path: &std::path::Path) -> PathBuf {
 
 pub(crate) fn load_settings(keep_path: &std::path::Path) -> (Settings, bool) {
     let path = settings_path(keep_path);
-    let Some(contents) = std::fs::read_to_string(&path).ok() else {
+    let Ok(contents) = std::fs::read_to_string(&path) else {
         return (Settings::default(), false);
     };
     let settings: Settings = serde_json::from_str(&contents).unwrap_or_default();

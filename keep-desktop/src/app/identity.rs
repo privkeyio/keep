@@ -224,10 +224,7 @@ impl App {
                         }
                     }
                     IdentityKind::Nsec => {
-                        let Ok(bytes) = hex::decode(&pubkey_hex) else {
-                            return Task::none();
-                        };
-                        let Ok(pubkey_bytes) = <[u8; 32]>::try_from(bytes) else {
+                        let Some(pubkey_bytes) = parse_hex_key(&pubkey_hex) else {
                             return Task::none();
                         };
                         let delete_result = {
