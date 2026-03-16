@@ -333,7 +333,6 @@ impl App {
                     self.screen = Screen::Recovery(state);
                     self.consume_pending_vault_share();
                 } else {
-                    self.scanner_recovery = None;
                     self.pending_vault_share = None;
                     self.screen = Screen::Import(import::State::new(self.build_import_summaries()));
                 }
@@ -849,16 +848,17 @@ impl App {
             return Task::none();
         };
         let (pubkey, name) = (key.pubkey, key.name.clone());
-        if self.active_share_hex.as_deref() == Some(hex.as_str()) {
-            self.handle_disconnect_relay();
-            self.stop_bunker();
-        }
+        let is_active = self.active_share_hex.as_deref() == Some(hex.as_str());
         let delete_result = {
             let mut guard = lock_keep(&self.keep);
             guard.as_mut().map(|keep| keep.delete_key(&pubkey))
         };
         match delete_result {
             Some(Ok(())) => {
+                if is_active {
+                    self.handle_disconnect_relay();
+                    self.stop_bunker();
+                }
                 {
                     let guard = lock_keep(&self.keep);
                     if let Some(keep) = guard.as_ref() {
