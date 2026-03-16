@@ -32,7 +32,8 @@ impl App {
         }
         *guard = None;
         drop(guard);
-        let clear_clipboard = self.clipboard_clear_at.take().is_some();
+        let clear_clipboard = self.clipboard_clear_at.take().is_some() || self.clipboard_has_secret;
+        self.clipboard_has_secret = false;
         self.active_share_hex = None;
         self.active_coordinations.clear();
         self.peer_xpubs.clear();
@@ -264,6 +265,7 @@ impl App {
     }
 
     pub(crate) fn start_clipboard_timer(&mut self) {
+        self.clipboard_has_secret = true;
         self.clipboard_clear_at = if self.settings.clipboard_clear_secs > 0 {
             Some(Instant::now() + Duration::from_secs(self.settings.clipboard_clear_secs))
         } else {

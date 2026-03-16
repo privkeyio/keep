@@ -27,7 +27,7 @@ impl App {
                     let (entries, callers, count) = keep
                         .signing_audit_read_page_with_metadata(offset, page_size, caller.as_deref())
                         .map_err(friendly_err)?;
-                    let has_more = entries.len() == page_size;
+                    let has_more = (offset + entries.len()) < count;
                     let display = entries.into_iter().map(to_display_entry).collect();
                     Ok(AuditLoadResult {
                         entries: display,

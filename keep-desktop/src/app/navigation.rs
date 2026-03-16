@@ -9,10 +9,12 @@ use super::{lock_keep, App};
 
 impl App {
     pub(crate) fn handle_navigation_message(&mut self, message: Message) -> Task<Message> {
-        if !matches!(message, Message::GoBack) {
+        if !matches!(message, Message::GoBack | Message::GoToExport(..)) {
             self.distribute_state = None;
             self.distribute_export_id = None;
         }
+        self.stop_scanner();
+        self.copy_feedback_until = None;
         match message {
             Message::GoToCreate => {
                 let existing_names: Vec<String> = self
@@ -39,14 +41,10 @@ impl App {
                 if matches!(self.screen, Screen::ShareList(_)) {
                     return Task::none();
                 }
-                self.stop_scanner();
-                self.copy_feedback_until = None;
                 self.set_share_screen(self.current_shares());
                 Task::none()
             }
             Message::GoBack => {
-                self.stop_scanner();
-                self.copy_feedback_until = None;
                 if let Some(dist_state) = self.distribute_state.take() {
                     self.distribute_export_id = None;
                     self.screen = Screen::Distribute(dist_state);
@@ -66,8 +64,6 @@ impl App {
                 if matches!(self.screen, Screen::NsecKeys(_)) {
                     return Task::none();
                 }
-                self.stop_scanner();
-                self.copy_feedback_until = None;
                 self.set_nsec_keys_screen();
                 Task::none()
             }

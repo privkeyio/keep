@@ -104,6 +104,7 @@ pub struct App {
     delete_identity_confirm: Option<String>,
     last_activity: Instant,
     pub(crate) clipboard_clear_at: Option<Instant>,
+    clipboard_has_secret: bool,
     copy_feedback_until: Option<Instant>,
     pub(crate) toast: Option<Toast>,
     toast_dismiss_at: Option<Instant>,
@@ -189,6 +190,7 @@ impl App {
             delete_identity_confirm: None,
             last_activity: Instant::now(),
             clipboard_clear_at: None,
+            clipboard_has_secret: false,
             copy_feedback_until: None,
             toast: None,
             toast_dismiss_at: None,
@@ -288,7 +290,46 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        if !matches!(message, Message::Tick) {
+        let is_background = matches!(
+            message,
+            Message::Tick
+                | Message::ScannerPoll
+                | Message::UnlockResult(..)
+                | Message::StartFreshResult(..)
+                | Message::CreateResult(..)
+                | Message::ExportGenerated(..)
+                | Message::NcryptsecGenerated(..)
+                | Message::RecoveryResult(..)
+                | Message::VaultShareExported(..)
+                | Message::ImportResult(..)
+                | Message::ImportNsecResult(..)
+                | Message::ImportNcryptsecResult(..)
+                | Message::WalletsLoaded(..)
+                | Message::WalletSessionStarted(..)
+                | Message::WalletDescriptorProgress(..)
+                | Message::WalletAnnounceResult(..)
+                | Message::ConnectRelayResult(..)
+                | Message::BunkerStartResult(..)
+                | Message::BunkerRevokeResult(..)
+                | Message::BunkerClientsLoaded(..)
+                | Message::BunkerPermissionUpdated(..)
+                | Message::AuditLoaded(..)
+                | Message::AuditPageLoaded(..)
+                | Message::AuditChainVerified(..)
+                | Message::BackupResult(..)
+                | Message::RestorePickFailed(..)
+                | Message::RestoreFileLoaded(..)
+                | Message::RestoreVerified(..)
+                | Message::RestoreResult(..)
+                | Message::KillSwitchDeactivateResult(..)
+        );
+        #[cfg(unix)]
+        let is_background = is_background
+            || matches!(
+                message,
+                Message::LocalSignerStartResult(..) | Message::LocalSignerRevokeResult(..)
+            );
+        if !is_background {
             self.last_activity = Instant::now();
         }
 
@@ -402,6 +443,10 @@ impl App {
             }
 
             Message::BackupResult(result) => self.handle_backup_result(result),
+            Message::RestorePickFailed(e) => {
+                self.set_toast(e, ToastKind::Error);
+                Task::none()
+            }
             Message::RestoreFileLoaded(name, data) => {
                 if let Screen::Settings(s) = &mut self.screen {
                     s.restore_file_loaded(name, data);
@@ -429,6 +474,7 @@ impl App {
         let now = Instant::now();
         if self.clipboard_clear_at.is_some_and(|t| now >= t) {
             self.clipboard_clear_at = None;
+            self.clipboard_has_secret = false;
             return iced::clipboard::write(String::new());
         }
         if let Screen::Recovery(s) = &mut self.screen {
@@ -727,6 +773,7 @@ impl App {
             delete_identity_confirm: None,
             last_activity: Instant::now(),
             clipboard_clear_at: None,
+            clipboard_has_secret: false,
             copy_feedback_until: None,
             toast: None,
             toast_dismiss_at: None,

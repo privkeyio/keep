@@ -97,7 +97,10 @@ impl App {
             },
             |result: Result<(String, Vec<u8>), String>| match result {
                 Ok((name, data)) => Message::RestoreFileLoaded(name, data),
-                Err(_) => Message::Settings(crate::screen::settings::Message::RestoreCancel),
+                Err(ref e) if e == "Cancelled" => {
+                    Message::Settings(crate::screen::settings::Message::RestoreCancel)
+                }
+                Err(e) => Message::RestorePickFailed(e),
             },
         )
     }

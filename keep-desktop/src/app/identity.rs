@@ -237,7 +237,10 @@ impl App {
                                 self.set_toast(super::friendly_err(e), ToastKind::Error);
                                 false
                             }
-                            None => false,
+                            None => {
+                                self.set_toast("Vault is locked".into(), ToastKind::Error);
+                                false
+                            }
                         }
                     }
                 };

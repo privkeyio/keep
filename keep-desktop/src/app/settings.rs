@@ -71,6 +71,28 @@ impl App {
                 if let Screen::Settings(s) = &mut self.screen {
                     s.sync_proxy_port(self.proxy_port);
                 }
+                if self.proxy_enabled {
+                    let frost_active = matches!(
+                        self.frost_status,
+                        ConnectionStatus::Connected | ConnectionStatus::Connecting
+                    );
+                    let bunker_active = self.bunker.is_some();
+                    let mut tasks = Vec::new();
+                    if frost_active {
+                        tasks.push(self.handle_reconnect_relay());
+                    }
+                    if bunker_active {
+                        self.stop_bunker();
+                        tasks.push(self.handle_bunker_start());
+                    }
+                    if !tasks.is_empty() {
+                        self.set_toast(
+                            format!("Proxy port changed to {port}, reconnecting..."),
+                            ToastKind::Success,
+                        );
+                        return Task::batch(tasks);
+                    }
+                }
                 return Task::none();
             }
             Event::MinimizeToTrayToggled(v) => {
@@ -219,14 +241,15 @@ impl App {
     }
 
     pub(crate) fn handle_kill_switch_activate(&mut self) -> Task<Message> {
-        let vault_err = {
+        let result = {
             let mut guard = lock_keep(&self.keep);
-            guard
-                .as_mut()
-                .and_then(|keep| keep.set_kill_switch(true).err())
+            match guard.as_mut() {
+                None => Err("Vault is locked".to_string()),
+                Some(keep) => keep.set_kill_switch(true).map_err(friendly_err),
+            }
         };
-        if let Some(e) = vault_err {
-            self.set_toast(friendly_err(e), ToastKind::Error);
+        if let Err(e) = result {
+            self.set_toast(e, ToastKind::Error);
             return Task::none();
         }
         self.settings.kill_switch_active = true;
