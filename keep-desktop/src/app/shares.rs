@@ -479,10 +479,7 @@ impl App {
 
     pub(crate) fn handle_delete(&mut self, id: ShareIdentity) {
         let group_hex = hex::encode(id.group_pubkey);
-        if self.active_share_hex.as_deref() == Some(group_hex.as_str()) {
-            self.handle_disconnect_relay();
-            self.stop_bunker();
-        }
+        let is_active = self.active_share_hex.as_deref() == Some(group_hex.as_str());
         let result = {
             let mut guard = lock_keep(&self.keep);
             match guard.as_mut() {
@@ -495,7 +492,13 @@ impl App {
             Err(e) => Err(e),
         };
         match result {
-            Ok(()) => self.refresh_shares(),
+            Ok(()) => {
+                if is_active {
+                    self.handle_disconnect_relay();
+                    self.stop_bunker();
+                }
+                self.refresh_shares();
+            }
             Err(e) => {
                 if let Screen::ShareList(s) = &mut self.screen {
                     s.clear_delete_confirm();
