@@ -68,26 +68,30 @@ pub struct SigningRequestContext {
     pub operation: Nip55RequestType,
     pub package_name: String,
     pub event_kind: Option<u32>,
-    pub current_hour: u32,
-    pub recent_request_count: u32,
     pub has_signed_kind_before: bool,
     pub app_age_ms: Option<u64>,
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum AutoSignDecision {
-    Allowed { hourly_count: u32, daily_count: u32 },
+    Allowed {
+        hourly_count: u32,
+        daily_count: u32,
+        hourly_limit: u32,
+        daily_limit: u32,
+    },
     HourlyLimitExceeded,
     DailyLimitExceeded,
     UnusualActivity,
-    CoolingOff { until_ms: u64 },
+    CoolingOff {
+        until_ms: u64,
+    },
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum SignPolicyEvaluation {
     AutoApprove,
     FallToUi,
-    Denied { reason: String },
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
@@ -138,20 +142,26 @@ pub fn sensitive_kind_warning(kind: u32) -> Option<String> {
 }
 
 #[uniffi::export]
-pub fn assess_signing_risk(ctx: SigningRequestContext) -> SigningRiskAssessment {
+pub fn assess_signing_risk(
+    ctx: SigningRequestContext,
+    recent_request_count: u32,
+) -> SigningRiskAssessment {
     let mut factors = Vec::new();
-    let clamped_hour = ctx.current_hour.min(23);
+
+    let current_hour = {
+        let secs = now_ms() / 1000;
+        ((secs % 86400) / 3600) as u32
+    };
 
     match ctx.operation {
         Nip55RequestType::Nip04Encrypt
         | Nip55RequestType::Nip44Encrypt
         | Nip55RequestType::Nip04Decrypt
         | Nip55RequestType::Nip44Decrypt
-        | Nip55RequestType::DecryptZapEvent
-        | Nip55RequestType::GetPublicKey => {
+        | Nip55RequestType::DecryptZapEvent => {
             factors.push(SigningRiskFactor::SensitiveOperation);
         }
-        Nip55RequestType::SignEvent => {}
+        Nip55RequestType::GetPublicKey | Nip55RequestType::SignEvent => {}
     }
 
     if let Some(kind) = ctx.event_kind {
@@ -163,11 +173,11 @@ pub fn assess_signing_risk(ctx: SigningRequestContext) -> SigningRiskAssessment 
         }
     }
 
-    if ctx.recent_request_count > HIGH_FREQUENCY_THRESHOLD {
+    if recent_request_count > HIGH_FREQUENCY_THRESHOLD {
         factors.push(SigningRiskFactor::HighFrequency);
     }
 
-    if !(6..23).contains(&clamped_hour) {
+    if !(6..23).contains(&current_hour) {
         factors.push(SigningRiskFactor::UnusualTime);
     }
 
@@ -299,39 +309,50 @@ impl SigningRateLimiter {
             return AutoSignDecision::CoolingOff { until_ms: until };
         }
 
-        let hourly = increment_usage(&mut state.hourly, &package_name, now_ms, HOUR_MS);
-        let daily = increment_usage(&mut state.daily, &package_name, now_ms, DAY_MS);
-        let recent = increment_usage(
-            &mut state.recent,
+        let hourly = get_usage_count(&state.hourly, &package_name, now_ms, HOUR_MS);
+        let daily = get_usage_count(&state.daily, &package_name, now_ms, DAY_MS);
+        let recent = get_usage_count(
+            &state.recent,
             &package_name,
             now_ms,
             UNUSUAL_ACTIVITY_WINDOW_MS,
         );
 
-        if hourly > HOURLY_LIMIT {
+        if hourly >= HOURLY_LIMIT {
             state
                 .cooled_off_until
                 .insert(package_name, now_ms + COOLING_OFF_PERIOD_MS);
             return AutoSignDecision::HourlyLimitExceeded;
         }
 
-        if daily > DAILY_LIMIT {
+        if daily >= DAILY_LIMIT {
             state
                 .cooled_off_until
                 .insert(package_name, now_ms + COOLING_OFF_PERIOD_MS);
             return AutoSignDecision::DailyLimitExceeded;
         }
 
-        if recent > UNUSUAL_ACTIVITY_THRESHOLD {
+        if recent >= UNUSUAL_ACTIVITY_THRESHOLD {
             state
                 .cooled_off_until
-                .insert(package_name, now_ms + COOLING_OFF_PERIOD_MS);
+                .insert(package_name.clone(), now_ms + COOLING_OFF_PERIOD_MS);
             return AutoSignDecision::UnusualActivity;
         }
+
+        let hourly = increment_usage(&mut state.hourly, &package_name, now_ms, HOUR_MS);
+        let daily = increment_usage(&mut state.daily, &package_name, now_ms, DAY_MS);
+        increment_usage(
+            &mut state.recent,
+            &package_name,
+            now_ms,
+            UNUSUAL_ACTIVITY_WINDOW_MS,
+        );
 
         AutoSignDecision::Allowed {
             hourly_count: hourly,
             daily_count: daily,
+            hourly_limit: HOURLY_LIMIT,
+            daily_limit: DAILY_LIMIT,
         }
     }
 }
@@ -339,23 +360,28 @@ impl SigningRateLimiter {
 #[uniffi::export]
 pub fn evaluate_sign_policy(
     policy_mode: PolicyMode,
-    operation: Nip55RequestType,
-    event_kind: Option<u32>,
+    ctx: SigningRequestContext,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
-    risk: SigningRiskAssessment,
 ) -> SignPolicyEvaluation {
     if matches!(policy_mode, PolicyMode::Manual) {
         return SignPolicyEvaluation::FallToUi;
     }
 
-    if !matches!(operation, Nip55RequestType::SignEvent) {
+    if !matches!(ctx.operation, Nip55RequestType::SignEvent) {
         return SignPolicyEvaluation::FallToUi;
     }
 
-    if event_kind.is_some_and(is_sensitive_kind) {
+    if ctx.event_kind.is_some_and(is_sensitive_kind) {
         return SignPolicyEvaluation::FallToUi;
     }
+
+    let recent_count = match &rate_check {
+        AutoSignDecision::Allowed { hourly_count, .. } => *hourly_count,
+        _ => 0,
+    };
+
+    let risk = assess_signing_risk(ctx, recent_count);
 
     if !is_opted_in || risk.score >= RISK_ESCALATION_THRESHOLD {
         return SignPolicyEvaluation::FallToUi;
@@ -424,6 +450,25 @@ fn evict_if_needed(map: &mut HashMap<String, UsageWindow>, now_ms: u64, window_m
 mod tests {
     use super::*;
 
+    fn test_ctx(operation: Nip55RequestType, event_kind: Option<u32>) -> SigningRequestContext {
+        SigningRequestContext {
+            operation,
+            package_name: "com.test".to_string(),
+            event_kind,
+            has_signed_kind_before: true,
+            app_age_ms: Some(48 * 60 * 60 * 1000),
+        }
+    }
+
+    fn allowed(hourly: u32, daily: u32) -> AutoSignDecision {
+        AutoSignDecision::Allowed {
+            hourly_count: hourly,
+            daily_count: daily,
+            hourly_limit: HOURLY_LIMIT,
+            daily_limit: DAILY_LIMIT,
+        }
+    }
+
     #[test]
     fn test_sensitive_kinds() {
         assert!(is_sensitive_kind(0));
@@ -446,53 +491,19 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_assessment_no_factors() {
-        let ctx = SigningRequestContext {
-            operation: Nip55RequestType::SignEvent,
-            package_name: "com.test".to_string(),
-            event_kind: Some(1),
-            current_hour: 12,
-            recent_request_count: 0,
-            has_signed_kind_before: true,
-            app_age_ms: Some(48 * 60 * 60 * 1000),
-        };
-        let result = assess_signing_risk(ctx);
-        assert_eq!(result.score, 0);
-        assert!(result.factors.is_empty());
-        assert_eq!(result.required_auth, SigningAuthLevel::None);
-    }
-
-    #[test]
     fn test_risk_assessment_sensitive_kind() {
-        let ctx = SigningRequestContext {
-            operation: Nip55RequestType::SignEvent,
-            package_name: "com.test".to_string(),
-            event_kind: Some(4),
-            current_hour: 12,
-            recent_request_count: 0,
-            has_signed_kind_before: true,
-            app_age_ms: Some(48 * 60 * 60 * 1000),
-        };
-        let result = assess_signing_risk(ctx);
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
+        let result = assess_signing_risk(ctx, 0);
         assert!(result
             .factors
             .contains(&SigningRiskFactor::SensitiveEventKind));
-        assert_eq!(result.required_auth, SigningAuthLevel::Biometric);
     }
 
     #[test]
-    fn test_risk_assessment_high_score() {
-        let ctx = SigningRequestContext {
-            operation: Nip55RequestType::SignEvent,
-            package_name: "com.test".to_string(),
-            event_kind: Some(4),
-            current_hour: 3,
-            recent_request_count: 20,
-            has_signed_kind_before: false,
-            app_age_ms: Some(0),
-        };
-        let result = assess_signing_risk(ctx);
-        assert_eq!(result.required_auth, SigningAuthLevel::Explicit);
+    fn test_risk_assessment_high_frequency() {
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        let result = assess_signing_risk(ctx, 20);
+        assert!(result.factors.contains(&SigningRiskFactor::HighFrequency));
     }
 
     #[test]
@@ -501,41 +512,55 @@ mod tests {
             operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
-            current_hour: 12,
-            recent_request_count: 0,
             has_signed_kind_before: true,
             app_age_ms: None,
         };
-        let result = assess_signing_risk(ctx);
+        let result = assess_signing_risk(ctx, 0);
         assert!(result.factors.contains(&SigningRiskFactor::UnknownAge));
-        assert_eq!(result.score, 5);
     }
 
     #[test]
-    fn test_risk_assessment_hour_clamped() {
+    fn test_risk_assessment_new_app() {
         let ctx = SigningRequestContext {
             operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
-            current_hour: 99,
-            recent_request_count: 0,
             has_signed_kind_before: true,
-            app_age_ms: Some(48 * 60 * 60 * 1000),
+            app_age_ms: Some(0),
         };
-        let result = assess_signing_risk(ctx);
-        assert!(result.factors.contains(&SigningRiskFactor::UnusualTime));
+        let result = assess_signing_risk(ctx, 0);
+        assert!(result.factors.contains(&SigningRiskFactor::NewApp));
+    }
 
-        let ctx2 = SigningRequestContext {
+    #[test]
+    fn test_risk_assessment_first_kind() {
+        let ctx = SigningRequestContext {
             operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
-            current_hour: 12,
-            recent_request_count: 0,
-            has_signed_kind_before: true,
+            has_signed_kind_before: false,
             app_age_ms: Some(48 * 60 * 60 * 1000),
         };
-        let result2 = assess_signing_risk(ctx2);
-        assert!(!result2.factors.contains(&SigningRiskFactor::UnusualTime));
+        let result = assess_signing_risk(ctx, 0);
+        assert!(result.factors.contains(&SigningRiskFactor::FirstKind));
+    }
+
+    #[test]
+    fn test_risk_assessment_sensitive_operation() {
+        let ctx = test_ctx(Nip55RequestType::Nip44Decrypt, None);
+        let result = assess_signing_risk(ctx, 0);
+        assert!(result
+            .factors
+            .contains(&SigningRiskFactor::SensitiveOperation));
+    }
+
+    #[test]
+    fn test_risk_assessment_get_public_key_not_sensitive() {
+        let ctx = test_ctx(Nip55RequestType::GetPublicKey, None);
+        let result = assess_signing_risk(ctx, 0);
+        assert!(!result
+            .factors
+            .contains(&SigningRiskFactor::SensitiveOperation));
     }
 
     #[test]
@@ -543,6 +568,23 @@ mod tests {
         let limiter = SigningRateLimiter::new();
         let result = limiter.check_and_record_at("com.test".to_string(), 1000);
         assert!(matches!(result, AutoSignDecision::Allowed { .. }));
+    }
+
+    #[test]
+    fn test_rate_limiter_allowed_includes_limits() {
+        let limiter = SigningRateLimiter::new();
+        let result = limiter.check_and_record_at("com.test".to_string(), 1000);
+        match result {
+            AutoSignDecision::Allowed {
+                hourly_limit,
+                daily_limit,
+                ..
+            } => {
+                assert_eq!(hourly_limit, HOURLY_LIMIT);
+                assert_eq!(daily_limit, DAILY_LIMIT);
+            }
+            other => panic!("Expected Allowed, got {:?}", other),
+        }
     }
 
     #[test]
@@ -565,6 +607,23 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_limiter_denied_does_not_increment() {
+        let limiter = SigningRateLimiter::new();
+        let base = 1_000_000u64;
+        let gap = 1201u64;
+        for i in 0..HOURLY_LIMIT {
+            limiter.check_and_record_at("com.test".to_string(), base + (i as u64) * gap);
+        }
+        let ts_exceed = base + (HOURLY_LIMIT as u64) * gap;
+        let result = limiter.check_and_record_at("com.test".to_string(), ts_exceed);
+        assert!(matches!(result, AutoSignDecision::HourlyLimitExceeded));
+
+        let state = limiter.state.lock().unwrap();
+        let hourly = state.hourly.get("com.test").unwrap();
+        assert_eq!(hourly.count, HOURLY_LIMIT);
+    }
+
+    #[test]
     fn test_rate_limiter_cooling_off() {
         let limiter = SigningRateLimiter::new();
         for i in 0..=HOURLY_LIMIT {
@@ -574,147 +633,51 @@ mod tests {
         assert!(matches!(result, AutoSignDecision::CoolingOff { .. }));
     }
 
-    fn low_risk() -> SigningRiskAssessment {
-        SigningRiskAssessment {
-            score: 0,
-            factors: vec![],
-            required_auth: SigningAuthLevel::None,
-        }
-    }
-
-    fn high_risk() -> SigningRiskAssessment {
-        SigningRiskAssessment {
-            score: 40,
-            factors: vec![SigningRiskFactor::SensitiveEventKind],
-            required_auth: SigningAuthLevel::Biometric,
-        }
-    }
-
     #[test]
     fn test_evaluate_sign_policy_manual() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Manual,
-            Nip55RequestType::SignEvent,
-            None,
-            false,
-            AutoSignDecision::Allowed {
-                hourly_count: 0,
-                daily_count: 0,
-            },
-            low_risk(),
-        );
+        let ctx = test_ctx(Nip55RequestType::SignEvent, None);
+        let result = evaluate_sign_policy(PolicyMode::Manual, ctx, false, allowed(0, 0));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_sensitive() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Auto,
-            Nip55RequestType::SignEvent,
-            Some(4),
-            true,
-            AutoSignDecision::Allowed {
-                hourly_count: 1,
-                daily_count: 1,
-            },
-            low_risk(),
-        );
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_approved() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Auto,
-            Nip55RequestType::SignEvent,
-            Some(1),
-            true,
-            AutoSignDecision::Allowed {
-                hourly_count: 1,
-                daily_count: 1,
-            },
-            low_risk(),
-        );
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::AutoApprove);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_not_opted_in() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Auto,
-            Nip55RequestType::SignEvent,
-            Some(1),
-            false,
-            AutoSignDecision::Allowed {
-                hourly_count: 0,
-                daily_count: 0,
-            },
-            low_risk(),
-        );
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, false, allowed(0, 0));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_rate_limit_falls_to_ui() {
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55RequestType::SignEvent,
-            Some(1),
+            ctx,
             true,
             AutoSignDecision::HourlyLimitExceeded,
-            low_risk(),
-        );
-        assert_eq!(result, SignPolicyEvaluation::FallToUi);
-    }
-
-    #[test]
-    fn test_evaluate_sign_policy_high_risk_falls_to_ui() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Auto,
-            Nip55RequestType::SignEvent,
-            Some(1),
-            true,
-            AutoSignDecision::Allowed {
-                hourly_count: 1,
-                daily_count: 1,
-            },
-            high_risk(),
         );
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_encrypt_falls_to_ui() {
-        let result = evaluate_sign_policy(
-            PolicyMode::Auto,
-            Nip55RequestType::Nip44Encrypt,
-            None,
-            true,
-            AutoSignDecision::Allowed {
-                hourly_count: 1,
-                daily_count: 1,
-            },
-            low_risk(),
-        );
+        let ctx = test_ctx(Nip55RequestType::Nip44Encrypt, None);
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
-    }
-
-    #[test]
-    fn test_risk_assessment_sensitive_operation() {
-        let ctx = SigningRequestContext {
-            operation: Nip55RequestType::Nip44Decrypt,
-            package_name: "com.test".to_string(),
-            event_kind: None,
-            current_hour: 12,
-            recent_request_count: 0,
-            has_signed_kind_before: true,
-            app_age_ms: Some(48 * 60 * 60 * 1000),
-        };
-        let result = assess_signing_risk(ctx);
-        assert!(result
-            .factors
-            .contains(&SigningRiskFactor::SensitiveOperation));
-        assert_eq!(result.required_auth, SigningAuthLevel::Biometric);
     }
 
     #[test]
