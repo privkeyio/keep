@@ -12,6 +12,7 @@ mod nip55;
 mod persistence;
 mod policy;
 mod psbt;
+mod signing_policy;
 mod storage;
 mod types;
 mod velocity;
@@ -29,6 +30,11 @@ pub use nip46::{
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
+pub use signing_policy::{
+    assess_signing_risk, evaluate_sign_policy, is_sensitive_kind, sensitive_kind_warning,
+    AutoSignDecision, PolicyMode, SignPolicyEvaluation, SigningAuthLevel, SigningRateLimiter,
+    SigningRequestContext, SigningRiskAssessment, SigningRiskFactor, UsageStats,
+};
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,

@@ -29,7 +29,7 @@ fn pubkey_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum Nip55RequestType {
     GetPublicKey,
     SignEvent,
