@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
+use crate::nip55::Nip55RequestType;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,7 +65,7 @@ pub struct SigningRiskAssessment {
 
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct SigningRequestContext {
-    pub operation: Nip55Operation,
+    pub operation: Nip55RequestType,
     pub package_name: String,
     pub event_kind: Option<u32>,
     pub current_hour: u32,
@@ -93,17 +94,6 @@ pub enum SignPolicyEvaluation {
 pub enum PolicyMode {
     Manual,
     Auto,
-}
-
-#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
-pub enum Nip55Operation {
-    GetPublicKey,
-    SignEvent,
-    Nip04Encrypt,
-    Nip44Encrypt,
-    Nip04Decrypt,
-    Nip44Decrypt,
-    DecryptZapEvent,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -153,15 +143,15 @@ pub fn assess_signing_risk(ctx: SigningRequestContext) -> SigningRiskAssessment 
     let clamped_hour = ctx.current_hour.min(23);
 
     match ctx.operation {
-        Nip55Operation::Nip04Encrypt
-        | Nip55Operation::Nip44Encrypt
-        | Nip55Operation::Nip04Decrypt
-        | Nip55Operation::Nip44Decrypt
-        | Nip55Operation::DecryptZapEvent
-        | Nip55Operation::GetPublicKey => {
+        Nip55RequestType::Nip04Encrypt
+        | Nip55RequestType::Nip44Encrypt
+        | Nip55RequestType::Nip04Decrypt
+        | Nip55RequestType::Nip44Decrypt
+        | Nip55RequestType::DecryptZapEvent
+        | Nip55RequestType::GetPublicKey => {
             factors.push(SigningRiskFactor::SensitiveOperation);
         }
-        Nip55Operation::SignEvent => {}
+        Nip55RequestType::SignEvent => {}
     }
 
     if let Some(kind) = ctx.event_kind {
@@ -349,7 +339,7 @@ impl SigningRateLimiter {
 #[uniffi::export]
 pub fn evaluate_sign_policy(
     policy_mode: PolicyMode,
-    operation: Nip55Operation,
+    operation: Nip55RequestType,
     event_kind: Option<u32>,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
@@ -359,7 +349,7 @@ pub fn evaluate_sign_policy(
         return SignPolicyEvaluation::FallToUi;
     }
 
-    if !matches!(operation, Nip55Operation::SignEvent) {
+    if !matches!(operation, Nip55RequestType::SignEvent) {
         return SignPolicyEvaluation::FallToUi;
     }
 
@@ -458,7 +448,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_no_factors() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
             current_hour: 12,
@@ -475,7 +465,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_sensitive_kind() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(4),
             current_hour: 12,
@@ -493,7 +483,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_high_score() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(4),
             current_hour: 3,
@@ -508,7 +498,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_unknown_age() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
             current_hour: 12,
@@ -524,7 +514,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_hour_clamped() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
             current_hour: 99,
@@ -536,7 +526,7 @@ mod tests {
         assert!(result.factors.contains(&SigningRiskFactor::UnusualTime));
 
         let ctx2 = SigningRequestContext {
-            operation: Nip55Operation::SignEvent,
+            operation: Nip55RequestType::SignEvent,
             package_name: "com.test".to_string(),
             event_kind: Some(1),
             current_hour: 12,
@@ -604,7 +594,7 @@ mod tests {
     fn test_evaluate_sign_policy_manual() {
         let result = evaluate_sign_policy(
             PolicyMode::Manual,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             None,
             false,
             AutoSignDecision::Allowed {
@@ -620,7 +610,7 @@ mod tests {
     fn test_evaluate_sign_policy_auto_sensitive() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             Some(4),
             true,
             AutoSignDecision::Allowed {
@@ -636,7 +626,7 @@ mod tests {
     fn test_evaluate_sign_policy_auto_approved() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             Some(1),
             true,
             AutoSignDecision::Allowed {
@@ -652,7 +642,7 @@ mod tests {
     fn test_evaluate_sign_policy_auto_not_opted_in() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             Some(1),
             false,
             AutoSignDecision::Allowed {
@@ -668,7 +658,7 @@ mod tests {
     fn test_evaluate_sign_policy_rate_limit_falls_to_ui() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             Some(1),
             true,
             AutoSignDecision::HourlyLimitExceeded,
@@ -681,7 +671,7 @@ mod tests {
     fn test_evaluate_sign_policy_high_risk_falls_to_ui() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::SignEvent,
+            Nip55RequestType::SignEvent,
             Some(1),
             true,
             AutoSignDecision::Allowed {
@@ -697,7 +687,7 @@ mod tests {
     fn test_evaluate_sign_policy_encrypt_falls_to_ui() {
         let result = evaluate_sign_policy(
             PolicyMode::Auto,
-            Nip55Operation::Nip44Encrypt,
+            Nip55RequestType::Nip44Encrypt,
             None,
             true,
             AutoSignDecision::Allowed {
@@ -712,7 +702,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_sensitive_operation() {
         let ctx = SigningRequestContext {
-            operation: Nip55Operation::Nip44Decrypt,
+            operation: Nip55RequestType::Nip44Decrypt,
             package_name: "com.test".to_string(),
             event_kind: None,
             current_hour: 12,
