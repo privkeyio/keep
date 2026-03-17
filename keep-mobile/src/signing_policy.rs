@@ -77,6 +77,7 @@ pub enum AutoSignDecision {
     Allowed {
         hourly_count: u32,
         daily_count: u32,
+        recent_count: u32,
         hourly_limit: u32,
         daily_limit: u32,
     },
@@ -145,13 +146,11 @@ pub fn sensitive_kind_warning(kind: u32) -> Option<String> {
 pub fn assess_signing_risk(
     ctx: SigningRequestContext,
     recent_request_count: u32,
+    current_hour: u32,
 ) -> SigningRiskAssessment {
     let mut factors = Vec::new();
 
-    let current_hour = {
-        let secs = now_ms() / 1000;
-        ((secs % 86400) / 3600) as u32
-    };
+    let current_hour = current_hour.clamp(0, 23);
 
     match ctx.operation {
         Nip55RequestType::Nip04Encrypt
@@ -341,7 +340,7 @@ impl SigningRateLimiter {
 
         let hourly = increment_usage(&mut state.hourly, &package_name, now_ms, HOUR_MS);
         let daily = increment_usage(&mut state.daily, &package_name, now_ms, DAY_MS);
-        increment_usage(
+        let recent = increment_usage(
             &mut state.recent,
             &package_name,
             now_ms,
@@ -351,6 +350,7 @@ impl SigningRateLimiter {
         AutoSignDecision::Allowed {
             hourly_count: hourly,
             daily_count: daily,
+            recent_count: recent,
             hourly_limit: HOURLY_LIMIT,
             daily_limit: DAILY_LIMIT,
         }
@@ -377,11 +377,15 @@ pub fn evaluate_sign_policy(
     }
 
     let recent_count = match &rate_check {
-        AutoSignDecision::Allowed { hourly_count, .. } => *hourly_count,
+        AutoSignDecision::Allowed { recent_count, .. } => *recent_count,
         _ => 0,
     };
 
-    let risk = assess_signing_risk(ctx, recent_count);
+    let current_hour = {
+        let secs = now_ms() / 1000;
+        ((secs % 86400) / 3600) as u32
+    };
+    let risk = assess_signing_risk(ctx, recent_count, current_hour);
 
     if !is_opted_in || risk.score >= RISK_ESCALATION_THRESHOLD {
         return SignPolicyEvaluation::FallToUi;
@@ -464,6 +468,7 @@ mod tests {
         AutoSignDecision::Allowed {
             hourly_count: hourly,
             daily_count: daily,
+            recent_count: 0,
             hourly_limit: HOURLY_LIMIT,
             daily_limit: DAILY_LIMIT,
         }
@@ -493,7 +498,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_sensitive_kind() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(result
             .factors
             .contains(&SigningRiskFactor::SensitiveEventKind));
@@ -502,7 +507,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_high_frequency() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-        let result = assess_signing_risk(ctx, 20);
+        let result = assess_signing_risk(ctx, 20, 12);
         assert!(result.factors.contains(&SigningRiskFactor::HighFrequency));
     }
 
@@ -515,7 +520,7 @@ mod tests {
             has_signed_kind_before: true,
             app_age_ms: None,
         };
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(result.factors.contains(&SigningRiskFactor::UnknownAge));
     }
 
@@ -528,7 +533,7 @@ mod tests {
             has_signed_kind_before: true,
             app_age_ms: Some(0),
         };
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(result.factors.contains(&SigningRiskFactor::NewApp));
     }
 
@@ -541,14 +546,14 @@ mod tests {
             has_signed_kind_before: false,
             app_age_ms: Some(48 * 60 * 60 * 1000),
         };
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(result.factors.contains(&SigningRiskFactor::FirstKind));
     }
 
     #[test]
     fn test_risk_assessment_sensitive_operation() {
         let ctx = test_ctx(Nip55RequestType::Nip44Decrypt, None);
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(result
             .factors
             .contains(&SigningRiskFactor::SensitiveOperation));
@@ -557,7 +562,7 @@ mod tests {
     #[test]
     fn test_risk_assessment_get_public_key_not_sensitive() {
         let ctx = test_ctx(Nip55RequestType::GetPublicKey, None);
-        let result = assess_signing_risk(ctx, 0);
+        let result = assess_signing_risk(ctx, 0, 12);
         assert!(!result
             .factors
             .contains(&SigningRiskFactor::SensitiveOperation));
@@ -626,10 +631,13 @@ mod tests {
     #[test]
     fn test_rate_limiter_cooling_off() {
         let limiter = SigningRateLimiter::new();
+        let base = 1_000_000u64;
+        let gap = 1201u64;
         for i in 0..=HOURLY_LIMIT {
-            limiter.check_and_record_at("com.test".to_string(), 1000 + i as u64);
+            limiter.check_and_record_at("com.test".to_string(), base + (i as u64) * gap);
         }
-        let result = limiter.check_and_record_at("com.test".to_string(), 2000);
+        let ts = base + ((HOURLY_LIMIT + 1) as u64) * gap;
+        let result = limiter.check_and_record_at("com.test".to_string(), ts);
         assert!(matches!(result, AutoSignDecision::CoolingOff { .. }));
     }
 
