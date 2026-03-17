@@ -240,6 +240,7 @@ impl Default for SigningRateLimiter {
     }
 }
 
+#[derive(Default)]
 struct RateLimiterState {
     hourly: HashMap<String, UsageWindow>,
     daily: HashMap<String, UsageWindow>,
@@ -252,12 +253,7 @@ impl SigningRateLimiter {
     #[uniffi::constructor]
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(RateLimiterState {
-                hourly: HashMap::new(),
-                daily: HashMap::new(),
-                recent: HashMap::new(),
-                cooled_off_until: HashMap::new(),
-            }),
+            state: Mutex::new(RateLimiterState::default()),
         }
     }
 
@@ -364,11 +360,11 @@ pub fn evaluate_sign_policy(
     is_opted_in: bool,
     rate_check: AutoSignDecision,
 ) -> SignPolicyEvaluation {
-    if matches!(policy_mode, PolicyMode::Manual) {
+    if policy_mode == PolicyMode::Manual {
         return SignPolicyEvaluation::FallToUi;
     }
 
-    if !matches!(ctx.operation, Nip55RequestType::SignEvent) {
+    if ctx.operation != Nip55RequestType::SignEvent {
         return SignPolicyEvaluation::FallToUi;
     }
 
@@ -376,15 +372,13 @@ pub fn evaluate_sign_policy(
         return SignPolicyEvaluation::FallToUi;
     }
 
-    let recent_count = match &rate_check {
-        AutoSignDecision::Allowed { recent_count, .. } => *recent_count,
-        _ => 0,
+    let recent_count = if let AutoSignDecision::Allowed { recent_count, .. } = &rate_check {
+        *recent_count
+    } else {
+        0
     };
 
-    let current_hour = {
-        let secs = now_ms() / 1000;
-        ((secs % 86400) / 3600) as u32
-    };
+    let current_hour = ((now_ms() / 1000 % 86400) / 3600) as u32;
     let risk = assess_signing_risk(ctx, recent_count, current_hour);
 
     if !is_opted_in || risk.score >= RISK_ESCALATION_THRESHOLD {
