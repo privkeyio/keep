@@ -32,8 +32,9 @@ pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use signing_policy::{
     assess_signing_risk, evaluate_sign_policy, is_sensitive_kind, sensitive_kind_warning,
-    AutoSignDecision, PolicyMode, SignPolicyEvaluation, SigningAuthLevel, SigningRateLimiter,
-    SigningRequestContext, SigningRiskAssessment, SigningRiskFactor, UsageStats,
+    AutoSignDecision, Nip55Operation, PolicyMode, SignPolicyEvaluation, SigningAuthLevel,
+    SigningRateLimiter, SigningRequestContext, SigningRiskAssessment, SigningRiskFactor,
+    UsageStats,
 };
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
