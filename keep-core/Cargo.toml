@@ -49,7 +49,7 @@ dirs = "6.0"
 tracing = "0.1"
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"
 temp-env = "0.3"
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.5"
