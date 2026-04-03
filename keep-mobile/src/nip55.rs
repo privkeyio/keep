@@ -109,11 +109,9 @@ fn spawn_async_with_timeout<T: Send + 'static>(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeepMobileError::FrostError {
             msg: format!("{operation} timed out"),
         }),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(KeepMobileError::FrostError {
-                msg: format!("{operation} failed unexpectedly"),
-            })
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(KeepMobileError::FrostError {
+            msg: format!("{operation} failed unexpectedly"),
+        }),
     }
 }
 

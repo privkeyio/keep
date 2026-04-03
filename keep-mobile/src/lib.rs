@@ -306,11 +306,13 @@ struct MobileSigningHooks {
 
 impl MobileSigningHooks {
     fn set_pre_approved(&self, approved: bool) {
-        self.pre_approved.store(approved, std::sync::atomic::Ordering::Release);
+        self.pre_approved
+            .store(approved, std::sync::atomic::Ordering::Release);
     }
 
     fn consume_pre_approval(&self) -> bool {
-        self.pre_approved.swap(false, std::sync::atomic::Ordering::AcqRel)
+        self.pre_approved
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }
 

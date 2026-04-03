@@ -235,7 +235,13 @@ impl KfpNode {
                 if session.has_all_shares() {
                     let pubkey_pkg = self.share.pubkey_package()?;
                     let sig = session.try_aggregate(&pubkey_pkg)?;
-                    sig.map(|s| (s, session.message().to_vec(), session.participants().to_vec()))
+                    sig.map(|s| {
+                        (
+                            s,
+                            session.message().to_vec(),
+                            session.participants().to_vec(),
+                        )
+                    })
                 } else {
                     None
                 }
