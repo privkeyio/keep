@@ -226,11 +226,59 @@ impl KfpNode {
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
 
-        {
+        let self_aggregated_sig = {
             let mut sessions = self.sessions.write();
             if let Some(session) = sessions.get_session_mut(session_id) {
                 session.add_signature_share(self.share.metadata.identifier, sig_share)?;
+                if session.has_all_shares() {
+                    let pubkey_pkg = self.share.pubkey_package()?;
+                    session.try_aggregate(&pubkey_pkg)?
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        };
+
+        if let Some(sig) = self_aggregated_sig {
+            let session_message = {
+                let sessions = self.sessions.read();
+                sessions
+                    .get_session(session_id)
+                    .map(|s| s.message().to_vec())
+                    .unwrap_or_default()
+            };
+            let session_participants = {
+                let sessions = self.sessions.read();
+                sessions
+                    .get_session(session_id)
+                    .map(|s| s.participants().to_vec())
+                    .unwrap_or_default()
+            };
+
+            info!(
+                session_id = %hex::encode(session_id),
+                "Signature complete (single-participant)!"
+            );
+
+            self.audit_log.log_signing_operation(
+                *session_id,
+                &session_message,
+                Some(&sig),
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureCompleted,
+            );
+
+            self.invoke_post_sign_hook(session_id, &sig);
+
+            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
+                session_id: *session_id,
+                signature: sig,
+            });
+
+            return Ok(());
         }
 
         let share_bytes = sig_share.serialize();
@@ -490,6 +538,20 @@ impl KfpNode {
         }
 
         let mut rx = self.event_tx.subscribe();
+
+        // For single-participant (threshold=1), all commitments are already present.
+        // Must subscribe before generating share so we don't miss SignatureComplete.
+        let all_committed = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&session_id)
+                .map(|s| s.has_all_commitments())
+                .unwrap_or(false)
+        };
+        if all_committed {
+            self.generate_and_send_share(&session_id).await?;
+        }
+
         let timeout = Duration::from_secs(30);
 
         let result = tokio::time::timeout(timeout, async {

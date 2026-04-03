@@ -301,10 +301,25 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
+    pre_approved: std::sync::atomic::AtomicBool,
+}
+
+impl MobileSigningHooks {
+    fn set_pre_approved(&self, approved: bool) {
+        self.pre_approved.store(approved, std::sync::atomic::Ordering::Release);
+    }
+
+    fn consume_pre_approval(&self) -> bool {
+        self.pre_approved.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
+        if self.consume_pre_approval() {
+            return Ok(());
+        }
+
         let (response_tx, mut response_rx) = mpsc::channel(1);
         if self
             .request_tx
@@ -360,6 +375,7 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
+    signing_hooks: Arc<RwLock<Option<Arc<MobileSigningHooks>>>>,
 }
 
 struct PendingRequest {
@@ -483,6 +499,7 @@ impl KeepMobile {
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            signing_hooks: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -546,6 +563,14 @@ impl KeepMobile {
         let result = self.do_import_nsec(&hex_key, name);
         hex_key.zeroize();
         result
+    }
+
+    pub fn set_signing_pre_approved(&self, approved: bool) {
+        self.runtime.block_on(async {
+            if let Some(hooks) = self.signing_hooks.read().await.as_ref() {
+                hooks.set_pre_approved(approved);
+            }
+        });
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -1854,8 +1879,12 @@ impl KeepMobile {
             };
 
             let (request_tx, request_rx) = mpsc::channel(32);
-            let hooks = Arc::new(MobileSigningHooks { request_tx });
-            node.set_hooks(hooks);
+            let hooks = Arc::new(MobileSigningHooks {
+                request_tx,
+                pre_approved: std::sync::atomic::AtomicBool::new(false),
+            });
+            node.set_hooks(hooks.clone());
+            *self.signing_hooks.write().await = Some(hooks);
 
             let event_rx = node.subscribe();
             let node = Arc::new(node);

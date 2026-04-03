@@ -474,14 +474,24 @@ impl Nip55Handler {
 
         let event_hash = compute_nostr_event_id(&event)?;
 
-        let signature = self.mobile.runtime.block_on(async {
-            let node_guard = self.mobile.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            node.request_signature(event_hash.to_vec(), "nostr_event")
-                .await
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
-        })?;
+        let node_arc = self.mobile.node.clone();
+        let rt = self.mobile.runtime.handle().clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        rt.spawn(async move {
+            let result: Result<[u8; 64], KeepMobileError> = async {
+                let node_guard = node_arc.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                node.request_signature(event_hash.to_vec(), "nostr_event")
+                    .await
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+            }.await;
+            let _ = tx.send(result);
+        });
+        let signature = rx
+            .recv_timeout(std::time::Duration::from_secs(35))
+            .map_err(|e| KeepMobileError::FrostError {
+                msg: format!("Signing channel error: {e}")
+            })??;
 
         let signature_hex = hex::encode(signature);
 
