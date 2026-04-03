@@ -100,7 +100,9 @@ impl KfpNode {
             .read()
             .get_peer_by_pubkey(&from)
             .map(|p| p.share_index)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!("Peer {from} not found in peer list"))
+            })?;
 
         let session_info = SessionInfo {
             session_id: request.session_id,
@@ -242,18 +244,11 @@ impl KfpNode {
         };
 
         if let Some(sig) = self_aggregated_sig {
-            let session_message = {
+            let (session_message, session_participants) = {
                 let sessions = self.sessions.read();
                 sessions
                     .get_session(session_id)
-                    .map(|s| s.message().to_vec())
-                    .unwrap_or_default()
-            };
-            let session_participants = {
-                let sessions = self.sessions.read();
-                sessions
-                    .get_session(session_id)
-                    .map(|s| s.participants().to_vec())
+                    .map(|s| (s.message().to_vec(), s.participants().to_vec()))
                     .unwrap_or_default()
             };
 
@@ -395,19 +390,27 @@ impl KfpNode {
     ) -> Result<()> {
         {
             let sessions = self.sessions.read();
-            if let Some(session) = sessions.get_session(&payload.session_id) {
-                let peers = self.peers.read();
-                let is_participant = session.participants().iter().any(|&idx| {
-                    peers
-                        .get_peer(idx)
-                        .map(|p| p.pubkey == from)
-                        .unwrap_or(false)
-                });
-                if !is_participant {
-                    return Err(FrostNetError::UntrustedPeer(
-                        "Sender not a session participant".into(),
-                    ));
+            let session = match sessions.get_session(&payload.session_id) {
+                Some(s) => s,
+                None => {
+                    debug!(
+                        session_id = %hex::encode(payload.session_id),
+                        "Ignoring signature complete for unknown session"
+                    );
+                    return Ok(());
                 }
+            };
+            let peers = self.peers.read();
+            let is_participant = session.participants().iter().any(|&idx| {
+                peers
+                    .get_peer(idx)
+                    .map(|p| p.pubkey == from)
+                    .unwrap_or(false)
+            });
+            if !is_participant {
+                return Err(FrostNetError::UntrustedPeer(
+                    "Sender not a session participant".into(),
+                ));
             }
         }
 
@@ -477,6 +480,16 @@ impl KfpNode {
             participants.clone(),
         );
 
+        let session_info = SessionInfo {
+            session_id,
+            message: message.clone(),
+            threshold: self.share.metadata.threshold,
+            participants: participants.clone(),
+            requester: self.share.metadata.identifier,
+        };
+        let hooks = self.hooks.read().clone();
+        hooks.pre_sign(&session_info)?;
+
         let key_package = self.share.key_package()?;
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
@@ -494,21 +507,7 @@ impl KfpNode {
             session.set_our_commitment(our_commitment);
             session.add_commitment(self.share.metadata.identifier, our_commitment)?;
 
-            // Record consumption AFTER nonces are generated to prevent reuse across restarts
             sessions.record_nonce_consumption(&session_id)?;
-        }
-
-        let session_info = {
-            let sessions = self.sessions.read();
-            sessions
-                .get_session(&session_id)
-                .map(SessionInfo::from)
-                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
-        };
-        let hooks = self.hooks.read().clone();
-        if let Err(e) = hooks.pre_sign(&session_info) {
-            self.cleanup_session_on_hook_failure(&session_id);
-            return Err(e);
         }
 
         let our_commit_bytes = our_commitment

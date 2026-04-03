@@ -609,10 +609,6 @@ impl KfpNode {
             .is_none_or(|p| p.allow_receive)
     }
 
-    pub(crate) fn cleanup_session_on_hook_failure(&self, session_id: &[u8; 32]) {
-        self.sessions.write().complete_session(session_id);
-    }
-
     pub(crate) fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
         let info = {
             let mut sessions = self.sessions.write();
