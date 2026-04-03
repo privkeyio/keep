@@ -94,6 +94,31 @@ struct RateLimitState {
     consecutive_failures: u32,
 }
 
+fn spawn_async_with_timeout<T: Send + 'static>(
+    mobile: &KeepMobile,
+    timeout: Duration,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, KeepMobileError>> + Send + 'static,
+) -> Result<T, KeepMobileError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    mobile.runtime.handle().spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeepMobileError::FrostError {
+            msg: format!("{operation} timed out"),
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(KeepMobileError::FrostError {
+                msg: format!("{operation} failed unexpectedly"),
+            })
+        }
+    }
+}
+
+const FROST_OP_TIMEOUT: Duration = Duration::from_secs(35);
+
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
     mobile: Arc<KeepMobile>,
@@ -288,34 +313,16 @@ impl Nip55Handler {
         pubkey_bytes: &[u8; 33],
     ) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
         let node_arc = self.mobile.node.clone();
-        let rt = self.mobile.runtime.handle().clone();
         let pubkey_bytes = *pubkey_bytes;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        rt.spawn(async move {
-            let result: Result<Zeroizing<[u8; 32]>, KeepMobileError> = async {
-                let node_guard = node_arc.read().await;
-                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-                node.request_ecdh(&pubkey_bytes)
-                    .await
-                    .map_err(|_| KeepMobileError::FrostError {
-                        msg: "ECDH failed".into(),
-                    })
-            }.await;
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(std::time::Duration::from_secs(35)) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(KeepMobileError::FrostError {
-                    msg: "ECDH request timed out".into(),
+        spawn_async_with_timeout(&self.mobile, FROST_OP_TIMEOUT, "ECDH request", async move {
+            let node_guard = node_arc.read().await;
+            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            node.request_ecdh(&pubkey_bytes)
+                .await
+                .map_err(|_| KeepMobileError::FrostError {
+                    msg: "ECDH failed".into(),
                 })
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(KeepMobileError::FrostError {
-                    msg: "ECDH task failed unexpectedly".into(),
-                })
-            }
-        }
+        })
     }
 
     fn handle_nip44_encrypt(
@@ -494,31 +501,18 @@ impl Nip55Handler {
         let event_hash = compute_nostr_event_id(&event)?;
 
         let node_arc = self.mobile.node.clone();
-        let rt = self.mobile.runtime.handle().clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        rt.spawn(async move {
-            let result: Result<[u8; 64], KeepMobileError> = async {
+        let signature = spawn_async_with_timeout(
+            &self.mobile,
+            FROST_OP_TIMEOUT,
+            "Signing request",
+            async move {
                 let node_guard = node_arc.read().await;
                 let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
                 node.request_signature(event_hash.to_vec(), "nostr_event")
                     .await
                     .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
-            }.await;
-            let _ = tx.send(result);
-        });
-        let signature = match rx.recv_timeout(std::time::Duration::from_secs(35)) {
-            Ok(result) => result?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "Signing request timed out".into(),
-                });
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "Signing task failed unexpectedly".into(),
-                });
-            }
-        };
+            },
+        )?;
 
         let signature_hex = hex::encode(signature);
 
