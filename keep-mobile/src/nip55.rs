@@ -101,21 +101,24 @@ fn spawn_async_with_timeout<T: Send + 'static>(
     future: impl std::future::Future<Output = Result<T, KeepMobileError>> + Send + 'static,
 ) -> Result<T, KeepMobileError> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    mobile.runtime.handle().spawn(async move {
+    let handle = mobile.runtime.handle().spawn(async move {
         let _ = tx.send(future.await);
     });
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeepMobileError::FrostError {
-            msg: format!("{operation} timed out"),
-        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            handle.abort();
+            Err(KeepMobileError::FrostError {
+                msg: format!("{operation} timed out"),
+            })
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(KeepMobileError::FrostError {
             msg: format!("{operation} failed unexpectedly"),
         }),
     }
 }
 
-const FROST_OP_TIMEOUT: Duration = Duration::from_secs(35);
+const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
 
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
