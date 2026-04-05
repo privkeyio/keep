@@ -201,7 +201,10 @@ impl KfpNode {
         self.peers.write().update_last_seen(payload.share_index);
 
         if proceed_to_round2 {
-            self.generate_and_send_share(&payload.session_id).await?;
+            if let Err(e) = self.generate_and_send_share(&payload.session_id).await {
+                self.sessions.write().complete_session(&payload.session_id);
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -585,7 +588,10 @@ impl KfpNode {
 
         match result {
             Ok(r) => r,
-            Err(_) => Err(FrostNetError::Timeout("Signing request timed out".into())),
+            Err(_) => {
+                self.sessions.write().complete_session(&session_id);
+                Err(FrostNetError::Timeout("Signing request timed out".into()))
+            }
         }
     }
 }
