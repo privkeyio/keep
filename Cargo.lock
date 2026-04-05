@@ -4268,7 +4268,7 @@ dependencies = [
  "nix 0.31.2",
  "p384",
  "postcard",
- "rand_core 0.9.5",
+ "rand_core 0.10.0",
  "redb 3.1.1",
  "serde",
  "serde_json",

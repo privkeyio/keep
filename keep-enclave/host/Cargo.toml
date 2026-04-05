@@ -30,7 +30,7 @@ getrandom = "0.4"
 aes-gcm = "0.10.3"
 base64 = "0.22"
 redb.workspace = true
-rand_core = "0.9"
+rand_core = "0.10"
 der = { version = "0.8", features = ["alloc"] }
 
 [dev-dependencies]
