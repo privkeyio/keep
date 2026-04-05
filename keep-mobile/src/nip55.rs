@@ -94,6 +94,32 @@ struct RateLimitState {
     consecutive_failures: u32,
 }
 
+fn spawn_async_with_timeout<T: Send + 'static>(
+    mobile: &KeepMobile,
+    timeout: Duration,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, KeepMobileError>> + Send + 'static,
+) -> Result<T, KeepMobileError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = mobile.runtime.handle().spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            handle.abort();
+            Err(KeepMobileError::FrostError {
+                msg: format!("{operation} timed out"),
+            })
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(KeepMobileError::FrostError {
+            msg: format!("{operation} failed unexpectedly"),
+        }),
+    }
+}
+
+const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
+
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
     mobile: Arc<KeepMobile>,
@@ -287,11 +313,12 @@ impl Nip55Handler {
         &self,
         pubkey_bytes: &[u8; 33],
     ) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
-        self.mobile.runtime.block_on(async {
-            let node_guard = self.mobile.node.read().await;
+        let node_arc = self.mobile.node.clone();
+        let pubkey_bytes = *pubkey_bytes;
+        spawn_async_with_timeout(&self.mobile, FROST_OP_TIMEOUT, "ECDH request", async move {
+            let node_guard = node_arc.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            node.request_ecdh(pubkey_bytes)
+            node.request_ecdh(&pubkey_bytes)
                 .await
                 .map_err(|_| KeepMobileError::FrostError {
                     msg: "ECDH failed".into(),
@@ -474,14 +501,19 @@ impl Nip55Handler {
 
         let event_hash = compute_nostr_event_id(&event)?;
 
-        let signature = self.mobile.runtime.block_on(async {
-            let node_guard = self.mobile.node.read().await;
-            let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-
-            node.request_signature(event_hash.to_vec(), "nostr_event")
-                .await
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
-        })?;
+        let node_arc = self.mobile.node.clone();
+        let signature = spawn_async_with_timeout(
+            &self.mobile,
+            FROST_OP_TIMEOUT,
+            "Signing request",
+            async move {
+                let node_guard = node_arc.read().await;
+                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                node.request_signature(event_hash.to_vec(), "nostr_event")
+                    .await
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+            },
+        )?;
 
         let signature_hex = hex::encode(signature);
 

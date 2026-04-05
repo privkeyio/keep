@@ -100,7 +100,9 @@ impl KfpNode {
             .read()
             .get_peer_by_pubkey(&from)
             .map(|p| p.share_index)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!("Peer {from} not found in peer list"))
+            })?;
 
         let session_info = SessionInfo {
             session_id: request.session_id,
@@ -199,7 +201,10 @@ impl KfpNode {
         self.peers.write().update_last_seen(payload.share_index);
 
         if proceed_to_round2 {
-            self.generate_and_send_share(&payload.session_id).await?;
+            if let Err(e) = self.generate_and_send_share(&payload.session_id).await {
+                self.sessions.write().complete_session(&payload.session_id);
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -226,11 +231,51 @@ impl KfpNode {
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
 
-        {
+        let self_aggregated = {
             let mut sessions = self.sessions.write();
             if let Some(session) = sessions.get_session_mut(session_id) {
                 session.add_signature_share(self.share.metadata.identifier, sig_share)?;
+                if session.has_all_shares() {
+                    let pubkey_pkg = self.share.pubkey_package()?;
+                    let sig = session.try_aggregate(&pubkey_pkg)?;
+                    sig.map(|s| {
+                        (
+                            s,
+                            session.message().to_vec(),
+                            session.participants().to_vec(),
+                        )
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        };
+
+        if let Some((sig, session_message, session_participants)) = self_aggregated {
+            info!(
+                session_id = %hex::encode(session_id),
+                "Signature complete (single-participant)!"
+            );
+
+            self.audit_log.log_signing_operation(
+                *session_id,
+                &session_message,
+                Some(&sig),
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureCompleted,
+            );
+
+            self.invoke_post_sign_hook(session_id, &sig);
+
+            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
+                session_id: *session_id,
+                signature: sig,
+            });
+
+            return Ok(());
         }
 
         let share_bytes = sig_share.serialize();
@@ -347,19 +392,27 @@ impl KfpNode {
     ) -> Result<()> {
         {
             let sessions = self.sessions.read();
-            if let Some(session) = sessions.get_session(&payload.session_id) {
-                let peers = self.peers.read();
-                let is_participant = session.participants().iter().any(|&idx| {
-                    peers
-                        .get_peer(idx)
-                        .map(|p| p.pubkey == from)
-                        .unwrap_or(false)
-                });
-                if !is_participant {
-                    return Err(FrostNetError::UntrustedPeer(
-                        "Sender not a session participant".into(),
-                    ));
+            let session = match sessions.get_session(&payload.session_id) {
+                Some(s) => s,
+                None => {
+                    debug!(
+                        session_id = %hex::encode(payload.session_id),
+                        "Ignoring signature complete for unknown session"
+                    );
+                    return Ok(());
                 }
+            };
+            let peers = self.peers.read();
+            let is_participant = session.participants().iter().any(|&idx| {
+                peers
+                    .get_peer(idx)
+                    .map(|p| p.pubkey == from)
+                    .unwrap_or(false)
+            });
+            if !is_participant {
+                return Err(FrostNetError::UntrustedPeer(
+                    "Sender not a session participant".into(),
+                ));
             }
         }
 
@@ -429,6 +482,16 @@ impl KfpNode {
             participants.clone(),
         );
 
+        let session_info = SessionInfo {
+            session_id,
+            message: message.clone(),
+            threshold: self.share.metadata.threshold,
+            participants: participants.clone(),
+            requester: self.share.metadata.identifier,
+        };
+        let hooks = self.hooks.read().clone();
+        hooks.pre_sign(&session_info)?;
+
         let key_package = self.share.key_package()?;
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
@@ -446,21 +509,7 @@ impl KfpNode {
             session.set_our_commitment(our_commitment);
             session.add_commitment(self.share.metadata.identifier, our_commitment)?;
 
-            // Record consumption AFTER nonces are generated to prevent reuse across restarts
             sessions.record_nonce_consumption(&session_id)?;
-        }
-
-        let session_info = {
-            let sessions = self.sessions.read();
-            sessions
-                .get_session(&session_id)
-                .map(SessionInfo::from)
-                .ok_or_else(|| FrostNetError::SessionNotFound(hex::encode(session_id)))?
-        };
-        let hooks = self.hooks.read().clone();
-        if let Err(e) = hooks.pre_sign(&session_info) {
-            self.cleanup_session_on_hook_failure(&session_id);
-            return Err(e);
         }
 
         let our_commit_bytes = our_commitment
@@ -490,6 +539,23 @@ impl KfpNode {
         }
 
         let mut rx = self.event_tx.subscribe();
+
+        // For single-participant (threshold=1), all commitments are already present.
+        // Must subscribe before generating share so we don't miss SignatureComplete.
+        let all_committed = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&session_id)
+                .map(|s| s.has_all_commitments())
+                .unwrap_or(false)
+        };
+        if all_committed {
+            if let Err(e) = self.generate_and_send_share(&session_id).await {
+                self.sessions.write().complete_session(&session_id);
+                return Err(e);
+            }
+        }
+
         let timeout = Duration::from_secs(30);
 
         let result = tokio::time::timeout(timeout, async {
@@ -522,7 +588,10 @@ impl KfpNode {
 
         match result {
             Ok(r) => r,
-            Err(_) => Err(FrostNetError::Timeout("Signing request timed out".into())),
+            Err(_) => {
+                self.sessions.write().complete_session(&session_id);
+                Err(FrostNetError::Timeout("Signing request timed out".into()))
+            }
         }
     }
 }
