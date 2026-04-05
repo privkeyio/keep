@@ -301,24 +301,27 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
-    pre_approved: std::sync::atomic::AtomicBool,
+    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
 }
 
 impl MobileSigningHooks {
-    fn set_pre_approved(&self, approved: bool) {
-        self.pre_approved
-            .store(approved, std::sync::atomic::Ordering::Release);
-    }
-
-    fn consume_pre_approval(&self) -> bool {
-        self.pre_approved
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    fn consume_pre_approval(&self, message: &[u8]) -> bool {
+        let mut guard = self.pre_approved_hash.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hash) = guard.take() {
+            use sha2::{Digest, Sha256};
+            let msg_hash: [u8; 32] = Sha256::digest(message).into();
+            if hash == msg_hash {
+                return true;
+            }
+            *guard = Some(hash);
+        }
+        false
     }
 }
 
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
-        if self.consume_pre_approval() {
+        if self.consume_pre_approval(&session.message) {
             return Ok(());
         }
 
@@ -378,6 +381,7 @@ pub struct KeepMobile {
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
     signing_hooks: Arc<RwLock<Option<Arc<MobileSigningHooks>>>>,
+    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
 }
 
 struct PendingRequest {
@@ -502,6 +506,7 @@ impl KeepMobile {
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             signing_hooks: Arc::new(RwLock::new(None)),
+            pre_approved_hash: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -567,12 +572,14 @@ impl KeepMobile {
         result
     }
 
-    pub fn set_signing_pre_approved(&self, approved: bool) {
-        self.runtime.block_on(async {
-            if let Some(hooks) = self.signing_hooks.read().await.as_ref() {
-                hooks.set_pre_approved(approved);
-            }
-        });
+    pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
+        use sha2::{Digest, Sha256};
+        let hash: [u8; 32] = Sha256::digest(&message).into();
+        *self.pre_approved_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+    }
+
+    pub fn clear_signing_pre_approval(&self) {
+        *self.pre_approved_hash.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -1883,7 +1890,7 @@ impl KeepMobile {
             let (request_tx, request_rx) = mpsc::channel(32);
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
-                pre_approved: std::sync::atomic::AtomicBool::new(false),
+                pre_approved_hash: self.pre_approved_hash.clone(),
             });
             node.set_hooks(hooks.clone());
             *self.signing_hooks.write().await = Some(hooks);

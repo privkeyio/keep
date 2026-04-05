@@ -547,7 +547,10 @@ impl KfpNode {
                 .unwrap_or(false)
         };
         if all_committed {
-            self.generate_and_send_share(&session_id).await?;
+            if let Err(e) = self.generate_and_send_share(&session_id).await {
+                self.sessions.write().complete_session(&session_id);
+                return Err(e);
+            }
         }
 
         let timeout = Duration::from_secs(30);
