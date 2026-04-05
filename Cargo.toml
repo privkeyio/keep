@@ -96,7 +96,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Testing
-tempfile = "3.10"
+tempfile = "3.27"
 
 [profile.dev.package.argon2]
 opt-level = 3
