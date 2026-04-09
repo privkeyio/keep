@@ -101,7 +101,8 @@ mod tests {
 
     #[test]
     fn reject_invalid_mnemonic() {
-        assert!(derive_nostr_key("not a valid mnemonic", "", 0).is_err());
+        let err = derive_nostr_key("not a valid mnemonic", "", 0).unwrap_err();
+        assert!(matches!(err, KeepError::InvalidMnemonic(_)));
     }
 
     #[test]
@@ -125,6 +126,7 @@ mod tests {
     fn reject_account_exceeding_hardened_limit() {
         let mnemonic =
             "leader monkey parrot ring guide accident before fence cannon height naive bean";
-        assert!(derive_nostr_key(mnemonic, "", 0x8000_0000).is_err());
+        let err = derive_nostr_key(mnemonic, "", 0x8000_0000).unwrap_err();
+        assert!(matches!(err, KeepError::InvalidInput(_)));
     }
 }

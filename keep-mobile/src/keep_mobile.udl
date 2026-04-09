@@ -248,6 +248,9 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     ShareInfo create_account_from_mnemonic(string mnemonic, string passphrase, string name);
 
+    [Throws=KeepMobileError]
+    ShareInfo create_account_from_mnemonic_with_index(string mnemonic, string passphrase, string name, u32 account_index);
+
     sequence<SignRequest> get_pending_requests();
 
     [Throws=KeepMobileError]

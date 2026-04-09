@@ -607,11 +607,21 @@ impl KeepMobile {
 
     pub fn create_account_from_mnemonic(
         &self,
+        mnemonic: String,
+        passphrase: String,
+        name: String,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        self.create_account_from_mnemonic_with_index(mnemonic, passphrase, name, 0)
+    }
+
+    pub fn create_account_from_mnemonic_with_index(
+        &self,
         mut mnemonic: String,
         mut passphrase: String,
         name: String,
+        account_index: u32,
     ) -> Result<ShareInfo, KeepMobileError> {
-        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, 0)
+        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
         passphrase.zeroize();
