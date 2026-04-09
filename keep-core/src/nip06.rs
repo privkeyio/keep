@@ -24,6 +24,8 @@ pub fn derive_nostr_key(
 
     let result = derive_from_master(&mut master, account);
     master.private_key.non_secure_erase();
+    master.chain_code = bitcoin::bip32::ChainCode::from([0u8; 32]);
+    std::hint::black_box(&master);
     result
 }
 
@@ -48,6 +50,8 @@ fn derive_from_master(master: &mut Xpriv, account: u32) -> Result<Zeroizing<[u8;
 
     let result = Zeroizing::new(derived.private_key.secret_bytes());
     derived.private_key.non_secure_erase();
+    derived.chain_code = bitcoin::bip32::ChainCode::from([0u8; 32]);
+    std::hint::black_box(&derived);
     Ok(result)
 }
 
@@ -99,5 +103,29 @@ mod tests {
     #[test]
     fn reject_invalid_mnemonic() {
         assert!(derive_nostr_key("not a valid mnemonic", "", 0).is_err());
+    }
+
+    #[test]
+    fn derive_nonzero_account() {
+        let mnemonic =
+            "leader monkey parrot ring guide accident before fence cannon height naive bean";
+        let key = derive_nostr_key(mnemonic, "", 1).unwrap();
+        assert_eq!(key.len(), 32);
+        let key0 = derive_nostr_key(mnemonic, "", 0).unwrap();
+        assert_ne!(&key[..], &key0[..]);
+    }
+
+    #[test]
+    fn derive_max_valid_account() {
+        let mnemonic =
+            "leader monkey parrot ring guide accident before fence cannon height naive bean";
+        assert!(derive_nostr_key(mnemonic, "", 0x7FFF_FFFF).is_ok());
+    }
+
+    #[test]
+    fn reject_account_exceeding_hardened_limit() {
+        let mnemonic =
+            "leader monkey parrot ring guide accident before fence cannon height naive bean";
+        assert!(derive_nostr_key(mnemonic, "", 0x8000_0000).is_err());
     }
 }
