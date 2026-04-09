@@ -8,22 +8,15 @@ use crate::error::{KeepError, Result};
 
 /// Generate a BIP-39 mnemonic phrase with the given word count (12 or 24).
 pub fn generate_mnemonic(word_count: u32) -> Result<Zeroizing<String>> {
-    let entropy_len = match word_count {
-        12 => 16,
-        24 => 32,
+    let entropy = match word_count {
+        12 => Zeroizing::new(crate::crypto::random_bytes::<16>().to_vec()),
+        24 => Zeroizing::new(crate::crypto::random_bytes::<32>().to_vec()),
         _ => {
             return Err(KeepError::InvalidMnemonic(
                 "word count must be 12 or 24".into(),
             ))
         }
     };
-
-    let mut entropy = Zeroizing::new(vec![0u8; entropy_len]);
-    if entropy_len == 16 {
-        entropy.copy_from_slice(&crate::crypto::random_bytes::<16>());
-    } else {
-        entropy.copy_from_slice(&crate::crypto::random_bytes::<32>());
-    }
 
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| KeepError::InvalidMnemonic(e.to_string()))?;

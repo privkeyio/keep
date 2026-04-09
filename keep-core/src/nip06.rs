@@ -17,27 +17,30 @@ pub fn derive_nostr_key(
         .parse()
         .map_err(|e: bip39::Error| KeepError::InvalidMnemonic(e.to_string()))?;
 
-    let mut seed = Zeroizing::new([0u8; 64]);
-    let seed_bytes = Zeroizing::new(parsed.to_seed(passphrase));
-    seed.copy_from_slice(&*seed_bytes);
+    let seed = Zeroizing::new(parsed.to_seed(passphrase));
 
     let mut master = Xpriv::new_master(Network::Bitcoin, &*seed)
         .map_err(|e| KeepError::InvalidMnemonic(format!("master key derivation failed: {e}")))?;
 
+    let result = derive_from_master(&mut master, account);
+    master.private_key.non_secure_erase();
+    result
+}
+
+fn derive_from_master(master: &mut Xpriv, account: u32) -> Result<Zeroizing<[u8; 32]>> {
     let path: DerivationPath = format!("m/44'/1237'/{account}'/0/0")
         .parse()
         .map_err(|e: bitcoin::bip32::Error| {
             KeepError::InvalidMnemonic(format!("invalid derivation path: {e}"))
         })?;
 
+    let secp = bitcoin::secp256k1::Secp256k1::signing_only();
     let mut derived = master
-        .derive_priv(&bitcoin::secp256k1::Secp256k1::signing_only(), &path)
+        .derive_priv(&secp, &path)
         .map_err(|e| KeepError::InvalidMnemonic(format!("key derivation failed: {e}")))?;
 
     let result = Zeroizing::new(derived.private_key.secret_bytes());
     derived.private_key.non_secure_erase();
-    master.private_key.non_secure_erase();
-
     Ok(result)
 }
 
