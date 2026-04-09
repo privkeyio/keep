@@ -4179,6 +4179,8 @@ dependencies = [
  "base64 0.22.1",
  "bech32",
  "bincode",
+ "bip39",
+ "bitcoin",
  "blake2",
  "cbc",
  "chacha20 0.10.0",

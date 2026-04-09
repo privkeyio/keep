@@ -592,6 +592,38 @@ impl KeepMobile {
         result
     }
 
+    pub fn generate_mnemonic(&self, word_count: u32) -> Result<String, KeepMobileError> {
+        let mnemonic = keep_core::mnemonic::generate_mnemonic(word_count)
+            .map_err(|e| KeepMobileError::InvalidInput {
+                msg: e.to_string(),
+            })?;
+        Ok((*mnemonic).clone())
+    }
+
+    pub fn validate_mnemonic(&self, mnemonic: String) -> Result<bool, KeepMobileError> {
+        keep_core::mnemonic::validate_mnemonic(&mnemonic).map_err(|e| {
+            KeepMobileError::InvalidInput {
+                msg: e.to_string(),
+            }
+        })?;
+        Ok(true)
+    }
+
+    pub fn create_account_from_mnemonic(
+        &self,
+        mnemonic: String,
+        passphrase: String,
+        name: String,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, 0).map_err(|e| {
+            KeepMobileError::InvalidInput {
+                msg: e.to_string(),
+            }
+        })?;
+        let hex_key = hex::encode(*key);
+        self.do_import_nsec(&hex_key, name)
+    }
+
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();

@@ -239,6 +239,15 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     ShareInfo import_share(string data, string passphrase, string name);
 
+    [Throws=KeepMobileError]
+    string generate_mnemonic(u32 word_count);
+
+    [Throws=KeepMobileError]
+    boolean validate_mnemonic(string mnemonic);
+
+    [Throws=KeepMobileError]
+    ShareInfo create_account_from_mnemonic(string mnemonic, string passphrase, string name);
+
     sequence<SignRequest> get_pending_requests();
 
     [Throws=KeepMobileError]
