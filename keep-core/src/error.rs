@@ -486,6 +486,8 @@ pub enum KeepError {
     KeyNotFound(String),
     #[error("Key already exists: {0}")]
     KeyAlreadyExists(String),
+    #[error("Invalid mnemonic: {0}")]
+    InvalidMnemonic(String),
     #[error("Invalid nsec format")]
     InvalidNsec,
     #[error("Invalid npub format")]

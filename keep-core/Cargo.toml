@@ -27,6 +27,8 @@ k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.10"
 frost-secp256k1-tr = "2.2.0"
 
+bip39 = { workspace = true }
+bitcoin = { workspace = true }
 scrypt = "0.11"
 unicode-normalization = "0.1"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
