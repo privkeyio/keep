@@ -54,11 +54,11 @@ pub mod hidden;
 pub mod keyring;
 /// Key types and Nostr keypair operations.
 pub mod keys;
+pub mod migration;
 /// BIP-39 mnemonic generation and validation.
 pub mod mnemonic;
 /// NIP-06 key derivation from mnemonic seed phrase.
 pub mod nip06;
-pub mod migration;
 pub(crate) mod rate_limit;
 /// Relay configuration for FROST shares.
 pub mod relay;

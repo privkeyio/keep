@@ -28,11 +28,18 @@ pub fn derive_nostr_key(
 }
 
 fn derive_from_master(master: &mut Xpriv, account: u32) -> Result<Zeroizing<[u8; 32]>> {
-    let path: DerivationPath = format!("m/44'/1237'/{account}'/0/0")
-        .parse()
-        .map_err(|e: bitcoin::bip32::Error| {
-            KeepError::InvalidMnemonic(format!("invalid derivation path: {e}"))
-        })?;
+    if account > 0x7FFF_FFFF {
+        return Err(KeepError::InvalidInput(format!(
+            "account index {account} exceeds maximum hardened child index (2^31 - 1)"
+        )));
+    }
+
+    let path: DerivationPath =
+        format!("m/44'/1237'/{account}'/0/0")
+            .parse()
+            .map_err(|e: bitcoin::bip32::Error| {
+                KeepError::InvalidMnemonic(format!("invalid derivation path: {e}"))
+            })?;
 
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
     let mut derived = master

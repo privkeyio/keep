@@ -18,8 +18,8 @@ pub fn generate_mnemonic(word_count: u32) -> Result<Zeroizing<String>> {
         }
     };
 
-    let mnemonic = Mnemonic::from_entropy(&entropy)
-        .map_err(|e| KeepError::InvalidMnemonic(e.to_string()))?;
+    let mnemonic =
+        Mnemonic::from_entropy(&entropy).map_err(|e| KeepError::InvalidMnemonic(e.to_string()))?;
 
     Ok(Zeroizing::new(mnemonic.to_string()))
 }

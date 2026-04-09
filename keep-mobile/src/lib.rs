@@ -594,18 +594,13 @@ impl KeepMobile {
 
     pub fn generate_mnemonic(&self, word_count: u32) -> Result<String, KeepMobileError> {
         let mnemonic = keep_core::mnemonic::generate_mnemonic(word_count)
-            .map_err(|e| KeepMobileError::InvalidInput {
-                msg: e.to_string(),
-            })?;
+            .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?;
         Ok((*mnemonic).clone())
     }
 
     pub fn validate_mnemonic(&self, mut mnemonic: String) -> Result<(), KeepMobileError> {
-        let result = keep_core::mnemonic::validate_mnemonic(&mnemonic).map_err(|e| {
-            KeepMobileError::InvalidInput {
-                msg: e.to_string(),
-            }
-        });
+        let result = keep_core::mnemonic::validate_mnemonic(&mnemonic)
+            .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
         result
     }
@@ -616,15 +611,12 @@ impl KeepMobile {
         mut passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
-        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, 0).map_err(|e| {
-            KeepMobileError::InvalidInput {
-                msg: e.to_string(),
-            }
-        });
+        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, 0)
+            .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
         passphrase.zeroize();
         let key = key?;
-        let mut hex_key = hex::encode(*key);
+        let mut hex_key = hex::encode(&*key);
         let result = self.do_import_nsec(&hex_key, name);
         hex_key.zeroize();
         result
