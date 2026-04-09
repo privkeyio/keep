@@ -1917,15 +1917,15 @@ impl KeepMobile {
             {
                 let store_path =
                     std::path::PathBuf::from(path).join("descriptor-sessions.redb");
-                match keep_frost_net::FileDescriptorSessionStore::new(&store_path) {
-                    Ok(store) => node.with_descriptor_session_store(
-                        Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
-                    ),
-                    Err(e) => {
-                        tracing::warn!("Failed to create descriptor session store: {e}");
-                        node
-                    }
-                }
+                let store = keep_frost_net::FileDescriptorSessionStore::new(&store_path)
+                    .map_err(|e| KeepMobileError::StorageError {
+                        msg: format!(
+                            "Failed to create descriptor session store: {e}"
+                        ),
+                    })?;
+                node.with_descriptor_session_store(
+                    Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
+                )
             } else {
                 node
             };
