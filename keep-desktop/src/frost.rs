@@ -279,6 +279,17 @@ pub(crate) async fn setup_frost_node(
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
 
+    let session_store_path = nonce_store_path.with_file_name("descriptor-sessions.redb");
+    let node = match keep_frost_net::FileDescriptorSessionStore::new(&session_store_path) {
+        Ok(store) => node.with_descriptor_session_store(
+            Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>
+        ),
+        Err(e) => {
+            tracing::warn!("Failed to create descriptor session store: {e}");
+            node
+        }
+    };
+
     let peer_policies = {
         let guard = keep_arc
             .lock()
