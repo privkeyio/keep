@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: MIT
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use keep_bitcoin::recovery::{RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier};
 use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
 use nostr_sdk::PublicKey;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
@@ -19,6 +22,58 @@ use crate::protocol::{
 
 const MAX_SESSIONS: usize = 64;
 const REAP_GRACE_SECS: u64 = 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedDescriptorSession {
+    pub session_id: [u8; 32],
+    pub group_pubkey: [u8; 32],
+    pub policy: WalletPolicy,
+    pub network: String,
+    pub initiator: Option<String>,
+    pub contributions: BTreeMap<u16, XpubContribution>,
+    pub expected_contributors: HashSet<u16>,
+    pub descriptor: Option<PersistedFinalizedDescriptor>,
+    pub acks: HashSet<u16>,
+    pub nacks: HashSet<u16>,
+    pub expected_acks: HashSet<u16>,
+    pub state: PersistedSessionState,
+    pub created_at_unix: u64,
+    pub contributions_complete_at_unix: Option<u64>,
+    pub finalized_at_unix: Option<u64>,
+    pub timeout_secs: u64,
+    pub contribution_timeout_secs: u64,
+    pub finalize_timeout_secs: u64,
+    pub ack_phase_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PersistedSessionState {
+    Proposed,
+    Finalized,
+    Complete,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedFinalizedDescriptor {
+    pub external: String,
+    pub internal: String,
+    pub policy_hash: [u8; 32],
+}
+
+pub trait DescriptorSessionStore: Send + Sync {
+    fn save(&self, session: &PersistedDescriptorSession) -> Result<()>;
+    fn load(&self, session_id: &[u8; 32]) -> Result<Option<PersistedDescriptorSession>>;
+    fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>>;
+    fn delete(&self, session_id: &[u8; 32]) -> Result<()>;
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
     let max = Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS);
@@ -382,11 +437,125 @@ impl DescriptorSession {
             self.state = DescriptorSessionState::Failed(reason);
         }
     }
+
+    pub fn to_persisted(&self) -> PersistedDescriptorSession {
+        let now = now_unix();
+        let elapsed = self.created_at.elapsed().as_secs();
+        let created_at_unix = now.saturating_sub(elapsed);
+
+        let contributions_complete_at_unix = self.contributions_complete_at.map(|t| {
+            let e = t.elapsed().as_secs();
+            now.saturating_sub(e)
+        });
+
+        let finalized_at_unix = self.finalized_at.map(|t| {
+            let e = t.elapsed().as_secs();
+            now.saturating_sub(e)
+        });
+
+        let state = match &self.state {
+            DescriptorSessionState::Proposed => PersistedSessionState::Proposed,
+            DescriptorSessionState::Finalized => PersistedSessionState::Finalized,
+            DescriptorSessionState::Complete => PersistedSessionState::Complete,
+            DescriptorSessionState::Failed(r) => PersistedSessionState::Failed(r.clone()),
+        };
+
+        let descriptor = self
+            .descriptor
+            .as_ref()
+            .map(|d| PersistedFinalizedDescriptor {
+                external: d.external.clone(),
+                internal: d.internal.clone(),
+                policy_hash: d.policy_hash,
+            });
+
+        PersistedDescriptorSession {
+            session_id: self.session_id,
+            group_pubkey: self.group_pubkey,
+            policy: self.policy.clone(),
+            network: self.network.clone(),
+            initiator: self.initiator.map(|pk| pk.to_hex()),
+            contributions: self.contributions.clone(),
+            expected_contributors: self.expected_contributors.clone(),
+            descriptor,
+            acks: self.acks.clone(),
+            nacks: self.nacks.clone(),
+            expected_acks: self.expected_acks.clone(),
+            state,
+            created_at_unix,
+            contributions_complete_at_unix,
+            finalized_at_unix,
+            timeout_secs: self.timeout.as_secs(),
+            contribution_timeout_secs: self.contribution_timeout.as_secs(),
+            finalize_timeout_secs: self.finalize_timeout.as_secs(),
+            ack_phase_timeout_secs: self.ack_phase_timeout.as_secs(),
+        }
+    }
+
+    pub fn from_persisted(p: PersistedDescriptorSession) -> Result<Self> {
+        let now = now_unix();
+        let elapsed_since_creation = now.saturating_sub(p.created_at_unix);
+        let created_at = Instant::now() - Duration::from_secs(elapsed_since_creation);
+
+        let contributions_complete_at = p.contributions_complete_at_unix.map(|ts| {
+            let elapsed = now.saturating_sub(ts);
+            Instant::now() - Duration::from_secs(elapsed)
+        });
+
+        let finalized_at = p.finalized_at_unix.map(|ts| {
+            let elapsed = now.saturating_sub(ts);
+            Instant::now() - Duration::from_secs(elapsed)
+        });
+
+        let state = match p.state {
+            PersistedSessionState::Proposed => DescriptorSessionState::Proposed,
+            PersistedSessionState::Finalized => DescriptorSessionState::Finalized,
+            PersistedSessionState::Complete => DescriptorSessionState::Complete,
+            PersistedSessionState::Failed(r) => DescriptorSessionState::Failed(r),
+        };
+
+        let descriptor = p.descriptor.map(|d| FinalizedDescriptor {
+            external: d.external,
+            internal: d.internal,
+            policy_hash: d.policy_hash,
+        });
+
+        let initiator =
+            match p.initiator {
+                Some(hex) => Some(PublicKey::from_hex(&hex).map_err(|e| {
+                    FrostNetError::Session(format!("invalid initiator pubkey: {e}"))
+                })?),
+                None => None,
+            };
+
+        Ok(Self {
+            session_id: p.session_id,
+            group_pubkey: p.group_pubkey,
+            policy: p.policy,
+            network: p.network,
+            initiator,
+            contributions: p.contributions,
+            expected_contributors: p.expected_contributors,
+            descriptor,
+            acks: p.acks,
+            nacks: p.nacks,
+            expected_acks: p.expected_acks,
+            state,
+            created_at,
+            contributions_complete_at,
+            finalized_at,
+            timeout: Duration::from_secs(p.timeout_secs),
+            contribution_timeout: Duration::from_secs(p.contribution_timeout_secs),
+            finalize_timeout: Duration::from_secs(p.finalize_timeout_secs),
+            ack_phase_timeout: Duration::from_secs(p.ack_phase_timeout_secs),
+        })
+    }
 }
 
 pub struct DescriptorSessionManager {
     sessions: HashMap<[u8; 32], DescriptorSession>,
     default_timeout: Duration,
+    store: Option<Arc<dyn DescriptorSessionStore>>,
 }
 
 impl DescriptorSessionManager {
@@ -394,6 +563,7 @@ impl DescriptorSessionManager {
         Self {
             sessions: HashMap::new(),
             default_timeout: Duration::from_secs(DESCRIPTOR_SESSION_TIMEOUT_SECS),
+            store: None,
         }
     }
 
@@ -402,7 +572,66 @@ impl DescriptorSessionManager {
         Ok(Self {
             sessions: HashMap::new(),
             default_timeout: validated,
+            store: None,
         })
+    }
+
+    pub fn set_store(&mut self, store: Arc<dyn DescriptorSessionStore>) {
+        self.store = Some(store);
+    }
+
+    pub fn persist_session(&self, session_id: &[u8; 32]) {
+        let Some(store) = &self.store else { return };
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        let persisted = session.to_persisted();
+        if let Err(e) = store.save(&persisted) {
+            warn!(session_id = %hex::encode(session_id), "Failed to persist descriptor session: {e}");
+        }
+    }
+
+    pub fn delete_persisted_session(&self, session_id: &[u8; 32]) {
+        let Some(store) = &self.store else { return };
+        if let Err(e) = store.delete(session_id) {
+            warn!(session_id = %hex::encode(session_id), "Failed to delete persisted descriptor session: {e}");
+        }
+    }
+
+    pub fn load_persisted_sessions(&mut self) -> Result<usize> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        let persisted = store.load_all()?;
+        let mut loaded = 0;
+        for p in persisted {
+            let sid = p.session_id;
+            let is_terminal = matches!(
+                p.state,
+                PersistedSessionState::Complete | PersistedSessionState::Failed(_)
+            );
+            match DescriptorSession::from_persisted(p) {
+                Ok(session) => {
+                    if is_terminal || session.is_expired() {
+                        if let Err(e) = store.delete(&sid) {
+                            warn!(session_id = %hex::encode(sid), "Failed to clean up persisted session: {e}");
+                        }
+                        continue;
+                    }
+                    if self.sessions.len() >= MAX_SESSIONS {
+                        warn!("Skipping persisted session, max sessions reached");
+                        break;
+                    }
+                    self.sessions.insert(sid, session);
+                    loaded += 1;
+                }
+                Err(e) => {
+                    warn!(session_id = %hex::encode(sid), "Failed to restore persisted session: {e}");
+                    let _ = store.delete(&sid);
+                }
+            }
+        }
+        Ok(loaded)
     }
 
     pub fn session_count(&self) -> usize {
@@ -472,6 +701,7 @@ impl DescriptorSessionManager {
         );
 
         self.sessions.insert(session_id, session);
+        self.persist_session(&session_id);
         Ok(self.sessions.get_mut(&session_id).unwrap())
     }
 
@@ -487,6 +717,7 @@ impl DescriptorSessionManager {
 
     pub fn remove_session(&mut self, session_id: &[u8; 32]) {
         self.sessions.remove(session_id);
+        self.delete_persisted_session(session_id);
     }
 
     pub fn cleanup_expired(&mut self) -> Vec<([u8; 32], String)> {
@@ -499,6 +730,9 @@ impl DescriptorSessionManager {
                 true
             }
         });
+        for (id, _) in &expired {
+            self.delete_persisted_session(id);
+        }
         expired
     }
 }
@@ -1275,5 +1509,160 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Duplicate xpub"));
+    }
+
+    #[test]
+    fn test_persist_and_restore_proposed_session() {
+        let mut session = test_session();
+        let keys = nostr_sdk::Keys::generate();
+        session.set_initiator(keys.public_key());
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+
+        let persisted = session.to_persisted();
+        assert_eq!(persisted.session_id, [1u8; 32]);
+        assert_eq!(persisted.state, PersistedSessionState::Proposed);
+        assert_eq!(persisted.contributions.len(), 1);
+        assert!(persisted.initiator.is_some());
+
+        let restored = DescriptorSession::from_persisted(persisted).unwrap();
+        assert_eq!(*restored.state(), DescriptorSessionState::Proposed);
+        assert_eq!(restored.contributions().len(), 1);
+        assert_eq!(restored.initiator(), Some(&keys.public_key()));
+        assert_eq!(restored.network(), "signet");
+    }
+
+    #[test]
+    fn test_persist_and_restore_finalized_session() {
+        let mut session = test_session();
+        session
+            .add_contribution(1, "tpub1zzzzzzzzzzzzzzz".into(), "aabbccdd".into())
+            .unwrap();
+        session
+            .add_contribution(2, "tpub2zzzzzzzzzzzzzzz".into(), "11223344".into())
+            .unwrap();
+        session
+            .add_contribution(3, "tpub3zzzzzzzzzzzzzzz".into(), "55667788".into())
+            .unwrap();
+
+        let finalized = FinalizedDescriptor {
+            external: "tr(frost_key,{pk(xpub1),pk(xpub2)})".into(),
+            internal: "tr(frost_key,{pk(xpub1),pk(xpub2)})/1".into(),
+            policy_hash: [0xAA; 32],
+        };
+        session.set_finalized(finalized).unwrap();
+
+        let persisted = session.to_persisted();
+        assert_eq!(persisted.state, PersistedSessionState::Finalized);
+        assert!(persisted.descriptor.is_some());
+
+        let restored = DescriptorSession::from_persisted(persisted).unwrap();
+        assert_eq!(*restored.state(), DescriptorSessionState::Finalized);
+        let desc = restored.descriptor().unwrap();
+        assert!(desc.external.contains("frost_key"));
+    }
+
+    #[test]
+    fn test_expired_sessions_cleaned_on_load() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mut manager = DescriptorSessionManager::new();
+        manager.set_store(store.clone());
+
+        let persisted = PersistedDescriptorSession {
+            session_id: [1u8; 32],
+            group_pubkey: [2u8; 32],
+            policy: test_policy(),
+            network: "signet".into(),
+            initiator: None,
+            contributions: BTreeMap::new(),
+            expected_contributors: [1u16, 2, 3].into_iter().collect(),
+            descriptor: None,
+            acks: HashSet::new(),
+            nacks: HashSet::new(),
+            expected_acks: [1u16, 2, 3].into_iter().collect(),
+            state: PersistedSessionState::Proposed,
+            created_at_unix: 1000,
+            contributions_complete_at_unix: None,
+            finalized_at_unix: None,
+            timeout_secs: 1,
+            contribution_timeout_secs: 1,
+            finalize_timeout_secs: 1,
+            ack_phase_timeout_secs: 1,
+        };
+        store.save(&persisted).unwrap();
+
+        let loaded = manager.load_persisted_sessions().unwrap();
+        assert_eq!(loaded, 0);
+        assert!(manager.get_session(&[1u8; 32]).is_none());
+        assert!(store.load(&[1u8; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_completed_sessions_cleaned_on_load() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mut manager = DescriptorSessionManager::new();
+        manager.set_store(store.clone());
+
+        let persisted = PersistedDescriptorSession {
+            session_id: [1u8; 32],
+            group_pubkey: [2u8; 32],
+            policy: test_policy(),
+            network: "signet".into(),
+            initiator: None,
+            contributions: BTreeMap::new(),
+            expected_contributors: [1u16, 2, 3].into_iter().collect(),
+            descriptor: None,
+            acks: HashSet::new(),
+            nacks: HashSet::new(),
+            expected_acks: [1u16, 2, 3].into_iter().collect(),
+            state: PersistedSessionState::Complete,
+            created_at_unix: super::now_unix(),
+            contributions_complete_at_unix: None,
+            finalized_at_unix: None,
+            timeout_secs: 600,
+            contribution_timeout_secs: 300,
+            finalize_timeout_secs: 300,
+            ack_phase_timeout_secs: 300,
+        };
+        store.save(&persisted).unwrap();
+
+        let loaded = manager.load_persisted_sessions().unwrap();
+        assert_eq!(loaded, 0);
+        assert!(store.load(&[1u8; 32]).unwrap().is_none());
+    }
+
+    struct MemorySessionStore {
+        sessions: parking_lot::RwLock<HashMap<[u8; 32], PersistedDescriptorSession>>,
+    }
+
+    impl MemorySessionStore {
+        fn new() -> Self {
+            Self {
+                sessions: parking_lot::RwLock::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl DescriptorSessionStore for MemorySessionStore {
+        fn save(&self, session: &PersistedDescriptorSession) -> Result<()> {
+            self.sessions
+                .write()
+                .insert(session.session_id, session.clone());
+            Ok(())
+        }
+
+        fn load(&self, session_id: &[u8; 32]) -> Result<Option<PersistedDescriptorSession>> {
+            Ok(self.sessions.read().get(session_id).cloned())
+        }
+
+        fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>> {
+            Ok(self.sessions.read().values().cloned().collect())
+        }
+
+        fn delete(&self, session_id: &[u8; 32]) -> Result<()> {
+            self.sessions.write().remove(session_id);
+            Ok(())
+        }
     }
 }

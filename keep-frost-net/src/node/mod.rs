@@ -469,6 +469,26 @@ impl KfpNode {
         })
     }
 
+    pub fn with_descriptor_session_store(
+        self,
+        store: Arc<dyn crate::descriptor_session::DescriptorSessionStore>,
+    ) -> Self {
+        {
+            let mut sessions = self.descriptor_sessions.write();
+            sessions.set_store(store);
+            match sessions.load_persisted_sessions() {
+                Ok(count) if count > 0 => {
+                    info!(count, "Restored persisted descriptor sessions");
+                }
+                Err(e) => {
+                    warn!("Failed to load persisted descriptor sessions: {e}");
+                }
+                _ => {}
+            }
+        }
+        self
+    }
+
     pub fn with_expected_pcrs(mut self, pcrs: ExpectedPcrs) -> Self {
         self.expected_pcrs = Some(pcrs);
         self

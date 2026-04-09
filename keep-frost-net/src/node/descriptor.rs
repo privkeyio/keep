@@ -89,6 +89,7 @@ impl KfpNode {
                     return Err(e);
                 }
             }
+            sessions.persist_session(&session_id);
         }
 
         let mut payload = DescriptorProposePayload::new(
@@ -244,6 +245,7 @@ impl KfpNode {
                     ) {
                         debug!("Failed to store initiator contribution: {e}");
                     }
+                    sessions.persist_session(&payload.session_id);
                     true
                 }
                 Err(e) => {
@@ -314,6 +316,7 @@ impl KfpNode {
                 account_xpub.to_string(),
                 fingerprint.to_string(),
             )?;
+            sessions.persist_session(&session_id);
         }
 
         let payload = DescriptorContributePayload::new(
@@ -402,7 +405,9 @@ impl KfpNode {
                 share_index: payload.share_index,
             });
 
-            session.has_all_contributions()
+            let all = session.has_all_contributions();
+            sessions.persist_session(&payload.session_id);
+            all
         };
 
         if all_contributions {
@@ -433,7 +438,9 @@ impl KfpNode {
                 policy_hash,
             })?;
 
-            session.contributions().clone()
+            let contribs = session.contributions().clone();
+            sessions.persist_session(&session_id);
+            contribs
         };
 
         let payload = DescriptorFinalizePayload::new(
@@ -716,6 +723,7 @@ impl KfpNode {
                 internal: payload.internal_descriptor.clone(),
                 policy_hash: payload.policy_hash,
             })?;
+            sessions.persist_session(&payload.session_id);
         }
 
         let _ = self.event_tx.send(KfpNodeEvent::DescriptorComplete {
@@ -828,6 +836,7 @@ impl KfpNode {
             session.fail(format!("Peer {share_index} rejected descriptor: {reason}"));
         }
 
+        sessions.persist_session(&payload.session_id);
         drop(sessions);
 
         info!(
@@ -886,12 +895,14 @@ impl KfpNode {
                 payload.descriptor_hash,
                 &payload.key_proof_psbt,
             )?;
-            (
+            let result = (
                 is_new,
                 session.is_complete(),
                 session.ack_count(),
                 session.expected_ack_count(),
-            )
+            );
+            sessions.persist_session(&payload.session_id);
+            result
         };
 
         info!(

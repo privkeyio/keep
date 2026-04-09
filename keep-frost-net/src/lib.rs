@@ -60,6 +60,7 @@ mod attestation;
 mod audit;
 mod cert_pin;
 mod descriptor_session;
+mod descriptor_session_store;
 mod ecdh;
 mod error;
 mod event;
@@ -75,9 +76,11 @@ pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
-    DescriptorSession, DescriptorSessionManager, DescriptorSessionState, FinalizedDescriptor,
-    XpubContribution,
+    DescriptorSession, DescriptorSessionManager, DescriptorSessionState, DescriptorSessionStore,
+    FinalizedDescriptor, PersistedDescriptorSession, PersistedFinalizedDescriptor,
+    PersistedSessionState, XpubContribution,
 };
+pub use descriptor_session_store::FileDescriptorSessionStore;
 pub use ecdh::{
     aggregate_ecdh_shares, compute_partial_ecdh, derive_ecdh_session_id, EcdhSession,
     EcdhSessionManager, EcdhSessionState,

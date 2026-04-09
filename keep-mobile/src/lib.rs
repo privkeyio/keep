@@ -384,6 +384,7 @@ pub struct KeepMobile {
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
     pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    session_store_path: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 struct PendingRequest {
@@ -508,7 +509,14 @@ impl KeepMobile {
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pre_approved_hash: Arc::new(std::sync::Mutex::new(None)),
+            session_store_path: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    pub fn set_session_store_path(&self, path: String) {
+        if let Ok(mut guard) = self.session_store_path.lock() {
+            *guard = Some(path);
+        }
     }
 
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
@@ -1892,6 +1900,27 @@ impl KeepMobile {
             let node = match proxy {
                 Some(addr) => KfpNode::new_with_proxy(share, verified_relays, addr).await?,
                 None => KfpNode::new(share, verified_relays).await?,
+            };
+
+            let node = if let Some(path) = self
+                .session_store_path
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+            {
+                let store_path =
+                    std::path::PathBuf::from(path).join("descriptor-sessions.redb");
+                match keep_frost_net::FileDescriptorSessionStore::new(&store_path) {
+                    Ok(store) => node.with_descriptor_session_store(
+                        Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
+                    ),
+                    Err(e) => {
+                        tracing::warn!("Failed to create descriptor session store: {e}");
+                        node
+                    }
+                }
+            } else {
+                node
             };
 
             let (request_tx, request_rx) = mpsc::channel(32);
