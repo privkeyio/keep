@@ -19,12 +19,11 @@ pub fn generate_mnemonic(word_count: u32) -> Result<Zeroizing<String>> {
     };
 
     let mut entropy = Zeroizing::new(vec![0u8; entropy_len]);
-    let random: Vec<u8> = if entropy_len == 16 {
-        crate::crypto::random_bytes::<16>().to_vec()
+    if entropy_len == 16 {
+        entropy.copy_from_slice(&crate::crypto::random_bytes::<16>());
     } else {
-        crate::crypto::random_bytes::<32>().to_vec()
-    };
-    entropy.copy_from_slice(&random);
+        entropy.copy_from_slice(&crate::crypto::random_bytes::<32>());
+    }
 
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| KeepError::InvalidMnemonic(e.to_string()))?;

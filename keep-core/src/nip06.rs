@@ -13,17 +13,15 @@ pub fn derive_nostr_key(
     passphrase: &str,
     account: u32,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    crate::mnemonic::validate_mnemonic(mnemonic)?;
-
     let parsed: bip39::Mnemonic = mnemonic
         .parse()
         .map_err(|e: bip39::Error| KeepError::InvalidMnemonic(e.to_string()))?;
 
     let mut seed = Zeroizing::new([0u8; 64]);
-    let seed_bytes = parsed.to_seed(passphrase);
-    seed.copy_from_slice(&seed_bytes);
+    let seed_bytes = Zeroizing::new(parsed.to_seed(passphrase));
+    seed.copy_from_slice(&*seed_bytes);
 
-    let master = Xpriv::new_master(Network::Bitcoin, &*seed)
+    let mut master = Xpriv::new_master(Network::Bitcoin, &*seed)
         .map_err(|e| KeepError::InvalidMnemonic(format!("master key derivation failed: {e}")))?;
 
     let path: DerivationPath = format!("m/44'/1237'/{account}'/0/0")
@@ -32,11 +30,15 @@ pub fn derive_nostr_key(
             KeepError::InvalidMnemonic(format!("invalid derivation path: {e}"))
         })?;
 
-    let derived = master.derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &path).map_err(
-        |e| KeepError::InvalidMnemonic(format!("key derivation failed: {e}")),
-    )?;
+    let mut derived = master
+        .derive_priv(&bitcoin::secp256k1::Secp256k1::signing_only(), &path)
+        .map_err(|e| KeepError::InvalidMnemonic(format!("key derivation failed: {e}")))?;
 
-    Ok(Zeroizing::new(derived.private_key.secret_bytes()))
+    let result = Zeroizing::new(derived.private_key.secret_bytes());
+    derived.private_key.non_secure_erase();
+    master.private_key.non_secure_erase();
+
+    Ok(result)
 }
 
 #[cfg(test)]
