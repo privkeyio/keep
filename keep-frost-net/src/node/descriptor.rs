@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::descriptor_session::{
@@ -243,7 +243,7 @@ impl KfpNode {
                         payload.initiator_xpub.clone(),
                         payload.initiator_fingerprint.clone(),
                     ) {
-                        debug!("Failed to store initiator contribution: {e}");
+                        warn!("Failed to store initiator contribution: {e}");
                     }
                     sessions.persist_session(&payload.session_id);
                     true

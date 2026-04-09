@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::descriptor_session::{DescriptorSessionStore, PersistedDescriptorSession};
 use crate::error::{FrostNetError, Result};
@@ -63,13 +63,10 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
         let entry = table
             .get(session_id.as_slice())
             .map_err(|e| FrostNetError::Session(format!("Failed to get session: {e}")))?;
-        match entry {
-            Some(data) => {
-                let session: PersistedDescriptorSession = serde_json::from_slice(data.value())?;
-                Ok(Some(session))
-            }
-            None => Ok(None),
-        }
+        entry
+            .map(|data| serde_json::from_slice(data.value()))
+            .transpose()
+            .map_err(Into::into)
     }
 
     fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>> {
@@ -81,20 +78,35 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
             .open_table(TABLE)
             .map_err(|e| FrostNetError::Session(format!("Failed to open table: {e}")))?;
         let mut sessions = Vec::new();
+        let mut corrupt_keys = Vec::new();
         let iter = table
             .iter()
             .map_err(|e| FrostNetError::Session(format!("Failed to iterate sessions: {e}")))?;
         for entry in iter {
-            let (_, value) = entry.map_err(|e| {
+            let (key, value) = entry.map_err(|e| {
                 FrostNetError::Session(format!("Failed to read session entry: {e}"))
             })?;
             match serde_json::from_slice::<PersistedDescriptorSession>(value.value()) {
                 Ok(session) => sessions.push(session),
                 Err(e) => {
-                    debug!("Skipping corrupt session entry: {e}");
+                    warn!("Removing corrupt session entry: {e}");
+                    corrupt_keys.push(key.value().to_vec());
                 }
             }
         }
+        drop(txn);
+
+        if !corrupt_keys.is_empty() {
+            if let Ok(txn) = self.db.begin_write() {
+                if let Ok(mut table) = txn.open_table(TABLE) {
+                    for key in &corrupt_keys {
+                        let _ = table.remove(key.as_slice());
+                    }
+                }
+                let _ = txn.commit();
+            }
+        }
+
         Ok(sessions)
     }
 

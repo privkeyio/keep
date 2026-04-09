@@ -92,6 +92,22 @@ fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
     Ok(timeout)
 }
 
+fn clamp_session_timeout(secs: u64) -> Duration {
+    let max = DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS;
+    Duration::from_secs(secs.max(1).min(max))
+}
+
+fn unix_to_instant(now: u64, ts: u64, field: &str) -> Result<Instant> {
+    let elapsed = now.saturating_sub(ts);
+    Instant::now()
+        .checked_sub(Duration::from_secs(elapsed))
+        .ok_or_else(|| {
+            FrostNetError::Session(format!(
+                "persisted {field} too far in the past ({elapsed}s)"
+            ))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorSessionState {
     Proposed,
@@ -494,18 +510,16 @@ impl DescriptorSession {
 
     pub fn from_persisted(p: PersistedDescriptorSession) -> Result<Self> {
         let now = now_unix();
-        let elapsed_since_creation = now.saturating_sub(p.created_at_unix);
-        let created_at = Instant::now() - Duration::from_secs(elapsed_since_creation);
 
-        let contributions_complete_at = p.contributions_complete_at_unix.map(|ts| {
-            let elapsed = now.saturating_sub(ts);
-            Instant::now() - Duration::from_secs(elapsed)
-        });
-
-        let finalized_at = p.finalized_at_unix.map(|ts| {
-            let elapsed = now.saturating_sub(ts);
-            Instant::now() - Duration::from_secs(elapsed)
-        });
+        let created_at = unix_to_instant(now, p.created_at_unix, "created_at")?;
+        let contributions_complete_at = p
+            .contributions_complete_at_unix
+            .map(|ts| unix_to_instant(now, ts, "contributions_complete_at"))
+            .transpose()?;
+        let finalized_at = p
+            .finalized_at_unix
+            .map(|ts| unix_to_instant(now, ts, "finalized_at"))
+            .transpose()?;
 
         let state = match p.state {
             PersistedSessionState::Proposed => DescriptorSessionState::Proposed,
@@ -520,13 +534,13 @@ impl DescriptorSession {
             policy_hash: d.policy_hash,
         });
 
-        let initiator =
-            match p.initiator {
-                Some(hex) => Some(PublicKey::from_hex(&hex).map_err(|e| {
-                    FrostNetError::Session(format!("invalid initiator pubkey: {e}"))
-                })?),
-                None => None,
-            };
+        let initiator = p
+            .initiator
+            .map(|hex| {
+                PublicKey::from_hex(&hex)
+                    .map_err(|e| FrostNetError::Session(format!("invalid initiator pubkey: {e}")))
+            })
+            .transpose()?;
 
         Ok(Self {
             session_id: p.session_id,
@@ -544,10 +558,10 @@ impl DescriptorSession {
             created_at,
             contributions_complete_at,
             finalized_at,
-            timeout: Duration::from_secs(p.timeout_secs),
-            contribution_timeout: Duration::from_secs(p.contribution_timeout_secs),
-            finalize_timeout: Duration::from_secs(p.finalize_timeout_secs),
-            ack_phase_timeout: Duration::from_secs(p.ack_phase_timeout_secs),
+            timeout: clamp_session_timeout(p.timeout_secs),
+            contribution_timeout: clamp_session_timeout(p.contribution_timeout_secs),
+            finalize_timeout: clamp_session_timeout(p.finalize_timeout_secs),
+            ack_phase_timeout: clamp_session_timeout(p.ack_phase_timeout_secs),
         })
     }
 }
@@ -701,7 +715,6 @@ impl DescriptorSessionManager {
         );
 
         self.sessions.insert(session_id, session);
-        self.persist_session(&session_id);
         Ok(self.sessions.get_mut(&session_id).unwrap())
     }
 

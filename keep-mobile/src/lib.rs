@@ -514,6 +514,13 @@ impl KeepMobile {
     }
 
     pub fn set_session_store_path(&self, path: String) {
+        if std::path::Path::new(&path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            tracing::warn!("Rejecting session store path with parent traversal: {path}");
+            return;
+        }
         if let Ok(mut guard) = self.session_store_path.lock() {
             *guard = Some(path);
         }
