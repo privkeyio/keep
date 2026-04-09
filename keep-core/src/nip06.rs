@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::bip32::{ChainCode, DerivationPath, Xpriv};
 use bitcoin::Network;
 use zeroize::Zeroizing;
 
@@ -13,6 +13,12 @@ pub fn derive_nostr_key(
     passphrase: &str,
     account: u32,
 ) -> Result<Zeroizing<[u8; 32]>> {
+    if account > 0x7FFF_FFFF {
+        return Err(KeepError::InvalidInput(format!(
+            "account index {account} exceeds maximum hardened child index (2^31 - 1)"
+        )));
+    }
+
     let parsed: bip39::Mnemonic = mnemonic
         .parse()
         .map_err(|e: bip39::Error| KeepError::InvalidMnemonic(e.to_string()))?;
@@ -21,20 +27,6 @@ pub fn derive_nostr_key(
 
     let mut master = Xpriv::new_master(Network::Bitcoin, &*seed)
         .map_err(|e| KeepError::InvalidMnemonic(format!("master key derivation failed: {e}")))?;
-
-    let result = derive_from_master(&mut master, account);
-    master.private_key.non_secure_erase();
-    master.chain_code = bitcoin::bip32::ChainCode::from([0u8; 32]);
-    std::hint::black_box(&master);
-    result
-}
-
-fn derive_from_master(master: &mut Xpriv, account: u32) -> Result<Zeroizing<[u8; 32]>> {
-    if account > 0x7FFF_FFFF {
-        return Err(KeepError::InvalidInput(format!(
-            "account index {account} exceeds maximum hardened child index (2^31 - 1)"
-        )));
-    }
 
     let path: DerivationPath =
         format!("m/44'/1237'/{account}'/0/0")
@@ -49,10 +41,17 @@ fn derive_from_master(master: &mut Xpriv, account: u32) -> Result<Zeroizing<[u8;
         .map_err(|e| KeepError::InvalidMnemonic(format!("key derivation failed: {e}")))?;
 
     let result = Zeroizing::new(derived.private_key.secret_bytes());
-    derived.private_key.non_secure_erase();
-    derived.chain_code = bitcoin::bip32::ChainCode::from([0u8; 32]);
-    std::hint::black_box(&derived);
+
+    erase_xpriv(&mut master);
+    erase_xpriv(&mut derived);
+
     Ok(result)
+}
+
+fn erase_xpriv(key: &mut Xpriv) {
+    key.private_key.non_secure_erase();
+    key.chain_code = ChainCode::from([0u8; 32]);
+    std::hint::black_box(key);
 }
 
 #[cfg(test)]
