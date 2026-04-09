@@ -5,6 +5,9 @@ use std::path::Path;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, warn};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::descriptor_session::{DescriptorSessionStore, PersistedDescriptorSession};
 use crate::error::{FrostNetError, Result};
 
@@ -18,6 +21,14 @@ impl FileDescriptorSessionStore {
     pub fn new(path: &Path) -> Result<Self> {
         let db = Database::create(path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open session store: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                FrostNetError::Session(format!("Failed to set session store permissions: {e}"))
+            })?;
+        }
 
         let txn = db.begin_write().map_err(|e| {
             FrostNetError::Session(format!("Failed to begin write for table creation: {e}"))
@@ -69,7 +80,7 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
             .map_err(Into::into)
     }
 
-    fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>> {
+    fn load_all(&self, limit: usize) -> Result<Vec<PersistedDescriptorSession>> {
         let txn = self
             .db
             .begin_read()
@@ -87,7 +98,12 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
                 FrostNetError::Session(format!("Failed to read session entry: {e}"))
             })?;
             match serde_json::from_slice::<PersistedDescriptorSession>(value.value()) {
-                Ok(session) => sessions.push(session),
+                Ok(session) => {
+                    sessions.push(session);
+                    if sessions.len() >= limit {
+                        break;
+                    }
+                }
                 Err(e) => {
                     warn!("Removing corrupt session entry: {e}");
                     corrupt_keys.push(key.value().to_vec());
@@ -97,13 +113,20 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
         drop(txn);
 
         if !corrupt_keys.is_empty() {
-            if let Ok(txn) = self.db.begin_write() {
-                if let Ok(mut table) = txn.open_table(TABLE) {
-                    for key in &corrupt_keys {
-                        let _ = table.remove(key.as_slice());
+            match self.db.begin_write() {
+                Ok(txn) => {
+                    if let Ok(mut table) = txn.open_table(TABLE) {
+                        for key in &corrupt_keys {
+                            let _ = table.remove(key.as_slice());
+                        }
+                    }
+                    if let Err(e) = txn.commit() {
+                        warn!("Failed to commit corrupt entry cleanup: {e}");
                     }
                 }
-                let _ = txn.commit();
+                Err(e) => {
+                    warn!("Failed to begin write for corrupt entry cleanup: {e}");
+                }
             }
         }
 
@@ -187,12 +210,12 @@ mod tests {
 
         assert!(store.load(&[99u8; 32]).unwrap().is_none());
 
-        let all = store.load_all().unwrap();
+        let all = store.load_all(100).unwrap();
         assert_eq!(all.len(), 1);
 
         store.delete(&[1u8; 32]).unwrap();
         assert!(store.load(&[1u8; 32]).unwrap().is_none());
-        assert!(store.load_all().unwrap().is_empty());
+        assert!(store.load_all(100).unwrap().is_empty());
     }
 
     #[test]
@@ -208,7 +231,7 @@ mod tests {
 
         {
             let store = FileDescriptorSessionStore::new(&path).unwrap();
-            let all = store.load_all().unwrap();
+            let all = store.load_all(100).unwrap();
             assert_eq!(all.len(), 2);
             assert!(store.load(&[1u8; 32]).unwrap().is_some());
             assert!(store.load(&[2u8; 32]).unwrap().is_some());
@@ -230,6 +253,6 @@ mod tests {
         let loaded = store.load(&[1u8; 32]).unwrap().unwrap();
         assert_eq!(loaded.state, PersistedSessionState::Finalized);
 
-        assert_eq!(store.load_all().unwrap().len(), 1);
+        assert_eq!(store.load_all(100).unwrap().len(), 1);
     }
 }

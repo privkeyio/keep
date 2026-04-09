@@ -48,13 +48,13 @@ fn within_replay_window(created_at: u64, window_secs: u64) -> bool {
     created_at >= min_valid && created_at <= max_valid
 }
 
-fn is_valid_xpub(xpub: &str) -> bool {
+pub(crate) fn is_valid_xpub(xpub: &str) -> bool {
     xpub.len() >= MIN_XPUB_LENGTH
         && xpub.len() <= MAX_XPUB_LENGTH
         && VALID_XPUB_PREFIXES.iter().any(|pfx| xpub.starts_with(pfx))
 }
 
-fn is_valid_fingerprint(fp: &str) -> bool {
+pub(crate) fn is_valid_fingerprint(fp: &str) -> bool {
     fp.len() == MAX_FINGERPRINT_LENGTH && fp.chars().all(|c| c.is_ascii_hexdigit())
 }
 

@@ -15,9 +15,11 @@ use tracing::warn;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
-    KeySlot, WalletPolicy, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
+    is_valid_fingerprint, is_valid_xpub, KeySlot, WalletPolicy,
+    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
     DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
-    DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_XPUB_LENGTH,
+    DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_PARTICIPANTS, MAX_XPUB_LENGTH,
+    VALID_NETWORKS,
 };
 
 const MAX_SESSIONS: usize = 64;
@@ -64,7 +66,7 @@ pub struct PersistedFinalizedDescriptor {
 pub trait DescriptorSessionStore: Send + Sync {
     fn save(&self, session: &PersistedDescriptorSession) -> Result<()>;
     fn load(&self, session_id: &[u8; 32]) -> Result<Option<PersistedDescriptorSession>>;
-    fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>>;
+    fn load_all(&self, limit: usize) -> Result<Vec<PersistedDescriptorSession>>;
     fn delete(&self, session_id: &[u8; 32]) -> Result<()>;
 }
 
@@ -93,11 +95,38 @@ fn validate_session_timeout(timeout: Duration) -> Result<Duration> {
 }
 
 fn clamp_session_timeout(secs: u64) -> Duration {
-    let max = DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS;
-    Duration::from_secs(secs.max(1).min(max))
+    Duration::from_secs(secs.clamp(1, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS))
+}
+
+fn instant_to_unix(now: u64, instant: Instant) -> u64 {
+    now.saturating_sub(instant.elapsed().as_secs())
+}
+
+fn discard_reason(session: &DescriptorSession, is_terminal: bool) -> Option<&'static str> {
+    if is_terminal || session.is_expired() {
+        return Some("terminal or expired");
+    }
+    if !VALID_NETWORKS.contains(&session.network.as_str()) {
+        return Some("invalid network");
+    }
+    if session.expected_contributors.len() > MAX_PARTICIPANTS {
+        return Some("too many contributors");
+    }
+    let has_invalid_contribution = session.contributions.values().any(|c| {
+        !is_valid_xpub(&c.account_xpub) || !is_valid_fingerprint(&c.fingerprint)
+    });
+    if has_invalid_contribution {
+        return Some("invalid contribution data");
+    }
+    None
 }
 
 fn unix_to_instant(now: u64, ts: u64, field: &str) -> Result<Instant> {
+    if ts > now.saturating_add(crate::protocol::MAX_FUTURE_SKEW_SECS) {
+        return Err(FrostNetError::Session(format!(
+            "persisted {field} is in the future ({ts} > {now})"
+        )));
+    }
     let elapsed = now.saturating_sub(ts);
     Instant::now()
         .checked_sub(Duration::from_secs(elapsed))
@@ -456,24 +485,26 @@ impl DescriptorSession {
 
     pub fn to_persisted(&self) -> PersistedDescriptorSession {
         let now = now_unix();
-        let elapsed = self.created_at.elapsed().as_secs();
-        let created_at_unix = now.saturating_sub(elapsed);
-
-        let contributions_complete_at_unix = self.contributions_complete_at.map(|t| {
-            let e = t.elapsed().as_secs();
-            now.saturating_sub(e)
-        });
-
-        let finalized_at_unix = self.finalized_at.map(|t| {
-            let e = t.elapsed().as_secs();
-            now.saturating_sub(e)
-        });
+        let created_at_unix = instant_to_unix(now, self.created_at);
+        let contributions_complete_at_unix = self.contributions_complete_at.map(|t| instant_to_unix(now, t));
+        let finalized_at_unix = self.finalized_at.map(|t| instant_to_unix(now, t));
 
         let state = match &self.state {
             DescriptorSessionState::Proposed => PersistedSessionState::Proposed,
             DescriptorSessionState::Finalized => PersistedSessionState::Finalized,
             DescriptorSessionState::Complete => PersistedSessionState::Complete,
-            DescriptorSessionState::Failed(r) => PersistedSessionState::Failed(r.clone()),
+            DescriptorSessionState::Failed(r) => {
+                let truncated = if r.len() > 512 {
+                    let mut end = 512;
+                    while !r.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &r[..end])
+                } else {
+                    r.clone()
+                };
+                PersistedSessionState::Failed(truncated)
+            }
         };
 
         let descriptor = self
@@ -616,7 +647,7 @@ impl DescriptorSessionManager {
         let Some(store) = &self.store else {
             return Ok(0);
         };
-        let persisted = store.load_all()?;
+        let persisted = store.load_all(MAX_SESSIONS)?;
         let mut loaded = 0;
         for p in persisted {
             let sid = p.session_id;
@@ -624,26 +655,27 @@ impl DescriptorSessionManager {
                 p.state,
                 PersistedSessionState::Complete | PersistedSessionState::Failed(_)
             );
-            match DescriptorSession::from_persisted(p) {
-                Ok(session) => {
-                    if is_terminal || session.is_expired() {
-                        if let Err(e) = store.delete(&sid) {
-                            warn!(session_id = %hex::encode(sid), "Failed to clean up persisted session: {e}");
-                        }
-                        continue;
-                    }
-                    if self.sessions.len() >= MAX_SESSIONS {
-                        warn!("Skipping persisted session, max sessions reached");
-                        break;
-                    }
-                    self.sessions.insert(sid, session);
-                    loaded += 1;
-                }
+            let session = match DescriptorSession::from_persisted(p) {
+                Ok(s) => s,
                 Err(e) => {
                     warn!(session_id = %hex::encode(sid), "Failed to restore persisted session: {e}");
                     let _ = store.delete(&sid);
+                    continue;
                 }
+            };
+
+            if let Some(reason) = discard_reason(&session, is_terminal) {
+                warn!(session_id = %hex::encode(sid), "Discarding persisted session: {reason}");
+                let _ = store.delete(&sid);
+                continue;
             }
+
+            if self.sessions.len() >= MAX_SESSIONS {
+                warn!("Skipping persisted session, max sessions reached");
+                break;
+            }
+            self.sessions.insert(sid, session);
+            loaded += 1;
         }
         Ok(loaded)
     }
@@ -689,7 +721,7 @@ impl DescriptorSessionManager {
                     "Descriptor session already active".into(),
                 ));
             }
-            self.sessions.remove(&session_id);
+            self.remove_session(&session_id);
         }
 
         self.cleanup_expired();
@@ -1669,8 +1701,8 @@ mod tests {
             Ok(self.sessions.read().get(session_id).cloned())
         }
 
-        fn load_all(&self) -> Result<Vec<PersistedDescriptorSession>> {
-            Ok(self.sessions.read().values().cloned().collect())
+        fn load_all(&self, limit: usize) -> Result<Vec<PersistedDescriptorSession>> {
+            Ok(self.sessions.read().values().take(limit).cloned().collect())
         }
 
         fn delete(&self, session_id: &[u8; 32]) -> Result<()> {
