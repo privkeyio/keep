@@ -626,7 +626,7 @@ impl KeepMobile {
         mnemonic.zeroize();
         passphrase.zeroize();
         let key = key?;
-        let mut hex_key = hex::encode(*key);
+        let mut hex_key = hex::encode(&*key);
         let result = self.do_import_nsec(&hex_key, name);
         hex_key.zeroize();
         result
