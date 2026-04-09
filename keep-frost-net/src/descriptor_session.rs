@@ -15,11 +15,10 @@ use tracing::warn;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
-    is_valid_fingerprint, is_valid_xpub, KeySlot, WalletPolicy,
-    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
-    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
-    DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH, MAX_PARTICIPANTS, MAX_XPUB_LENGTH,
-    VALID_NETWORKS,
+    is_valid_fingerprint, is_valid_xpub, KeySlot, WalletPolicy, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS,
+    DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, MAX_FINGERPRINT_LENGTH,
+    MAX_PARTICIPANTS, MAX_XPUB_LENGTH, VALID_NETWORKS,
 };
 
 const MAX_SESSIONS: usize = 64;
@@ -112,9 +111,10 @@ fn discard_reason(session: &DescriptorSession, is_terminal: bool) -> Option<&'st
     if session.expected_contributors.len() > MAX_PARTICIPANTS {
         return Some("too many contributors");
     }
-    let has_invalid_contribution = session.contributions.values().any(|c| {
-        !is_valid_xpub(&c.account_xpub) || !is_valid_fingerprint(&c.fingerprint)
-    });
+    let has_invalid_contribution = session
+        .contributions
+        .values()
+        .any(|c| !is_valid_xpub(&c.account_xpub) || !is_valid_fingerprint(&c.fingerprint));
     if has_invalid_contribution {
         return Some("invalid contribution data");
     }
@@ -486,7 +486,9 @@ impl DescriptorSession {
     pub fn to_persisted(&self) -> PersistedDescriptorSession {
         let now = now_unix();
         let created_at_unix = instant_to_unix(now, self.created_at);
-        let contributions_complete_at_unix = self.contributions_complete_at.map(|t| instant_to_unix(now, t));
+        let contributions_complete_at_unix = self
+            .contributions_complete_at
+            .map(|t| instant_to_unix(now, t));
         let finalized_at_unix = self.finalized_at.map(|t| instant_to_unix(now, t));
 
         let state = match &self.state {

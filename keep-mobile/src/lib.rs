@@ -513,17 +513,21 @@ impl KeepMobile {
         })
     }
 
-    pub fn set_session_store_path(&self, path: String) {
+    pub fn set_session_store_path(&self, path: String) -> Result<(), KeepMobileError> {
         if std::path::Path::new(&path)
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            tracing::warn!("Rejecting session store path with parent traversal: {path}");
-            return;
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("Session store path contains parent traversal: {path}"),
+            });
         }
-        if let Ok(mut guard) = self.session_store_path.lock() {
-            *guard = Some(path);
-        }
+        let mut guard = self.session_store_path.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("session_store_path lock poisoned: {poisoned:?}");
+            poisoned.into_inner()
+        });
+        *guard = Some(path);
+        Ok(())
     }
 
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
@@ -1912,8 +1916,11 @@ impl KeepMobile {
             let node = if let Some(path) = self
                 .session_store_path
                 .lock()
-                .ok()
-                .and_then(|g| g.clone())
+                .unwrap_or_else(|poisoned| {
+                    tracing::error!("session_store_path lock poisoned: {poisoned:?}");
+                    poisoned.into_inner()
+                })
+                .clone()
             {
                 let store_path =
                     std::path::PathBuf::from(path).join("descriptor-sessions.redb");

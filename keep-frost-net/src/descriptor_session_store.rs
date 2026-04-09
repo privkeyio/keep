@@ -81,6 +81,9 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
     }
 
     fn load_all(&self, limit: usize) -> Result<Vec<PersistedDescriptorSession>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let txn = self
             .db
             .begin_read()
@@ -115,13 +118,27 @@ impl DescriptorSessionStore for FileDescriptorSessionStore {
         if !corrupt_keys.is_empty() {
             match self.db.begin_write() {
                 Ok(txn) => {
-                    if let Ok(mut table) = txn.open_table(TABLE) {
-                        for key in &corrupt_keys {
-                            let _ = table.remove(key.as_slice());
+                    let mut ok = true;
+                    match txn.open_table(TABLE) {
+                        Ok(mut table) => {
+                            for key in &corrupt_keys {
+                                if let Err(e) = table.remove(key.as_slice()) {
+                                    warn!(key = %hex::encode(key), "Failed to remove corrupt entry: {e}");
+                                    ok = false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to open table for corrupt entry cleanup: {e}");
+                            ok = false;
                         }
                     }
-                    if let Err(e) = txn.commit() {
-                        warn!("Failed to commit corrupt entry cleanup: {e}");
+                    if ok {
+                        if let Err(e) = txn.commit() {
+                            warn!("Failed to commit corrupt entry cleanup: {e}");
+                        }
+                    } else {
+                        warn!("Skipping corrupt entry cleanup commit due to prior errors");
                     }
                 }
                 Err(e) => {
