@@ -139,9 +139,21 @@ struct AuditEntryExport {
     hash: String,
 }
 
-impl From<AuditEntry> for AuditEntryExport {
-    fn from(e: AuditEntry) -> Self {
-        Self {
+impl TryFrom<AuditEntry> for AuditEntryExport {
+    type Error = KeepMobileError;
+
+    fn try_from(e: AuditEntry) -> Result<Self, Self::Error> {
+        if e.prev_hash.len() != 32 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("prev_hash length {} != 32", e.prev_hash.len()),
+            });
+        }
+        if e.hash.len() != 32 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("hash length {} != 32", e.hash.len()),
+            });
+        }
+        Ok(Self {
             timestamp: e.timestamp,
             event_type: e.event_type,
             pubkey: e.pubkey,
@@ -149,7 +161,7 @@ impl From<AuditEntry> for AuditEntryExport {
             details: e.details,
             prev_hash: hex::encode(e.prev_hash),
             hash: hex::encode(e.hash),
-        }
+        })
     }
 }
 
@@ -260,8 +272,8 @@ impl AuditLog {
         let entries: Vec<AuditEntryExport> = self
             .get_entries(None)?
             .into_iter()
-            .map(AuditEntryExport::from)
-            .collect();
+            .map(AuditEntryExport::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
@@ -468,9 +480,21 @@ struct SigningAuditEntryExport {
     hash: String,
 }
 
-impl From<SigningAuditEntry> for SigningAuditEntryExport {
-    fn from(e: SigningAuditEntry) -> Self {
-        Self {
+impl TryFrom<SigningAuditEntry> for SigningAuditEntryExport {
+    type Error = KeepMobileError;
+
+    fn try_from(e: SigningAuditEntry) -> Result<Self, Self::Error> {
+        if e.prev_hash.len() != 32 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("prev_hash length {} != 32", e.prev_hash.len()),
+            });
+        }
+        if e.hash.len() != 32 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!("hash length {} != 32", e.hash.len()),
+            });
+        }
+        Ok(Self {
             timestamp: e.timestamp,
             request_type: e.request_type,
             decision: e.decision,
@@ -481,7 +505,7 @@ impl From<SigningAuditEntry> for SigningAuditEntryExport {
             reason: e.reason,
             prev_hash: hex::encode(e.prev_hash),
             hash: hex::encode(e.hash),
-        }
+        })
     }
 }
 
@@ -681,8 +705,8 @@ impl SigningAuditLog {
         let entries: Vec<SigningAuditEntryExport> = self
             .load_all_entries()?
             .into_iter()
-            .map(SigningAuditEntryExport::from)
-            .collect();
+            .map(SigningAuditEntryExport::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
@@ -812,7 +836,15 @@ mod tests {
         assert_eq!(entries[0].pubkey.as_deref(), Some("pk1"));
         assert!(entries[0].success);
         assert_eq!(entries[0].hash.len(), 64);
-        assert!(entries[0].hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(entries[0]
+            .hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(entries[0].prev_hash.len(), 64);
+        assert!(entries[0]
+            .prev_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -1037,7 +1069,15 @@ mod tests {
         assert_eq!(entries[0].caller_name.as_deref(), Some("Test App"));
         assert_eq!(entries[0].event_kind, Some(1));
         assert_eq!(entries[0].hash.len(), 64);
-        assert!(entries[0].hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(entries[0]
+            .hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(entries[0].prev_hash.len(), 64);
+        assert!(entries[0]
+            .prev_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
