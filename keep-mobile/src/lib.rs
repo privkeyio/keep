@@ -264,6 +264,9 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
+    // Relies on SecureStorage (Android Keystore / iOS Keychain) for encryption at rest
+    #[serde(default)]
+    plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
 }
 
 #[uniffi::export(with_foreign)]
@@ -587,7 +590,7 @@ impl KeepMobile {
                 msg: "Key must be exactly 64 hex characters".into(),
             });
         }
-        let result = self.do_import_nsec(&hex_key, name);
+        let result = self.do_import_nsec(&hex_key, name, None);
         hex_key.zeroize();
         result
     }
@@ -621,13 +624,21 @@ impl KeepMobile {
         name: String,
         account_index: u32,
     ) -> Result<ShareInfo, KeepMobileError> {
+        Self::validate_share_name(&name)?;
+        if self.storage.list_all_shares().len() >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
+            });
+        }
+
+        let mnemonic_bytes = Zeroizing::new(mnemonic.as_bytes().to_vec());
         let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
         passphrase.zeroize();
         let key = key?;
         let mut hex_key = hex::encode(*key);
-        let result = self.do_import_nsec(&hex_key, name);
+        let result = self.do_import_nsec(&hex_key, name, Some(mnemonic_bytes));
         hex_key.zeroize();
         result
     }
@@ -800,6 +811,58 @@ impl KeepMobile {
         self.storage.delete_share_by_key(group_pubkey)?;
 
         Ok(())
+    }
+
+    // Load-modify-store without locking; acceptable in single-user mobile context
+    pub fn mark_share_backed_up(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let data = self.storage.load_share_by_key(group_pubkey.clone())?;
+        let mut stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        let mut metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json)
+                .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        metadata.mark_backed_up();
+
+        stored.metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let metadata_info = ShareMetadataInfo {
+            name: metadata.name,
+            identifier: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            group_pubkey: metadata.group_pubkey.to_vec(),
+        };
+
+        self.storage
+            .store_share_by_key(group_pubkey, serialized, metadata_info)?;
+        Ok(())
+    }
+
+    // Caller is responsible for re-authentication before calling this method
+    pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<String>, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let data = self.storage.load_share_by_key(group_pubkey)?;
+        let stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        stored
+            .plaintext_mnemonic
+            .map(|bytes| {
+                let s = std::str::from_utf8(&bytes).map_err(|_| KeepMobileError::StorageError {
+                    msg: "mnemonic contains invalid UTF-8".to_string(),
+                })?;
+                Ok(s.to_owned())
+            })
+            .transpose()
     }
 
     pub fn frost_generate(
@@ -1497,6 +1560,7 @@ impl KeepMobile {
                 created_at: share_meta.created_at,
                 last_used: share_meta.last_used,
                 sign_count: share_meta.sign_count,
+                did_backup: share_meta.did_backup,
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
             });
@@ -1638,6 +1702,7 @@ impl KeepMobile {
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
+                did_backup: bs.did_backup,
             };
 
             let stored = StoredShareData {
@@ -1648,6 +1713,7 @@ impl KeepMobile {
                     Zeroizing::new(Vec::new()),
                 ),
                 pubkey_package_bytes,
+                plaintext_mnemonic: None,
             };
 
             let serialized = serde_json::to_vec(&stored)
@@ -1664,11 +1730,16 @@ impl KeepMobile {
                     msg: format!("nsec conversion: {e}"),
                 })?;
 
-            let (metadata_info, stored) =
-                Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, bk.name.clone())
-                    .map_err(|e| KeepMobileError::BackupError {
-                        msg: format!("nsec share data: {e}"),
-                    })?;
+            let (metadata_info, stored) = Self::build_nsec_share_data(
+                key_package,
+                pubkey_package,
+                vk_bytes,
+                bk.name.clone(),
+                None,
+            )
+            .map_err(|e| KeepMobileError::BackupError {
+                msg: format!("nsec share data: {e}"),
+            })?;
 
             let group_hex = hex::encode(&metadata_info.group_pubkey);
             if first_group_hex.is_none() {
@@ -2041,7 +2112,12 @@ impl KeepMobile {
         })
     }
 
-    fn do_import_nsec(&self, hex_key: &str, name: String) -> Result<ShareInfo, KeepMobileError> {
+    fn do_import_nsec(
+        &self,
+        hex_key: &str,
+        name: String,
+        plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<ShareInfo, KeepMobileError> {
         Self::validate_share_name(&name)?;
 
         let share_count = self.storage.list_all_shares().len();
@@ -2065,8 +2141,13 @@ impl KeepMobile {
         }
 
         let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
-        let (metadata_info, stored) =
-            Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, name)?;
+        let (metadata_info, stored) = Self::build_nsec_share_data(
+            key_package,
+            pubkey_package,
+            vk_bytes,
+            name,
+            plaintext_mnemonic,
+        )?;
 
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
@@ -2152,6 +2233,7 @@ impl KeepMobile {
         pubkey_package: frost_secp256k1_tr::keys::PublicKeyPackage,
         vk_bytes: Vec<u8>,
         name: String,
+        plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<(ShareMetadataInfo, StoredShareData), KeepMobileError> {
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33]
@@ -2189,6 +2271,7 @@ impl KeepMobile {
                     msg: format!("Serialization failed: {e}"),
                 }
             })?,
+            plaintext_mnemonic,
         };
 
         Ok((metadata_info, stored))
@@ -2293,6 +2376,7 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
                 })?,
+            plaintext_mnemonic: None,
         };
 
         let serialized = serde_json::to_vec(&stored)
@@ -2618,6 +2702,7 @@ impl KeepMobile {
             created_at: metadata.created_at,
             last_used: metadata.last_used,
             sign_count: metadata.sign_count,
+            did_backup: metadata.did_backup,
         })
     }
 

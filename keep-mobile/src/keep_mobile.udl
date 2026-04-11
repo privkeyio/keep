@@ -62,6 +62,7 @@ dictionary StoredShareInfo {
     i64 created_at;
     i64? last_used;
     u64 sign_count;
+    boolean did_backup;
 };
 
 dictionary SignRequest {
@@ -284,6 +285,12 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     void delete_share_by_key(string group_pubkey);
+
+    [Throws=KeepMobileError]
+    void mark_share_backed_up(string group_pubkey);
+
+    [Throws=KeepMobileError]
+    string? get_seed_words(string group_pubkey);
 
     [Throws=KeepMobileError]
     sequence<CertificatePin> get_certificate_pins();

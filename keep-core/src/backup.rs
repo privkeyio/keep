@@ -88,6 +88,9 @@ pub struct BackupShare {
     pub last_used: Option<i64>,
     /// Number of signatures produced.
     pub sign_count: u64,
+    /// Whether this share has been backed up.
+    #[serde(default)]
+    pub did_backup: bool,
     /// Hex-encoded serialized key package.
     pub key_package: String,
     /// Hex-encoded serialized public key package.
@@ -278,6 +281,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             created_at: share.metadata.created_at,
             last_used: share.metadata.last_used,
             sign_count: share.metadata.sign_count,
+            did_backup: share.metadata.did_backup,
             key_package: hex::encode(key_package_bytes.as_slice()),
             pubkey_package: hex::encode(&share.pubkey_package),
         });
@@ -468,6 +472,7 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
+                did_backup: bs.did_backup,
             },
             encrypted_key_package: encrypted.to_bytes(),
             pubkey_package,
