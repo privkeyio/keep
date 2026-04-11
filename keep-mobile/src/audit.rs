@@ -130,13 +130,13 @@ impl AuditEntry {
 
 #[derive(Serialize, Deserialize)]
 struct AuditEntryExport {
-    pub timestamp: i64,
-    pub event_type: AuditEventType,
-    pub pubkey: Option<String>,
-    pub success: bool,
-    pub details: Option<String>,
-    pub prev_hash: String,
-    pub hash: String,
+    timestamp: i64,
+    event_type: AuditEventType,
+    pubkey: Option<String>,
+    success: bool,
+    details: Option<String>,
+    prev_hash: String,
+    hash: String,
 }
 
 impl From<AuditEntry> for AuditEntryExport {
@@ -147,8 +147,8 @@ impl From<AuditEntry> for AuditEntryExport {
             pubkey: e.pubkey,
             success: e.success,
             details: e.details,
-            prev_hash: hex::encode(&e.prev_hash),
-            hash: hex::encode(&e.hash),
+            prev_hash: hex::encode(e.prev_hash),
+            hash: hex::encode(e.hash),
         }
     }
 }
@@ -257,15 +257,11 @@ impl AuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entry_jsons = self.storage.load_entries(None)?;
-        let mut entries = Vec::with_capacity(entry_jsons.len());
-        for json in entry_jsons {
-            let entry: AuditEntry =
-                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid audit entry: {e}"),
-                })?;
-            entries.push(AuditEntryExport::from(entry));
-        }
+        let entries: Vec<AuditEntryExport> = self
+            .get_entries(None)?
+            .into_iter()
+            .map(AuditEntryExport::from)
+            .collect();
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
@@ -460,16 +456,16 @@ impl SigningAuditEntry {
 
 #[derive(Serialize, Deserialize)]
 struct SigningAuditEntryExport {
-    pub timestamp: i64,
-    pub request_type: SigningRequestType,
-    pub decision: SigningDecision,
-    pub was_automatic: bool,
-    pub caller: String,
-    pub caller_name: Option<String>,
-    pub event_kind: Option<u32>,
-    pub reason: Option<String>,
-    pub prev_hash: String,
-    pub hash: String,
+    timestamp: i64,
+    request_type: SigningRequestType,
+    decision: SigningDecision,
+    was_automatic: bool,
+    caller: String,
+    caller_name: Option<String>,
+    event_kind: Option<u32>,
+    reason: Option<String>,
+    prev_hash: String,
+    hash: String,
 }
 
 impl From<SigningAuditEntry> for SigningAuditEntryExport {
@@ -483,8 +479,8 @@ impl From<SigningAuditEntry> for SigningAuditEntryExport {
             caller_name: e.caller_name,
             event_kind: e.event_kind,
             reason: e.reason,
-            prev_hash: hex::encode(&e.prev_hash),
-            hash: hex::encode(&e.hash),
+            prev_hash: hex::encode(e.prev_hash),
+            hash: hex::encode(e.hash),
         }
     }
 }
@@ -515,6 +511,21 @@ pub trait SigningAuditStorage: Send + Sync {
 pub struct SigningAuditLog {
     storage: std::sync::Arc<dyn SigningAuditStorage>,
     last_hash: std::sync::Mutex<[u8; 32]>,
+}
+
+impl SigningAuditLog {
+    fn load_all_entries(&self) -> Result<Vec<SigningAuditEntry>, KeepMobileError> {
+        let entry_jsons = self.storage.load_entries(None)?;
+        let mut entries = Vec::with_capacity(entry_jsons.len());
+        for json in entry_jsons {
+            let entry: SigningAuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid signing audit entry: {e}"),
+                })?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
 }
 
 #[uniffi::export]
@@ -627,7 +638,7 @@ impl SigningAuditLog {
     }
 
     pub fn verify_chain(&self) -> Result<ChainStatus, KeepMobileError> {
-        let entries = self.storage.load_entries(None)?;
+        let entries = self.load_all_entries()?;
 
         if entries.len() > MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
@@ -635,7 +646,6 @@ impl SigningAuditLog {
             });
         }
 
-        let mut prev_hash = [0u8; 32];
         let count: u32 = entries
             .len()
             .try_into()
@@ -643,11 +653,8 @@ impl SigningAuditLog {
                 msg: "Entry count exceeds u32".into(),
             })?;
 
-        for json in entries {
-            let entry: SigningAuditEntry =
-                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid signing audit entry: {e}"),
-                })?;
+        let mut prev_hash = [0u8; 32];
+        for entry in entries {
             if !entry.verify(&prev_hash) {
                 return Ok(ChainStatus {
                     verified: false,
@@ -671,15 +678,11 @@ impl SigningAuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entry_jsons = self.storage.load_entries(None)?;
-        let mut entries = Vec::with_capacity(entry_jsons.len());
-        for json in entry_jsons {
-            let entry: SigningAuditEntry =
-                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid signing audit entry: {e}"),
-                })?;
-            entries.push(SigningAuditEntryExport::from(entry));
-        }
+        let entries: Vec<SigningAuditEntryExport> = self
+            .load_all_entries()?
+            .into_iter()
+            .map(SigningAuditEntryExport::from)
+            .collect();
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
