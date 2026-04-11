@@ -80,6 +80,9 @@ pub enum KeepMobileError {
     #[error("Backup error: {msg}")]
     BackupError { msg: String },
 
+    #[error("Encryption error: {msg}")]
+    EncryptionError { msg: String },
+
     #[error("Certificate pin mismatch")]
     CertificatePinMismatch {
         hostname: String,

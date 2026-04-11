@@ -270,6 +270,9 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     string export_share(string passphrase);
 
+    [Throws=KeepMobileError]
+    string export_ncryptsec(string password);
+
     sequence<StoredShareInfo> list_shares();
 
     StoredShareInfo? get_active_share();

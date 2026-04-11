@@ -729,6 +729,32 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
 
+    pub fn export_ncryptsec(&self, password: String) -> Result<String, KeepMobileError> {
+        let password = Zeroizing::new(password);
+        let share = self.load_share_package()?;
+
+        if share.metadata.threshold != 1 || share.metadata.total_shares != 1 {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "NIP-49 export is only supported for single-key (nsec) shares".into(),
+            });
+        }
+
+        let key_package = share
+            .key_package()
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+
+        let share_bytes = Zeroizing::new(key_package.signing_share().serialize());
+        let secret: [u8; 32] = share_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| KeepMobileError::EncryptionError {
+                msg: "unexpected signing share length".into(),
+            })?;
+
+        keep_core::keys::nip49::encrypt(&secret, &password, None)
+            .map_err(|e| KeepMobileError::EncryptionError { msg: e.to_string() })
+    }
+
     pub fn list_shares(&self) -> Vec<StoredShareInfo> {
         self.storage
             .list_all_shares()
