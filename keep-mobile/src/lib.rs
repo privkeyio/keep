@@ -751,7 +751,7 @@ impl KeepMobile {
                 }
             })?);
 
-        keep_core::keys::nip49::encrypt(&secret, &password, None)
+        keep_core::keys::nip49::encrypt(&secret, &password, Some(14))
             .map_err(|e| KeepMobileError::EncryptionError { msg: e.to_string() })
     }
 
