@@ -264,8 +264,8 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
-    #[serde(default)]
-    encrypted_mnemonic: Option<Vec<u8>>,
+    #[serde(default, alias = "encrypted_mnemonic")]
+    plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
 }
 
 #[uniffi::export(with_foreign)]
@@ -623,7 +623,7 @@ impl KeepMobile {
         name: String,
         account_index: u32,
     ) -> Result<ShareInfo, KeepMobileError> {
-        let mnemonic_bytes = mnemonic.as_bytes().to_vec();
+        let mnemonic_bytes = Zeroizing::new(mnemonic.as_bytes().to_vec());
         let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
@@ -637,7 +637,7 @@ impl KeepMobile {
         let data = self.storage.load_share_by_key(share_info.group_pubkey.clone())?;
         let mut stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
-        stored.encrypted_mnemonic = Some(mnemonic_bytes);
+        stored.plaintext_mnemonic = Some(mnemonic_bytes);
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
         let metadata_info = ShareMetadataInfo {
@@ -841,9 +841,15 @@ impl KeepMobile {
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        Ok(stored
-            .encrypted_mnemonic
-            .map(|bytes| String::from_utf8(bytes).unwrap_or_default()))
+        stored
+            .plaintext_mnemonic
+            .map(|bytes| {
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| KeepMobileError::StorageError {
+                        msg: "mnemonic contains invalid UTF-8".to_string(),
+                    })
+            })
+            .transpose()
     }
 
     pub fn frost_generate(
@@ -1694,7 +1700,7 @@ impl KeepMobile {
                     Zeroizing::new(Vec::new()),
                 ),
                 pubkey_package_bytes,
-                encrypted_mnemonic: None,
+                plaintext_mnemonic: None,
             };
 
             let serialized = serde_json::to_vec(&stored)
@@ -2236,7 +2242,7 @@ impl KeepMobile {
                     msg: format!("Serialization failed: {e}"),
                 }
             })?,
-            encrypted_mnemonic: None,
+            plaintext_mnemonic: None,
         };
 
         Ok((metadata_info, stored))
@@ -2341,7 +2347,7 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
                 })?,
-            encrypted_mnemonic: None,
+            plaintext_mnemonic: None,
         };
 
         let serialized = serde_json::to_vec(&stored)
