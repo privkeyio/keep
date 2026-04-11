@@ -744,12 +744,12 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
 
         let share_bytes = Zeroizing::new(key_package.signing_share().serialize());
-        let secret: [u8; 32] = share_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| KeepMobileError::EncryptionError {
-                msg: "unexpected signing share length".into(),
-            })?;
+        let secret: Zeroizing<[u8; 32]> =
+            Zeroizing::new(share_bytes.as_slice().try_into().map_err(|_| {
+                KeepMobileError::EncryptionError {
+                    msg: "unexpected signing share length".into(),
+                }
+            })?);
 
         keep_core::keys::nip49::encrypt(&secret, &password, None)
             .map_err(|e| KeepMobileError::EncryptionError { msg: e.to_string() })

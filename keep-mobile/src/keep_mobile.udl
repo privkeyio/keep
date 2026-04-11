@@ -32,6 +32,7 @@ interface KeepMobileError {
     PolicyViolation(string reason);
     InvalidPolicy(string msg);
     PolicySignatureInvalid();
+    EncryptionError(string msg);
     CertificatePinMismatch(string hostname, string expected, string actual);
 };
 
