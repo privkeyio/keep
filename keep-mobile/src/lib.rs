@@ -822,10 +822,9 @@ impl KeepMobile {
         stored
             .plaintext_mnemonic
             .map(|bytes| {
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| KeepMobileError::StorageError {
-                        msg: "mnemonic contains invalid UTF-8".to_string(),
-                    })
+                String::from_utf8(bytes.to_vec()).map_err(|_| KeepMobileError::StorageError {
+                    msg: "mnemonic contains invalid UTF-8".to_string(),
+                })
             })
             .transpose()
     }
@@ -1695,11 +1694,16 @@ impl KeepMobile {
                     msg: format!("nsec conversion: {e}"),
                 })?;
 
-            let (metadata_info, stored) =
-                Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, bk.name.clone(), None)
-                    .map_err(|e| KeepMobileError::BackupError {
-                        msg: format!("nsec share data: {e}"),
-                    })?;
+            let (metadata_info, stored) = Self::build_nsec_share_data(
+                key_package,
+                pubkey_package,
+                vk_bytes,
+                bk.name.clone(),
+                None,
+            )
+            .map_err(|e| KeepMobileError::BackupError {
+                msg: format!("nsec share data: {e}"),
+            })?;
 
             let group_hex = hex::encode(&metadata_info.group_pubkey);
             if first_group_hex.is_none() {
@@ -2101,8 +2105,13 @@ impl KeepMobile {
         }
 
         let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
-        let (metadata_info, stored) =
-            Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, name, plaintext_mnemonic)?;
+        let (metadata_info, stored) = Self::build_nsec_share_data(
+            key_package,
+            pubkey_package,
+            vk_bytes,
+            name,
+            plaintext_mnemonic,
+        )?;
 
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
