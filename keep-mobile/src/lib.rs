@@ -624,6 +624,13 @@ impl KeepMobile {
         name: String,
         account_index: u32,
     ) -> Result<ShareInfo, KeepMobileError> {
+        Self::validate_share_name(&name)?;
+        if self.storage.list_all_shares().len() >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
+            });
+        }
+
         let mnemonic_bytes = Zeroizing::new(mnemonic.as_bytes().to_vec());
         let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
@@ -824,10 +831,8 @@ impl KeepMobile {
         stored
             .plaintext_mnemonic
             .map(|bytes| {
-                let s = std::str::from_utf8(&bytes).map_err(|_| {
-                    KeepMobileError::StorageError {
-                        msg: "mnemonic contains invalid UTF-8".to_string(),
-                    }
+                let s = std::str::from_utf8(&bytes).map_err(|_| KeepMobileError::StorageError {
+                    msg: "mnemonic contains invalid UTF-8".to_string(),
                 })?;
                 Ok(s.to_owned())
             })
