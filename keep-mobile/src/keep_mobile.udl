@@ -32,6 +32,8 @@ interface KeepMobileError {
     PolicyViolation(string reason);
     InvalidPolicy(string msg);
     PolicySignatureInvalid();
+    BackupError(string msg);
+    EncryptionError(string msg);
     CertificatePinMismatch(string hostname, string expected, string actual);
 };
 
@@ -269,6 +271,9 @@ interface KeepMobile {
 
     [Throws=KeepMobileError]
     string export_share(string passphrase);
+
+    [Throws=KeepMobileError]
+    string export_ncryptsec(string password);
 
     sequence<StoredShareInfo> list_shares();
 
