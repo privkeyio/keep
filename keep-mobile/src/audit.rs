@@ -128,6 +128,31 @@ impl AuditEntry {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct AuditEntryExport {
+    pub timestamp: i64,
+    pub event_type: AuditEventType,
+    pub pubkey: Option<String>,
+    pub success: bool,
+    pub details: Option<String>,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+impl From<AuditEntry> for AuditEntryExport {
+    fn from(e: AuditEntry) -> Self {
+        Self {
+            timestamp: e.timestamp,
+            event_type: e.event_type,
+            pubkey: e.pubkey,
+            success: e.success,
+            details: e.details,
+            prev_hash: hex::encode(&e.prev_hash),
+            hash: hex::encode(&e.hash),
+        }
+    }
+}
+
 #[uniffi::export(with_foreign)]
 pub trait AuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
@@ -220,13 +245,6 @@ impl AuditLog {
 
     pub fn get_entries(&self, limit: Option<u32>) -> Result<Vec<AuditEntry>, KeepMobileError> {
         let entry_jsons = self.storage.load_entries(limit)?;
-
-        if entry_jsons.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
-
         let mut entries = Vec::with_capacity(entry_jsons.len());
         for json in entry_jsons {
             let entry: AuditEntry =
@@ -239,7 +257,15 @@ impl AuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entries = self.get_entries(None)?;
+        let entry_jsons = self.storage.load_entries(None)?;
+        let mut entries = Vec::with_capacity(entry_jsons.len());
+        for json in entry_jsons {
+            let entry: AuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid audit entry: {e}"),
+                })?;
+            entries.push(AuditEntryExport::from(entry));
+        }
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
@@ -432,6 +458,37 @@ impl SigningAuditEntry {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct SigningAuditEntryExport {
+    pub timestamp: i64,
+    pub request_type: SigningRequestType,
+    pub decision: SigningDecision,
+    pub was_automatic: bool,
+    pub caller: String,
+    pub caller_name: Option<String>,
+    pub event_kind: Option<u32>,
+    pub reason: Option<String>,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+impl From<SigningAuditEntry> for SigningAuditEntryExport {
+    fn from(e: SigningAuditEntry) -> Self {
+        Self {
+            timestamp: e.timestamp,
+            request_type: e.request_type,
+            decision: e.decision,
+            was_automatic: e.was_automatic,
+            caller: e.caller,
+            caller_name: e.caller_name,
+            event_kind: e.event_kind,
+            reason: e.reason,
+            prev_hash: hex::encode(&e.prev_hash),
+            hash: hex::encode(&e.hash),
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct ChainStatus {
     pub verified: bool,
@@ -615,24 +672,14 @@ impl SigningAuditLog {
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
         let entry_jsons = self.storage.load_entries(None)?;
-
-        if entry_jsons.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!(
-                    "Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"
-                ),
-            });
-        }
-
         let mut entries = Vec::with_capacity(entry_jsons.len());
         for json in entry_jsons {
             let entry: SigningAuditEntry =
                 serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
                     msg: format!("Invalid signing audit entry: {e}"),
                 })?;
-            entries.push(entry);
+            entries.push(SigningAuditEntryExport::from(entry));
         }
-
         serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
@@ -748,12 +795,21 @@ mod tests {
         let storage = Arc::new(MockStorage::new());
         let log = AuditLog::new(storage).unwrap();
 
+        let json = log.export_json().unwrap();
+        let entries: Vec<AuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert!(entries.is_empty());
+
         log.log_event(AuditEventType::Sign, Some("pk1".into()), true, None)
             .unwrap();
 
         let json = log.export_json().unwrap();
-        assert!(json.contains("Sign"), "JSON: {json}");
-        assert!(json.contains("pk1"), "JSON: {json}");
+        let entries: Vec<AuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, AuditEventType::Sign);
+        assert_eq!(entries[0].pubkey.as_deref(), Some("pk1"));
+        assert!(entries[0].success);
+        assert_eq!(entries[0].hash.len(), 64);
+        assert!(entries[0].hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -954,6 +1010,10 @@ mod tests {
         let storage = Arc::new(MockSigningStorage::new());
         let log = SigningAuditLog::new(storage).unwrap();
 
+        let json = log.export_json().unwrap();
+        let entries: Vec<SigningAuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert!(entries.is_empty());
+
         log.log_event(
             SigningRequestType::SignEvent,
             SigningDecision::Approved,
@@ -966,9 +1026,15 @@ mod tests {
         .unwrap();
 
         let json = log.export_json().unwrap();
-        assert!(json.contains("SignEvent"), "JSON: {json}");
-        assert!(json.contains("app1"), "JSON: {json}");
-        assert!(json.contains("Test App"), "JSON: {json}");
+        let entries: Vec<SigningAuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].request_type, SigningRequestType::SignEvent);
+        assert_eq!(entries[0].decision, SigningDecision::Approved);
+        assert_eq!(entries[0].caller, "app1");
+        assert_eq!(entries[0].caller_name.as_deref(), Some("Test App"));
+        assert_eq!(entries[0].event_kind, Some(1));
+        assert_eq!(entries[0].hash.len(), 64);
+        assert!(entries[0].hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
