@@ -805,8 +805,7 @@ impl KeepMobile {
             identifier: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
-            group_pubkey: hex::decode(&group_pubkey)
-                .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?,
+            group_pubkey: metadata.group_pubkey.to_vec(),
         };
 
         self.storage
