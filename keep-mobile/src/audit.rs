@@ -21,6 +21,26 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
     &s[..end]
 }
 
+fn require_hash_32(hash: &[u8], field: &str) -> Result<(), KeepMobileError> {
+    if hash.len() != 32 {
+        return Err(KeepMobileError::InvalidInput {
+            msg: format!("{field} length {} != 32", hash.len()),
+        });
+    }
+    Ok(())
+}
+
+fn hash_optional_str(data: &mut Vec<u8>, opt: &Option<String>) {
+    match opt {
+        Some(s) => {
+            data.push(1);
+            data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        None => data.push(0),
+    }
+}
+
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditEventType {
     Sign = 0,
@@ -94,25 +114,9 @@ impl AuditEntry {
         let mut data = Vec::new();
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         data.push(self.event_type as u8);
-        match &self.pubkey {
-            Some(pk) => {
-                data.push(1);
-                let len = (pk.len() as u32).to_le_bytes();
-                data.extend_from_slice(&len);
-                data.extend_from_slice(pk.as_bytes());
-            }
-            None => data.push(0),
-        }
+        hash_optional_str(&mut data, &self.pubkey);
         data.push(self.success as u8);
-        match &self.details {
-            Some(d) => {
-                data.push(1);
-                let len = (d.len() as u32).to_le_bytes();
-                data.extend_from_slice(&len);
-                data.extend_from_slice(d.as_bytes());
-            }
-            None => data.push(0),
-        }
+        hash_optional_str(&mut data, &self.details);
         data.extend_from_slice(&self.prev_hash);
         blake2b_256(&data)
     }
@@ -144,16 +148,8 @@ impl TryFrom<AuditEntry> for AuditEntryExport {
     type Error = KeepMobileError;
 
     fn try_from(e: AuditEntry) -> Result<Self, Self::Error> {
-        if e.prev_hash.len() != 32 {
-            return Err(KeepMobileError::InvalidInput {
-                msg: format!("prev_hash length {} != 32", e.prev_hash.len()),
-            });
-        }
-        if e.hash.len() != 32 {
-            return Err(KeepMobileError::InvalidInput {
-                msg: format!("hash length {} != 32", e.hash.len()),
-            });
-        }
+        require_hash_32(&e.prev_hash, "prev_hash")?;
+        require_hash_32(&e.hash, "hash")?;
         Ok(Self {
             timestamp: e.timestamp,
             event_type: e.event_type,
@@ -179,6 +175,29 @@ pub trait AuditStorage: Send + Sync {
 pub struct AuditLog {
     storage: std::sync::Arc<dyn AuditStorage>,
     last_hash: std::sync::Mutex<[u8; 32]>,
+}
+
+impl AuditLog {
+    fn load_all_checked(&self) -> Result<Vec<AuditEntry>, KeepMobileError> {
+        const _: () = assert!(MAX_AUDIT_ENTRIES < u32::MAX as usize);
+        let entry_jsons = self
+            .storage
+            .load_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
+        if entry_jsons.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
+        let mut entries = Vec::with_capacity(entry_jsons.len());
+        for json in entry_jsons {
+            let entry: AuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid audit entry: {e}"),
+                })?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
 }
 
 #[uniffi::export]
@@ -276,12 +295,7 @@ impl AuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entries = self.get_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
+        let entries = self.load_all_checked()?;
         let exports: Vec<AuditEntryExport> = entries
             .into_iter()
             .map(AuditEntryExport::try_from)
@@ -292,12 +306,7 @@ impl AuditLog {
     }
 
     pub fn verify_chain(&self) -> Result<bool, KeepMobileError> {
-        let entries = self.get_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
+        let entries = self.load_all_checked()?;
         let mut prev_hash = [0u8; 32];
 
         for entry in entries {
@@ -445,14 +454,7 @@ impl SigningAuditEntry {
         data.push(self.was_automatic as u8);
         data.extend_from_slice(&(self.caller.len() as u32).to_le_bytes());
         data.extend_from_slice(self.caller.as_bytes());
-        match &self.caller_name {
-            Some(s) => {
-                data.push(1);
-                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                data.extend_from_slice(s.as_bytes());
-            }
-            None => data.push(0),
-        }
+        hash_optional_str(&mut data, &self.caller_name);
         match self.event_kind {
             Some(kind) => {
                 data.push(1);
@@ -460,14 +462,7 @@ impl SigningAuditEntry {
             }
             None => data.push(0),
         }
-        match &self.reason {
-            Some(s) => {
-                data.push(1);
-                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                data.extend_from_slice(s.as_bytes());
-            }
-            None => data.push(0),
-        }
+        hash_optional_str(&mut data, &self.reason);
         data.extend_from_slice(&self.prev_hash);
         blake2b_256(&data)
     }
@@ -502,16 +497,8 @@ impl TryFrom<SigningAuditEntry> for SigningAuditEntryExport {
     type Error = KeepMobileError;
 
     fn try_from(e: SigningAuditEntry) -> Result<Self, Self::Error> {
-        if e.prev_hash.len() != 32 {
-            return Err(KeepMobileError::InvalidInput {
-                msg: format!("prev_hash length {} != 32", e.prev_hash.len()),
-            });
-        }
-        if e.hash.len() != 32 {
-            return Err(KeepMobileError::InvalidInput {
-                msg: format!("hash length {} != 32", e.hash.len()),
-            });
-        }
+        require_hash_32(&e.prev_hash, "prev_hash")?;
+        require_hash_32(&e.hash, "hash")?;
         Ok(Self {
             timestamp: e.timestamp,
             request_type: e.request_type,
@@ -556,11 +543,18 @@ pub struct SigningAuditLog {
 }
 
 impl SigningAuditLog {
-    fn load_all_entries(&self) -> Result<Vec<SigningAuditEntry>, KeepMobileError> {
+    fn load_all_checked(&self) -> Result<Vec<SigningAuditEntry>, KeepMobileError> {
         const _: () = assert!(MAX_AUDIT_ENTRIES < u32::MAX as usize);
         let entry_jsons = self
             .storage
             .load_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
+        if entry_jsons.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"
+                ),
+            });
+        }
         let mut entries = Vec::with_capacity(entry_jsons.len());
         for json in entry_jsons {
             let entry: SigningAuditEntry =
@@ -683,20 +677,8 @@ impl SigningAuditLog {
     }
 
     pub fn verify_chain(&self) -> Result<ChainStatus, KeepMobileError> {
-        let entries = self.load_all_entries()?;
-
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
-
-        let count: u32 = entries
-            .len()
-            .try_into()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Entry count exceeds u32".into(),
-            })?;
+        let entries = self.load_all_checked()?;
+        let count = entries.len() as u32;
 
         let mut prev_hash = [0u8; 32];
         for entry in entries {
@@ -723,12 +705,7 @@ impl SigningAuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entries = self.load_all_entries()?;
-        if entries.len() > MAX_AUDIT_ENTRIES {
-            return Err(KeepMobileError::StorageError {
-                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
-            });
-        }
+        let entries = self.load_all_checked()?;
         let exports: Vec<SigningAuditEntryExport> = entries
             .into_iter()
             .map(SigningAuditEntryExport::try_from)
@@ -759,6 +736,11 @@ impl SigningAuditLog {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn assert_lowercase_hex(s: &str) {
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
 
     struct MockStorage {
         entries: Mutex<Vec<String>>,
@@ -861,16 +843,8 @@ mod tests {
         assert_eq!(entries[0].event_type, AuditEventType::Sign);
         assert_eq!(entries[0].pubkey.as_deref(), Some("pk1"));
         assert!(entries[0].success);
-        assert_eq!(entries[0].hash.len(), 64);
-        assert!(entries[0]
-            .hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        assert_eq!(entries[0].prev_hash.len(), 64);
-        assert!(entries[0]
-            .prev_hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_lowercase_hex(&entries[0].hash);
+        assert_lowercase_hex(&entries[0].prev_hash);
     }
 
     #[test]
@@ -1125,16 +1099,8 @@ mod tests {
         assert_eq!(entries[0].caller, "app1");
         assert_eq!(entries[0].caller_name.as_deref(), Some("Test App"));
         assert_eq!(entries[0].event_kind, Some(1));
-        assert_eq!(entries[0].hash.len(), 64);
-        assert!(entries[0]
-            .hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        assert_eq!(entries[0].prev_hash.len(), 64);
-        assert!(entries[0]
-            .prev_hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_lowercase_hex(&entries[0].hash);
+        assert_lowercase_hex(&entries[0].prev_hash);
     }
 
     #[test]
