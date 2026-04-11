@@ -589,7 +589,7 @@ impl KeepMobile {
                 msg: "Key must be exactly 64 hex characters".into(),
             });
         }
-        let result = self.do_import_nsec(&hex_key, name);
+        let result = self.do_import_nsec(&hex_key, name, None);
         hex_key.zeroize();
         result
     }
@@ -630,31 +630,9 @@ impl KeepMobile {
         passphrase.zeroize();
         let key = key?;
         let mut hex_key = hex::encode(*key);
-        let result = self.do_import_nsec(&hex_key, name);
+        let result = self.do_import_nsec(&hex_key, name, Some(mnemonic_bytes));
         hex_key.zeroize();
-        let share_info = result?;
-
-        let data = self.storage.load_share_by_key(share_info.group_pubkey.clone())?;
-        let mut stored: StoredShareData = serde_json::from_slice(&data)
-            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
-        stored.plaintext_mnemonic = Some(mnemonic_bytes);
-        let serialized = serde_json::to_vec(&stored)
-            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
-        let metadata_info = ShareMetadataInfo {
-            name: share_info.name.clone(),
-            identifier: share_info.share_index,
-            threshold: share_info.threshold,
-            total_shares: share_info.total_shares,
-            group_pubkey: hex::decode(&share_info.group_pubkey)
-                .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?,
-        };
-        self.storage.store_share_by_key(
-            share_info.group_pubkey.clone(),
-            serialized,
-            metadata_info,
-        )?;
-
-        Ok(share_info)
+        result
     }
 
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
@@ -1718,7 +1696,7 @@ impl KeepMobile {
                 })?;
 
             let (metadata_info, stored) =
-                Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, bk.name.clone())
+                Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, bk.name.clone(), None)
                     .map_err(|e| KeepMobileError::BackupError {
                         msg: format!("nsec share data: {e}"),
                     })?;
@@ -2094,7 +2072,12 @@ impl KeepMobile {
         })
     }
 
-    fn do_import_nsec(&self, hex_key: &str, name: String) -> Result<ShareInfo, KeepMobileError> {
+    fn do_import_nsec(
+        &self,
+        hex_key: &str,
+        name: String,
+        plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<ShareInfo, KeepMobileError> {
         Self::validate_share_name(&name)?;
 
         let share_count = self.storage.list_all_shares().len();
@@ -2119,7 +2102,7 @@ impl KeepMobile {
 
         let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
         let (metadata_info, stored) =
-            Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, name)?;
+            Self::build_nsec_share_data(key_package, pubkey_package, vk_bytes, name, plaintext_mnemonic)?;
 
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
@@ -2205,6 +2188,7 @@ impl KeepMobile {
         pubkey_package: frost_secp256k1_tr::keys::PublicKeyPackage,
         vk_bytes: Vec<u8>,
         name: String,
+        plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<(ShareMetadataInfo, StoredShareData), KeepMobileError> {
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33]
@@ -2242,7 +2226,7 @@ impl KeepMobile {
                     msg: format!("Serialization failed: {e}"),
                 }
             })?,
-            plaintext_mnemonic: None,
+            plaintext_mnemonic,
         };
 
         Ok((metadata_info, stored))
