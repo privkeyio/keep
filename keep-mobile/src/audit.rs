@@ -613,6 +613,31 @@ impl SigningAuditLog {
         })
     }
 
+    pub fn export_json(&self) -> Result<String, KeepMobileError> {
+        let entry_jsons = self.storage.load_entries(None)?;
+
+        if entry_jsons.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"
+                ),
+            });
+        }
+
+        let mut entries = Vec::with_capacity(entry_jsons.len());
+        for json in entry_jsons {
+            let entry: SigningAuditEntry =
+                serde_json::from_str(&json).map_err(|e| KeepMobileError::Serialization {
+                    msg: format!("Invalid signing audit entry: {e}"),
+                })?;
+            entries.push(entry);
+        }
+
+        serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
+            msg: format!("Export failed: {e}"),
+        })
+    }
+
     pub fn get_entry_count(&self) -> Result<u32, KeepMobileError> {
         self.storage.entry_count()
     }
@@ -922,6 +947,28 @@ mod tests {
 
         let callers = log.get_distinct_callers().unwrap();
         assert_eq!(callers.len(), 3);
+    }
+
+    #[test]
+    fn test_signing_audit_export_json() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app1".into(),
+            Some("Test App".into()),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let json = log.export_json().unwrap();
+        assert!(json.contains("SignEvent"), "JSON: {json}");
+        assert!(json.contains("app1"), "JSON: {json}");
+        assert!(json.contains("Test App"), "JSON: {json}");
     }
 
     #[test]
