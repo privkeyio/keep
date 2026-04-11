@@ -31,6 +31,7 @@ pub struct StoredShareInfo {
     pub created_at: i64,
     pub last_used: Option<i64>,
     pub sign_count: u64,
+    pub did_backup: bool,
 }
 
 #[uniffi::export(with_foreign)]

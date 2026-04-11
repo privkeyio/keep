@@ -32,6 +32,9 @@ pub struct ShareMetadata {
     pub last_used: Option<i64>,
     /// Number of signatures made.
     pub sign_count: u64,
+    /// Whether this share has been backed up.
+    #[serde(default)]
+    pub did_backup: bool,
 }
 
 impl ShareMetadata {
@@ -52,12 +55,18 @@ impl ShareMetadata {
             created_at: chrono::Utc::now().timestamp(),
             last_used: None,
             sign_count: 0,
+            did_backup: false,
         }
     }
 
     /// Record usage timestamp.
     pub fn record_usage(&mut self) {
         self.last_used = Some(chrono::Utc::now().timestamp());
+    }
+
+    /// Mark this share as backed up.
+    pub fn mark_backed_up(&mut self) {
+        self.did_backup = true;
     }
 
     /// Increment signature count and record usage.

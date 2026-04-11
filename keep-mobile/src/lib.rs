@@ -264,6 +264,8 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
+    #[serde(default)]
+    encrypted_mnemonic: Option<Vec<u8>>,
 }
 
 #[uniffi::export(with_foreign)]
@@ -621,6 +623,7 @@ impl KeepMobile {
         name: String,
         account_index: u32,
     ) -> Result<ShareInfo, KeepMobileError> {
+        let mnemonic_bytes = mnemonic.as_bytes().to_vec();
         let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
         mnemonic.zeroize();
@@ -629,7 +632,29 @@ impl KeepMobile {
         let mut hex_key = hex::encode(*key);
         let result = self.do_import_nsec(&hex_key, name);
         hex_key.zeroize();
-        result
+        let share_info = result?;
+
+        let data = self.storage.load_share_by_key(share_info.group_pubkey.clone())?;
+        let mut stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+        stored.encrypted_mnemonic = Some(mnemonic_bytes);
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+        let metadata_info = ShareMetadataInfo {
+            name: share_info.name.clone(),
+            identifier: share_info.share_index,
+            threshold: share_info.threshold,
+            total_shares: share_info.total_shares,
+            group_pubkey: hex::decode(&share_info.group_pubkey)
+                .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?,
+        };
+        self.storage.store_share_by_key(
+            share_info.group_pubkey.clone(),
+            serialized,
+            metadata_info,
+        )?;
+
+        Ok(share_info)
     }
 
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
@@ -774,6 +799,51 @@ impl KeepMobile {
         self.storage.delete_share_by_key(group_pubkey)?;
 
         Ok(())
+    }
+
+    pub fn mark_share_backed_up(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let data = self.storage.load_share_by_key(group_pubkey.clone())?;
+        let mut stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        let mut metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json)
+                .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        metadata.mark_backed_up();
+
+        stored.metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let metadata_info = ShareMetadataInfo {
+            name: metadata.name,
+            identifier: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            group_pubkey: hex::decode(&group_pubkey)
+                .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?,
+        };
+
+        self.storage
+            .store_share_by_key(group_pubkey, serialized, metadata_info)?;
+        Ok(())
+    }
+
+    pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<String>, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let data = self.storage.load_share_by_key(group_pubkey)?;
+        let stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        Ok(stored
+            .encrypted_mnemonic
+            .map(|bytes| String::from_utf8(bytes).unwrap_or_default()))
     }
 
     pub fn frost_generate(
@@ -1471,6 +1541,7 @@ impl KeepMobile {
                 created_at: share_meta.created_at,
                 last_used: share_meta.last_used,
                 sign_count: share_meta.sign_count,
+                did_backup: share_meta.did_backup,
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
             });
@@ -1612,6 +1683,7 @@ impl KeepMobile {
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
+                did_backup: bs.did_backup,
             };
 
             let stored = StoredShareData {
@@ -1622,6 +1694,7 @@ impl KeepMobile {
                     Zeroizing::new(Vec::new()),
                 ),
                 pubkey_package_bytes,
+                encrypted_mnemonic: None,
             };
 
             let serialized = serde_json::to_vec(&stored)
@@ -2163,6 +2236,7 @@ impl KeepMobile {
                     msg: format!("Serialization failed: {e}"),
                 }
             })?,
+            encrypted_mnemonic: None,
         };
 
         Ok((metadata_info, stored))
@@ -2267,6 +2341,7 @@ impl KeepMobile {
                 .map_err(|e| KeepMobileError::FrostError {
                     msg: format!("Serialization failed: {e}"),
                 })?,
+            encrypted_mnemonic: None,
         };
 
         let serialized = serde_json::to_vec(&stored)
@@ -2592,6 +2667,7 @@ impl KeepMobile {
             created_at: metadata.created_at,
             last_used: metadata.last_used,
             sign_count: metadata.sign_count,
+            did_backup: metadata.did_backup,
         })
     }
 
