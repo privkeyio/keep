@@ -128,7 +128,8 @@ impl AuditEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct AuditEntryExport {
     timestamp: i64,
     event_type: AuditEventType,
@@ -256,7 +257,13 @@ impl AuditLog {
     }
 
     pub fn get_entries(&self, limit: Option<u32>) -> Result<Vec<AuditEntry>, KeepMobileError> {
-        let entry_jsons = self.storage.load_entries(limit)?;
+        const _: () = assert!(MAX_AUDIT_ENTRIES < u32::MAX as usize);
+        let capped = Some(
+            limit
+                .unwrap_or(MAX_AUDIT_ENTRIES as u32 + 1)
+                .min(MAX_AUDIT_ENTRIES as u32 + 1),
+        );
+        let entry_jsons = self.storage.load_entries(capped)?;
         let mut entries = Vec::with_capacity(entry_jsons.len());
         for json in entry_jsons {
             let entry: AuditEntry =
@@ -476,7 +483,8 @@ impl SigningAuditEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct SigningAuditEntryExport {
     timestamp: i64,
     request_type: SigningRequestType,
@@ -549,7 +557,10 @@ pub struct SigningAuditLog {
 
 impl SigningAuditLog {
     fn load_all_entries(&self) -> Result<Vec<SigningAuditEntry>, KeepMobileError> {
-        let entry_jsons = self.storage.load_entries(None)?;
+        const _: () = assert!(MAX_AUDIT_ENTRIES < u32::MAX as usize);
+        let entry_jsons = self
+            .storage
+            .load_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
         let mut entries = Vec::with_capacity(entry_jsons.len());
         for json in entry_jsons {
             let entry: SigningAuditEntry =
@@ -863,6 +874,37 @@ mod tests {
     }
 
     #[test]
+    fn test_export_json_chain_linkage() {
+        let storage = Arc::new(MockStorage::new());
+        let log = AuditLog::new(storage).unwrap();
+
+        log.log_event(AuditEventType::Sign, Some("pk1".into()), true, None)
+            .unwrap();
+        log.log_event(AuditEventType::FrostSign, Some("pk2".into()), true, None)
+            .unwrap();
+        log.log_event(
+            AuditEventType::ShareExport,
+            Some("pk1".into()),
+            true,
+            Some("exported".into()),
+        )
+        .unwrap();
+
+        let json = log.export_json().unwrap();
+        let entries: Vec<AuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].prev_hash, "0".repeat(64));
+        for i in 1..entries.len() {
+            assert_eq!(
+                entries[i].prev_hash, entries[i - 1].hash,
+                "entry {i} prev_hash should equal entry {} hash",
+                i - 1
+            );
+        }
+    }
+
+    #[test]
     fn test_chain_detects_tampering() {
         let mock = Arc::new(MockStorage::new());
         let storage: Arc<dyn AuditStorage> = Arc::clone(&mock) as Arc<dyn AuditStorage>;
@@ -1093,6 +1135,38 @@ mod tests {
             .prev_hash
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_signing_export_json_chain_linkage() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let log = SigningAuditLog::new(storage).unwrap();
+
+        for i in 0..3 {
+            log.log_event(
+                SigningRequestType::SignEvent,
+                SigningDecision::Approved,
+                false,
+                format!("app{i}"),
+                Some(format!("App {i}")),
+                Some(1),
+                None,
+            )
+            .unwrap();
+        }
+
+        let json = log.export_json().unwrap();
+        let entries: Vec<SigningAuditEntryExport> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].prev_hash, "0".repeat(64));
+        for i in 1..entries.len() {
+            assert_eq!(
+                entries[i].prev_hash, entries[i - 1].hash,
+                "entry {i} prev_hash should equal entry {} hash",
+                i - 1
+            );
+        }
     }
 
     #[test]
