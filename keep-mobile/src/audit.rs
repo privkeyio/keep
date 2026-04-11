@@ -269,18 +269,28 @@ impl AuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entries: Vec<AuditEntryExport> = self
-            .get_entries(None)?
+        let entries = self.get_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
+        let exports: Vec<AuditEntryExport> = entries
             .into_iter()
             .map(AuditEntryExport::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
+        serde_json::to_string_pretty(&exports).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
     }
 
     pub fn verify_chain(&self) -> Result<bool, KeepMobileError> {
-        let entries = self.get_entries(None)?;
+        let entries = self.get_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
         let mut prev_hash = [0u8; 32];
 
         for entry in entries {
@@ -702,12 +712,17 @@ impl SigningAuditLog {
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
-        let entries: Vec<SigningAuditEntryExport> = self
-            .load_all_entries()?
+        let entries = self.load_all_entries()?;
+        if entries.len() > MAX_AUDIT_ENTRIES {
+            return Err(KeepMobileError::StorageError {
+                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
+            });
+        }
+        let exports: Vec<SigningAuditEntryExport> = entries
             .into_iter()
             .map(SigningAuditEntryExport::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        serde_json::to_string_pretty(&entries).map_err(|e| KeepMobileError::Serialization {
+        serde_json::to_string_pretty(&exports).map_err(|e| KeepMobileError::Serialization {
             msg: format!("Export failed: {e}"),
         })
     }
