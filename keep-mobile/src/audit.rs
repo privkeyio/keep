@@ -550,9 +550,7 @@ impl SigningAuditLog {
             .load_entries(Some(MAX_AUDIT_ENTRIES as u32 + 1))?;
         if entry_jsons.len() > MAX_AUDIT_ENTRIES {
             return Err(KeepMobileError::StorageError {
-                msg: format!(
-                    "Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"
-                ),
+                msg: format!("Signing audit log exceeds maximum of {MAX_AUDIT_ENTRIES} entries"),
             });
         }
         let mut entries = Vec::with_capacity(entry_jsons.len());
@@ -739,7 +737,9 @@ mod tests {
 
     fn assert_lowercase_hex(s: &str) {
         assert_eq!(s.len(), 64);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     struct MockStorage {
@@ -871,7 +871,8 @@ mod tests {
         assert_eq!(entries[0].prev_hash, "0".repeat(64));
         for i in 1..entries.len() {
             assert_eq!(
-                entries[i].prev_hash, entries[i - 1].hash,
+                entries[i].prev_hash,
+                entries[i - 1].hash,
                 "entry {i} prev_hash should equal entry {} hash",
                 i - 1
             );
@@ -1128,7 +1129,8 @@ mod tests {
         assert_eq!(entries[0].prev_hash, "0".repeat(64));
         for i in 1..entries.len() {
             assert_eq!(
-                entries[i].prev_hash, entries[i - 1].hash,
+                entries[i].prev_hash,
+                entries[i - 1].hash,
                 "entry {i} prev_hash should equal entry {} hash",
                 i - 1
             );
