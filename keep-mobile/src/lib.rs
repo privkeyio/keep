@@ -264,7 +264,8 @@ struct StoredShareData {
     metadata_json: String,
     key_package_bytes: Zeroizing<Vec<u8>>,
     pubkey_package_bytes: Vec<u8>,
-    #[serde(default, alias = "encrypted_mnemonic")]
+    // Relies on SecureStorage (Android Keystore / iOS Keychain) for encryption at rest
+    #[serde(default)]
     plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
 }
 
@@ -779,6 +780,7 @@ impl KeepMobile {
         Ok(())
     }
 
+    // Load-modify-store without locking; acceptable in single-user mobile context
     pub fn mark_share_backed_up(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
@@ -812,6 +814,7 @@ impl KeepMobile {
         Ok(())
     }
 
+    // Caller is responsible for re-authentication before calling this method
     pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<String>, KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
@@ -822,9 +825,12 @@ impl KeepMobile {
         stored
             .plaintext_mnemonic
             .map(|bytes| {
-                String::from_utf8(bytes.to_vec()).map_err(|_| KeepMobileError::StorageError {
-                    msg: "mnemonic contains invalid UTF-8".to_string(),
-                })
+                let s = std::str::from_utf8(&bytes).map_err(|_| {
+                    KeepMobileError::StorageError {
+                        msg: "mnemonic contains invalid UTF-8".to_string(),
+                    }
+                })?;
+                Ok(s.to_owned())
             })
             .transpose()
     }
