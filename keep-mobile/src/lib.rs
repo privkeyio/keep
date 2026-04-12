@@ -793,7 +793,7 @@ impl KeepMobile {
     }
 
     pub fn get_active_share_metadata(&self) -> Option<ShareMetadataInfo> {
-        let key = self.storage.get_active_share_key()?;
+        let key = self.resolve_active_share().ok()?;
         let data = self.storage.load_share_by_key(key).ok()?;
         let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
         let metadata: ShareMetadata = serde_json::from_str(&stored.metadata_json).ok()?;
@@ -2156,14 +2156,13 @@ impl KeepMobile {
         }
 
         let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
-        let did_backup = plaintext_mnemonic.is_none();
         let (metadata_info, stored) = Self::build_nsec_share_data(
             key_package,
             pubkey_package,
             vk_bytes,
             name,
             plaintext_mnemonic,
-            did_backup,
+            false,
         )?;
 
         let serialized = serde_json::to_vec(&stored)
