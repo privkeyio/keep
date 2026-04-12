@@ -17,7 +17,7 @@ keep-agent = { path = "../keep-agent", features = ["mcp"] }
 keep-frost-net = { path = "../keep-frost-net" }
 keep-nip46 = { path = "../keep-nip46" }
 
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 dialoguer = "0.12"
 indicatif = "0.18"
 console = "0.16"
