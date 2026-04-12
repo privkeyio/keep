@@ -38,7 +38,7 @@ urlencoding = "2.1"
 url = "2.5"
 
 frost-secp256k1-tr = "2.2.0"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 rand = "0.10"
 
 serialport = "4.9.0"
@@ -79,5 +79,5 @@ warden = ["dep:reqwest", "dep:uuid"]
 
 [dev-dependencies]
 tempfile = "3.27"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"

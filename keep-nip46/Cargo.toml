@@ -22,7 +22,7 @@ tracing.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
 rand.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 zeroize.workspace = true
 
 [dev-dependencies]

@@ -20,7 +20,7 @@ chacha20 = { version = "0.10", features = ["xchacha"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 blake2 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 hkdf = "0.12"
 hmac = "0.12"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
