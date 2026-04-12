@@ -461,6 +461,19 @@ impl StateContext {
     }
 }
 
+impl From<&ShareMetadata> for ShareMetadataInfo {
+    fn from(metadata: &ShareMetadata) -> Self {
+        ShareMetadataInfo {
+            name: metadata.name.clone(),
+            identifier: metadata.identifier,
+            threshold: metadata.threshold,
+            total_shares: metadata.total_shares,
+            group_pubkey: metadata.group_pubkey.to_vec(),
+            did_backup: metadata.did_backup,
+        }
+    }
+}
+
 #[uniffi::export]
 impl KeepMobile {
     #[uniffi::constructor]
@@ -781,11 +794,10 @@ impl KeepMobile {
 
     pub fn get_active_share_metadata(&self) -> Option<ShareMetadataInfo> {
         let key = self.storage.get_active_share_key()?;
-        let key_bytes = hex::decode(&key).ok()?;
-        self.storage
-            .list_all_shares()
-            .into_iter()
-            .find(|m| m.group_pubkey == key_bytes)
+        let data = self.storage.load_share_by_key(key).ok()?;
+        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+        let metadata: ShareMetadata = serde_json::from_str(&stored.metadata_json).ok()?;
+        Some((&metadata).into())
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
@@ -842,17 +854,8 @@ impl KeepMobile {
         let serialized = serde_json::to_vec(&stored)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
-        let metadata_info = ShareMetadataInfo {
-            name: metadata.name,
-            identifier: metadata.identifier,
-            threshold: metadata.threshold,
-            total_shares: metadata.total_shares,
-            group_pubkey: metadata.group_pubkey.to_vec(),
-            did_backup: metadata.did_backup,
-        };
-
         self.storage
-            .store_share_by_key(group_pubkey, serialized, metadata_info)?;
+            .store_share_by_key(group_pubkey, serialized, (&metadata).into())?;
         Ok(())
     }
 
@@ -1701,7 +1704,7 @@ impl KeepMobile {
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
                 group_pubkey: group_pubkey_bytes,
-                did_backup: bs.did_backup,
+                did_backup: true,
             };
 
             let share_meta = keep_core::frost::ShareMetadata {
@@ -1713,7 +1716,7 @@ impl KeepMobile {
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
-                did_backup: bs.did_backup,
+                did_backup: true,
             };
 
             let stored = StoredShareData {
@@ -1747,6 +1750,7 @@ impl KeepMobile {
                 vk_bytes,
                 bk.name.clone(),
                 None,
+                true,
             )
             .map_err(|e| KeepMobileError::BackupError {
                 msg: format!("nsec share data: {e}"),
@@ -2152,12 +2156,14 @@ impl KeepMobile {
         }
 
         let (key_package, pubkey_package, vk_bytes) = Self::build_nsec_packages(&key_bytes)?;
+        let did_backup = plaintext_mnemonic.is_none();
         let (metadata_info, stored) = Self::build_nsec_share_data(
             key_package,
             pubkey_package,
             vk_bytes,
             name,
             plaintext_mnemonic,
+            did_backup,
         )?;
 
         let serialized = serde_json::to_vec(&stored)
@@ -2245,6 +2251,7 @@ impl KeepMobile {
         vk_bytes: Vec<u8>,
         name: String,
         plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
+        did_backup: bool,
     ) -> Result<(ShareMetadataInfo, StoredShareData), KeepMobileError> {
         let group_pubkey: [u8; 32] = match vk_bytes.len() {
             33 => vk_bytes[1..33]
@@ -2260,18 +2267,11 @@ impl KeepMobile {
         };
 
         let mut metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name);
-        if plaintext_mnemonic.is_none() {
-            metadata.did_backup = true;
+        if did_backup {
+            metadata.mark_backed_up();
         }
 
-        let metadata_info = ShareMetadataInfo {
-            name: metadata.name.clone(),
-            identifier: metadata.identifier,
-            threshold: metadata.threshold,
-            total_shares: metadata.total_shares,
-            group_pubkey: metadata.group_pubkey.to_vec(),
-            did_backup: metadata.did_backup,
-        };
+        let metadata_info: ShareMetadataInfo = (&metadata).into();
 
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&metadata)
@@ -2364,14 +2364,7 @@ impl KeepMobile {
     }
 
     fn store_share_package(&self, share: &SharePackage) -> Result<ShareInfo, KeepMobileError> {
-        let metadata = ShareMetadataInfo {
-            name: share.metadata.name.clone(),
-            identifier: share.metadata.identifier,
-            threshold: share.metadata.threshold,
-            total_shares: share.metadata.total_shares,
-            group_pubkey: share.metadata.group_pubkey.to_vec(),
-            did_backup: share.metadata.did_backup,
-        };
+        let metadata: ShareMetadataInfo = (&share.metadata).into();
 
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
