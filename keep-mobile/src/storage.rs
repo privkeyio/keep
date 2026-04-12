@@ -10,6 +10,7 @@ pub struct ShareMetadataInfo {
     pub threshold: u16,
     pub total_shares: u16,
     pub group_pubkey: Vec<u8>,
+    pub did_backup: bool,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

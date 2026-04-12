@@ -43,6 +43,7 @@ dictionary ShareMetadataInfo {
     u16 threshold;
     u16 total_shares;
     sequence<u8> group_pubkey;
+    boolean did_backup;
 };
 
 dictionary ShareInfo {
@@ -279,6 +280,8 @@ interface KeepMobile {
     sequence<StoredShareInfo> list_shares();
 
     StoredShareInfo? get_active_share();
+
+    ShareMetadataInfo? get_active_share_metadata();
 
     [Throws=KeepMobileError]
     void set_active_share(string group_pubkey);

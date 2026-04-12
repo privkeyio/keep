@@ -224,6 +224,7 @@ fn storage_metadata(name: &str) -> ShareMetadataInfo {
         threshold: 0,
         total_shares: 0,
         group_pubkey: vec![],
+        did_backup: false,
     }
 }
 

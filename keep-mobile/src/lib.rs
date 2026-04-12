@@ -779,6 +779,15 @@ impl KeepMobile {
         self.load_stored_share_info(key)
     }
 
+    pub fn get_active_share_metadata(&self) -> Option<ShareMetadataInfo> {
+        let key = self.storage.get_active_share_key()?;
+        let key_bytes = hex::decode(&key).ok()?;
+        self.storage
+            .list_all_shares()
+            .into_iter()
+            .find(|m| m.group_pubkey == key_bytes)
+    }
+
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
@@ -839,6 +848,7 @@ impl KeepMobile {
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
             group_pubkey: metadata.group_pubkey.to_vec(),
+            did_backup: metadata.did_backup,
         };
 
         self.storage
@@ -1691,6 +1701,7 @@ impl KeepMobile {
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
                 group_pubkey: group_pubkey_bytes,
+                did_backup: bs.did_backup,
             };
 
             let share_meta = keep_core::frost::ShareMetadata {
@@ -2248,7 +2259,10 @@ impl KeepMobile {
             }
         };
 
-        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name);
+        let mut metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name);
+        if plaintext_mnemonic.is_none() {
+            metadata.did_backup = true;
+        }
 
         let metadata_info = ShareMetadataInfo {
             name: metadata.name.clone(),
@@ -2256,6 +2270,7 @@ impl KeepMobile {
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
             group_pubkey: metadata.group_pubkey.to_vec(),
+            did_backup: metadata.did_backup,
         };
 
         let stored = StoredShareData {
@@ -2355,6 +2370,7 @@ impl KeepMobile {
             threshold: share.metadata.threshold,
             total_shares: share.metadata.total_shares,
             group_pubkey: share.metadata.group_pubkey.to_vec(),
+            did_backup: share.metadata.did_backup,
         };
 
         let stored = StoredShareData {
