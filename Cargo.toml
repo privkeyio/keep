@@ -79,7 +79,7 @@ urlencoding = "2.1"
 url = "2.5"
 
 # Storage
-redb = "3"
+redb = "4"
 
 
 # Misc

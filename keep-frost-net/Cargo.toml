@@ -31,7 +31,7 @@ base64 = "0.22"
 rustls = "0.23"
 rustls-pki-types = "1"
 
-redb = "3"
+redb = "4"
 thiserror = "2.0"
 tokio-rustls = "0.26"
 tracing = "0.1"
