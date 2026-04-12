@@ -623,9 +623,9 @@ dependencies = [
 
 [[package]]
 name = "aws-nitro-enclaves-nsm-api"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92c1f4471b33f6a7af9ea421b249ed18a11c71156564baf6293148fa6ad1b09"
+checksum = "597f622c473bdc54103cfe964bbad00609df2bb88a0ac6cee0fc951aaee9694e"
 dependencies = [
  "libc",
  "log",
