@@ -62,27 +62,12 @@ impl KfpNode {
 
         let session_timeout = timeout_secs.map(std::time::Duration::from_secs);
 
-        {
-            let mut sessions = self.psbt_sessions.write();
-            let session = sessions.create_session(
-                session_id,
-                self.group_pubkey,
-                descriptor_hash,
-                tier_index,
-                psbt.clone(),
-                required_threshold,
-                signers,
-                session_timeout,
-            )?;
-            session.set_initiator(self.keys.public_key());
-        }
-
         let mut payload = PsbtProposePayload::new(
             session_id,
             self.group_pubkey,
             descriptor_hash,
             tier_index,
-            psbt,
+            psbt.clone(),
             fee_sats,
             required_threshold,
             created_at,
@@ -96,12 +81,53 @@ impl KfpNode {
         }
 
         let msg = KfpMessage::PsbtPropose(payload);
+        msg.validate()
+            .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
 
-        let target_peers = self.bidirectional_online_peers();
+        {
+            let mut sessions = self.psbt_sessions.write();
+            let session = sessions.create_session(
+                session_id,
+                self.group_pubkey,
+                descriptor_hash,
+                tier_index,
+                psbt,
+                required_threshold,
+                signers,
+                session_timeout,
+            )?;
+            session.set_initiator(self.keys.public_key());
+        }
+
+        let expected_signers: HashSet<SignerId> = {
+            let sessions = self.psbt_sessions.read();
+            match sessions.get_session(&session_id) {
+                Some(s) => s.expected_signers().clone(),
+                None => HashSet::new(),
+            }
+        };
+        let online = self.bidirectional_online_peers();
+        let target_peers: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            online
+                .into_iter()
+                .filter(|pk| {
+                    let Some(peer) = peers.get_peer_by_pubkey(pk) else {
+                        return false;
+                    };
+                    expected_signers.iter().any(|sid| match sid {
+                        SignerId::Share(idx) => peer.share_index == *idx,
+                        SignerId::Fingerprint(fp) => {
+                            peer.recovery_xpubs.iter().any(|x| &x.fingerprint == fp)
+                        }
+                    })
+                })
+                .collect()
+        };
         if target_peers.is_empty() {
             self.psbt_sessions.write().remove_session(&session_id);
             return Err(FrostNetError::Session(
-                "No online peers to coordinate PSBT with".into(),
+                "No online expected signers to coordinate PSBT with".into(),
             ));
         }
 
@@ -257,9 +283,9 @@ impl KfpNode {
             .collect()
     }
 
-    /// Encrypt and send a PSBT coordination message to each target peer. Any
-    /// per-peer failure (encryption, signing, relay) aborts the broadcast with
-    /// the first error.
+    /// Encrypt and send a PSBT coordination message to each target peer.
+    /// Attempts every target even if some fail; returns an aggregated error
+    /// listing each failed peer when any send fails.
     async fn broadcast_psbt_event(
         &self,
         msg: &KfpMessage,
@@ -267,21 +293,49 @@ impl KfpNode {
         msg_type: &'static str,
         targets: &[PublicKey],
     ) -> Result<()> {
+        let mut failures: Vec<(PublicKey, String)> = Vec::new();
         for pubkey in targets {
-            let event = KfpEventBuilder::psbt_event(
-                &self.keys,
-                pubkey,
-                &self.group_pubkey,
-                session_id,
-                msg_type,
-                msg,
-            )?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            let send_result: Result<()> = async {
+                let event = KfpEventBuilder::psbt_event(
+                    &self.keys,
+                    pubkey,
+                    &self.group_pubkey,
+                    session_id,
+                    msg_type,
+                    msg,
+                )?;
+                self.client
+                    .send_event(&event)
+                    .await
+                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = send_result {
+                warn!(
+                    session_id = %hex::encode(session_id),
+                    msg_type,
+                    peer = %pubkey,
+                    error = %e,
+                    "PSBT broadcast to peer failed"
+                );
+                failures.push((*pubkey, e.to_string()));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let detail = failures
+                .iter()
+                .map(|(pk, err)| format!("{pk}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(FrostNetError::Transport(format!(
+                "PSBT {msg_type} broadcast failed for {}/{} peers: {detail}",
+                failures.len(),
+                targets.len()
+            )))
+        }
     }
 
     fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {
@@ -315,12 +369,15 @@ impl KfpNode {
             }
         }
         if saw_any_finalized {
-            return Err(FrostNetError::Session(
+            Err(FrostNetError::Session(
                 "PSBT descriptor_hash does not match any finalized descriptor for this group"
                     .into(),
-            ));
+            ))
+        } else {
+            Err(FrostNetError::Session(
+                "no finalized descriptor for group; cannot verify descriptor_hash".into(),
+            ))
         }
-        Ok(())
     }
 
     fn own_recovery_fingerprints(&self) -> HashSet<String> {

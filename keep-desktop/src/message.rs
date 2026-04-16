@@ -301,6 +301,12 @@ pub enum FrostNodeMsg {
         responsive: Vec<u16>,
         unresponsive: Vec<u16>,
     },
+    PsbtSignatureNeeded {
+        session_id: [u8; 32],
+        tier_index: u32,
+        #[allow(dead_code)]
+        initiator_pubkey: nostr_sdk::PublicKey,
+    },
 }
 
 impl fmt::Debug for FrostNodeMsg {
@@ -375,6 +381,15 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("HealthCheckComplete")
                 .field("responsive", &responsive.len())
                 .field("unresponsive", &unresponsive.len())
+                .finish(),
+            Self::PsbtSignatureNeeded {
+                session_id,
+                tier_index,
+                ..
+            } => f
+                .debug_struct("PsbtSignatureNeeded")
+                .field("session_id", &hex::encode(session_id))
+                .field("tier_index", tier_index)
                 .finish(),
         }
     }

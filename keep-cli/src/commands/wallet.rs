@@ -1148,13 +1148,17 @@ pub fn cmd_wallet_spend(
             "--threshold {threshold} exceeds total signers {total_signers}"
         )));
     }
-    for fp in signer_fingerprint {
-        if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(KeepError::InvalidInput(format!(
-                "--signer-fingerprint '{fp}' must be 8 hex characters"
-            )));
-        }
-    }
+    let signer_fingerprint: Vec<String> = signer_fingerprint
+        .iter()
+        .map(|fp| {
+            if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(KeepError::InvalidInput(format!(
+                    "--signer-fingerprint '{fp}' must be 8 hex characters"
+                )));
+            }
+            Ok(fp.to_ascii_lowercase())
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let group_pubkey = parse_group_id(group)?;
 
@@ -1244,7 +1248,7 @@ pub fn cmd_wallet_spend(
                 fee,
                 threshold,
                 signer_share.to_vec(),
-                signer_fingerprint.to_vec(),
+                signer_fingerprint.clone(),
                 Vec::new(),
                 Vec::new(),
                 timeout_secs,
@@ -1261,15 +1265,20 @@ pub fn cmd_wallet_spend(
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(keep_frost_net::PSBT_SESSION_TIMEOUT_SECS));
         let wait_spinner = out.spinner("Waiting for PSBT coordination...");
-        let result: Result<_> = async {
+        enum WaitOutcome {
+            Finalized(Option<[u8; 32]>),
+            Aborted(String),
+            LocalAbort(&'static str),
+        }
+        let outcome: WaitOutcome = async {
             let deadline = tokio::time::Instant::now() + wait_deadline;
             loop {
                 let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
                     Some(r) => r,
                     None => {
-                        return Err(KeepError::Frost(
-                            "Timed out waiting for PSBT coordination to complete".into(),
-                        ));
+                        return WaitOutcome::LocalAbort(
+                            "Timed out waiting for PSBT coordination to complete",
+                        );
                     }
                 };
                 match tokio::time::timeout(remaining, event_rx.recv()).await {
@@ -1277,15 +1286,13 @@ pub fn cmd_wallet_spend(
                         session_id: sid,
                         txid,
                     })) if sid == session_id => {
-                        return Ok(txid);
+                        return WaitOutcome::Finalized(txid);
                     }
                     Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtAborted {
                         session_id: sid,
                         reason,
                     })) if sid == session_id => {
-                        return Err(KeepError::Frost(format!(
-                            "PSBT session aborted: {reason}"
-                        )));
+                        return WaitOutcome::Aborted(reason);
                     }
                     Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureReceived {
                         session_id: sid,
@@ -1301,14 +1308,14 @@ pub fn cmd_wallet_spend(
                         );
                     }
                     Ok(Err(_)) => {
-                        return Err(KeepError::Frost(
-                            "Event channel closed before PSBT finalized".into(),
-                        ));
+                        return WaitOutcome::LocalAbort(
+                            "Event channel closed before PSBT finalized",
+                        );
                     }
                     Err(_) => {
-                        return Err(KeepError::Frost(
-                            "Timed out waiting for PSBT coordination to complete".into(),
-                        ));
+                        return WaitOutcome::LocalAbort(
+                            "Timed out waiting for PSBT coordination to complete",
+                        );
                     }
                     _ => {}
                 }
@@ -1316,6 +1323,23 @@ pub fn cmd_wallet_spend(
         }
         .await;
         wait_spinner.finish();
+
+        let result: Result<Option<[u8; 32]>> = match outcome {
+            WaitOutcome::Finalized(txid) => Ok(txid),
+            WaitOutcome::Aborted(reason) => {
+                Err(KeepError::Frost(format!("PSBT session aborted: {reason}")))
+            }
+            WaitOutcome::LocalAbort(reason) => {
+                if let Err(e) = node.abort_psbt_session(session_id, reason).await {
+                    tracing::warn!(
+                        session = %hex::encode(&session_id[..8]),
+                        error = %e,
+                        "Failed to notify peers of PSBT abort"
+                    );
+                }
+                Err(KeepError::Frost(reason.to_string()))
+            }
+        };
 
         node_handle.abort();
         match result {

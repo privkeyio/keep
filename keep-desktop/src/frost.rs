@@ -718,11 +718,19 @@ pub(crate) async fn frost_event_listener(
                             &hex::encode(session_id)[..8]
                         ));
                     }
-                    Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, .. }) => {
-                        log!(EventLogType::Error, format!(
-                            "PSBT signature required for tier {tier_index} (session {}) but desktop UI does not yet wire PSBT participation; contribution will not be made automatically",
+                    Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, initiator_pubkey }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT signature required for tier {tier_index} (session {})",
                             &hex::encode(session_id)[..8]
                         ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtSignatureNeeded {
+                                session_id,
+                                tier_index,
+                                initiator_pubkey,
+                            },
+                        );
                     }
                     Ok(KfpNodeEvent::PsbtSignatureReceived { session_id, signature_count, threshold, .. }) => {
                         log!(EventLogType::Descriptor, format!(
@@ -1025,6 +1033,17 @@ impl App {
                         }
                     }
                 }
+            }
+            FrostNodeMsg::PsbtSignatureNeeded {
+                session_id,
+                tier_index,
+                ..
+            } => {
+                tracing::info!(
+                    session_id = %hex::encode(session_id),
+                    tier_index,
+                    "PSBT signature needed (UI wiring pending)"
+                );
             }
         }
         iced::Task::none()
