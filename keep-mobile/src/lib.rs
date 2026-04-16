@@ -2661,6 +2661,7 @@ impl KeepMobile {
                             external_descriptor,
                             internal_descriptor,
                             network,
+                            policy_hash,
                         }) => {
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
@@ -2688,6 +2689,7 @@ impl KeepMobile {
                                 session_id,
                                 external_descriptor,
                                 internal_descriptor,
+                                policy_hash,
                             )
                             .await;
                         }
@@ -2781,6 +2783,7 @@ impl KeepMobile {
         session_id: [u8; 32],
         external_descriptor: String,
         internal_descriptor: String,
+        _policy_hash: [u8; 32],
     ) {
         let group_pubkey = hex::encode(node.group_pubkey());
         let created_at = std::time::SystemTime::now()

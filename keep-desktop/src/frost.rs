@@ -719,8 +719,8 @@ pub(crate) async fn frost_event_listener(
                         ));
                     }
                     Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, .. }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "PSBT signature needed for tier {tier_index}: {}",
+                        log!(EventLogType::Error, format!(
+                            "PSBT signature required for tier {tier_index} (session {}) but desktop UI does not yet wire PSBT participation; contribution will not be made automatically",
                             &hex::encode(session_id)[..8]
                         ));
                     }
