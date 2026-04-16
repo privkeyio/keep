@@ -253,16 +253,7 @@ impl KfpNode {
         initiator_pubkey: &PublicKey,
         signer: SignerId,
         merged_psbt: Vec<u8>,
-        tap_script_sigs: Vec<TapScriptSigEntry>,
     ) -> Result<()> {
-        {
-            let mut sessions = self.psbt_sessions.write();
-            let session = sessions
-                .get_session_mut(&session_id)
-                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.add_signature(signer.clone(), merged_psbt.clone(), signer_marker(&signer))?;
-        }
-
         let (share_index, fingerprint) = match &signer {
             SignerId::Share(i) => (Some(*i), None),
             SignerId::Fingerprint(fp) => (None, Some(fp.clone())),
@@ -273,9 +264,8 @@ impl KfpNode {
             self.group_pubkey,
             share_index,
             fingerprint,
-            merged_psbt,
-        )
-        .with_tap_script_sigs(tap_script_sigs);
+            merged_psbt.clone(),
+        );
 
         let msg = KfpMessage::PsbtSign(payload);
         let json = msg.to_json()?;
@@ -304,6 +294,14 @@ impl KfpNode {
             .send_event(&event)
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+        {
+            let mut sessions = self.psbt_sessions.write();
+            let session = sessions
+                .get_session_mut(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
+            session.add_signature(signer.clone(), merged_psbt, signer_marker(&signer))?;
+        }
 
         info!(session_id = %hex::encode(session_id), "Sent PSBT signature contribution");
         Ok(())

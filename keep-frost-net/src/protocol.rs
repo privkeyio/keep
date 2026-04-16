@@ -36,9 +36,10 @@ pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const MAX_RECOVERY_XPUBS: usize = 20;
 pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
 pub const MAX_KEY_PROOF_PSBT_SIZE: usize = 512;
-pub const MAX_PSBT_SIZE: usize = 131072;
-pub const MAX_TAP_SCRIPT_SIG_SIZE: usize = 128;
-pub const MAX_TAP_SCRIPT_SIGS_PER_MESSAGE: usize = 64;
+pub const MAX_PSBT_SIZE: usize = 32768;
+pub const MAX_PSBT_INPUTS: usize = 256;
+pub const MAX_PSBT_OUTPUTS: usize = 256;
+pub const MAX_PSBT_ADDRESS_LENGTH: usize = 128;
 pub const PSBT_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const PSBT_SESSION_MAX_TIMEOUT_SECS: u64 = 86400;
 pub const PSBT_SIGNING_PHASE_TIMEOUT_SECS: u64 = 300;
@@ -436,9 +437,23 @@ impl KfpMessage {
                 if p.expected_fingerprints.len() > MAX_PARTICIPANTS {
                     return Err("Too many expected fingerprints");
                 }
+                if p.required_threshold == 0 {
+                    return Err("required_threshold must be non-zero");
+                }
+                let total_signers = p
+                    .expected_signers
+                    .len()
+                    .saturating_add(p.expected_fingerprints.len());
+                if p.required_threshold as usize > total_signers {
+                    return Err("required_threshold exceeds total expected signers");
+                }
+                let mut seen_shares: HashSet<u16> = HashSet::new();
                 for idx in &p.expected_signers {
                     if *idx == 0 {
                         return Err("expected_signers share index must be non-zero");
+                    }
+                    if !seen_shares.insert(*idx) {
+                        return Err("Duplicate share index in expected_signers");
                     }
                 }
                 let mut seen_fps: HashSet<&String> = HashSet::new();
@@ -448,6 +463,26 @@ impl KfpMessage {
                     }
                     if !seen_fps.insert(fp) {
                         return Err("Duplicate fingerprint in expected_fingerprints");
+                    }
+                }
+                if p.inputs.len() > MAX_PSBT_INPUTS {
+                    return Err("Too many PSBT inputs");
+                }
+                if p.outputs.len() > MAX_PSBT_OUTPUTS {
+                    return Err("Too many PSBT outputs");
+                }
+                for input in &p.inputs {
+                    if let Some(addr) = &input.address {
+                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                            return Err("PSBT input address exceeds maximum length");
+                        }
+                    }
+                }
+                for output in &p.outputs {
+                    if let Some(addr) = &output.address {
+                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                            return Err("PSBT output address exceeds maximum length");
+                        }
                     }
                 }
             }
@@ -469,20 +504,6 @@ impl KfpMessage {
                 if let Some(si) = p.signer_share_index {
                     if si == 0 {
                         return Err("signer_share_index must be non-zero");
-                    }
-                }
-                if p.tap_script_sigs.len() > MAX_TAP_SCRIPT_SIGS_PER_MESSAGE {
-                    return Err("Too many tap_script_sigs");
-                }
-                for sig in &p.tap_script_sigs {
-                    if sig.signature.is_empty() || sig.signature.len() > MAX_TAP_SCRIPT_SIG_SIZE {
-                        return Err("Invalid tap_script_sig signature size");
-                    }
-                    if sig.x_only_pubkey.len() != 32 {
-                        return Err("tap_script_sig x_only_pubkey must be 32 bytes");
-                    }
-                    if sig.leaf_hash.len() != 32 {
-                        return Err("tap_script_sig leaf_hash must be 32 bytes");
                     }
                 }
             }
@@ -1366,17 +1387,6 @@ impl PsbtProposePayload {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TapScriptSigEntry {
-    pub input_index: u32,
-    #[serde(with = "hex_vec")]
-    pub x_only_pubkey: Vec<u8>,
-    #[serde(with = "hex_vec")]
-    pub leaf_hash: Vec<u8>,
-    #[serde(with = "hex_vec")]
-    pub signature: Vec<u8>,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PsbtSignPayload {
     #[serde(with = "hex_bytes")]
@@ -1389,8 +1399,6 @@ pub struct PsbtSignPayload {
     pub signer_fingerprint: Option<String>,
     #[serde(with = "base64_vec")]
     pub psbt: Vec<u8>,
-    #[serde(default)]
-    pub tap_script_sigs: Vec<TapScriptSigEntry>,
     pub created_at: u64,
 }
 
@@ -1408,14 +1416,8 @@ impl PsbtSignPayload {
             signer_share_index,
             signer_fingerprint,
             psbt,
-            tap_script_sigs: Vec::new(),
             created_at: Timestamp::now().as_secs(),
         }
-    }
-
-    pub fn with_tap_script_sigs(mut self, sigs: Vec<TapScriptSigEntry>) -> Self {
-        self.tap_script_sigs = sigs;
-        self
     }
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
@@ -2149,13 +2151,7 @@ mod tests {
             Some(2),
             None,
             vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x02],
-        )
-        .with_tap_script_sigs(vec![TapScriptSigEntry {
-            input_index: 0,
-            x_only_pubkey: vec![0xaa; 32],
-            leaf_hash: vec![0xbb; 32],
-            signature: vec![0xcc; 64],
-        }]);
+        );
 
         let msg = KfpMessage::PsbtSign(payload);
         let json = msg.to_json().unwrap();
@@ -2165,9 +2161,6 @@ mod tests {
             KfpMessage::PsbtSign(p) => {
                 assert_eq!(p.signer_share_index, Some(2));
                 assert_eq!(p.signer_fingerprint, None);
-                assert_eq!(p.tap_script_sigs.len(), 1);
-                assert_eq!(p.tap_script_sigs[0].signature.len(), 64);
-                assert_eq!(p.tap_script_sigs[0].x_only_pubkey.len(), 32);
             }
             _ => panic!("expected PsbtSign"),
         }
@@ -2184,25 +2177,6 @@ mod tests {
         );
         payload.signer_share_index = None;
         payload.signer_fingerprint = None;
-        let msg = KfpMessage::PsbtSign(payload);
-        assert!(msg.validate().is_err());
-    }
-
-    #[test]
-    fn test_psbt_sign_rejects_wrong_pubkey_length() {
-        let payload = PsbtSignPayload::new(
-            [4u8; 32],
-            [5u8; 32],
-            Some(1),
-            None,
-            vec![0x70, 0x73, 0x62, 0x74, 0xff],
-        )
-        .with_tap_script_sigs(vec![TapScriptSigEntry {
-            input_index: 0,
-            x_only_pubkey: vec![0xaa; 16],
-            leaf_hash: vec![0xbb; 32],
-            signature: vec![0xcc; 64],
-        }]);
         let msg = KfpMessage::PsbtSign(payload);
         assert!(msg.validate().is_err());
     }
