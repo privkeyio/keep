@@ -392,6 +392,7 @@ pub struct KfpNode {
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
+    pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
 }
 
 impl KfpNode {
@@ -537,6 +538,7 @@ impl KfpNode {
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
+            psbt_proposers: RwLock::new(HashSet::new()),
         })
     }
 
@@ -680,6 +682,14 @@ impl KfpNode {
 
     pub fn descriptor_proposers(&self) -> HashSet<u16> {
         self.descriptor_proposers.read().clone()
+    }
+
+    pub fn set_psbt_proposers(&self, indices: HashSet<u16>) {
+        *self.psbt_proposers.write() = indices;
+    }
+
+    pub fn psbt_proposers(&self) -> HashSet<u16> {
+        self.psbt_proposers.read().clone()
     }
 
     pub fn set_hooks(&self, hooks: Arc<dyn SigningHooks>) {
@@ -890,6 +900,13 @@ impl KfpNode {
                         let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
                             session_id,
                             error: reason,
+                        });
+                    }
+                    let expired_psbt = self.psbt_sessions.write().cleanup_expired();
+                    for (session_id, reason) in expired_psbt {
+                        let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
+                            session_id,
+                            reason,
                         });
                     }
                     {

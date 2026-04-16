@@ -7,12 +7,9 @@
 //! ```text
 //!              add_signature (>=1)
 //!   Proposed ─────────────────────► Signing
-//!       │                               │  set_finalized
-//!       │                               ▼
-//!       │                           Finalized
-//!       │                               ▲
-//!       └── set_finalized (no sigs needed,
-//!           e.g. proposer has threshold locally) ┘
+//!                                       │  set_finalized (threshold met)
+//!                                       ▼
+//!                                   Finalized
 //!
 //!   Any state ── abort() / timeout ──► Aborted(reason)
 //! ```
@@ -25,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -77,6 +75,8 @@ pub struct PsbtSession {
     required_threshold: u32,
     expected_signers: HashSet<SignerId>,
     received_sigs: HashMap<SignerId, Vec<u8>>,
+    partial_psbts: HashMap<SignerId, Vec<u8>>,
+    initiator: Option<PublicKey>,
     final_tx: Option<Vec<u8>>,
     txid: Option<[u8; 32]>,
     state: PsbtSessionState,
@@ -150,6 +150,8 @@ impl PsbtSession {
             required_threshold,
             expected_signers,
             received_sigs: HashMap::new(),
+            partial_psbts: HashMap::new(),
+            initiator: None,
             final_tx: None,
             txid: None,
             state: PsbtSessionState::Proposed,
@@ -160,6 +162,18 @@ impl PsbtSession {
             signing_timeout: Duration::from_secs(PSBT_SIGNING_PHASE_TIMEOUT_SECS),
             finalize_timeout: Duration::from_secs(PSBT_FINALIZE_PHASE_TIMEOUT_SECS),
         })
+    }
+
+    pub fn set_initiator(&mut self, pubkey: PublicKey) {
+        self.initiator = Some(pubkey);
+    }
+
+    pub fn initiator(&self) -> Option<&PublicKey> {
+        self.initiator.as_ref()
+    }
+
+    pub fn partial_psbts(&self) -> &HashMap<SignerId, Vec<u8>> {
+        &self.partial_psbts
     }
 
     pub fn session_id(&self) -> &[u8; 32] {
@@ -258,8 +272,12 @@ impl PsbtSession {
             ));
         }
 
-        self.received_sigs.insert(signer, signer_marker);
-        self.current_psbt = merged_psbt;
+        let first_signer = self.received_sigs.is_empty();
+        self.received_sigs.insert(signer.clone(), signer_marker);
+        self.partial_psbts.insert(signer, merged_psbt.clone());
+        if first_signer {
+            self.current_psbt = merged_psbt;
+        }
 
         if self.state == PsbtSessionState::Proposed {
             self.state = PsbtSessionState::Signing;
@@ -270,11 +288,13 @@ impl PsbtSession {
     }
 
     /// Transition to Finalized state with an optional final (signed) tx.
+    ///
+    /// Must be called while the session is in `Signing` state and the
+    /// signature threshold has been met.
     pub fn set_finalized(
         &mut self,
         finalized_psbt: Vec<u8>,
-        final_tx: Option<Vec<u8>>,
-        txid: Option<[u8; 32]>,
+        final_tx: Option<(Vec<u8>, [u8; 32])>,
     ) -> Result<()> {
         match &self.state {
             PsbtSessionState::Aborted(r) => {
@@ -283,7 +303,18 @@ impl PsbtSession {
             PsbtSessionState::Finalized => {
                 return Err(FrostNetError::Session("Session already finalized".into()));
             }
-            _ => {}
+            PsbtSessionState::Proposed => {
+                return Err(FrostNetError::Session(
+                    "Cannot finalize from Proposed; need at least one signature".into(),
+                ));
+            }
+            PsbtSessionState::Signing => {}
+        }
+
+        if !self.threshold_met() {
+            return Err(FrostNetError::Session(
+                "Cannot finalize: signature threshold not yet met".into(),
+            ));
         }
 
         if finalized_psbt.is_empty() {
@@ -292,7 +323,7 @@ impl PsbtSession {
         if finalized_psbt.len() > MAX_PSBT_SIZE {
             return Err(FrostNetError::Session("PSBT exceeds maximum size".into()));
         }
-        if let Some(tx) = &final_tx {
+        if let Some((tx, _)) = &final_tx {
             if tx.is_empty() {
                 return Err(FrostNetError::Session(
                     "final_tx must not be empty when provided".into(),
@@ -306,8 +337,16 @@ impl PsbtSession {
         }
 
         self.current_psbt = finalized_psbt;
-        self.final_tx = final_tx;
-        self.txid = txid;
+        match final_tx {
+            Some((tx, id)) => {
+                self.final_tx = Some(tx);
+                self.txid = Some(id);
+            }
+            None => {
+                self.final_tx = None;
+                self.txid = None;
+            }
+        }
         self.state = PsbtSessionState::Finalized;
         self.finalized_at = Some(Instant::now());
         Ok(())
@@ -349,15 +388,15 @@ impl PsbtSession {
             }
             PsbtSessionState::Signing => {
                 if self.created_at.elapsed() > self.timeout {
-                    Some("session")
-                } else if let Some(first) = self.first_sig_at {
-                    if self.threshold_met() && first.elapsed() > self.finalize_timeout {
-                        Some("finalize")
-                    } else if first.elapsed() > self.signing_timeout {
-                        Some("signing")
-                    } else {
-                        None
-                    }
+                    return Some("session");
+                }
+                let first = self
+                    .first_sig_at
+                    .expect("first_sig_at is always set when entering Signing");
+                if self.threshold_met() && first.elapsed() > self.finalize_timeout {
+                    Some("finalize")
+                } else if first.elapsed() > self.signing_timeout {
+                    Some("signing")
                 } else {
                     None
                 }
@@ -706,14 +745,19 @@ mod tests {
         assert!(err.to_string().contains("not expected"));
     }
 
-    #[test]
-    fn test_set_finalized_from_signing() {
+    fn finalize_ready_session() -> PsbtSession {
         let mut s = new_session();
         s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
             .unwrap();
         s.add_signature(SignerId::Share(2), vec![2; 4], vec![0xbb])
             .unwrap();
-        s.set_finalized(vec![9; 4], Some(vec![8; 4]), Some([0xcc; 32]))
+        s
+    }
+
+    #[test]
+    fn test_set_finalized_from_signing() {
+        let mut s = finalize_ready_session();
+        s.set_finalized(vec![9; 4], Some((vec![8; 4], [0xcc; 32])))
             .unwrap();
         assert_eq!(s.state(), &PsbtSessionState::Finalized);
         assert_eq!(s.final_tx(), Some(&[8, 8, 8, 8][..]));
@@ -721,26 +765,35 @@ mod tests {
     }
 
     #[test]
-    fn test_set_finalized_from_proposed() {
+    fn test_set_finalized_from_proposed_rejected() {
         let mut s = new_session();
-        s.set_finalized(vec![9; 4], None, None).unwrap();
-        assert_eq!(s.state(), &PsbtSessionState::Finalized);
+        let err = s.set_finalized(vec![9; 4], None).unwrap_err();
+        assert!(err.to_string().contains("Proposed"));
+    }
+
+    #[test]
+    fn test_set_finalized_below_threshold_rejected() {
+        let mut s = new_session();
+        s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+            .unwrap();
+        let err = s.set_finalized(vec![9; 4], None).unwrap_err();
+        assert!(err.to_string().contains("threshold"));
     }
 
     #[test]
     fn test_cannot_finalize_twice() {
-        let mut s = new_session();
-        s.set_finalized(vec![9; 4], None, None).unwrap();
-        let err = s.set_finalized(vec![7; 4], None, None).unwrap_err();
+        let mut s = finalize_ready_session();
+        s.set_finalized(vec![9; 4], None).unwrap();
+        let err = s.set_finalized(vec![7; 4], None).unwrap_err();
         assert!(err.to_string().contains("already finalized"));
     }
 
     #[test]
     fn test_cannot_sign_after_finalize() {
-        let mut s = new_session();
-        s.set_finalized(vec![9; 4], None, None).unwrap();
+        let mut s = finalize_ready_session();
+        s.set_finalized(vec![9; 4], None).unwrap();
         let err = s
-            .add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+            .add_signature(SignerId::Share(3), vec![1; 4], vec![0xaa])
             .unwrap_err();
         assert!(err.to_string().contains("already finalized"));
     }
@@ -754,16 +807,34 @@ mod tests {
             .add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
             .unwrap_err();
         assert!(err.to_string().contains("aborted"));
-        let err2 = s.set_finalized(vec![1; 4], None, None).unwrap_err();
+        let err2 = s.set_finalized(vec![1; 4], None).unwrap_err();
         assert!(err2.to_string().contains("aborted"));
     }
 
     #[test]
     fn test_abort_after_finalize_is_noop() {
-        let mut s = new_session();
-        s.set_finalized(vec![1; 4], None, None).unwrap();
+        let mut s = finalize_ready_session();
+        s.set_finalized(vec![1; 4], None).unwrap();
         s.abort("too late".into());
         assert_eq!(s.state(), &PsbtSessionState::Finalized);
+    }
+
+    #[test]
+    fn test_partial_psbts_stored_per_signer() {
+        let mut s = new_session();
+        s.add_signature(SignerId::Share(1), vec![1, 1, 1, 1], vec![0xaa])
+            .unwrap();
+        s.add_signature(SignerId::Share(2), vec![2, 2, 2, 2], vec![0xbb])
+            .unwrap();
+        assert_eq!(
+            s.partial_psbts().get(&SignerId::Share(1)).map(Vec::as_slice),
+            Some(&[1, 1, 1, 1][..])
+        );
+        assert_eq!(
+            s.partial_psbts().get(&SignerId::Share(2)).map(Vec::as_slice),
+            Some(&[2, 2, 2, 2][..])
+        );
+        assert_eq!(s.current_psbt(), &[1, 1, 1, 1][..]);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
@@ -40,6 +41,9 @@ impl KfpNode {
             ));
         }
 
+        let our_index = self.share.metadata.identifier;
+        self.check_psbt_proposer_authorized(our_index)?;
+
         let created_at = Timestamp::now().as_secs();
         let session_id = derive_psbt_session_id(
             &self.group_pubkey,
@@ -61,7 +65,7 @@ impl KfpNode {
 
         {
             let mut sessions = self.psbt_sessions.write();
-            sessions.create_session(
+            let session = sessions.create_session(
                 session_id,
                 self.group_pubkey,
                 descriptor_hash,
@@ -71,6 +75,7 @@ impl KfpNode {
                 signers,
                 session_timeout,
             )?;
+            session.set_initiator(self.keys.public_key());
         }
 
         let mut payload = PsbtProposePayload::new(
@@ -167,6 +172,18 @@ impl KfpNode {
             ));
         }
 
+        let sender_share_index = {
+            let peers = self.peers.read();
+            let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!(
+                    "PSBT proposal from unknown peer: {sender}"
+                ))
+            })?;
+            peer.share_index
+        };
+        self.verify_peer_share_index(sender, sender_share_index)?;
+        self.check_psbt_proposer_authorized(sender_share_index)?;
+
         let expected_id = derive_psbt_session_id(
             &payload.group_pubkey,
             &payload.descriptor_hash,
@@ -179,6 +196,8 @@ impl KfpNode {
                 "PSBT session_id does not match derived value".into(),
             ));
         }
+
+        self.verify_descriptor_hash_against_stored(&payload.descriptor_hash)?;
 
         let mut signers: HashSet<SignerId> = HashSet::new();
         for idx in &payload.expected_signers {
@@ -212,9 +231,20 @@ impl KfpNode {
                 signers,
                 propose_timeout,
             ) {
-                Ok(_) => true,
+                Ok(session) => {
+                    session.set_initiator(sender);
+                    true
+                }
                 Err(e) => {
-                    debug!("PSBT session creation failed: {e}");
+                    warn!(
+                        session_id = %hex::encode(payload.session_id),
+                        error = %e,
+                        "PSBT session creation failed"
+                    );
+                    let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
+                        session_id: payload.session_id,
+                        reason: format!("session creation failed: {e}"),
+                    });
                     false
                 }
             }
@@ -230,8 +260,13 @@ impl KfpNode {
         });
 
         let our_index = self.share.metadata.identifier;
-        let we_are_signer = payload.expected_signers.contains(&our_index);
-        if we_are_signer {
+        let our_fingerprints = self.own_recovery_fingerprints();
+        let we_are_share_signer = payload.expected_signers.contains(&our_index);
+        let we_are_external_signer = payload
+            .expected_fingerprints
+            .iter()
+            .any(|fp| our_fingerprints.contains(fp));
+        if we_are_share_signer || we_are_external_signer {
             let _ = self.event_tx.send(KfpNodeEvent::PsbtSignatureNeeded {
                 session_id: payload.session_id,
                 tier_index: payload.tier_index,
@@ -242,6 +277,54 @@ impl KfpNode {
         }
 
         Ok(())
+    }
+
+    fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {
+        let proposers = self.psbt_proposers.read();
+        if !proposers.is_empty() && !proposers.contains(&share_index) {
+            return Err(FrostNetError::Session(format!(
+                "Share {share_index} is not authorized to propose PSBTs"
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_descriptor_hash_against_stored(&self, descriptor_hash: &[u8; 32]) -> Result<()> {
+        let sessions = self.descriptor_sessions.read();
+        let mut saw_any_finalized = false;
+        for (_, session) in sessions.iter_sessions() {
+            if session.group_pubkey() != &self.group_pubkey {
+                continue;
+            }
+            let Some(finalized) = session.descriptor() else {
+                continue;
+            };
+            saw_any_finalized = true;
+            let mut hasher = Sha256::new();
+            hasher.update(finalized.external.as_bytes());
+            hasher.update(finalized.internal.as_bytes());
+            hasher.update(finalized.policy_hash);
+            let expected: [u8; 32] = hasher.finalize().into();
+            if &expected == descriptor_hash {
+                return Ok(());
+            }
+        }
+        if saw_any_finalized {
+            return Err(FrostNetError::Session(
+                "PSBT descriptor_hash does not match any finalized descriptor for this group"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn own_recovery_fingerprints(&self) -> HashSet<String> {
+        let our_index = self.share.metadata.identifier;
+        self.peers
+            .read()
+            .get_peer_recovery_xpubs(our_index)
+            .map(|xpubs| xpubs.iter().map(|x| x.fingerprint.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Submit a partial signature for a PSBT session. The caller provides the
@@ -334,7 +417,26 @@ impl KfpNode {
                 self.verify_peer_share_index(sender, idx)?;
                 SignerId::Share(idx)
             }
-            (None, Some(fp)) => SignerId::Fingerprint(fp),
+            (None, Some(fp)) => {
+                let sender_fingerprints = {
+                    let peers = self.peers.read();
+                    let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
+                        FrostNetError::UntrustedPeer(format!(
+                            "PsbtSign from unknown peer: {sender}"
+                        ))
+                    })?;
+                    peer.recovery_xpubs
+                        .iter()
+                        .map(|x| x.fingerprint.clone())
+                        .collect::<HashSet<_>>()
+                };
+                if !sender_fingerprints.contains(&fp) {
+                    return Err(FrostNetError::Session(format!(
+                        "PsbtSign fingerprint {fp} is not owned by sender {sender}"
+                    )));
+                }
+                SignerId::Fingerprint(fp)
+            }
             (None, None) => {
                 return Err(FrostNetError::Session(
                     "PsbtSign missing signer identity".into(),
@@ -369,19 +471,19 @@ impl KfpNode {
         &self,
         session_id: [u8; 32],
         finalized_psbt: Vec<u8>,
-        final_tx: Option<Vec<u8>>,
-        txid: Option<[u8; 32]>,
+        final_tx: Option<(Vec<u8>, [u8; 32])>,
     ) -> Result<()> {
+        let txid = final_tx.as_ref().map(|(_, id)| *id);
         {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
                 .get_session_mut(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.set_finalized(finalized_psbt.clone(), final_tx.clone(), txid)?;
+            session.set_finalized(finalized_psbt.clone(), final_tx.clone())?;
         }
 
         let mut payload = PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt);
-        if let (Some(tx), Some(id)) = (final_tx, txid) {
+        if let Some((tx, id)) = final_tx {
             payload = payload.with_final_tx(tx, id);
         }
         let msg = KfpMessage::PsbtFinalize(payload);
@@ -447,6 +549,17 @@ impl KfpNode {
             ));
         }
 
+        let final_tx = match (payload.final_tx, payload.txid) {
+            (Some(tx), Some(id)) => Some((tx, id)),
+            (None, None) => None,
+            _ => {
+                return Err(FrostNetError::Session(
+                    "PsbtFinalize must include both final_tx and txid, or neither".into(),
+                ));
+            }
+        };
+        let txid = final_tx.as_ref().map(|(_, id)| *id);
+
         {
             let mut sessions = self.psbt_sessions.write();
             let session = match sessions.get_session_mut(&payload.session_id) {
@@ -459,7 +572,20 @@ impl KfpNode {
                     return Ok(());
                 }
             };
-            if let Err(e) = session.set_finalized(payload.psbt, payload.final_tx, payload.txid) {
+            match session.initiator() {
+                Some(initiator) if *initiator == sender => {}
+                Some(_) => {
+                    return Err(FrostNetError::Session(
+                        "PsbtFinalize sender is not the session initiator".into(),
+                    ));
+                }
+                None => {
+                    return Err(FrostNetError::Session(
+                        "PsbtFinalize for session with no recorded initiator".into(),
+                    ));
+                }
+            }
+            if let Err(e) = session.set_finalized(payload.psbt, final_tx) {
                 warn!("Failed to mark PSBT session finalized: {e}");
                 return Ok(());
             }
@@ -467,7 +593,7 @@ impl KfpNode {
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtFinalized {
             session_id: payload.session_id,
-            txid: payload.txid,
+            txid,
         });
 
         Ok(())
@@ -548,11 +674,42 @@ impl KfpNode {
 
         let sanitized = sanitize_reason(&payload.reason);
 
+        let sender_share_index = self
+            .peers
+            .read()
+            .get_peer_by_pubkey(&sender)
+            .map(|p| p.share_index);
+        let sender_fingerprints = self
+            .peers
+            .read()
+            .get_peer_by_pubkey(&sender)
+            .map(|p| {
+                p.recovery_xpubs
+                    .iter()
+                    .map(|x| x.fingerprint.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+
         {
             let mut sessions = self.psbt_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&payload.session_id) {
-                session.abort(sanitized.clone());
+            let Some(session) = sessions.get_session_mut(&payload.session_id) else {
+                return Ok(());
+            };
+            let is_initiator = session
+                .initiator()
+                .map(|init| *init == sender)
+                .unwrap_or(false);
+            let is_expected_signer = session.expected_signers().iter().any(|s| match s {
+                SignerId::Share(idx) => Some(*idx) == sender_share_index,
+                SignerId::Fingerprint(fp) => sender_fingerprints.contains(fp),
+            });
+            if !is_initiator && !is_expected_signer {
+                return Err(FrostNetError::Session(format!(
+                    "Peer {sender} is not an authorized aborter for this PSBT session"
+                )));
             }
+            session.abort(sanitized.clone());
         }
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
