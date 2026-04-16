@@ -311,6 +311,35 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    /// Build an encrypted PSBT coordination event for `recipient`. Used by
+    /// `PsbtPropose` / `PsbtSign` / `PsbtFinalize` / `PsbtAbort`, which all
+    /// share the same g/s/t tag layout.
+    pub fn psbt_event(
+        keys: &Keys,
+        recipient: &PublicKey,
+        group_pubkey: &[u8; 32],
+        session_id: &[u8; 32],
+        msg_type: &'static str,
+        msg: &KfpMessage,
+    ) -> Result<Event> {
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+            .tag(Tag::custom(TagKind::custom("t"), [msg_type]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn decrypt_message(keys: &Keys, event: &Event) -> Result<KfpMessage> {
         const MAX_ENCRYPTED_CONTENT_SIZE: usize = MAX_MESSAGE_SIZE * 2;
         if event.content.len() > MAX_ENCRYPTED_CONTENT_SIZE {

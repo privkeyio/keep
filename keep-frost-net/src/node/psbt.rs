@@ -8,9 +8,8 @@ use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
-
 use crate::error::{FrostNetError, Result};
+use crate::event::KfpEventBuilder;
 use crate::protocol::*;
 use crate::psbt_session::{derive_psbt_session_id, SignerId};
 
@@ -97,18 +96,8 @@ impl KfpNode {
         }
 
         let msg = KfpMessage::PsbtPropose(payload);
-        let json = msg.to_json()?;
 
-        let target_peers: Vec<PublicKey> = {
-            let peers = self.peers.read();
-            peers
-                .get_online_peers()
-                .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
-                .map(|p| p.pubkey)
-                .collect()
-        };
-
+        let target_peers = self.bidirectional_online_peers();
         if target_peers.is_empty() {
             self.psbt_sessions.write().remove_session(&session_id);
             return Err(FrostNetError::Session(
@@ -116,28 +105,8 @@ impl KfpNode {
             ));
         }
 
-        for pubkey in &target_peers {
-            let encrypted =
-                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
-                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
-
-            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-                .tag(Tag::public_key(*pubkey))
-                .tag(Tag::custom(
-                    TagKind::custom("g"),
-                    [hex::encode(self.group_pubkey)],
-                ))
-                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-                .tag(Tag::custom(TagKind::custom("t"), ["psbt_propose"]))
-                .sign_with_keys(&self.keys)
-                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
-
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-        }
+        self.broadcast_psbt_event(&msg, &session_id, "psbt_propose", &target_peers)
+            .await?;
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtProposed {
             session_id,
@@ -279,6 +248,44 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Collect online peers we can both send to and receive from.
+    fn bidirectional_online_peers(&self) -> Vec<PublicKey> {
+        let peers = self.peers.read();
+        peers
+            .get_online_peers()
+            .iter()
+            .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+            .map(|p| p.pubkey)
+            .collect()
+    }
+
+    /// Encrypt and send a PSBT coordination message to each target peer. Any
+    /// per-peer failure (encryption, signing, relay) aborts the broadcast with
+    /// the first error.
+    async fn broadcast_psbt_event(
+        &self,
+        msg: &KfpMessage,
+        session_id: &[u8; 32],
+        msg_type: &'static str,
+        targets: &[PublicKey],
+    ) -> Result<()> {
+        for pubkey in targets {
+            let event = KfpEventBuilder::psbt_event(
+                &self.keys,
+                pubkey,
+                &self.group_pubkey,
+                session_id,
+                msg_type,
+                msg,
+            )?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {
         let proposers = self.psbt_proposers.read();
         if !proposers.is_empty() && !proposers.contains(&share_index) {
@@ -350,27 +357,15 @@ impl KfpNode {
         );
 
         let msg = KfpMessage::PsbtSign(payload);
-        let json = msg.to_json()?;
 
-        let encrypted = nip44::encrypt(
-            self.keys.secret_key(),
+        let event = KfpEventBuilder::psbt_event(
+            &self.keys,
             initiator_pubkey,
-            &json,
-            nip44::Version::V2,
-        )
-        .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
-
-        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-            .tag(Tag::public_key(*initiator_pubkey))
-            .tag(Tag::custom(
-                TagKind::custom("g"),
-                [hex::encode(self.group_pubkey)],
-            ))
-            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-            .tag(Tag::custom(TagKind::custom("t"), ["psbt_sign"]))
-            .sign_with_keys(&self.keys)
-            .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+            &self.group_pubkey,
+            &session_id,
+            "psbt_sign",
+            &msg,
+        )?;
 
         self.client
             .send_event(&event)
@@ -514,40 +509,10 @@ impl KfpNode {
             payload = payload.with_final_tx(tx, id);
         }
         let msg = KfpMessage::PsbtFinalize(payload);
-        let json = msg.to_json()?;
 
-        let target_peers: Vec<PublicKey> = {
-            let peers = self.peers.read();
-            peers
-                .get_online_peers()
-                .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
-                .map(|p| p.pubkey)
-                .collect()
-        };
-
-        for pubkey in &target_peers {
-            let encrypted =
-                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
-                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
-
-            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-                .tag(Tag::public_key(*pubkey))
-                .tag(Tag::custom(
-                    TagKind::custom("g"),
-                    [hex::encode(self.group_pubkey)],
-                ))
-                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-                .tag(Tag::custom(TagKind::custom("t"), ["psbt_finalize"]))
-                .sign_with_keys(&self.keys)
-                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
-
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-        }
+        let target_peers = self.bidirectional_online_peers();
+        self.broadcast_psbt_event(&msg, &session_id, "psbt_finalize", &target_peers)
+            .await?;
 
         let _ = self
             .event_tx
@@ -637,40 +602,10 @@ impl KfpNode {
 
         let payload = PsbtAbortPayload::new(session_id, self.group_pubkey, reason);
         let msg = KfpMessage::PsbtAbort(payload);
-        let json = msg.to_json()?;
 
-        let target_peers: Vec<PublicKey> = {
-            let peers = self.peers.read();
-            peers
-                .get_online_peers()
-                .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
-                .map(|p| p.pubkey)
-                .collect()
-        };
-
-        for pubkey in &target_peers {
-            let encrypted =
-                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
-                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
-
-            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-                .tag(Tag::public_key(*pubkey))
-                .tag(Tag::custom(
-                    TagKind::custom("g"),
-                    [hex::encode(self.group_pubkey)],
-                ))
-                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
-                .tag(Tag::custom(TagKind::custom("t"), ["psbt_abort"]))
-                .sign_with_keys(&self.keys)
-                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
-
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-        }
+        let target_peers = self.bidirectional_online_peers();
+        self.broadcast_psbt_event(&msg, &session_id, "psbt_abort", &target_peers)
+            .await?;
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
             session_id,
@@ -701,22 +636,19 @@ impl KfpNode {
 
         let sanitized = sanitize_reason(&payload.reason);
 
-        let sender_share_index = self
-            .peers
-            .read()
-            .get_peer_by_pubkey(&sender)
-            .map(|p| p.share_index);
-        let sender_fingerprints = self
-            .peers
-            .read()
-            .get_peer_by_pubkey(&sender)
-            .map(|p| {
-                p.recovery_xpubs
-                    .iter()
-                    .map(|x| x.fingerprint.clone())
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let (sender_share_index, sender_fingerprints) = {
+            let peers = self.peers.read();
+            match peers.get_peer_by_pubkey(&sender) {
+                Some(peer) => (
+                    Some(peer.share_index),
+                    peer.recovery_xpubs
+                        .iter()
+                        .map(|x| x.fingerprint.clone())
+                        .collect::<HashSet<_>>(),
+                ),
+                None => (None, HashSet::new()),
+            }
+        };
 
         {
             let mut sessions = self.psbt_sessions.write();
