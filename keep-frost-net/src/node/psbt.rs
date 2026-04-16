@@ -319,12 +319,11 @@ impl KfpNode {
     }
 
     fn own_recovery_fingerprints(&self) -> HashSet<String> {
-        let our_index = self.share.metadata.identifier;
-        self.peers
+        self.local_recovery_xpubs
             .read()
-            .get_peer_recovery_xpubs(our_index)
-            .map(|xpubs| xpubs.iter().map(|x| x.fingerprint.clone()).collect())
-            .unwrap_or_default()
+            .iter()
+            .map(|x| x.fingerprint.clone())
+            .collect()
     }
 
     /// Submit a partial signature for a PSBT session. The caller provides the
@@ -444,7 +443,7 @@ impl KfpNode {
             }
         };
 
-        let (count, threshold) = {
+        let (count, threshold, should_finalize, finalized_psbt) = {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
@@ -452,7 +451,22 @@ impl KfpNode {
 
             session.add_signature(signer.clone(), payload.psbt, signer_marker(&signer))?;
 
-            (session.signature_count(), session.required_threshold())
+            let threshold_met = session.threshold_met();
+            let is_initiator = session.initiator() == Some(&self.keys.public_key());
+            let already_finalized =
+                matches!(session.state(), crate::psbt_session::PsbtSessionState::Finalized);
+            let should_finalize = threshold_met && is_initiator && !already_finalized;
+            let finalized_psbt = if should_finalize {
+                session.current_psbt().to_vec()
+            } else {
+                Vec::new()
+            };
+            (
+                session.signature_count(),
+                session.required_threshold(),
+                should_finalize,
+                finalized_psbt,
+            )
         };
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtSignatureReceived {
@@ -461,6 +475,19 @@ impl KfpNode {
             signature_count: count,
             threshold,
         });
+
+        if should_finalize {
+            if let Err(e) = self
+                .finalize_psbt_session(payload.session_id, finalized_psbt, None)
+                .await
+            {
+                warn!(
+                    session_id = %hex::encode(payload.session_id),
+                    error = %e,
+                    "Initiator auto-finalize failed"
+                );
+            }
+        }
 
         Ok(())
     }

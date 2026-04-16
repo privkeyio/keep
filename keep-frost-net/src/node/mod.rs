@@ -394,6 +394,7 @@ pub struct KfpNode {
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
+    pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
 }
 
 impl KfpNode {
@@ -540,6 +541,7 @@ impl KfpNode {
             seen_xpub_announces: RwLock::new(HashSet::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
+            local_recovery_xpubs: RwLock::new(Vec::new()),
         })
     }
 
@@ -635,6 +637,8 @@ impl KfpNode {
                 .map(|p| p.pubkey)
                 .collect()
         };
+
+        *self.local_recovery_xpubs.write() = recovery_xpubs.clone();
 
         let xpub_count = recovery_xpubs.len();
         let payload = XpubAnnouncePayload::new(
