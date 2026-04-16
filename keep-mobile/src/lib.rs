@@ -1147,6 +1147,50 @@ impl KeepMobile {
         persistence::delete_descriptor(&self.storage, &group_pubkey)
     }
 
+    pub fn wallet_register_on_device(
+        &self,
+        group_pubkey: String,
+        device_uri: String,
+        wallet_name: Option<String>,
+    ) -> Result<Option<String>, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
+        let group_bytes =
+            hex::decode(&group_pubkey).map_err(|e| KeepMobileError::InvalidInput {
+                msg: format!("invalid group pubkey hex: {e}"),
+            })?;
+        let name = wallet_name.unwrap_or_else(|| {
+            let tag = group_bytes
+                .get(..4)
+                .map(hex::encode)
+                .unwrap_or_else(|| "keep".into());
+            format!("keep-{tag}")
+        });
+
+        self.runtime.block_on(async {
+            let client = keep_nip46::Nip46Client::connect_to(&device_uri)
+                .await
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+
+            let outcome: Result<Option<String>, KeepMobileError> = async {
+                client
+                    .connect()
+                    .await
+                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                let response = client
+                    .register_wallet(&name, &desc.external_descriptor)
+                    .await
+                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                Ok(response.hmac.map(hex::encode))
+            }
+            .await;
+
+            client.disconnect().await;
+            outcome
+        })
+    }
+
     pub fn wallet_descriptor_set_callbacks(&self, callbacks: Arc<dyn DescriptorCallbacks>) {
         self.runtime.block_on(async {
             *self.descriptor_callbacks.write().await = Some(callbacks);

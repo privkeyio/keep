@@ -312,6 +312,9 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     void wallet_descriptor_delete(string group_pubkey);
 
+    [Throws=KeepMobileError]
+    string? wallet_register_on_device(string group_pubkey, string device_uri, string? wallet_name);
+
     void wallet_descriptor_set_callbacks(DescriptorCallbacks callbacks);
 
     [Throws=KeepMobileError]

@@ -203,6 +203,100 @@ pub fn cmd_wallet_descriptor(
     Ok(())
 }
 
+pub fn cmd_wallet_register(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    device_uri: &str,
+    name: Option<&str>,
+) -> Result<()> {
+    debug!(group, device = %mask_secret(device_uri), "wallet register");
+
+    let group_pubkey = parse_group_id(group)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let desc = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
+
+    let wallet_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("keep-{}", hex::encode(&group_pubkey[..4])));
+
+    out.newline();
+    out.header("Register Wallet on Hardware Signer");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Network", &desc.network);
+    out.field("Wallet name", &wallet_name);
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    rt.block_on(async {
+        let spinner = out.spinner("Connecting to signer...");
+        let client = keep_nip46::Nip46Client::connect_to(device_uri)
+            .await
+            .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
+        spinner.finish();
+
+        let spinner = out.spinner("Authenticating with signer...");
+        client
+            .connect()
+            .await
+            .map_err(|e| KeepError::Runtime(format!("handshake: {e}")))?;
+        spinner.finish();
+
+        let spinner = out.spinner("Registering wallet on device (confirm on device)...");
+        let response = client
+            .register_wallet(&wallet_name, &desc.external_descriptor)
+            .await
+            .map_err(|e| KeepError::Runtime(format!("register_wallet: {e}")))?;
+        spinner.finish();
+
+        client.disconnect().await;
+
+        out.success("Wallet registered on device!");
+        if let Some(hmac) = response.hmac {
+            out.field("Registration token", &hex::encode(hmac));
+        } else {
+            out.info("Device did not return a registration token.");
+        }
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn mask_secret(uri: &str) -> String {
+    match url::Url::parse(uri) {
+        Ok(mut parsed) => {
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(k, v)| {
+                    if k == "secret" {
+                        (k.into_owned(), "***".into())
+                    } else {
+                        (k.into_owned(), v.into_owned())
+                    }
+                })
+                .collect();
+            parsed.query_pairs_mut().clear();
+            for (k, v) in pairs {
+                parsed.query_pairs_mut().append_pair(&k, &v);
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<invalid>".into(),
+    }
+}
+
 pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<()> {
     let group_pubkey = parse_group_hex(group_hex)?;
 
@@ -1000,5 +1094,18 @@ mod tests {
         let err = parse_recovery_policy(&specs, 5);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("Duplicate timelock"));
+    }
+
+    #[test]
+    fn test_mask_secret_hides_bunker_secret() {
+        let uri = "bunker://aabbcc?relay=wss%3A%2F%2Frelay.example.com&secret=topsecret";
+        let masked = mask_secret(uri);
+        assert!(!masked.contains("topsecret"));
+        assert!(masked.contains("secret=%2A%2A%2A") || masked.contains("secret=***"));
+    }
+
+    #[test]
+    fn test_mask_secret_passthrough_invalid() {
+        assert_eq!(mask_secret("not a url"), "<invalid>");
     }
 }
