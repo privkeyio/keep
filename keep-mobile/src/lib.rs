@@ -1716,6 +1716,7 @@ impl KeepMobile {
                 network: d.network.clone(),
                 created_at: d.created_at,
                 device_registrations,
+                policy_hash: [0u8; 32],
             });
         }
 

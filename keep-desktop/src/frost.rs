@@ -624,6 +624,7 @@ pub(crate) async fn frost_event_listener(
                         session_id,
                         external_descriptor,
                         internal_descriptor,
+                        policy_hash,
                         ..
                     }) => {
                         log!(EventLogType::Descriptor, "Descriptor complete".to_string());
@@ -633,6 +634,7 @@ pub(crate) async fn frost_event_listener(
                                 session_id,
                                 external_descriptor,
                                 internal_descriptor,
+                                policy_hash,
                             },
                         );
                     }
@@ -957,11 +959,13 @@ impl App {
                 session_id,
                 external_descriptor,
                 internal_descriptor,
+                policy_hash,
             } => {
                 self.handle_descriptor_complete(
                     session_id,
                     external_descriptor,
                     internal_descriptor,
+                    policy_hash,
                 );
             }
             FrostNodeMsg::DescriptorNacked {
@@ -1261,6 +1265,7 @@ impl App {
         session_id: [u8; 32],
         external_descriptor: String,
         internal_descriptor: String,
+        policy_hash: [u8; 32],
     ) {
         let Some(coord) = self.active_coordinations.remove(&session_id) else {
             return;
@@ -1276,6 +1281,7 @@ impl App {
             network: network.clone(),
             created_at,
             device_registrations: Vec::new(),
+            policy_hash,
         };
 
         let store_result = {

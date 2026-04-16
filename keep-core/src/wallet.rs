@@ -118,6 +118,11 @@ pub struct WalletDescriptor {
     /// Hardware signers that have registered this wallet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_registrations: Vec<DeviceRegistration>,
+    /// Hash of the wallet policy that produced this descriptor. Required for
+    /// canonical descriptor hashing (matches the on-wire `descriptor_hash`
+    /// computed as `sha256(external || internal || policy_hash)`).
+    #[serde(default)]
+    pub policy_hash: [u8; 32],
 }
 
 impl WalletDescriptor {
@@ -168,6 +173,7 @@ mod tests {
             network: "testnet".into(),
             created_at: 0,
             device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
         };
         let signer = [7u8; 32];
         desc.upsert_device_registration(DeviceRegistration {
@@ -200,6 +206,7 @@ mod tests {
             network: "testnet".into(),
             created_at: 1,
             device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("device_registrations"));

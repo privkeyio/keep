@@ -153,6 +153,7 @@ pub fn cmd_frost_network_serve(
                         external_descriptor,
                         internal_descriptor,
                         network,
+                        policy_hash,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -174,6 +175,7 @@ pub fn cmd_frost_network_serve(
                                 network,
                                 created_at: now,
                                 device_registrations: Vec::new(),
+                                policy_hash,
                             };
                             let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {

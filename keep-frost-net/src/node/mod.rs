@@ -171,6 +171,7 @@ pub enum KfpNodeEvent {
         external_descriptor: String,
         internal_descriptor: String,
         network: String,
+        policy_hash: [u8; 32],
     },
     DescriptorAcked {
         session_id: [u8; 32],

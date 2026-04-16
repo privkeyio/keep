@@ -731,6 +731,7 @@ impl KfpNode {
             external_descriptor: payload.external_descriptor,
             internal_descriptor: payload.internal_descriptor,
             network: session_network,
+            policy_hash: payload.policy_hash,
         });
 
         Ok(())
@@ -932,6 +933,7 @@ impl KfpNode {
                         external_descriptor: desc.external.clone(),
                         internal_descriptor: desc.internal.clone(),
                         network: session.network().to_string(),
+                        policy_hash: desc.policy_hash,
                     });
                 }
             }

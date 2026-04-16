@@ -180,6 +180,7 @@ pub fn cmd_wallet_descriptor(
         network: canonical_network.clone(),
         created_at: now,
         device_registrations: Vec::new(),
+        policy_hash: [0u8; 32],
     };
 
     let mut keep = Keep::open(path)?;
@@ -849,6 +850,7 @@ pub fn cmd_wallet_propose(
 
         let mut external_descriptor = String::new();
         let mut internal_descriptor = String::new();
+        let mut finalized_policy_hash = [0u8; 32];
         let mut complete = false;
 
         while tokio::time::Instant::now() < ack_deadline {
@@ -858,10 +860,12 @@ pub fn cmd_wallet_propose(
                     session_id: sid,
                     external_descriptor: ext,
                     internal_descriptor: int,
+                    policy_hash,
                     ..
                 })) if sid == session_id => {
                     external_descriptor = ext;
                     internal_descriptor = int;
+                    finalized_policy_hash = policy_hash;
                     complete = true;
                     break;
                 }
@@ -910,6 +914,7 @@ pub fn cmd_wallet_propose(
             network: network.to_string(),
             created_at: now,
             device_registrations: Vec::new(),
+            policy_hash: finalized_policy_hash,
         };
 
         keep.store_wallet_descriptor(&descriptor)?;
@@ -1228,6 +1233,8 @@ pub fn cmd_wallet_spend(
             ));
         }
 
+        let mut event_rx = node.subscribe();
+
         let spinner = out.spinner("Sending PSBT proposal...");
         let session_id = node
             .request_psbt_spend(
@@ -1248,12 +1255,79 @@ pub fn cmd_wallet_spend(
 
         out.field("Session", &hex::encode(&session_id[..8]));
         out.newline();
-        out.info("PSBT coordination proposed. Other signers will now contribute partial signatures.");
-        out.info(
-            "Collect `psbt_sign` contributions and combine off-line; when threshold is met, run `finalize_psbt_session` on this node.",
-        );
+        out.info("PSBT coordination proposed. Waiting for signatures and finalization...");
+
+        let wait_deadline = timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(keep_frost_net::PSBT_SESSION_TIMEOUT_SECS));
+        let wait_spinner = out.spinner("Waiting for PSBT coordination...");
+        let result: Result<_> = async {
+            let deadline = tokio::time::Instant::now() + wait_deadline;
+            loop {
+                let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+                    Some(r) => r,
+                    None => {
+                        return Err(KeepError::Frost(
+                            "Timed out waiting for PSBT coordination to complete".into(),
+                        ));
+                    }
+                };
+                match tokio::time::timeout(remaining, event_rx.recv()).await {
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtFinalized {
+                        session_id: sid,
+                        txid,
+                    })) if sid == session_id => {
+                        return Ok(txid);
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtAborted {
+                        session_id: sid,
+                        reason,
+                    })) if sid == session_id => {
+                        return Err(KeepError::Frost(format!(
+                            "PSBT session aborted: {reason}"
+                        )));
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureReceived {
+                        session_id: sid,
+                        signature_count,
+                        threshold,
+                        ..
+                    })) if sid == session_id => {
+                        tracing::info!(
+                            session = %hex::encode(&sid[..8]),
+                            signature_count,
+                            threshold,
+                            "Received PSBT signature"
+                        );
+                    }
+                    Ok(Err(_)) => {
+                        return Err(KeepError::Frost(
+                            "Event channel closed before PSBT finalized".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(KeepError::Frost(
+                            "Timed out waiting for PSBT coordination to complete".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        .await;
+        wait_spinner.finish();
 
         node_handle.abort();
+        match result {
+            Ok(Some(txid)) => {
+                out.success("PSBT finalized");
+                out.field("Txid", &hex::encode(txid));
+            }
+            Ok(None) => {
+                out.success("PSBT finalized (no final tx attached)");
+            }
+            Err(e) => return Err(e),
+        }
         Ok::<_, KeepError>(())
     })?;
 
@@ -1287,6 +1361,7 @@ fn compute_descriptor_hash(desc: &WalletDescriptor) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(desc.external_descriptor.as_bytes());
     h.update(desc.internal_descriptor.as_bytes());
+    h.update(desc.policy_hash);
     h.finalize().into()
 }
 
