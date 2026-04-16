@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod descriptor;
 mod ecdh;
+mod psbt;
 mod signing;
 
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,7 @@ use crate::event::KfpEventBuilder;
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
+use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
 
 #[derive(Clone, Debug)]
@@ -194,6 +196,29 @@ pub enum KfpNodeEvent {
         responsive: Vec<u16>,
         unresponsive: Vec<u16>,
     },
+    PsbtProposed {
+        session_id: [u8; 32],
+        tier_index: u32,
+    },
+    PsbtSignatureNeeded {
+        session_id: [u8; 32],
+        tier_index: u32,
+        initiator_pubkey: PublicKey,
+    },
+    PsbtSignatureReceived {
+        session_id: [u8; 32],
+        signer: crate::psbt_session::SignerId,
+        signature_count: usize,
+        threshold: u32,
+    },
+    PsbtFinalized {
+        session_id: [u8; 32],
+        txid: Option<[u8; 32]>,
+    },
+    PsbtAborted {
+        session_id: [u8; 32],
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for KfpNodeEvent {
@@ -304,6 +329,45 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("responsive", responsive)
                 .field("unresponsive", unresponsive)
                 .finish(),
+            Self::PsbtProposed {
+                session_id,
+                tier_index,
+            } => f
+                .debug_struct("PsbtProposed")
+                .field("session_id", &hex::encode(session_id))
+                .field("tier_index", tier_index)
+                .finish(),
+            Self::PsbtSignatureNeeded {
+                session_id,
+                tier_index,
+                ..
+            } => f
+                .debug_struct("PsbtSignatureNeeded")
+                .field("session_id", &hex::encode(session_id))
+                .field("tier_index", tier_index)
+                .finish(),
+            Self::PsbtSignatureReceived {
+                session_id,
+                signer,
+                signature_count,
+                threshold,
+            } => f
+                .debug_struct("PsbtSignatureReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("signer", signer)
+                .field("signature_count", signature_count)
+                .field("threshold", threshold)
+                .finish(),
+            Self::PsbtFinalized { session_id, txid } => f
+                .debug_struct("PsbtFinalized")
+                .field("session_id", &hex::encode(session_id))
+                .field("txid", &txid.map(hex::encode))
+                .finish(),
+            Self::PsbtAborted { session_id, reason } => f
+                .debug_struct("PsbtAborted")
+                .field("session_id", &hex::encode(session_id))
+                .field("reason", reason)
+                .finish(),
         }
     }
 }
@@ -316,6 +380,7 @@ pub struct KfpNode {
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
     pub(crate) ecdh_sessions: Arc<RwLock<EcdhSessionManager>>,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
+    pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
     pub(crate) peers: Arc<RwLock<PeerManager>>,
     pub(crate) policies: Arc<RwLock<HashMap<PublicKey, PeerPolicy>>>,
     pub(crate) hooks: RwLock<Arc<dyn SigningHooks>>,
@@ -368,6 +433,11 @@ impl KfpNode {
         let descriptor_manager = match session_timeout {
             Some(t) => DescriptorSessionManager::with_timeout(t)?,
             None => DescriptorSessionManager::new(),
+        };
+
+        let psbt_manager = match session_timeout {
+            Some(t) => PsbtSessionManager::with_timeout(t)?,
+            None => PsbtSessionManager::new(),
         };
 
         for relay in &relays {
@@ -455,6 +525,7 @@ impl KfpNode {
             sessions: Arc::new(RwLock::new(session_manager)),
             ecdh_sessions: Arc::new(RwLock::new(ecdh_manager)),
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
+            psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
             policies: Arc::new(RwLock::new(HashMap::new())),
             hooks: RwLock::new(Arc::new(NoOpHooks)),
@@ -941,6 +1012,18 @@ impl KfpNode {
             }
             KfpMessage::XpubAnnounce(payload) => {
                 self.handle_xpub_announce(event.pubkey, payload).await?;
+            }
+            KfpMessage::PsbtPropose(payload) => {
+                self.handle_psbt_propose(event.pubkey, payload).await?;
+            }
+            KfpMessage::PsbtSign(payload) => {
+                self.handle_psbt_sign(event.pubkey, payload).await?;
+            }
+            KfpMessage::PsbtFinalize(payload) => {
+                self.handle_psbt_finalize(event.pubkey, payload).await?;
+            }
+            KfpMessage::PsbtAbort(payload) => {
+                self.handle_psbt_abort(event.pubkey, payload).await?;
             }
             KfpMessage::Ping(payload) => {
                 self.handle_ping(event.pubkey, payload).await?;

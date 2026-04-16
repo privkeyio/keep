@@ -238,6 +238,44 @@ pub(crate) enum WalletCommands {
         #[arg(long, help = "Session timeout in seconds (max 86400)")]
         timeout: Option<u64>,
     },
+    /// Propose a recovery-tier (scriptpath) spend via WDC PSBT coordination
+    Spend {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(long, help = "Recovery tier index (0 = first recovery tier)")]
+        recovery_tier: u32,
+        #[arg(
+            long,
+            help = "Path to an unsigned PSBT file (binary or base64) describing the recovery spend"
+        )]
+        psbt_file: PathBuf,
+        #[arg(long, help = "Fee in sats (for display)", default_value = "0")]
+        fee: u64,
+        #[arg(
+            long,
+            help = "Required number of partial signatures",
+            default_value = "1"
+        )]
+        threshold: u32,
+        #[arg(
+            long,
+            help = "Expected signer FROST share index (repeatable)",
+            default_values_t = Vec::<u16>::new(),
+        )]
+        signer_share: Vec<u16>,
+        #[arg(
+            long,
+            help = "Expected signer xpub fingerprint, 8 hex chars (repeatable)",
+            default_values_t = Vec::<String>::new(),
+        )]
+        signer_fingerprint: Vec<String>,
+        #[arg(long, help = "Share index to use for signing")]
+        share: Option<u16>,
+        #[arg(short, long, help = "Nostr relay URL")]
+        relay: Option<String>,
+        #[arg(long, help = "Session timeout in seconds (max 86400)")]
+        timeout: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]

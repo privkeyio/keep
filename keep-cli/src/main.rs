@@ -486,6 +486,34 @@ fn dispatch_wallet(
         WalletCommands::Registrations { group, show_token } => {
             commands::wallet::cmd_wallet_registrations(out, path, &group, show_token)
         }
+        WalletCommands::Spend {
+            group,
+            recovery_tier,
+            psbt_file,
+            fee,
+            threshold,
+            signer_share,
+            signer_fingerprint,
+            share,
+            relay,
+            timeout,
+        } => {
+            let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
+            commands::wallet::cmd_wallet_spend(
+                out,
+                path,
+                &group,
+                recovery_tier,
+                &psbt_file,
+                fee,
+                threshold,
+                &signer_share,
+                &signer_fingerprint,
+                share,
+                relay,
+                timeout,
+            )
+        }
     }
 }
 

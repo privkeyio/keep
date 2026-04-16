@@ -1101,6 +1101,195 @@ pub fn cmd_wallet_announce_keys(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_wallet_spend(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    recovery_tier: u32,
+    psbt_file: &Path,
+    fee: u64,
+    threshold: u32,
+    signer_share: &[u16],
+    signer_fingerprint: &[String],
+    share_index: Option<u16>,
+    relay: &str,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    debug!(group, recovery_tier, relay, timeout = ?timeout_secs, "wallet spend");
+
+    if let Some(t) = timeout_secs {
+        if t == 0 || t > keep_frost_net::PSBT_SESSION_MAX_TIMEOUT_SECS {
+            return Err(KeepError::InvalidInput(format!(
+                "timeout must be between 1 and {} seconds",
+                keep_frost_net::PSBT_SESSION_MAX_TIMEOUT_SECS
+            )));
+        }
+    }
+
+    if signer_share.is_empty() && signer_fingerprint.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "must specify at least one --signer-share or --signer-fingerprint".into(),
+        ));
+    }
+    if threshold == 0 {
+        return Err(KeepError::InvalidInput(
+            "--threshold must be non-zero".into(),
+        ));
+    }
+    let total_signers = signer_share.len() + signer_fingerprint.len();
+    if (threshold as usize) > total_signers {
+        return Err(KeepError::InvalidInput(format!(
+            "--threshold {threshold} exceeds total signers {total_signers}"
+        )));
+    }
+    for fp in signer_fingerprint {
+        if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(KeepError::InvalidInput(format!(
+                "--signer-fingerprint '{fp}' must be 8 hex characters"
+            )));
+        }
+    }
+
+    let group_pubkey = parse_group_id(group)?;
+
+    let psbt_bytes = read_psbt_file(psbt_file)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let descriptor = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
+
+    let descriptor_hash = compute_descriptor_hash(&descriptor);
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    out.newline();
+    out.header("WDC Recovery Spend Proposal");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Network", &descriptor.network);
+    out.field("Recovery tier", &recovery_tier.to_string());
+    out.field("PSBT bytes", &psbt_bytes.len().to_string());
+    out.field("Fee (display)", &format!("{fee} sats"));
+    out.field(
+        "Expected signers",
+        &format!(
+            "{} share(s) + {} external",
+            signer_share.len(),
+            signer_fingerprint.len()
+        ),
+    );
+    out.field("Required threshold", &threshold.to_string());
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    rt.block_on(async {
+        let node = std::sync::Arc::new(
+            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+                .await
+                .map_err(|e| KeepError::Frost(e.to_string()))?,
+        );
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let spinner = out.spinner("Discovering peers...");
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        spinner.finish();
+
+        let online = node.online_peers();
+        out.info(&format!("{online} peer(s) online"));
+        if online == 0 {
+            node_handle.abort();
+            return Err(KeepError::Frost(
+                "No peers online. Start 'keep frost network serve' on the recovery key holders' devices first.".into(),
+            ));
+        }
+
+        let spinner = out.spinner("Sending PSBT proposal...");
+        let session_id = node
+            .request_psbt_spend(
+                descriptor_hash,
+                recovery_tier,
+                psbt_bytes,
+                fee,
+                threshold,
+                signer_share.to_vec(),
+                signer_fingerprint.to_vec(),
+                Vec::new(),
+                Vec::new(),
+                timeout_secs,
+            )
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+
+        out.field("Session", &hex::encode(&session_id[..8]));
+        out.newline();
+        out.info("PSBT coordination proposed. Other signers will now contribute partial signatures.");
+        out.info(
+            "Collect `psbt_sign` contributions and combine off-line; when threshold is met, run `finalize_psbt_session` on this node.",
+        );
+
+        node_handle.abort();
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read PSBT file: {e}")))?;
+    // Accept either raw PSBT binary (prefix "psbt\xff") or base64-encoded text.
+    if raw.starts_with(b"psbt\xff") {
+        return Ok(raw);
+    }
+    let text = String::from_utf8(raw.clone()).map_err(|_| {
+        KeepError::InvalidInput("PSBT file is neither binary PSBT nor UTF-8".into())
+    })?;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let decoded = STANDARD
+        .decode(text.trim())
+        .map_err(|e| KeepError::InvalidInput(format!("cannot base64-decode PSBT: {e}")))?;
+    if !decoded.starts_with(b"psbt\xff") {
+        return Err(KeepError::InvalidInput(
+            "decoded PSBT does not start with the PSBT magic bytes".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn compute_descriptor_hash(desc: &WalletDescriptor) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(desc.external_descriptor.as_bytes());
+    h.update(desc.internal_descriptor.as_bytes());
+    h.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,6 +69,7 @@ mod nonce_store;
 mod peer;
 pub mod proof;
 mod protocol;
+mod psbt_session;
 mod session;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
@@ -97,17 +98,24 @@ pub use protocol::{
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
     DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
     EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, PingPayload, PolicyTier, PongPayload,
-    RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
-    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, WalletPolicy,
-    XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS,
-    DESCRIPTOR_ACK_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
-    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
-    DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
-    MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH,
-    MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE,
-    MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH, MAX_PARTICIPANTS,
-    MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
-    MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, VALID_NETWORKS, VALID_XPUB_PREFIXES,
+    PsbtAbortPayload, PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo, PsbtProposePayload,
+    PsbtSignPayload, RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload,
+    RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload, SignatureSharePayload,
+    TapScriptSigEntry, WalletPolicy, XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS,
+    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
+    KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
+    MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH,
+    MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH,
+    MAX_NAME_LENGTH, MAX_PARTICIPANTS, MAX_PSBT_SIZE, MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS,
+    MAX_SIGNATURE_SHARE_SIZE, MAX_TAP_SCRIPT_SIGS_PER_MESSAGE, MAX_TAP_SCRIPT_SIG_SIZE,
+    MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, PSBT_FINALIZE_PHASE_TIMEOUT_SECS,
+    PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS,
+    VALID_NETWORKS, VALID_XPUB_PREFIXES,
+};
+pub use psbt_session::{
+    derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

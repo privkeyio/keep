@@ -709,6 +709,38 @@ pub(crate) async fn frost_event_listener(
                     Ok(KfpNodeEvent::DescriptorProposed { .. }) => {
                         log!(EventLogType::Descriptor, "Descriptor proposed".to_string());
                     }
+                    // TODO(WDC-PSBT): expose PSBT coordination to UI (#331)
+                    Ok(KfpNodeEvent::PsbtProposed { session_id, tier_index }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT proposed for tier {tier_index}: {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                    }
+                    Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, .. }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT signature needed for tier {tier_index}: {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                    }
+                    Ok(KfpNodeEvent::PsbtSignatureReceived { session_id, signature_count, threshold, .. }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT signature received ({signature_count}/{threshold}): {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                    }
+                    Ok(KfpNodeEvent::PsbtFinalized { session_id, .. }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT finalized: {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                    }
+                    Ok(KfpNodeEvent::PsbtAborted { session_id, reason }) => {
+                        log!(EventLogType::Error, format!(
+                            "PSBT aborted ({}): {}",
+                            &hex::encode(session_id)[..8],
+                            truncate_peer_string(&reason)
+                        ));
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
