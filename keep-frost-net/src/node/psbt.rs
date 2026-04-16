@@ -144,9 +144,7 @@ impl KfpNode {
         let sender_share_index = {
             let peers = self.peers.read();
             let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
-                FrostNetError::UntrustedPeer(format!(
-                    "PSBT proposal from unknown peer: {sender}"
-                ))
+                FrostNetError::UntrustedPeer(format!("PSBT proposal from unknown peer: {sender}"))
             })?;
             peer.share_index
         };
@@ -448,8 +446,10 @@ impl KfpNode {
 
             let threshold_met = session.threshold_met();
             let is_initiator = session.initiator() == Some(&self.keys.public_key());
-            let already_finalized =
-                matches!(session.state(), crate::psbt_session::PsbtSessionState::Finalized);
+            let already_finalized = matches!(
+                session.state(),
+                crate::psbt_session::PsbtSessionState::Finalized
+            );
             let should_finalize = threshold_met && is_initiator && !already_finalized;
             let finalized_psbt = if should_finalize {
                 session.current_psbt().to_vec()

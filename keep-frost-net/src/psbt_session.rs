@@ -827,11 +827,15 @@ mod tests {
         s.add_signature(SignerId::Share(2), vec![2, 2, 2, 2], vec![0xbb])
             .unwrap();
         assert_eq!(
-            s.partial_psbts().get(&SignerId::Share(1)).map(Vec::as_slice),
+            s.partial_psbts()
+                .get(&SignerId::Share(1))
+                .map(Vec::as_slice),
             Some(&[1, 1, 1, 1][..])
         );
         assert_eq!(
-            s.partial_psbts().get(&SignerId::Share(2)).map(Vec::as_slice),
+            s.partial_psbts()
+                .get(&SignerId::Share(2))
+                .map(Vec::as_slice),
             Some(&[2, 2, 2, 2][..])
         );
         assert_eq!(s.current_psbt(), &[1, 1, 1, 1][..]);
