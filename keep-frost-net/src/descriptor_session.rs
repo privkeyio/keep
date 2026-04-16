@@ -757,9 +757,7 @@ impl DescriptorSessionManager {
     }
 
     pub fn iter_sessions(&self) -> impl Iterator<Item = (&[u8; 32], &DescriptorSession)> {
-        self.sessions
-            .iter()
-            .filter(|(_, s)| !s.is_expired())
+        self.sessions.iter().filter(|(_, s)| !s.is_expired())
     }
 
     pub fn get_session_mut(&mut self, session_id: &[u8; 32]) -> Option<&mut DescriptorSession> {
