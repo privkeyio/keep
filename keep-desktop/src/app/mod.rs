@@ -152,6 +152,7 @@ pub struct App {
     pub(crate) bunker_cert_pin_failed: bool,
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
+    pub(crate) pending_psbt_signatures: Vec<crate::screen::wallet::PsbtPendingDisplay>,
     import_return_to_nsec: bool,
     distribute_state: Option<distribute::State>,
     distribute_export_id: Option<u16>,
@@ -232,6 +233,7 @@ impl App {
             scanner_rx: None,
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
+            pending_psbt_signatures: Vec::new(),
             import_return_to_nsec: false,
             distribute_state: None,
             distribute_export_id: None,
@@ -322,6 +324,7 @@ impl App {
                 | Message::RestoreVerified(..)
                 | Message::RestoreResult(..)
                 | Message::KillSwitchDeactivateResult(..)
+                | Message::RejectPsbtSignatureResult(..)
         );
         #[cfg(unix)]
         let is_background = is_background
@@ -402,7 +405,9 @@ impl App {
             | Message::WalletSessionStarted(..)
             | Message::WalletDescriptorProgress(..)
             | Message::WalletAnnounceResult(..)
-            | Message::WalletRegisterResult(..) => self.handle_wallet_global_message(message),
+            | Message::WalletRegisterResult(..)
+            | Message::RejectPsbtSignature(..)
+            | Message::RejectPsbtSignatureResult(..) => self.handle_wallet_global_message(message),
 
             Message::Relay(msg) => self.handle_relay_message(msg),
             Message::ConnectRelayResult(result) => self.handle_connect_relay_result(result),
@@ -815,6 +820,7 @@ impl App {
             scanner_rx: None,
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
+            pending_psbt_signatures: Vec::new(),
             import_return_to_nsec: false,
             distribute_state: None,
             distribute_export_id: None,

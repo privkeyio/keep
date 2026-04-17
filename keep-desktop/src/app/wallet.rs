@@ -79,6 +79,9 @@ impl App {
                 device_uri,
                 wallet_name,
             ),
+            wallet::Event::RejectPsbt(session_id) => {
+                Task::done(Message::RejectPsbtSignature(session_id))
+            }
         }
     }
 
@@ -89,6 +92,7 @@ impl App {
                     Ok(wallets) => {
                         let mut ws = wallet::State::new(wallets);
                         ws.peer_xpubs = self.peer_xpubs.clone();
+                        ws.pending_psbt_signatures = self.pending_psbt_signatures.clone();
                         self.screen = Screen::Wallet(ws);
                     }
                     Err(e) => {
@@ -189,6 +193,37 @@ impl App {
                         if let Screen::Wallet(s) = &mut self.screen {
                             s.register_failed(e);
                         }
+                    }
+                }
+                Task::none()
+            }
+            Message::RejectPsbtSignature(session_id) => {
+                let Some(node) = self.get_frost_node() else {
+                    self.set_toast("Relay not connected".into(), ToastKind::Error);
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.abort_psbt_session(session_id, "rejected by signer")
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    move |r| Message::RejectPsbtSignatureResult(session_id, r),
+                )
+            }
+            Message::RejectPsbtSignatureResult(session_id, result) => {
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                }
+                match result {
+                    Ok(()) => {
+                        self.set_toast("PSBT rejected".into(), ToastKind::Success);
+                    }
+                    Err(e) => {
+                        self.set_toast(format!("PSBT reject failed: {e}"), ToastKind::Error);
                     }
                 }
                 Task::none()

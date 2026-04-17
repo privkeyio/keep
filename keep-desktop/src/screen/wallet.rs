@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use keep_frost_net::AnnouncedXpub;
+use keep_frost_net::PsbtSessionSnapshot;
 use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, VALID_XPUB_PREFIXES};
 
 use crate::screen::shares::ShareEntry;
@@ -126,6 +127,7 @@ pub enum Message {
     RegisterNameChanged(String),
     CancelRegister,
     SubmitRegister,
+    RejectPsbt([u8; 32]),
 }
 
 impl std::fmt::Debug for Message {
@@ -155,6 +157,7 @@ impl std::fmt::Debug for Message {
             Self::RegisterNameChanged(n) => f.debug_tuple("RegisterNameChanged").field(n).finish(),
             Self::CancelRegister => write!(f, "CancelRegister"),
             Self::SubmitRegister => write!(f, "SubmitRegister"),
+            Self::RejectPsbt(id) => f.debug_tuple("RejectPsbt").field(&hex::encode(id)).finish(),
         }
     }
 }
@@ -178,6 +181,19 @@ pub enum Event {
         device_uri: String,
         wallet_name: String,
     },
+    RejectPsbt([u8; 32]),
+}
+
+/// Display entry for a pending PSBT signature request awaiting the user's
+/// review. The UI only ever exposes a Reject action, no approval control of
+/// any kind is rendered, so there is no way for a misrouted message to trigger
+/// an approve-equivalent action from this card.
+#[derive(Debug, Clone)]
+pub struct PsbtPendingDisplay {
+    pub session_id: [u8; 32],
+    pub tier_index: u32,
+    pub initiator_pubkey: nostr_sdk::PublicKey,
+    pub snapshot: Option<PsbtSessionSnapshot>,
 }
 
 pub struct State {
@@ -187,6 +203,7 @@ pub struct State {
     pub announce: Option<AnnounceState>,
     pub register: Option<RegisterState>,
     pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
+    pub pending_psbt_signatures: Vec<PsbtPendingDisplay>,
 }
 
 pub struct SetupState {
@@ -208,6 +225,7 @@ impl State {
             announce: None,
             register: None,
             peer_xpubs: HashMap::new(),
+            pending_psbt_signatures: Vec::new(),
         }
     }
 
@@ -313,6 +331,7 @@ impl State {
                 })
             }
             Message::CopyDescriptor(desc) => Some(Event::CopyDescriptor(desc)),
+            Message::RejectPsbt(id) => Some(Event::RejectPsbt(id)),
             Message::StartRegister(i) => {
                 if let Some(entry) = self.descriptors.get(i) {
                     let default_name = hex::encode(&entry.group_pubkey[..4]);
@@ -498,6 +517,10 @@ impl State {
             for (i, entry) in self.descriptors.iter().enumerate() {
                 list = list.push(self.wallet_card(i, entry));
             }
+        }
+
+        if !self.pending_psbt_signatures.is_empty() {
+            list = list.push(self.pending_psbt_signatures_section());
         }
 
         if !self.peer_xpubs.is_empty() {
@@ -1010,6 +1033,103 @@ impl State {
             .padding(theme::space::XL)
             .width(Length::Fill)
             .height(Length::Fill)
+            .into()
+    }
+
+    fn pending_psbt_signatures_section(&self) -> Element<'_, Message> {
+        let mut request_list = column![].spacing(theme::space::SM);
+
+        for entry in &self.pending_psbt_signatures {
+            let sid_short = hex::encode(entry.session_id);
+            let sid_short = sid_short.get(..12).unwrap_or(&sid_short).to_string();
+            let initiator = entry.initiator_pubkey.to_string();
+            let initiator_short = initiator.get(..16).unwrap_or(&initiator).to_string();
+
+            let reject_btn = button(text("Reject").size(theme::size::SMALL))
+                .on_press(Message::RejectPsbt(entry.session_id))
+                .style(theme::danger_button)
+                .padding([theme::space::XS, theme::space::MD]);
+
+            let card: Element<'_, Message> = match &entry.snapshot {
+                Some(snap) => {
+                    let psbt_hash = hex::encode(snap.psbt_hash);
+                    let psbt_hash_short = psbt_hash.get(..12).unwrap_or(&psbt_hash).to_string();
+                    let fee_text = match snap.fee_sats {
+                        Some(f) => format!("{f} sats"),
+                        None => "unknown".into(),
+                    };
+
+                    let header =
+                        row![
+                            text(format!("PSBT signature request — session {sid_short}"))
+                                .size(theme::size::SMALL)
+                                .color(theme::color::TEXT_MUTED),
+                        ]
+                        .align_y(Alignment::Center);
+
+                    let details = column![
+                        text(format!("From: {initiator_short}"))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                        text(format!(
+                            "Tier {}   outputs: {}   fee: {}",
+                            snap.tier_index, snap.output_count, fee_text
+                        ))
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                        text(format!(
+                            "Network: {}   threshold: {}/{}   PSBT hash: {}",
+                            snap.network,
+                            snap.threshold,
+                            snap.expected_signers_len,
+                            psbt_hash_short
+                        ))
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                    ]
+                    .spacing(theme::space::XS);
+
+                    container(
+                        column![header, details, row![reject_btn].spacing(theme::space::SM)]
+                            .spacing(theme::space::XS),
+                    )
+                    .style(theme::warning_style)
+                    .padding(theme::space::MD)
+                    .width(Length::Fill)
+                    .into()
+                }
+                None => container(
+                    column![
+                        text(format!(
+                            "Malformed PSBT from {initiator_short} — Reject only."
+                        ))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::ERROR),
+                        text(format!("Session: {sid_short}   tier {}", entry.tier_index))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                        row![reject_btn].spacing(theme::space::SM),
+                    ]
+                    .spacing(theme::space::XS),
+                )
+                .style(theme::warning_style)
+                .padding(theme::space::MD)
+                .width(Length::Fill)
+                .into(),
+            };
+
+            request_list = request_list.push(card);
+        }
+
+        let count = self.pending_psbt_signatures.len();
+        let label = text(format!("Pending PSBT Signatures ({count})"))
+            .size(theme::size::BODY)
+            .color(theme::color::TEXT);
+
+        container(column![label, request_list].spacing(theme::space::SM))
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
             .into()
     }
 

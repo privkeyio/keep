@@ -5,6 +5,8 @@ mod ecdh;
 mod psbt;
 mod signing;
 
+pub use psbt::PsbtSessionSnapshot;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;

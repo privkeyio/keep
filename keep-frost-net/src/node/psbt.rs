@@ -15,7 +15,46 @@ use crate::psbt_session::{derive_psbt_session_id, SignerId};
 
 use super::{KfpNode, KfpNodeEvent};
 
+/// Read-only snapshot of a PSBT coordination session, safe for UI display.
+///
+/// Produced by [`KfpNode::psbt_session_snapshot`]. Returned `None` by the
+/// accessor when the stored PSBT cannot be decoded (fail-closed); callers
+/// must not offer any approval UI in that case.
+#[derive(Debug, Clone)]
+pub struct PsbtSessionSnapshot {
+    pub session_id: [u8; 32],
+    pub tier_index: u32,
+    pub initiator_pubkey: PublicKey,
+    pub psbt_hash: [u8; 32],
+    pub output_count: u32,
+    pub fee_sats: Option<u64>,
+    pub network: String,
+    pub threshold: u32,
+    pub expected_signers_len: u32,
+}
+
 impl KfpNode {
+    /// Return a display-safe snapshot for the given PSBT session. Returns
+    /// `None` if the session does not exist or the stored PSBT fails to
+    /// decode.
+    pub fn psbt_session_snapshot(&self, session_id: &[u8; 32]) -> Option<PsbtSessionSnapshot> {
+        let sessions = self.psbt_sessions.read();
+        let session = sessions.get_session(session_id)?;
+        let initiator = *session.initiator()?;
+        let (psbt_hash, output_count, fee_sats, network) =
+            decode_psbt_for_snapshot(session.current_psbt())?;
+        Some(PsbtSessionSnapshot {
+            session_id: *session.session_id(),
+            tier_index: session.tier_index(),
+            initiator_pubkey: initiator,
+            psbt_hash,
+            output_count,
+            fee_sats,
+            network,
+            threshold: session.required_threshold(),
+            expected_signers_len: session.expected_signers().len() as u32,
+        })
+    }
     /// Propose a PSBT for a recovery tier spend. Publishes `PsbtPropose` to all
     /// expected signers over NIP-44 encrypted channel.
     ///
@@ -740,6 +779,68 @@ impl KfpNode {
     }
 }
 
+/// Decode a PSBT and extract snapshot-safe fields. Returns `None` on decode
+/// error (fail-closed).
+fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<u64>, String)> {
+    let psbt = bitcoin::psbt::Psbt::deserialize(psbt_bytes).ok()?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(psbt_bytes);
+    let psbt_hash: [u8; 32] = hasher.finalize().into();
+
+    let output_count = u32::try_from(psbt.unsigned_tx.output.len()).ok()?;
+
+    let all_witness = psbt.inputs.iter().all(|i| i.witness_utxo.is_some());
+    let fee_sats = if all_witness {
+        let total_in: Option<u64> = psbt.inputs.iter().try_fold(0u64, |acc, i| {
+            i.witness_utxo
+                .as_ref()
+                .and_then(|u| acc.checked_add(u.value.to_sat()))
+        });
+        let total_out: Option<u64> = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()));
+        match (total_in, total_out) {
+            (Some(i), Some(o)) => i.checked_sub(o),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let network = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .find_map(|o| {
+            for net in [
+                bitcoin::Network::Bitcoin,
+                bitcoin::Network::Testnet,
+                bitcoin::Network::Signet,
+                bitcoin::Network::Regtest,
+            ] {
+                if bitcoin::Address::from_script(&o.script_pubkey, net).is_ok() {
+                    return Some(
+                        match net {
+                            bitcoin::Network::Bitcoin => "bitcoin",
+                            bitcoin::Network::Testnet => "testnet",
+                            bitcoin::Network::Signet => "signet",
+                            bitcoin::Network::Regtest => "regtest",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                    );
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some((psbt_hash, output_count, fee_sats, network))
+}
+
 fn signer_marker(signer: &SignerId) -> Vec<u8> {
     match signer {
         SignerId::Share(i) => {
@@ -890,5 +991,81 @@ mod descriptor_lookup_tests {
             decide_descriptor_hash_verification(true, true, &group, &hash, Some(&unused_lookup));
         assert!(result.is_ok());
         let _ = lookup; // silence unused
+    }
+}
+
+#[cfg(test)]
+mod snapshot_decode_tests {
+    use super::decode_psbt_for_snapshot;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::secp256k1::{Keypair, Secp256k1};
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+
+    fn fixture_psbt(include_witness_utxo: bool) -> Vec<u8> {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        if include_witness_utxo {
+            psbt.inputs[0].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(60_000),
+                script_pubkey: tap_script,
+            });
+        }
+        psbt.serialize()
+    }
+
+    #[test]
+    fn decode_good_psbt_reports_fee_and_output_count() {
+        let bytes = fixture_psbt(true);
+        let (hash, outputs, fee, network) = decode_psbt_for_snapshot(&bytes).expect("decodes");
+        assert_ne!(hash, [0u8; 32]);
+        assert_eq!(outputs, 1);
+        assert_eq!(fee, Some(10_000));
+        assert!(matches!(
+            network.as_str(),
+            "bitcoin" | "testnet" | "signet" | "regtest"
+        ));
+    }
+
+    #[test]
+    fn decode_psbt_without_witness_utxo_reports_none_fee() {
+        let bytes = fixture_psbt(false);
+        let (_, outputs, fee, _) = decode_psbt_for_snapshot(&bytes).expect("decodes");
+        assert_eq!(outputs, 1);
+        assert_eq!(fee, None);
+    }
+
+    #[test]
+    fn decode_psbt_garbage_returns_none() {
+        assert!(decode_psbt_for_snapshot(&[0u8, 1, 2, 3]).is_none());
+        assert!(decode_psbt_for_snapshot(&[]).is_none());
     }
 }

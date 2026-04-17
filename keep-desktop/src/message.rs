@@ -4,7 +4,7 @@
 use std::fmt;
 
 use keep_core::backup::BackupInfo;
-use keep_frost_net::AnnouncedXpub;
+use keep_frost_net::{AnnouncedXpub, PsbtSessionSnapshot};
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
@@ -192,6 +192,8 @@ pub enum Message {
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     WalletAnnounceResult(Result<(), String>),
     WalletRegisterResult(Result<(), String>),
+    RejectPsbtSignature([u8; 32]),
+    RejectPsbtSignatureResult([u8; 32], Result<(), String>),
 
     // Relay / FROST
     Relay(crate::screen::relay::Message),
@@ -304,8 +306,8 @@ pub enum FrostNodeMsg {
     PsbtSignatureNeeded {
         session_id: [u8; 32],
         tier_index: u32,
-        #[allow(dead_code)]
         initiator_pubkey: nostr_sdk::PublicKey,
+        snapshot: Option<PsbtSessionSnapshot>,
     },
 }
 
@@ -468,6 +470,15 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::WalletRegisterResult(r) => f
                 .debug_tuple("WalletRegisterResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::RejectPsbtSignature(id) => f
+                .debug_tuple("RejectPsbtSignature")
+                .field(&hex::encode(id))
+                .finish(),
+            Self::RejectPsbtSignatureResult(id, r) => f
+                .debug_tuple("RejectPsbtSignatureResult")
+                .field(&hex::encode(id))
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),
             Self::Relay(msg) => f.debug_tuple("Relay").field(msg).finish(),

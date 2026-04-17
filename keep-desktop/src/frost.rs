@@ -749,12 +749,14 @@ pub(crate) async fn frost_event_listener(
                             "PSBT signature required for tier {tier_index} (session {})",
                             &hex::encode(session_id)[..8]
                         ));
+                        let snapshot = node.psbt_session_snapshot(&session_id);
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::PsbtSignatureNeeded {
                                 session_id,
                                 tier_index,
                                 initiator_pubkey,
+                                snapshot,
                             },
                         );
                     }
@@ -1063,13 +1065,29 @@ impl App {
             FrostNodeMsg::PsbtSignatureNeeded {
                 session_id,
                 tier_index,
-                ..
+                initiator_pubkey,
+                snapshot,
             } => {
                 tracing::info!(
                     session_id = %hex::encode(session_id),
                     tier_index,
-                    "PSBT signature needed (UI wiring pending)"
+                    has_snapshot = snapshot.is_some(),
+                    "PSBT signature needed; routing to wallet screen"
                 );
+                let entry = crate::screen::wallet::PsbtPendingDisplay {
+                    session_id,
+                    tier_index,
+                    initiator_pubkey,
+                    snapshot,
+                };
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                self.pending_psbt_signatures.push(entry.clone());
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                    ws.pending_psbt_signatures.push(entry);
+                }
             }
         }
         iced::Task::none()
