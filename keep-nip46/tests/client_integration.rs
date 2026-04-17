@@ -204,18 +204,23 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
 
 #[tokio::test]
 async fn test_nip46_client_register_wallet_rejects_empty_name() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let relay_url = mock_relay.url().await.to_string();
+
     let signer_keys = Keys::generate();
-    let client = Nip46Client::connect_with(
-        signer_keys.public_key(),
-        vec!["wss://relay.example.com/".into()],
-        None,
-    )
-    .await;
-    // If connect_with times out dialing a fake relay it's fine — we just
-    // verify the input validation path fires.
-    if let Ok(client) = client {
-        let err = client.register_wallet("", "tr(...)").await.unwrap_err();
-        assert!(err.to_string().contains("wallet name must not be empty"));
-        client.disconnect().await;
-    }
+    let client = Nip46Client::connect_with(signer_keys.public_key(), vec![relay_url], None)
+        .await
+        .expect("client connect");
+
+    let err = client
+        .register_wallet("", "tr(xpub.../<0;1>/*)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("wallet name must not be empty"));
+
+    client.disconnect().await;
 }

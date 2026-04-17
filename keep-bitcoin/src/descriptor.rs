@@ -114,6 +114,10 @@ impl DescriptorExport {
         Ok(format!("{internal}#{checksum}"))
     }
 
+    pub fn multipath_descriptor(&self) -> Result<String> {
+        multipath_from_external(&self.descriptor)
+    }
+
     pub fn to_sparrow_json(&self, name: &str) -> Result<String> {
         let internal = self.internal_descriptor()?;
 
@@ -136,6 +140,25 @@ impl DescriptorExport {
 
         serde_json::to_string_pretty(&json).map_err(|e| BitcoinError::Descriptor(e.to_string()))
     }
+}
+
+/// Build a BIP-389 multipath descriptor from a single-path external descriptor.
+///
+/// `tr(.../0/*)#chk` becomes `tr(.../<0;1>/*)#newchk`. Descriptors that contain
+/// no `/0/*` derivation path are returned with a (re)computed checksum.
+pub fn multipath_from_external(external: &str) -> Result<String> {
+    let body = external.split('#').next().unwrap_or(external);
+    if body.contains("<0;1>") || body.contains("<1;0>") {
+        let checksum = compute_checksum(body)?;
+        return Ok(format!("{body}#{checksum}"));
+    }
+    if !body.contains("/0/*") {
+        let checksum = compute_checksum(body)?;
+        return Ok(format!("{body}#{checksum}"));
+    }
+    let multipath = body.replace("/0/*", "/<0;1>/*");
+    let checksum = compute_checksum(&multipath)?;
+    Ok(format!("{multipath}#{checksum}"))
 }
 
 fn compute_checksum(descriptor: &str) -> Result<String> {

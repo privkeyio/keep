@@ -239,6 +239,9 @@ pub fn cmd_wallet_register(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let multipath = keep_bitcoin::multipath_from_external(&desc.external_descriptor)
+        .map_err(|e| KeepError::Runtime(format!("build multipath descriptor: {e}")))?;
+
     rt.block_on(async {
         let spinner = out.spinner("Connecting to signer...");
         let client = keep_nip46::Nip46Client::connect_to(device_uri)
@@ -246,25 +249,34 @@ pub fn cmd_wallet_register(
             .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
         spinner.finish();
 
-        let spinner = out.spinner("Authenticating with signer...");
-        client
-            .connect()
-            .await
-            .map_err(|e| KeepError::Runtime(format!("handshake: {e}")))?;
-        spinner.finish();
+        let outcome = async {
+            let spinner = out.spinner("Authenticating with signer...");
+            client
+                .connect()
+                .await
+                .map_err(|e| KeepError::Runtime(format!("handshake: {e}")))?;
+            spinner.finish();
 
-        let spinner = out.spinner("Registering wallet on device (confirm on device)...");
-        let response = client
-            .register_wallet(&wallet_name, &desc.external_descriptor)
-            .await
-            .map_err(|e| KeepError::Runtime(format!("register_wallet: {e}")))?;
-        spinner.finish();
+            let spinner = out.spinner("Registering wallet on device (confirm on device)...");
+            let response = client
+                .register_wallet(&wallet_name, &multipath)
+                .await
+                .map_err(|e| KeepError::Runtime(format!("register_wallet: {e}")))?;
+            spinner.finish();
+            Ok::<_, KeepError>(response)
+        }
+        .await;
 
         client.disconnect().await;
+
+        let response = outcome?;
 
         out.success("Wallet registered on device!");
         if let Some(hmac) = response.hmac {
             out.field("Registration token", &hex::encode(hmac));
+            // TODO: persist the HMAC in WalletDescriptor per signer pubkey so
+            // subsequent sessions can prove prior registration to the device.
+            out.info("Save this token: it is required for subsequent device sessions.");
         } else {
             out.info("Device did not return a registration token.");
         }

@@ -4,16 +4,19 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use keep_core::error::{CryptoError, NetworkError, StorageError};
-use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
+use keep_core::relay::{normalize_relay_url, validate_relay_url, TIMESTAMP_TWEAK_RANGE};
 
 use crate::bunker::parse_bunker_url;
 use crate::error::Result;
 use crate::types::Nip46Response;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
+const MAX_HMAC_HEX_LEN: usize = 128;
 pub const MAX_WALLET_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTOR_LEN: usize = 4096;
 
@@ -27,7 +30,7 @@ pub struct RegisterWalletResponse {
 pub struct Nip46Client {
     signer_pubkey: PublicKey,
     relays: Vec<String>,
-    secret: Option<String>,
+    secret: Option<Zeroizing<String>>,
     client_keys: Keys,
     client: Client,
 }
@@ -48,6 +51,17 @@ impl Nip46Client {
         if relays.is_empty() {
             return Err(NetworkError::relay("at least one relay required").into());
         }
+
+        let mut normalized = Vec::with_capacity(relays.len());
+        for relay in &relays {
+            validate_relay_url(relay).map_err(|e| {
+                keep_core::error::KeepError::InvalidInput(format!(
+                    "invalid relay URL '{relay}': {e}"
+                ))
+            })?;
+            normalized.push(normalize_relay_url(relay));
+        }
+        let relays = normalized;
 
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
@@ -70,7 +84,7 @@ impl Nip46Client {
         Ok(Self {
             signer_pubkey,
             relays,
-            secret,
+            secret: secret.map(Zeroizing::new),
             client_keys,
             client,
         })
@@ -91,7 +105,7 @@ impl Nip46Client {
     pub async fn connect(&self) -> Result<()> {
         let mut params = vec![self.signer_pubkey.to_hex()];
         if let Some(ref s) = self.secret {
-            params.push(s.clone());
+            params.push(s.as_str().to_string());
         }
         let id = new_request_id();
         let response = self.request(&id, "connect", params).await?;
@@ -104,6 +118,12 @@ impl Nip46Client {
         }
     }
 
+    /// Register a wallet descriptor on the remote signer.
+    ///
+    /// The `descriptor` must already encode both the external (receive) and
+    /// internal (change) paths, typically as a BIP-389 multipath descriptor
+    /// (e.g. `tr(...<0;1>/*)`). Sending only a single-path descriptor prevents
+    /// the device from deriving change addresses.
     pub async fn register_wallet(
         &self,
         name: &str,
@@ -129,13 +149,21 @@ impl Nip46Client {
                 "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
             )));
         }
+        let has_multipath = descriptor.contains("<0;1>") || descriptor.contains("<1;0>");
+        let has_single_path = descriptor.contains("/0/*") || descriptor.contains("/1/*");
+        if has_single_path && !has_multipath {
+            return Err(keep_core::error::KeepError::InvalidInput(
+                "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
+            ));
+        }
 
         let id = new_request_id();
         let response = self
-            .request(
+            .request_with_timeout(
                 &id,
                 "register_wallet",
                 vec![name.to_string(), descriptor.to_string()],
+                REGISTER_WALLET_TIMEOUT,
             )
             .await?;
 
@@ -144,15 +172,35 @@ impl Nip46Client {
         }
 
         let hmac = match response.result.as_deref() {
-            None | Some("") | Some("null") => None,
-            Some(hex_str) => Some(hex::decode(hex_str.trim()).map_err(|e| {
-                StorageError::invalid_format(format!("register_wallet hmac hex: {e}"))
-            })?),
+            None | Some("") => None,
+            Some(hex_str) => {
+                let trimmed = hex_str.trim();
+                if trimmed.len() > MAX_HMAC_HEX_LEN {
+                    return Err(keep_core::error::KeepError::InvalidInput(format!(
+                        "register_wallet hmac too long: {} hex chars (max {MAX_HMAC_HEX_LEN})",
+                        trimmed.len()
+                    )));
+                }
+                Some(hex::decode(trimmed).map_err(|e| {
+                    StorageError::invalid_format(format!("register_wallet hmac hex: {e}"))
+                })?)
+            }
         };
         Ok(RegisterWalletResponse { hmac })
     }
 
     async fn request(&self, id: &str, method: &str, params: Vec<String>) -> Result<Nip46Response> {
+        self.request_with_timeout(id, method, params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        id: &str,
+        method: &str,
+        params: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Nip46Response> {
         let mut notifications = self.client.notifications();
 
         let request = serde_json::json!({
@@ -184,15 +232,17 @@ impl Nip46Client {
 
         debug!(method, id, "NIP-46 client request sent");
 
-        self.wait_for_response(id, &mut notifications).await
+        self.wait_for_response(id, &mut notifications, timeout)
+            .await
     }
 
     async fn wait_for_response(
         &self,
         id: &str,
         notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        timeout: Duration,
     ) -> Result<Nip46Response> {
-        let deadline = tokio::time::Instant::now() + DEFAULT_REQUEST_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -202,7 +252,11 @@ impl Nip46Client {
 
             let notif = match tokio::time::timeout(remaining, notifications.recv()).await {
                 Ok(Ok(n)) => n,
-                Ok(Err(_)) => {
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    warn!(dropped = n, "NIP-46 notification stream lagged");
+                    continue;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return Err(NetworkError::response("notification stream closed").into());
                 }
                 Err(_) => {

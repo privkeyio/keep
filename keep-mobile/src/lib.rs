@@ -1168,20 +1168,26 @@ impl KeepMobile {
             format!("keep-{tag}")
         });
 
+        let multipath =
+            keep_bitcoin::multipath_from_external(&desc.external_descriptor).map_err(|e| {
+                KeepMobileError::InvalidInput {
+                    msg: format!("build multipath descriptor: {e}"),
+                }
+            })?;
+
+        // TODO: persist the returned HMAC in the stored WalletDescriptor per
+        // signer pubkey so subsequent sessions can prove prior registration.
         self.runtime.block_on(async {
             let client = keep_nip46::Nip46Client::connect_to(&device_uri)
                 .await
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                .map_err(nip46_to_mobile_error)?;
 
             let outcome: Result<Option<String>, KeepMobileError> = async {
-                client
-                    .connect()
-                    .await
-                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                client.connect().await.map_err(nip46_to_mobile_error)?;
                 let response = client
-                    .register_wallet(&name, &desc.external_descriptor)
+                    .register_wallet(&name, &multipath)
                     .await
-                    .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+                    .map_err(nip46_to_mobile_error)?;
                 Ok(response.hmac.map(hex::encode))
             }
             .await;
@@ -1936,6 +1942,16 @@ fn decode_hex(hex_str: &str, label: &str) -> Result<Vec<u8>, KeepMobileError> {
     hex::decode(hex_str).map_err(|e| KeepMobileError::BackupError {
         msg: format!("hex decode {label}: {e}"),
     })
+}
+
+fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
+    match e {
+        keep_core::error::KeepError::InvalidInput(msg) => KeepMobileError::InvalidInput { msg },
+        keep_core::error::KeepError::Runtime(msg) => KeepMobileError::NetworkError { msg },
+        other => KeepMobileError::NetworkError {
+            msg: other.to_string(),
+        },
+    }
 }
 
 fn bytes_to_32(bytes: &[u8], label: &str) -> Result<[u8; 32], KeepMobileError> {
