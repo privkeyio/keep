@@ -275,27 +275,45 @@ impl RecoveryConfig {
     }
 
     fn format_descriptor(&self, internal_key: XOnlyPublicKey, tiers: &[TierInfo]) -> String {
-        let mut desc = format!("tr({internal_key}");
-        if !tiers.is_empty() {
-            desc.push_str(",{");
-            for (i, tier) in tiers.iter().enumerate() {
-                if i > 0 {
-                    desc.push(',');
-                }
-                match tier.timelock_blocks {
-                    Some(blocks) => {
-                        desc.push_str(&format!("{}(csv={})", tier.name, blocks));
-                    }
-                    None => {
-                        desc.push_str(&tier.name);
-                    }
-                }
-            }
-            desc.push('}');
+        if tiers.is_empty() {
+            return format!("tr({internal_key})");
         }
-        desc.push(')');
-        desc
+        let depths = optimal_depth(tiers.len());
+        let leaves: Vec<String> = tiers.iter().map(tier_miniscript).collect();
+        let tree = build_tree_string(&leaves, &depths);
+        format!("tr({internal_key},{tree})")
     }
+}
+
+fn tier_miniscript(tier: &TierInfo) -> String {
+    let inner = if tier.keys.len() == 1 && tier.threshold == 1 {
+        format!("pk({})", tier.keys[0])
+    } else {
+        let key_list = tier
+            .keys
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("multi_a({},{})", tier.threshold, key_list)
+    };
+    match tier.timelock_blocks {
+        Some(blocks) => format!("and_v(v:older({blocks}),{inner})"),
+        None => inner,
+    }
+}
+
+fn build_tree_string(leaves: &[String], depths: &[u8]) -> String {
+    let mut stack: Vec<(u8, String)> = Vec::with_capacity(leaves.len());
+    for (leaf, &d) in leaves.iter().zip(depths) {
+        stack.push((d, leaf.clone()));
+        while stack.len() >= 2 && stack[stack.len() - 1].0 == stack[stack.len() - 2].0 {
+            let (d_top, s_top) = stack.pop().expect("len checked");
+            let (_, s_second) = stack.pop().expect("len checked");
+            stack.push((d_top.saturating_sub(1), format!("{{{s_second},{s_top}}}")));
+        }
+    }
+    stack.pop().map(|(_, s)| s).unwrap_or_default()
 }
 
 fn build_multisig_script(keys: &[[u8; 32]], threshold: u32) -> Result<ScriptBuf> {
@@ -329,7 +347,7 @@ fn build_timelocked_multisig(
     let mut builder = ScriptBuf::builder()
         .push_sequence(Sequence::from_height(seq_u16))
         .push_opcode(bitcoin::opcodes::all::OP_CSV)
-        .push_opcode(bitcoin::opcodes::all::OP_DROP);
+        .push_opcode(bitcoin::opcodes::all::OP_VERIFY);
 
     builder = push_checksig_chain(builder, &pubkeys);
 
@@ -556,7 +574,64 @@ mod tests {
 
         let output = config.build().unwrap();
         assert!(output.descriptor.starts_with("tr("));
-        assert!(output.descriptor.contains("csv="));
+        assert!(output.descriptor.contains("older("));
+    }
+
+    #[test]
+    fn test_descriptor_parses_as_miniscript() {
+        use bitcoin::secp256k1::Secp256k1;
+        use miniscript::Descriptor;
+
+        let keys: Vec<[u8; 32]> = (1..=6).map(test_keypair).collect();
+        let cases = vec![
+            RecoveryConfig {
+                primary: SpendingTier {
+                    keys: vec![keys[0]],
+                    threshold: 1,
+                },
+                recovery_tiers: vec![RecoveryTier {
+                    keys: vec![keys[1]],
+                    threshold: 1,
+                    timelock_months: 6,
+                }],
+                network: Network::Testnet,
+            },
+            RecoveryConfig {
+                primary: SpendingTier {
+                    keys: vec![keys[0], keys[1], keys[2]],
+                    threshold: 2,
+                },
+                recovery_tiers: vec![
+                    RecoveryTier {
+                        keys: vec![keys[3], keys[4]],
+                        threshold: 2,
+                        timelock_months: 6,
+                    },
+                    RecoveryTier {
+                        keys: vec![keys[5]],
+                        threshold: 1,
+                        timelock_months: 12,
+                    },
+                ],
+                network: Network::Testnet,
+            },
+        ];
+
+        let _ = Secp256k1::new();
+        for config in cases {
+            let output = config.build().unwrap();
+            let desc: Descriptor<miniscript::DescriptorPublicKey> = output
+                .descriptor
+                .parse()
+                .unwrap_or_else(|e| panic!("parse failed for {}: {e}", output.descriptor));
+            let parsed_spk = desc.at_derivation_index(0).unwrap().script_pubkey();
+            let expected_spk = bitcoin::ScriptBuf::new_p2tr_tweaked(output.spend_info.output_key());
+            assert_eq!(
+                parsed_spk, expected_spk,
+                "miniscript-derived scriptPubKey mismatches TaprootBuilder output for {}",
+                output.descriptor
+            );
+        }
     }
 
     #[test]
@@ -568,7 +643,7 @@ mod tests {
 
         let asm = script.to_asm_string();
         assert!(asm.contains("OP_CSV"));
-        assert!(asm.contains("OP_DROP"));
+        assert!(asm.contains("OP_VERIFY"));
         assert!(asm.contains("OP_CHECKSIG"));
     }
 

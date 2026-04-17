@@ -341,7 +341,7 @@ mod tests {
 
         let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
         assert!(export.descriptor.starts_with(&format!("tr({xonly},")));
-        assert!(export.descriptor.contains("csv="));
+        assert!(export.descriptor.contains("older("));
         assert!(export.descriptor.contains('#'));
     }
 
