@@ -120,12 +120,14 @@ pub struct WalletDescriptor {
     pub device_registrations: Vec<DeviceRegistration>,
     /// Hash of the wallet policy that produced this descriptor. Required for
     /// canonical descriptor hashing (matches the on-wire `descriptor_hash`
-    /// computed as `sha256(external || internal || policy_hash)`).
+    /// computed as length-framed
+    /// `sha256(len(ext) || ext || len(int) || int || policy_hash)`).
     #[serde(default)]
     pub policy_hash: [u8; 32],
 }
 
 impl WalletDescriptor {
+<<<<<<< HEAD
     /// Return the registration record for a signer pubkey, if any.
     pub fn device_registration(&self, signer_pubkey: &[u8; 32]) -> Option<&DeviceRegistration> {
         self.device_registrations
@@ -146,14 +148,18 @@ impl WalletDescriptor {
         }
     }
 
-    /// Canonical descriptor hash: `sha256(external || internal || policy_hash)`.
+    /// Canonical descriptor hash with length framing to avoid collisions
+    /// when the split between external/internal shifts:
+    /// `sha256(u64_le(ext.len) || ext || u64_le(int.len) || int || policy_hash)`.
     ///
     /// Must match the on-wire `descriptor_hash` used by the FROST PSBT
     /// coordination protocol.
     pub fn canonical_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
+        h.update((self.external_descriptor.len() as u64).to_le_bytes());
         h.update(self.external_descriptor.as_bytes());
+        h.update((self.internal_descriptor.len() as u64).to_le_bytes());
         h.update(self.internal_descriptor.as_bytes());
         h.update(self.policy_hash);
         h.finalize().into()

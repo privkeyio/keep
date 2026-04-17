@@ -401,7 +401,9 @@ impl KfpNode {
                 };
                 saw_any_finalized = true;
                 let mut hasher = Sha256::new();
+                hasher.update((finalized.external.len() as u64).to_le_bytes());
                 hasher.update(finalized.external.as_bytes());
+                hasher.update((finalized.internal.len() as u64).to_le_bytes());
                 hasher.update(finalized.internal.as_bytes());
                 hasher.update(finalized.policy_hash);
                 let expected: [u8; 32] = hasher.finalize().into();

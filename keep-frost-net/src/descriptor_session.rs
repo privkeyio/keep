@@ -369,7 +369,9 @@ impl DescriptorSession {
             .ok_or_else(|| FrostNetError::Session("No finalized descriptor".into()))?;
 
         let mut hasher = Sha256::new();
+        hasher.update((finalized.external.len() as u64).to_le_bytes());
         hasher.update(finalized.external.as_bytes());
+        hasher.update((finalized.internal.len() as u64).to_le_bytes());
         hasher.update(finalized.internal.as_bytes());
         hasher.update(finalized.policy_hash);
         let expected_hash: [u8; 32] = hasher.finalize().into();
@@ -1008,7 +1010,9 @@ mod tests {
 
     fn descriptor_hash(external: &str, internal: &str, policy_hash: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        hasher.update((external.len() as u64).to_le_bytes());
         hasher.update(external.as_bytes());
+        hasher.update((internal.len() as u64).to_le_bytes());
         hasher.update(internal.as_bytes());
         hasher.update(policy_hash);
         hasher.finalize().into()
