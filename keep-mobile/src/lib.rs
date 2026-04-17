@@ -1156,17 +1156,7 @@ impl KeepMobile {
         validate_hex_pubkey(&group_pubkey)?;
 
         let desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
-        let group_bytes =
-            hex::decode(&group_pubkey).map_err(|e| KeepMobileError::InvalidInput {
-                msg: format!("invalid group pubkey hex: {e}"),
-            })?;
-        let name = wallet_name.unwrap_or_else(|| {
-            let tag = group_bytes
-                .get(..4)
-                .map(hex::encode)
-                .unwrap_or_else(|| "keep".into());
-            format!("keep-{tag}")
-        });
+        let name = wallet_name.unwrap_or_else(|| format!("keep-{}", &group_pubkey[..8]));
 
         let multipath =
             keep_bitcoin::multipath_from_external(&desc.external_descriptor).map_err(|e| {
@@ -1945,9 +1935,13 @@ fn decode_hex(hex_str: &str, label: &str) -> Result<Vec<u8>, KeepMobileError> {
 }
 
 fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
+    use keep_core::error::{KeepError, NetworkError};
     match e {
-        keep_core::error::KeepError::InvalidInput(msg) => KeepMobileError::InvalidInput { msg },
-        keep_core::error::KeepError::Runtime(msg) => KeepMobileError::NetworkError { msg },
+        KeepError::InvalidInput(msg) => KeepMobileError::InvalidInput { msg },
+        KeepError::RateLimited(_) => KeepMobileError::RateLimited,
+        KeepError::NetworkErr(NetworkError::Timeout { .. }) => KeepMobileError::Timeout,
+        KeepError::NetworkErr(e) => KeepMobileError::NetworkError { msg: e.to_string() },
+        KeepError::Runtime(msg) => KeepMobileError::NetworkError { msg },
         other => KeepMobileError::NetworkError {
             msg: other.to_string(),
         },

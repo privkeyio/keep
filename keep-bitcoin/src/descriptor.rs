@@ -144,21 +144,18 @@ impl DescriptorExport {
 
 /// Build a BIP-389 multipath descriptor from a single-path external descriptor.
 ///
-/// `tr(.../0/*)#chk` becomes `tr(.../<0;1>/*)#newchk`. Descriptors that contain
-/// no `/0/*` derivation path are returned with a (re)computed checksum.
+/// Rewrites every trailing `/0/*` key derivation to `/<0;1>/*`. Keys already in
+/// multipath form (`<0;1>` or `<1;0>`) are left untouched, so mixed multisig
+/// descriptors where some keys are single-path and some are multipath are
+/// normalized to fully multipath. Matching is anchored to `,` and `)` so
+/// occurrences inside origin info (bracketed `[fp/path]`) cannot be rewritten.
 pub fn multipath_from_external(external: &str) -> Result<String> {
     let body = external.split('#').next().unwrap_or(external);
-    if body.contains("<0;1>") || body.contains("<1;0>") {
-        let checksum = compute_checksum(body)?;
-        return Ok(format!("{body}#{checksum}"));
-    }
-    if !body.contains("/0/*") {
-        let checksum = compute_checksum(body)?;
-        return Ok(format!("{body}#{checksum}"));
-    }
-    let multipath = body.replace("/0/*", "/<0;1>/*");
-    let checksum = compute_checksum(&multipath)?;
-    Ok(format!("{multipath}#{checksum}"))
+    let normalized = body
+        .replace("/0/*)", "/<0;1>/*)")
+        .replace("/0/*,", "/<0;1>/*,");
+    let checksum = compute_checksum(&normalized)?;
+    Ok(format!("{normalized}#{checksum}"))
 }
 
 fn compute_checksum(descriptor: &str) -> Result<String> {
@@ -366,6 +363,47 @@ mod tests {
         let xpub_str = xpub.to_string();
 
         assert!(xpub_to_x_only(&xpub_str, Network::Bitcoin).is_err());
+    }
+
+    #[test]
+    fn test_multipath_rewrites_single_key() {
+        let out = multipath_from_external("tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)").unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/<0;1>/*)"));
+        assert!(!body.contains("/0/*)"));
+    }
+
+    #[test]
+    fn test_multipath_preserves_already_multipath() {
+        let out = multipath_from_external(
+            "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/<0;1>/*)",
+        )
+        .unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/<0;1>/*)"));
+        assert_eq!(body.matches("<0;1>").count(), 1);
+    }
+
+    #[test]
+    fn test_multipath_normalizes_mixed_multisig() {
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("wsh(sortedmulti(2,{xpub}/<0;1>/*,{xpub}/0/*))");
+        let out = multipath_from_external(&input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert_eq!(body.matches("<0;1>").count(), 2);
+        assert!(!body.contains("/0/*,"));
+        assert!(!body.contains("/0/*)"));
+    }
+
+    #[test]
+    fn test_multipath_leaves_origin_info_alone() {
+        let out = multipath_from_external(
+            "tr([deadbeef/86'/0'/0']xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)",
+        )
+        .unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.contains("[deadbeef/86'/0'/0']"));
+        assert!(body.ends_with("/<0;1>/*)"));
     }
 
     #[test]

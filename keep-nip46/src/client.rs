@@ -6,8 +6,11 @@ use nostr_sdk::prelude::*;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-use keep_core::error::{CryptoError, NetworkError, StorageError};
-use keep_core::relay::{normalize_relay_url, validate_relay_url, TIMESTAMP_TWEAK_RANGE};
+use keep_core::error::{CryptoError, KeepError, NetworkError, StorageError};
+use keep_core::relay::{
+    normalize_relay_url, validate_relay_url, validate_relay_url_allow_internal,
+    ALLOW_INTERNAL_HOSTS, TIMESTAMP_TWEAK_RANGE,
+};
 
 use crate::bunker::parse_bunker_url;
 use crate::error::Result;
@@ -37,9 +40,8 @@ pub struct Nip46Client {
 
 impl Nip46Client {
     pub async fn connect_to(uri: &str) -> Result<Self> {
-        let (signer_pubkey, relays, secret) = parse_bunker_url(uri).map_err(|e| {
-            keep_core::error::KeepError::InvalidInput(format!("invalid NIP-46 URI: {e}"))
-        })?;
+        let (signer_pubkey, relays, secret) = parse_bunker_url(uri)
+            .map_err(|e| KeepError::InvalidInput(format!("invalid NIP-46 URI: {e}")))?;
         Self::connect_with(signer_pubkey, relays, secret).await
     }
 
@@ -52,12 +54,15 @@ impl Nip46Client {
             return Err(NetworkError::relay("at least one relay required").into());
         }
 
+        let validate = if ALLOW_INTERNAL_HOSTS {
+            validate_relay_url_allow_internal
+        } else {
+            validate_relay_url
+        };
         let mut normalized = Vec::with_capacity(relays.len());
         for relay in &relays {
-            validate_relay_url(relay).map_err(|e| {
-                keep_core::error::KeepError::InvalidInput(format!(
-                    "invalid relay URL '{relay}': {e}"
-                ))
+            validate(relay).map_err(|e| {
+                KeepError::InvalidInput(format!("invalid relay URL '{relay}': {e}"))
             })?;
             normalized.push(normalize_relay_url(relay));
         }
@@ -130,31 +135,36 @@ impl Nip46Client {
         descriptor: &str,
     ) -> Result<RegisterWalletResponse> {
         if name.is_empty() {
-            return Err(keep_core::error::KeepError::InvalidInput(
+            return Err(KeepError::InvalidInput(
                 "wallet name must not be empty".into(),
             ));
         }
         if name.len() > MAX_WALLET_NAME_LEN {
-            return Err(keep_core::error::KeepError::InvalidInput(format!(
+            return Err(KeepError::InvalidInput(format!(
                 "wallet name exceeds {MAX_WALLET_NAME_LEN} bytes"
             )));
         }
         if descriptor.is_empty() {
-            return Err(keep_core::error::KeepError::InvalidInput(
+            return Err(KeepError::InvalidInput(
                 "descriptor must not be empty".into(),
             ));
         }
         if descriptor.len() > MAX_DESCRIPTOR_LEN {
-            return Err(keep_core::error::KeepError::InvalidInput(format!(
+            return Err(KeepError::InvalidInput(format!(
                 "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
             )));
         }
         let has_multipath = descriptor.contains("<0;1>") || descriptor.contains("<1;0>");
-        let has_single_path = descriptor.contains("/0/*") || descriptor.contains("/1/*");
-        if has_single_path && !has_multipath {
-            return Err(keep_core::error::KeepError::InvalidInput(
-                "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
-            ));
+        let has_single_path = ["/0/*)", "/0/*,", "/1/*)", "/1/*,"]
+            .iter()
+            .any(|p| descriptor.contains(p));
+        if has_single_path {
+            let msg = if has_multipath {
+                "descriptor mixes multipath and single-path keys; normalize all keys to <0;1>"
+            } else {
+                "descriptor must be multipath (e.g. <0;1>) so the device can derive change"
+            };
+            return Err(KeepError::InvalidInput(msg.into()));
         }
 
         let id = new_request_id();
@@ -176,7 +186,7 @@ impl Nip46Client {
             Some(hex_str) => {
                 let trimmed = hex_str.trim();
                 if trimmed.len() > MAX_HMAC_HEX_LEN {
-                    return Err(keep_core::error::KeepError::InvalidInput(format!(
+                    return Err(KeepError::InvalidInput(format!(
                         "register_wallet hmac too long: {} hex chars (max {MAX_HMAC_HEX_LEN})",
                         trimmed.len()
                     )));
@@ -208,13 +218,15 @@ impl Nip46Client {
             "method": method,
             "params": params,
         });
-        let payload = serde_json::to_string(&request)
-            .map_err(|e| StorageError::serialization(e.to_string()))?;
+        let payload = Zeroizing::new(
+            serde_json::to_string(&request)
+                .map_err(|e| StorageError::serialization(e.to_string()))?,
+        );
 
         let encrypted = nip44::encrypt(
             self.client_keys.secret_key(),
             &self.signer_pubkey,
-            &payload,
+            payload.as_str(),
             nip44::Version::V2,
         )
         .map_err(|e| CryptoError::encryption(e.to_string()))?;
@@ -243,11 +255,12 @@ impl Nip46Client {
         timeout: Duration,
     ) -> Result<Nip46Response> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let timeout_err = || NetworkError::timeout(format!("no response for request {id}"));
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(NetworkError::timeout(format!("no response for request {id}")).into());
+                return Err(timeout_err().into());
             }
 
             let notif = match tokio::time::timeout(remaining, notifications.recv()).await {
@@ -259,11 +272,7 @@ impl Nip46Client {
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return Err(NetworkError::response("notification stream closed").into());
                 }
-                Err(_) => {
-                    return Err(
-                        NetworkError::timeout(format!("no response for request {id}")).into(),
-                    );
-                }
+                Err(_) => return Err(timeout_err().into()),
             };
 
             let RelayPoolNotification::Event { event, .. } = notif else {
