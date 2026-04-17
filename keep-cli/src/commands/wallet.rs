@@ -1171,23 +1171,43 @@ pub fn cmd_wallet_spend(
             "--threshold must be non-zero".into(),
         ));
     }
+
+    let mut seen_shares = std::collections::HashSet::new();
+    let mut signer_share_dedup: Vec<u16> = Vec::with_capacity(signer_share.len());
+    for idx in signer_share {
+        if !seen_shares.insert(*idx) {
+            return Err(KeepError::InvalidInput(format!(
+                "duplicate --signer-share: {idx}"
+            )));
+        }
+        signer_share_dedup.push(*idx);
+    }
+
+    let mut seen_fps = std::collections::HashSet::new();
+    let mut signer_fingerprint_dedup: Vec<String> = Vec::with_capacity(signer_fingerprint.len());
+    for fp in signer_fingerprint {
+        if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(KeepError::InvalidInput(format!(
+                "--signer-fingerprint '{fp}' must be 8 hex characters"
+            )));
+        }
+        let lower = fp.to_ascii_lowercase();
+        if !seen_fps.insert(lower.clone()) {
+            return Err(KeepError::InvalidInput(format!(
+                "duplicate --signer-fingerprint: {lower}"
+            )));
+        }
+        signer_fingerprint_dedup.push(lower);
+    }
+    let signer_fingerprint = signer_fingerprint_dedup;
+
+    let signer_share: &[u16] = &signer_share_dedup;
     let total_signers = signer_share.len() + signer_fingerprint.len();
     if (threshold as usize) > total_signers {
         return Err(KeepError::InvalidInput(format!(
             "--threshold {threshold} exceeds total signers {total_signers}"
         )));
     }
-    let signer_fingerprint: Vec<String> = signer_fingerprint
-        .iter()
-        .map(|fp| {
-            if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(KeepError::InvalidInput(format!(
-                    "--signer-fingerprint '{fp}' must be 8 hex characters"
-                )));
-            }
-            Ok(fp.to_ascii_lowercase())
-        })
-        .collect::<Result<Vec<_>>>()?;
 
     let group_pubkey = parse_group_id(group)?;
 
@@ -1203,6 +1223,12 @@ pub fn cmd_wallet_spend(
     let descriptor = keep
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
+
+    if descriptor.policy_hash == [0u8; 32] {
+        return Err(KeepError::InvalidInput(
+            "descriptor has placeholder policy_hash; coordinate via `keep wallet propose` before spending".into(),
+        ));
+    }
 
     let descriptor_hash = descriptor.canonical_hash();
 
