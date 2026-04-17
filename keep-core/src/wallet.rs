@@ -145,6 +145,19 @@ impl WalletDescriptor {
             self.device_registrations.push(reg);
         }
     }
+
+    /// Canonical descriptor hash: `sha256(external || internal || policy_hash)`.
+    ///
+    /// Must match the on-wire `descriptor_hash` used by the FROST PSBT
+    /// coordination protocol.
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.external_descriptor.as_bytes());
+        h.update(self.internal_descriptor.as_bytes());
+        h.update(self.policy_hash);
+        h.finalize().into()
+    }
 }
 
 #[cfg(test)]

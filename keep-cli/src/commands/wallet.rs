@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
@@ -15,6 +16,28 @@ use crate::cli::WalletExportFormat;
 use crate::output::Output;
 
 use super::get_password;
+
+/// Adapter exposing `Keep`'s persisted wallet descriptors to
+/// `keep_frost_net::PersistedDescriptorLookup`, so the PSBT coordinator can
+/// accept descriptor_hash values for sessions whose in-memory descriptor
+/// session was dropped (e.g. after a restart).
+struct KeepDescriptorLookup(Arc<Mutex<Keep>>);
+
+impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
+    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
+        let guard = match self.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let descriptors = match guard.list_wallet_descriptors() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        descriptors
+            .iter()
+            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
+    }
+}
 
 fn parse_group_hex(group_hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(group_hex)
@@ -703,12 +726,14 @@ pub fn cmd_wallet_propose(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = Arc::new(Mutex::new(keep));
+
     rt.block_on(async {
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         let (xpub, fingerprint) = node
             .derive_account_xpub(network)
@@ -917,7 +942,9 @@ pub fn cmd_wallet_propose(
             policy_hash: finalized_policy_hash,
         };
 
-        keep.store_wallet_descriptor(&descriptor)?;
+        keep.lock()
+            .map_err(|_| KeepError::Runtime("Keep mutex poisoned".into()))?
+            .store_wallet_descriptor(&descriptor)?;
 
         out.newline();
         out.success("Wallet descriptor coordinated and stored!");
@@ -1028,12 +1055,14 @@ pub fn cmd_wallet_announce_keys(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = Arc::new(Mutex::new(keep));
+
     rt.block_on(async {
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         node.announce()
             .await
@@ -1175,7 +1204,7 @@ pub fn cmd_wallet_spend(
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
 
-    let descriptor_hash = compute_descriptor_hash(&descriptor);
+    let descriptor_hash = descriptor.canonical_hash();
 
     let share = match share_index {
         Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
@@ -1204,12 +1233,14 @@ pub fn cmd_wallet_spend(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = Arc::new(Mutex::new(keep));
+
     rt.block_on(async {
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         node.announce()
             .await
@@ -1378,15 +1409,6 @@ fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(decoded)
-}
-
-fn compute_descriptor_hash(desc: &WalletDescriptor) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(desc.external_descriptor.as_bytes());
-    h.update(desc.internal_descriptor.as_bytes());
-    h.update(desc.policy_hash);
-    h.finalize().into()
 }
 
 #[cfg(test)]

@@ -349,35 +349,38 @@ impl KfpNode {
     }
 
     fn verify_descriptor_hash_against_stored(&self, descriptor_hash: &[u8; 32]) -> Result<()> {
-        let sessions = self.descriptor_sessions.read();
-        let mut saw_any_finalized = false;
-        for (_, session) in sessions.iter_sessions() {
-            if session.group_pubkey() != &self.group_pubkey {
-                continue;
+        let (in_memory_match, saw_any_finalized) = {
+            let sessions = self.descriptor_sessions.read();
+            let mut saw_any_finalized = false;
+            let mut matched = false;
+            for (_, session) in sessions.iter_sessions() {
+                if session.group_pubkey() != &self.group_pubkey {
+                    continue;
+                }
+                let Some(finalized) = session.descriptor() else {
+                    continue;
+                };
+                saw_any_finalized = true;
+                let mut hasher = Sha256::new();
+                hasher.update(finalized.external.as_bytes());
+                hasher.update(finalized.internal.as_bytes());
+                hasher.update(finalized.policy_hash);
+                let expected: [u8; 32] = hasher.finalize().into();
+                if &expected == descriptor_hash {
+                    matched = true;
+                    break;
+                }
             }
-            let Some(finalized) = session.descriptor() else {
-                continue;
-            };
-            saw_any_finalized = true;
-            let mut hasher = Sha256::new();
-            hasher.update(finalized.external.as_bytes());
-            hasher.update(finalized.internal.as_bytes());
-            hasher.update(finalized.policy_hash);
-            let expected: [u8; 32] = hasher.finalize().into();
-            if &expected == descriptor_hash {
-                return Ok(());
-            }
-        }
-        if saw_any_finalized {
-            Err(FrostNetError::Session(
-                "PSBT descriptor_hash does not match any finalized descriptor for this group"
-                    .into(),
-            ))
-        } else {
-            Err(FrostNetError::Session(
-                "no finalized descriptor for group; cannot verify descriptor_hash".into(),
-            ))
-        }
+            (matched, saw_any_finalized)
+        };
+
+        decide_descriptor_hash_verification(
+            in_memory_match,
+            saw_any_finalized,
+            &self.group_pubkey,
+            descriptor_hash,
+            self.descriptor_lookup.as_deref(),
+        )
     }
 
     fn own_recovery_fingerprints(&self) -> HashSet<String> {
@@ -754,6 +757,36 @@ fn signer_marker(signer: &SignerId) -> Vec<u8> {
     }
 }
 
+/// Apply the descriptor_hash verification policy given an in-memory match
+/// result and an optional persisted-descriptor fallback. Both the in-memory
+/// path and the persisted-lookup path are equivalent in trust: either one
+/// matching accepts the hash; otherwise the call fails closed.
+fn decide_descriptor_hash_verification(
+    in_memory_match: bool,
+    saw_any_finalized_in_memory: bool,
+    group: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    lookup: Option<&dyn super::PersistedDescriptorLookup>,
+) -> Result<()> {
+    if in_memory_match {
+        return Ok(());
+    }
+    if let Some(lookup) = lookup {
+        if lookup.find_by_hash(group, descriptor_hash) {
+            return Ok(());
+        }
+    }
+    if saw_any_finalized_in_memory {
+        Err(FrostNetError::Session(
+            "PSBT descriptor_hash does not match any finalized descriptor for this group".into(),
+        ))
+    } else {
+        Err(FrostNetError::Session(
+            "no finalized descriptor for group; cannot verify descriptor_hash".into(),
+        ))
+    }
+}
+
 fn sanitize_reason(reason: &str) -> String {
     let sanitized: String = reason
         .chars()
@@ -764,5 +797,98 @@ fn sanitize_reason(reason: &str) -> String {
         "no reason given".to_string()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod descriptor_lookup_tests {
+    use super::*;
+    use crate::node::PersistedDescriptorLookup;
+
+    struct MockLookup {
+        responds_true: bool,
+        expected_group: [u8; 32],
+        expected_hash: [u8; 32],
+    }
+
+    impl PersistedDescriptorLookup for MockLookup {
+        fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
+            assert_eq!(group, &self.expected_group);
+            assert_eq!(hash, &self.expected_hash);
+            self.responds_true
+        }
+    }
+
+    fn fixture() -> ([u8; 32], [u8; 32]) {
+        ([7u8; 32], [9u8; 32])
+    }
+
+    #[test]
+    fn in_memory_empty_lookup_false_rejects() {
+        let (group, hash) = fixture();
+        let lookup = MockLookup {
+            responds_true: false,
+            expected_group: group,
+            expected_hash: hash,
+        };
+        let result =
+            decide_descriptor_hash_verification(false, false, &group, &hash, Some(&lookup));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn in_memory_empty_lookup_true_accepts() {
+        let (group, hash) = fixture();
+        let lookup = MockLookup {
+            responds_true: true,
+            expected_group: group,
+            expected_hash: hash,
+        };
+        let result =
+            decide_descriptor_hash_verification(false, false, &group, &hash, Some(&lookup));
+        assert!(
+            result.is_ok(),
+            "persisted lookup match should accept after restart"
+        );
+    }
+
+    #[test]
+    fn neither_matches_rejects() {
+        let (group, hash) = fixture();
+        let lookup = MockLookup {
+            responds_true: false,
+            expected_group: group,
+            expected_hash: hash,
+        };
+        let result = decide_descriptor_hash_verification(false, true, &group, &hash, Some(&lookup));
+        assert!(result.is_err());
+        let result_no_lookup =
+            decide_descriptor_hash_verification(false, true, &group, &hash, None);
+        assert!(result_no_lookup.is_err());
+    }
+
+    #[test]
+    fn in_memory_match_accepts_regardless_of_lookup() {
+        let (group, hash) = fixture();
+        let result_no_lookup = decide_descriptor_hash_verification(true, true, &group, &hash, None);
+        assert!(result_no_lookup.is_ok());
+
+        let lookup = MockLookup {
+            responds_true: false,
+            expected_group: group,
+            expected_hash: hash,
+        };
+        // In-memory matched: lookup must not be consulted. We assert by giving
+        // it different expected bytes so that if it were called the assertion
+        // inside MockLookup would fire.
+        let unused_lookup = MockLookup {
+            responds_true: false,
+            expected_group: [0u8; 32],
+            expected_hash: [0u8; 32],
+        };
+        let result =
+            decide_descriptor_hash_verification(true, true, &group, &hash, Some(&unused_lookup));
+        assert!(result.is_ok());
+        let _ = lookup; // silence unused
     }
 }

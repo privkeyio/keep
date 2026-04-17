@@ -31,6 +31,29 @@ use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 
+/// Adapter exposing the desktop's optional `Keep` to
+/// `keep_frost_net::PersistedDescriptorLookup`.
+struct KeepDescriptorLookup(Arc<Mutex<Option<Keep>>>);
+
+impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
+    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
+        let guard = match self.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let Some(keep) = guard.as_ref() else {
+            return false;
+        };
+        let descriptors = match keep.list_wallet_descriptors() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        descriptors
+            .iter()
+            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
+    }
+}
+
 pub(crate) async fn verify_relay_certificates(
     relay_urls: &[String],
     certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
@@ -278,6 +301,9 @@ pub(crate) async fn setup_frost_node(
     )
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
+
+    let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep_arc.clone()))
+        as Arc<dyn keep_frost_net::PersistedDescriptorLookup>);
 
     let session_store_path = nonce_store_path.with_file_name("descriptor-sessions.redb");
     let node = match keep_frost_net::FileDescriptorSessionStore::new(&session_store_path) {

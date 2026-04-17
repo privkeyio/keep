@@ -36,6 +36,16 @@ use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
 
+/// Fallback lookup for finalized wallet descriptors that have been persisted
+/// outside of the in-memory `DescriptorSessionManager` (e.g. stored by the
+/// host application). Used when a PSBT coordination message arrives for a
+/// descriptor whose session is no longer held in memory (e.g. after restart).
+pub trait PersistedDescriptorLookup: Send + Sync {
+    /// Returns `true` if a persisted descriptor for `group` exists with the
+    /// canonical `sha256(external || internal || policy_hash)` equal to `hash`.
+    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool;
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerPolicy {
     pub pubkey: PublicKey,
@@ -395,6 +405,7 @@ pub struct KfpNode {
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
     pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
+    pub(crate) descriptor_lookup: Option<Arc<dyn PersistedDescriptorLookup>>,
 }
 
 impl KfpNode {
@@ -542,7 +553,13 @@ impl KfpNode {
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
             local_recovery_xpubs: RwLock::new(Vec::new()),
+            descriptor_lookup: None,
         })
+    }
+
+    pub fn with_descriptor_lookup(mut self, lookup: Arc<dyn PersistedDescriptorLookup>) -> Self {
+        self.descriptor_lookup = Some(lookup);
+        self
     }
 
     pub fn with_descriptor_session_store(

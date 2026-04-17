@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
@@ -21,6 +22,26 @@ mod hardware;
 
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
+
+/// Adapter exposing `Keep`'s persisted wallet descriptors to
+/// `keep_frost_net::PersistedDescriptorLookup`.
+struct KeepDescriptorLookup(Arc<Mutex<Keep>>);
+
+impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
+    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
+        let guard = match self.0.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let descriptors = match guard.list_wallet_descriptors() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        descriptors
+            .iter()
+            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
+    }
+}
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_network_serve(
@@ -61,22 +82,23 @@ pub fn cmd_frost_network_serve(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
+
     rt.block_on(async {
         out.info("Starting FROST coordination node...");
 
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node =
+            node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();
         let npub = pk.to_bech32().unwrap_or_else(|_| format!("{pk}"));
         out.field("Node pubkey", &npub);
         out.newline();
         out.info("Listening for FROST messages... (Ctrl+C to stop)");
-
-        let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
 
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
