@@ -212,14 +212,14 @@ impl App {
                 )
             }
             Message::RejectPsbtSignatureResult(session_id, result) => {
-                self.pending_psbt_signatures
-                    .retain(|e| e.session_id != session_id);
-                if let Screen::Wallet(s) = &mut self.screen {
-                    s.pending_psbt_signatures
-                        .retain(|e| e.session_id != session_id);
-                }
                 match result {
                     Ok(()) => {
+                        self.pending_psbt_signatures
+                            .retain(|e| e.session_id != session_id);
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.pending_psbt_signatures
+                                .retain(|e| e.session_id != session_id);
+                        }
                         self.set_toast("PSBT rejected".into(), ToastKind::Success);
                     }
                     Err(e) => {
