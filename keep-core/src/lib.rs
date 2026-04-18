@@ -40,6 +40,8 @@ pub mod backend;
 pub mod backup;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
+/// Shared text-level helpers for output descriptor strings.
+pub mod descriptor;
 /// Display formatting helpers for truncation and timestamps.
 pub mod display;
 /// Multi-source entropy mixing for defense-in-depth randomness.
@@ -86,7 +88,7 @@ use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
 use crate::storage::Storage;
-pub use crate::wallet::WalletDescriptor;
+pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 
 /// The main Keep type for encrypted key management.
 pub struct Keep {
@@ -686,6 +688,22 @@ impl Keep {
             return Err(KeepError::Locked);
         }
         self.storage.delete_descriptor(group_pubkey)
+    }
+
+    /// Atomically insert or update a device registration on the descriptor for
+    /// the given FROST group. Performs the load-modify-store under the
+    /// storage's descriptor write lock so concurrent callers cannot drop each
+    /// other's updates.
+    pub fn upsert_device_registration(
+        &self,
+        group_pubkey: &[u8; 32],
+        registration: DeviceRegistration,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage
+            .upsert_device_registration(group_pubkey, registration)
     }
 
     /// Store a key health status record.

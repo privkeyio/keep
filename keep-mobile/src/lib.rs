@@ -37,10 +37,10 @@ pub use signing_policy::{
 };
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,
-    FrostGenerationResult, GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo,
-    PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
-    WalletDescriptorInfo,
+    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
+    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, KeepLiveState,
+    KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
+    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
 #[uniffi::export]
@@ -388,6 +388,7 @@ pub struct KeepMobile {
     state_rev: Arc<std::sync::atomic::AtomicU64>,
     pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
+    descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
 
 struct PendingRequest {
@@ -526,6 +527,7 @@ impl KeepMobile {
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pre_approved_hash: Arc::new(std::sync::Mutex::new(None)),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
+            descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -1147,6 +1149,104 @@ impl KeepMobile {
         persistence::delete_descriptor(&self.storage, &group_pubkey)
     }
 
+    /// Register a wallet on a hardware NIP-46 signer and persist the result.
+    ///
+    /// On success the returned `DeviceRegistrationInfo` has its `hmac` field
+    /// cleared so the raw registration token never crosses the UniFFI boundary
+    /// into foreign code (Kotlin/Swift), where it could be inadvertently
+    /// logged or displayed. The token itself is persisted on the wallet
+    /// descriptor in secure storage.
+    pub fn wallet_register_on_device(
+        &self,
+        group_pubkey: String,
+        device_uri: String,
+        wallet_name: Option<String>,
+    ) -> Result<DeviceRegistrationInfo, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+
+        let name = wallet_name.unwrap_or_else(|| format!("keep-{}", &group_pubkey[..8]));
+        if name.is_empty() {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "wallet name must not be empty".into(),
+            });
+        }
+        if name.len() > keep_nip46::MAX_WALLET_NAME_LEN {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!(
+                    "wallet name exceeds {} bytes",
+                    keep_nip46::MAX_WALLET_NAME_LEN
+                ),
+            });
+        }
+
+        let desc_initial = persistence::load_descriptor(&self.storage, &group_pubkey)?;
+
+        let multipath = keep_bitcoin::multipath_from_external(&desc_initial.external_descriptor)
+            .map_err(|e| KeepMobileError::InvalidInput {
+                msg: format!("build multipath descriptor: {e}"),
+            })?;
+
+        let (signer_hex, hmac_hex) = self.runtime.block_on(async {
+            let client = keep_nip46::Nip46Client::connect_to(&device_uri)
+                .await
+                .map_err(nip46_to_mobile_error)?;
+            let signer_hex = hex::encode(client.signer_pubkey().to_bytes());
+
+            let outcome: Result<Option<String>, KeepMobileError> = async {
+                client.connect().await.map_err(nip46_to_mobile_error)?;
+                let response = client
+                    .register_wallet(&name, &multipath)
+                    .await
+                    .map_err(nip46_to_mobile_error)?;
+                Ok(response.hmac.as_deref().map(|h| hex::encode(h.as_slice())))
+            }
+            .await;
+
+            client.disconnect().await;
+            outcome.map(|hmac_hex| (signer_hex, hmac_hex))
+        })?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Atomically reload the descriptor under the storage lock so a
+        // concurrent register/edit cannot drop our update.
+        let persisted = {
+            let _guard =
+                self.descriptor_write_lock
+                    .lock()
+                    .map_err(|_| KeepMobileError::StorageError {
+                        msg: "descriptor lock poisoned".into(),
+                    })?;
+            let mut desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
+            let registration = DeviceRegistrationInfo {
+                signer_pubkey: signer_hex,
+                wallet_name: name,
+                hmac: hmac_hex,
+                registered_at: now,
+            };
+            if let Some(slot) = desc
+                .device_registrations
+                .iter_mut()
+                .find(|r| r.signer_pubkey == registration.signer_pubkey)
+            {
+                *slot = registration.clone();
+            } else {
+                desc.device_registrations.push(registration.clone());
+            }
+            persistence::persist_descriptor(&self.storage, &desc)?;
+            registration
+        };
+
+        // Strip the raw token before crossing the UniFFI boundary.
+        Ok(DeviceRegistrationInfo {
+            hmac: None,
+            ..persisted
+        })
+    }
+
     pub fn wallet_descriptor_set_callbacks(&self, callbacks: Arc<dyn DescriptorCallbacks>) {
         self.runtime.block_on(async {
             *self.descriptor_callbacks.write().await = Some(callbacks);
@@ -1584,12 +1684,38 @@ impl KeepMobile {
         for d in &descriptors {
             let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;
             let group_pubkey = bytes_to_32(&bytes, "descriptor group_pubkey")?;
+            let mut device_registrations = Vec::with_capacity(d.device_registrations.len());
+            for reg in &d.device_registrations {
+                let signer_bytes =
+                    decode_hex(&reg.signer_pubkey, "device_registration signer_pubkey")?;
+                let signer_pubkey =
+                    bytes_to_32(&signer_bytes, "device_registration signer_pubkey")?;
+                let hmac = match reg.hmac.as_deref() {
+                    Some(h) => {
+                        if !persistence::is_valid_hmac_hex(h) {
+                            return Err(KeepMobileError::BackupError {
+                                msg: "device_registration hmac has invalid hex length or format"
+                                    .into(),
+                            });
+                        }
+                        Some(Zeroizing::new(decode_hex(h, "device_registration hmac")?))
+                    }
+                    None => None,
+                };
+                device_registrations.push(keep_core::DeviceRegistration {
+                    signer_pubkey,
+                    wallet_name: reg.wallet_name.clone(),
+                    hmac,
+                    registered_at: reg.registered_at,
+                });
+            }
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),
                 internal_descriptor: d.internal_descriptor.clone(),
                 network: d.network.clone(),
                 created_at: d.created_at,
+                device_registrations,
             });
         }
 
@@ -1774,6 +1900,16 @@ impl KeepMobile {
                 internal_descriptor: wd.internal_descriptor.clone(),
                 network: wd.network.clone(),
                 created_at: wd.created_at,
+                device_registrations: wd
+                    .device_registrations
+                    .iter()
+                    .map(|r| DeviceRegistrationInfo {
+                        signer_pubkey: hex::encode(r.signer_pubkey),
+                        wallet_name: r.wallet_name.clone(),
+                        hmac: r.hmac.as_deref().map(hex::encode),
+                        registered_at: r.registered_at,
+                    })
+                    .collect(),
             });
         }
 
@@ -1892,6 +2028,23 @@ fn decode_hex(hex_str: &str, label: &str) -> Result<Vec<u8>, KeepMobileError> {
     hex::decode(hex_str).map_err(|e| KeepMobileError::BackupError {
         msg: format!("hex decode {label}: {e}"),
     })
+}
+
+fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
+    use keep_core::error::{KeepError, NetworkError};
+    match e {
+        KeepError::InvalidInput(msg) => KeepMobileError::InvalidInput { msg },
+        KeepError::RateLimited(_) => KeepMobileError::RateLimited,
+        KeepError::NetworkErr(NetworkError::Timeout { .. }) => KeepMobileError::Timeout,
+        KeepError::NetworkErr(e) => KeepMobileError::NetworkError { msg: e.to_string() },
+        KeepError::StorageErr(e) => KeepMobileError::StorageError { msg: e.to_string() },
+        KeepError::CryptoErr(e) => KeepMobileError::FrostError { msg: e.to_string() },
+        KeepError::Encryption(msg) => KeepMobileError::EncryptionError { msg },
+        KeepError::Runtime(msg) => KeepMobileError::NotSupported { msg },
+        other => KeepMobileError::NetworkError {
+            msg: other.to_string(),
+        },
+    }
 }
 
 fn bytes_to_32(bytes: &[u8], label: &str) -> Result<[u8; 32], KeepMobileError> {
@@ -2640,6 +2793,7 @@ impl KeepMobile {
             internal_descriptor: internal_descriptor.clone(),
             network,
             created_at,
+            device_registrations: Vec::new(),
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

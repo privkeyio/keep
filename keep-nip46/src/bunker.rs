@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
-use keep_core::relay::{normalize_relay_url, validate_relay_url, MAX_RELAYS};
+use keep_core::relay::{
+    normalize_relay_url, validate_relay_url, validate_relay_url_allow_internal,
+    ALLOW_INTERNAL_HOSTS, MAX_RELAYS,
+};
 use nostr_sdk::prelude::*;
 
 pub fn generate_bunker_url(
@@ -78,10 +81,16 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     let mut image = None;
     let mut perms = None;
 
+    let validate = if ALLOW_INTERNAL_HOSTS {
+        validate_relay_url_allow_internal
+    } else {
+        validate_relay_url
+    };
+
     for (key, value) in parsed.query_pairs() {
         match key.as_ref() {
             "relay" => {
-                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate_relay_url(&value).is_ok() {
+                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate(&value).is_ok() {
                     relays.push(normalize_relay_url(&value));
                 }
             }
@@ -136,14 +145,19 @@ pub fn parse_bunker_url(
     let mut relays = Vec::new();
     let mut secret = None;
 
+    let validate = if ALLOW_INTERNAL_HOSTS {
+        validate_relay_url_allow_internal
+    } else {
+        validate_relay_url
+    };
+
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "relay" => {
                 if relays.len() >= MAX_RELAYS {
                     continue;
                 }
-                validate_relay_url(&value)
-                    .map_err(|e| format!("Invalid relay URL '{value}': {e}"))?;
+                validate(&value).map_err(|e| format!("Invalid relay URL '{value}': {e}"))?;
                 relays.push(normalize_relay_url(&value));
             }
             "secret" => secret = Some(value.to_string()),

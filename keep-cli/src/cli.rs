@@ -197,6 +197,28 @@ pub(crate) enum WalletCommands {
         )]
         xpub: Vec<String>,
     },
+    /// Register a stored wallet descriptor on a NIP-46 hardware signer
+    Register {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(
+            short,
+            long,
+            help = "NIP-46 bunker URI (bunker://<pubkey>?relay=...&secret=...)"
+        )]
+        device: String,
+        #[arg(long, help = "Wallet display name sent to the signer")]
+        name: Option<String>,
+        #[arg(long, help = "Print the registration token (HMAC) to the terminal")]
+        show_token: bool,
+    },
+    /// List hardware signers that have registered a stored wallet
+    Registrations {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(long, help = "Print the registration tokens (HMACs) to the terminal")]
+        show_token: bool,
+    },
     /// Propose a wallet descriptor via Nostr descriptor coordination
     Propose {
         #[arg(short, long, help = "FROST group npub or hex")]

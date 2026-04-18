@@ -470,6 +470,22 @@ fn dispatch_wallet(
                 out, path, &group, &network, relay, share, &recovery, timeout,
             )
         }
+        WalletCommands::Register {
+            group,
+            device,
+            name,
+            show_token,
+        } => commands::wallet::cmd_wallet_register(
+            out,
+            path,
+            &group,
+            &device,
+            name.as_deref(),
+            show_token,
+        ),
+        WalletCommands::Registrations { group, show_token } => {
+            commands::wallet::cmd_wallet_registrations(out, path, &group, show_token)
+        }
     }
 }
 

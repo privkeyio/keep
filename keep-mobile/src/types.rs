@@ -80,6 +80,7 @@ pub struct WalletDescriptorInfo {
     pub internal_descriptor: String,
     pub network: String,
     pub created_at: u64,
+    pub device_registrations: Vec<DeviceRegistrationInfo>,
 }
 
 impl std::fmt::Debug for WalletDescriptorInfo {
@@ -90,6 +91,26 @@ impl std::fmt::Debug for WalletDescriptorInfo {
             .field("internal_descriptor", &"[redacted]")
             .field("network", &self.network)
             .field("created_at", &self.created_at)
+            .field("device_registrations", &self.device_registrations.len())
+            .finish()
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct DeviceRegistrationInfo {
+    pub signer_pubkey: String,
+    pub wallet_name: String,
+    pub hmac: Option<String>,
+    pub registered_at: u64,
+}
+
+impl std::fmt::Debug for DeviceRegistrationInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRegistrationInfo")
+            .field("signer_pubkey", &self.signer_pubkey)
+            .field("wallet_name", &self.wallet_name)
+            .field("hmac", &self.hmac.as_ref().map(|_| "<redacted>"))
+            .field("registered_at", &self.registered_at)
             .finish()
     }
 }

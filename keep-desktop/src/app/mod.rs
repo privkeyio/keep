@@ -307,6 +307,7 @@ impl App {
                 | Message::WalletSessionStarted(..)
                 | Message::WalletDescriptorProgress(..)
                 | Message::WalletAnnounceResult(..)
+                | Message::WalletRegisterResult(..)
                 | Message::ConnectRelayResult(..)
                 | Message::BunkerStartResult(..)
                 | Message::BunkerRevokeResult(..)
@@ -400,7 +401,8 @@ impl App {
             Message::WalletsLoaded(..)
             | Message::WalletSessionStarted(..)
             | Message::WalletDescriptorProgress(..)
-            | Message::WalletAnnounceResult(..) => self.handle_wallet_global_message(message),
+            | Message::WalletAnnounceResult(..)
+            | Message::WalletRegisterResult(..) => self.handle_wallet_global_message(message),
 
             Message::Relay(msg) => self.handle_relay_message(msg),
             Message::ConnectRelayResult(result) => self.handle_connect_relay_result(result),

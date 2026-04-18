@@ -26,6 +26,7 @@ sha2 = "0.10"
 zeroize.workspace = true
 
 [dev-dependencies]
+keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal"] }
 nostr-relay-builder = "0.44"
 rustls = { version = "0.23", features = ["ring"] }
 tracing-subscriber = "0.3"

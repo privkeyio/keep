@@ -114,6 +114,10 @@ impl DescriptorExport {
         Ok(format!("{internal}#{checksum}"))
     }
 
+    pub fn multipath_descriptor(&self) -> Result<String> {
+        multipath_from_external(&self.descriptor)
+    }
+
     pub fn to_sparrow_json(&self, name: &str) -> Result<String> {
         let internal = self.internal_descriptor()?;
 
@@ -136,6 +140,36 @@ impl DescriptorExport {
 
         serde_json::to_string_pretty(&json).map_err(|e| BitcoinError::Descriptor(e.to_string()))
     }
+}
+
+/// Build a BIP-389 multipath descriptor from a single-path external descriptor.
+///
+/// Rewrites every trailing `/0/*` key derivation to `/<0;1>/*`. Matching is
+/// anchored so only a `/0/*` that terminates a key expression (immediately
+/// followed by `,` or `)`, and preceded by a non-`/` character) is rewritten;
+/// occurrences inside longer paths or origin info are left alone. Descriptors
+/// containing a terminating `/1/*` (internal) path, or already holding
+/// `<1;0>` (reverse-order multipath), are rejected rather than silently
+/// coerced: swapping external and change order would produce divergent
+/// receive/change mappings across co-signers.
+pub fn multipath_from_external(external: &str) -> Result<String> {
+    let body = external.split('#').next().unwrap_or(external);
+
+    if keep_core::descriptor::contains_tail(body, '1') {
+        return Err(BitcoinError::Descriptor(
+            "descriptor contains /1/* internal path; expected external /0/* or multipath".into(),
+        ));
+    }
+    if body.contains("<1;0>") {
+        return Err(BitcoinError::Descriptor(
+            "descriptor uses <1;0> multipath order; reorder to <0;1> before building".into(),
+        ));
+    }
+
+    let normalized = keep_core::descriptor::rewrite_trailing_zero_star(body);
+
+    let checksum = compute_checksum(&normalized)?;
+    Ok(format!("{normalized}#{checksum}"))
 }
 
 fn compute_checksum(descriptor: &str) -> Result<String> {
@@ -343,6 +377,82 @@ mod tests {
         let xpub_str = xpub.to_string();
 
         assert!(xpub_to_x_only(&xpub_str, Network::Bitcoin).is_err());
+    }
+
+    #[test]
+    fn test_multipath_rewrites_single_key() {
+        let out = multipath_from_external("tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)").unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/<0;1>/*)"));
+        assert!(!body.contains("/0/*)"));
+    }
+
+    #[test]
+    fn test_multipath_preserves_already_multipath() {
+        let out = multipath_from_external(
+            "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/<0;1>/*)",
+        )
+        .unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/<0;1>/*)"));
+        assert_eq!(body.matches("<0;1>").count(), 1);
+    }
+
+    #[test]
+    fn test_multipath_normalizes_mixed_multisig() {
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("wsh(sortedmulti(2,{xpub}/<0;1>/*,{xpub}/0/*))");
+        let out = multipath_from_external(&input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert_eq!(body.matches("<0;1>").count(), 2);
+        assert!(!body.contains("/0/*,"));
+        assert!(!body.contains("/0/*)"));
+    }
+
+    #[test]
+    fn test_multipath_leaves_origin_info_alone() {
+        let out = multipath_from_external(
+            "tr([deadbeef/86'/0'/0']xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)",
+        )
+        .unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.contains("[deadbeef/86'/0'/0']"));
+        assert!(body.ends_with("/<0;1>/*)"));
+    }
+
+    #[test]
+    fn test_multipath_does_not_mangle_nested_paths() {
+        // xpub/0/0/*) must become xpub/0/<0;1>/*), not xpub/<0;1>/*.
+        let input = "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/0/*)";
+        let out = multipath_from_external(input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/0/<0;1>/*)"));
+    }
+
+    #[test]
+    fn test_multipath_no_derivation_tail_unchanged() {
+        // Bare descriptor with no /0/* tail: body should be unchanged aside
+        // from the appended checksum.
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("tr({xpub})");
+        let out = multipath_from_external(&input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert_eq!(body, input);
+    }
+
+    #[test]
+    fn test_multipath_rejects_internal_only_descriptor() {
+        let err = multipath_from_external("tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/1/*)");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_multipath_rejects_reverse_order_marker() {
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("wsh(sortedmulti(2,{xpub}/<1;0>/*,{xpub}/<0;1>/*))");
+        let err = multipath_from_external(&input).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("<1;0>"), "unexpected error: {msg}");
     }
 
     #[test]

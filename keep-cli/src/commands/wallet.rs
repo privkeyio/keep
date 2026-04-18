@@ -179,6 +179,7 @@ pub fn cmd_wallet_descriptor(
         internal_descriptor: internal.clone(),
         network: canonical_network.clone(),
         created_at: now,
+        device_registrations: Vec::new(),
     };
 
     let mut keep = Keep::open(path)?;
@@ -201,6 +202,231 @@ pub fn cmd_wallet_descriptor(
     out.field("Internal (change)", &internal);
 
     Ok(())
+}
+
+pub fn cmd_wallet_register(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    device_uri: &str,
+    name: Option<&str>,
+    show_token: bool,
+) -> Result<()> {
+    debug!(group, device = %mask_secret(device_uri), "wallet register");
+
+    let group_pubkey = parse_group_id(group)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let desc = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
+
+    let wallet_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("keep-{}", hex::encode(&group_pubkey[..4])));
+    if wallet_name.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "wallet name must not be empty".into(),
+        ));
+    }
+    if wallet_name.len() > keep_nip46::MAX_WALLET_NAME_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "wallet name exceeds {} bytes",
+            keep_nip46::MAX_WALLET_NAME_LEN
+        )));
+    }
+
+    let multipath = keep_bitcoin::multipath_from_external(&desc.external_descriptor)
+        .map_err(|e| KeepError::Runtime(format!("build multipath descriptor: {e}")))?;
+    if multipath.len() > keep_nip46::MAX_DESCRIPTOR_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "descriptor exceeds {} bytes",
+            keep_nip46::MAX_DESCRIPTOR_LEN
+        )));
+    }
+
+    out.newline();
+    out.header("Register Wallet on Hardware Signer");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Network", &desc.network);
+    out.field("Wallet name", &wallet_name);
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    let register_outcome = rt.block_on(async {
+        let spinner = out.spinner("Connecting to signer...");
+        let client = keep_nip46::Nip46Client::connect_to(device_uri)
+            .await
+            .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
+        spinner.finish();
+        let signer = client.signer_pubkey();
+
+        let outcome = async {
+            let spinner = out.spinner("Authenticating with signer...");
+            client
+                .connect()
+                .await
+                .map_err(|e| KeepError::Runtime(format!("handshake: {e}")))?;
+            spinner.finish();
+
+            let spinner = out.spinner("Registering wallet on device (confirm on device)...");
+            let response = client
+                .register_wallet(&wallet_name, &multipath)
+                .await
+                .map_err(|e| KeepError::Runtime(format!("register_wallet: {e}")))?;
+            spinner.finish();
+            Ok::<_, KeepError>(response)
+        }
+        .await;
+
+        client.disconnect().await;
+        Ok::<_, KeepError>((signer, outcome?))
+    });
+    // Give nostr_sdk background tasks a chance to flush before we tear the
+    // runtime down; avoids aborting in-flight disconnect cleanup.
+    rt.shutdown_timeout(Duration::from_secs(2));
+
+    let (signer_pubkey, response) = register_outcome?;
+
+    let signer_bytes = signer_pubkey.to_bytes();
+    let signer_hex = hex::encode(signer_bytes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Surface the device-side outcome before attempting local persistence so an
+    // operator knows registration already took effect on the signer if the
+    // local save errors below. Re-running register is idempotent.
+    out.success("Device accepted the wallet registration");
+    out.field("Signer pubkey", &signer_hex);
+    match response.hmac.as_deref() {
+        Some(hmac) => out.field("Registration token", &format_token(hmac, show_token)),
+        None => out.info("Device did not return a registration token."),
+    }
+
+    let token_status = if response.hmac.is_some() {
+        "received"
+    } else {
+        "none"
+    };
+    keep.upsert_device_registration(
+        &group_pubkey,
+        keep_core::DeviceRegistration {
+            signer_pubkey: signer_bytes,
+            wallet_name: wallet_name.clone(),
+            hmac: response.hmac.clone(),
+            registered_at: now,
+        },
+    )
+    .map_err(|e| {
+        KeepError::Other(format!(
+            "device registration already succeeded on signer {signer_hex} (token: {token_status}) but saving to local descriptor failed: {e}; re-running register is safe"
+        ))
+    })?;
+
+    out.info("Registration saved to wallet descriptor.");
+
+    Ok(())
+}
+
+pub fn cmd_wallet_registrations(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    show_token: bool,
+) -> Result<()> {
+    let group_pubkey = parse_group_id(group)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let desc = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
+
+    out.newline();
+    out.header("Registered Hardware Signers");
+    out.field("Group", &hex::encode(group_pubkey));
+
+    if desc.device_registrations.is_empty() {
+        out.info("No hardware signers have registered this wallet.");
+        return Ok(());
+    }
+
+    for reg in &desc.device_registrations {
+        out.newline();
+        out.field("Signer pubkey", &hex::encode(reg.signer_pubkey));
+        out.field("Wallet name", &reg.wallet_name);
+        out.field("Registered at", &format_registered_at(reg.registered_at));
+        if let Some(hmac) = reg.hmac.as_deref() {
+            out.field("Registration token", &format_token(hmac, show_token));
+        }
+    }
+
+    Ok(())
+}
+
+fn mask_secret(uri: &str) -> String {
+    match url::Url::parse(uri) {
+        Ok(mut parsed) => {
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(k, v)| match k.as_ref() {
+                    "secret" => (k.into_owned(), "***".into()),
+                    // relay hostnames may include .onion or internal hosts we
+                    // don't want echoed to logs; truncate to a short prefix.
+                    "relay" => (k.into_owned(), truncate_relay_for_log(&v)),
+                    _ => (k.into_owned(), v.into_owned()),
+                })
+                .collect();
+            parsed.query_pairs_mut().clear();
+            for (k, v) in pairs {
+                parsed.query_pairs_mut().append_pair(&k, &v);
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<invalid>".into(),
+    }
+}
+
+fn truncate_relay_for_log(relay: &str) -> String {
+    const PREFIX_LEN: usize = 16;
+    if relay.len() <= PREFIX_LEN {
+        return relay.to_string();
+    }
+    let prefix: String = relay.chars().take(PREFIX_LEN).collect();
+    format!("{prefix}...")
+}
+
+fn format_token(hmac: &[u8], show_token: bool) -> String {
+    if show_token {
+        hex::encode(hmac)
+    } else {
+        format!(
+            "[redacted; {} bytes] (use --show-token to reveal)",
+            hmac.len()
+        )
+    }
+}
+
+fn format_registered_at(ts: u64) -> String {
+    let signed = i64::try_from(ts).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(signed, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<()> {
@@ -683,6 +909,7 @@ pub fn cmd_wallet_propose(
             internal_descriptor,
             network: network.to_string(),
             created_at: now,
+            device_registrations: Vec::new(),
         };
 
         keep.store_wallet_descriptor(&descriptor)?;
@@ -1000,5 +1227,32 @@ mod tests {
         let err = parse_recovery_policy(&specs, 5);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("Duplicate timelock"));
+    }
+
+    #[test]
+    fn test_mask_secret_hides_bunker_secret() {
+        let uri = "bunker://aabbcc?relay=wss%3A%2F%2Frelay.example.com&secret=topsecret";
+        let masked = mask_secret(uri);
+        assert!(!masked.contains("topsecret"));
+        assert!(masked.contains("secret=%2A%2A%2A") || masked.contains("secret=***"));
+    }
+
+    #[test]
+    fn test_mask_secret_passthrough_invalid() {
+        assert_eq!(mask_secret("not a url"), "<invalid>");
+    }
+
+    #[test]
+    fn test_mask_secret_truncates_relay() {
+        let uri = "bunker://aabbcc?relay=wss%3A%2F%2Fabcdefghijklmnop.onion%2Fpath&secret=x";
+        let masked = mask_secret(uri);
+        assert!(!masked.contains("abcdefghijklmnop.onion/path"));
+        assert!(masked.contains("secret=%2A%2A%2A") || masked.contains("secret=***"));
+    }
+
+    #[test]
+    fn test_format_registered_at_rfc3339() {
+        let formatted = format_registered_at(0);
+        assert_eq!(formatted, "1970-01-01T00:00:00+00:00");
     }
 }

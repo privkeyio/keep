@@ -35,7 +35,7 @@ pub(crate) struct Nip46Request {
     pub params: Vec<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Nip46Response {
     pub id: String,
     pub result: Option<String>,
