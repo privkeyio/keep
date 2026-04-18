@@ -204,7 +204,14 @@ pub(crate) fn persist_cert_pins(
     )
 }
 
+/// At-rest schema for a persisted wallet descriptor.
+///
+/// `SecureStorage` implementations **must** back this record with platform
+/// secure storage (iOS Keychain, Android Keystore-backed) because
+/// `device_registrations` contains device-returned authentication material
+/// (the HMAC/registration token).
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredDescriptor {
     group_pubkey: String,
     external_descriptor: String,
@@ -215,7 +222,13 @@ struct StoredDescriptor {
     device_registrations: Vec<StoredDeviceRegistration>,
 }
 
+/// At-rest schema for a hardware-signer registration record.
+///
+/// See [`StoredDescriptor`] for secure-storage requirements. The `hmac` field,
+/// when present, must be exactly `HMAC_SHA256_HEX_LEN` hex characters; entries
+/// that fail this shape are dropped with a warning at load time.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StoredDeviceRegistration {
     pub signer_pubkey: String,
     pub wallet_name: String,
@@ -223,6 +236,8 @@ pub(crate) struct StoredDeviceRegistration {
     pub hmac: Option<String>,
     pub registered_at: u64,
 }
+
+const HMAC_SHA256_HEX_LEN: usize = 64;
 
 fn descriptor_key(group_pubkey_hex: &str) -> String {
     format!("{DESCRIPTOR_KEY_PREFIX}{group_pubkey_hex}")
@@ -326,11 +341,29 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
     let device_registrations = stored
         .device_registrations
         .into_iter()
-        .map(|r| DeviceRegistrationInfo {
-            signer_pubkey: r.signer_pubkey,
-            wallet_name: r.wallet_name,
-            hmac: r.hmac,
-            registered_at: r.registered_at,
+        .filter_map(|r| {
+            let hmac = match r.hmac {
+                Some(h) if h.len() == HMAC_SHA256_HEX_LEN
+                    && h.chars().all(|c| c.is_ascii_hexdigit()) =>
+                {
+                    Some(h)
+                }
+                Some(h) => {
+                    tracing::warn!(
+                        signer = %r.signer_pubkey,
+                        hmac_len = h.len(),
+                        "dropping device_registration with malformed hmac"
+                    );
+                    return None;
+                }
+                None => None,
+            };
+            Some(DeviceRegistrationInfo {
+                signer_pubkey: r.signer_pubkey,
+                wallet_name: r.wallet_name,
+                hmac,
+                registered_at: r.registered_at,
+            })
         })
         .collect();
     WalletDescriptorInfo {

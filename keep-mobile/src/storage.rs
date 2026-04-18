@@ -35,6 +35,14 @@ pub struct StoredShareInfo {
     pub did_backup: bool,
 }
 
+/// Platform-provided secure storage for encrypted share data and wallet
+/// descriptor records.
+///
+/// Implementations **must** be backed by platform secure storage (iOS
+/// Keychain, Android Keystore-backed EncryptedSharedPreferences or
+/// equivalent): records persisted through this trait include authentication
+/// material (device-returned registration tokens on wallet descriptor
+/// records) and FROST share data. Plain-disk file storage is NOT acceptable.
 #[uniffi::export(with_foreign)]
 pub trait SecureStorage: Send + Sync {
     fn store_share(
