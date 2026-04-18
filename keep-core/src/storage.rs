@@ -21,6 +21,7 @@ use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// SOCKS5 proxy configuration stored in the vault.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -582,8 +583,10 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = serde_json::to_vec(descriptor)
-            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+        let serialized = Zeroizing::new(
+            serde_json::to_vec(descriptor)
+                .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?,
+        );
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 

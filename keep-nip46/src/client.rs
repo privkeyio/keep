@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use tracing::{debug, warn};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use keep_core::error::{CryptoError, KeepError, NetworkError, StorageError};
 use keep_core::relay::{
@@ -213,7 +213,7 @@ impl Nip46Client {
         }
 
         let id = new_request_id();
-        let response = self
+        let mut response = self
             .request_with_timeout(
                 &id,
                 "register_wallet",
@@ -229,17 +229,23 @@ impl Nip46Client {
             return Err(NetworkError::response(format!("register_wallet rejected: {err}")).into());
         }
 
-        let hmac = match response.result.as_deref() {
-            None | Some("") => None,
+        let hmac = match response.result.as_mut() {
+            None => None,
+            Some(hex_str) if hex_str.trim().is_empty() => {
+                hex_str.zeroize();
+                None
+            }
             Some(hex_str) => {
-                let trimmed = hex_str.trim();
-                if trimmed.len() > MAX_HMAC_HEX_LEN {
+                let trimmed_len = hex_str.trim().len();
+                if trimmed_len > MAX_HMAC_HEX_LEN {
+                    hex_str.zeroize();
                     return Err(KeepError::InvalidInput(format!(
-                        "register_wallet hmac too long: {} hex chars (max {MAX_HMAC_HEX_LEN})",
-                        trimmed.len()
+                        "register_wallet hmac too long: {trimmed_len} hex chars (max {MAX_HMAC_HEX_LEN})"
                     )));
                 }
-                let decoded = hex::decode(trimmed).map_err(|e| {
+                let decode_result = hex::decode(hex_str.trim());
+                hex_str.zeroize();
+                let decoded = decode_result.map_err(|e| {
                     StorageError::invalid_format(format!("register_wallet hmac hex: {e}"))
                 })?;
                 if decoded.len() != HMAC_SHA256_LEN {

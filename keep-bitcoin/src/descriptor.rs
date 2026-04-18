@@ -144,14 +144,14 @@ impl DescriptorExport {
 
 /// Build a BIP-389 multipath descriptor from a single-path external descriptor.
 ///
-/// Rewrites every trailing `/0/*` key derivation to `/<0;1>/*`. Keys already in
-/// multipath form (`<0;1>` or `<1;0>`) are normalized to `<0;1>` so all keys in
-/// a multisig descriptor agree on the external/change order. Matching is
+/// Rewrites every trailing `/0/*` key derivation to `/<0;1>/*`. Matching is
 /// anchored so only a `/0/*` that terminates a key expression (immediately
 /// followed by `,` or `)`, and preceded by a non-`/` character) is rewritten;
 /// occurrences inside longer paths or origin info are left alone. Descriptors
-/// containing a terminating `/1/*` (internal) path are rejected rather than
-/// silently coerced.
+/// containing a terminating `/1/*` (internal) path, or already holding
+/// `<1;0>` (reverse-order multipath), are rejected rather than silently
+/// coerced: swapping external and change order would produce divergent
+/// receive/change mappings across co-signers.
 pub fn multipath_from_external(external: &str) -> Result<String> {
     let body = external.split('#').next().unwrap_or(external);
 
@@ -160,9 +160,13 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
             "descriptor contains /1/* internal path; expected external /0/* or multipath".into(),
         ));
     }
+    if body.contains("<1;0>") {
+        return Err(BitcoinError::Descriptor(
+            "descriptor uses <1;0> multipath order; reorder to <0;1> before building".into(),
+        ));
+    }
 
     let normalized = keep_core::descriptor::rewrite_trailing_zero_star(body);
-    let normalized = normalized.replace("<1;0>", "<0;1>");
 
     let checksum = compute_checksum(&normalized)?;
     Ok(format!("{normalized}#{checksum}"))
@@ -432,13 +436,12 @@ mod tests {
     }
 
     #[test]
-    fn test_multipath_normalizes_reverse_order_marker() {
+    fn test_multipath_rejects_reverse_order_marker() {
         let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
         let input = format!("wsh(sortedmulti(2,{xpub}/<1;0>/*,{xpub}/<0;1>/*))");
-        let out = multipath_from_external(&input).unwrap();
-        let body = out.split('#').next().unwrap();
-        assert!(!body.contains("<1;0>"));
-        assert_eq!(body.matches("<0;1>").count(), 2);
+        let err = multipath_from_external(&input).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("<1;0>"), "unexpected error: {msg}");
     }
 
     #[test]
