@@ -25,9 +25,27 @@ pub const MAX_WALLET_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTOR_LEN: usize = 4096;
 
 /// Outcome of a successful `register_wallet` request.
-#[derive(Debug, Clone)]
+///
+/// `hmac` is an opaque device-returned token. It is **not** cryptographically
+/// verified by this client; callers must not treat it as an authenticator
+/// unless a verification protocol is added on top.
+#[derive(Clone)]
 pub struct RegisterWalletResponse {
-    pub hmac: Option<Vec<u8>>,
+    pub hmac: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for RegisterWalletResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterWalletResponse")
+            .field(
+                "hmac",
+                &self
+                    .hmac
+                    .as_ref()
+                    .map(|h| format!("<redacted; {} bytes>", h.len())),
+            )
+            .finish()
+    }
 }
 
 /// Client that sends NIP-46 requests to a remote signer (e.g. a hardware wallet).
@@ -125,9 +143,10 @@ impl Nip46Client {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let mut params = vec![self.signer_pubkey.to_hex()];
+        let mut params: Vec<Zeroizing<String>> =
+            vec![Zeroizing::new(self.signer_pubkey.to_hex())];
         if let Some(ref s) = self.secret {
-            params.push(s.as_str().to_string());
+            params.push(Zeroizing::new(s.as_str().to_string()));
         }
         let id = new_request_id();
         let response = self.request(&id, "connect", params).await?;
@@ -198,7 +217,10 @@ impl Nip46Client {
             .request_with_timeout(
                 &id,
                 "register_wallet",
-                vec![name.to_string(), descriptor.to_string()],
+                vec![
+                    Zeroizing::new(name.to_string()),
+                    Zeroizing::new(descriptor.to_string()),
+                ],
                 REGISTER_WALLET_TIMEOUT,
             )
             .await?;
@@ -226,13 +248,18 @@ impl Nip46Client {
                         decoded.len()
                     )));
                 }
-                Some(decoded)
+                Some(Zeroizing::new(decoded))
             }
         };
         Ok(RegisterWalletResponse { hmac })
     }
 
-    async fn request(&self, id: &str, method: &str, params: Vec<String>) -> Result<Nip46Response> {
+    async fn request(
+        &self,
+        id: &str,
+        method: &str,
+        params: Vec<Zeroizing<String>>,
+    ) -> Result<Nip46Response> {
         self.request_with_timeout(id, method, params, DEFAULT_REQUEST_TIMEOUT)
             .await
     }
@@ -241,20 +268,32 @@ impl Nip46Client {
         &self,
         id: &str,
         method: &str,
-        params: Vec<String>,
+        params: Vec<Zeroizing<String>>,
         timeout: Duration,
     ) -> Result<Nip46Response> {
         let mut notifications = self.client.notifications();
 
-        let request = serde_json::json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        let payload = Zeroizing::new(
-            serde_json::to_string(&request)
-                .map_err(|e| StorageError::serialization(e.to_string()))?,
-        );
+        // Build the JSON payload directly into a Zeroizing<String> so secret
+        // params (e.g. bunker connect secret) never land in an intermediate
+        // serde_json::Value::String or non-zeroizing String buffer. Only the
+        // per-param JSON-escaping allocation happens on the heap, and we drop
+        // that allocation back into a Zeroizing wrapper immediately.
+        let mut payload = Zeroizing::new(String::with_capacity(128));
+        payload.push_str("{\"id\":");
+        append_json_string(&mut payload, id)?;
+        payload.push_str(",\"method\":");
+        append_json_string(&mut payload, method)?;
+        payload.push_str(",\"params\":[");
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 {
+                payload.push(',');
+            }
+            append_json_string(&mut payload, p.as_str())?;
+        }
+        payload.push_str("]}");
+        // Drop the original params eagerly; each element is Zeroizing<String>
+        // and will zero its backing allocation here.
+        drop(params);
 
         let encrypted = nip44::encrypt(
             self.client_keys.secret_key(),
@@ -353,6 +392,18 @@ impl Nip46Client {
 
 fn new_request_id() -> String {
     hex::encode(keep_core::crypto::random_bytes::<16>())
+}
+
+/// JSON-escape `value` and append the quoted result to `buf`. The intermediate
+/// escape allocation is wrapped in `Zeroizing` and dropped at function return,
+/// so a secret passed here never lives in a non-zeroized `String`.
+fn append_json_string(buf: &mut Zeroizing<String>, value: &str) -> Result<()> {
+    let escaped = Zeroizing::new(
+        serde_json::to_string(value)
+            .map_err(|e| StorageError::serialization(e.to_string()))?,
+    );
+    buf.push_str(escaped.as_str());
+    Ok(())
 }
 
 #[cfg(test)]

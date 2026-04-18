@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Health status of a key share from a liveness check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,11 +46,43 @@ pub struct DeviceRegistration {
     pub signer_pubkey: [u8; 32],
     /// The wallet name sent to the device at registration time.
     pub wallet_name: String,
-    /// The registration token (HMAC) returned by the device, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hmac: Option<Vec<u8>>,
+    /// Opaque registration token returned by the device, if any.
+    ///
+    /// This value is **not** cryptographically verified by keep-core; it is
+    /// an arbitrary byte string the device returned at registration time and
+    /// must not be treated as an authenticator unless a verification protocol
+    /// is added. The inner `Vec<u8>` is wrapped in `Zeroizing` so in-memory
+    /// copies are wiped on drop even when the enclosing descriptor is cloned.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "zeroizing_vec_opt"
+    )]
+    pub hmac: Option<Zeroizing<Vec<u8>>>,
     /// Unix timestamp of the successful registration.
     pub registered_at: u64,
+}
+
+mod zeroizing_vec_opt {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Zeroizing<Vec<u8>>>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serializer.serialize_some(&v[..]),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, D::Error> {
+        let opt: Option<Vec<u8>> = Option::deserialize(deserializer)?;
+        Ok(opt.map(Zeroizing::new))
+    }
 }
 
 impl std::fmt::Debug for DeviceRegistration {
@@ -140,19 +173,22 @@ mod tests {
         desc.upsert_device_registration(DeviceRegistration {
             signer_pubkey: signer,
             wallet_name: "first".into(),
-            hmac: Some(vec![1, 2, 3]),
+            hmac: Some(Zeroizing::new(vec![1, 2, 3])),
             registered_at: 1,
         });
         desc.upsert_device_registration(DeviceRegistration {
             signer_pubkey: signer,
             wallet_name: "second".into(),
-            hmac: Some(vec![9, 9, 9]),
+            hmac: Some(Zeroizing::new(vec![9, 9, 9])),
             registered_at: 2,
         });
         assert_eq!(desc.device_registrations.len(), 1);
         let reg = desc.device_registration(&signer).unwrap();
         assert_eq!(reg.wallet_name, "second");
-        assert_eq!(reg.hmac.as_deref(), Some(&[9, 9, 9][..]));
+        assert_eq!(
+            reg.hmac.as_ref().map(|v| v.as_slice()),
+            Some(&[9, 9, 9][..])
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use nostr_relay_builder::prelude::*;
 use nostr_sdk::prelude::{Keys, PublicKey};
 use tokio::sync::Mutex;
 
+use keep_core::error::{KeepError, NetworkError};
 use keep_core::keyring::Keyring;
 use keep_core::keys::{KeyType, NostrKeypair};
 use keep_nip46::{generate_bunker_url, Nip46Client, Server, ServerConfig};
@@ -67,17 +68,24 @@ async fn test_nip46_client_rejects_unknown_method() {
         .expect("client connect");
     client.connect().await.expect("connect handshake");
 
-    // The keep-nip46 server does not implement register_wallet — it should
-    // respond with an "Unknown method" error. Verify the client surfaces it.
+    // The keep-nip46 server does not implement register_wallet, so it should
+    // respond with an "Unknown method" error. Verify the client surfaces it as
+    // a typed NetworkError::Response with a non-empty message.
     let err = client
         .register_wallet("test-wallet", "tr([deadbeef]xpub6.../<0;1>/*)")
         .await
         .expect_err("register_wallet should error against a non-hardware signer");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("register_wallet rejected") || msg.contains("Unknown method"),
-        "unexpected error: {msg}"
-    );
+    match err {
+        KeepError::NetworkErr(NetworkError::Response { message, .. }) => {
+            assert!(!message.is_empty(), "empty response error message");
+            assert!(
+                message.contains("register_wallet rejected")
+                    || message.contains("Unknown method"),
+                "unexpected response error: {message}"
+            );
+        }
+        other => panic!("expected NetworkError::Response, got {other:?}"),
+    }
 
     client.disconnect().await;
     server_handle.abort();
@@ -207,7 +215,7 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
         .expect("register_wallet succeeds");
 
     let decoded = resp.hmac.expect("hmac returned");
-    assert_eq!(hex::encode(decoded), hmac_hex);
+    assert_eq!(hex::encode(decoded.as_slice()), hmac_hex);
 
     client.disconnect().await;
     signer_handle.abort();
