@@ -20,6 +20,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_HMAC_HEX_LEN: usize = 128;
+const HMAC_SHA256_LEN: usize = 32;
 pub const MAX_WALLET_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTOR_LEN: usize = 4096;
 
@@ -70,21 +71,37 @@ impl Nip46Client {
 
         let client_keys = Keys::generate();
         let client = Client::new(client_keys.clone());
-        for relay in &relays {
-            client
-                .add_relay(relay.as_str())
-                .await
-                .map_err(|e| NetworkError::relay(format!("add relay: {e}")))?;
-        }
-        client.connect().await;
 
-        let filter = Filter::new()
-            .kind(Kind::NostrConnect)
-            .pubkey(client_keys.public_key());
-        client
-            .subscribe(filter, None)
-            .await
-            .map_err(|e| NetworkError::subscribe(e.to_string()))?;
+        let setup = async {
+            for relay in &relays {
+                client
+                    .add_relay(relay.as_str())
+                    .await
+                    .map_err(|e| NetworkError::relay(format!("add relay: {e}")))?;
+            }
+            client.connect().await;
+
+            let filter = Filter::new()
+                .kind(Kind::NostrConnect)
+                .pubkey(client_keys.public_key());
+            client
+                .subscribe(filter, None)
+                .await
+                .map_err(|e| NetworkError::subscribe(e.to_string()))?;
+            Ok::<_, KeepError>(())
+        };
+
+        match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, setup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                client.disconnect().await;
+                return Err(NetworkError::timeout(
+                    "timed out connecting to NIP-46 relay".to_string(),
+                )
+                .into());
+            }
+        }
 
         Ok(Self {
             signer_pubkey,
@@ -166,6 +183,11 @@ impl Nip46Client {
             };
             return Err(KeepError::InvalidInput(msg.into()));
         }
+        if !has_multipath && descriptor.contains('*') {
+            return Err(KeepError::InvalidInput(
+                "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
+            ));
+        }
 
         let id = new_request_id();
         let response = self
@@ -191,9 +213,16 @@ impl Nip46Client {
                         trimmed.len()
                     )));
                 }
-                Some(hex::decode(trimmed).map_err(|e| {
+                let decoded = hex::decode(trimmed).map_err(|e| {
                     StorageError::invalid_format(format!("register_wallet hmac hex: {e}"))
-                })?)
+                })?;
+                if decoded.len() != HMAC_SHA256_LEN {
+                    return Err(KeepError::InvalidInput(format!(
+                        "register_wallet hmac must be {HMAC_SHA256_LEN} bytes, got {}",
+                        decoded.len()
+                    )));
+                }
+                Some(decoded)
             }
         };
         Ok(RegisterWalletResponse { hmac })

@@ -39,7 +39,7 @@ impl KeyHealthStatus {
 }
 
 /// Record of a hardware signer that has registered this wallet via NIP-46.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceRegistration {
     /// The NIP-46 signer pubkey (x-only, 32 bytes).
     pub signer_pubkey: [u8; 32],
@@ -50,6 +50,23 @@ pub struct DeviceRegistration {
     pub hmac: Option<Vec<u8>>,
     /// Unix timestamp of the successful registration.
     pub registered_at: u64,
+}
+
+impl std::fmt::Debug for DeviceRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRegistration")
+            .field("signer_pubkey", &self.signer_pubkey)
+            .field("wallet_name", &self.wallet_name)
+            .field(
+                "hmac",
+                &self
+                    .hmac
+                    .as_ref()
+                    .map(|h| format!("<redacted; {} bytes>", h.len())),
+            )
+            .field("registered_at", &self.registered_at)
+            .finish()
+    }
 }
 
 /// A finalized wallet descriptor associated with a FROST group.

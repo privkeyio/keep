@@ -1646,13 +1646,30 @@ impl KeepMobile {
         for d in &descriptors {
             let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;
             let group_pubkey = bytes_to_32(&bytes, "descriptor group_pubkey")?;
+            let mut device_registrations = Vec::with_capacity(d.device_registrations.len());
+            for reg in &d.device_registrations {
+                let signer_bytes =
+                    decode_hex(&reg.signer_pubkey, "device_registration signer_pubkey")?;
+                let signer_pubkey =
+                    bytes_to_32(&signer_bytes, "device_registration signer_pubkey")?;
+                let hmac = match reg.hmac.as_deref() {
+                    Some(h) => Some(decode_hex(h, "device_registration hmac")?),
+                    None => None,
+                };
+                device_registrations.push(keep_core::DeviceRegistration {
+                    signer_pubkey,
+                    wallet_name: reg.wallet_name.clone(),
+                    hmac,
+                    registered_at: reg.registered_at,
+                });
+            }
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),
                 internal_descriptor: d.internal_descriptor.clone(),
                 network: d.network.clone(),
                 created_at: d.created_at,
-                device_registrations: Vec::new(),
+                device_registrations,
             });
         }
 

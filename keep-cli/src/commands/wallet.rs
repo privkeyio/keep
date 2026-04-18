@@ -210,6 +210,7 @@ pub fn cmd_wallet_register(
     group: &str,
     device_uri: &str,
     name: Option<&str>,
+    show_token: bool,
 ) -> Result<()> {
     debug!(group, device = %mask_secret(device_uri), "wallet register");
 
@@ -288,17 +289,28 @@ pub fn cmd_wallet_register(
 
     out.success("Wallet registered on device!");
     out.field("Signer pubkey", &hex::encode(signer_bytes));
-    if let Some(hmac) = &response.hmac {
-        out.field("Registration token", &hex::encode(hmac));
-    } else {
-        out.info("Device did not return a registration token.");
+    match (&response.hmac, show_token) {
+        (Some(hmac), true) => out.field("Registration token", &hex::encode(hmac)),
+        (Some(hmac), false) => out.field(
+            "Registration token",
+            &format!(
+                "[redacted; {} bytes] (use --show-token to reveal)",
+                hmac.len()
+            ),
+        ),
+        (None, _) => out.info("Device did not return a registration token."),
     }
     out.info("Registration saved to wallet descriptor.");
 
     Ok(())
 }
 
-pub fn cmd_wallet_registrations(out: &Output, path: &Path, group: &str) -> Result<()> {
+pub fn cmd_wallet_registrations(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    show_token: bool,
+) -> Result<()> {
     let group_pubkey = parse_group_id(group)?;
 
     let mut keep = Keep::open(path)?;
@@ -327,7 +339,15 @@ pub fn cmd_wallet_registrations(out: &Output, path: &Path, group: &str) -> Resul
         out.field("Wallet name", &reg.wallet_name);
         out.field("Registered at", &reg.registered_at.to_string());
         if let Some(hmac) = &reg.hmac {
-            out.field("Registration token", &hex::encode(hmac));
+            let value = if show_token {
+                hex::encode(hmac)
+            } else {
+                format!(
+                    "[redacted; {} bytes] (use --show-token to reveal)",
+                    hmac.len()
+                )
+            };
+            out.field("Registration token", &value);
         }
     }
 

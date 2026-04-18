@@ -209,11 +209,15 @@ pub(crate) enum WalletCommands {
         device: String,
         #[arg(long, help = "Wallet display name sent to the signer")]
         name: Option<String>,
+        #[arg(long, help = "Print the registration token (HMAC) to the terminal")]
+        show_token: bool,
     },
     /// List hardware signers that have registered a stored wallet
     Registrations {
         #[arg(short, long, help = "FROST group npub or hex")]
         group: String,
+        #[arg(long, help = "Print the registration tokens (HMACs) to the terminal")]
+        show_token: bool,
     },
     /// Propose a wallet descriptor via Nostr descriptor coordination
     Propose {

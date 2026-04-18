@@ -85,20 +85,22 @@ async fn test_nip46_client_rejects_unknown_method() {
 
 #[tokio::test]
 async fn test_nip46_client_parses_bunker_url() {
-    let keys = Keys::generate();
-    let url = generate_bunker_url(
-        &keys.public_key(),
-        &["wss://relay.example.com/".into()],
-        Some("topsecretbunker12"),
-    );
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
-    // Parsing is covered here by connection-free checks: build a client URL and
-    // ensure connect_to accepts a well-formed bunker URL structure.
-    // We don't actually dial a real relay in this sub-test.
     let bad = Nip46Client::connect_to("not-a-bunker-url").await;
     assert!(bad.is_err(), "invalid URL must be rejected");
 
-    let _ = url;
+    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let relay_url = mock_relay.url().await.to_string();
+    let keys = Keys::generate();
+    let url = generate_bunker_url(&keys.public_key(), &[relay_url], Some("topsecretbunker12"));
+
+    let client = Nip46Client::connect_to(&url)
+        .await
+        .expect("well-formed bunker URL connects");
+    client.disconnect().await;
 }
 
 // Simulates a remote hardware signer that accepts register_wallet and replies
@@ -107,12 +109,17 @@ async fn run_stub_signer(
     signer_keys: Keys,
     relay_url: String,
     hmac_hex: String,
-) -> tokio::task::JoinHandle<()> {
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     use nostr_sdk::prelude::{
         nip44, Client, EventBuilder, Filter, Kind, RelayPoolNotification, Tag, Timestamp,
     };
 
-    tokio::spawn(async move {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+    let handle = tokio::spawn(async move {
         let client = Client::new(signer_keys.clone());
         client.add_relay(relay_url.as_str()).await.unwrap();
         client.connect().await;
@@ -120,6 +127,7 @@ async fn run_stub_signer(
             .kind(Kind::NostrConnect)
             .pubkey(signer_keys.public_key());
         client.subscribe(filter, None).await.unwrap();
+        let _ = ready_tx.send(());
 
         let mut notifications = client.notifications();
         while let Ok(notif) = notifications.recv().await {
@@ -166,7 +174,9 @@ async fn run_stub_signer(
                 .unwrap();
             let _ = client.send_event(&ev).await;
         }
-    })
+    });
+
+    (handle, ready_rx)
 }
 
 #[tokio::test]
@@ -182,8 +192,9 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
     let signer_pubkey = signer_keys.public_key();
     let hmac_hex = "deadbeef".repeat(8);
 
-    let signer_handle = run_stub_signer(signer_keys, relay_url.clone(), hmac_hex.clone()).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (signer_handle, signer_ready) =
+        run_stub_signer(signer_keys, relay_url.clone(), hmac_hex.clone()).await;
+    signer_ready.await.expect("stub signer ready");
 
     let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
         .await

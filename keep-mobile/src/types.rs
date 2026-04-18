@@ -96,12 +96,23 @@ impl std::fmt::Debug for WalletDescriptorInfo {
     }
 }
 
-#[derive(uniffi::Record, Clone, Debug)]
+#[derive(uniffi::Record, Clone)]
 pub struct DeviceRegistrationInfo {
     pub signer_pubkey: String,
     pub wallet_name: String,
     pub hmac: Option<String>,
     pub registered_at: u64,
+}
+
+impl std::fmt::Debug for DeviceRegistrationInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRegistrationInfo")
+            .field("signer_pubkey", &self.signer_pubkey)
+            .field("wallet_name", &self.wallet_name)
+            .field("hmac", &self.hmac.as_ref().map(|_| "<redacted>"))
+            .field("registered_at", &self.registered_at)
+            .finish()
+    }
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

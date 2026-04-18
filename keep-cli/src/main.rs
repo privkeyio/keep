@@ -474,9 +474,17 @@ fn dispatch_wallet(
             group,
             device,
             name,
-        } => commands::wallet::cmd_wallet_register(out, path, &group, &device, name.as_deref()),
-        WalletCommands::Registrations { group } => {
-            commands::wallet::cmd_wallet_registrations(out, path, &group)
+            show_token,
+        } => commands::wallet::cmd_wallet_register(
+            out,
+            path,
+            &group,
+            &device,
+            name.as_deref(),
+            show_token,
+        ),
+        WalletCommands::Registrations { group, show_token } => {
+            commands::wallet::cmd_wallet_registrations(out, path, &group, show_token)
         }
     }
 }
