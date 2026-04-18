@@ -191,6 +191,7 @@ pub enum Message {
     WalletSessionStarted(Result<([u8; 32], [u8; 32], String, usize), String>),
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     WalletAnnounceResult(Result<(), String>),
+    WalletRegisterResult(Result<(), String>),
 
     // Relay / FROST
     Relay(crate::screen::relay::Message),
@@ -447,6 +448,10 @@ impl fmt::Debug for Message {
             Self::WalletDescriptorProgress(..) => f.write_str("WalletDescriptorProgress"),
             Self::WalletAnnounceResult(r) => f
                 .debug_tuple("WalletAnnounceResult")
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::WalletRegisterResult(r) => f
+                .debug_tuple("WalletRegisterResult")
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),
             Self::Relay(msg) => f.debug_tuple("Relay").field(msg).finish(),

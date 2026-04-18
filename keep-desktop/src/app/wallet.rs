@@ -4,7 +4,8 @@ use crate::message::Message;
 use crate::screen::wallet::{self, DescriptorProgress, SetupPhase};
 use crate::screen::Screen;
 
-use super::{App, ToastKind, MAX_ACTIVE_COORDINATIONS};
+use super::util::with_keep_blocking;
+use super::{friendly_err, App, ToastKind, MAX_ACTIVE_COORDINATIONS};
 
 impl App {
     pub(crate) fn handle_wallet_message(&mut self, msg: wallet::Message) -> Task<Message> {
@@ -66,6 +67,17 @@ impl App {
                 )
             }
             wallet::Event::CopyDescriptor(desc) => iced::clipboard::write(desc),
+            wallet::Event::SubmitRegister {
+                group_pubkey,
+                external_descriptor,
+                device_uri,
+                wallet_name,
+            } => self.begin_register_on_device(
+                group_pubkey,
+                external_descriptor,
+                device_uri,
+                wallet_name,
+            ),
         }
     }
 
@@ -164,8 +176,103 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WalletRegisterResult(result) => {
+                match result {
+                    Ok(()) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.register_submitted();
+                        }
+                        self.set_toast("Wallet registered on device".into(), ToastKind::Success);
+                    }
+                    Err(e) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.register_failed(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
             _ => Task::none(),
         }
+    }
+
+    fn begin_register_on_device(
+        &mut self,
+        group_pubkey: [u8; 32],
+        external_descriptor: String,
+        device_uri: String,
+        wallet_name: String,
+    ) -> Task<Message> {
+        let multipath = match keep_bitcoin::multipath_from_external(&external_descriptor) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.register_failed(format!("build multipath descriptor: {e}"));
+                }
+                return Task::none();
+            }
+        };
+        if multipath.len() > keep_nip46::MAX_DESCRIPTOR_LEN {
+            if let Screen::Wallet(s) = &mut self.screen {
+                s.register_failed(format!(
+                    "descriptor exceeds {} bytes",
+                    keep_nip46::MAX_DESCRIPTOR_LEN
+                ));
+            }
+            return Task::none();
+        }
+
+        let keep_arc = self.keep.clone();
+
+        Task::perform(
+            async move {
+                let client = keep_nip46::Nip46Client::connect_to(&device_uri)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let signer = client.signer_pubkey();
+
+                let register_outcome = async {
+                    client
+                        .connect()
+                        .await
+                        .map_err(|e| format!("handshake: {e}"))?;
+                    client
+                        .register_wallet(&wallet_name, &multipath)
+                        .await
+                        .map_err(|e| format!("register_wallet: {e}"))
+                }
+                .await;
+
+                client.disconnect().await;
+                let response = register_outcome?;
+
+                let signer_bytes = signer.to_bytes();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Failed to save registration", move |keep| {
+                        keep.upsert_device_registration(
+                            &group_pubkey,
+                            keep_core::DeviceRegistration {
+                                signer_pubkey: signer_bytes,
+                                wallet_name,
+                                hmac: response.hmac.clone(),
+                                registered_at: now,
+                            },
+                        )
+                        .map_err(friendly_err)
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                Ok::<(), String>(())
+            },
+            Message::WalletRegisterResult,
+        )
     }
 
     pub(crate) fn begin_descriptor_coordination(&mut self) -> Task<Message> {

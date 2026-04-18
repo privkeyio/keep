@@ -11,6 +11,8 @@ use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, VALID_XPUB_PREFIXES
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
+const MAX_DEVICE_URI_LEN: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub struct WalletEntry {
     #[allow(dead_code)]
@@ -79,6 +81,16 @@ pub struct AnnounceState {
     pub submitting: bool,
 }
 
+pub struct RegisterState {
+    pub group_pubkey: [u8; 32],
+    pub external_descriptor: String,
+    pub default_wallet_name: String,
+    pub device_uri: String,
+    pub wallet_name: String,
+    pub error: Option<String>,
+    pub submitting: bool,
+}
+
 #[derive(Clone)]
 pub enum Message {
     ToggleDetails(usize),
@@ -98,6 +110,11 @@ pub enum Message {
     CancelAnnounce,
     SubmitAnnounce,
     CopyDescriptor(String),
+    StartRegister(usize),
+    RegisterDeviceUriChanged(String),
+    RegisterNameChanged(String),
+    CancelRegister,
+    SubmitRegister,
 }
 
 impl std::fmt::Debug for Message {
@@ -120,6 +137,13 @@ impl std::fmt::Debug for Message {
             Self::CancelAnnounce => write!(f, "CancelAnnounce"),
             Self::SubmitAnnounce => write!(f, "SubmitAnnounce"),
             Self::CopyDescriptor(_) => write!(f, "CopyDescriptor(<redacted>)"),
+            Self::StartRegister(i) => f.debug_tuple("StartRegister").field(i).finish(),
+            Self::RegisterDeviceUriChanged(_) => {
+                write!(f, "RegisterDeviceUriChanged(<redacted>)")
+            }
+            Self::RegisterNameChanged(n) => f.debug_tuple("RegisterNameChanged").field(n).finish(),
+            Self::CancelRegister => write!(f, "CancelRegister"),
+            Self::SubmitRegister => write!(f, "SubmitRegister"),
         }
     }
 }
@@ -137,6 +161,12 @@ pub enum Event {
         label: String,
     },
     CopyDescriptor(String),
+    SubmitRegister {
+        group_pubkey: [u8; 32],
+        external_descriptor: String,
+        device_uri: String,
+        wallet_name: String,
+    },
 }
 
 pub struct State {
@@ -144,6 +174,7 @@ pub struct State {
     pub expanded: Option<usize>,
     pub setup: Option<SetupState>,
     pub announce: Option<AnnounceState>,
+    pub register: Option<RegisterState>,
     pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
 }
 
@@ -164,6 +195,7 @@ impl State {
             expanded: None,
             setup: None,
             announce: None,
+            register: None,
             peer_xpubs: HashMap::new(),
         }
     }
@@ -270,6 +302,78 @@ impl State {
                 })
             }
             Message::CopyDescriptor(desc) => Some(Event::CopyDescriptor(desc)),
+            Message::StartRegister(i) => {
+                if let Some(entry) = self.descriptors.get(i) {
+                    let default_name = hex::encode(&entry.group_pubkey[..4]);
+                    self.register = Some(RegisterState {
+                        group_pubkey: entry.group_pubkey,
+                        external_descriptor: entry.external_descriptor.clone(),
+                        default_wallet_name: format!("keep-{default_name}"),
+                        device_uri: String::new(),
+                        wallet_name: String::new(),
+                        error: None,
+                        submitting: false,
+                    });
+                }
+                None
+            }
+            Message::RegisterDeviceUriChanged(v) => {
+                if let Some(r) = &mut self.register {
+                    r.device_uri = v.chars().take(MAX_DEVICE_URI_LEN).collect();
+                }
+                None
+            }
+            Message::RegisterNameChanged(v) => {
+                if let Some(r) = &mut self.register {
+                    r.wallet_name = v.chars().take(keep_nip46::MAX_WALLET_NAME_LEN).collect();
+                }
+                None
+            }
+            Message::CancelRegister => {
+                self.register = None;
+                None
+            }
+            Message::SubmitRegister => {
+                let Some(r) = &mut self.register else {
+                    return None;
+                };
+                let device_uri = r.device_uri.trim().to_string();
+                if device_uri.is_empty() {
+                    r.error = Some("Device URI is required".into());
+                    return None;
+                }
+                if !(device_uri.starts_with("bunker://")
+                    || device_uri.starts_with("nostrconnect://"))
+                {
+                    r.error = Some("URI must start with bunker:// or nostrconnect://".into());
+                    return None;
+                }
+                let name_trimmed = r.wallet_name.trim();
+                let wallet_name = if name_trimmed.is_empty() {
+                    r.default_wallet_name.clone()
+                } else {
+                    name_trimmed.to_string()
+                };
+                r.error = None;
+                r.submitting = true;
+                Some(Event::SubmitRegister {
+                    group_pubkey: r.group_pubkey,
+                    external_descriptor: r.external_descriptor.clone(),
+                    device_uri,
+                    wallet_name,
+                })
+            }
+        }
+    }
+
+    pub fn register_submitted(&mut self) {
+        self.register = None;
+    }
+
+    pub fn register_failed(&mut self, error: String) {
+        if let Some(r) = &mut self.register {
+            r.error = Some(error);
+            r.submitting = false;
         }
     }
 
@@ -327,6 +431,10 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        if let Some(register) = &self.register {
+            return self.view_register(register);
+        }
+
         if let Some(announce) = &self.announce {
             return self.view_announce(announce);
         }
@@ -705,13 +813,22 @@ impl State {
                 .size(theme::size::SMALL)
                 .color(theme::color::TEXT_MUTED);
 
+            let register_btn = button(text("Register on Device").size(theme::size::SMALL))
+                .on_press(Message::StartRegister(i))
+                .style(theme::primary_button)
+                .padding([theme::space::XS, theme::space::MD]);
+
+            let actions_row = row![register_btn].spacing(theme::space::SM);
+
             let details = column![
                 ext_row,
                 ext_value,
                 int_row,
                 int_value,
                 hex_full,
-                created_text
+                created_text,
+                Space::new().height(theme::space::SM),
+                actions_row,
             ]
             .spacing(theme::space::XS);
 
@@ -785,6 +902,90 @@ impl State {
             submit_btn,
         ]
         .spacing(theme::space::XS);
+
+        if let Some(err) = &state.error {
+            content = content.push(theme::error_text(err.as_str()));
+        }
+
+        container(scrollable(content))
+            .padding(theme::space::XL)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_register<'a>(&self, state: &'a RegisterState) -> Element<'a, Message> {
+        let back_btn = button(text("< Back").size(theme::size::BODY))
+            .on_press_maybe(if state.submitting {
+                None
+            } else {
+                Some(Message::CancelRegister)
+            })
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Register on Hardware Signer")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
+        let subtitle = text(
+            "Send this descriptor to a NIP-46 capable hardware signer so it can verify addresses",
+        )
+        .size(theme::size::SMALL)
+        .color(theme::color::TEXT_MUTED);
+
+        let group_label = text(format!("Group: {}", hex::encode(&state.group_pubkey[..8])))
+            .size(theme::size::TINY)
+            .color(theme::color::TEXT_DIM);
+
+        let uri_input = text_input("bunker://... or nostrconnect://...", &state.device_uri)
+            .on_input(Message::RegisterDeviceUriChanged)
+            .padding(theme::space::SM)
+            .secure(true);
+
+        let name_placeholder = format!("default: {}", state.default_wallet_name);
+        let name_input = text_input(&name_placeholder, &state.wallet_name)
+            .on_input(Message::RegisterNameChanged)
+            .padding(theme::space::SM);
+
+        let can_submit = !state.submitting && !state.device_uri.trim().is_empty();
+        let submit_label = if state.submitting {
+            "Registering..."
+        } else {
+            "Register"
+        };
+        let mut submit_btn = button(text(submit_label).size(theme::size::BODY))
+            .style(theme::primary_button)
+            .padding([theme::space::SM, theme::space::LG]);
+        if can_submit {
+            submit_btn = submit_btn.on_press(Message::SubmitRegister);
+        }
+
+        let mut content = column![
+            header,
+            subtitle,
+            group_label,
+            Space::new().height(theme::space::SM),
+            theme::label("Device URI"),
+            uri_input,
+            Space::new().height(theme::space::XS),
+            theme::label("Wallet name (optional)"),
+            name_input,
+            Space::new().height(theme::space::MD),
+            submit_btn,
+        ]
+        .spacing(theme::space::XS);
+
+        if state.submitting {
+            content = content.push(
+                text("Confirm the registration on your hardware signer.")
+                    .size(theme::size::SMALL)
+                    .color(theme::color::TEXT_MUTED),
+            );
+        }
 
         if let Some(err) = &state.error {
             content = content.push(theme::error_text(err.as_str()));
