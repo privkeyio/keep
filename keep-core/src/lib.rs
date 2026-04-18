@@ -40,6 +40,8 @@ pub mod backend;
 pub mod backup;
 /// Cryptographic primitives for encryption, key derivation, and hashing.
 pub mod crypto;
+/// Shared text-level helpers for output descriptor strings.
+pub mod descriptor;
 /// Display formatting helpers for truncation and timestamps.
 pub mod display;
 /// Multi-source entropy mixing for defense-in-depth randomness.

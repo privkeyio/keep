@@ -171,10 +171,9 @@ impl Nip46Client {
                 "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
             )));
         }
-        let has_multipath = descriptor.contains("<0;1>") || descriptor.contains("<1;0>");
-        let has_single_path = ["/0/*)", "/0/*,", "/1/*)", "/1/*,"]
-            .iter()
-            .any(|p| descriptor.contains(p));
+        let body = descriptor.split('#').next().unwrap_or(descriptor);
+        let has_multipath = keep_core::descriptor::has_multipath_marker(body);
+        let has_single_path = keep_core::descriptor::has_single_path_tail(body);
         if has_single_path {
             let msg = if has_multipath {
                 "descriptor mixes multipath and single-path keys; normalize all keys to <0;1>"
@@ -183,7 +182,12 @@ impl Nip46Client {
             };
             return Err(KeepError::InvalidInput(msg.into()));
         }
-        if !has_multipath && descriptor.contains('*') {
+        if body.contains("<1;0>") {
+            return Err(KeepError::InvalidInput(
+                "descriptor must use <0;1> multipath order; reorder before sending".into(),
+            ));
+        }
+        if !has_multipath && body.contains('*') {
             return Err(KeepError::InvalidInput(
                 "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
             ));

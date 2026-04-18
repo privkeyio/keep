@@ -145,15 +145,25 @@ impl DescriptorExport {
 /// Build a BIP-389 multipath descriptor from a single-path external descriptor.
 ///
 /// Rewrites every trailing `/0/*` key derivation to `/<0;1>/*`. Keys already in
-/// multipath form (`<0;1>` or `<1;0>`) are left untouched, so mixed multisig
-/// descriptors where some keys are single-path and some are multipath are
-/// normalized to fully multipath. Matching is anchored to `,` and `)` so
-/// occurrences inside origin info (bracketed `[fp/path]`) cannot be rewritten.
+/// multipath form (`<0;1>` or `<1;0>`) are normalized to `<0;1>` so all keys in
+/// a multisig descriptor agree on the external/change order. Matching is
+/// anchored so only a `/0/*` that terminates a key expression (immediately
+/// followed by `,` or `)`, and preceded by a non-`/` character) is rewritten;
+/// occurrences inside longer paths or origin info are left alone. Descriptors
+/// containing a terminating `/1/*` (internal) path are rejected rather than
+/// silently coerced.
 pub fn multipath_from_external(external: &str) -> Result<String> {
     let body = external.split('#').next().unwrap_or(external);
-    let normalized = body
-        .replace("/0/*)", "/<0;1>/*)")
-        .replace("/0/*,", "/<0;1>/*,");
+
+    if keep_core::descriptor::contains_tail(body, '1') {
+        return Err(BitcoinError::Descriptor(
+            "descriptor contains /1/* internal path; expected external /0/* or multipath".into(),
+        ));
+    }
+
+    let normalized = keep_core::descriptor::rewrite_trailing_zero_star(body);
+    let normalized = normalized.replace("<1;0>", "<0;1>");
+
     let checksum = compute_checksum(&normalized)?;
     Ok(format!("{normalized}#{checksum}"))
 }
@@ -404,6 +414,31 @@ mod tests {
         let body = out.split('#').next().unwrap();
         assert!(body.contains("[deadbeef/86'/0'/0']"));
         assert!(body.ends_with("/<0;1>/*)"));
+    }
+
+    #[test]
+    fn test_multipath_does_not_mangle_nested_paths() {
+        // xpub/0/0/*) must become xpub/0/<0;1>/*), not xpub/<0;1>/*.
+        let input = "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/0/*)";
+        let out = multipath_from_external(input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(body.ends_with("/0/<0;1>/*)"));
+    }
+
+    #[test]
+    fn test_multipath_rejects_internal_only_descriptor() {
+        let err = multipath_from_external("tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/1/*)");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_multipath_normalizes_reverse_order_marker() {
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("wsh(sortedmulti(2,{xpub}/<1;0>/*,{xpub}/<0;1>/*))");
+        let out = multipath_from_external(&input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert!(!body.contains("<1;0>"));
+        assert_eq!(body.matches("<0;1>").count(), 2);
     }
 
     #[test]
