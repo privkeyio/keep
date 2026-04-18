@@ -337,18 +337,17 @@ pub(crate) fn persist_descriptor(
     Ok(())
 }
 
+fn is_valid_hmac_hex(s: &str) -> bool {
+    s.len() == HMAC_SHA256_HEX_LEN && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
     let device_registrations = stored
         .device_registrations
         .into_iter()
         .filter_map(|r| {
-            let hmac = match r.hmac {
-                Some(h) if h.len() == HMAC_SHA256_HEX_LEN
-                    && h.chars().all(|c| c.is_ascii_hexdigit()) =>
-                {
-                    Some(h)
-                }
-                Some(h) => {
+            if let Some(h) = r.hmac.as_deref() {
+                if !is_valid_hmac_hex(h) {
                     tracing::warn!(
                         signer = %r.signer_pubkey,
                         hmac_len = h.len(),
@@ -356,12 +355,11 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
                     );
                     return None;
                 }
-                None => None,
-            };
+            }
             Some(DeviceRegistrationInfo {
                 signer_pubkey: r.signer_pubkey,
                 wallet_name: r.wallet_name,
-                hmac,
+                hmac: r.hmac,
                 registered_at: r.registered_at,
             })
         })

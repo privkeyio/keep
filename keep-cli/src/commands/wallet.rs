@@ -313,16 +313,9 @@ pub fn cmd_wallet_register(
 
     out.success("Wallet registered on device!");
     out.field("Signer pubkey", &hex::encode(signer_bytes));
-    match (&response.hmac, show_token) {
-        (Some(hmac), true) => out.field("Registration token", &hex::encode(hmac.as_slice())),
-        (Some(hmac), false) => out.field(
-            "Registration token",
-            &format!(
-                "[redacted; {} bytes] (use --show-token to reveal)",
-                hmac.len()
-            ),
-        ),
-        (None, _) => out.info("Device did not return a registration token."),
+    match response.hmac.as_deref() {
+        Some(hmac) => out.field("Registration token", &format_token(hmac, show_token)),
+        None => out.info("Device did not return a registration token."),
     }
     out.info("Registration saved to wallet descriptor.");
 
@@ -362,16 +355,8 @@ pub fn cmd_wallet_registrations(
         out.field("Signer pubkey", &hex::encode(reg.signer_pubkey));
         out.field("Wallet name", &reg.wallet_name);
         out.field("Registered at", &format_registered_at(reg.registered_at));
-        if let Some(hmac) = &reg.hmac {
-            let value = if show_token {
-                hex::encode(hmac.as_slice())
-            } else {
-                format!(
-                    "[redacted; {} bytes] (use --show-token to reveal)",
-                    hmac.len()
-                )
-            };
-            out.field("Registration token", &value);
+        if let Some(hmac) = reg.hmac.as_deref() {
+            out.field("Registration token", &format_token(hmac, show_token));
         }
     }
 
@@ -408,6 +393,17 @@ fn truncate_relay_for_log(relay: &str) -> String {
     }
     let prefix: String = relay.chars().take(PREFIX_LEN).collect();
     format!("{prefix}...")
+}
+
+fn format_token(hmac: &[u8], show_token: bool) -> String {
+    if show_token {
+        hex::encode(hmac)
+    } else {
+        format!(
+            "[redacted; {} bytes] (use --show-token to reveal)",
+            hmac.len()
+        )
+    }
 }
 
 fn format_registered_at(ts: u64) -> String {

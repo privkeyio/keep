@@ -1242,10 +1242,8 @@ impl KeepMobile {
 
         // Strip the raw token before crossing the UniFFI boundary.
         Ok(DeviceRegistrationInfo {
-            signer_pubkey: persisted.signer_pubkey,
-            wallet_name: persisted.wallet_name,
             hmac: None,
-            registered_at: persisted.registered_at,
+            ..persisted
         })
     }
 
