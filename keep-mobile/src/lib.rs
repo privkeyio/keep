@@ -1691,7 +1691,15 @@ impl KeepMobile {
                 let signer_pubkey =
                     bytes_to_32(&signer_bytes, "device_registration signer_pubkey")?;
                 let hmac = match reg.hmac.as_deref() {
-                    Some(h) => Some(Zeroizing::new(decode_hex(h, "device_registration hmac")?)),
+                    Some(h) => {
+                        if !persistence::is_valid_hmac_hex(h) {
+                            return Err(KeepMobileError::BackupError {
+                                msg: "device_registration hmac has invalid hex length or format"
+                                    .into(),
+                            });
+                        }
+                        Some(Zeroizing::new(decode_hex(h, "device_registration hmac")?))
+                    }
                     None => None,
                 };
                 device_registrations.push(keep_core::DeviceRegistration {
@@ -2029,7 +2037,10 @@ fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
         KeepError::RateLimited(_) => KeepMobileError::RateLimited,
         KeepError::NetworkErr(NetworkError::Timeout { .. }) => KeepMobileError::Timeout,
         KeepError::NetworkErr(e) => KeepMobileError::NetworkError { msg: e.to_string() },
-        KeepError::Runtime(msg) => KeepMobileError::NetworkError { msg },
+        KeepError::StorageErr(e) => KeepMobileError::StorageError { msg: e.to_string() },
+        KeepError::CryptoErr(e) => KeepMobileError::FrostError { msg: e.to_string() },
+        KeepError::Encryption(msg) => KeepMobileError::EncryptionError { msg },
+        KeepError::Runtime(msg) => KeepMobileError::NotSupported { msg },
         other => KeepMobileError::NetworkError {
             msg: other.to_string(),
         },

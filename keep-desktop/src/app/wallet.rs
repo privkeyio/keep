@@ -1,4 +1,5 @@
 use iced::Task;
+use tracing::{info, warn};
 
 use crate::message::Message;
 use crate::screen::wallet::{self, DescriptorProgress, SetupPhase};
@@ -223,23 +224,39 @@ impl App {
         }
 
         let keep_arc = self.keep.clone();
+        let group_hex = hex::encode(group_pubkey);
 
         Task::perform(
             async move {
                 let client = keep_nip46::Nip46Client::connect_to(&device_uri)
                     .await
-                    .map_err(|e| format!("connect: {e}"))?;
+                    .map_err(|e| {
+                        warn!(group = %group_hex, "NIP-46 connect failed: {e}");
+                        format!("connect: {e}")
+                    })?;
                 let signer = client.signer_pubkey();
+                let signer_hex = hex::encode(signer.to_bytes());
 
                 let register_outcome = async {
-                    client
-                        .connect()
-                        .await
-                        .map_err(|e| format!("handshake: {e}"))?;
+                    client.connect().await.map_err(|e| {
+                        warn!(
+                            group = %group_hex,
+                            signer = %signer_hex,
+                            "NIP-46 handshake failed: {e}",
+                        );
+                        format!("handshake: {e}")
+                    })?;
                     client
                         .register_wallet(&wallet_name, &multipath)
                         .await
-                        .map_err(|e| format!("register_wallet: {e}"))
+                        .map_err(|e| {
+                            warn!(
+                                group = %group_hex,
+                                signer = %signer_hex,
+                                "register_wallet rejected: {e}",
+                            );
+                            format!("register_wallet: {e}")
+                        })
                 }
                 .await;
 
@@ -252,13 +269,16 @@ impl App {
                     .unwrap_or_default()
                     .as_secs();
 
+                let group_hex_for_save = group_hex.clone();
+                let signer_hex_for_save = signer_hex.clone();
+                let wallet_name_saved = wallet_name.clone();
                 tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Failed to save registration", move |keep| {
                         keep.upsert_device_registration(
                             &group_pubkey,
                             keep_core::DeviceRegistration {
                                 signer_pubkey: signer_bytes,
-                                wallet_name,
+                                wallet_name: wallet_name_saved,
                                 hmac: response.hmac.clone(),
                                 registered_at: now,
                             },
@@ -267,8 +287,21 @@ impl App {
                     })
                 })
                 .await
-                .map_err(|_| "Background task failed".to_string())??;
+                .map_err(|_| {
+                    warn!(
+                        group = %group_hex_for_save,
+                        signer = %signer_hex_for_save,
+                        "spawn_blocking for upsert_device_registration failed",
+                    );
+                    "Background task failed".to_string()
+                })??;
 
+                info!(
+                    group = %group_hex,
+                    signer = %signer_hex,
+                    wallet_name = %wallet_name,
+                    "wallet registered on device",
+                );
                 Ok::<(), String>(())
             },
             Message::WalletRegisterResult,

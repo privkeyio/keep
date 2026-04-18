@@ -13,6 +13,17 @@ use crate::theme;
 
 const MAX_DEVICE_URI_LEN: usize = 2048;
 
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_bytes));
+    for c in s.chars() {
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct WalletEntry {
     #[allow(dead_code)]
@@ -319,13 +330,13 @@ impl State {
             }
             Message::RegisterDeviceUriChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.device_uri = v.chars().take(MAX_DEVICE_URI_LEN).collect();
+                    r.device_uri = truncate_to_bytes(&v, MAX_DEVICE_URI_LEN);
                 }
                 None
             }
             Message::RegisterNameChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.wallet_name = v.chars().take(keep_nip46::MAX_WALLET_NAME_LEN).collect();
+                    r.wallet_name = truncate_to_bytes(&v, keep_nip46::MAX_WALLET_NAME_LEN);
                 }
                 None
             }
@@ -941,15 +952,19 @@ impl State {
             .size(theme::size::TINY)
             .color(theme::color::TEXT_DIM);
 
-        let uri_input = text_input("bunker://... or nostrconnect://...", &state.device_uri)
-            .on_input(Message::RegisterDeviceUriChanged)
+        let mut uri_input = text_input("bunker://... or nostrconnect://...", &state.device_uri)
             .padding(theme::space::SM)
             .secure(true);
+        if !state.submitting {
+            uri_input = uri_input.on_input(Message::RegisterDeviceUriChanged);
+        }
 
         let name_placeholder = format!("default: {}", state.default_wallet_name);
-        let name_input = text_input(&name_placeholder, &state.wallet_name)
-            .on_input(Message::RegisterNameChanged)
-            .padding(theme::space::SM);
+        let mut name_input =
+            text_input(&name_placeholder, &state.wallet_name).padding(theme::space::SM);
+        if !state.submitting {
+            name_input = name_input.on_input(Message::RegisterNameChanged);
+        }
 
         let can_submit = !state.submitting && !state.device_uri.trim().is_empty();
         let submit_label = if state.submitting {

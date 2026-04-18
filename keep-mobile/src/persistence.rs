@@ -337,7 +337,7 @@ pub(crate) fn persist_descriptor(
     Ok(())
 }
 
-fn is_valid_hmac_hex(s: &str) -> bool {
+pub(crate) fn is_valid_hmac_hex(s: &str) -> bool {
     s.len() == HMAC_SHA256_HEX_LEN && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 

@@ -9,9 +9,11 @@
 //! normalization) and `keep-nip46` (for validation) can agree on how a
 //! single-path `/0/*` or `/1/*` tail is detected.
 
-/// Returns true if the descriptor body contains a key-expression-terminating
-/// `/{digit}/*` derivation suffix (anchored so matches inside longer paths or
-/// origin info are ignored).
+/// Returns true if the descriptor body contains a terminating `/{digit}/*`
+/// derivation suffix, i.e. a `/{digit}/*` immediately followed by `)` or `,`.
+/// The guard `bytes[i - 1] != b'/'` only rejects a doubled slash `//{digit}/*`;
+/// nested paths like `xpub.../0/0/*)` also match at the trailing segment
+/// because that segment drives external/change derivation.
 pub fn contains_tail(body: &str, digit: char) -> bool {
     let bytes = body.as_bytes();
     let digit_byte = digit as u8;
@@ -31,12 +33,15 @@ pub fn contains_tail(body: &str, digit: char) -> bool {
     false
 }
 
-/// Rewrite every anchored `/0/*` tail to `/<0;1>/*`. Occurrences inside longer
-/// paths (preceded by `/`) or not followed by `,` or `)` are left alone.
+/// Rewrite every anchored `/0/*` tail (a `/0/*` followed by `)` or `,`, whose
+/// leading `/` is not itself preceded by another `/`) to `/<0;1>/*`. Works on
+/// byte indices but copies unchanged regions as UTF-8 slices so the output
+/// stays well-formed even if the input contains non-ASCII bytes.
 pub fn rewrite_trailing_zero_star(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len() + 8);
     let mut i = 0;
+    let mut run_start = 0;
     while i < bytes.len() {
         if i + 4 < bytes.len()
             && bytes[i] == b'/'
@@ -46,12 +51,18 @@ pub fn rewrite_trailing_zero_star(body: &str) -> String {
             && matches!(bytes[i + 4], b')' | b',')
             && (i == 0 || bytes[i - 1] != b'/')
         {
+            if run_start < i {
+                out.push_str(&body[run_start..i]);
+            }
             out.push_str("/<0;1>/*");
             i += 4;
+            run_start = i;
         } else {
-            out.push(bytes[i] as char);
             i += 1;
         }
+    }
+    if run_start < bytes.len() {
+        out.push_str(&body[run_start..]);
     }
     out
 }

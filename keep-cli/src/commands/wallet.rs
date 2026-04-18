@@ -297,10 +297,27 @@ pub fn cmd_wallet_register(
     let (signer_pubkey, response) = register_outcome?;
 
     let signer_bytes = signer_pubkey.to_bytes();
+    let signer_hex = hex::encode(signer_bytes);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    // Surface the device-side outcome before attempting local persistence so an
+    // operator knows registration already took effect on the signer if the
+    // local save errors below. Re-running register is idempotent.
+    out.success("Device accepted the wallet registration");
+    out.field("Signer pubkey", &signer_hex);
+    match response.hmac.as_deref() {
+        Some(hmac) => out.field("Registration token", &format_token(hmac, show_token)),
+        None => out.info("Device did not return a registration token."),
+    }
+
+    let token_status = if response.hmac.is_some() {
+        "received"
+    } else {
+        "none"
+    };
     keep.upsert_device_registration(
         &group_pubkey,
         keep_core::DeviceRegistration {
@@ -309,14 +326,13 @@ pub fn cmd_wallet_register(
             hmac: response.hmac.clone(),
             registered_at: now,
         },
-    )?;
+    )
+    .map_err(|e| {
+        KeepError::Other(format!(
+            "device registration already succeeded on signer {signer_hex} (token: {token_status}) but saving to local descriptor failed: {e}; re-running register is safe"
+        ))
+    })?;
 
-    out.success("Wallet registered on device!");
-    out.field("Signer pubkey", &hex::encode(signer_bytes));
-    match response.hmac.as_deref() {
-        Some(hmac) => out.field("Registration token", &format_token(hmac, show_token)),
-        None => out.info("Device did not return a registration token."),
-    }
     out.info("Registration saved to wallet descriptor.");
 
     Ok(())

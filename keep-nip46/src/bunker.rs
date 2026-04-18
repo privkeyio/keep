@@ -81,10 +81,16 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     let mut image = None;
     let mut perms = None;
 
+    let validate = if ALLOW_INTERNAL_HOSTS {
+        validate_relay_url_allow_internal
+    } else {
+        validate_relay_url
+    };
+
     for (key, value) in parsed.query_pairs() {
         match key.as_ref() {
             "relay" => {
-                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate_relay_url(&value).is_ok() {
+                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate(&value).is_ok() {
                     relays.push(normalize_relay_url(&value));
                 }
             }

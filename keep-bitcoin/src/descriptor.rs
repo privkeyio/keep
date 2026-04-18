@@ -430,6 +430,17 @@ mod tests {
     }
 
     #[test]
+    fn test_multipath_no_derivation_tail_unchanged() {
+        // Bare descriptor with no /0/* tail: body should be unchanged aside
+        // from the appended checksum.
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        let input = format!("tr({xpub})");
+        let out = multipath_from_external(&input).unwrap();
+        let body = out.split('#').next().unwrap();
+        assert_eq!(body, input);
+    }
+
+    #[test]
     fn test_multipath_rejects_internal_only_descriptor() {
         let err = multipath_from_external("tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/1/*)");
         assert!(err.is_err());
