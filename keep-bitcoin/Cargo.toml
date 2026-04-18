@@ -19,7 +19,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 thiserror = "2.0"
 hex = "0.4"
 tracing = "0.1"
-miniscript = "12"
+miniscript = "=12.3.5"
 
 [dev-dependencies]
 tempfile = "3.27"

@@ -465,6 +465,19 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_descriptor_canonical_form() {
+        // Guards against accidental miniscript version bumps that shift
+        // canonical descriptor formatting. The emitted descriptor string is a
+        // consensus value across FROST peers; if this literal changes, mixed
+        // miniscript versions will break descriptor coordination.
+        let xonly =
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let expected = "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2";
+        let (canonical, _) = canonicalize_descriptor(&format!("tr({xonly})")).unwrap();
+        assert_eq!(canonical, expected);
+    }
+
+    #[test]
     fn test_frost_wallet_descriptor_has_checksum() {
         let group_pk = test_group_pubkey();
         let export =

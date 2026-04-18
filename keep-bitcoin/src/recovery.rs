@@ -179,9 +179,10 @@ impl RecoveryConfig {
         let secp = Secp256k1::new();
         let tiers = self.build_tier_infos()?;
         let internal_key = self.internal_key()?;
-        let spend_info = self.build_taproot(&secp, internal_key, &tiers)?;
+        let depths = optimal_depth(tiers.len());
+        let spend_info = self.build_taproot(&secp, internal_key, &tiers, &depths)?;
         let address = Address::p2tr_tweaked(spend_info.output_key(), self.network);
-        let descriptor = self.format_descriptor(internal_key, &tiers);
+        let descriptor = self.format_descriptor(internal_key, &tiers, &depths);
 
         Ok(RecoveryOutput {
             address,
@@ -195,9 +196,10 @@ impl RecoveryConfig {
         self.validate()?;
         let secp = Secp256k1::new();
         let tiers = self.build_tier_infos()?;
-        let spend_info = self.build_taproot(&secp, *internal_key, &tiers)?;
+        let depths = optimal_depth(tiers.len());
+        let spend_info = self.build_taproot(&secp, *internal_key, &tiers, &depths)?;
         let address = Address::p2tr_tweaked(spend_info.output_key(), self.network);
-        let descriptor = self.format_descriptor(*internal_key, &tiers);
+        let descriptor = self.format_descriptor(*internal_key, &tiers, &depths);
 
         Ok(RecoveryOutput {
             address,
@@ -253,6 +255,7 @@ impl RecoveryConfig {
         secp: &Secp256k1<All>,
         internal_key: XOnlyPublicKey,
         tiers: &[TierInfo],
+        depths: &[u8],
     ) -> Result<TaprootSpendInfo> {
         if tiers.is_empty() {
             return TaprootBuilder::new()
@@ -260,8 +263,8 @@ impl RecoveryConfig {
                 .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {e:?}")));
         }
 
+        debug_assert_eq!(tiers.len(), depths.len());
         let mut builder = TaprootBuilder::new();
-        let depths = optimal_depth(tiers.len());
 
         for (i, tier) in tiers.iter().enumerate() {
             builder = builder
@@ -274,13 +277,18 @@ impl RecoveryConfig {
             .map_err(|e| BitcoinError::Recovery(format!("taproot finalize: {e:?}")))
     }
 
-    fn format_descriptor(&self, internal_key: XOnlyPublicKey, tiers: &[TierInfo]) -> String {
+    fn format_descriptor(
+        &self,
+        internal_key: XOnlyPublicKey,
+        tiers: &[TierInfo],
+        depths: &[u8],
+    ) -> String {
         if tiers.is_empty() {
             return format!("tr({internal_key})");
         }
-        let depths = optimal_depth(tiers.len());
+        debug_assert_eq!(tiers.len(), depths.len());
         let leaves: Vec<String> = tiers.iter().map(tier_miniscript).collect();
-        let tree = build_tree_string(&leaves, &depths);
+        let tree = build_tree_string(&leaves, depths);
         format!("tr({internal_key},{tree})")
     }
 }
@@ -304,12 +312,17 @@ fn tier_miniscript(tier: &TierInfo) -> String {
 }
 
 fn build_tree_string(leaves: &[String], depths: &[u8]) -> String {
+    debug_assert_eq!(leaves.len(), depths.len());
     let mut stack: Vec<(u8, String)> = Vec::with_capacity(leaves.len());
     for (leaf, &d) in leaves.iter().zip(depths) {
         stack.push((d, leaf.clone()));
         while stack.len() >= 2 && stack[stack.len() - 1].0 == stack[stack.len() - 2].0 {
-            let (d_top, s_top) = stack.pop().expect("len checked");
-            let (_, s_second) = stack.pop().expect("len checked");
+            let Some((d_top, s_top)) = stack.pop() else {
+                break;
+            };
+            let Some((_, s_second)) = stack.pop() else {
+                break;
+            };
             stack.push((d_top.saturating_sub(1), format!("{{{s_second},{s_top}}}")));
         }
     }
@@ -344,6 +357,9 @@ fn build_timelocked_multisig(
 
     let pubkeys: Vec<XOnlyPublicKey> = keys.iter().map(parse_xonly).collect::<Result<Vec<_>>>()?;
 
+    // v0.4+: OP_VERIFY form per miniscript canonical older(n);
+    // v0.3.x recovery addresses (OP_DROP form) are incompatible and must be
+    // swept externally before upgrading.
     let mut builder = ScriptBuf::builder()
         .push_sequence(Sequence::from_height(seq_u16))
         .push_opcode(bitcoin::opcodes::all::OP_CSV)
@@ -582,7 +598,7 @@ mod tests {
         use bitcoin::secp256k1::Secp256k1;
         use miniscript::Descriptor;
 
-        let keys: Vec<[u8; 32]> = (1..=6).map(test_keypair).collect();
+        let keys: Vec<[u8; 32]> = (1..=12).map(test_keypair).collect();
         let cases = vec![
             RecoveryConfig {
                 primary: SpendingTier {
@@ -606,6 +622,54 @@ mod tests {
                         keys: vec![keys[3], keys[4]],
                         threshold: 2,
                         timelock_months: 6,
+                    },
+                    RecoveryTier {
+                        keys: vec![keys[5]],
+                        threshold: 1,
+                        timelock_months: 12,
+                    },
+                ],
+                network: Network::Testnet,
+            },
+            RecoveryConfig {
+                primary: SpendingTier {
+                    keys: vec![keys[0], keys[1]],
+                    threshold: 2,
+                },
+                recovery_tiers: vec![
+                    RecoveryTier {
+                        keys: vec![keys[2]],
+                        threshold: 1,
+                        timelock_months: 6,
+                    },
+                    RecoveryTier {
+                        keys: vec![keys[3]],
+                        threshold: 1,
+                        timelock_months: 12,
+                    },
+                ],
+                network: Network::Testnet,
+            },
+            RecoveryConfig {
+                primary: SpendingTier {
+                    keys: vec![keys[0], keys[1]],
+                    threshold: 2,
+                },
+                recovery_tiers: vec![
+                    RecoveryTier {
+                        keys: vec![keys[2]],
+                        threshold: 1,
+                        timelock_months: 3,
+                    },
+                    RecoveryTier {
+                        keys: vec![keys[3]],
+                        threshold: 1,
+                        timelock_months: 6,
+                    },
+                    RecoveryTier {
+                        keys: vec![keys[4]],
+                        threshold: 1,
+                        timelock_months: 9,
                     },
                     RecoveryTier {
                         keys: vec![keys[5]],
