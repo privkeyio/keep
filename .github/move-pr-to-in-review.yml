@@ -1,0 +1,18 @@
+name: Move PR to In Review when reviewer is requested
+
+on:
+  pull_request:
+    types: [review_requested]
+
+jobs:
+  move-to-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Move PR to "In Review" column
+        uses: nipe0324/update-project-v2-item-field@v2.0.2
+        with:
+          project-url: https://github.com/orgs/privkeyio/projects/6
+          github-token: ${{ secrets.UPDATE_PROJECT_V2_PAT }}
+          field-name: "Status"
+          field-value: "In Review"
