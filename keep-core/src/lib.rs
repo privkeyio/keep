@@ -690,6 +690,22 @@ impl Keep {
         self.storage.delete_descriptor(group_pubkey)
     }
 
+    /// Atomically insert or update a device registration on the descriptor for
+    /// the given FROST group. Performs the load-modify-store under the
+    /// storage's descriptor write lock so concurrent callers cannot drop each
+    /// other's updates.
+    pub fn upsert_device_registration(
+        &self,
+        group_pubkey: &[u8; 32],
+        registration: DeviceRegistration,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage
+            .upsert_device_registration(group_pubkey, registration)
+    }
+
     /// Store a key health status record.
     pub fn store_health_status(&self, status: &wallet::KeyHealthStatus) -> Result<()> {
         if !self.is_unlocked() {

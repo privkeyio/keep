@@ -320,8 +320,12 @@ interface KeepMobile {
     [Throws=KeepMobileError]
     void wallet_descriptor_delete(string group_pubkey);
 
+    // Register a wallet on a hardware NIP-46 signer. The returned
+    // DeviceRegistrationInfo has its `hmac` field cleared so the raw token
+    // never crosses the UniFFI boundary. The token is persisted internally on
+    // the wallet descriptor in secure storage.
     [Throws=KeepMobileError]
-    string? wallet_register_on_device(string group_pubkey, string device_uri, string? wallet_name);
+    DeviceRegistrationInfo wallet_register_on_device(string group_pubkey, string device_uri, string? wallet_name);
 
     void wallet_descriptor_set_callbacks(DescriptorCallbacks callbacks);
 

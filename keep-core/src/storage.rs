@@ -203,6 +203,10 @@ pub struct Storage {
     pub(crate) header: Header,
     pub(crate) data_key: Option<SecretKey>,
     pub(crate) backend: Option<Box<dyn StorageBackend>>,
+    /// Serializes read-modify-write sequences on wallet descriptors so that
+    /// e.g. two concurrent `upsert_device_registration` calls cannot drop
+    /// one another's updates.
+    pub(crate) descriptor_lock: std::sync::Mutex<()>,
 }
 
 fn create_storage_dir(path: &Path) -> Result<()> {
@@ -271,6 +275,7 @@ impl Storage {
             header,
             data_key: Some(data_key),
             backend: Some(backend),
+            descriptor_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -296,6 +301,7 @@ impl Storage {
             header,
             data_key: None,
             backend: None,
+            descriptor_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -626,6 +632,28 @@ impl Storage {
         }
 
         Ok(descriptors)
+    }
+
+    /// Atomically insert or update a device registration on the descriptor
+    /// for the given group. Serialized under `descriptor_lock` so concurrent
+    /// callers cannot lose each other's updates across the read-modify-write.
+    pub fn upsert_device_registration(
+        &self,
+        group_pubkey: &[u8; 32],
+        registration: crate::wallet::DeviceRegistration,
+    ) -> Result<()> {
+        let _guard = self
+            .descriptor_lock
+            .lock()
+            .map_err(|_| StorageError::database("descriptor lock poisoned"))?;
+        let mut descriptor = self.get_descriptor(group_pubkey)?.ok_or_else(|| {
+            KeepError::KeyNotFound(format!(
+                "wallet descriptor for group {} not found",
+                hex::encode(group_pubkey)
+            ))
+        })?;
+        descriptor.upsert_device_registration(registration);
+        self.store_descriptor(&descriptor)
     }
 
     /// Delete a wallet descriptor.

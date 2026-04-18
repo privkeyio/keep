@@ -223,13 +223,33 @@ pub fn cmd_wallet_register(
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let mut desc = keep
+    let desc = keep
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
 
     let wallet_name = name
         .map(str::to_string)
         .unwrap_or_else(|| format!("keep-{}", hex::encode(&group_pubkey[..4])));
+    if wallet_name.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "wallet name must not be empty".into(),
+        ));
+    }
+    if wallet_name.len() > keep_nip46::MAX_WALLET_NAME_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "wallet name exceeds {} bytes",
+            keep_nip46::MAX_WALLET_NAME_LEN
+        )));
+    }
+
+    let multipath = keep_bitcoin::multipath_from_external(&desc.external_descriptor)
+        .map_err(|e| KeepError::Runtime(format!("build multipath descriptor: {e}")))?;
+    if multipath.len() > keep_nip46::MAX_DESCRIPTOR_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "descriptor exceeds {} bytes",
+            keep_nip46::MAX_DESCRIPTOR_LEN
+        )));
+    }
 
     out.newline();
     out.header("Register Wallet on Hardware Signer");
@@ -241,10 +261,7 @@ pub fn cmd_wallet_register(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
-    let multipath = keep_bitcoin::multipath_from_external(&desc.external_descriptor)
-        .map_err(|e| KeepError::Runtime(format!("build multipath descriptor: {e}")))?;
-
-    let (signer_pubkey, response) = rt.block_on(async {
+    let register_outcome = rt.block_on(async {
         let spinner = out.spinner("Connecting to signer...");
         let client = keep_nip46::Nip46Client::connect_to(device_uri)
             .await
@@ -272,25 +289,32 @@ pub fn cmd_wallet_register(
 
         client.disconnect().await;
         Ok::<_, KeepError>((signer, outcome?))
-    })?;
+    });
+    // Give nostr_sdk background tasks a chance to flush before we tear the
+    // runtime down; avoids aborting in-flight disconnect cleanup.
+    rt.shutdown_timeout(Duration::from_secs(2));
+
+    let (signer_pubkey, response) = register_outcome?;
 
     let signer_bytes = signer_pubkey.to_bytes();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    desc.upsert_device_registration(keep_core::DeviceRegistration {
-        signer_pubkey: signer_bytes,
-        wallet_name: wallet_name.clone(),
-        hmac: response.hmac.clone(),
-        registered_at: now,
-    });
-    keep.store_wallet_descriptor(&desc)?;
+    keep.upsert_device_registration(
+        &group_pubkey,
+        keep_core::DeviceRegistration {
+            signer_pubkey: signer_bytes,
+            wallet_name: wallet_name.clone(),
+            hmac: response.hmac.clone(),
+            registered_at: now,
+        },
+    )?;
 
     out.success("Wallet registered on device!");
     out.field("Signer pubkey", &hex::encode(signer_bytes));
     match (&response.hmac, show_token) {
-        (Some(hmac), true) => out.field("Registration token", &hex::encode(hmac)),
+        (Some(hmac), true) => out.field("Registration token", &hex::encode(hmac.as_slice())),
         (Some(hmac), false) => out.field(
             "Registration token",
             &format!(
@@ -337,10 +361,10 @@ pub fn cmd_wallet_registrations(
         out.newline();
         out.field("Signer pubkey", &hex::encode(reg.signer_pubkey));
         out.field("Wallet name", &reg.wallet_name);
-        out.field("Registered at", &reg.registered_at.to_string());
+        out.field("Registered at", &format_registered_at(reg.registered_at));
         if let Some(hmac) = &reg.hmac {
             let value = if show_token {
-                hex::encode(hmac)
+                hex::encode(hmac.as_slice())
             } else {
                 format!(
                     "[redacted; {} bytes] (use --show-token to reveal)",
@@ -359,12 +383,12 @@ fn mask_secret(uri: &str) -> String {
         Ok(mut parsed) => {
             let pairs: Vec<(String, String)> = parsed
                 .query_pairs()
-                .map(|(k, v)| {
-                    if k == "secret" {
-                        (k.into_owned(), "***".into())
-                    } else {
-                        (k.into_owned(), v.into_owned())
-                    }
+                .map(|(k, v)| match k.as_ref() {
+                    "secret" => (k.into_owned(), "***".into()),
+                    // relay hostnames may include .onion or internal hosts we
+                    // don't want echoed to logs; truncate to a short prefix.
+                    "relay" => (k.into_owned(), truncate_relay_for_log(&v)),
+                    _ => (k.into_owned(), v.into_owned()),
                 })
                 .collect();
             parsed.query_pairs_mut().clear();
@@ -375,6 +399,22 @@ fn mask_secret(uri: &str) -> String {
         }
         Err(_) => "<invalid>".into(),
     }
+}
+
+fn truncate_relay_for_log(relay: &str) -> String {
+    const PREFIX_LEN: usize = 16;
+    if relay.len() <= PREFIX_LEN {
+        return relay.to_string();
+    }
+    let prefix: String = relay.chars().take(PREFIX_LEN).collect();
+    format!("{prefix}...")
+}
+
+fn format_registered_at(ts: u64) -> String {
+    let signed = i64::try_from(ts).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(signed, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<()> {
@@ -1188,5 +1228,19 @@ mod tests {
     #[test]
     fn test_mask_secret_passthrough_invalid() {
         assert_eq!(mask_secret("not a url"), "<invalid>");
+    }
+
+    #[test]
+    fn test_mask_secret_truncates_relay() {
+        let uri = "bunker://aabbcc?relay=wss%3A%2F%2Fabcdefghijklmnop.onion%2Fpath&secret=x";
+        let masked = mask_secret(uri);
+        assert!(!masked.contains("abcdefghijklmnop.onion/path"));
+        assert!(masked.contains("secret=%2A%2A%2A") || masked.contains("secret=***"));
+    }
+
+    #[test]
+    fn test_format_registered_at_rfc3339() {
+        let formatted = format_registered_at(0);
+        assert_eq!(formatted, "1970-01-01T00:00:00+00:00");
     }
 }
