@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_PUBKEY_LEN};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
-use crate::types::{KeyHealthStatusInfo, WalletDescriptorInfo};
+use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::VelocityTracker;
 use crate::{
     CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, HEALTH_STATUS_INDEX_KEY,
@@ -211,6 +211,17 @@ struct StoredDescriptor {
     internal_descriptor: String,
     network: String,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    device_registrations: Vec<StoredDeviceRegistration>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StoredDeviceRegistration {
+    pub signer_pubkey: String,
+    pub wallet_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>,
+    pub registered_at: u64,
 }
 
 fn descriptor_key(group_pubkey_hex: &str) -> String {
@@ -257,13 +268,7 @@ pub(crate) fn load_descriptors(storage: &Arc<dyn SecureStorage>) -> Vec<WalletDe
         match storage.load_share_by_key(descriptor_key(group_hex)) {
             Ok(data) => match serde_json::from_slice::<StoredDescriptor>(&data) {
                 Ok(stored) => {
-                    result.push(WalletDescriptorInfo {
-                        group_pubkey: stored.group_pubkey,
-                        external_descriptor: stored.external_descriptor,
-                        internal_descriptor: stored.internal_descriptor,
-                        network: stored.network,
-                        created_at: stored.created_at,
-                    });
+                    result.push(stored_to_info(stored));
                 }
                 Err(e) => {
                     tracing::warn!("Corrupt descriptor for {group_hex}: {e}");
@@ -292,26 +297,14 @@ pub(crate) fn load_descriptor(
         serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
             msg: format!("Failed to deserialize descriptor: {e}"),
         })?;
-    Ok(WalletDescriptorInfo {
-        group_pubkey: stored.group_pubkey,
-        external_descriptor: stored.external_descriptor,
-        internal_descriptor: stored.internal_descriptor,
-        network: stored.network,
-        created_at: stored.created_at,
-    })
+    Ok(stored_to_info(stored))
 }
 
 pub(crate) fn persist_descriptor(
     storage: &Arc<dyn SecureStorage>,
     info: &WalletDescriptorInfo,
 ) -> Result<(), KeepMobileError> {
-    let stored = StoredDescriptor {
-        group_pubkey: info.group_pubkey.clone(),
-        external_descriptor: info.external_descriptor.clone(),
-        internal_descriptor: info.internal_descriptor.clone(),
-        network: info.network.clone(),
-        created_at: info.created_at,
-    };
+    let stored = info_to_stored(info);
     let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize descriptor: {e}"),
     })?;
@@ -327,6 +320,47 @@ pub(crate) fn persist_descriptor(
         persist_descriptor_index(storage, &index)?;
     }
     Ok(())
+}
+
+fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
+    let device_registrations = stored
+        .device_registrations
+        .into_iter()
+        .map(|r| DeviceRegistrationInfo {
+            signer_pubkey: r.signer_pubkey,
+            wallet_name: r.wallet_name,
+            hmac: r.hmac,
+            registered_at: r.registered_at,
+        })
+        .collect();
+    WalletDescriptorInfo {
+        group_pubkey: stored.group_pubkey,
+        external_descriptor: stored.external_descriptor,
+        internal_descriptor: stored.internal_descriptor,
+        network: stored.network,
+        created_at: stored.created_at,
+        device_registrations,
+    }
+}
+
+fn info_to_stored(info: &WalletDescriptorInfo) -> StoredDescriptor {
+    StoredDescriptor {
+        group_pubkey: info.group_pubkey.clone(),
+        external_descriptor: info.external_descriptor.clone(),
+        internal_descriptor: info.internal_descriptor.clone(),
+        network: info.network.clone(),
+        created_at: info.created_at,
+        device_registrations: info
+            .device_registrations
+            .iter()
+            .map(|r| StoredDeviceRegistration {
+                signer_pubkey: r.signer_pubkey.clone(),
+                wallet_name: r.wallet_name.clone(),
+                hmac: r.hmac.clone(),
+                registered_at: r.registered_at,
+            })
+            .collect(),
+    }
 }
 
 pub(crate) fn delete_descriptor(

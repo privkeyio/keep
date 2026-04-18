@@ -173,6 +173,7 @@ pub fn cmd_frost_network_serve(
                                 internal_descriptor,
                                 network,
                                 created_at: now,
+                                device_registrations: Vec::new(),
                             };
                             let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {

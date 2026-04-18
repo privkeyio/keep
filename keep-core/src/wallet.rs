@@ -38,6 +38,20 @@ impl KeyHealthStatus {
     }
 }
 
+/// Record of a hardware signer that has registered this wallet via NIP-46.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceRegistration {
+    /// The NIP-46 signer pubkey (x-only, 32 bytes).
+    pub signer_pubkey: [u8; 32],
+    /// The wallet name sent to the device at registration time.
+    pub wallet_name: String,
+    /// The registration token (HMAC) returned by the device, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<Vec<u8>>,
+    /// Unix timestamp of the successful registration.
+    pub registered_at: u64,
+}
+
 /// A finalized wallet descriptor associated with a FROST group.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalletDescriptor {
@@ -51,4 +65,90 @@ pub struct WalletDescriptor {
     pub network: String,
     /// Unix timestamp when the descriptor was created.
     pub created_at: u64,
+    /// Hardware signers that have registered this wallet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_registrations: Vec<DeviceRegistration>,
+}
+
+impl WalletDescriptor {
+    /// Return the registration record for a signer pubkey, if any.
+    pub fn device_registration(&self, signer_pubkey: &[u8; 32]) -> Option<&DeviceRegistration> {
+        self.device_registrations
+            .iter()
+            .find(|r| &r.signer_pubkey == signer_pubkey)
+    }
+
+    /// Insert or update the registration for a signer pubkey.
+    pub fn upsert_device_registration(&mut self, reg: DeviceRegistration) {
+        if let Some(slot) = self
+            .device_registrations
+            .iter_mut()
+            .find(|r| r.signer_pubkey == reg.signer_pubkey)
+        {
+            *slot = reg;
+        } else {
+            self.device_registrations.push(reg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_descriptor_back_compat_deserializes_without_registrations() {
+        let json = r#"{
+            "group_pubkey": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "external_descriptor": "tr(xpub.../0/*)#abc",
+            "internal_descriptor": "tr(xpub.../1/*)#def",
+            "network": "testnet",
+            "created_at": 1700000000
+        }"#;
+        let desc: WalletDescriptor = serde_json::from_str(json).expect("back-compat deserialize");
+        assert!(desc.device_registrations.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_device_registration_inserts_then_replaces() {
+        let mut desc = WalletDescriptor {
+            group_pubkey: [0u8; 32],
+            external_descriptor: String::new(),
+            internal_descriptor: String::new(),
+            network: "testnet".into(),
+            created_at: 0,
+            device_registrations: Vec::new(),
+        };
+        let signer = [7u8; 32];
+        desc.upsert_device_registration(DeviceRegistration {
+            signer_pubkey: signer,
+            wallet_name: "first".into(),
+            hmac: Some(vec![1, 2, 3]),
+            registered_at: 1,
+        });
+        desc.upsert_device_registration(DeviceRegistration {
+            signer_pubkey: signer,
+            wallet_name: "second".into(),
+            hmac: Some(vec![9, 9, 9]),
+            registered_at: 2,
+        });
+        assert_eq!(desc.device_registrations.len(), 1);
+        let reg = desc.device_registration(&signer).unwrap();
+        assert_eq!(reg.wallet_name, "second");
+        assert_eq!(reg.hmac.as_deref(), Some(&[9, 9, 9][..]));
+    }
+
+    #[test]
+    fn test_empty_registrations_roundtrip_omits_field() {
+        let desc = WalletDescriptor {
+            group_pubkey: [0u8; 32],
+            external_descriptor: "a".into(),
+            internal_descriptor: "b".into(),
+            network: "testnet".into(),
+            created_at: 1,
+            device_registrations: Vec::new(),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        assert!(!json.contains("device_registrations"));
+    }
 }

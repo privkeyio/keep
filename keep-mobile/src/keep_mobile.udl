@@ -155,6 +155,14 @@ dictionary WalletDescriptorInfo {
     string internal_descriptor;
     string network;
     u64 created_at;
+    sequence<DeviceRegistrationInfo> device_registrations;
+};
+
+dictionary DeviceRegistrationInfo {
+    string signer_pubkey;
+    string wallet_name;
+    string? hmac;
+    u64 registered_at;
 };
 
 dictionary RecoveryTierConfig {

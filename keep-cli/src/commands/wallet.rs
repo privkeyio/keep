@@ -179,6 +179,7 @@ pub fn cmd_wallet_descriptor(
         internal_descriptor: internal.clone(),
         network: canonical_network.clone(),
         created_at: now,
+        device_registrations: Vec::new(),
     };
 
     let mut keep = Keep::open(path)?;
@@ -221,7 +222,7 @@ pub fn cmd_wallet_register(
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let desc = keep
+    let mut desc = keep
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
 
@@ -242,12 +243,13 @@ pub fn cmd_wallet_register(
     let multipath = keep_bitcoin::multipath_from_external(&desc.external_descriptor)
         .map_err(|e| KeepError::Runtime(format!("build multipath descriptor: {e}")))?;
 
-    rt.block_on(async {
+    let (signer_pubkey, response) = rt.block_on(async {
         let spinner = out.spinner("Connecting to signer...");
         let client = keep_nip46::Nip46Client::connect_to(device_uri)
             .await
             .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
         spinner.finish();
+        let signer = client.signer_pubkey();
 
         let outcome = async {
             let spinner = out.spinner("Authenticating with signer...");
@@ -268,20 +270,66 @@ pub fn cmd_wallet_register(
         .await;
 
         client.disconnect().await;
-
-        let response = outcome?;
-
-        out.success("Wallet registered on device!");
-        if let Some(hmac) = response.hmac {
-            out.field("Registration token", &hex::encode(hmac));
-            // TODO: persist the HMAC in WalletDescriptor per signer pubkey so
-            // subsequent sessions can prove prior registration to the device.
-            out.info("Save this token: it is required for subsequent device sessions.");
-        } else {
-            out.info("Device did not return a registration token.");
-        }
-        Ok::<_, KeepError>(())
+        Ok::<_, KeepError>((signer, outcome?))
     })?;
+
+    let signer_bytes = signer_pubkey.to_bytes();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    desc.upsert_device_registration(keep_core::DeviceRegistration {
+        signer_pubkey: signer_bytes,
+        wallet_name: wallet_name.clone(),
+        hmac: response.hmac.clone(),
+        registered_at: now,
+    });
+    keep.store_wallet_descriptor(&desc)?;
+
+    out.success("Wallet registered on device!");
+    out.field("Signer pubkey", &hex::encode(signer_bytes));
+    if let Some(hmac) = &response.hmac {
+        out.field("Registration token", &hex::encode(hmac));
+    } else {
+        out.info("Device did not return a registration token.");
+    }
+    out.info("Registration saved to wallet descriptor.");
+
+    Ok(())
+}
+
+pub fn cmd_wallet_registrations(out: &Output, path: &Path, group: &str) -> Result<()> {
+    let group_pubkey = parse_group_id(group)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let desc = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no descriptor for this group".into()))?;
+
+    out.newline();
+    out.header("Registered Hardware Signers");
+    out.field("Group", &hex::encode(group_pubkey));
+
+    if desc.device_registrations.is_empty() {
+        out.info("No hardware signers have registered this wallet.");
+        return Ok(());
+    }
+
+    for reg in &desc.device_registrations {
+        out.newline();
+        out.field("Signer pubkey", &hex::encode(reg.signer_pubkey));
+        out.field("Wallet name", &reg.wallet_name);
+        out.field("Registered at", &reg.registered_at.to_string());
+        if let Some(hmac) = &reg.hmac {
+            out.field("Registration token", &hex::encode(hmac));
+        }
+    }
 
     Ok(())
 }
@@ -789,6 +837,7 @@ pub fn cmd_wallet_propose(
             internal_descriptor,
             network: network.to_string(),
             created_at: now,
+            device_registrations: Vec::new(),
         };
 
         keep.store_wallet_descriptor(&descriptor)?;

@@ -210,6 +210,11 @@ pub(crate) enum WalletCommands {
         #[arg(long, help = "Wallet display name sent to the signer")]
         name: Option<String>,
     },
+    /// List hardware signers that have registered a stored wallet
+    Registrations {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+    },
     /// Propose a wallet descriptor via Nostr descriptor coordination
     Propose {
         #[arg(short, long, help = "FROST group npub or hex")]

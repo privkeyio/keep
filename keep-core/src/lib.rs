@@ -86,7 +86,7 @@ use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
 use crate::storage::Storage;
-pub use crate::wallet::WalletDescriptor;
+pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 
 /// The main Keep type for encrypted key management.
 pub struct Keep {

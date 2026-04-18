@@ -37,10 +37,10 @@ pub use signing_policy::{
 };
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DkgConfig, DkgStatus,
-    FrostGenerationResult, GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo,
-    PeerStatus, RecoveryTierConfig, SignRequest, SignRequestMetadata, ThresholdConfig,
-    WalletDescriptorInfo,
+    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
+    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, KeepLiveState,
+    KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
+    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
 #[uniffi::export]
@@ -1155,7 +1155,7 @@ impl KeepMobile {
     ) -> Result<Option<String>, KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
-        let desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
+        let mut desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
         let name = wallet_name.unwrap_or_else(|| format!("keep-{}", &group_pubkey[..8]));
 
         let multipath =
@@ -1165,12 +1165,11 @@ impl KeepMobile {
                 }
             })?;
 
-        // TODO: persist the returned HMAC in the stored WalletDescriptor per
-        // signer pubkey so subsequent sessions can prove prior registration.
-        self.runtime.block_on(async {
+        let (signer_hex, hmac_hex) = self.runtime.block_on(async {
             let client = keep_nip46::Nip46Client::connect_to(&device_uri)
                 .await
                 .map_err(nip46_to_mobile_error)?;
+            let signer_hex = hex::encode(client.signer_pubkey().to_bytes());
 
             let outcome: Result<Option<String>, KeepMobileError> = async {
                 client.connect().await.map_err(nip46_to_mobile_error)?;
@@ -1183,8 +1182,31 @@ impl KeepMobile {
             .await;
 
             client.disconnect().await;
-            outcome
-        })
+            outcome.map(|hmac_hex| (signer_hex, hmac_hex))
+        })?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let registration = DeviceRegistrationInfo {
+            signer_pubkey: signer_hex,
+            wallet_name: name,
+            hmac: hmac_hex.clone(),
+            registered_at: now,
+        };
+        if let Some(slot) = desc
+            .device_registrations
+            .iter_mut()
+            .find(|r| r.signer_pubkey == registration.signer_pubkey)
+        {
+            *slot = registration;
+        } else {
+            desc.device_registrations.push(registration);
+        }
+        persistence::persist_descriptor(&self.storage, &desc)?;
+
+        Ok(hmac_hex)
     }
 
     pub fn wallet_descriptor_set_callbacks(&self, callbacks: Arc<dyn DescriptorCallbacks>) {
@@ -1630,6 +1652,7 @@ impl KeepMobile {
                 internal_descriptor: d.internal_descriptor.clone(),
                 network: d.network.clone(),
                 created_at: d.created_at,
+                device_registrations: Vec::new(),
             });
         }
 
@@ -1814,6 +1837,16 @@ impl KeepMobile {
                 internal_descriptor: wd.internal_descriptor.clone(),
                 network: wd.network.clone(),
                 created_at: wd.created_at,
+                device_registrations: wd
+                    .device_registrations
+                    .iter()
+                    .map(|r| DeviceRegistrationInfo {
+                        signer_pubkey: hex::encode(r.signer_pubkey),
+                        wallet_name: r.wallet_name.clone(),
+                        hmac: r.hmac.as_deref().map(hex::encode),
+                        registered_at: r.registered_at,
+                    })
+                    .collect(),
             });
         }
 
@@ -2694,6 +2727,7 @@ impl KeepMobile {
             internal_descriptor: internal_descriptor.clone(),
             network,
             created_at,
+            device_registrations: Vec::new(),
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

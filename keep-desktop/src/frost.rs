@@ -1243,6 +1243,7 @@ impl App {
             internal_descriptor: internal_descriptor.clone(),
             network: network.clone(),
             created_at,
+            device_registrations: Vec::new(),
         };
 
         let store_result = {
