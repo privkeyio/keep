@@ -143,8 +143,7 @@ impl Nip46Client {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let mut params: Vec<Zeroizing<String>> =
-            vec![Zeroizing::new(self.signer_pubkey.to_hex())];
+        let mut params: Vec<Zeroizing<String>> = vec![Zeroizing::new(self.signer_pubkey.to_hex())];
         if let Some(ref s) = self.secret {
             params.push(Zeroizing::new(s.as_str().to_string()));
         }
@@ -405,8 +404,7 @@ fn new_request_id() -> String {
 /// so a secret passed here never lives in a non-zeroized `String`.
 fn append_json_string(buf: &mut Zeroizing<String>, value: &str) -> Result<()> {
     let escaped = Zeroizing::new(
-        serde_json::to_string(value)
-            .map_err(|e| StorageError::serialization(e.to_string()))?,
+        serde_json::to_string(value).map_err(|e| StorageError::serialization(e.to_string()))?,
     );
     buf.push_str(escaped.as_str());
     Ok(())

@@ -1214,12 +1214,12 @@ impl KeepMobile {
         // Atomically reload the descriptor under the storage lock so a
         // concurrent register/edit cannot drop our update.
         let persisted = {
-            let _guard = self
-                .descriptor_write_lock
-                .lock()
-                .map_err(|_| KeepMobileError::StorageError {
-                    msg: "descriptor lock poisoned".into(),
-                })?;
+            let _guard =
+                self.descriptor_write_lock
+                    .lock()
+                    .map_err(|_| KeepMobileError::StorageError {
+                        msg: "descriptor lock poisoned".into(),
+                    })?;
             let mut desc = persistence::load_descriptor(&self.storage, &group_pubkey)?;
             let registration = DeviceRegistrationInfo {
                 signer_pubkey: signer_hex,

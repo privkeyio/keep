@@ -79,8 +79,7 @@ async fn test_nip46_client_rejects_unknown_method() {
         KeepError::NetworkErr(NetworkError::Response { message, .. }) => {
             assert!(!message.is_empty(), "empty response error message");
             assert!(
-                message.contains("register_wallet rejected")
-                    || message.contains("Unknown method"),
+                message.contains("register_wallet rejected") || message.contains("Unknown method"),
                 "unexpected response error: {message}"
             );
         }

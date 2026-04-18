@@ -73,8 +73,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contains_tail_rejects_nested_path() {
-        assert!(!contains_tail("xpub.../0/0/*)", '0'));
+    fn contains_tail_matches_terminating_tail_of_deeper_path() {
+        // Deeper paths like /86'/0'/0'/0/* also terminate in /0/*; the final
+        // segment drives external/change derivation and must be flagged.
+        assert!(contains_tail("xpub.../0/0/*)", '0'));
+    }
+
+    #[test]
+    fn contains_tail_ignores_non_terminating_matches() {
+        // /0/*/ is not a tail (not followed by ')' or ','): do not match.
+        assert!(!contains_tail("xpub.../0/*/0/*)", '1'));
+        // /0 not followed by /* is not a tail.
+        assert!(!contains_tail("xpub.../0/1/*)", '0'));
     }
 
     #[test]
@@ -84,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_leaves_nested_path_alone() {
+    fn rewrite_targets_the_terminating_segment() {
         let input = "tr(xpub.../0/0/*)";
         let out = rewrite_trailing_zero_star(input);
         assert_eq!(out, "tr(xpub.../0/<0;1>/*)");
