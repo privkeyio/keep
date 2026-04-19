@@ -96,27 +96,21 @@ impl DescriptorExport {
     }
 
     pub fn internal_descriptor(&self) -> Result<String> {
-        let desc = self
-            .descriptor
-            .split('#')
-            .next()
-            .unwrap_or(&self.descriptor);
-        let body = if desc.contains("/0/*)") {
-            desc.replace("/0/*)", "/1/*)")
-        } else {
-            desc.to_string()
-        };
+        let body = self.descriptor_body().replace("/0/*)", "/1/*)");
         let (canonical, _) = canonicalize_descriptor(&body)?;
         Ok(canonical)
     }
 
     pub fn is_single_chain(&self) -> bool {
-        let desc = self
-            .descriptor
+        let body = self.descriptor_body();
+        !body.contains("/0/*)") && !body.contains("<0;1>")
+    }
+
+    fn descriptor_body(&self) -> &str {
+        self.descriptor
             .split('#')
             .next()
-            .unwrap_or(&self.descriptor);
-        !desc.contains("/0/*)") && !desc.contains("<0;1>")
+            .unwrap_or(&self.descriptor)
     }
 
     pub fn multipath_descriptor(&self) -> Result<String> {
@@ -188,12 +182,10 @@ fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
         .parse()
         .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
     let canonical = parsed.to_string();
-    let checksum = canonical
-        .rsplit_once('#')
-        .map(|(_, c)| c.to_string())
-        .ok_or_else(|| {
-            BitcoinError::Descriptor("rust-miniscript returned descriptor without checksum".into())
-        })?;
+    let (_, checksum) = canonical.rsplit_once('#').ok_or_else(|| {
+        BitcoinError::Descriptor("rust-miniscript returned descriptor without checksum".into())
+    })?;
+    let checksum = checksum.to_string();
     Ok((canonical, checksum))
 }
 
@@ -470,9 +462,9 @@ mod tests {
         // canonical descriptor formatting. The emitted descriptor string is a
         // consensus value across FROST peers; if this literal changes, mixed
         // miniscript versions will break descriptor coordination.
-        let xonly =
-            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let expected = "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2";
+        let xonly = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let expected =
+            "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2";
         let (canonical, _) = canonicalize_descriptor(&format!("tr({xonly})")).unwrap();
         assert_eq!(canonical, expected);
     }

@@ -297,13 +297,13 @@ fn tier_miniscript(tier: &TierInfo) -> String {
     let inner = if tier.keys.len() == 1 && tier.threshold == 1 {
         format!("pk({})", tier.keys[0])
     } else {
-        let key_list = tier
+        let keys = tier
             .keys
             .iter()
-            .map(|k| k.to_string())
+            .map(XOnlyPublicKey::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        format!("multi_a({},{})", tier.threshold, key_list)
+        format!("multi_a({},{keys})", tier.threshold)
     };
     match tier.timelock_blocks {
         Some(blocks) => format!("and_v(v:older({blocks}),{inner})"),
@@ -317,12 +317,8 @@ fn build_tree_string(leaves: &[String], depths: &[u8]) -> String {
     for (leaf, &d) in leaves.iter().zip(depths) {
         stack.push((d, leaf.clone()));
         while stack.len() >= 2 && stack[stack.len() - 1].0 == stack[stack.len() - 2].0 {
-            let Some((d_top, s_top)) = stack.pop() else {
-                break;
-            };
-            let Some((_, s_second)) = stack.pop() else {
-                break;
-            };
+            let (d_top, s_top) = stack.pop().expect("len >= 2");
+            let (_, s_second) = stack.pop().expect("len >= 2");
             stack.push((d_top.saturating_sub(1), format!("{{{s_second},{s_top}}}")));
         }
     }
