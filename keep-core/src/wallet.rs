@@ -127,7 +127,6 @@ pub struct WalletDescriptor {
 }
 
 impl WalletDescriptor {
-<<<<<<< HEAD
     /// Return the registration record for a signer pubkey, if any.
     pub fn device_registration(&self, signer_pubkey: &[u8; 32]) -> Option<&DeviceRegistration> {
         self.device_registrations

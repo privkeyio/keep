@@ -44,6 +44,11 @@ pub const PSBT_SESSION_TIMEOUT_SECS: u64 = 600;
 pub const PSBT_SESSION_MAX_TIMEOUT_SECS: u64 = 86400;
 pub const PSBT_SIGNING_PHASE_TIMEOUT_SECS: u64 = 300;
 pub const PSBT_FINALIZE_PHASE_TIMEOUT_SECS: u64 = 120;
+/// Window from session creation during which the proposer expects the first
+/// signer to respond. Once exceeded in the `Proposed` state the session is
+/// treated as timed out in the propose/ack phase (distinct from signing,
+/// which is measured from `first_sig_at`).
+pub const PSBT_PROPOSE_ACK_PHASE_TIMEOUT_SECS: u64 = 300;
 pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
@@ -63,7 +68,13 @@ pub(crate) fn is_valid_xpub(xpub: &str) -> bool {
 }
 
 pub(crate) fn is_valid_fingerprint(fp: &str) -> bool {
-    fp.len() == MAX_FINGERPRINT_LENGTH && fp.chars().all(|c| c.is_ascii_hexdigit())
+    // Canonical form is exactly 8 lowercase hex characters. Enforcing the
+    // case at the protocol boundary keeps downstream equality checks
+    // case-sensitive without surprises (CLI already lowercases).
+    fp.len() == MAX_FINGERPRINT_LENGTH
+        && fp
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -500,6 +511,9 @@ impl KfpMessage {
                 }
                 if p.signer_fingerprint.is_none() && p.signer_share_index.is_none() {
                     return Err("PsbtSign must specify signer identity");
+                }
+                if p.signer_fingerprint.is_some() && p.signer_share_index.is_some() {
+                    return Err("PsbtSign must not specify both signer_share_index and signer_fingerprint");
                 }
                 if let Some(si) = p.signer_share_index {
                     if si == 0 {

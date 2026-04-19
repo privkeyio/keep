@@ -41,8 +41,14 @@ impl KfpNode {
         let sessions = self.psbt_sessions.read();
         let session = sessions.get_session(session_id)?;
         let initiator = *session.initiator()?;
-        let (psbt_hash, output_count, fee_sats, network) =
+        let descriptor_hash = *session.descriptor_hash();
+        let (psbt_hash, output_count, fee_sats) =
             decode_psbt_for_snapshot(session.current_psbt())?;
+        let network = self
+            .descriptor_lookup
+            .as_deref()
+            .and_then(|l| l.network_for(&self.group_pubkey, &descriptor_hash))
+            .unwrap_or_else(|| "unknown".to_string());
         Some(PsbtSessionSnapshot {
             session_id: *session.session_id(),
             tier_index: session.tier_index(),
@@ -76,6 +82,12 @@ impl KfpNode {
         if expected_share_signers.is_empty() && expected_fingerprints.is_empty() {
             return Err(FrostNetError::Session(
                 "Must specify at least one expected signer".into(),
+            ));
+        }
+
+        if descriptor_hash == [0u8; 32] {
+            return Err(FrostNetError::Session(
+                "descriptor_hash is the placeholder all-zero hash; refusing to propose a PSBT for an un-coordinated descriptor".into(),
             ));
         }
 
@@ -170,8 +182,16 @@ impl KfpNode {
             ));
         }
 
-        self.broadcast_psbt_event(&msg, &session_id, "psbt_propose", &target_peers)
-            .await?;
+        let (reached, broadcast_err) = self
+            .broadcast_psbt_event_partial(&msg, &session_id, "psbt_propose", &target_peers)
+            .await;
+        if let Some(err) = broadcast_err {
+            // Best-effort abort for peers that did receive the proposal so
+            // they don't keep the session alive while we consider it failed.
+            self.best_effort_abort(&session_id, &reached, "proposer aborting after partial broadcast failure").await;
+            self.psbt_sessions.write().remove_session(&session_id);
+            return Err(err);
+        }
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtProposed {
             session_id,
@@ -323,15 +343,18 @@ impl KfpNode {
     }
 
     /// Encrypt and send a PSBT coordination message to each target peer.
-    /// Attempts every target even if some fail; returns an aggregated error
-    /// listing each failed peer when any send fails.
-    async fn broadcast_psbt_event(
+    /// Attempts every target even if some fail. Returns the list of peers the
+    /// event was successfully delivered to, alongside any aggregated error.
+    /// Callers with initiator responsibilities may use the reached-peer list
+    /// to best-effort abort partially-broadcast sessions.
+    async fn broadcast_psbt_event_partial(
         &self,
         msg: &KfpMessage,
         session_id: &[u8; 32],
         msg_type: &'static str,
         targets: &[PublicKey],
-    ) -> Result<()> {
+    ) -> (Vec<PublicKey>, Option<FrostNetError>) {
+        let mut reached: Vec<PublicKey> = Vec::new();
         let mut failures: Vec<(PublicKey, String)> = Vec::new();
         for pubkey in targets {
             let send_result: Result<()> = async {
@@ -350,30 +373,78 @@ impl KfpNode {
                 Ok(())
             }
             .await;
-            if let Err(e) = send_result {
-                warn!(
-                    session_id = %hex::encode(session_id),
-                    msg_type,
-                    peer = %pubkey,
-                    error = %e,
-                    "PSBT broadcast to peer failed"
-                );
-                failures.push((*pubkey, e.to_string()));
+            match send_result {
+                Ok(()) => reached.push(*pubkey),
+                Err(e) => {
+                    warn!(
+                        session_id = %hex::encode(session_id),
+                        msg_type,
+                        peer = %pubkey,
+                        error = %e,
+                        "PSBT broadcast to peer failed"
+                    );
+                    failures.push((*pubkey, e.to_string()));
+                }
             }
         }
-        if failures.is_empty() {
-            Ok(())
+        let err = if failures.is_empty() {
+            None
         } else {
             let detail = failures
                 .iter()
                 .map(|(pk, err)| format!("{pk}: {err}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            Err(FrostNetError::Transport(format!(
+            Some(FrostNetError::Transport(format!(
                 "PSBT {msg_type} broadcast failed for {}/{} peers: {detail}",
                 failures.len(),
                 targets.len()
             )))
+        };
+        (reached, err)
+    }
+
+    /// Thin wrapper over `broadcast_psbt_event_partial` that discards the
+    /// reached-peer list and returns an error if any send failed.
+    async fn broadcast_psbt_event(
+        &self,
+        msg: &KfpMessage,
+        session_id: &[u8; 32],
+        msg_type: &'static str,
+        targets: &[PublicKey],
+    ) -> Result<()> {
+        let (_, err) = self
+            .broadcast_psbt_event_partial(msg, session_id, msg_type, targets)
+            .await;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Best-effort send `PsbtAbort` to the given peers. Errors are logged and
+    /// swallowed since this runs as rollback from a failed broadcast and must
+    /// not mask the original failure.
+    async fn best_effort_abort(
+        &self,
+        session_id: &[u8; 32],
+        peers: &[PublicKey],
+        reason: &str,
+    ) {
+        if peers.is_empty() {
+            return;
+        }
+        let payload = PsbtAbortPayload::new(*session_id, self.group_pubkey, reason);
+        let msg = KfpMessage::PsbtAbort(payload);
+        let (_, err) = self
+            .broadcast_psbt_event_partial(&msg, session_id, "psbt_abort", peers)
+            .await;
+        if let Some(e) = err {
+            warn!(
+                session_id = %hex::encode(session_id),
+                error = %e,
+                "best-effort PSBT abort broadcast had failures",
+            );
         }
     }
 
@@ -457,30 +528,50 @@ impl KfpNode {
 
         let msg = KfpMessage::PsbtSign(payload);
 
-        let event = KfpEventBuilder::psbt_event(
+        // Commit the signature to our local session before sending so we
+        // reject duplicate local contributions on retry, but capture enough
+        // information to roll back if the wire send fails.
+        {
+            let mut sessions = self.psbt_sessions.write();
+            let session = sessions
+                .get_session_mut(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
+            session.add_signature(
+                signer.clone(),
+                merged_psbt.clone(),
+                signer_marker(&signer),
+            )?;
+        }
+
+        let event = match KfpEventBuilder::psbt_event(
             &self.keys,
             initiator_pubkey,
             &self.group_pubkey,
             &session_id,
             "psbt_sign",
             &msg,
-        )?;
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                self.rollback_local_signature(&session_id, &signer);
+                return Err(e);
+            }
+        };
 
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-
-        {
-            let mut sessions = self.psbt_sessions.write();
-            let session = sessions
-                .get_session_mut(&session_id)
-                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.add_signature(signer.clone(), merged_psbt, signer_marker(&signer))?;
+        if let Err(e) = self.client.send_event(&event).await {
+            self.rollback_local_signature(&session_id, &signer);
+            return Err(FrostNetError::Transport(e.to_string()));
         }
 
         info!(session_id = %hex::encode(session_id), "Sent PSBT signature contribution");
         Ok(())
+    }
+
+    fn rollback_local_signature(&self, session_id: &[u8; 32], signer: &SignerId) {
+        let mut sessions = self.psbt_sessions.write();
+        if let Some(session) = sessions.get_session_mut(session_id) {
+            session.remove_signature(signer);
+        }
     }
 
     pub(crate) async fn handle_psbt_sign(
@@ -511,6 +602,7 @@ impl KfpNode {
                 SignerId::Share(idx)
             }
             (None, Some(fp)) => {
+                let fp = fp.to_ascii_lowercase();
                 let sender_fingerprints = {
                     let peers = self.peers.read();
                     let peer = peers.get_peer_by_pubkey(&sender).ok_or_else(|| {
@@ -520,7 +612,7 @@ impl KfpNode {
                     })?;
                     peer.recovery_xpubs
                         .iter()
-                        .map(|x| x.fingerprint.clone())
+                        .map(|x| x.fingerprint.to_ascii_lowercase())
                         .collect::<HashSet<_>>()
                 };
                 if !sender_fingerprints.contains(&fp) {
@@ -597,23 +689,67 @@ impl KfpNode {
         final_tx: Option<(Vec<u8>, [u8; 32])>,
     ) -> Result<()> {
         let txid = final_tx.as_ref().map(|(_, id)| *id);
+
+        let (expected_signers, initiator) = {
+            let sessions = self.psbt_sessions.read();
+            let session = sessions
+                .get_session(&session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
+            (
+                session.expected_signers().clone(),
+                session.initiator().copied(),
+            )
+        };
+
+        let mut payload =
+            PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt.clone());
+        if let Some((tx, id)) = final_tx.clone() {
+            payload = payload.with_final_tx(tx, id);
+        }
+        let msg = KfpMessage::PsbtFinalize(payload);
+
+        let online = self.bidirectional_online_peers();
+        let target_peers: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            online
+                .into_iter()
+                .filter(|pk| {
+                    if Some(*pk) == initiator {
+                        return true;
+                    }
+                    let Some(peer) = peers.get_peer_by_pubkey(pk) else {
+                        return false;
+                    };
+                    expected_signers.iter().any(|sid| match sid {
+                        SignerId::Share(idx) => peer.share_index == *idx,
+                        SignerId::Fingerprint(fp) => {
+                            peer.recovery_xpubs.iter().any(|x| &x.fingerprint == fp)
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        // Broadcast before flipping local state so a broadcast failure doesn't
+        // leave peers in the dark while we believe the session is finalized.
+        let (_reached, broadcast_err) = self
+            .broadcast_psbt_event_partial(&msg, &session_id, "psbt_finalize", &target_peers)
+            .await;
+        if let Some(e) = &broadcast_err {
+            warn!(
+                session_id = %hex::encode(session_id),
+                error = %e,
+                "finalize broadcast had failures; committing local state anyway so caller sees finalization",
+            );
+        }
+
         {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
                 .get_session_mut(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.set_finalized(finalized_psbt.clone(), final_tx.clone())?;
+            session.set_finalized(finalized_psbt, final_tx)?;
         }
-
-        let mut payload = PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt);
-        if let Some((tx, id)) = final_tx {
-            payload = payload.with_final_tx(tx, id);
-        }
-        let msg = KfpMessage::PsbtFinalize(payload);
-
-        let target_peers = self.bidirectional_online_peers();
-        self.broadcast_psbt_event(&msg, &session_id, "psbt_finalize", &target_peers)
-            .await?;
 
         let _ = self
             .event_tx
@@ -783,7 +919,7 @@ impl KfpNode {
 
 /// Decode a PSBT and extract snapshot-safe fields. Returns `None` on decode
 /// error (fail-closed).
-fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<u64>, String)> {
+fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<u64>)> {
     let psbt = bitcoin::psbt::Psbt::deserialize(psbt_bytes).ok()?;
 
     let mut hasher = Sha256::new();
@@ -792,55 +928,32 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
 
     let output_count = u32::try_from(psbt.unsigned_tx.output.len()).ok()?;
 
-    let all_witness = psbt.inputs.iter().all(|i| i.witness_utxo.is_some());
-    let fee_sats = if all_witness {
-        let total_in: Option<u64> = psbt.inputs.iter().try_fold(0u64, |acc, i| {
-            i.witness_utxo
-                .as_ref()
-                .and_then(|u| acc.checked_add(u.value.to_sat()))
-        });
-        let total_out: Option<u64> = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()));
-        match (total_in, total_out) {
-            (Some(i), Some(o)) => i.checked_sub(o),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    let network = psbt
+    let total_in: Option<u64> = psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter()).try_fold(
+        0u64,
+        |acc, (psbt_in, tx_in)| {
+            let value_sat = if let Some(wu) = psbt_in.witness_utxo.as_ref() {
+                wu.value.to_sat()
+            } else if let Some(nwu) = psbt_in.non_witness_utxo.as_ref() {
+                let vout = tx_in.previous_output.vout as usize;
+                let out = nwu.output.get(vout)?;
+                out.value.to_sat()
+            } else {
+                return None;
+            };
+            acc.checked_add(value_sat)
+        },
+    );
+    let total_out: Option<u64> = psbt
         .unsigned_tx
         .output
         .iter()
-        .find_map(|o| {
-            for net in [
-                bitcoin::Network::Bitcoin,
-                bitcoin::Network::Testnet,
-                bitcoin::Network::Signet,
-                bitcoin::Network::Regtest,
-            ] {
-                if bitcoin::Address::from_script(&o.script_pubkey, net).is_ok() {
-                    return Some(
-                        match net {
-                            bitcoin::Network::Bitcoin => "bitcoin",
-                            bitcoin::Network::Testnet => "testnet",
-                            bitcoin::Network::Signet => "signet",
-                            bitcoin::Network::Regtest => "regtest",
-                            _ => "unknown",
-                        }
-                        .to_string(),
-                    );
-                }
-            }
-            None
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()));
+    let fee_sats = match (total_in, total_out) {
+        (Some(i), Some(o)) => i.checked_sub(o),
+        _ => None,
+    };
 
-    Some((psbt_hash, output_count, fee_sats, network))
+    Some((psbt_hash, output_count, fee_sats))
 }
 
 fn signer_marker(signer: &SignerId) -> Vec<u8> {

@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{FrostNetError, Result};
 use crate::protocol::{
     is_valid_fingerprint, MAX_PARTICIPANTS, MAX_PSBT_SIZE, PSBT_FINALIZE_PHASE_TIMEOUT_SECS,
-    PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS,
+    PSBT_PROPOSE_ACK_PHASE_TIMEOUT_SECS, PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS,
+    PSBT_SIGNING_PHASE_TIMEOUT_SECS,
 };
 
 const MAX_SESSIONS: usize = 32;
@@ -287,6 +288,24 @@ impl PsbtSession {
         Ok(())
     }
 
+    /// Roll back a locally-recorded signature. Intended for the caller that
+    /// optimistically committed a contribution under `add_signature` and
+    /// then saw the wire send fail; keeps local state consistent with what
+    /// other peers have observed. If the rollback empties the signature set
+    /// the session transitions back to `Proposed`.
+    pub fn remove_signature(&mut self, signer: &SignerId) -> bool {
+        let removed = self.received_sigs.remove(signer).is_some();
+        self.partial_psbts.remove(signer);
+        if removed && self.received_sigs.is_empty() {
+            self.current_psbt = self.proposal_psbt.clone();
+            self.first_sig_at = None;
+            if matches!(self.state, PsbtSessionState::Signing) {
+                self.state = PsbtSessionState::Proposed;
+            }
+        }
+        removed
+    }
+
     /// Transition to Finalized state with an optional final (signed) tx.
     ///
     /// Must be called while the session is in `Signing` state and the
@@ -380,8 +399,10 @@ impl PsbtSession {
             PsbtSessionState::Proposed => {
                 if self.created_at.elapsed() > self.timeout {
                     Some("session")
-                } else if self.created_at.elapsed() > self.signing_timeout {
-                    Some("signing")
+                } else if self.created_at.elapsed()
+                    > Duration::from_secs(PSBT_PROPOSE_ACK_PHASE_TIMEOUT_SECS)
+                {
+                    Some("propose")
                 } else {
                     None
                 }
@@ -462,7 +483,8 @@ impl PsbtSessionManager {
         timeout: Option<Duration>,
     ) -> Result<&mut PsbtSession> {
         if let Some(existing) = self.sessions.get(&session_id) {
-            if !existing.is_expired() {
+            let aborted = matches!(existing.state(), PsbtSessionState::Aborted(_));
+            if !existing.is_expired() && !aborted {
                 return Err(FrostNetError::Session("PSBT session already active".into()));
             }
             self.sessions.remove(&session_id);
