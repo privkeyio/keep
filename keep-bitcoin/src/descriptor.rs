@@ -5,6 +5,7 @@ use std::str::FromStr;
 use bitcoin::bip32::Xpub;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::{Network, XOnlyPublicKey};
+use miniscript::{Descriptor, DescriptorPublicKey};
 
 use crate::address::AddressDerivation;
 use crate::error::{BitcoinError, Result};
@@ -47,10 +48,10 @@ impl DescriptorExport {
 
         let descriptor = format!("tr([{fingerprint}/86'/{coin_type}'/{account}']{xpub}/0/*)");
 
-        let checksum = compute_checksum(&descriptor)?;
+        let (descriptor, checksum) = canonicalize_descriptor(&descriptor)?;
 
         Ok(Self {
-            descriptor: format!("{descriptor}#{checksum}"),
+            descriptor,
             checksum,
             fingerprint: fingerprint.to_string(),
             network,
@@ -67,15 +68,10 @@ impl DescriptorExport {
         let fingerprint = Self::pubkey_fingerprint(group_pubkey);
 
         let (descriptor, checksum) = match recovery {
-            None => {
-                let desc = format!("tr({xonly})");
-                let checksum = compute_checksum(&desc)?;
-                (format!("{desc}#{checksum}"), checksum)
-            }
+            None => canonicalize_descriptor(&format!("tr({xonly})"))?,
             Some(config) => {
                 let output = config.build_with_internal_key(&xonly)?;
-                let checksum = compute_checksum(&output.descriptor)?;
-                (format!("{}#{checksum}", output.descriptor), checksum)
+                canonicalize_descriptor(&output.descriptor)?
             }
         };
 
@@ -100,18 +96,22 @@ impl DescriptorExport {
     }
 
     pub fn internal_descriptor(&self) -> Result<String> {
-        let desc = self
-            .descriptor
+        let body = keep_core::descriptor::rewrite_trailing_zero_to_one(self.descriptor_body());
+        let (canonical, _) = canonicalize_descriptor(&body)?;
+        Ok(canonical)
+    }
+
+    pub fn is_single_chain(&self) -> bool {
+        let body = self.descriptor_body();
+        !keep_core::descriptor::has_single_path_tail(body)
+            && !keep_core::descriptor::has_multipath_marker(body)
+    }
+
+    fn descriptor_body(&self) -> &str {
+        self.descriptor
             .split('#')
             .next()
-            .unwrap_or(&self.descriptor);
-        if !desc.contains("/0/*)") {
-            let checksum = compute_checksum(desc)?;
-            return Ok(format!("{desc}#{checksum}"));
-        }
-        let internal = desc.replace("/0/*)", "/1/*)");
-        let checksum = compute_checksum(&internal)?;
-        Ok(format!("{internal}#{checksum}"))
+            .unwrap_or(&self.descriptor)
     }
 
     pub fn multipath_descriptor(&self) -> Result<String> {
@@ -119,6 +119,11 @@ impl DescriptorExport {
     }
 
     pub fn to_sparrow_json(&self, name: &str) -> Result<String> {
+        if self.is_single_chain() {
+            return Err(BitcoinError::Descriptor(
+                "single-chain descriptor cannot be exported to Sparrow: external and change paths would collide causing address reuse".into(),
+            ));
+        }
         let internal = self.internal_descriptor()?;
 
         let json = serde_json::json!({
@@ -168,81 +173,21 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
 
     let normalized = keep_core::descriptor::rewrite_trailing_zero_star(body);
 
-    let checksum = compute_checksum(&normalized)?;
-    Ok(format!("{normalized}#{checksum}"))
+    let (canonical, _) = canonicalize_descriptor(&normalized)?;
+    Ok(canonical)
 }
 
-fn compute_checksum(descriptor: &str) -> Result<String> {
-    const CHECKSUM_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    const GENERATOR: [u64; 5] = [
-        0xf5dee51989,
-        0xa9fdca3312,
-        0x1bab10e32d,
-        0x3706b1677a,
-        0x644d626ffd,
-    ];
-
-    fn polymod(c: u64, val: u64) -> u64 {
-        let mut c = c;
-        let c0 = c >> 35;
-        c = ((c & 0x7ffffffff) << 5) ^ val;
-        for (i, gen) in GENERATOR.iter().enumerate() {
-            if (c0 >> i) & 1 == 1 {
-                c ^= gen;
-            }
-        }
-        c
-    }
-
-    let mut c: u64 = 1;
-    let mut cls: u64 = 0;
-    let mut clscount = 0;
-
-    for ch in descriptor.chars() {
-        if ch == '#' {
-            break;
-        }
-
-        let pos = match ch {
-            'a'..='z' => (ch as u64) - ('a' as u64),
-            'A'..='Z' => (ch as u64) - ('A' as u64),
-            '0'..='9' => (ch as u64) - ('0' as u64) + 26,
-            '&' | '\'' | '(' | ')' | '*' | '+' | ',' | '-' | '.' | '/' => {
-                (ch as u64) - ('&' as u64) + 36
-            }
-            ':' | ';' | '<' | '=' | '>' | '?' | '@' => (ch as u64) - (':' as u64) + 46,
-            '[' | '\\' | ']' | '^' | '_' | '`' => (ch as u64) - ('[' as u64) + 53,
-            '{' | '|' | '}' | '~' => (ch as u64) - ('{' as u64) + 59,
-            _ => continue,
-        };
-
-        c = polymod(c, pos & 31);
-        cls = cls * 3 + (pos >> 5);
-        clscount += 1;
-
-        if clscount == 3 {
-            c = polymod(c, cls);
-            cls = 0;
-            clscount = 0;
-        }
-    }
-
-    if clscount > 0 {
-        c = polymod(c, cls);
-    }
-
-    for _ in 0..8 {
-        c = polymod(c, 0);
-    }
-
-    c ^= 1;
-
-    let mut checksum = String::with_capacity(8);
-    for i in 0..8 {
-        checksum.push(CHECKSUM_CHARSET[((c >> (5 * (7 - i))) & 31) as usize] as char);
-    }
-
-    Ok(checksum)
+fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
+    let body = body.split('#').next().unwrap_or(body);
+    let parsed: Descriptor<DescriptorPublicKey> = body
+        .parse()
+        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    let canonical = parsed.to_string();
+    let (_, checksum) = canonical.rsplit_once('#').ok_or_else(|| {
+        BitcoinError::Descriptor("rust-miniscript returned descriptor without checksum".into())
+    })?;
+    let checksum = checksum.to_string();
+    Ok((canonical, checksum))
 }
 
 #[cfg(test)]
@@ -341,7 +286,7 @@ mod tests {
 
         let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
         assert!(export.descriptor.starts_with(&format!("tr({xonly},")));
-        assert!(export.descriptor.contains("csv="));
+        assert!(export.descriptor.contains("older("));
         assert!(export.descriptor.contains('#'));
     }
 
@@ -453,6 +398,77 @@ mod tests {
         let err = multipath_from_external(&input).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("<1;0>"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_descriptor_round_trips_through_miniscript() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        use miniscript::{Descriptor, DescriptorPublicKey};
+
+        let secp = Secp256k1::new();
+        let seeded = |seed: u8| -> [u8; 32] {
+            let kp = Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
+            kp.x_only_public_key().0.serialize()
+        };
+
+        let group_pk = seeded(0x42);
+        let primary_pk = seeded(0x10);
+        let recovery1_pk = seeded(0x20);
+        let recovery2_pk = seeded(0x30);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![primary_pk, group_pk],
+                threshold: 2,
+            },
+            recovery_tiers: vec![
+                RecoveryTier {
+                    keys: vec![recovery1_pk],
+                    threshold: 1,
+                    timelock_months: 6,
+                },
+                RecoveryTier {
+                    keys: vec![recovery2_pk],
+                    threshold: 1,
+                    timelock_months: 12,
+                },
+            ],
+            network: Network::Signet,
+        };
+
+        let export =
+            DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Signet).unwrap();
+
+        let external = export.external_descriptor().to_string();
+
+        let external_roundtrip = Descriptor::<DescriptorPublicKey>::from_str(&external)
+            .unwrap()
+            .to_string();
+        assert_eq!(external, external_roundtrip);
+
+        let (_, emitted_checksum) = external.rsplit_once('#').unwrap();
+        assert_eq!(emitted_checksum.len(), 8);
+        assert!(
+            emitted_checksum
+                .chars()
+                .all(|c| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(c)),
+            "checksum {emitted_checksum} contains non-BIP-380 charset chars"
+        );
+    }
+
+    #[test]
+    fn test_reference_descriptor_canonical_form() {
+        // Guards against accidental miniscript version bumps that shift
+        // canonical descriptor formatting. The emitted descriptor string is a
+        // consensus value across FROST peers; if this literal changes, mixed
+        // miniscript versions will break descriptor coordination.
+        // secp256k1 generator point G x-coordinate; stable, known-valid x-only key.
+        let xonly = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let expected =
+            "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2";
+        let (canonical, _) = canonicalize_descriptor(&format!("tr({xonly})")).unwrap();
+        assert_eq!(canonical, expected);
     }
 
     #[test]

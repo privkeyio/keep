@@ -67,6 +67,40 @@ pub fn rewrite_trailing_zero_star(body: &str) -> String {
     out
 }
 
+/// Rewrite every anchored `/0/*` tail to `/1/*`, using the same anchoring
+/// rules as [`rewrite_trailing_zero_star`] so nested paths and origin info
+/// are left alone. Used to derive an internal (change) descriptor from an
+/// external (receive) descriptor without touching unrelated `/0/*` substrings.
+pub fn rewrite_trailing_zero_to_one(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    let mut run_start = 0;
+    while i < bytes.len() {
+        if i + 4 < bytes.len()
+            && bytes[i] == b'/'
+            && bytes[i + 1] == b'0'
+            && bytes[i + 2] == b'/'
+            && bytes[i + 3] == b'*'
+            && matches!(bytes[i + 4], b')' | b',')
+            && (i == 0 || bytes[i - 1] != b'/')
+        {
+            if run_start < i {
+                out.push_str(&body[run_start..i]);
+            }
+            out.push_str("/1/*");
+            i += 4;
+            run_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if run_start < bytes.len() {
+        out.push_str(&body[run_start..]);
+    }
+    out
+}
+
 /// Returns true if the descriptor body contains any BIP-389 multipath
 /// placeholder (`<0;1>` or `<1;0>`).
 pub fn has_multipath_marker(body: &str) -> bool {
@@ -123,5 +157,29 @@ mod tests {
         let input = "tr([deadbeef/86'/0'/0']xpub.../0/*)";
         let out = rewrite_trailing_zero_star(input);
         assert_eq!(out, "tr([deadbeef/86'/0'/0']xpub.../<0;1>/*)");
+    }
+
+    #[test]
+    fn rewrite_zero_to_one_targets_terminating_segment() {
+        assert_eq!(
+            rewrite_trailing_zero_to_one("tr(xpub.../0/0/*)"),
+            "tr(xpub.../0/1/*)"
+        );
+    }
+
+    #[test]
+    fn rewrite_zero_to_one_ignores_origin_info() {
+        assert_eq!(
+            rewrite_trailing_zero_to_one("tr([deadbeef/86'/0'/0']xpub.../0/*)"),
+            "tr([deadbeef/86'/0'/0']xpub.../1/*)"
+        );
+    }
+
+    #[test]
+    fn rewrite_zero_to_one_handles_multiple_keys() {
+        assert_eq!(
+            rewrite_trailing_zero_to_one("wsh(sortedmulti(2,xpub1/0/*,xpub2/0/*))"),
+            "wsh(sortedmulti(2,xpub1/1/*,xpub2/1/*))"
+        );
     }
 }
