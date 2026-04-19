@@ -96,14 +96,15 @@ impl DescriptorExport {
     }
 
     pub fn internal_descriptor(&self) -> Result<String> {
-        let body = self.descriptor_body().replace("/0/*)", "/1/*)");
+        let body = keep_core::descriptor::rewrite_trailing_zero_to_one(self.descriptor_body());
         let (canonical, _) = canonicalize_descriptor(&body)?;
         Ok(canonical)
     }
 
     pub fn is_single_chain(&self) -> bool {
         let body = self.descriptor_body();
-        !body.contains("/0/*)") && !body.contains("<0;1>")
+        !keep_core::descriptor::has_single_path_tail(body)
+            && !keep_core::descriptor::has_multipath_marker(body)
     }
 
     fn descriptor_body(&self) -> &str {
@@ -462,6 +463,7 @@ mod tests {
         // canonical descriptor formatting. The emitted descriptor string is a
         // consensus value across FROST peers; if this literal changes, mixed
         // miniscript versions will break descriptor coordination.
+        // secp256k1 generator point G x-coordinate; stable, known-valid x-only key.
         let xonly = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let expected =
             "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gxjkeue2";
