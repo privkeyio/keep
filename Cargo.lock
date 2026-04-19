@@ -4207,6 +4207,7 @@ dependencies = [
 name = "keep-desktop"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "bitcoin",
  "chrono",
  "dirs",

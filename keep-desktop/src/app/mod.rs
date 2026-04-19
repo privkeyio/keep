@@ -153,6 +153,7 @@ pub struct App {
     pub(crate) active_coordinations: HashMap<[u8; 32], ActiveCoordination>,
     pub(crate) peer_xpubs: HashMap<u16, Vec<keep_frost_net::AnnouncedXpub>>,
     pub(crate) pending_psbt_signatures: Vec<crate::screen::wallet::PsbtPendingDisplay>,
+    pub(crate) active_psbt_spend: Option<[u8; 32]>,
     import_return_to_nsec: bool,
     distribute_state: Option<distribute::State>,
     distribute_export_id: Option<u16>,
@@ -234,6 +235,7 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             pending_psbt_signatures: Vec::new(),
+            active_psbt_spend: None,
             import_return_to_nsec: false,
             distribute_state: None,
             distribute_export_id: None,
@@ -325,6 +327,7 @@ impl App {
                 | Message::RestoreResult(..)
                 | Message::KillSwitchDeactivateResult(..)
                 | Message::RejectPsbtSignatureResult(..)
+                | Message::SpendStartedResult(..)
         );
         #[cfg(unix)]
         let is_background = is_background
@@ -407,7 +410,8 @@ impl App {
             | Message::WalletAnnounceResult(..)
             | Message::WalletRegisterResult(..)
             | Message::RejectPsbtSignature(..)
-            | Message::RejectPsbtSignatureResult(..) => self.handle_wallet_global_message(message),
+            | Message::RejectPsbtSignatureResult(..)
+            | Message::SpendStartedResult(..) => self.handle_wallet_global_message(message),
 
             Message::Relay(msg) => self.handle_relay_message(msg),
             Message::ConnectRelayResult(result) => self.handle_connect_relay_result(result),
@@ -821,6 +825,7 @@ impl App {
             active_coordinations: HashMap::new(),
             peer_xpubs: HashMap::new(),
             pending_psbt_signatures: Vec::new(),
+            active_psbt_spend: None,
             import_return_to_nsec: false,
             distribute_state: None,
             distribute_export_id: None,

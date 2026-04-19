@@ -757,12 +757,24 @@ pub(crate) async fn frost_event_listener(
                             "PSBT signature received ({signature_count}/{threshold}): {}",
                             &hex::encode(session_id)[..8]
                         ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtSignatureReceived {
+                                session_id,
+                                signature_count,
+                                threshold,
+                            },
+                        );
                     }
-                    Ok(KfpNodeEvent::PsbtFinalized { session_id, .. }) => {
+                    Ok(KfpNodeEvent::PsbtFinalized { session_id, txid }) => {
                         log!(EventLogType::Descriptor, format!(
                             "PSBT finalized: {}",
                             &hex::encode(session_id)[..8]
                         ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtFinalized { session_id, txid },
+                        );
                     }
                     Ok(KfpNodeEvent::PsbtAborted { session_id, reason }) => {
                         log!(EventLogType::Error, format!(
@@ -770,6 +782,10 @@ pub(crate) async fn frost_event_listener(
                             &hex::encode(session_id)[..8],
                             truncate_peer_string(&reason)
                         ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtAborted { session_id, reason },
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1079,6 +1095,33 @@ impl App {
                     ws.pending_psbt_signatures
                         .retain(|e| e.session_id != session_id);
                     ws.pending_psbt_signatures.push(entry);
+                }
+            }
+            FrostNodeMsg::PsbtSignatureReceived {
+                session_id,
+                signature_count,
+                threshold,
+            } => {
+                if self.active_psbt_spend == Some(session_id) {
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_progress(signature_count, threshold);
+                    }
+                }
+            }
+            FrostNodeMsg::PsbtFinalized { session_id, txid } => {
+                if self.active_psbt_spend == Some(session_id) {
+                    self.active_psbt_spend = None;
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_finalized(txid);
+                    }
+                }
+            }
+            FrostNodeMsg::PsbtAborted { session_id, reason } => {
+                if self.active_psbt_spend == Some(session_id) {
+                    self.active_psbt_spend = None;
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_failed(reason);
+                    }
                 }
             }
         }
