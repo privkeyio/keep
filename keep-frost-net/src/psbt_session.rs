@@ -235,9 +235,11 @@ impl PsbtSession {
         self.txid.as_ref()
     }
 
-    /// Add a signature contribution from a signer. Updates the current PSBT
-    /// (an opaque blob; the caller is responsible for producing a PSBT that
-    /// includes their own signature merged in).
+    /// Add a signature contribution from a signer. The merged PSBT is stored
+    /// in `partial_psbts` keyed by signer; `current_psbt` is set from the
+    /// first signer's contribution and retained for snapshot display only.
+    /// Subsequent signatures do not overwrite `current_psbt`; the proposer
+    /// aggregates from `partial_psbts` at finalization time.
     pub fn add_signature(
         &mut self,
         signer: SignerId,
@@ -409,6 +411,7 @@ impl PsbtSession {
             PsbtSessionState::Aborted(_) | PsbtSessionState::Finalized
         ) {
             self.state = PsbtSessionState::Aborted(reason);
+            self.finalizing = false;
         }
     }
 
@@ -443,9 +446,7 @@ impl PsbtSession {
                 if self.created_at.elapsed() > self.timeout {
                     return Some("session");
                 }
-                let first = self
-                    .first_sig_at
-                    .expect("first_sig_at is always set when entering Signing");
+                let first = self.first_sig_at.unwrap_or(self.created_at);
                 if self.threshold_met() && first.elapsed() > self.finalize_timeout {
                     Some("finalize")
                 } else if first.elapsed() > self.signing_timeout {

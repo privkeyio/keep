@@ -1423,6 +1423,13 @@ fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
         .map_err(|e| KeepError::InvalidInput(format!("cannot read PSBT file: {e}")))?;
     // Accept either raw PSBT binary (prefix "psbt\xff") or base64-encoded text.
     if raw.starts_with(b"psbt\xff") {
+        if raw.len() > keep_frost_net::MAX_PSBT_SIZE {
+            return Err(KeepError::InvalidInput(format!(
+                "PSBT is {} bytes, exceeds maximum {}",
+                raw.len(),
+                keep_frost_net::MAX_PSBT_SIZE
+            )));
+        }
         return Ok(raw);
     }
     let text = String::from_utf8(raw.clone()).map_err(|_| {
@@ -1432,6 +1439,13 @@ fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
     let decoded = STANDARD
         .decode(text.trim())
         .map_err(|e| KeepError::InvalidInput(format!("cannot base64-decode PSBT: {e}")))?;
+    if decoded.len() > keep_frost_net::MAX_PSBT_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "decoded PSBT is {} bytes, exceeds maximum {}",
+            decoded.len(),
+            keep_frost_net::MAX_PSBT_SIZE
+        )));
+    }
     if !decoded.starts_with(b"psbt\xff") {
         return Err(KeepError::InvalidInput(
             "decoded PSBT does not start with the PSBT magic bytes".into(),

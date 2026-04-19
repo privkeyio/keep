@@ -37,6 +37,7 @@ pub const MAX_RECOVERY_XPUBS: usize = 20;
 pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
 pub const MAX_KEY_PROOF_PSBT_SIZE: usize = 512;
 pub const MAX_PSBT_SIZE: usize = 32768;
+pub const PSBT_MAGIC: &[u8; 5] = b"psbt\xff";
 pub const MAX_PSBT_INPUTS: usize = 256;
 pub const MAX_PSBT_OUTPUTS: usize = 256;
 pub const MAX_PSBT_ADDRESS_LENGTH: usize = 128;
@@ -428,8 +429,14 @@ impl KfpMessage {
                 if p.psbt.is_empty() {
                     return Err("PSBT must not be empty");
                 }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
                 if p.psbt.len() > MAX_PSBT_SIZE {
                     return Err("PSBT exceeds maximum size");
+                }
+                if (p.tier_index as usize) >= MAX_RECOVERY_TIERS {
+                    return Err("tier_index exceeds maximum recovery tiers");
                 }
                 if let Some(t) = p.timeout_secs {
                     if t == 0 {
@@ -501,6 +508,9 @@ impl KfpMessage {
                 if p.psbt.is_empty() {
                     return Err("PSBT must not be empty");
                 }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
                 if p.psbt.len() > MAX_PSBT_SIZE {
                     return Err("PSBT exceeds maximum size");
                 }
@@ -527,8 +537,14 @@ impl KfpMessage {
                 if p.psbt.is_empty() {
                     return Err("PSBT must not be empty");
                 }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
                 if p.psbt.len() > MAX_PSBT_SIZE {
                     return Err("PSBT exceeds maximum size");
+                }
+                if p.final_tx.is_some() != p.txid.is_some() {
+                    return Err("final_tx and txid must both be present or both absent");
                 }
                 if let Some(tx) = &p.final_tx {
                     if tx.is_empty() {

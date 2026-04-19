@@ -432,29 +432,23 @@ impl App {
         };
 
         let keep_arc = self.keep.clone();
-        let descriptor_hash = match tokio::task::block_in_place(|| {
-            with_keep_blocking(&keep_arc, "Failed to load descriptor", move |keep| {
-                let descriptor = keep
-                    .get_wallet_descriptor(&group_pubkey)
-                    .map_err(friendly_err)?
-                    .ok_or_else(|| "No wallet descriptor for this group".to_string())?;
-                if descriptor.policy_hash == [0u8; 32] {
-                    return Err("Descriptor has placeholder policy_hash; coordinate the descriptor before spending".into());
-                }
-                Ok(descriptor.canonical_hash())
-            })
-        }) {
-            Ok(h) => h,
-            Err(e) => {
-                if let Screen::Wallet(s) = &mut self.screen {
-                    s.spend_failed(e.clone());
-                }
-                return Task::none();
-            }
-        };
-
         Task::perform(
             async move {
+                let descriptor_hash = tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Failed to load descriptor", move |keep| {
+                        let descriptor = keep
+                            .get_wallet_descriptor(&group_pubkey)
+                            .map_err(friendly_err)?
+                            .ok_or_else(|| "No wallet descriptor for this group".to_string())?;
+                        if descriptor.policy_hash == [0u8; 32] {
+                            return Err("Descriptor has placeholder policy_hash; coordinate the descriptor before spending".into());
+                        }
+                        Ok(descriptor.canonical_hash())
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
                 node.request_psbt_spend(
                     descriptor_hash,
                     tier,

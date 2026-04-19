@@ -322,6 +322,23 @@ impl KfpEventBuilder {
         msg_type: &'static str,
         msg: &KfpMessage,
     ) -> Result<Event> {
+        if msg.message_type() != msg_type {
+            return Err(FrostNetError::Protocol(format!(
+                "psbt_event msg_type tag '{msg_type}' does not match payload type '{}'",
+                msg.message_type()
+            )));
+        }
+        if msg.group_pubkey() != Some(group_pubkey) {
+            return Err(FrostNetError::Protocol(
+                "psbt_event group_pubkey tag does not match payload".into(),
+            ));
+        }
+        if msg.session_id() != Some(session_id) {
+            return Err(FrostNetError::Protocol(
+                "psbt_event session_id tag does not match payload".into(),
+            ));
+        }
+
         let content = msg.to_json()?;
 
         let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)

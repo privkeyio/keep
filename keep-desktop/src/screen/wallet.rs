@@ -36,29 +36,29 @@ fn parse_psbt_text(input: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
 
     use base64::{engine::general_purpose, Engine};
-    let bytes = if let Ok(b) = general_purpose::STANDARD.decode(cleaned.as_bytes()) {
-        b
-    } else if let Ok(b) = general_purpose::STANDARD_NO_PAD.decode(cleaned.as_bytes()) {
-        b
-    } else if let Ok(b) = hex::decode(&cleaned) {
-        b
-    } else {
-        return Err("PSBT must be valid base64 or hex".into());
-    };
+    let candidates: [Result<Vec<u8>, ()>; 3] = [
+        general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .map_err(|_| ()),
+        general_purpose::STANDARD_NO_PAD
+            .decode(cleaned.as_bytes())
+            .map_err(|_| ()),
+        hex::decode(&cleaned).map_err(|_| ()),
+    ];
 
-    if bytes.is_empty() {
-        return Err("PSBT cannot be empty".into());
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.starts_with(b"psbt\xff") {
+            continue;
+        }
+        if candidate.len() > MAX_PSBT_SIZE {
+            return Err(format!(
+                "PSBT is {} bytes, exceeds maximum {MAX_PSBT_SIZE}",
+                candidate.len()
+            ));
+        }
+        return Ok(candidate);
     }
-    if bytes.len() > MAX_PSBT_SIZE {
-        return Err(format!(
-            "PSBT is {} bytes, exceeds maximum {MAX_PSBT_SIZE}",
-            bytes.len()
-        ));
-    }
-    if !bytes.starts_with(b"psbt\xff") {
-        return Err("Decoded data does not start with PSBT magic bytes".into());
-    }
-    Ok(bytes)
+    Err("PSBT must be valid base64 or hex starting with the PSBT magic bytes".into())
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +161,7 @@ pub struct SpendState {
     pub signer_shares: String,
     pub signer_fingerprints: String,
     pub timeout_secs: String,
+    pub validated_threshold: Option<u32>,
     pub phase: SpendPhase,
     pub session_id: Option<[u8; 32]>,
     pub error: Option<String>,
@@ -201,6 +202,7 @@ pub enum Message {
     SpendTimeoutChanged(String),
     SubmitSpend,
     CancelSpend,
+    DoneSpend,
 }
 
 impl std::fmt::Debug for Message {
@@ -248,6 +250,7 @@ impl std::fmt::Debug for Message {
             Self::SpendTimeoutChanged(v) => f.debug_tuple("SpendTimeoutChanged").field(v).finish(),
             Self::SubmitSpend => write!(f, "SubmitSpend"),
             Self::CancelSpend => write!(f, "CancelSpend"),
+            Self::DoneSpend => write!(f, "DoneSpend"),
         }
     }
 }
@@ -524,6 +527,10 @@ impl State {
                 self.spend = None;
                 Some(Event::CancelSpend { session_id })
             }
+            Message::DoneSpend => {
+                self.spend = None;
+                None
+            }
             Message::SubmitRegister => {
                 let Some(r) = &mut self.register else {
                     return None;
@@ -569,6 +576,7 @@ impl State {
             signer_shares: String::new(),
             signer_fingerprints: String::new(),
             timeout_secs: String::new(),
+            validated_threshold: None,
             phase: SpendPhase::Compose,
             session_id: None,
             error: None,
@@ -581,7 +589,7 @@ impl State {
             s.error = None;
             s.phase = SpendPhase::InFlight {
                 received: 0,
-                threshold: s.threshold.parse().unwrap_or(0),
+                threshold: s.validated_threshold.unwrap_or(0),
             };
         }
     }
@@ -714,6 +722,7 @@ impl State {
         };
 
         s.error = None;
+        s.validated_threshold = Some(threshold);
 
         Some(Event::SubmitSpend {
             wallet_idx: s.wallet_idx,
@@ -1381,13 +1390,13 @@ impl State {
     }
 
     fn view_spend<'a>(&'a self, spend: &'a SpendState) -> Element<'a, Message> {
-        let back_label = match &spend.phase {
-            SpendPhase::Compose | SpendPhase::Failed(_) => "< Back",
-            SpendPhase::InFlight { .. } => "< Cancel",
-            SpendPhase::Finalized { .. } => "< Done",
+        let (back_label, back_msg) = match &spend.phase {
+            SpendPhase::Compose | SpendPhase::Failed(_) => ("< Back", Message::CancelSpend),
+            SpendPhase::InFlight { .. } => ("< Cancel", Message::CancelSpend),
+            SpendPhase::Finalized { .. } => ("< Done", Message::DoneSpend),
         };
         let back_btn = button(text(back_label).size(theme::size::BODY))
-            .on_press(Message::CancelSpend)
+            .on_press(back_msg)
             .style(theme::text_button)
             .padding([theme::space::XS, theme::space::SM]);
 

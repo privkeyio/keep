@@ -44,7 +44,11 @@ use crate::session::{NetworkSession, SessionManager};
 /// descriptor whose session is no longer held in memory (e.g. after restart).
 pub trait PersistedDescriptorLookup: Send + Sync {
     /// Returns `true` if a persisted descriptor for `group` exists with the
-    /// canonical `sha256(external || internal || policy_hash)` equal to `hash`.
+    /// canonical hash equal to `hash`. Implementations must use the same
+    /// length-framed digest produced by `WalletDescriptor::canonical_hash`,
+    /// i.e. `sha256(le_u64(len(external)) || external || le_u64(len(internal))
+    /// || internal || policy_hash)`, so unframed concatenations match across
+    /// stores.
     fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool;
 
     /// Return the canonical network string of the persisted descriptor whose

@@ -102,6 +102,11 @@ impl KfpNode {
             created_at,
         );
 
+        let expected_fingerprints: Vec<String> = expected_fingerprints
+            .into_iter()
+            .map(|fp| fp.to_ascii_lowercase())
+            .collect();
+
         let mut signers: HashSet<SignerId> = HashSet::new();
         for idx in &expected_share_signers {
             signers.insert(SignerId::Share(*idx));
@@ -695,6 +700,12 @@ impl KfpNode {
                 session.initiator().copied(),
             )
         };
+
+        if initiator != Some(self.keys.public_key()) {
+            return Err(FrostNetError::PolicyViolation(
+                "Only the session initiator may finalize the PSBT".into(),
+            ));
+        }
 
         let mut payload =
             PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt.clone());
