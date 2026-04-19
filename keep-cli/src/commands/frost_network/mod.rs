@@ -23,24 +23,16 @@ mod hardware;
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
 
-/// Adapter exposing `Keep`'s persisted wallet descriptors to
-/// `keep_frost_net::PersistedDescriptorLookup`.
-struct KeepDescriptorLookup(Arc<Mutex<Keep>>);
-
-impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
-    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
-        let guard = match self.0.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        let descriptors = match guard.list_wallet_descriptors() {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        descriptors
-            .iter()
-            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
-    }
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
+/// and returns no match when the vault is locked or the mutex is poisoned.
+fn descriptor_lookup_for(
+    keep: Arc<Mutex<Keep>>,
+) -> keep_frost_net::KeepDescriptorLookup<impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static>
+{
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        guard.list_wallet_descriptors().ok()
+    })
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
@@ -91,7 +83,7 @@ pub fn cmd_frost_network_serve(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         let node =
-            node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+            node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();

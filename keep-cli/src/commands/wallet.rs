@@ -17,26 +17,16 @@ use crate::output::Output;
 
 use super::get_password;
 
-/// Adapter exposing `Keep`'s persisted wallet descriptors to
-/// `keep_frost_net::PersistedDescriptorLookup`, so the PSBT coordinator can
-/// accept descriptor_hash values for sessions whose in-memory descriptor
-/// session was dropped (e.g. after a restart).
-struct KeepDescriptorLookup(Arc<Mutex<Keep>>);
-
-impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
-    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
-        let guard = match self.0.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        let descriptors = match guard.list_wallet_descriptors() {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        descriptors
-            .iter()
-            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
-    }
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
+/// and returns no match when the vault is locked or the mutex is poisoned.
+fn descriptor_lookup_for(
+    keep: Arc<Mutex<Keep>>,
+) -> keep_frost_net::KeepDescriptorLookup<impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static>
+{
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        guard.list_wallet_descriptors().ok()
+    })
 }
 
 fn parse_group_hex(group_hex: &str) -> Result<[u8; 32]> {
@@ -732,7 +722,7 @@ pub fn cmd_wallet_propose(
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = std::sync::Arc::new(node);
 
         let (xpub, fingerprint) = node
@@ -1061,7 +1051,7 @@ pub fn cmd_wallet_announce_keys(
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = std::sync::Arc::new(node);
 
         node.announce()
@@ -1265,7 +1255,7 @@ pub fn cmd_wallet_spend(
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep.clone())));
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = std::sync::Arc::new(node);
 
         node.announce()
@@ -1416,6 +1406,18 @@ pub fn cmd_wallet_spend(
 }
 
 fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
+    // Cap file size before touching it so a hostile caller cannot exhaust
+    // memory by pointing at a huge file. The `* 2` budget accounts for
+    // base64-encoded PSBTs, which inflate the raw size by ~4/3.
+    const MAX_PSBT_FILE_BYTES: u64 = (keep_frost_net::MAX_PSBT_SIZE as u64) * 2;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot stat PSBT file: {e}")))?;
+    if meta.len() > MAX_PSBT_FILE_BYTES {
+        return Err(KeepError::InvalidInput(format!(
+            "PSBT file is {} bytes, exceeds maximum {MAX_PSBT_FILE_BYTES}",
+            meta.len()
+        )));
+    }
     let raw = std::fs::read(path)
         .map_err(|e| KeepError::InvalidInput(format!("cannot read PSBT file: {e}")))?;
     // Accept either raw PSBT binary (prefix "psbt\xff") or base64-encoded text.

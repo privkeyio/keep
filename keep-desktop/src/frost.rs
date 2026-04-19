@@ -31,27 +31,19 @@ use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 
-/// Adapter exposing the desktop's optional `Keep` to
-/// `keep_frost_net::PersistedDescriptorLookup`.
-struct KeepDescriptorLookup(Arc<Mutex<Option<Keep>>>);
-
-impl keep_frost_net::PersistedDescriptorLookup for KeepDescriptorLookup {
-    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
-        let guard = match self.0.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        let Some(keep) = guard.as_ref() else {
-            return false;
-        };
-        let descriptors = match keep.list_wallet_descriptors() {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        descriptors
-            .iter()
-            .any(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
-    }
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Option<Keep>>>`. Logs a
+/// warning and returns no match when the vault is locked, absent, or the
+/// mutex is poisoned.
+pub(crate) fn descriptor_lookup_for(
+    keep: Arc<Mutex<Option<Keep>>>,
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<keep_core::wallet::WalletDescriptor>> + Send + Sync + 'static,
+> {
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        let keep = guard.as_ref()?;
+        keep.list_wallet_descriptors().ok()
+    })
 }
 
 pub(crate) async fn verify_relay_certificates(
@@ -302,7 +294,7 @@ pub(crate) async fn setup_frost_node(
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
 
-    let node = node.with_descriptor_lookup(Arc::new(KeepDescriptorLookup(keep_arc.clone()))
+    let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep_arc.clone()))
         as Arc<dyn keep_frost_net::PersistedDescriptorLookup>);
 
     let session_store_path = nonce_store_path.with_file_name("descriptor-sessions.redb");

@@ -46,6 +46,71 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     /// Returns `true` if a persisted descriptor for `group` exists with the
     /// canonical `sha256(external || internal || policy_hash)` equal to `hash`.
     fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool;
+
+    /// Return the canonical network string of the persisted descriptor whose
+    /// group + canonical hash match, if any. Used by snapshot helpers to
+    /// report the network without having to infer it from output scripts
+    /// (which mis-classifies regtest/testnet equivalences).
+    fn network_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        let _ = (group, hash);
+        None
+    }
+}
+
+/// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
+///
+/// The closure is invoked on every query and is expected to return the
+/// currently-persisted descriptors, or `None` if the vault cannot be read
+/// (e.g. locked or mutex poisoned). When the closure returns `None` the
+/// lookup logs a warning and reports no match (fail-closed); callers must
+/// ensure the vault is unlocked for PSBT coordination to succeed.
+pub struct KeepDescriptorLookup<F>
+where
+    F: Fn() -> Option<Vec<keep_core::wallet::WalletDescriptor>> + Send + Sync + 'static,
+{
+    fetch: F,
+}
+
+impl<F> KeepDescriptorLookup<F>
+where
+    F: Fn() -> Option<Vec<keep_core::wallet::WalletDescriptor>> + Send + Sync + 'static,
+{
+    pub fn new(fetch: F) -> Self {
+        Self { fetch }
+    }
+
+    fn lookup<T>(
+        &self,
+        f: impl FnOnce(&keep_core::wallet::WalletDescriptor) -> Option<T>,
+        group: &[u8; 32],
+        hash: &[u8; 32],
+    ) -> Option<T> {
+        let Some(descriptors) = (self.fetch)() else {
+            tracing::warn!(
+                group = %hex::encode(group),
+                descriptor_hash = %hex::encode(hash),
+                "KeepDescriptorLookup could not read persisted descriptors (vault locked or unavailable); treating as no-match",
+            );
+            return None;
+        };
+        descriptors
+            .iter()
+            .find(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
+            .and_then(f)
+    }
+}
+
+impl<F> PersistedDescriptorLookup for KeepDescriptorLookup<F>
+where
+    F: Fn() -> Option<Vec<keep_core::wallet::WalletDescriptor>> + Send + Sync + 'static,
+{
+    fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool {
+        self.lookup(|_| Some(()), group, hash).is_some()
+    }
+
+    fn network_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        self.lookup(|d| Some(d.network.clone()), group, hash)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -656,6 +721,16 @@ impl KfpNode {
                 .map(|p| p.pubkey)
                 .collect()
         };
+
+        // Canonicalize fingerprints to lowercase before persisting or sending
+        // so protocol equality checks stay case-sensitive without surprises.
+        let recovery_xpubs: Vec<AnnouncedXpub> = recovery_xpubs
+            .into_iter()
+            .map(|mut x| {
+                x.fingerprint = x.fingerprint.to_ascii_lowercase();
+                x
+            })
+            .collect();
 
         *self.local_recovery_xpubs.write() = recovery_xpubs.clone();
 

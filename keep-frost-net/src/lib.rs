@@ -89,8 +89,8 @@ pub use ecdh::{
 pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{
-    HealthCheckResult, KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy, PersistedDescriptorLookup,
-    PsbtSessionSnapshot, SessionInfo, SigningHooks,
+    HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, PeerPolicy,
+    PersistedDescriptorLookup, PsbtSessionSnapshot, SessionInfo, SigningHooks,
 };
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
