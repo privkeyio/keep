@@ -21,8 +21,9 @@ use super::get_password;
 /// and returns no match when the vault is locked or the mutex is poisoned.
 fn descriptor_lookup_for(
     keep: Arc<Mutex<Keep>>,
-) -> keep_frost_net::KeepDescriptorLookup<impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static>
-{
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static,
+> {
     keep_frost_net::KeepDescriptorLookup::new(move || {
         let guard = keep.lock().ok()?;
         guard.list_wallet_descriptors().ok()

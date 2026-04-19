@@ -81,6 +81,7 @@ pub struct PsbtSession {
     final_tx: Option<Vec<u8>>,
     txid: Option<[u8; 32]>,
     state: PsbtSessionState,
+    finalizing: bool,
     created_at: Instant,
     first_sig_at: Option<Instant>,
     finalized_at: Option<Instant>,
@@ -156,6 +157,7 @@ impl PsbtSession {
             final_tx: None,
             txid: None,
             state: PsbtSessionState::Proposed,
+            finalizing: false,
             created_at: Instant::now(),
             first_sig_at: None,
             finalized_at: None,
@@ -296,14 +298,44 @@ impl PsbtSession {
     pub fn remove_signature(&mut self, signer: &SignerId) -> bool {
         let removed = self.received_sigs.remove(signer).is_some();
         self.partial_psbts.remove(signer);
-        if removed && self.received_sigs.is_empty() {
-            self.current_psbt = self.proposal_psbt.clone();
-            self.first_sig_at = None;
-            if matches!(self.state, PsbtSessionState::Signing) {
-                self.state = PsbtSessionState::Proposed;
+        if removed {
+            if self.received_sigs.is_empty() {
+                self.current_psbt = self.proposal_psbt.clone();
+                self.first_sig_at = None;
+                if matches!(self.state, PsbtSessionState::Signing) {
+                    self.state = PsbtSessionState::Proposed;
+                }
+            } else if let Some(remaining) = self.partial_psbts.values().next().cloned() {
+                self.current_psbt = remaining;
             }
         }
         removed
+    }
+
+    /// Atomic claim-to-finalize check, intended to gate a single caller when
+    /// concurrent signatures cross the threshold. Returns `true` exactly once
+    /// per session: when the session is in `Signing`, threshold is met, and
+    /// finalization has not yet been claimed. On `true`, callers must follow
+    /// through with `set_finalized` or call `clear_finalizing` on failure.
+    pub fn begin_finalize(&mut self) -> bool {
+        if self.finalizing {
+            return false;
+        }
+        if !matches!(self.state, PsbtSessionState::Signing) {
+            return false;
+        }
+        if !self.threshold_met() {
+            return false;
+        }
+        self.finalizing = true;
+        true
+    }
+
+    /// Release the `begin_finalize` claim after a finalize attempt failed
+    /// before it could call `set_finalized`. Safe to call when no claim is
+    /// held.
+    pub fn clear_finalizing(&mut self) {
+        self.finalizing = false;
     }
 
     /// Transition to Finalized state with an optional final (signed) tx.

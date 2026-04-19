@@ -42,8 +42,7 @@ impl KfpNode {
         let session = sessions.get_session(session_id)?;
         let initiator = *session.initiator()?;
         let descriptor_hash = *session.descriptor_hash();
-        let (psbt_hash, output_count, fee_sats) =
-            decode_psbt_for_snapshot(session.current_psbt())?;
+        let (psbt_hash, output_count, fee_sats) = decode_psbt_for_snapshot(session.current_psbt())?;
         let network = self
             .descriptor_lookup
             .as_deref()
@@ -188,7 +187,12 @@ impl KfpNode {
         if let Some(err) = broadcast_err {
             // Best-effort abort for peers that did receive the proposal so
             // they don't keep the session alive while we consider it failed.
-            self.best_effort_abort(&session_id, &reached, "proposer aborting after partial broadcast failure").await;
+            self.best_effort_abort(
+                &session_id,
+                &reached,
+                "proposer aborting after partial broadcast failure",
+            )
+            .await;
             self.psbt_sessions.write().remove_session(&session_id);
             return Err(err);
         }
@@ -425,12 +429,7 @@ impl KfpNode {
     /// Best-effort send `PsbtAbort` to the given peers. Errors are logged and
     /// swallowed since this runs as rollback from a failed broadcast and must
     /// not mask the original failure.
-    async fn best_effort_abort(
-        &self,
-        session_id: &[u8; 32],
-        peers: &[PublicKey],
-        reason: &str,
-    ) {
+    async fn best_effort_abort(&self, session_id: &[u8; 32], peers: &[PublicKey], reason: &str) {
         if peers.is_empty() {
             return;
         }
@@ -536,11 +535,7 @@ impl KfpNode {
             let session = sessions
                 .get_session_mut(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.add_signature(
-                signer.clone(),
-                merged_psbt.clone(),
-                signer_marker(&signer),
-            )?;
+            session.add_signature(signer.clone(), merged_psbt.clone(), signer_marker(&signer))?;
         }
 
         let event = match KfpEventBuilder::psbt_event(
@@ -570,7 +565,12 @@ impl KfpNode {
     fn rollback_local_signature(&self, session_id: &[u8; 32], signer: &SignerId) {
         let mut sessions = self.psbt_sessions.write();
         if let Some(session) = sessions.get_session_mut(session_id) {
-            session.remove_signature(signer);
+            if !session.remove_signature(signer) {
+                debug!(
+                    session_id = %hex::encode(session_id),
+                    "rollback_local_signature: no local signature to remove"
+                );
+            }
         }
     }
 
@@ -637,13 +637,8 @@ impl KfpNode {
 
             session.add_signature(signer.clone(), payload.psbt, signer_marker(&signer))?;
 
-            let threshold_met = session.threshold_met();
             let is_initiator = session.initiator() == Some(&self.keys.public_key());
-            let already_finalized = matches!(
-                session.state(),
-                crate::psbt_session::PsbtSessionState::Finalized
-            );
-            let should_finalize = threshold_met && is_initiator && !already_finalized;
+            let should_finalize = is_initiator && session.begin_finalize();
             let finalized_psbt = if should_finalize {
                 session.current_psbt().to_vec()
             } else {
@@ -928,12 +923,17 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
 
     let output_count = u32::try_from(psbt.unsigned_tx.output.len()).ok()?;
 
-    let total_in: Option<u64> = psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter()).try_fold(
-        0u64,
-        |acc, (psbt_in, tx_in)| {
+    let total_in: Option<u64> = psbt
+        .inputs
+        .iter()
+        .zip(psbt.unsigned_tx.input.iter())
+        .try_fold(0u64, |acc, (psbt_in, tx_in)| {
             let value_sat = if let Some(wu) = psbt_in.witness_utxo.as_ref() {
                 wu.value.to_sat()
             } else if let Some(nwu) = psbt_in.non_witness_utxo.as_ref() {
+                if nwu.compute_txid() != tx_in.previous_output.txid {
+                    return None;
+                }
                 let vout = tx_in.previous_output.vout as usize;
                 let out = nwu.output.get(vout)?;
                 out.value.to_sat()
@@ -941,8 +941,7 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
                 return None;
             };
             acc.checked_add(value_sat)
-        },
-    );
+        });
     let total_out: Option<u64> = psbt
         .unsigned_tx
         .output
@@ -1160,20 +1159,16 @@ mod snapshot_decode_tests {
     #[test]
     fn decode_good_psbt_reports_fee_and_output_count() {
         let bytes = fixture_psbt(true);
-        let (hash, outputs, fee, network) = decode_psbt_for_snapshot(&bytes).expect("decodes");
+        let (hash, outputs, fee) = decode_psbt_for_snapshot(&bytes).expect("decodes");
         assert_ne!(hash, [0u8; 32]);
         assert_eq!(outputs, 1);
         assert_eq!(fee, Some(10_000));
-        assert!(matches!(
-            network.as_str(),
-            "bitcoin" | "testnet" | "signet" | "regtest"
-        ));
     }
 
     #[test]
     fn decode_psbt_without_witness_utxo_reports_none_fee() {
         let bytes = fixture_psbt(false);
-        let (_, outputs, fee, _) = decode_psbt_for_snapshot(&bytes).expect("decodes");
+        let (_, outputs, fee) = decode_psbt_for_snapshot(&bytes).expect("decodes");
         assert_eq!(outputs, 1);
         assert_eq!(fee, None);
     }

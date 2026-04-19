@@ -513,7 +513,9 @@ impl KfpMessage {
                     return Err("PsbtSign must specify signer identity");
                 }
                 if p.signer_fingerprint.is_some() && p.signer_share_index.is_some() {
-                    return Err("PsbtSign must not specify both signer_share_index and signer_fingerprint");
+                    return Err(
+                        "PsbtSign must not specify both signer_share_index and signer_fingerprint",
+                    );
                 }
                 if let Some(si) = p.signer_share_index {
                     if si == 0 {
@@ -572,10 +574,10 @@ impl KfpMessage {
                     if !seen_xpubs.insert(&xpub.xpub) {
                         return Err("Duplicate recovery xpub");
                     }
-                    if xpub.fingerprint.len() != MAX_FINGERPRINT_LENGTH
-                        || !xpub.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        return Err("Recovery fingerprint must be exactly 8 hex characters");
+                    if !is_valid_fingerprint(&xpub.fingerprint) {
+                        return Err(
+                            "Recovery fingerprint must be exactly 8 lowercase hex characters",
+                        );
                     }
                     if let Some(ref label) = xpub.label {
                         if label.is_empty() {

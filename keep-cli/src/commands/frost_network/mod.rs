@@ -27,8 +27,9 @@ pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_har
 /// and returns no match when the vault is locked or the mutex is poisoned.
 fn descriptor_lookup_for(
     keep: Arc<Mutex<Keep>>,
-) -> keep_frost_net::KeepDescriptorLookup<impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static>
-{
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static,
+> {
     keep_frost_net::KeepDescriptorLookup::new(move || {
         let guard = keep.lock().ok()?;
         guard.list_wallet_descriptors().ok()
