@@ -2788,6 +2788,7 @@ impl KeepMobile {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_descriptor_complete(
         storage: &Arc<dyn SecureStorage>,
         cbs: &Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
@@ -2811,7 +2812,11 @@ impl KeepMobile {
             network,
             created_at,
             device_registrations: Vec::new(),
-            policy_hash_hex: Some(hex::encode(policy_hash)),
+            policy_hash_hex: if policy_hash == [0u8; 32] {
+                None
+            } else {
+                Some(hex::encode(policy_hash))
+            },
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

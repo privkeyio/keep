@@ -43,7 +43,8 @@ impl KfpNode {
         let session = sessions.get_session(session_id)?;
         let initiator = *session.initiator()?;
         let descriptor_hash = *session.descriptor_hash();
-        let (psbt_hash, output_count, fee_sats) = decode_psbt_for_snapshot(session.proposal_psbt())?;
+        let (psbt_hash, output_count, fee_sats) =
+            decode_psbt_for_snapshot(session.proposal_psbt())?;
         let network = self
             .descriptor_lookup
             .as_deref()
@@ -861,9 +862,7 @@ impl KfpNode {
         let final_tx = match (payload.final_tx, payload.txid) {
             (Some(tx), Some(id)) => {
                 let decoded: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&tx)
-                    .map_err(|e| {
-                        FrostNetError::Session(format!("final_tx decode failed: {e}"))
-                    })?;
+                    .map_err(|e| FrostNetError::Session(format!("final_tx decode failed: {e}")))?;
                 let computed_bytes: [u8; 32] = decoded.compute_txid().to_byte_array();
                 if computed_bytes != id {
                     return Err(FrostNetError::Session(

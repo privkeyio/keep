@@ -242,6 +242,7 @@ pub(crate) struct StoredDeviceRegistration {
 }
 
 const HMAC_SHA256_HEX_LEN: usize = 64;
+const POLICY_HASH_HEX_LEN: usize = 64;
 
 fn descriptor_key(group_pubkey_hex: &str) -> String {
     format!("{DESCRIPTOR_KEY_PREFIX}{group_pubkey_hex}")
@@ -324,7 +325,7 @@ pub(crate) fn persist_descriptor(
     info: &WalletDescriptorInfo,
 ) -> Result<(), KeepMobileError> {
     match info.policy_hash_hex.as_deref() {
-        Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
+        Some(h) if h.len() == POLICY_HASH_HEX_LEN && h.chars().all(|c| c.is_ascii_hexdigit()) => {
             if h.chars().all(|c| c == '0') {
                 return Err(KeepMobileError::StorageError {
                     msg: "refusing to persist descriptor with placeholder all-zero policy_hash"
@@ -334,7 +335,7 @@ pub(crate) fn persist_descriptor(
         }
         Some(_) => {
             return Err(KeepMobileError::StorageError {
-                msg: "policy_hash_hex must be 64 hex characters".into(),
+                msg: format!("policy_hash_hex must be {POLICY_HASH_HEX_LEN} hex characters"),
             });
         }
         None => {}

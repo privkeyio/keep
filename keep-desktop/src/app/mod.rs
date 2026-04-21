@@ -327,6 +327,7 @@ impl App {
                 | Message::RestoreResult(..)
                 | Message::KillSwitchDeactivateResult(..)
                 | Message::RejectPsbtSignatureResult(..)
+                | Message::CancelSpendResult(..)
                 | Message::SpendStartedResult(..)
         );
         #[cfg(unix)]
@@ -411,6 +412,7 @@ impl App {
             | Message::WalletRegisterResult(..)
             | Message::RejectPsbtSignature(..)
             | Message::RejectPsbtSignatureResult(..)
+            | Message::CancelSpendResult(..)
             | Message::SpendStartedResult(..) => self.handle_wallet_global_message(message),
 
             Message::Relay(msg) => self.handle_relay_message(msg),

@@ -113,19 +113,14 @@ impl App {
             ),
             wallet::Event::CancelSpend { session_id } => {
                 if let Some(sid) = session_id {
-                    if self.active_psbt_spend == Some(sid) {
-                        self.active_psbt_spend = None;
-                    }
                     if let Some(node) = self.get_frost_node() {
                         Task::perform(
                             async move {
-                                if let Err(e) =
-                                    node.abort_psbt_session(sid, "cancelled by user").await
-                                {
-                                    warn!(session = %hex::encode(sid), error = %e, "PSBT abort failed");
-                                }
+                                node.abort_psbt_session(sid, "cancelled by user")
+                                    .await
+                                    .map_err(|e| format!("{e}"))
                             },
-                            |()| Message::Tick,
+                            move |r| Message::CancelSpendResult(sid, r),
                         )
                     } else {
                         Task::none()
@@ -262,6 +257,20 @@ impl App {
                     },
                     move |r| Message::RejectPsbtSignatureResult(session_id, r),
                 )
+            }
+            Message::CancelSpendResult(session_id, result) => {
+                match result {
+                    Ok(()) => {
+                        if self.active_psbt_spend == Some(session_id) {
+                            self.active_psbt_spend = None;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(session = %hex::encode(session_id), error = %e, "PSBT abort failed");
+                        self.set_toast(format!("Cancel failed: {e}"), ToastKind::Error);
+                    }
+                }
+                Task::none()
             }
             Message::RejectPsbtSignatureResult(session_id, result) => {
                 match result {

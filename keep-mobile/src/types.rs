@@ -93,6 +93,7 @@ impl std::fmt::Debug for WalletDescriptorInfo {
             .field("network", &self.network)
             .field("created_at", &self.created_at)
             .field("device_registrations", &self.device_registrations.len())
+            .field("policy_hash_hex", &self.policy_hash_hex)
             .finish()
     }
 }

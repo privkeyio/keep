@@ -60,6 +60,19 @@ impl SignerId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpiredPsbtKind {
+    Finalized,
+    Aborted,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExpiredPsbtSession {
+    pub session_id: [u8; 32],
+    pub reason: String,
+    pub kind: ExpiredPsbtKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PsbtSessionState {
     Proposed,
     Signing,
@@ -565,11 +578,19 @@ impl PsbtSessionManager {
         Ok(self.sessions.get_mut(&session_id).unwrap())
     }
 
-    pub fn cleanup_expired(&mut self) -> Vec<([u8; 32], String)> {
+    pub fn cleanup_expired(&mut self) -> Vec<ExpiredPsbtSession> {
         let mut expired = Vec::new();
         self.sessions.retain(|id, s| {
             if let Some(phase) = s.expired_phase() {
-                expired.push((*id, format!("timeout:{phase}")));
+                let kind = match s.state() {
+                    PsbtSessionState::Finalized => ExpiredPsbtKind::Finalized,
+                    _ => ExpiredPsbtKind::Aborted,
+                };
+                expired.push(ExpiredPsbtSession {
+                    session_id: *id,
+                    reason: format!("timeout:{phase}"),
+                    kind,
+                });
                 false
             } else {
                 true
@@ -786,22 +807,17 @@ mod tests {
     #[test]
     fn test_threshold_met_after_required_sigs() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4])
-            .unwrap();
+        s.add_signature(SignerId::Share(1), vec![1; 4]).unwrap();
         assert!(!s.threshold_met());
-        s.add_signature(SignerId::Share(2), vec![2; 4])
-            .unwrap();
+        s.add_signature(SignerId::Share(2), vec![2; 4]).unwrap();
         assert!(s.threshold_met());
     }
 
     #[test]
     fn test_reject_duplicate_signer() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4])
-            .unwrap();
-        let err = s
-            .add_signature(SignerId::Share(1), vec![2; 4])
-            .unwrap_err();
+        s.add_signature(SignerId::Share(1), vec![1; 4]).unwrap();
+        let err = s.add_signature(SignerId::Share(1), vec![2; 4]).unwrap_err();
         assert!(err.to_string().contains("Duplicate"));
     }
 
@@ -816,10 +832,8 @@ mod tests {
 
     fn finalize_ready_session() -> PsbtSession {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4])
-            .unwrap();
-        s.add_signature(SignerId::Share(2), vec![2; 4])
-            .unwrap();
+        s.add_signature(SignerId::Share(1), vec![1; 4]).unwrap();
+        s.add_signature(SignerId::Share(2), vec![2; 4]).unwrap();
         s
     }
 
@@ -843,8 +857,7 @@ mod tests {
     #[test]
     fn test_set_finalized_below_threshold_rejected() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4])
-            .unwrap();
+        s.add_signature(SignerId::Share(1), vec![1; 4]).unwrap();
         let err = s.set_finalized(vec![9; 4], None).unwrap_err();
         assert!(err.to_string().contains("threshold"));
     }
@@ -861,9 +874,7 @@ mod tests {
     fn test_cannot_sign_after_finalize() {
         let mut s = finalize_ready_session();
         s.set_finalized(vec![9; 4], None).unwrap();
-        let err = s
-            .add_signature(SignerId::Share(3), vec![1; 4])
-            .unwrap_err();
+        let err = s.add_signature(SignerId::Share(3), vec![1; 4]).unwrap_err();
         assert!(err.to_string().contains("already finalized"));
     }
 
@@ -872,9 +883,7 @@ mod tests {
         let mut s = new_session();
         s.abort("user cancelled".into());
         assert!(matches!(s.state(), PsbtSessionState::Aborted(r) if r == "user cancelled"));
-        let err = s
-            .add_signature(SignerId::Share(1), vec![1; 4])
-            .unwrap_err();
+        let err = s.add_signature(SignerId::Share(1), vec![1; 4]).unwrap_err();
         assert!(err.to_string().contains("aborted"));
         let err2 = s.set_finalized(vec![1; 4], None).unwrap_err();
         assert!(err2.to_string().contains("aborted"));
@@ -1030,8 +1039,7 @@ mod tests {
     fn test_proposal_psbt_preserved_after_signatures() {
         let mut s = new_session();
         let original = s.proposal_psbt().to_vec();
-        s.add_signature(SignerId::Share(1), vec![9; 8])
-            .unwrap();
+        s.add_signature(SignerId::Share(1), vec![9; 8]).unwrap();
         assert_eq!(s.proposal_psbt(), &original[..]);
         assert_eq!(s.current_psbt(), &[9; 8][..]);
     }

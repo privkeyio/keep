@@ -389,7 +389,10 @@ impl KfpEventBuilder {
             ));
         }
 
-        KfpMessage::from_json(&content).map_err(FrostNetError::Json)
+        let msg = KfpMessage::from_json(&content).map_err(FrostNetError::Json)?;
+        msg.validate()
+            .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
+        Ok(msg)
     }
 
     pub fn get_message_type(event: &Event) -> Option<String> {

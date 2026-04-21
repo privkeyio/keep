@@ -47,7 +47,7 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     /// canonical hash equal to `hash`. Implementations must use the same
     /// length-framed digest produced by `WalletDescriptor::canonical_hash`,
     /// i.e. `sha256(le_u64(len(external)) || external || le_u64(len(internal))
-    /// || internal || policy_hash)`, so unframed concatenations match across
+    /// || internal || policy_hash)`, so the framed digests match across
     /// stores.
     fn find_by_hash(&self, group: &[u8; 32], hash: &[u8; 32]) -> bool;
 
@@ -483,11 +483,13 @@ pub struct KfpNode {
 /// placeholder when the result is empty. Shared between descriptor and PSBT
 /// coordination paths, which both accept peer-supplied reason strings.
 pub(crate) fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NACK_REASON_LENGTH)
-        .collect();
+    let mut sanitized = String::new();
+    for c in reason.chars().filter(|c| !c.is_control()) {
+        if sanitized.len() + c.len_utf8() > MAX_NACK_REASON_LENGTH {
+            break;
+        }
+        sanitized.push(c);
+    }
     if sanitized.is_empty() {
         "no reason given".to_string()
     } else {
@@ -1022,11 +1024,13 @@ impl KfpNode {
                         });
                     }
                     let expired_psbt = self.psbt_sessions.write().cleanup_expired();
-                    for (session_id, reason) in expired_psbt {
-                        let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
-                            session_id,
-                            reason,
-                        });
+                    for entry in expired_psbt {
+                        if matches!(entry.kind, crate::psbt_session::ExpiredPsbtKind::Aborted) {
+                            let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
+                                session_id: entry.session_id,
+                                reason: entry.reason,
+                            });
+                        }
                     }
                     {
                         let now = Timestamp::now().as_secs();

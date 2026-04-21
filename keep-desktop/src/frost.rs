@@ -1272,7 +1272,9 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.pending_psbt_signatures.clear();
         self.active_coordinations.clear();
+        self.active_psbt_spend = None;
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.frost_node.lock() {
@@ -1282,6 +1284,9 @@ impl App {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
             }
+        }
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.pending_psbt_signatures.clear();
         }
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
@@ -1314,7 +1319,12 @@ impl App {
         }
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.pending_psbt_signatures.clear();
         self.active_coordinations.clear();
+        self.active_psbt_spend = None;
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.pending_psbt_signatures.clear();
+        }
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);

@@ -194,6 +194,7 @@ pub enum Message {
     WalletRegisterResult(Result<(), String>),
     RejectPsbtSignature([u8; 32]),
     RejectPsbtSignatureResult([u8; 32], Result<(), String>),
+    CancelSpendResult([u8; 32], Result<(), String>),
     SpendStartedResult(Result<[u8; 32], String>),
 
     // Relay / FROST
@@ -512,6 +513,11 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::RejectPsbtSignatureResult(id, r) => f
                 .debug_tuple("RejectPsbtSignatureResult")
+                .field(&hex::encode(id))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::CancelSpendResult(id, r) => f
+                .debug_tuple("CancelSpendResult")
                 .field(&hex::encode(id))
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),
