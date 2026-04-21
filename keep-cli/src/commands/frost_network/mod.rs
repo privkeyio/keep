@@ -108,7 +108,7 @@ pub fn cmd_frost_network_serve(
                         tracing::warn!(
                             session,
                             tier_index,
-                            "PSBT signature requested but `frost network serve` does not yet implement signer contribution; the initiator will time out. See https://github.com/privkeyio/keep/issues for tracking."
+                            "PSBT signature requested but `frost network serve` does not yet implement signer contribution; the initiator will time out."
                         );
                     }
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {

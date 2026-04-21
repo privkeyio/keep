@@ -337,11 +337,7 @@ pub(crate) fn persist_descriptor(
                 msg: "policy_hash_hex must be 64 hex characters".into(),
             });
         }
-        None => {
-            return Err(KeepMobileError::StorageError {
-                msg: "policy_hash_hex is required when persisting a descriptor".into(),
-            });
-        }
+        None => {}
     }
     let stored = info_to_stored(info);
     let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {

@@ -109,25 +109,7 @@ impl KfpNode {
             .map(|fp| fp.to_ascii_lowercase())
             .collect();
 
-        // Reject dual-identity expected signers where a single peer holds
-        // both a share index and one of the listed fingerprints, which would
-        // let the same party contribute twice toward threshold.
-        {
-            let peers = self.peers.read();
-            for idx in &expected_share_signers {
-                let Some(peer) = peers.get_peer(*idx) else {
-                    continue;
-                };
-                for xpub in &peer.recovery_xpubs {
-                    let fp_lc = xpub.fingerprint.to_ascii_lowercase();
-                    if expected_fingerprints.contains(&fp_lc) {
-                        return Err(FrostNetError::Session(format!(
-                            "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
-                        )));
-                    }
-                }
-            }
-        }
+        self.reject_dual_identity_signers(&expected_share_signers, &expected_fingerprints)?;
 
         let mut signers: HashSet<SignerId> = HashSet::new();
         for idx in &expected_share_signers {
@@ -282,6 +264,11 @@ impl KfpNode {
         }
 
         self.verify_descriptor_hash_against_stored(&payload.descriptor_hash)?;
+
+        self.reject_dual_identity_signers(
+            &payload.expected_signers,
+            &payload.expected_fingerprints,
+        )?;
 
         let mut signers: HashSet<SignerId> = HashSet::new();
         for idx in &payload.expected_signers {
@@ -488,6 +475,28 @@ impl KfpNode {
         Ok(())
     }
 
+    fn reject_dual_identity_signers(
+        &self,
+        expected_share_signers: &[u16],
+        expected_fingerprints: &[String],
+    ) -> Result<()> {
+        let peers = self.peers.read();
+        for idx in expected_share_signers {
+            let Some(peer) = peers.get_peer(*idx) else {
+                continue;
+            };
+            for xpub in &peer.recovery_xpubs {
+                let fp_lc = xpub.fingerprint.to_ascii_lowercase();
+                if expected_fingerprints.contains(&fp_lc) {
+                    return Err(FrostNetError::Session(format!(
+                        "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {
         let proposers = self.psbt_proposers.read();
         if !proposers.is_empty() && !proposers.contains(&share_index) {
@@ -676,7 +685,7 @@ impl KfpNode {
             }
         };
 
-        let (count, threshold, should_finalize, aggregated_psbt) = {
+        let (count, threshold, should_finalize, aggregated_psbt, aggregation_error) = {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
@@ -686,33 +695,39 @@ impl KfpNode {
 
             let is_initiator = session.initiator() == Some(&self.keys.public_key());
             let should_finalize = is_initiator && session.begin_finalize();
-            let aggregated = if should_finalize {
+            let (aggregated, agg_err) = if should_finalize {
                 match aggregate_partial_psbts(
                     session.proposal_psbt(),
                     session.partial_psbts(),
                     session.required_threshold(),
                 ) {
-                    Ok(bytes) => Some(bytes),
+                    Ok(bytes) => (Some(bytes), None),
                     Err(e) => {
                         warn!(
                             session_id = %hex::encode(payload.session_id),
                             error = %e,
-                            "Auto-finalize aggregation failed; releasing finalize claim"
+                            "Auto-finalize aggregation failed; aborting session"
                         );
                         session.clear_finalizing();
-                        None
+                        (None, Some(e.to_string()))
                     }
                 }
             } else {
-                None
+                (None, None)
             };
             (
                 session.signature_count(),
                 session.required_threshold(),
                 should_finalize && aggregated.is_some(),
                 aggregated,
+                agg_err,
             )
         };
+
+        if let Some(err) = aggregation_error {
+            let reason = format!("aggregation failed: {err}");
+            let _ = self.abort_psbt_session(payload.session_id, &reason).await;
+        }
 
         let _ = self.event_tx.send(KfpNodeEvent::PsbtSignatureReceived {
             session_id: payload.session_id,
@@ -1063,6 +1078,10 @@ fn aggregate_partial_psbts(
             FrostNetError::Session(format!("PSBT combine failed for {signer:?}: {e}"))
         })?;
     }
+    // Threshold check assumes recovery-tier (tap_script_sigs) or classic multisig
+    // (partial_sigs) semantics where each signer contributes a distinct signature.
+    // FROST key-path spends produce a single aggregated tap_key_sig regardless of
+    // threshold; this check must be revised before reuse on that path.
     for (idx, input) in aggregated.inputs.iter().enumerate() {
         let sig_count = input.partial_sigs.len()
             + input.tap_script_sigs.len()
