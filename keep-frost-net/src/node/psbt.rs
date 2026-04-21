@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
-use crate::psbt_session::{derive_psbt_session_id, SignerId};
+use crate::psbt_session::{derive_psbt_session_id, SignerId, MAX_PSBT_SESSIONS_PER_PROPOSER};
 
 use super::{KfpNode, KfpNodeEvent};
 
@@ -93,6 +93,7 @@ impl KfpNode {
 
         let our_index = self.share.metadata.identifier;
         self.check_psbt_proposer_authorized(our_index)?;
+        self.check_psbt_proposer_session_budget(&self.keys.public_key())?;
 
         let created_at = Timestamp::now().as_secs();
         let session_id = derive_psbt_session_id(
@@ -107,6 +108,26 @@ impl KfpNode {
             .into_iter()
             .map(|fp| fp.to_ascii_lowercase())
             .collect();
+
+        // Reject dual-identity expected signers where a single peer holds
+        // both a share index and one of the listed fingerprints, which would
+        // let the same party contribute twice toward threshold.
+        {
+            let peers = self.peers.read();
+            for idx in &expected_share_signers {
+                let Some(peer) = peers.get_peer(*idx) else {
+                    continue;
+                };
+                for xpub in &peer.recovery_xpubs {
+                    let fp_lc = xpub.fingerprint.to_ascii_lowercase();
+                    if expected_fingerprints.contains(&fp_lc) {
+                        return Err(FrostNetError::Session(format!(
+                            "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
+                        )));
+                    }
+                }
+            }
+        }
 
         let mut signers: HashSet<SignerId> = HashSet::new();
         for idx in &expected_share_signers {
@@ -245,6 +266,7 @@ impl KfpNode {
         };
         self.verify_peer_share_index(sender, sender_share_index)?;
         self.check_psbt_proposer_authorized(sender_share_index)?;
+        self.check_psbt_proposer_session_budget(&sender)?;
 
         let expected_id = derive_psbt_session_id(
             &payload.group_pubkey,
@@ -451,6 +473,19 @@ impl KfpNode {
                 "best-effort PSBT abort broadcast had failures",
             );
         }
+    }
+
+    fn check_psbt_proposer_session_budget(&self, proposer: &PublicKey) -> Result<()> {
+        let active = self
+            .psbt_sessions
+            .read()
+            .active_sessions_by_proposer(proposer);
+        if active >= MAX_PSBT_SESSIONS_PER_PROPOSER {
+            return Err(FrostNetError::Session(format!(
+                "Proposer already has {active} active PSBT session(s); limit is {MAX_PSBT_SESSIONS_PER_PROPOSER}"
+            )));
+        }
+        Ok(())
     }
 
     fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {

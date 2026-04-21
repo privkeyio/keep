@@ -35,6 +35,9 @@ use crate::protocol::{
 
 const MAX_SESSIONS: usize = 32;
 const REAP_GRACE_SECS: u64 = 60;
+/// Maximum concurrent non-terminal PSBT sessions any single proposer is
+/// allowed to keep open. Prevents one peer from exhausting `MAX_SESSIONS`.
+pub const MAX_PSBT_SESSIONS_PER_PROPOSER: usize = 4;
 
 /// Identifies a participant in a PSBT coordination session.
 ///
@@ -484,6 +487,20 @@ impl PsbtSessionManager {
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Number of currently active (non-terminal, non-expired) sessions whose
+    /// initiator matches `proposer`. Used to rate-limit per-peer PSBT session
+    /// creation so one peer cannot exhaust the global session slot pool.
+    pub fn active_sessions_by_proposer(&self, proposer: &PublicKey) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| {
+                !s.is_terminal()
+                    && !s.is_expired()
+                    && s.initiator().map(|p| p == proposer).unwrap_or(false)
+            })
+            .count()
     }
 
     pub fn get_session(&self, session_id: &[u8; 32]) -> Option<&PsbtSession> {
