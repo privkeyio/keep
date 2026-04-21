@@ -42,9 +42,9 @@ webpki-roots = "1.0"
 zeroize = "1.8"
 hmac = "0.12"
 subtle = "2.5"
+bitcoin = { version = "0.32", features = ["serde", "base64"] }
 
 [dev-dependencies]
-bitcoin = "0.32"
 tempfile = "3.27"
 tokio-test = "0.4"
 nostr-relay-builder = "0.44"

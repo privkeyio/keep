@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
@@ -15,6 +16,19 @@ use crate::cli::WalletExportFormat;
 use crate::output::Output;
 
 use super::get_password;
+
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
+/// and returns no match when the vault is locked or the mutex is poisoned.
+fn descriptor_lookup_for(
+    keep: Arc<Mutex<Keep>>,
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static,
+> {
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        guard.list_wallet_descriptors().ok()
+    })
+}
 
 fn parse_group_hex(group_hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(group_hex)
@@ -180,6 +194,7 @@ pub fn cmd_wallet_descriptor(
         network: canonical_network.clone(),
         created_at: now,
         device_registrations: Vec::new(),
+        policy_hash: [0u8; 32],
     };
 
     let mut keep = Keep::open(path)?;
@@ -702,12 +717,14 @@ pub fn cmd_wallet_propose(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = Arc::new(Mutex::new(keep));
+
     rt.block_on(async {
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         let (xpub, fingerprint) = node
             .derive_account_xpub(network)
@@ -849,6 +866,7 @@ pub fn cmd_wallet_propose(
 
         let mut external_descriptor = String::new();
         let mut internal_descriptor = String::new();
+        let mut finalized_policy_hash = [0u8; 32];
         let mut complete = false;
 
         while tokio::time::Instant::now() < ack_deadline {
@@ -858,10 +876,12 @@ pub fn cmd_wallet_propose(
                     session_id: sid,
                     external_descriptor: ext,
                     internal_descriptor: int,
+                    policy_hash,
                     ..
                 })) if sid == session_id => {
                     external_descriptor = ext;
                     internal_descriptor = int;
+                    finalized_policy_hash = policy_hash;
                     complete = true;
                     break;
                 }
@@ -910,9 +930,12 @@ pub fn cmd_wallet_propose(
             network: network.to_string(),
             created_at: now,
             device_registrations: Vec::new(),
+            policy_hash: finalized_policy_hash,
         };
 
-        keep.store_wallet_descriptor(&descriptor)?;
+        keep.lock()
+            .map_err(|_| KeepError::Runtime("Keep mutex poisoned".into()))?
+            .store_wallet_descriptor(&descriptor)?;
 
         out.newline();
         out.success("Wallet descriptor coordinated and stored!");
@@ -1023,12 +1046,14 @@ pub fn cmd_wallet_announce_keys(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = Arc::new(Mutex::new(keep));
+
     rt.block_on(async {
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         node.announce()
             .await
@@ -1099,6 +1124,337 @@ pub fn cmd_wallet_announce_keys(
     })?;
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_wallet_spend(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    recovery_tier: u32,
+    psbt_file: &Path,
+    fee: u64,
+    threshold: u32,
+    signer_share: &[u16],
+    signer_fingerprint: &[String],
+    share_index: Option<u16>,
+    relay: &str,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    debug!(group, recovery_tier, relay, timeout = ?timeout_secs, "wallet spend");
+
+    // Spend flows unlock the vault for the session's full duration. Cap the
+    // per-invocation max at 15 minutes to bound exposure even though the
+    // protocol layer permits longer sessions.
+    const SPEND_TIMEOUT_MAX_SECS: u64 = 900;
+    if let Some(t) = timeout_secs {
+        if t == 0 || t > SPEND_TIMEOUT_MAX_SECS {
+            return Err(KeepError::InvalidInput(format!(
+                "timeout must be between 1 and {SPEND_TIMEOUT_MAX_SECS} seconds"
+            )));
+        }
+    }
+
+    if signer_share.is_empty() && signer_fingerprint.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "must specify at least one --signer-share or --signer-fingerprint".into(),
+        ));
+    }
+    if threshold == 0 {
+        return Err(KeepError::InvalidInput(
+            "--threshold must be non-zero".into(),
+        ));
+    }
+
+    let mut seen_shares = std::collections::HashSet::new();
+    let mut signer_share_dedup: Vec<u16> = Vec::with_capacity(signer_share.len());
+    for idx in signer_share {
+        if !seen_shares.insert(*idx) {
+            return Err(KeepError::InvalidInput(format!(
+                "duplicate --signer-share: {idx}"
+            )));
+        }
+        signer_share_dedup.push(*idx);
+    }
+
+    let mut seen_fps = std::collections::HashSet::new();
+    let mut signer_fingerprint_dedup: Vec<String> = Vec::with_capacity(signer_fingerprint.len());
+    for fp in signer_fingerprint {
+        if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(KeepError::InvalidInput(format!(
+                "--signer-fingerprint '{fp}' must be 8 hex characters"
+            )));
+        }
+        let lower = fp.to_ascii_lowercase();
+        if !seen_fps.insert(lower.clone()) {
+            return Err(KeepError::InvalidInput(format!(
+                "duplicate --signer-fingerprint: {lower}"
+            )));
+        }
+        signer_fingerprint_dedup.push(lower);
+    }
+    let signer_fingerprint = signer_fingerprint_dedup;
+
+    let signer_share: &[u16] = &signer_share_dedup;
+    let total_signers = signer_share.len() + signer_fingerprint.len();
+    if (threshold as usize) > total_signers {
+        return Err(KeepError::InvalidInput(format!(
+            "--threshold {threshold} exceeds total signers {total_signers}"
+        )));
+    }
+
+    let group_pubkey = parse_group_id(group)?;
+
+    let psbt_bytes = read_psbt_file(psbt_file)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let descriptor = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
+
+    if descriptor.policy_hash == [0u8; 32] {
+        return Err(KeepError::InvalidInput(
+            "descriptor has placeholder policy_hash; coordinate via `keep wallet propose` before spending".into(),
+        ));
+    }
+
+    let descriptor_hash = descriptor.canonical_hash();
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    out.newline();
+    out.header("WDC Recovery Spend Proposal");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Network", &descriptor.network);
+    out.field("Recovery tier", &recovery_tier.to_string());
+    out.field("PSBT bytes", &psbt_bytes.len().to_string());
+    out.field("Fee (display)", &format!("{fee} sats"));
+    out.field(
+        "Expected signers",
+        &format!(
+            "{} share(s) + {} external",
+            signer_share.len(),
+            signer_fingerprint.len()
+        ),
+    );
+    out.field("Required threshold", &threshold.to_string());
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    let keep = Arc::new(Mutex::new(keep));
+
+    rt.block_on(async {
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = std::sync::Arc::new(node);
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let spinner = out.spinner("Discovering peers...");
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        spinner.finish();
+
+        let online = node.online_peers();
+        out.info(&format!("{online} peer(s) online"));
+        if online == 0 {
+            node_handle.abort();
+            return Err(KeepError::Frost(
+                "No peers online. Start 'keep frost network serve' on the recovery key holders' devices first.".into(),
+            ));
+        }
+
+        let mut event_rx = node.subscribe();
+
+        let spinner = out.spinner("Sending PSBT proposal...");
+        let session_id = node
+            .request_psbt_spend(
+                descriptor_hash,
+                recovery_tier,
+                psbt_bytes,
+                fee,
+                threshold,
+                signer_share.to_vec(),
+                signer_fingerprint.clone(),
+                Vec::new(),
+                Vec::new(),
+                timeout_secs,
+            )
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        spinner.finish();
+
+        out.field("Session", &hex::encode(&session_id[..8]));
+        out.newline();
+        out.info("PSBT coordination proposed. Waiting for signatures and finalization...");
+
+        let wait_deadline = timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(keep_frost_net::PSBT_SESSION_TIMEOUT_SECS));
+        let wait_spinner = out.spinner("Waiting for PSBT coordination...");
+        enum WaitOutcome {
+            Finalized(Option<[u8; 32]>),
+            Aborted(String),
+            LocalAbort(&'static str),
+        }
+        let outcome: WaitOutcome = async {
+            let deadline = tokio::time::Instant::now() + wait_deadline;
+            loop {
+                let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+                    Some(r) => r,
+                    None => {
+                        return WaitOutcome::LocalAbort(
+                            "Timed out waiting for PSBT coordination to complete",
+                        );
+                    }
+                };
+                match tokio::time::timeout(remaining, event_rx.recv()).await {
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtFinalized {
+                        session_id: sid,
+                        txid,
+                    })) if sid == session_id => {
+                        return WaitOutcome::Finalized(txid);
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtAborted {
+                        session_id: sid,
+                        reason,
+                    })) if sid == session_id => {
+                        return WaitOutcome::Aborted(reason);
+                    }
+                    Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureReceived {
+                        session_id: sid,
+                        signature_count,
+                        threshold,
+                        ..
+                    })) if sid == session_id => {
+                        tracing::info!(
+                            session = %hex::encode(&sid[..8]),
+                            signature_count,
+                            threshold,
+                            "Received PSBT signature"
+                        );
+                    }
+                    Ok(Err(_)) => {
+                        return WaitOutcome::LocalAbort(
+                            "Event channel closed before PSBT finalized",
+                        );
+                    }
+                    Err(_) => {
+                        return WaitOutcome::LocalAbort(
+                            "Timed out waiting for PSBT coordination to complete",
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        .await;
+        wait_spinner.finish();
+
+        let result: Result<Option<[u8; 32]>> = match outcome {
+            WaitOutcome::Finalized(txid) => Ok(txid),
+            WaitOutcome::Aborted(reason) => {
+                Err(KeepError::Frost(format!("PSBT session aborted: {reason}")))
+            }
+            WaitOutcome::LocalAbort(reason) => {
+                if let Err(e) = node.abort_psbt_session(session_id, reason).await {
+                    tracing::warn!(
+                        session = %hex::encode(&session_id[..8]),
+                        error = %e,
+                        "Failed to notify peers of PSBT abort"
+                    );
+                }
+                Err(KeepError::Frost(reason.to_string()))
+            }
+        };
+
+        node_handle.abort();
+        match result {
+            Ok(Some(txid)) => {
+                out.success("PSBT finalized");
+                out.field("Txid", &hex::encode(txid));
+            }
+            Ok(None) => {
+                out.success("PSBT finalized (no final tx attached)");
+            }
+            Err(e) => return Err(e),
+        }
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+fn read_psbt_file(path: &Path) -> Result<Vec<u8>> {
+    // Cap file size before touching it so a hostile caller cannot exhaust
+    // memory by pointing at a huge file. The `* 2` budget accounts for
+    // base64-encoded PSBTs, which inflate the raw size by ~4/3.
+    const MAX_PSBT_FILE_BYTES: u64 = (keep_frost_net::MAX_PSBT_SIZE as u64) * 2;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot stat PSBT file: {e}")))?;
+    if meta.len() > MAX_PSBT_FILE_BYTES {
+        return Err(KeepError::InvalidInput(format!(
+            "PSBT file is {} bytes, exceeds maximum {MAX_PSBT_FILE_BYTES}",
+            meta.len()
+        )));
+    }
+    let raw = std::fs::read(path)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read PSBT file: {e}")))?;
+    // Accept either raw PSBT binary (prefix "psbt\xff") or base64-encoded text.
+    if raw.starts_with(b"psbt\xff") {
+        if raw.len() > keep_frost_net::MAX_PSBT_SIZE {
+            return Err(KeepError::InvalidInput(format!(
+                "PSBT is {} bytes, exceeds maximum {}",
+                raw.len(),
+                keep_frost_net::MAX_PSBT_SIZE
+            )));
+        }
+        return Ok(raw);
+    }
+    let text = String::from_utf8(raw.clone()).map_err(|_| {
+        KeepError::InvalidInput("PSBT file is neither binary PSBT nor UTF-8".into())
+    })?;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let decoded = STANDARD
+        .decode(text.trim())
+        .map_err(|e| KeepError::InvalidInput(format!("cannot base64-decode PSBT: {e}")))?;
+    if decoded.len() > keep_frost_net::MAX_PSBT_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "decoded PSBT is {} bytes, exceeds maximum {}",
+            decoded.len(),
+            keep_frost_net::MAX_PSBT_SIZE
+        )));
+    }
+    if !decoded.starts_with(b"psbt\xff") {
+        return Err(KeepError::InvalidInput(
+            "decoded PSBT does not start with the PSBT magic bytes".into(),
+        ));
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]

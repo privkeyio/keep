@@ -4118,6 +4118,7 @@ name = "keep-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bitflags 2.11.0",
  "chrono",
  "clap",
@@ -4206,6 +4207,7 @@ dependencies = [
 name = "keep-desktop"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "bitcoin",
  "chrono",
  "dirs",

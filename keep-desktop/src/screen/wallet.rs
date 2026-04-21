@@ -6,7 +6,11 @@ use std::collections::HashMap;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 use keep_frost_net::AnnouncedXpub;
-use keep_frost_net::{MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, VALID_XPUB_PREFIXES};
+use keep_frost_net::PsbtSessionSnapshot;
+use keep_frost_net::{
+    MAX_PSBT_SIZE, MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, PSBT_SESSION_MAX_TIMEOUT_SECS,
+    VALID_XPUB_PREFIXES,
+};
 
 use crate::screen::shares::ShareEntry;
 use crate::theme;
@@ -22,6 +26,39 @@ fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
         out.push(c);
     }
     out
+}
+
+fn parse_psbt_text(input: &str) -> Result<Vec<u8>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("PSBT cannot be empty".into());
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+
+    use base64::{engine::general_purpose, Engine};
+    let candidates: [Result<Vec<u8>, ()>; 3] = [
+        general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .map_err(|_| ()),
+        general_purpose::STANDARD_NO_PAD
+            .decode(cleaned.as_bytes())
+            .map_err(|_| ()),
+        hex::decode(&cleaned).map_err(|_| ()),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.starts_with(b"psbt\xff") {
+            continue;
+        }
+        if candidate.len() > MAX_PSBT_SIZE {
+            return Err(format!(
+                "PSBT is {} bytes, exceeds maximum {MAX_PSBT_SIZE}",
+                candidate.len()
+            ));
+        }
+        return Ok(candidate);
+    }
+    Err("PSBT must be valid base64 or hex starting with the PSBT magic bytes".into())
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +139,34 @@ pub struct RegisterState {
     pub submitting: bool,
 }
 
+const MAX_SPEND_FIELD_LEN: usize = 256;
+const MAX_PSBT_TEXT_LEN: usize = MAX_PSBT_SIZE * 2 + 16;
+
+#[derive(Debug, Clone)]
+pub enum SpendPhase {
+    Compose,
+    InFlight { received: usize, threshold: u32 },
+    Finalized { txid: Option<[u8; 32]> },
+    Failed(String),
+}
+
+pub struct SpendState {
+    pub wallet_idx: usize,
+    pub group_pubkey: [u8; 32],
+    pub network: String,
+    pub tier: String,
+    pub psbt_text: String,
+    pub fee: String,
+    pub threshold: String,
+    pub signer_shares: String,
+    pub signer_fingerprints: String,
+    pub timeout_secs: String,
+    pub validated_threshold: Option<u32>,
+    pub phase: SpendPhase,
+    pub session_id: Option<[u8; 32]>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub enum Message {
     ToggleDetails(usize),
@@ -126,6 +191,18 @@ pub enum Message {
     RegisterNameChanged(String),
     CancelRegister,
     SubmitRegister,
+    RejectPsbt([u8; 32]),
+    StartSpend(usize),
+    SpendTierChanged(String),
+    SpendPsbtChanged(String),
+    SpendFeeChanged(String),
+    SpendThresholdChanged(String),
+    SpendSignerSharesChanged(String),
+    SpendSignerFingerprintsChanged(String),
+    SpendTimeoutChanged(String),
+    SubmitSpend,
+    CancelSpend,
+    DoneSpend,
 }
 
 impl std::fmt::Debug for Message {
@@ -155,6 +232,25 @@ impl std::fmt::Debug for Message {
             Self::RegisterNameChanged(n) => f.debug_tuple("RegisterNameChanged").field(n).finish(),
             Self::CancelRegister => write!(f, "CancelRegister"),
             Self::SubmitRegister => write!(f, "SubmitRegister"),
+            Self::RejectPsbt(id) => f.debug_tuple("RejectPsbt").field(&hex::encode(id)).finish(),
+            Self::StartSpend(i) => f.debug_tuple("StartSpend").field(i).finish(),
+            Self::SpendTierChanged(v) => f.debug_tuple("SpendTierChanged").field(v).finish(),
+            Self::SpendPsbtChanged(_) => write!(f, "SpendPsbtChanged(<redacted>)"),
+            Self::SpendFeeChanged(v) => f.debug_tuple("SpendFeeChanged").field(v).finish(),
+            Self::SpendThresholdChanged(v) => {
+                f.debug_tuple("SpendThresholdChanged").field(v).finish()
+            }
+            Self::SpendSignerSharesChanged(v) => {
+                f.debug_tuple("SpendSignerSharesChanged").field(v).finish()
+            }
+            Self::SpendSignerFingerprintsChanged(v) => f
+                .debug_tuple("SpendSignerFingerprintsChanged")
+                .field(v)
+                .finish(),
+            Self::SpendTimeoutChanged(v) => f.debug_tuple("SpendTimeoutChanged").field(v).finish(),
+            Self::SubmitSpend => write!(f, "SubmitSpend"),
+            Self::CancelSpend => write!(f, "CancelSpend"),
+            Self::DoneSpend => write!(f, "DoneSpend"),
         }
     }
 }
@@ -178,6 +274,39 @@ pub enum Event {
         device_uri: String,
         wallet_name: String,
     },
+    RejectPsbt([u8; 32]),
+    StartSpend {
+        wallet_idx: usize,
+    },
+    SubmitSpend {
+        #[allow(dead_code)]
+        wallet_idx: usize,
+        group_pubkey: [u8; 32],
+        #[allow(dead_code)]
+        network: String,
+        tier: u32,
+        psbt_bytes: Vec<u8>,
+        fee: u64,
+        threshold: u32,
+        signer_shares: Vec<u16>,
+        signer_fingerprints: Vec<String>,
+        timeout_secs: Option<u64>,
+    },
+    CancelSpend {
+        session_id: Option<[u8; 32]>,
+    },
+}
+
+/// Display entry for a pending PSBT signature request awaiting the user's
+/// review. The UI only ever exposes a Reject action, no approval control of
+/// any kind is rendered, so there is no way for a misrouted message to trigger
+/// an approve-equivalent action from this card.
+#[derive(Debug, Clone)]
+pub struct PsbtPendingDisplay {
+    pub session_id: [u8; 32],
+    pub tier_index: u32,
+    pub initiator_pubkey: nostr_sdk::PublicKey,
+    pub snapshot: Option<PsbtSessionSnapshot>,
 }
 
 pub struct State {
@@ -187,6 +316,8 @@ pub struct State {
     pub announce: Option<AnnounceState>,
     pub register: Option<RegisterState>,
     pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
+    pub pending_psbt_signatures: Vec<PsbtPendingDisplay>,
+    pub spend: Option<Box<SpendState>>,
 }
 
 pub struct SetupState {
@@ -208,6 +339,8 @@ impl State {
             announce: None,
             register: None,
             peer_xpubs: HashMap::new(),
+            pending_psbt_signatures: Vec::new(),
+            spend: None,
         }
     }
 
@@ -313,6 +446,7 @@ impl State {
                 })
             }
             Message::CopyDescriptor(desc) => Some(Event::CopyDescriptor(desc)),
+            Message::RejectPsbt(id) => Some(Event::RejectPsbt(id)),
             Message::StartRegister(i) => {
                 if let Some(entry) = self.descriptors.get(i) {
                     let default_name = hex::encode(&entry.group_pubkey[..4]);
@@ -342,6 +476,59 @@ impl State {
             }
             Message::CancelRegister => {
                 self.register = None;
+                None
+            }
+            Message::StartSpend(i) => Some(Event::StartSpend { wallet_idx: i }),
+            Message::SpendTierChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.tier = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SpendPsbtChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.psbt_text = v.chars().take(MAX_PSBT_TEXT_LEN).collect();
+                }
+                None
+            }
+            Message::SpendFeeChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.fee = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SpendThresholdChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.threshold = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SpendSignerSharesChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.signer_shares = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SpendSignerFingerprintsChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.signer_fingerprints = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SpendTimeoutChanged(v) => {
+                if let Some(s) = &mut self.spend {
+                    s.timeout_secs = v.chars().take(MAX_SPEND_FIELD_LEN).collect();
+                }
+                None
+            }
+            Message::SubmitSpend => self.submit_spend(),
+            Message::CancelSpend => {
+                let session_id = self.spend.as_ref().and_then(|s| s.session_id);
+                self.spend = None;
+                Some(Event::CancelSpend { session_id })
+            }
+            Message::DoneSpend => {
+                self.spend = None;
                 None
             }
             Message::SubmitRegister => {
@@ -375,6 +562,180 @@ impl State {
                 })
             }
         }
+    }
+
+    pub fn begin_spend(&mut self, wallet_idx: usize, entry: &WalletEntry) {
+        self.spend = Some(Box::new(SpendState {
+            wallet_idx,
+            group_pubkey: entry.group_pubkey,
+            network: entry.network.clone(),
+            tier: "0".into(),
+            psbt_text: String::new(),
+            fee: String::new(),
+            threshold: String::new(),
+            signer_shares: String::new(),
+            signer_fingerprints: String::new(),
+            timeout_secs: String::new(),
+            validated_threshold: None,
+            phase: SpendPhase::Compose,
+            session_id: None,
+            error: None,
+        }));
+    }
+
+    pub fn spend_started(&mut self, session_id: [u8; 32]) {
+        if let Some(s) = &mut self.spend {
+            s.session_id = Some(session_id);
+            s.error = None;
+            s.phase = SpendPhase::InFlight {
+                received: 0,
+                threshold: s.validated_threshold.unwrap_or(0),
+            };
+        }
+    }
+
+    pub fn spend_progress(&mut self, received: usize, threshold: u32) {
+        if let Some(s) = &mut self.spend {
+            s.phase = SpendPhase::InFlight {
+                received,
+                threshold,
+            };
+        }
+    }
+
+    pub fn spend_finalized(&mut self, txid: Option<[u8; 32]>) {
+        if let Some(s) = &mut self.spend {
+            s.phase = SpendPhase::Finalized { txid };
+        }
+    }
+
+    pub fn spend_failed(&mut self, reason: String) {
+        if let Some(s) = &mut self.spend {
+            s.error = Some(reason.clone());
+            s.phase = SpendPhase::Failed(reason);
+        }
+    }
+
+    fn submit_spend(&mut self) -> Option<Event> {
+        let Some(s) = &mut self.spend else {
+            return None;
+        };
+        if !matches!(s.phase, SpendPhase::Compose) {
+            return None;
+        }
+
+        let tier: u32 = match s.tier.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                s.error = Some("Tier must be a non-negative integer".into());
+                return None;
+            }
+        };
+        let fee: u64 = match s.fee.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                s.error = Some("Fee must be a non-negative integer (sats)".into());
+                return None;
+            }
+        };
+        let threshold: u32 = match s.threshold.trim().parse() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                s.error = Some("Threshold must be >= 1".into());
+                return None;
+            }
+        };
+
+        let mut signer_shares: Vec<u16> = Vec::new();
+        let mut seen_shares = std::collections::HashSet::new();
+        for part in s.signer_shares.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            match p.parse::<u16>() {
+                Ok(idx) => {
+                    if !seen_shares.insert(idx) {
+                        s.error = Some(format!("Duplicate signer share: {idx}"));
+                        return None;
+                    }
+                    signer_shares.push(idx);
+                }
+                Err(_) => {
+                    s.error = Some(format!("Invalid share index: {p}"));
+                    return None;
+                }
+            }
+        }
+
+        let mut signer_fingerprints: Vec<String> = Vec::new();
+        let mut seen_fps = std::collections::HashSet::new();
+        for part in s.signer_fingerprints.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if p.len() != 8 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+                s.error = Some(format!("Fingerprint '{p}' must be 8 hex characters"));
+                return None;
+            }
+            let lower = p.to_ascii_lowercase();
+            if !seen_fps.insert(lower.clone()) {
+                s.error = Some(format!("Duplicate fingerprint: {lower}"));
+                return None;
+            }
+            signer_fingerprints.push(lower);
+        }
+
+        if signer_shares.is_empty() && signer_fingerprints.is_empty() {
+            s.error = Some("Specify at least one signer share or fingerprint".into());
+            return None;
+        }
+        let total = signer_shares.len() + signer_fingerprints.len();
+        if (threshold as usize) > total {
+            s.error = Some(format!(
+                "Threshold {threshold} exceeds total signers {total}"
+            ));
+            return None;
+        }
+
+        let timeout_secs: Option<u64> = if s.timeout_secs.trim().is_empty() {
+            None
+        } else {
+            match s.timeout_secs.trim().parse::<u64>() {
+                Ok(v) if (1..=PSBT_SESSION_MAX_TIMEOUT_SECS).contains(&v) => Some(v),
+                _ => {
+                    s.error = Some(format!(
+                        "Timeout must be 1..={PSBT_SESSION_MAX_TIMEOUT_SECS} seconds"
+                    ));
+                    return None;
+                }
+            }
+        };
+
+        let psbt_bytes = match parse_psbt_text(&s.psbt_text) {
+            Ok(b) => b,
+            Err(e) => {
+                s.error = Some(e);
+                return None;
+            }
+        };
+
+        s.error = None;
+        s.validated_threshold = Some(threshold);
+
+        Some(Event::SubmitSpend {
+            wallet_idx: s.wallet_idx,
+            group_pubkey: s.group_pubkey,
+            network: s.network.clone(),
+            tier,
+            psbt_bytes,
+            fee,
+            threshold,
+            signer_shares,
+            signer_fingerprints,
+            timeout_secs,
+        })
     }
 
     pub fn register_submitted(&mut self) {
@@ -442,6 +803,10 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        if let Some(spend) = &self.spend {
+            return self.view_spend(spend);
+        }
+
         if let Some(register) = &self.register {
             return self.view_register(register);
         }
@@ -498,6 +863,10 @@ impl State {
             for (i, entry) in self.descriptors.iter().enumerate() {
                 list = list.push(self.wallet_card(i, entry));
             }
+        }
+
+        if !self.pending_psbt_signatures.is_empty() {
+            list = list.push(self.pending_psbt_signatures_section());
         }
 
         if !self.peer_xpubs.is_empty() {
@@ -829,7 +1198,14 @@ impl State {
                 .style(theme::primary_button)
                 .padding([theme::space::XS, theme::space::MD]);
 
-            let actions_row = row![register_btn].spacing(theme::space::SM);
+            let mut spend_btn = button(text("Spend from Recovery Tier").size(theme::size::SMALL))
+                .style(theme::secondary_button)
+                .padding([theme::space::XS, theme::space::MD]);
+            if !entry.external_descriptor.is_empty() {
+                spend_btn = spend_btn.on_press(Message::StartSpend(i));
+            }
+
+            let actions_row = row![register_btn, spend_btn].spacing(theme::space::SM);
 
             let details = column![
                 ext_row,
@@ -1010,6 +1386,267 @@ impl State {
             .padding(theme::space::XL)
             .width(Length::Fill)
             .height(Length::Fill)
+            .into()
+    }
+
+    fn view_spend<'a>(&'a self, spend: &'a SpendState) -> Element<'a, Message> {
+        let (back_label, back_msg) = match &spend.phase {
+            SpendPhase::Compose | SpendPhase::Failed(_) => ("< Back", Message::CancelSpend),
+            SpendPhase::InFlight { .. } => ("< Cancel", Message::CancelSpend),
+            SpendPhase::Finalized { .. } => ("< Done", Message::DoneSpend),
+        };
+        let back_btn = button(text(back_label).size(theme::size::BODY))
+            .on_press(back_msg)
+            .style(theme::text_button)
+            .padding([theme::space::XS, theme::space::SM]);
+
+        let title_text = text("Spend from Recovery Tier")
+            .size(theme::size::HEADING)
+            .color(theme::color::TEXT);
+
+        let header = row![back_btn, Space::new().width(theme::space::SM), title_text]
+            .align_y(Alignment::Center);
+
+        let group_label = text(format!(
+            "Group: {}   network: {}",
+            hex::encode(&spend.group_pubkey[..8]),
+            spend.network
+        ))
+        .size(theme::size::TINY)
+        .color(theme::color::TEXT_DIM);
+
+        let body: Element<'a, Message> = match &spend.phase {
+            SpendPhase::Compose => {
+                let tier_input = text_input("0", &spend.tier)
+                    .on_input(Message::SpendTierChanged)
+                    .padding(theme::space::SM)
+                    .width(80);
+
+                let psbt_input = text_input("base64 or hex", &spend.psbt_text)
+                    .on_input(Message::SpendPsbtChanged)
+                    .padding(theme::space::SM);
+
+                let fee_input = text_input("sats", &spend.fee)
+                    .on_input(Message::SpendFeeChanged)
+                    .padding(theme::space::SM)
+                    .width(140);
+
+                let threshold_input = text_input("e.g. 2", &spend.threshold)
+                    .on_input(Message::SpendThresholdChanged)
+                    .padding(theme::space::SM)
+                    .width(80);
+
+                let shares_input = text_input("comma-separated, e.g. 1,2,3", &spend.signer_shares)
+                    .on_input(Message::SpendSignerSharesChanged)
+                    .padding(theme::space::SM);
+
+                let fps_input = text_input(
+                    "comma-separated 8-hex fingerprints",
+                    &spend.signer_fingerprints,
+                )
+                .on_input(Message::SpendSignerFingerprintsChanged)
+                .padding(theme::space::SM);
+
+                let timeout_input = text_input("optional seconds", &spend.timeout_secs)
+                    .on_input(Message::SpendTimeoutChanged)
+                    .padding(theme::space::SM)
+                    .width(160);
+
+                let submit_btn = button(text("Submit Spend").size(theme::size::BODY))
+                    .style(theme::primary_button)
+                    .padding([theme::space::SM, theme::space::LG])
+                    .on_press(Message::SubmitSpend);
+
+                let mut content = column![
+                    theme::label("Recovery tier index"),
+                    tier_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("PSBT (base64 or hex)"),
+                    psbt_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("Fee (sats, display)"),
+                    fee_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("Threshold"),
+                    threshold_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("Signer shares"),
+                    shares_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("Signer fingerprints"),
+                    fps_input,
+                    Space::new().height(theme::space::XS),
+                    theme::label("Timeout (optional)"),
+                    timeout_input,
+                    Space::new().height(theme::space::MD),
+                    submit_btn,
+                ]
+                .spacing(theme::space::XS);
+
+                if let Some(err) = &spend.error {
+                    content = content.push(theme::error_text(err.as_str()));
+                }
+                content.into()
+            }
+            SpendPhase::InFlight {
+                received,
+                threshold,
+            } => {
+                let session = spend
+                    .session_id
+                    .map(|sid| {
+                        let s = hex::encode(sid);
+                        s.get(..16).unwrap_or(&s).to_string()
+                    })
+                    .unwrap_or_else(|| "pending".into());
+                let status = format!(
+                    "Coordinating PSBT (signatures {received}/{threshold})\nSession: {session}"
+                );
+                container(
+                    text(status)
+                        .size(theme::size::BODY)
+                        .color(theme::color::PRIMARY),
+                )
+                .style(theme::card_style)
+                .padding(theme::space::LG)
+                .width(Length::Fill)
+                .into()
+            }
+            SpendPhase::Finalized { txid } => {
+                let msg = match txid {
+                    Some(t) => format!("PSBT finalized.\nTxid: {}", hex::encode(t)),
+                    None => "PSBT finalized (no final tx attached)".into(),
+                };
+                container(
+                    text(msg)
+                        .size(theme::size::BODY)
+                        .color(theme::color::SUCCESS),
+                )
+                .style(theme::card_style)
+                .padding(theme::space::LG)
+                .width(Length::Fill)
+                .into()
+            }
+            SpendPhase::Failed(err) => container(
+                text(format!("PSBT spend failed: {err}"))
+                    .size(theme::size::BODY)
+                    .color(theme::color::ERROR),
+            )
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
+            .into(),
+        };
+
+        let content = column![
+            header,
+            group_label,
+            Space::new().height(theme::space::SM),
+            body,
+        ]
+        .spacing(theme::space::XS);
+
+        container(scrollable(content))
+            .padding(theme::space::XL)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn pending_psbt_signatures_section(&self) -> Element<'_, Message> {
+        let mut request_list = column![].spacing(theme::space::SM);
+
+        for entry in &self.pending_psbt_signatures {
+            let sid_short = hex::encode(entry.session_id);
+            let sid_short = sid_short.get(..12).unwrap_or(&sid_short).to_string();
+            let initiator = entry.initiator_pubkey.to_string();
+            let initiator_short = initiator.get(..16).unwrap_or(&initiator).to_string();
+
+            let reject_btn = button(text("Reject").size(theme::size::SMALL))
+                .on_press(Message::RejectPsbt(entry.session_id))
+                .style(theme::danger_button)
+                .padding([theme::space::XS, theme::space::MD]);
+
+            let card: Element<'_, Message> = match &entry.snapshot {
+                Some(snap) => {
+                    let psbt_hash = hex::encode(snap.psbt_hash);
+                    let psbt_hash_short = psbt_hash.get(..12).unwrap_or(&psbt_hash).to_string();
+                    let fee_text = match snap.fee_sats {
+                        Some(f) => format!("{f} sats"),
+                        None => "unknown".into(),
+                    };
+
+                    let header =
+                        row![
+                            text(format!("PSBT signature request — session {sid_short}"))
+                                .size(theme::size::SMALL)
+                                .color(theme::color::TEXT_MUTED),
+                        ]
+                        .align_y(Alignment::Center);
+
+                    let details = column![
+                        text(format!("From: {initiator_short}"))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                        text(format!(
+                            "Tier {}   outputs: {}   fee: {}",
+                            snap.tier_index, snap.output_count, fee_text
+                        ))
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                        text(format!(
+                            "Network: {}   threshold: {}/{}   PSBT hash: {}",
+                            snap.network,
+                            snap.threshold,
+                            snap.expected_signers_len,
+                            psbt_hash_short
+                        ))
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_DIM),
+                    ]
+                    .spacing(theme::space::XS);
+
+                    container(
+                        column![header, details, row![reject_btn].spacing(theme::space::SM)]
+                            .spacing(theme::space::XS),
+                    )
+                    .style(theme::warning_style)
+                    .padding(theme::space::MD)
+                    .width(Length::Fill)
+                    .into()
+                }
+                None => container(
+                    column![
+                        text(format!(
+                            "Malformed PSBT from {initiator_short} — Reject only."
+                        ))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::ERROR),
+                        text(format!("Session: {sid_short}   tier {}", entry.tier_index))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                        row![reject_btn].spacing(theme::space::SM),
+                    ]
+                    .spacing(theme::space::XS),
+                )
+                .style(theme::warning_style)
+                .padding(theme::space::MD)
+                .width(Length::Fill)
+                .into(),
+            };
+
+            request_list = request_list.push(card);
+        }
+
+        let count = self.pending_psbt_signatures.len();
+        let label = text(format!("Pending PSBT Signatures ({count})"))
+            .size(theme::size::BODY)
+            .color(theme::color::TEXT);
+
+        container(column![label, request_list].spacing(theme::space::SM))
+            .style(theme::card_style)
+            .padding(theme::space::LG)
+            .width(Length::Fill)
             .into()
     }
 

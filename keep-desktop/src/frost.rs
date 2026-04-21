@@ -31,6 +31,21 @@ use crate::screen::Screen;
 
 const MAX_FROST_EVENT_QUEUE: usize = 1000;
 
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Option<Keep>>>`. Logs a
+/// warning and returns no match when the vault is locked, absent, or the
+/// mutex is poisoned.
+pub(crate) fn descriptor_lookup_for(
+    keep: Arc<Mutex<Option<Keep>>>,
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<keep_core::wallet::WalletDescriptor>> + Send + Sync + 'static,
+> {
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        let keep = guard.as_ref()?;
+        keep.list_wallet_descriptors().ok()
+    })
+}
+
 pub(crate) async fn verify_relay_certificates(
     relay_urls: &[String],
     certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
@@ -278,6 +293,9 @@ pub(crate) async fn setup_frost_node(
     )
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
+
+    let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep_arc.clone()))
+        as Arc<dyn keep_frost_net::PersistedDescriptorLookup>);
 
     let session_store_path = nonce_store_path.with_file_name("descriptor-sessions.redb");
     let node = match keep_frost_net::FileDescriptorSessionStore::new(&session_store_path) {
@@ -624,6 +642,7 @@ pub(crate) async fn frost_event_listener(
                         session_id,
                         external_descriptor,
                         internal_descriptor,
+                        policy_hash,
                         ..
                     }) => {
                         log!(EventLogType::Descriptor, "Descriptor complete".to_string());
@@ -633,6 +652,7 @@ pub(crate) async fn frost_event_listener(
                                 session_id,
                                 external_descriptor,
                                 internal_descriptor,
+                                policy_hash,
                             },
                         );
                     }
@@ -708,6 +728,64 @@ pub(crate) async fn frost_event_listener(
                     }
                     Ok(KfpNodeEvent::DescriptorProposed { .. }) => {
                         log!(EventLogType::Descriptor, "Descriptor proposed".to_string());
+                    }
+                    // TODO(WDC-PSBT): expose PSBT coordination to UI (#331)
+                    Ok(KfpNodeEvent::PsbtProposed { session_id, tier_index }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT proposed for tier {tier_index}: {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                    }
+                    Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, initiator_pubkey }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT signature required for tier {tier_index} (session {})",
+                            &hex::encode(session_id)[..8]
+                        ));
+                        let snapshot = node.psbt_session_snapshot(&session_id);
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtSignatureNeeded {
+                                session_id,
+                                tier_index,
+                                initiator_pubkey,
+                                snapshot,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::PsbtSignatureReceived { session_id, signature_count, threshold, .. }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT signature received ({signature_count}/{threshold}): {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtSignatureReceived {
+                                session_id,
+                                signature_count,
+                                threshold,
+                            },
+                        );
+                    }
+                    Ok(KfpNodeEvent::PsbtFinalized { session_id, txid }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "PSBT finalized: {}",
+                            &hex::encode(session_id)[..8]
+                        ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtFinalized { session_id, txid },
+                        );
+                    }
+                    Ok(KfpNodeEvent::PsbtAborted { session_id, reason }) => {
+                        log!(EventLogType::Error, format!(
+                            "PSBT aborted ({}): {}",
+                            &hex::encode(session_id)[..8],
+                            truncate_peer_string(&reason)
+                        ));
+                        push_frost_event(
+                            &frost_events,
+                            FrostNodeMsg::PsbtAborted { session_id, reason },
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -925,11 +1003,13 @@ impl App {
                 session_id,
                 external_descriptor,
                 internal_descriptor,
+                policy_hash,
             } => {
                 self.handle_descriptor_complete(
                     session_id,
                     external_descriptor,
                     internal_descriptor,
+                    policy_hash,
                 );
             }
             FrostNodeMsg::DescriptorNacked {
@@ -987,6 +1067,72 @@ impl App {
                         } else if unresponsive.contains(&peer.share_index) {
                             peer.online = false;
                         }
+                    }
+                }
+            }
+            FrostNodeMsg::PsbtSignatureNeeded {
+                session_id,
+                tier_index,
+                initiator_pubkey,
+                snapshot,
+            } => {
+                tracing::info!(
+                    session_id = %hex::encode(session_id),
+                    tier_index,
+                    has_snapshot = snapshot.is_some(),
+                    "PSBT signature needed; routing to wallet screen"
+                );
+                let entry = crate::screen::wallet::PsbtPendingDisplay {
+                    session_id,
+                    tier_index,
+                    initiator_pubkey,
+                    snapshot,
+                };
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                self.pending_psbt_signatures.push(entry.clone());
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                    ws.pending_psbt_signatures.push(entry);
+                }
+            }
+            FrostNodeMsg::PsbtSignatureReceived {
+                session_id,
+                signature_count,
+                threshold,
+            } => {
+                if self.active_psbt_spend == Some(session_id) {
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_progress(signature_count, threshold);
+                    }
+                }
+            }
+            FrostNodeMsg::PsbtFinalized { session_id, txid } => {
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                }
+                if self.active_psbt_spend == Some(session_id) {
+                    self.active_psbt_spend = None;
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_finalized(txid);
+                    }
+                }
+            }
+            FrostNodeMsg::PsbtAborted { session_id, reason } => {
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                }
+                if self.active_psbt_spend == Some(session_id) {
+                    self.active_psbt_spend = None;
+                    if let Screen::Wallet(ws) = &mut self.screen {
+                        ws.spend_failed(reason);
                     }
                 }
             }
@@ -1126,7 +1272,9 @@ impl App {
         self.frost_status = ConnectionStatus::Disconnected;
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.pending_psbt_signatures.clear();
         self.active_coordinations.clear();
+        self.active_psbt_spend = None;
         self.frost_reconnect_attempts = 0;
         self.frost_reconnect_at = None;
         if let Ok(mut guard) = self.frost_node.lock() {
@@ -1136,6 +1284,9 @@ impl App {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
             }
+        }
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.pending_psbt_signatures.clear();
         }
         if let Some(s) = self.relay_screen_mut() {
             s.status = ConnectionStatus::Disconnected;
@@ -1168,7 +1319,12 @@ impl App {
         }
         self.frost_peers.clear();
         self.pending_sign_display.clear();
+        self.pending_psbt_signatures.clear();
         self.active_coordinations.clear();
+        self.active_psbt_spend = None;
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.pending_psbt_signatures.clear();
+        }
         if let Ok(mut guard) = self.pending_sign_requests.lock() {
             for entry in guard.drain(..) {
                 let _ = entry.response_tx.try_send(false);
@@ -1229,6 +1385,7 @@ impl App {
         session_id: [u8; 32],
         external_descriptor: String,
         internal_descriptor: String,
+        policy_hash: [u8; 32],
     ) {
         let Some(coord) = self.active_coordinations.remove(&session_id) else {
             return;
@@ -1244,6 +1401,7 @@ impl App {
             network: network.clone(),
             created_at,
             device_registrations: Vec::new(),
+            policy_hash,
         };
 
         let store_result = {

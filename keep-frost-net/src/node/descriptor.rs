@@ -16,7 +16,7 @@ use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
-use super::{KfpNode, KfpNodeEvent};
+use super::{sanitize_reason, KfpNode, KfpNodeEvent};
 
 impl KfpNode {
     pub async fn request_descriptor(
@@ -634,7 +634,9 @@ impl KfpNode {
 
         let descriptor_hash: [u8; 32] = {
             let mut hasher = Sha256::new();
+            hasher.update((payload.external_descriptor.len() as u64).to_le_bytes());
             hasher.update(payload.external_descriptor.as_bytes());
+            hasher.update((payload.internal_descriptor.len() as u64).to_le_bytes());
             hasher.update(payload.internal_descriptor.as_bytes());
             hasher.update(payload.policy_hash);
             hasher.finalize().into()
@@ -731,6 +733,7 @@ impl KfpNode {
             external_descriptor: payload.external_descriptor,
             internal_descriptor: payload.internal_descriptor,
             network: session_network,
+            policy_hash: payload.policy_hash,
         });
 
         Ok(())
@@ -932,6 +935,7 @@ impl KfpNode {
                         external_descriptor: desc.external.clone(),
                         internal_descriptor: desc.internal.clone(),
                         network: session.network().to_string(),
+                        policy_hash: desc.policy_hash,
                     });
                 }
             }
@@ -1073,18 +1077,5 @@ impl KfpNode {
         let bytes = <[u8; 32]>::try_from(serialized.as_slice())
             .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
         Ok(Zeroizing::new(bytes))
-    }
-}
-
-fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NACK_REASON_LENGTH)
-        .collect();
-    if sanitized.is_empty() {
-        "no reason given".to_string()
-    } else {
-        sanitized
     }
 }

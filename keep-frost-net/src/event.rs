@@ -311,6 +311,52 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    /// Build an encrypted PSBT coordination event for `recipient`. Used by
+    /// `PsbtPropose` / `PsbtSign` / `PsbtFinalize` / `PsbtAbort`, which all
+    /// share the same g/s/t tag layout.
+    pub fn psbt_event(
+        keys: &Keys,
+        recipient: &PublicKey,
+        group_pubkey: &[u8; 32],
+        session_id: &[u8; 32],
+        msg_type: &'static str,
+        msg: &KfpMessage,
+    ) -> Result<Event> {
+        if msg.message_type() != msg_type {
+            return Err(FrostNetError::Protocol(format!(
+                "psbt_event msg_type tag '{msg_type}' does not match payload type '{}'",
+                msg.message_type()
+            )));
+        }
+        if msg.group_pubkey() != Some(group_pubkey) {
+            return Err(FrostNetError::Protocol(
+                "psbt_event group_pubkey tag does not match payload".into(),
+            ));
+        }
+        if msg.session_id() != Some(session_id) {
+            return Err(FrostNetError::Protocol(
+                "psbt_event session_id tag does not match payload".into(),
+            ));
+        }
+
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+            .tag(Tag::custom(TagKind::custom("t"), [msg_type]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn decrypt_message(keys: &Keys, event: &Event) -> Result<KfpMessage> {
         const MAX_ENCRYPTED_CONTENT_SIZE: usize = MAX_MESSAGE_SIZE * 2;
         if event.content.len() > MAX_ENCRYPTED_CONTENT_SIZE {
@@ -343,7 +389,10 @@ impl KfpEventBuilder {
             ));
         }
 
-        KfpMessage::from_json(&content).map_err(FrostNetError::Json)
+        let msg = KfpMessage::from_json(&content).map_err(FrostNetError::Json)?;
+        msg.validate()
+            .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
+        Ok(msg)
     }
 
     pub fn get_message_type(event: &Event) -> Option<String> {

@@ -118,6 +118,12 @@ pub struct WalletDescriptor {
     /// Hardware signers that have registered this wallet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_registrations: Vec<DeviceRegistration>,
+    /// Hash of the wallet policy that produced this descriptor. Required for
+    /// canonical descriptor hashing (matches the on-wire `descriptor_hash`
+    /// computed as length-framed
+    /// `sha256(len(ext) || ext || len(int) || int || policy_hash)`).
+    #[serde(default)]
+    pub policy_hash: [u8; 32],
 }
 
 impl WalletDescriptor {
@@ -139,6 +145,23 @@ impl WalletDescriptor {
         } else {
             self.device_registrations.push(reg);
         }
+    }
+
+    /// Canonical descriptor hash with length framing to avoid collisions
+    /// when the split between external/internal shifts:
+    /// `sha256(u64_le(ext.len) || ext || u64_le(int.len) || int || policy_hash)`.
+    ///
+    /// Must match the on-wire `descriptor_hash` used by the FROST PSBT
+    /// coordination protocol.
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update((self.external_descriptor.len() as u64).to_le_bytes());
+        h.update(self.external_descriptor.as_bytes());
+        h.update((self.internal_descriptor.len() as u64).to_le_bytes());
+        h.update(self.internal_descriptor.as_bytes());
+        h.update(self.policy_hash);
+        h.finalize().into()
     }
 }
 
@@ -168,6 +191,7 @@ mod tests {
             network: "testnet".into(),
             created_at: 0,
             device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
         };
         let signer = [7u8; 32];
         desc.upsert_device_registration(DeviceRegistration {
@@ -200,6 +224,7 @@ mod tests {
             network: "testnet".into(),
             created_at: 1,
             device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("device_registrations"));

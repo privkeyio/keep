@@ -156,6 +156,7 @@ dictionary WalletDescriptorInfo {
     string network;
     u64 created_at;
     sequence<DeviceRegistrationInfo> device_registrations;
+    string? policy_hash_hex;
 };
 
 dictionary DeviceRegistrationInfo {

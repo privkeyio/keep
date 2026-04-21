@@ -1709,6 +1709,13 @@ impl KeepMobile {
                     registered_at: reg.registered_at,
                 });
             }
+            let policy_hash = match d.policy_hash_hex.as_deref() {
+                Some(h) => {
+                    let bytes = decode_hex(h, "descriptor policy_hash")?;
+                    bytes_to_32(&bytes, "descriptor policy_hash")?
+                }
+                None => [0u8; 32],
+            };
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),
@@ -1716,6 +1723,7 @@ impl KeepMobile {
                 network: d.network.clone(),
                 created_at: d.created_at,
                 device_registrations,
+                policy_hash,
             });
         }
 
@@ -1894,6 +1902,11 @@ impl KeepMobile {
         }
 
         for wd in &decrypted.wallet_descriptors {
+            let policy_hash_hex = if wd.policy_hash == [0u8; 32] {
+                None
+            } else {
+                Some(hex::encode(wd.policy_hash))
+            };
             prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),
@@ -1910,6 +1923,7 @@ impl KeepMobile {
                         registered_at: r.registered_at,
                     })
                     .collect(),
+                policy_hash_hex,
             });
         }
 
@@ -2660,6 +2674,7 @@ impl KeepMobile {
                             external_descriptor,
                             internal_descriptor,
                             network,
+                            policy_hash,
                         }) => {
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
@@ -2687,6 +2702,7 @@ impl KeepMobile {
                                 session_id,
                                 external_descriptor,
                                 internal_descriptor,
+                                policy_hash,
                             )
                             .await;
                         }
@@ -2772,6 +2788,7 @@ impl KeepMobile {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_descriptor_complete(
         storage: &Arc<dyn SecureStorage>,
         cbs: &Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
@@ -2780,6 +2797,7 @@ impl KeepMobile {
         session_id: [u8; 32],
         external_descriptor: String,
         internal_descriptor: String,
+        policy_hash: [u8; 32],
     ) {
         let group_pubkey = hex::encode(node.group_pubkey());
         let created_at = std::time::SystemTime::now()
@@ -2794,6 +2812,11 @@ impl KeepMobile {
             network,
             created_at,
             device_registrations: Vec::new(),
+            policy_hash_hex: if policy_hash == [0u8; 32] {
+                None
+            } else {
+                Some(hex::encode(policy_hash))
+            },
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

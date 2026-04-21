@@ -36,6 +36,20 @@ pub const MAX_NACK_REASON_LENGTH: usize = 1024;
 pub const MAX_RECOVERY_XPUBS: usize = 20;
 pub const MAX_XPUB_LABEL_LENGTH: usize = 64;
 pub const MAX_KEY_PROOF_PSBT_SIZE: usize = 512;
+pub const MAX_PSBT_SIZE: usize = 32768;
+pub const PSBT_MAGIC: &[u8; 5] = b"psbt\xff";
+pub const MAX_PSBT_INPUTS: usize = 256;
+pub const MAX_PSBT_OUTPUTS: usize = 256;
+pub const MAX_PSBT_ADDRESS_LENGTH: usize = 128;
+pub const PSBT_SESSION_TIMEOUT_SECS: u64 = 600;
+pub const PSBT_SESSION_MAX_TIMEOUT_SECS: u64 = 86400;
+pub const PSBT_SIGNING_PHASE_TIMEOUT_SECS: u64 = 300;
+pub const PSBT_FINALIZE_PHASE_TIMEOUT_SECS: u64 = 120;
+/// Window from session creation during which the proposer expects the first
+/// signer to respond. Once exceeded in the `Proposed` state the session is
+/// treated as timed out in the propose/ack phase (distinct from signing,
+/// which is measured from `first_sig_at`).
+pub const PSBT_PROPOSE_ACK_PHASE_TIMEOUT_SECS: u64 = 300;
 pub const VALID_XPUB_PREFIXES: &[&str] = &["xpub", "tpub", "Vpub", "Upub"];
 pub const VALID_NETWORKS: &[&str] = &["bitcoin", "testnet", "signet", "regtest"];
 
@@ -55,7 +69,13 @@ pub(crate) fn is_valid_xpub(xpub: &str) -> bool {
 }
 
 pub(crate) fn is_valid_fingerprint(fp: &str) -> bool {
-    fp.len() == MAX_FINGERPRINT_LENGTH && fp.chars().all(|c| c.is_ascii_hexdigit())
+    // Canonical form is exactly 8 lowercase hex characters. Enforcing the
+    // case at the protocol boundary keeps downstream equality checks
+    // case-sensitive without surprises (CLI already lowercases).
+    fp.len() == MAX_FINGERPRINT_LENGTH
+        && fp
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,6 +99,10 @@ pub enum KfpMessage {
     DescriptorAck(DescriptorAckPayload),
     DescriptorNack(DescriptorNackPayload),
     XpubAnnounce(XpubAnnouncePayload),
+    PsbtPropose(PsbtProposePayload),
+    PsbtSign(PsbtSignPayload),
+    PsbtFinalize(PsbtFinalizePayload),
+    PsbtAbort(PsbtAbortPayload),
     Ping(PingPayload),
     Pong(PongPayload),
     Error(ErrorPayload),
@@ -105,6 +129,10 @@ impl KfpMessage {
             KfpMessage::DescriptorAck(_) => "descriptor_ack",
             KfpMessage::DescriptorNack(_) => "descriptor_nack",
             KfpMessage::XpubAnnounce(_) => "xpub_announce",
+            KfpMessage::PsbtPropose(_) => "psbt_propose",
+            KfpMessage::PsbtSign(_) => "psbt_sign",
+            KfpMessage::PsbtFinalize(_) => "psbt_finalize",
+            KfpMessage::PsbtAbort(_) => "psbt_abort",
             KfpMessage::Ping(_) => "ping",
             KfpMessage::Pong(_) => "pong",
             KfpMessage::Error(_) => "error",
@@ -129,6 +157,10 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
             KfpMessage::DescriptorAck(p) => Some(&p.session_id),
             KfpMessage::DescriptorNack(p) => Some(&p.session_id),
+            KfpMessage::PsbtPropose(p) => Some(&p.session_id),
+            KfpMessage::PsbtSign(p) => Some(&p.session_id),
+            KfpMessage::PsbtFinalize(p) => Some(&p.session_id),
+            KfpMessage::PsbtAbort(p) => Some(&p.session_id),
             KfpMessage::Error(p) => p.session_id.as_ref(),
             _ => None,
         }
@@ -146,6 +178,10 @@ impl KfpMessage {
             KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
             KfpMessage::XpubAnnounce(p) => Some(&p.group_pubkey),
+            KfpMessage::PsbtPropose(p) => Some(&p.group_pubkey),
+            KfpMessage::PsbtSign(p) => Some(&p.group_pubkey),
+            KfpMessage::PsbtFinalize(p) => Some(&p.group_pubkey),
+            KfpMessage::PsbtAbort(p) => Some(&p.group_pubkey),
             _ => None,
         }
     }
@@ -389,6 +425,144 @@ impl KfpMessage {
                     return Err("Nack reason exceeds maximum length");
                 }
             }
+            KfpMessage::PsbtPropose(p) => {
+                if p.psbt.is_empty() {
+                    return Err("PSBT must not be empty");
+                }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
+                if p.psbt.len() > MAX_PSBT_SIZE {
+                    return Err("PSBT exceeds maximum size");
+                }
+                if (p.tier_index as usize) >= MAX_RECOVERY_TIERS {
+                    return Err("tier_index exceeds maximum recovery tiers");
+                }
+                if let Some(t) = p.timeout_secs {
+                    if t == 0 {
+                        return Err("timeout_secs must be greater than zero");
+                    }
+                    if t > PSBT_SESSION_MAX_TIMEOUT_SECS {
+                        return Err("timeout_secs exceeds maximum allowed value");
+                    }
+                }
+                if p.expected_signers.is_empty() && p.expected_fingerprints.is_empty() {
+                    return Err("Must specify at least one expected signer");
+                }
+                if p.expected_signers.len() > MAX_PARTICIPANTS {
+                    return Err("Too many expected signers");
+                }
+                if p.expected_fingerprints.len() > MAX_PARTICIPANTS {
+                    return Err("Too many expected fingerprints");
+                }
+                if p.required_threshold == 0 {
+                    return Err("required_threshold must be non-zero");
+                }
+                let total_signers = p
+                    .expected_signers
+                    .len()
+                    .saturating_add(p.expected_fingerprints.len());
+                if p.required_threshold as usize > total_signers {
+                    return Err("required_threshold exceeds total expected signers");
+                }
+                let mut seen_shares: HashSet<u16> = HashSet::new();
+                for idx in &p.expected_signers {
+                    if *idx == 0 {
+                        return Err("expected_signers share index must be non-zero");
+                    }
+                    if !seen_shares.insert(*idx) {
+                        return Err("Duplicate share index in expected_signers");
+                    }
+                }
+                let mut seen_fps: HashSet<&String> = HashSet::new();
+                for fp in &p.expected_fingerprints {
+                    if !is_valid_fingerprint(fp) {
+                        return Err("expected_fingerprint must be exactly 8 hex characters");
+                    }
+                    if !seen_fps.insert(fp) {
+                        return Err("Duplicate fingerprint in expected_fingerprints");
+                    }
+                }
+                if p.inputs.len() > MAX_PSBT_INPUTS {
+                    return Err("Too many PSBT inputs");
+                }
+                if p.outputs.len() > MAX_PSBT_OUTPUTS {
+                    return Err("Too many PSBT outputs");
+                }
+                for input in &p.inputs {
+                    if let Some(addr) = &input.address {
+                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                            return Err("PSBT input address exceeds maximum length");
+                        }
+                    }
+                }
+                for output in &p.outputs {
+                    if let Some(addr) = &output.address {
+                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                            return Err("PSBT output address exceeds maximum length");
+                        }
+                    }
+                }
+            }
+            KfpMessage::PsbtSign(p) => {
+                if p.psbt.is_empty() {
+                    return Err("PSBT must not be empty");
+                }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
+                if p.psbt.len() > MAX_PSBT_SIZE {
+                    return Err("PSBT exceeds maximum size");
+                }
+                if let Some(fp) = &p.signer_fingerprint {
+                    if !is_valid_fingerprint(fp) {
+                        return Err("signer_fingerprint must be exactly 8 hex characters");
+                    }
+                }
+                if p.signer_fingerprint.is_none() && p.signer_share_index.is_none() {
+                    return Err("PsbtSign must specify signer identity");
+                }
+                if p.signer_fingerprint.is_some() && p.signer_share_index.is_some() {
+                    return Err(
+                        "PsbtSign must not specify both signer_share_index and signer_fingerprint",
+                    );
+                }
+                if let Some(si) = p.signer_share_index {
+                    if si == 0 {
+                        return Err("signer_share_index must be non-zero");
+                    }
+                }
+            }
+            KfpMessage::PsbtFinalize(p) => {
+                if p.psbt.is_empty() {
+                    return Err("PSBT must not be empty");
+                }
+                if !p.psbt.starts_with(PSBT_MAGIC) {
+                    return Err("PSBT must start with the PSBT magic bytes");
+                }
+                if p.psbt.len() > MAX_PSBT_SIZE {
+                    return Err("PSBT exceeds maximum size");
+                }
+                if p.final_tx.is_some() != p.txid.is_some() {
+                    return Err("final_tx and txid must both be present or both absent");
+                }
+                if let Some(tx) = &p.final_tx {
+                    if tx.is_empty() {
+                        return Err("final_tx, if present, must not be empty");
+                    }
+                    if tx.len() > MAX_PSBT_SIZE {
+                        return Err("final_tx exceeds maximum size");
+                    }
+                }
+            }
+            KfpMessage::PsbtAbort(p) => {
+                if p.reason.is_empty() {
+                    return Err("Abort reason must not be empty");
+                }
+                if p.reason.len() > MAX_NACK_REASON_LENGTH {
+                    return Err("Abort reason exceeds maximum length");
+                }
+            }
             KfpMessage::XpubAnnounce(p) => {
                 if p.share_index == 0 {
                     return Err("share_index must be non-zero");
@@ -416,10 +590,10 @@ impl KfpMessage {
                     if !seen_xpubs.insert(&xpub.xpub) {
                         return Err("Duplicate recovery xpub");
                     }
-                    if xpub.fingerprint.len() != MAX_FINGERPRINT_LENGTH
-                        || !xpub.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        return Err("Recovery fingerprint must be exactly 8 hex characters");
+                    if !is_valid_fingerprint(&xpub.fingerprint) {
+                        return Err(
+                            "Recovery fingerprint must be exactly 8 lowercase hex characters",
+                        );
                     }
                     if let Some(ref label) = xpub.label {
                         if label.is_empty() {
@@ -1142,6 +1316,212 @@ impl DescriptorNackPayload {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PsbtInputInfo {
+    pub index: u32,
+    pub value_sats: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PsbtOutputInfo {
+    pub index: u32,
+    pub value_sats: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub is_change: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PsbtProposePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub descriptor_hash: [u8; 32],
+    pub tier_index: u32,
+    #[serde(with = "base64_vec")]
+    pub psbt: Vec<u8>,
+    pub fee_sats: u64,
+    #[serde(default)]
+    pub inputs: Vec<PsbtInputInfo>,
+    #[serde(default)]
+    pub outputs: Vec<PsbtOutputInfo>,
+    #[serde(default)]
+    pub expected_signers: Vec<u16>,
+    #[serde(default)]
+    pub expected_fingerprints: Vec<String>,
+    pub required_threshold: u32,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl PsbtProposePayload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        descriptor_hash: [u8; 32],
+        tier_index: u32,
+        psbt: Vec<u8>,
+        fee_sats: u64,
+        required_threshold: u32,
+        created_at: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            descriptor_hash,
+            tier_index,
+            psbt,
+            fee_sats,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            expected_signers: Vec::new(),
+            expected_fingerprints: Vec::new(),
+            required_threshold,
+            created_at,
+            timeout_secs: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    pub fn with_inputs(mut self, inputs: Vec<PsbtInputInfo>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    pub fn with_outputs(mut self, outputs: Vec<PsbtOutputInfo>) -> Self {
+        self.outputs = outputs;
+        self
+    }
+
+    pub fn with_expected_signers(mut self, signers: Vec<u16>) -> Self {
+        self.expected_signers = signers;
+        self
+    }
+
+    pub fn with_expected_fingerprints(mut self, fps: Vec<String>) -> Self {
+        self.expected_fingerprints = fps;
+        self
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PsbtSignPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_share_index: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_fingerprint: Option<String>,
+    #[serde(with = "base64_vec")]
+    pub psbt: Vec<u8>,
+    pub created_at: u64,
+}
+
+impl PsbtSignPayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        signer_share_index: Option<u16>,
+        signer_fingerprint: Option<String>,
+        psbt: Vec<u8>,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            signer_share_index,
+            signer_fingerprint,
+            psbt,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PsbtFinalizePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "base64_vec")]
+    pub psbt: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "base64_vec_option")]
+    pub final_tx: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "hex_bytes_option")]
+    pub txid: Option<[u8; 32]>,
+    pub created_at: u64,
+}
+
+impl PsbtFinalizePayload {
+    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], psbt: Vec<u8>) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            psbt,
+            final_tx: None,
+            txid: None,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn with_final_tx(mut self, tx: Vec<u8>, txid: [u8; 32]) -> Self {
+        self.final_tx = Some(tx);
+        self.txid = Some(txid);
+        self
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PsbtAbortPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub reason: String,
+    pub created_at: u64,
+}
+
+impl PsbtAbortPayload {
+    pub fn new(session_id: [u8; 32], group_pubkey: [u8; 32], reason: &str) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            reason: reason.to_string(),
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
 macro_rules! hex_bytes_serde {
     ($mod_name:ident, $size:expr) => {
         mod $mod_name {
@@ -1311,6 +1691,38 @@ mod base64_vec {
         base64::engine::general_purpose::STANDARD
             .decode(&s)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+mod base64_vec_option {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use base64::Engine;
+        match opt {
+            Some(bytes) => {
+                serializer.serialize_some(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use base64::Engine;
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => base64::engine::general_purpose::STANDARD
+                .decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1675,6 +2087,235 @@ mod tests {
         );
         let msg = KfpMessage::DescriptorFinalize(payload);
         assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_propose_roundtrip() {
+        let payload = PsbtProposePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            1,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x01],
+            1500,
+            2,
+            Timestamp::now().as_secs(),
+        )
+        .with_expected_signers(vec![1, 2, 3])
+        .with_expected_fingerprints(vec!["aabbccdd".into()])
+        .with_timeout(1200);
+
+        let msg = KfpMessage::PsbtPropose(payload);
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+
+        match parsed {
+            KfpMessage::PsbtPropose(p) => {
+                assert_eq!(p.session_id, [1u8; 32]);
+                assert_eq!(p.tier_index, 1);
+                assert_eq!(p.required_threshold, 2);
+                assert_eq!(p.fee_sats, 1500);
+                assert_eq!(p.psbt, vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x01]);
+                assert_eq!(p.expected_signers, vec![1, 2, 3]);
+                assert_eq!(p.expected_fingerprints, vec!["aabbccdd".to_string()]);
+                assert_eq!(p.timeout_secs, Some(1200));
+            }
+            _ => panic!("expected PsbtPropose"),
+        }
+    }
+
+    #[test]
+    fn test_psbt_propose_rejects_empty_psbt() {
+        let mut payload = PsbtProposePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            0,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff],
+            0,
+            1,
+            Timestamp::now().as_secs(),
+        )
+        .with_expected_signers(vec![1]);
+        payload.psbt = Vec::new();
+        let msg = KfpMessage::PsbtPropose(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_propose_rejects_no_signers() {
+        let payload = PsbtProposePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            0,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff],
+            0,
+            1,
+            Timestamp::now().as_secs(),
+        );
+        let msg = KfpMessage::PsbtPropose(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_propose_rejects_bad_fingerprint() {
+        let payload = PsbtProposePayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            0,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff],
+            0,
+            1,
+            Timestamp::now().as_secs(),
+        )
+        .with_expected_fingerprints(vec!["xyz".into()]);
+        let msg = KfpMessage::PsbtPropose(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_sign_roundtrip() {
+        let payload = PsbtSignPayload::new(
+            [4u8; 32],
+            [5u8; 32],
+            Some(2),
+            None,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x02],
+        );
+
+        let msg = KfpMessage::PsbtSign(payload);
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+
+        match parsed {
+            KfpMessage::PsbtSign(p) => {
+                assert_eq!(p.signer_share_index, Some(2));
+                assert_eq!(p.signer_fingerprint, None);
+            }
+            _ => panic!("expected PsbtSign"),
+        }
+    }
+
+    #[test]
+    fn test_psbt_sign_rejects_missing_signer_identity() {
+        let mut payload = PsbtSignPayload::new(
+            [4u8; 32],
+            [5u8; 32],
+            None,
+            None,
+            vec![0x70, 0x73, 0x62, 0x74, 0xff],
+        );
+        payload.signer_share_index = None;
+        payload.signer_fingerprint = None;
+        let msg = KfpMessage::PsbtSign(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_finalize_roundtrip_with_tx() {
+        let payload = PsbtFinalizePayload::new(
+            [6u8; 32],
+            [7u8; 32],
+            vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x09],
+        )
+        .with_final_tx(vec![0x02, 0x00, 0x00, 0x00], [0xab; 32]);
+
+        let msg = KfpMessage::PsbtFinalize(payload);
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+
+        match parsed {
+            KfpMessage::PsbtFinalize(p) => {
+                assert_eq!(p.session_id, [6u8; 32]);
+                assert!(p.final_tx.is_some());
+                assert_eq!(p.txid, Some([0xab; 32]));
+            }
+            _ => panic!("expected PsbtFinalize"),
+        }
+    }
+
+    #[test]
+    fn test_psbt_finalize_roundtrip_without_tx() {
+        let payload = PsbtFinalizePayload::new(
+            [6u8; 32],
+            [7u8; 32],
+            vec![0x70, 0x73, 0x62, 0x74, 0xff, 0x09],
+        );
+
+        let msg = KfpMessage::PsbtFinalize(payload);
+        let json = msg.to_json().unwrap();
+        assert!(!json.contains("final_tx"));
+
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::PsbtFinalize(p) => {
+                assert!(p.final_tx.is_none());
+                assert!(p.txid.is_none());
+            }
+            _ => panic!("expected PsbtFinalize"),
+        }
+    }
+
+    #[test]
+    fn test_psbt_abort_roundtrip() {
+        let payload = PsbtAbortPayload::new([8u8; 32], [9u8; 32], "user cancelled");
+        let msg = KfpMessage::PsbtAbort(payload);
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::PsbtAbort(p) => {
+                assert_eq!(p.reason, "user cancelled");
+            }
+            _ => panic!("expected PsbtAbort"),
+        }
+    }
+
+    #[test]
+    fn test_psbt_abort_empty_reason_rejected() {
+        let mut payload = PsbtAbortPayload::new([8u8; 32], [9u8; 32], "placeholder");
+        payload.reason = String::new();
+        let msg = KfpMessage::PsbtAbort(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_psbt_message_types() {
+        assert_eq!(
+            KfpMessage::PsbtPropose(PsbtProposePayload::new(
+                [0u8; 32],
+                [0u8; 32],
+                [0u8; 32],
+                0,
+                vec![1],
+                0,
+                1,
+                0,
+            ))
+            .message_type(),
+            "psbt_propose"
+        );
+        assert_eq!(
+            KfpMessage::PsbtSign(PsbtSignPayload::new(
+                [0u8; 32],
+                [0u8; 32],
+                Some(1),
+                None,
+                vec![1],
+            ))
+            .message_type(),
+            "psbt_sign"
+        );
+        assert_eq!(
+            KfpMessage::PsbtFinalize(PsbtFinalizePayload::new([0u8; 32], [0u8; 32], vec![1],))
+                .message_type(),
+            "psbt_finalize"
+        );
+        assert_eq!(
+            KfpMessage::PsbtAbort(PsbtAbortPayload::new([0u8; 32], [0u8; 32], "x")).message_type(),
+            "psbt_abort"
+        );
     }
 
     #[test]

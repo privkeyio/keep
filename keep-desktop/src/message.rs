@@ -4,7 +4,7 @@
 use std::fmt;
 
 use keep_core::backup::BackupInfo;
-use keep_frost_net::AnnouncedXpub;
+use keep_frost_net::{AnnouncedXpub, PsbtSessionSnapshot};
 use zeroize::Zeroizing;
 
 use crate::screen::shares::ShareEntry;
@@ -192,6 +192,10 @@ pub enum Message {
     WalletDescriptorProgress(DescriptorProgress, Option<[u8; 32]>),
     WalletAnnounceResult(Result<(), String>),
     WalletRegisterResult(Result<(), String>),
+    RejectPsbtSignature([u8; 32]),
+    RejectPsbtSignatureResult([u8; 32], Result<(), String>),
+    CancelSpendResult([u8; 32], Result<(), String>),
+    SpendStartedResult(Result<[u8; 32], String>),
 
     // Relay / FROST
     Relay(crate::screen::relay::Message),
@@ -276,6 +280,7 @@ pub enum FrostNodeMsg {
         session_id: [u8; 32],
         external_descriptor: String,
         internal_descriptor: String,
+        policy_hash: [u8; 32],
     },
     DescriptorAcked {
         session_id: [u8; 32],
@@ -299,6 +304,25 @@ pub enum FrostNodeMsg {
     HealthCheckComplete {
         responsive: Vec<u16>,
         unresponsive: Vec<u16>,
+    },
+    PsbtSignatureNeeded {
+        session_id: [u8; 32],
+        tier_index: u32,
+        initiator_pubkey: nostr_sdk::PublicKey,
+        snapshot: Option<PsbtSessionSnapshot>,
+    },
+    PsbtSignatureReceived {
+        session_id: [u8; 32],
+        signature_count: usize,
+        threshold: u32,
+    },
+    PsbtFinalized {
+        session_id: [u8; 32],
+        txid: Option<[u8; 32]>,
+    },
+    PsbtAborted {
+        session_id: [u8; 32],
+        reason: String,
     },
 }
 
@@ -374,6 +398,35 @@ impl fmt::Debug for FrostNodeMsg {
                 .debug_struct("HealthCheckComplete")
                 .field("responsive", &responsive.len())
                 .field("unresponsive", &unresponsive.len())
+                .finish(),
+            Self::PsbtSignatureNeeded {
+                session_id,
+                tier_index,
+                ..
+            } => f
+                .debug_struct("PsbtSignatureNeeded")
+                .field("session_id", &hex::encode(session_id))
+                .field("tier_index", tier_index)
+                .finish(),
+            Self::PsbtSignatureReceived {
+                session_id,
+                signature_count,
+                threshold,
+            } => f
+                .debug_struct("PsbtSignatureReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("signature_count", signature_count)
+                .field("threshold", threshold)
+                .finish(),
+            Self::PsbtFinalized { session_id, txid } => f
+                .debug_struct("PsbtFinalized")
+                .field("session_id", &hex::encode(session_id))
+                .field("txid", &txid.as_ref().map(hex::encode))
+                .finish(),
+            Self::PsbtAborted { session_id, reason } => f
+                .debug_struct("PsbtAborted")
+                .field("session_id", &hex::encode(session_id))
+                .field("reason", reason)
                 .finish(),
         }
     }
@@ -453,6 +506,24 @@ impl fmt::Debug for Message {
             Self::WalletRegisterResult(r) => f
                 .debug_tuple("WalletRegisterResult")
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::RejectPsbtSignature(id) => f
+                .debug_tuple("RejectPsbtSignature")
+                .field(&hex::encode(id))
+                .finish(),
+            Self::RejectPsbtSignatureResult(id, r) => f
+                .debug_tuple("RejectPsbtSignatureResult")
+                .field(&hex::encode(id))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::CancelSpendResult(id, r) => f
+                .debug_tuple("CancelSpendResult")
+                .field(&hex::encode(id))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::SpendStartedResult(r) => f
+                .debug_tuple("SpendStartedResult")
+                .field(&r.as_ref().map(hex::encode).map_err(|e| e.as_str()))
                 .finish(),
             Self::Relay(msg) => f.debug_tuple("Relay").field(msg).finish(),
             Self::ConnectRelayResult(r) => f

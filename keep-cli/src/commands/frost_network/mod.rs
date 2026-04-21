@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
@@ -21,6 +22,19 @@ mod hardware;
 
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
+
+/// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
+/// and returns no match when the vault is locked or the mutex is poisoned.
+fn descriptor_lookup_for(
+    keep: Arc<Mutex<Keep>>,
+) -> keep_frost_net::KeepDescriptorLookup<
+    impl Fn() -> Option<Vec<WalletDescriptor>> + Send + Sync + 'static,
+> {
+    keep_frost_net::KeepDescriptorLookup::new(move || {
+        let guard = keep.lock().ok()?;
+        guard.list_wallet_descriptors().ok()
+    })
+}
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_frost_network_serve(
@@ -61,14 +75,17 @@ pub fn cmd_frost_network_serve(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
+    let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
+
     rt.block_on(async {
         out.info("Starting FROST coordination node...");
 
-        let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
-        );
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node =
+            node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();
         let npub = pk.to_bech32().unwrap_or_else(|_| format!("{pk}"));
@@ -76,14 +93,24 @@ pub fn cmd_frost_network_serve(
         out.newline();
         out.info("Listening for FROST messages... (Ctrl+C to stop)");
 
-        let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
-
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
         let event_keep = keep.clone();
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
+                    Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureNeeded {
+                        session_id,
+                        tier_index,
+                        ..
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::warn!(
+                            session,
+                            tier_index,
+                            "PSBT signature requested but `frost network serve` does not yet implement signer contribution; the initiator will time out."
+                        );
+                    }
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
                         tracing::info!(share_index, name = name_str, "peer discovered");
@@ -153,6 +180,7 @@ pub fn cmd_frost_network_serve(
                         external_descriptor,
                         internal_descriptor,
                         network,
+                        policy_hash,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -174,6 +202,7 @@ pub fn cmd_frost_network_serve(
                                 network,
                                 created_at: now,
                                 device_registrations: Vec::new(),
+                                policy_hash,
                             };
                             let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {

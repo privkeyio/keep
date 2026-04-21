@@ -369,7 +369,9 @@ impl DescriptorSession {
             .ok_or_else(|| FrostNetError::Session("No finalized descriptor".into()))?;
 
         let mut hasher = Sha256::new();
+        hasher.update((finalized.external.len() as u64).to_le_bytes());
         hasher.update(finalized.external.as_bytes());
+        hasher.update((finalized.internal.len() as u64).to_le_bytes());
         hasher.update(finalized.internal.as_bytes());
         hasher.update(finalized.policy_hash);
         let expected_hash: [u8; 32] = hasher.finalize().into();
@@ -756,6 +758,10 @@ impl DescriptorSessionManager {
         self.sessions.get(session_id).filter(|s| !s.is_expired())
     }
 
+    pub fn iter_sessions(&self) -> impl Iterator<Item = (&[u8; 32], &DescriptorSession)> {
+        self.sessions.iter().filter(|(_, s)| !s.is_expired())
+    }
+
     pub fn get_session_mut(&mut self, session_id: &[u8; 32]) -> Option<&mut DescriptorSession> {
         self.sessions
             .get_mut(session_id)
@@ -1004,7 +1010,9 @@ mod tests {
 
     fn descriptor_hash(external: &str, internal: &str, policy_hash: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        hasher.update((external.len() as u64).to_le_bytes());
         hasher.update(external.as_bytes());
+        hasher.update((internal.len() as u64).to_le_bytes());
         hasher.update(internal.as_bytes());
         hasher.update(policy_hash);
         hasher.finalize().into()

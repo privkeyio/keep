@@ -79,6 +79,56 @@ impl App {
                 device_uri,
                 wallet_name,
             ),
+            wallet::Event::RejectPsbt(session_id) => {
+                Task::done(Message::RejectPsbtSignature(session_id))
+            }
+            wallet::Event::StartSpend { wallet_idx } => {
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    if let Some(entry) = ws.descriptors.get(wallet_idx).cloned() {
+                        ws.begin_spend(wallet_idx, &entry);
+                    }
+                }
+                Task::none()
+            }
+            wallet::Event::SubmitSpend {
+                wallet_idx: _,
+                group_pubkey,
+                network: _,
+                tier,
+                psbt_bytes,
+                fee,
+                threshold,
+                signer_shares,
+                signer_fingerprints,
+                timeout_secs,
+            } => self.begin_spend_psbt(
+                group_pubkey,
+                tier,
+                psbt_bytes,
+                fee,
+                threshold,
+                signer_shares,
+                signer_fingerprints,
+                timeout_secs,
+            ),
+            wallet::Event::CancelSpend { session_id } => {
+                if let Some(sid) = session_id {
+                    if let Some(node) = self.get_frost_node() {
+                        Task::perform(
+                            async move {
+                                node.abort_psbt_session(sid, "cancelled by user")
+                                    .await
+                                    .map_err(|e| format!("{e}"))
+                            },
+                            move |r| Message::CancelSpendResult(sid, r),
+                        )
+                    } else {
+                        Task::none()
+                    }
+                } else {
+                    Task::none()
+                }
+            }
         }
     }
 
@@ -89,6 +139,7 @@ impl App {
                     Ok(wallets) => {
                         let mut ws = wallet::State::new(wallets);
                         ws.peer_xpubs = self.peer_xpubs.clone();
+                        ws.pending_psbt_signatures = self.pending_psbt_signatures.clone();
                         self.screen = Screen::Wallet(ws);
                     }
                     Err(e) => {
@@ -189,6 +240,68 @@ impl App {
                         if let Screen::Wallet(s) = &mut self.screen {
                             s.register_failed(e);
                         }
+                    }
+                }
+                Task::none()
+            }
+            Message::RejectPsbtSignature(session_id) => {
+                let Some(node) = self.get_frost_node() else {
+                    self.set_toast("Relay not connected".into(), ToastKind::Error);
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.abort_psbt_session(session_id, "rejected by signer")
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    },
+                    move |r| Message::RejectPsbtSignatureResult(session_id, r),
+                )
+            }
+            Message::CancelSpendResult(session_id, result) => {
+                match result {
+                    Ok(()) => {
+                        if self.active_psbt_spend == Some(session_id) {
+                            self.active_psbt_spend = None;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(session = %hex::encode(session_id), error = %e, "PSBT abort failed");
+                        self.set_toast(format!("Cancel failed: {e}"), ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::RejectPsbtSignatureResult(session_id, result) => {
+                match result {
+                    Ok(()) => {
+                        self.pending_psbt_signatures
+                            .retain(|e| e.session_id != session_id);
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.pending_psbt_signatures
+                                .retain(|e| e.session_id != session_id);
+                        }
+                        self.set_toast("PSBT rejected".into(), ToastKind::Success);
+                    }
+                    Err(e) => {
+                        self.set_toast(format!("PSBT reject failed: {e}"), ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::SpendStartedResult(result) => {
+                match result {
+                    Ok(session_id) => {
+                        self.active_psbt_spend = Some(session_id);
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.spend_started(session_id);
+                        }
+                    }
+                    Err(e) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.spend_failed(e.clone());
+                        }
+                        self.set_toast(format!("Spend failed: {e}"), ToastKind::Error);
                     }
                 }
                 Task::none()
@@ -305,6 +418,62 @@ impl App {
                 Ok::<(), String>(())
             },
             Message::WalletRegisterResult,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_spend_psbt(
+        &mut self,
+        group_pubkey: [u8; 32],
+        tier: u32,
+        psbt_bytes: Vec<u8>,
+        fee: u64,
+        threshold: u32,
+        signer_shares: Vec<u16>,
+        signer_fingerprints: Vec<String>,
+        timeout_secs: Option<u64>,
+    ) -> Task<Message> {
+        let Some(node) = self.get_frost_node() else {
+            if let Screen::Wallet(s) = &mut self.screen {
+                s.spend_failed("Relay not connected".into());
+            }
+            return Task::none();
+        };
+
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                let descriptor_hash = tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Failed to load descriptor", move |keep| {
+                        let descriptor = keep
+                            .get_wallet_descriptor(&group_pubkey)
+                            .map_err(friendly_err)?
+                            .ok_or_else(|| "No wallet descriptor for this group".to_string())?;
+                        if descriptor.policy_hash == [0u8; 32] {
+                            return Err("Descriptor has placeholder policy_hash; coordinate the descriptor before spending".into());
+                        }
+                        Ok(descriptor.canonical_hash())
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                node.request_psbt_spend(
+                    descriptor_hash,
+                    tier,
+                    psbt_bytes,
+                    fee,
+                    threshold,
+                    signer_shares,
+                    signer_fingerprints,
+                    Vec::new(),
+                    Vec::new(),
+                    timeout_secs,
+                )
+                .await
+                .map_err(|e| format!("{e}"))
+            },
+            Message::SpendStartedResult,
         )
     }
 
