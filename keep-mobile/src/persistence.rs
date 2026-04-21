@@ -220,6 +220,10 @@ struct StoredDescriptor {
     created_at: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     device_registrations: Vec<StoredDeviceRegistration>,
+    /// Hex-encoded 32-byte canonical policy hash. `None` for legacy records
+    /// written before the field was introduced; new records always set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_hash_hex: Option<String>,
 }
 
 /// At-rest schema for a hardware-signer registration record.
@@ -319,6 +323,26 @@ pub(crate) fn persist_descriptor(
     storage: &Arc<dyn SecureStorage>,
     info: &WalletDescriptorInfo,
 ) -> Result<(), KeepMobileError> {
+    match info.policy_hash_hex.as_deref() {
+        Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
+            if h.chars().all(|c| c == '0') {
+                return Err(KeepMobileError::StorageError {
+                    msg: "refusing to persist descriptor with placeholder all-zero policy_hash"
+                        .into(),
+                });
+            }
+        }
+        Some(_) => {
+            return Err(KeepMobileError::StorageError {
+                msg: "policy_hash_hex must be 64 hex characters".into(),
+            });
+        }
+        None => {
+            return Err(KeepMobileError::StorageError {
+                msg: "policy_hash_hex is required when persisting a descriptor".into(),
+            });
+        }
+    }
     let stored = info_to_stored(info);
     let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize descriptor: {e}"),
@@ -371,6 +395,7 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
         network: stored.network,
         created_at: stored.created_at,
         device_registrations,
+        policy_hash_hex: stored.policy_hash_hex,
     }
 }
 
@@ -381,6 +406,7 @@ fn info_to_stored(info: &WalletDescriptorInfo) -> StoredDescriptor {
         internal_descriptor: info.internal_descriptor.clone(),
         network: info.network.clone(),
         created_at: info.created_at,
+        policy_hash_hex: info.policy_hash_hex.clone(),
         device_registrations: info
             .device_registrations
             .iter()

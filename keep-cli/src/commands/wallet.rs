@@ -1143,11 +1143,14 @@ pub fn cmd_wallet_spend(
 ) -> Result<()> {
     debug!(group, recovery_tier, relay, timeout = ?timeout_secs, "wallet spend");
 
+    // Spend flows unlock the vault for the session's full duration. Cap the
+    // per-invocation max at 15 minutes to bound exposure even though the
+    // protocol layer permits longer sessions.
+    const SPEND_TIMEOUT_MAX_SECS: u64 = 900;
     if let Some(t) = timeout_secs {
-        if t == 0 || t > keep_frost_net::PSBT_SESSION_MAX_TIMEOUT_SECS {
+        if t == 0 || t > SPEND_TIMEOUT_MAX_SECS {
             return Err(KeepError::InvalidInput(format!(
-                "timeout must be between 1 and {} seconds",
-                keep_frost_net::PSBT_SESSION_MAX_TIMEOUT_SECS
+                "timeout must be between 1 and {SPEND_TIMEOUT_MAX_SECS} seconds"
             )));
         }
     }

@@ -1109,6 +1109,12 @@ impl App {
                 }
             }
             FrostNodeMsg::PsbtFinalized { session_id, txid } => {
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                }
                 if self.active_psbt_spend == Some(session_id) {
                     self.active_psbt_spend = None;
                     if let Screen::Wallet(ws) = &mut self.screen {
@@ -1117,6 +1123,12 @@ impl App {
                 }
             }
             FrostNodeMsg::PsbtAborted { session_id, reason } => {
+                self.pending_psbt_signatures
+                    .retain(|e| e.session_id != session_id);
+                if let Screen::Wallet(ws) = &mut self.screen {
+                    ws.pending_psbt_signatures
+                        .retain(|e| e.session_id != session_id);
+                }
                 if self.active_psbt_spend == Some(session_id) {
                     self.active_psbt_spend = None;
                     if let Screen::Wallet(ws) = &mut self.screen {
