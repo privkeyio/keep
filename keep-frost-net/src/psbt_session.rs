@@ -75,7 +75,7 @@ pub struct PsbtSession {
     current_psbt: Vec<u8>,
     required_threshold: u32,
     expected_signers: HashSet<SignerId>,
-    received_sigs: HashMap<SignerId, Vec<u8>>,
+    received_sigs: HashSet<SignerId>,
     partial_psbts: HashMap<SignerId, Vec<u8>>,
     initiator: Option<PublicKey>,
     final_tx: Option<Vec<u8>>,
@@ -151,7 +151,7 @@ impl PsbtSession {
             proposal_psbt: psbt,
             required_threshold,
             expected_signers,
-            received_sigs: HashMap::new(),
+            received_sigs: HashSet::new(),
             partial_psbts: HashMap::new(),
             initiator: None,
             final_tx: None,
@@ -220,7 +220,7 @@ impl PsbtSession {
     }
 
     pub fn has_signed(&self, signer: &SignerId) -> bool {
-        self.received_sigs.contains_key(signer)
+        self.received_sigs.contains(signer)
     }
 
     pub fn threshold_met(&self) -> bool {
@@ -240,12 +240,7 @@ impl PsbtSession {
     /// first signer's contribution and retained for snapshot display only.
     /// Subsequent signatures do not overwrite `current_psbt`; the proposer
     /// aggregates from `partial_psbts` at finalization time.
-    pub fn add_signature(
-        &mut self,
-        signer: SignerId,
-        merged_psbt: Vec<u8>,
-        signer_marker: Vec<u8>,
-    ) -> Result<()> {
+    pub fn add_signature(&mut self, signer: SignerId, merged_psbt: Vec<u8>) -> Result<()> {
         match &self.state {
             PsbtSessionState::Aborted(r) => {
                 return Err(FrostNetError::Session(format!("Session aborted: {r}")));
@@ -271,14 +266,14 @@ impl PsbtSession {
             return Err(FrostNetError::Session("PSBT exceeds maximum size".into()));
         }
 
-        if self.received_sigs.contains_key(&signer) {
+        if self.received_sigs.contains(&signer) {
             return Err(FrostNetError::Session(
                 "Duplicate signature from this signer".into(),
             ));
         }
 
         let first_signer = self.received_sigs.is_empty();
-        self.received_sigs.insert(signer.clone(), signer_marker);
+        self.received_sigs.insert(signer.clone());
         self.partial_psbts.insert(signer, merged_psbt.clone());
         if first_signer {
             self.current_psbt = merged_psbt;
@@ -298,17 +293,19 @@ impl PsbtSession {
     /// other peers have observed. If the rollback empties the signature set
     /// the session transitions back to `Proposed`.
     pub fn remove_signature(&mut self, signer: &SignerId) -> bool {
-        let removed = self.received_sigs.remove(signer).is_some();
+        let removed = self.received_sigs.remove(signer);
         self.partial_psbts.remove(signer);
         if removed {
+            // current_psbt is snapshot-display only; after a rollback we can't
+            // deterministically choose a "representative" partial, so always
+            // fall back to the proposal PSBT. Aggregation at finalize time
+            // uses the full partial_psbts map regardless.
+            self.current_psbt = self.proposal_psbt.clone();
             if self.received_sigs.is_empty() {
-                self.current_psbt = self.proposal_psbt.clone();
                 self.first_sig_at = None;
                 if matches!(self.state, PsbtSessionState::Signing) {
                     self.state = PsbtSessionState::Proposed;
                 }
-            } else if let Some(remaining) = self.partial_psbts.values().next().cloned() {
-                self.current_psbt = remaining;
             }
         }
         removed
@@ -762,7 +759,7 @@ mod tests {
     #[test]
     fn test_add_signature_transitions_to_signing() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1, 2, 3, 4], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1, 2, 3, 4])
             .unwrap();
         assert_eq!(s.state(), &PsbtSessionState::Signing);
         assert_eq!(s.signature_count(), 1);
@@ -772,10 +769,10 @@ mod tests {
     #[test]
     fn test_threshold_met_after_required_sigs() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1; 4])
             .unwrap();
         assert!(!s.threshold_met());
-        s.add_signature(SignerId::Share(2), vec![2; 4], vec![0xbb])
+        s.add_signature(SignerId::Share(2), vec![2; 4])
             .unwrap();
         assert!(s.threshold_met());
     }
@@ -783,10 +780,10 @@ mod tests {
     #[test]
     fn test_reject_duplicate_signer() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1; 4])
             .unwrap();
         let err = s
-            .add_signature(SignerId::Share(1), vec![2; 4], vec![0xbb])
+            .add_signature(SignerId::Share(1), vec![2; 4])
             .unwrap_err();
         assert!(err.to_string().contains("Duplicate"));
     }
@@ -795,16 +792,16 @@ mod tests {
     fn test_reject_unexpected_signer() {
         let mut s = new_session();
         let err = s
-            .add_signature(SignerId::Share(99), vec![1; 4], vec![0xaa])
+            .add_signature(SignerId::Share(99), vec![1; 4])
             .unwrap_err();
         assert!(err.to_string().contains("not expected"));
     }
 
     fn finalize_ready_session() -> PsbtSession {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1; 4])
             .unwrap();
-        s.add_signature(SignerId::Share(2), vec![2; 4], vec![0xbb])
+        s.add_signature(SignerId::Share(2), vec![2; 4])
             .unwrap();
         s
     }
@@ -829,7 +826,7 @@ mod tests {
     #[test]
     fn test_set_finalized_below_threshold_rejected() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1; 4])
             .unwrap();
         let err = s.set_finalized(vec![9; 4], None).unwrap_err();
         assert!(err.to_string().contains("threshold"));
@@ -848,7 +845,7 @@ mod tests {
         let mut s = finalize_ready_session();
         s.set_finalized(vec![9; 4], None).unwrap();
         let err = s
-            .add_signature(SignerId::Share(3), vec![1; 4], vec![0xaa])
+            .add_signature(SignerId::Share(3), vec![1; 4])
             .unwrap_err();
         assert!(err.to_string().contains("already finalized"));
     }
@@ -859,7 +856,7 @@ mod tests {
         s.abort("user cancelled".into());
         assert!(matches!(s.state(), PsbtSessionState::Aborted(r) if r == "user cancelled"));
         let err = s
-            .add_signature(SignerId::Share(1), vec![1; 4], vec![0xaa])
+            .add_signature(SignerId::Share(1), vec![1; 4])
             .unwrap_err();
         assert!(err.to_string().contains("aborted"));
         let err2 = s.set_finalized(vec![1; 4], None).unwrap_err();
@@ -877,9 +874,9 @@ mod tests {
     #[test]
     fn test_partial_psbts_stored_per_signer() {
         let mut s = new_session();
-        s.add_signature(SignerId::Share(1), vec![1, 1, 1, 1], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![1, 1, 1, 1])
             .unwrap();
-        s.add_signature(SignerId::Share(2), vec![2, 2, 2, 2], vec![0xbb])
+        s.add_signature(SignerId::Share(2), vec![2, 2, 2, 2])
             .unwrap();
         assert_eq!(
             s.partial_psbts()
@@ -899,12 +896,8 @@ mod tests {
     #[test]
     fn test_external_fingerprint_signer_accepted() {
         let mut s = new_session();
-        s.add_signature(
-            SignerId::Fingerprint("aabbccdd".into()),
-            vec![1; 4],
-            vec![0xaa],
-        )
-        .unwrap();
+        s.add_signature(SignerId::Fingerprint("aabbccdd".into()), vec![1; 4])
+            .unwrap();
         assert_eq!(s.signature_count(), 1);
     }
 
@@ -1011,7 +1004,7 @@ mod tests {
     fn test_cannot_add_signature_above_psbt_size() {
         let mut s = new_session();
         let err = s
-            .add_signature(SignerId::Share(1), vec![0u8; MAX_PSBT_SIZE + 1], vec![0xaa])
+            .add_signature(SignerId::Share(1), vec![0u8; MAX_PSBT_SIZE + 1])
             .unwrap_err();
         assert!(err.to_string().contains("maximum"));
     }
@@ -1020,7 +1013,7 @@ mod tests {
     fn test_proposal_psbt_preserved_after_signatures() {
         let mut s = new_session();
         let original = s.proposal_psbt().to_vec();
-        s.add_signature(SignerId::Share(1), vec![9; 8], vec![0xaa])
+        s.add_signature(SignerId::Share(1), vec![9; 8])
             .unwrap();
         assert_eq!(s.proposal_psbt(), &original[..]);
         assert_eq!(s.current_psbt(), &[9; 8][..]);

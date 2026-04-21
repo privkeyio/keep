@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use bitcoin::hashes::Hash;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -42,7 +43,7 @@ impl KfpNode {
         let session = sessions.get_session(session_id)?;
         let initiator = *session.initiator()?;
         let descriptor_hash = *session.descriptor_hash();
-        let (psbt_hash, output_count, fee_sats) = decode_psbt_for_snapshot(session.current_psbt())?;
+        let (psbt_hash, output_count, fee_sats) = decode_psbt_for_snapshot(session.proposal_psbt())?;
         let network = self
             .descriptor_lookup
             .as_deref()
@@ -540,7 +541,7 @@ impl KfpNode {
             let session = sessions
                 .get_session_mut(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.add_signature(signer.clone(), merged_psbt.clone(), signer_marker(&signer))?;
+            session.add_signature(signer.clone(), merged_psbt.clone())?;
         }
 
         let event = match KfpEventBuilder::psbt_event(
@@ -602,7 +603,13 @@ impl KfpNode {
             payload.signer_share_index,
             payload.signer_fingerprint.clone(),
         ) {
-            (Some(idx), _) => {
+            (Some(_), Some(_)) => {
+                return Err(FrostNetError::Session(
+                    "PsbtSign must set exactly one of signer_share_index or signer_fingerprint"
+                        .into(),
+                ));
+            }
+            (Some(idx), None) => {
                 self.verify_peer_share_index(sender, idx)?;
                 SignerId::Share(idx)
             }
@@ -634,26 +641,41 @@ impl KfpNode {
             }
         };
 
-        let (count, threshold, should_finalize, finalized_psbt) = {
+        let (count, threshold, should_finalize, aggregated_psbt) = {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
                 .get_session_mut(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
 
-            session.add_signature(signer.clone(), payload.psbt, signer_marker(&signer))?;
+            session.add_signature(signer.clone(), payload.psbt)?;
 
             let is_initiator = session.initiator() == Some(&self.keys.public_key());
             let should_finalize = is_initiator && session.begin_finalize();
-            let finalized_psbt = if should_finalize {
-                session.current_psbt().to_vec()
+            let aggregated = if should_finalize {
+                match aggregate_partial_psbts(
+                    session.proposal_psbt(),
+                    session.partial_psbts(),
+                    session.required_threshold(),
+                ) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        warn!(
+                            session_id = %hex::encode(payload.session_id),
+                            error = %e,
+                            "Auto-finalize aggregation failed; releasing finalize claim"
+                        );
+                        session.clear_finalizing();
+                        None
+                    }
+                }
             } else {
-                Vec::new()
+                None
             };
             (
                 session.signature_count(),
                 session.required_threshold(),
-                should_finalize,
-                finalized_psbt,
+                should_finalize && aggregated.is_some(),
+                aggregated,
             )
         };
 
@@ -665,15 +687,17 @@ impl KfpNode {
         });
 
         if should_finalize {
-            if let Err(e) = self
-                .finalize_psbt_session(payload.session_id, finalized_psbt, None)
-                .await
-            {
-                warn!(
-                    session_id = %hex::encode(payload.session_id),
-                    error = %e,
-                    "Initiator auto-finalize failed"
-                );
+            if let Some(finalized_psbt) = aggregated_psbt {
+                if let Err(e) = self
+                    .finalize_psbt_session(payload.session_id, finalized_psbt, None)
+                    .await
+                {
+                    warn!(
+                        session_id = %hex::encode(payload.session_id),
+                        error = %e,
+                        "Initiator auto-finalize failed"
+                    );
+                }
             }
         }
 
@@ -785,7 +809,19 @@ impl KfpNode {
         }
 
         let final_tx = match (payload.final_tx, payload.txid) {
-            (Some(tx), Some(id)) => Some((tx, id)),
+            (Some(tx), Some(id)) => {
+                let decoded: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&tx)
+                    .map_err(|e| {
+                        FrostNetError::Session(format!("final_tx decode failed: {e}"))
+                    })?;
+                let computed_bytes: [u8; 32] = decoded.compute_txid().to_byte_array();
+                if computed_bytes != id {
+                    return Err(FrostNetError::Session(
+                        "PsbtFinalize txid does not match final_tx bytes".into(),
+                    ));
+                }
+                Some((tx, id))
+            }
             (None, None) => None,
             _ => {
                 return Err(FrostNetError::Session(
@@ -838,8 +874,15 @@ impl KfpNode {
     pub async fn abort_psbt_session(&self, session_id: [u8; 32], reason: &str) -> Result<()> {
         {
             let mut sessions = self.psbt_sessions.write();
-            if let Some(session) = sessions.get_session_mut(&session_id) {
-                session.abort(reason.to_string());
+            match sessions.get_session_mut(&session_id) {
+                Some(session) => session.abort(reason.to_string()),
+                None => {
+                    debug!(
+                        session_id = %hex::encode(session_id),
+                        "abort_psbt_session: unknown session, not broadcasting"
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -966,21 +1009,36 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
     Some((psbt_hash, output_count, fee_sats))
 }
 
-fn signer_marker(signer: &SignerId) -> Vec<u8> {
-    match signer {
-        SignerId::Share(i) => {
-            let mut v = Vec::with_capacity(3);
-            v.push(0x01);
-            v.extend_from_slice(&i.to_le_bytes());
-            v
-        }
-        SignerId::Fingerprint(fp) => {
-            let mut v = Vec::with_capacity(1 + fp.len());
-            v.push(0x02);
-            v.extend_from_slice(fp.as_bytes());
-            v
+/// Combine every signer's merged PSBT with the proposal PSBT using
+/// `Psbt::combine`. Fails if any partial is undecodable, combination fails,
+/// or fewer than `required_threshold` distinct tap_script / partial
+/// signatures are present on every input of the aggregated PSBT.
+fn aggregate_partial_psbts(
+    proposal_psbt: &[u8],
+    partial_psbts: &std::collections::HashMap<SignerId, Vec<u8>>,
+    required_threshold: u32,
+) -> Result<Vec<u8>> {
+    let mut aggregated = bitcoin::psbt::Psbt::deserialize(proposal_psbt)
+        .map_err(|e| FrostNetError::Session(format!("proposal PSBT decode failed: {e}")))?;
+    for (signer, bytes) in partial_psbts {
+        let partial = bitcoin::psbt::Psbt::deserialize(bytes).map_err(|e| {
+            FrostNetError::Session(format!("partial PSBT decode failed for {signer:?}: {e}"))
+        })?;
+        aggregated.combine(partial).map_err(|e| {
+            FrostNetError::Session(format!("PSBT combine failed for {signer:?}: {e}"))
+        })?;
+    }
+    for (idx, input) in aggregated.inputs.iter().enumerate() {
+        let sig_count = input.partial_sigs.len()
+            + input.tap_script_sigs.len()
+            + usize::from(input.tap_key_sig.is_some());
+        if (sig_count as u32) < required_threshold {
+            return Err(FrostNetError::Session(format!(
+                "aggregated PSBT input {idx} has {sig_count} signatures, below threshold {required_threshold}"
+            )));
         }
     }
+    Ok(aggregated.serialize())
 }
 
 /// Apply the descriptor_hash verification policy given an in-memory match
