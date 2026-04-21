@@ -111,13 +111,15 @@ impl KfpNode {
 
         self.reject_dual_identity_signers(&expected_share_signers, &expected_fingerprints)?;
 
-        let mut signers: HashSet<SignerId> = HashSet::new();
-        for idx in &expected_share_signers {
-            signers.insert(SignerId::Share(*idx));
-        }
-        for fp in &expected_fingerprints {
-            signers.insert(SignerId::Fingerprint(fp.clone()));
-        }
+        let signers: HashSet<SignerId> = expected_share_signers
+            .iter()
+            .map(|idx| SignerId::Share(*idx))
+            .chain(
+                expected_fingerprints
+                    .iter()
+                    .map(|fp| SignerId::Fingerprint(fp.clone())),
+            )
+            .collect();
 
         let session_timeout = timeout_secs.map(std::time::Duration::from_secs);
 
@@ -152,19 +154,13 @@ impl KfpNode {
                 tier_index,
                 psbt,
                 required_threshold,
-                signers,
+                signers.clone(),
                 session_timeout,
             )?;
             session.set_initiator(self.keys.public_key());
         }
 
-        let expected_signers: HashSet<SignerId> = {
-            let sessions = self.psbt_sessions.read();
-            match sessions.get_session(&session_id) {
-                Some(s) => s.expected_signers().clone(),
-                None => HashSet::new(),
-            }
-        };
+        let expected_signers = signers;
         let online = self.bidirectional_online_peers();
         let target_peers: Vec<PublicKey> = {
             let peers = self.peers.read();
@@ -270,17 +266,21 @@ impl KfpNode {
             &payload.expected_fingerprints,
         )?;
 
-        let mut signers: HashSet<SignerId> = HashSet::new();
-        for idx in &payload.expected_signers {
-            signers.insert(SignerId::Share(*idx));
-        }
-        for fp in &payload.expected_fingerprints {
-            signers.insert(SignerId::Fingerprint(fp.clone()));
-        }
+        let signers: HashSet<SignerId> = payload
+            .expected_signers
+            .iter()
+            .map(|idx| SignerId::Share(*idx))
+            .chain(
+                payload
+                    .expected_fingerprints
+                    .iter()
+                    .map(|fp| SignerId::Fingerprint(fp.clone())),
+            )
+            .collect();
 
         let propose_timeout = match payload.timeout_secs {
             None => None,
-            Some(t) if t > 0 && t <= PSBT_SESSION_MAX_TIMEOUT_SECS => {
+            Some(t) if (1..=PSBT_SESSION_MAX_TIMEOUT_SECS).contains(&t) => {
                 Some(std::time::Duration::from_secs(t))
             }
             Some(t) => {
@@ -435,10 +435,10 @@ impl KfpNode {
         let (_, err) = self
             .broadcast_psbt_event_partial(msg, session_id, msg_type, targets)
             .await;
-        match err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = err {
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Best-effort send `PsbtAbort` to the given peers. Errors are logged and
@@ -883,15 +883,12 @@ impl KfpNode {
 
         {
             let mut sessions = self.psbt_sessions.write();
-            let session = match sessions.get_session_mut(&payload.session_id) {
-                Some(s) => s,
-                None => {
-                    debug!(
-                        session_id = %hex::encode(payload.session_id),
-                        "PsbtFinalize for unknown session, ignoring"
-                    );
-                    return Ok(());
-                }
+            let Some(session) = sessions.get_session_mut(&payload.session_id) else {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "PsbtFinalize for unknown session, ignoring"
+                );
+                return Ok(());
             };
             match session.initiator() {
                 Some(initiator) if *initiator == sender => {}
@@ -924,16 +921,14 @@ impl KfpNode {
     pub async fn abort_psbt_session(&self, session_id: [u8; 32], reason: &str) -> Result<()> {
         {
             let mut sessions = self.psbt_sessions.write();
-            match sessions.get_session_mut(&session_id) {
-                Some(session) => session.abort(reason.to_string()),
-                None => {
-                    debug!(
-                        session_id = %hex::encode(session_id),
-                        "abort_psbt_session: unknown session, not broadcasting"
-                    );
-                    return Ok(());
-                }
-            }
+            let Some(session) = sessions.get_session_mut(&session_id) else {
+                debug!(
+                    session_id = %hex::encode(session_id),
+                    "abort_psbt_session: unknown session, not broadcasting"
+                );
+                return Ok(());
+            };
+            session.abort(reason.to_string());
         }
 
         let payload = PsbtAbortPayload::new(session_id, self.group_pubkey, reason);
@@ -991,10 +986,7 @@ impl KfpNode {
             let Some(session) = sessions.get_session_mut(&payload.session_id) else {
                 return Ok(());
             };
-            let is_initiator = session
-                .initiator()
-                .map(|init| *init == sender)
-                .unwrap_or(false);
+            let is_initiator = session.initiator().is_some_and(|init| *init == sender);
             let is_expected_signer = session.expected_signers().iter().any(|s| match s {
                 SignerId::Share(idx) => Some(*idx) == sender_share_index,
                 SignerId::Fingerprint(fp) => sender_fingerprints.contains(fp),
