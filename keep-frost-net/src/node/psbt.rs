@@ -14,7 +14,7 @@ use crate::event::KfpEventBuilder;
 use crate::protocol::*;
 use crate::psbt_session::{derive_psbt_session_id, SignerId, MAX_PSBT_SESSIONS_PER_PROPOSER};
 
-use super::{KfpNode, KfpNodeEvent};
+use super::{sanitize_reason, KfpNode, KfpNodeEvent};
 
 /// Read-only snapshot of a PSBT coordination session, safe for UI display.
 ///
@@ -1103,19 +1103,6 @@ fn decide_descriptor_hash_verification(
         Err(FrostNetError::Session(
             "no finalized descriptor for group; cannot verify descriptor_hash".into(),
         ))
-    }
-}
-
-fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NACK_REASON_LENGTH)
-        .collect();
-    if sanitized.is_empty() {
-        "no reason given".to_string()
-    } else {
-        sanitized
     }
 }
 

@@ -16,7 +16,7 @@ use crate::error::{FrostNetError, Result};
 use crate::protocol::*;
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
-use super::{KfpNode, KfpNodeEvent};
+use super::{sanitize_reason, KfpNode, KfpNodeEvent};
 
 impl KfpNode {
     pub async fn request_descriptor(
@@ -1077,18 +1077,5 @@ impl KfpNode {
         let bytes = <[u8; 32]>::try_from(serialized.as_slice())
             .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?;
         Ok(Zeroizing::new(bytes))
-    }
-}
-
-fn sanitize_reason(reason: &str) -> String {
-    let sanitized: String = reason
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NACK_REASON_LENGTH)
-        .collect();
-    if sanitized.is_empty() {
-        "no reason given".to_string()
-    } else {
-        sanitized
     }
 }

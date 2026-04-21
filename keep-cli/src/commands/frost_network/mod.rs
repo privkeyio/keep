@@ -99,6 +99,18 @@ pub fn cmd_frost_network_serve(
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
+                    Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureNeeded {
+                        session_id,
+                        tier_index,
+                        ..
+                    }) => {
+                        let session = hex::encode(&session_id[..8]);
+                        tracing::warn!(
+                            session,
+                            tier_index,
+                            "PSBT signature requested but `frost network serve` does not yet implement signer contribution; the initiator will time out. See https://github.com/privkeyio/keep/issues for tracking."
+                        );
+                    }
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
                         tracing::info!(share_index, name = name_str, "peer discovered");

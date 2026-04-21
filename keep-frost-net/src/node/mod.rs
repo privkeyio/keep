@@ -479,6 +479,22 @@ pub struct KfpNode {
     pub(crate) descriptor_lookup: Option<Arc<dyn PersistedDescriptorLookup>>,
 }
 
+/// Strip control characters, clamp to `MAX_NACK_REASON_LENGTH`, and return a
+/// placeholder when the result is empty. Shared between descriptor and PSBT
+/// coordination paths, which both accept peer-supplied reason strings.
+pub(crate) fn sanitize_reason(reason: &str) -> String {
+    let sanitized: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NACK_REASON_LENGTH)
+        .collect();
+    if sanitized.is_empty() {
+        "no reason given".to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl KfpNode {
     pub async fn new(share: SharePackage, relays: Vec<String>) -> Result<Self> {
         Self::with_nonce_store(share, relays, None, None, None).await
