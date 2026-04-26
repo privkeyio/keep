@@ -40,7 +40,7 @@ sha2 = "0.10.9"
 url = "2.5"
 webpki-roots = "1.0"
 zeroize = "1.8"
-hmac = "0.12"
+hmac = "0.13"
 subtle = "2.5"
 bitcoin = { version = "0.32", features = ["serde", "base64"] }
 
