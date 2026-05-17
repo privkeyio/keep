@@ -304,24 +304,18 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
-    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
 }
 
 impl MobileSigningHooks {
     fn consume_pre_approval(&self, message: &[u8]) -> bool {
+        use sha2::{Digest, Sha256};
+        let msg_hash: [u8; 32] = Sha256::digest(message).into();
         let mut guard = self
-            .pre_approved_hash
+            .pre_approved_hashes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(hash) = guard.take() {
-            use sha2::{Digest, Sha256};
-            let msg_hash: [u8; 32] = Sha256::digest(message).into();
-            if hash == msg_hash {
-                return true;
-            }
-            *guard = Some(hash);
-        }
-        false
+        guard.remove(&msg_hash)
     }
 }
 
@@ -329,6 +323,16 @@ impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
         if self.consume_pre_approval(&session.message) {
             return Ok(());
+        }
+
+        // If we're already running inside a tokio runtime (i.e. the auto-sign /
+        // ContentProvider background path), we can't safely block here. The caller
+        // should have set a pre-approval via set_signing_pre_approved before invoking
+        // the signer. Fail loudly instead of panicking via block_on.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(keep_frost_net::FrostNetError::Session(
+                "Sign request not pre-approved (background context)".into(),
+            ));
         }
 
         let (response_tx, mut response_rx) = mpsc::channel(1);
@@ -342,17 +346,11 @@ impl SigningHooks for MobileSigningHooks {
             ));
         }
 
-        let owned_rt;
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                owned_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
-                owned_rt.handle().clone()
-            }
-        };
+        let owned_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
+        let handle = owned_rt.handle().clone();
 
         let result = handle.block_on(async {
             tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await
@@ -386,7 +384,7 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -525,7 +523,7 @@ impl KeepMobile {
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pre_approved_hash: Arc::new(std::sync::Mutex::new(None)),
+            pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -661,17 +659,25 @@ impl KeepMobile {
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();
-        *self
-            .pre_approved_hash
+        self.pre_approved_hashes
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(hash);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash);
+    }
+
+    pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
+        let event: serde_json::Value = serde_json::from_str(&event_json)
+            .map_err(|_| KeepMobileError::InvalidSession)?;
+        let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
+        self.set_signing_pre_approved(event_hash.to_vec());
+        Ok(())
     }
 
     pub fn clear_signing_pre_approval(&self) {
-        *self
-            .pre_approved_hash
+        self.pre_approved_hashes
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -2259,7 +2265,7 @@ impl KeepMobile {
             let (request_tx, request_rx) = mpsc::channel(32);
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
-                pre_approved_hash: self.pre_approved_hash.clone(),
+                pre_approved_hashes: self.pre_approved_hashes.clone(),
             });
             node.set_hooks(hooks);
 
