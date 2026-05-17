@@ -20,7 +20,12 @@ const MAX_TAGS_COUNT: usize = 1000;
 const MAX_EVENT_SIZE: usize = 128 * 1024;
 const TIMESTAMP_DRIFT_SECS: i64 = 15 * 60;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-const MAX_REQUESTS_PER_WINDOW: u32 = 10;
+// Real Nostr clients (e.g. Amethyst sending NIP-17 DMs) easily fire 20-50 sign
+// requests in a short burst: kind 14 rumor + kind 13 seal + per-recipient
+// kind 1059 gift wraps + per-relay kind 22242 NIP-42 auth + reaction signing,
+// all chained. 10/min was a DoS guard that broke real-world flows; the Kotlin
+// IPC-level RateLimiter (30/sec) and per-app permissions already bound abuse.
+const MAX_REQUESTS_PER_WINDOW: u32 = 120;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
@@ -141,7 +146,12 @@ impl Nip55Handler {
         request: Nip55Request,
         caller_id: String,
     ) -> Result<Nip55Response, KeepMobileError> {
-        self.check_rate_limit(&caller_id)?;
+        if matches!(
+            request.request_type,
+            Nip55RequestType::SignEvent | Nip55RequestType::GetPublicKey
+        ) {
+            self.check_rate_limit(&caller_id)?;
+        }
 
         if let Some(ref current_user) = request.current_user {
             self.validate_current_user(current_user)?;
@@ -180,7 +190,12 @@ impl Nip55Handler {
             response.id = request_id;
         }
 
-        self.record_result(&caller_id, result.is_ok());
+        if matches!(
+            request.request_type,
+            Nip55RequestType::SignEvent | Nip55RequestType::GetPublicKey
+        ) {
+            self.record_result(&caller_id, result.is_ok());
+        }
         result
     }
 

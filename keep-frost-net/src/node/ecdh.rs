@@ -275,6 +275,30 @@ impl KfpNode {
         }
 
         let mut rx = self.event_tx.subscribe();
+
+        // For single-participant (threshold=1), our own partial is the only one needed.
+        // Subscribe first so we don't miss the EcdhComplete we send to ourselves.
+        let single_party_secret = {
+            let mut ecdh_sessions = self.ecdh_sessions.write();
+            match ecdh_sessions.get_session_mut(&session_id) {
+                Some(s) if s.has_all_shares() => s.try_complete()?,
+                _ => None,
+            }
+        };
+        if let Some(secret) = single_party_secret {
+            info!(
+                session_id = %hex::encode(session_id),
+                "ECDH complete (single-party)!"
+            );
+            self.ecdh_sessions
+                .write()
+                .complete_session(&session_id);
+            let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
+                session_id,
+                shared_secret: Zeroizing::new(*secret),
+            });
+        }
+
         let timeout = Duration::from_secs(30);
 
         let result = tokio::time::timeout(timeout, async {
