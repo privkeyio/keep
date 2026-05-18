@@ -82,6 +82,7 @@ pub struct WalletDescriptorInfo {
     pub created_at: u64,
     pub device_registrations: Vec<DeviceRegistrationInfo>,
     pub policy_hash_hex: Option<String>,
+    pub policy_json: Option<String>,
 }
 
 impl std::fmt::Debug for WalletDescriptorInfo {

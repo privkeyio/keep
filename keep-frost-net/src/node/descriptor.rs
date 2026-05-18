@@ -543,13 +543,14 @@ impl KfpNode {
 
         let our_index = self.share.metadata.identifier;
 
-        let (reconstruction_result, session_network, our_xpub) = {
+        let (reconstruction_result, session_network, our_xpub, session_policy) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             let network = session.network().to_string();
+            let policy = session.policy().clone();
 
             let initiator = session.initiator().ok_or_else(|| {
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -592,7 +593,7 @@ impl KfpNode {
                 )
                 .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
             };
-            (result, network, our_xpub)
+            (result, network, our_xpub, policy)
         };
 
         let (expected_external, expected_internal) = match reconstruction_result {
@@ -734,6 +735,7 @@ impl KfpNode {
             internal_descriptor: payload.internal_descriptor,
             network: session_network,
             policy_hash: payload.policy_hash,
+            policy: session_policy,
         });
 
         Ok(())
@@ -936,6 +938,7 @@ impl KfpNode {
                         internal_descriptor: desc.internal.clone(),
                         network: session.network().to_string(),
                         policy_hash: desc.policy_hash,
+                        policy: session.policy().clone(),
                     });
                 }
             }

@@ -224,6 +224,10 @@ struct StoredDescriptor {
     /// written before the field was introduced; new records always set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_hash_hex: Option<String>,
+    /// JSON-encoded `WalletPolicy`. Persisted as a string for FFI simplicity;
+    /// older records deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_json: Option<String>,
 }
 
 /// At-rest schema for a hardware-signer registration record.
@@ -403,6 +407,7 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
         created_at: stored.created_at,
         device_registrations,
         policy_hash_hex: stored.policy_hash_hex,
+        policy_json: stored.policy_json,
     }
 }
 
@@ -414,6 +419,7 @@ fn info_to_stored(info: &WalletDescriptorInfo) -> StoredDescriptor {
         network: info.network.clone(),
         created_at: info.created_at,
         policy_hash_hex: info.policy_hash_hex.clone(),
+        policy_json: info.policy_json.clone(),
         device_registrations: info
             .device_registrations
             .iter()
