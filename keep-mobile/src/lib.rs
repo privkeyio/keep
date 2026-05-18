@@ -1995,7 +1995,10 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(wd.policy_hash))
             };
-            let policy_json = wd.policy.as_ref().and_then(|v| serde_json::to_string(v).ok());
+            let policy_json = wd
+                .policy
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok());
             prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),

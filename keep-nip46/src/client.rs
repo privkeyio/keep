@@ -444,6 +444,20 @@ impl Nip46Client {
     ///   4. Schnorr-sign `sighash` under that key.
     ///
     /// All five params are hex-encoded except `descriptor`.
+    ///
+    /// # Trust assumption
+    ///
+    /// This call relays a 32-byte sighash to the remote bunker and trusts the
+    /// returned 64-byte Schnorr signature is a sig over THAT sighash by the
+    /// secret matching `xonly_pubkey`. The bunker is responsible for any
+    /// user-facing confirmation; this method does NOT itself prompt or
+    /// rate-limit. Callers MUST verify the returned signature against the
+    /// sighash and xonly_pubkey before merging it into a PSBT (see
+    /// `keep_bitcoin::merge_tap_script_sig`, which does this verification),
+    /// and MUST verify the PSBT input being signed is bound to a UTXO they
+    /// control (see `keep_bitcoin::verify_script_spend_input_binding`).
+    /// Without those two checks, this method is a signing oracle and any
+    /// caller that wraps it is too.
     pub async fn sign_tap_script(
         &self,
         sighash: &[u8; 32],
@@ -485,9 +499,7 @@ impl Nip46Client {
             .await?;
 
         if let Some(err) = response.error {
-            return Err(
-                NetworkError::response(format!("sign_tap_script rejected: {err}")).into(),
-            );
+            return Err(NetworkError::response(format!("sign_tap_script rejected: {err}")).into());
         }
 
         let hex_str = response.result.as_mut().ok_or_else(|| {
