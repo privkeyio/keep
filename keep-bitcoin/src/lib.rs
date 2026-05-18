@@ -21,7 +21,8 @@ pub use recovery::{
     PolicyInput, PolicyTierInput, RecoveryConfig, RecoveryOutput, RecoveryTier, SpendingTier,
 };
 pub use recovery_tx::{
-    merge_tap_script_sig, script_spend_sighashes, RecoveryTxBuilder, ScriptSpendSighash,
+    merge_tap_script_sig, script_spend_sighashes, verify_script_spend_input_binding,
+    RecoveryTxBuilder, ScriptSpendSighash, TAPROOT_DUST_LIMIT_SATS,
 };
 pub use signer::BitcoinSigner;
 
