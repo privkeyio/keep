@@ -5,8 +5,9 @@ use crate::recovery::{RecoveryOutput, TierInfo};
 use bitcoin::key::Secp256k1;
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{All, Keypair, Message};
+use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
+use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature, TapLeafHash};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use zeroize::Zeroize;
 
@@ -197,6 +198,95 @@ impl RecoveryTxBuilder {
             .control_block(&(tier.script.clone(), LeafVersion::TapScript))
             .ok_or_else(|| BitcoinError::Recovery("no control block for tier script".into()))
     }
+}
+
+/// Per-input recovery-tier script-spend sighash bundle.
+///
+/// Returned by [`script_spend_sighashes`]. Each entry contains the BIP-341
+/// sighash bytes the remote signer must sign, plus the leaf hash, leaf script,
+/// and control block needed to merge the resulting Schnorr signature back into
+/// the PSBT via [`merge_tap_script_sig`].
+#[derive(Clone, Debug)]
+pub struct ScriptSpendSighash {
+    pub input_index: usize,
+    pub sighash: [u8; 32],
+    pub leaf_hash: TapLeafHash,
+    pub script: ScriptBuf,
+    pub control_block: ControlBlock,
+}
+
+/// Compute the BIP-341 script-spend sighash for every input of `psbt` using
+/// the tap_scripts entries already attached to the PSBT. Each input must carry
+/// exactly one `tap_scripts` entry (as inserted by [`RecoveryTxBuilder::build_recovery_psbt`])
+/// and a `witness_utxo`. Returns one [`ScriptSpendSighash`] per input.
+pub fn script_spend_sighashes(psbt: &Psbt) -> Result<Vec<ScriptSpendSighash>> {
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input
+                .witness_utxo
+                .clone()
+                .ok_or(BitcoinError::MissingWitnessUtxo(i))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let mut out = Vec::with_capacity(psbt.inputs.len());
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        let mut iter = input.tap_scripts.iter();
+        let (control_block, (script, leaf_version)) = iter.next().ok_or_else(|| {
+            BitcoinError::Recovery(format!("input {i} has no tap_scripts entry"))
+        })?;
+        if iter.next().is_some() {
+            return Err(BitcoinError::Recovery(format!(
+                "input {i} has more than one tap_scripts entry; ambiguous tier"
+            )));
+        }
+        let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+        let sighash = sighash_cache
+            .taproot_script_spend_signature_hash(
+                i,
+                &Prevouts::All(&prevouts),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
+        out.push(ScriptSpendSighash {
+            input_index: i,
+            sighash: sighash.to_byte_array(),
+            leaf_hash,
+            script: script.clone(),
+            control_block: control_block.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Insert a remote Schnorr signature into `psbt.inputs[input_index].tap_script_sigs`
+/// keyed by `(xonly_pubkey, leaf_hash)` with `SIGHASH_DEFAULT`.
+pub fn merge_tap_script_sig(
+    psbt: &mut Psbt,
+    input_index: usize,
+    xonly_pubkey: bitcoin::XOnlyPublicKey,
+    leaf_hash: TapLeafHash,
+    schnorr_sig: [u8; 64],
+) -> Result<()> {
+    let input = psbt
+        .inputs
+        .get_mut(input_index)
+        .ok_or_else(|| BitcoinError::Recovery(format!("input {input_index} out of range")))?;
+    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&schnorr_sig)
+        .map_err(|e| BitcoinError::Signing(format!("invalid schnorr sig: {e}")))?;
+    input.tap_script_sigs.insert(
+        (xonly_pubkey, leaf_hash),
+        TaprootSignature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
