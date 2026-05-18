@@ -222,8 +222,7 @@ impl KfpNode {
                     let expected: [u8; 32] = hasher.finalize().into();
                     if expected != payload.new_descriptor_hash {
                         return Err(FrostNetError::Session(
-                            "Descriptor migrate new_descriptor_hash does not match session"
-                                .into(),
+                            "Descriptor migrate new_descriptor_hash does not match session".into(),
                         ));
                     }
                 }
@@ -234,7 +233,9 @@ impl KfpNode {
                     let known = self
                         .descriptor_lookup
                         .as_ref()
-                        .map(|l| l.find_by_hash(&payload.group_pubkey, &payload.new_descriptor_hash))
+                        .map(|l| {
+                            l.find_by_hash(&payload.group_pubkey, &payload.new_descriptor_hash)
+                        })
                         .unwrap_or(false);
                     if !known {
                         return Err(FrostNetError::Session(
@@ -916,10 +917,7 @@ impl KfpNode {
             // We captured `session_policy_version` under the earlier session
             // read so an eviction between reads cannot silently regress to
             // the v1 formula and produce a mismatch.
-            keep_core::wallet::fold_descriptor_version_suffix(
-                &mut hasher,
-                session_policy_version,
-            );
+            keep_core::wallet::fold_descriptor_version_suffix(&mut hasher, session_policy_version);
             hasher.finalize().into()
         };
 
