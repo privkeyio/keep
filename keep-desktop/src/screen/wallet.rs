@@ -493,19 +493,25 @@ impl State {
             }
             Message::RegisterDeviceUriChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.device_uri = truncate_to_bytes(&v, MAX_DEVICE_URI_LEN);
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.device_uri = truncate_to_bytes(&cleaned, MAX_DEVICE_URI_LEN);
                 }
                 None
             }
             Message::RegisterNameChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.wallet_name = truncate_to_bytes(&v, keep_nip46::MAX_WALLET_NAME_LEN);
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.wallet_name = truncate_to_bytes(&cleaned, keep_nip46::MAX_WALLET_NAME_LEN);
                 }
                 None
             }
             Message::RegisterDeviceKindChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.device_kind = truncate_to_bytes(&v, keep_nip46::MAX_DEVICE_KIND_LEN);
+                    // Drop control chars as the user types so they never enter
+                    // the field, instead of being surfaced as a post-submit
+                    // error. Length-cap after stripping.
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.device_kind = truncate_to_bytes(&cleaned, keep_nip46::MAX_DEVICE_KIND_LEN);
                 }
                 None
             }
