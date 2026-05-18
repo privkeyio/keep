@@ -407,7 +407,7 @@ impl App {
                     );
                 }
                 if let Some(ref k) = user_device_kind {
-                    if k.chars().any(|c| c.is_control()) {
+                    if keep_nip46::contains_control_chars(k) {
                         warn!(
                             group = %group_hex,
                             signer = %signer_hex,
