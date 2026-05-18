@@ -18,7 +18,10 @@ use crate::types::Nip46Response;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
-const GET_DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for the best-effort `get_device_info` probe. Kept short so a
+/// silent or hostile signer cannot stall registration UX. Callers that need to
+/// override (e.g. a known-slow device) can wrap with their own `tokio::time::timeout`.
+pub const GET_DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_HMAC_HEX_LEN: usize = 128;
 const HMAC_SHA256_LEN: usize = 32;
@@ -29,13 +32,13 @@ pub const MAX_DEVICE_INFO_JSON_LEN: usize = 2048;
 /// Size caps on individual fields of `DeviceInfo`.
 pub const MAX_DEVICE_KIND_LEN: usize = 32;
 pub const MAX_FIRMWARE_VERSION_LEN: usize = 64;
-const MAX_CAPABILITIES: usize = 32;
-const MAX_CAPABILITY_LEN: usize = 32;
+pub const MAX_CAPABILITIES: usize = 32;
+pub const MAX_CAPABILITY_LEN: usize = 32;
 
 /// Reject signer-supplied strings that contain control characters. Strings are
 /// surfaced verbatim in CLI/UI output, so any C0/C1 control codes would corrupt
 /// the terminal or hide content. Accept all other printable Unicode.
-fn contains_control_chars(s: &str) -> bool {
+pub fn contains_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
@@ -94,15 +97,17 @@ impl DeviceKind {
     }
 
     /// Promote `Other("Coldcard")` etc. to the matching named variant so two
-    /// registrations of the same device do not appear distinct.
+    /// registrations of the same device do not appear distinct. Matching is
+    /// case-insensitive ("COLDCARD", "ColdCard", "coldcard" all normalize to
+    /// `Coldcard`).
     fn normalize(self) -> Self {
         match self {
-            Self::Other(s) => match s.as_str() {
-                "Coldcard" => Self::Coldcard,
-                "Ledger" => Self::Ledger,
-                "BitBox02" => Self::BitBox02,
-                "Jade" => Self::Jade,
-                "Trezor" => Self::Trezor,
+            Self::Other(s) => match s.to_ascii_lowercase().as_str() {
+                "coldcard" => Self::Coldcard,
+                "ledger" => Self::Ledger,
+                "bitbox02" => Self::BitBox02,
+                "jade" => Self::Jade,
+                "trezor" => Self::Trezor,
                 _ => Self::Other(s),
             },
             other => other,
@@ -112,10 +117,11 @@ impl DeviceKind {
 
 /// Typed `get_device_info` response.
 ///
-/// `fingerprint` is the BIP32 master key fingerprint as a hex string (8 chars);
-/// `capabilities` is a free-form list. Both are validated when received: the
-/// fingerprint must decode to exactly 4 bytes and capability strings are
-/// length-capped.
+/// `fingerprint` is the BIP32 master key fingerprint as a hex string (8 chars).
+/// It is validated when received: must decode to exactly 4 bytes, and the
+/// all-zero sentinel (`00000000`, which BIP32 reserves for "no parent") is
+/// rejected. Stored normalized to lower-case so later string comparisons /
+/// serialization are stable.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceInfo {
@@ -401,11 +407,17 @@ impl Nip46Client {
                 ));
             }
         }
-        if info.fingerprint_bytes().is_none() {
+        let fp_bytes = info.fingerprint_bytes().ok_or_else(|| {
+            KeepError::InvalidInput("fingerprint must be 8 hex characters (4 bytes)".into())
+        })?;
+        if fp_bytes == [0u8; 4] {
             return Err(KeepError::InvalidInput(
-                "fingerprint must be 8 hex characters (4 bytes)".into(),
+                "fingerprint 00000000 is reserved by BIP32 for 'no parent' and cannot identify a device".into(),
             ));
         }
+        // Normalize hex to lower-case-no-whitespace so later comparisons /
+        // serialization are stable regardless of what the signer sent.
+        info.fingerprint = hex::encode(fp_bytes);
         if info.capabilities.len() > MAX_CAPABILITIES {
             return Err(KeepError::InvalidInput(format!(
                 "capabilities list exceeds {MAX_CAPABILITIES} entries"
@@ -630,6 +642,30 @@ mod tests {
         assert_eq!(
             DeviceKind::Other("Foundation".into()).normalize(),
             DeviceKind::Other("Foundation".into())
+        );
+    }
+
+    #[test]
+    fn test_device_kind_normalize_case_insensitive() {
+        assert_eq!(
+            DeviceKind::Other("COLDCARD".into()).normalize(),
+            DeviceKind::Coldcard
+        );
+        assert_eq!(
+            DeviceKind::Other("coldcard".into()).normalize(),
+            DeviceKind::Coldcard
+        );
+        assert_eq!(
+            DeviceKind::Other("ColdCard".into()).normalize(),
+            DeviceKind::Coldcard
+        );
+        assert_eq!(
+            DeviceKind::Other("trezor".into()).normalize(),
+            DeviceKind::Trezor
+        );
+        assert_eq!(
+            DeviceKind::Other("BITBOX02".into()).normalize(),
+            DeviceKind::BitBox02
         );
     }
 
