@@ -20,9 +20,12 @@ pub use psbt::{PsbtAnalysis, PsbtSigner};
 pub use recovery::{
     PolicyInput, PolicyTierInput, RecoveryConfig, RecoveryOutput, RecoveryTier, SpendingTier,
 };
-pub use recovery_tx::RecoveryTxBuilder;
+pub use recovery_tx::{
+    merge_tap_script_sig, script_spend_sighashes, RecoveryTxBuilder, ScriptSpendSighash,
+};
 pub use signer::BitcoinSigner;
 
+pub use bitcoin;
 pub use bitcoin::Network;
 
 fn aux_rand() -> Result<zeroize::Zeroizing<[u8; 32]>> {
