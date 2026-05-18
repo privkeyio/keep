@@ -707,11 +707,14 @@ async fn test_psbt_recovery_spend_end_to_end() {
     // live NIP-46 signer; the responder's `KfpNode` only sees the xpub +
     // fingerprint.
     let secp = Secp256k1::new();
-    let responder_xpriv = bitcoin::bip32::Xpriv::new_master(Network::Signet, &[7u8; 32])
-        .expect("xpriv master");
+    let responder_xpriv =
+        bitcoin::bip32::Xpriv::new_master(Network::Signet, &[7u8; 32]).expect("xpriv master");
     let responder_xpub = Xpub::from_priv(&secp, &responder_xpriv);
     let responder_xpub_str = responder_xpub.to_string();
-    let responder_fp = responder_xpub.fingerprint().to_string().to_ascii_lowercase();
+    let responder_fp = responder_xpub
+        .fingerprint()
+        .to_string()
+        .to_ascii_lowercase();
     let responder_xonly_bytes = responder_xpub.to_x_only_pub().serialize();
     let responder_xonly =
         XOnlyPublicKey::from_slice(&responder_xonly_bytes).expect("xonly from slice");
@@ -747,12 +750,9 @@ async fn test_psbt_recovery_spend_end_to_end() {
     };
     let policy_hash = keep_frost_net::derive_policy_hash(&policy);
 
-    let export = DescriptorExport::from_frost_wallet(
-        &group_pubkey,
-        Some(&recovery_config),
-        Network::Signet,
-    )
-    .expect("descriptor export");
+    let export =
+        DescriptorExport::from_frost_wallet(&group_pubkey, Some(&recovery_config), Network::Signet)
+            .expect("descriptor export");
     let external_desc = export.external_descriptor().to_string();
     let internal_desc = export.internal_descriptor().expect("internal descriptor");
 
@@ -925,6 +925,7 @@ async fn test_psbt_recovery_spend_end_to_end() {
         sighashes[0].input_index,
         responder_xonly,
         sighashes[0].leaf_hash,
+        &sighashes[0].sighash,
         schnorr_bytes,
     )
     .expect("merge sig");
@@ -945,10 +946,15 @@ async fn test_psbt_recovery_spend_end_to_end() {
     let finalized = timeout(Duration::from_secs(15), async {
         loop {
             match rx1.recv().await {
-                Ok(KfpNodeEvent::PsbtFinalized { session_id: sid, .. }) if sid == session_id => {
+                Ok(KfpNodeEvent::PsbtFinalized {
+                    session_id: sid, ..
+                }) if sid == session_id => {
                     return;
                 }
-                Ok(KfpNodeEvent::PsbtAborted { session_id: sid, reason }) if sid == session_id => {
+                Ok(KfpNodeEvent::PsbtAborted {
+                    session_id: sid,
+                    reason,
+                }) if sid == session_id => {
                     panic!("session aborted: {reason}");
                 }
                 Ok(_) => {}
@@ -989,10 +995,8 @@ async fn test_psbt_recovery_spend_end_to_end() {
         script_pubkey: recovery_output.address.script_pubkey(),
     };
     let mut cache = SighashCache::new(&final_tx);
-    let leaf_hash = TapLeafHash::from_script(
-        &recovery_output.tiers[0].script,
-        LeafVersion::TapScript,
-    );
+    let leaf_hash =
+        TapLeafHash::from_script(&recovery_output.tiers[0].script, LeafVersion::TapScript);
     let sighash = cache
         .taproot_script_spend_signature_hash(
             0,
