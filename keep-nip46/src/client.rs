@@ -22,9 +22,11 @@ const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
 /// silent or hostile signer cannot stall registration UX. Callers that need to
 /// override (e.g. a known-slow device) can wrap with their own `tokio::time::timeout`.
 pub const GET_DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(8);
+const SIGN_TAP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_HMAC_HEX_LEN: usize = 128;
 const HMAC_SHA256_LEN: usize = 32;
+const SCHNORR_SIG_LEN: usize = 64;
 pub const MAX_WALLET_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTOR_LEN: usize = 4096;
 /// Size cap on the JSON result string returned by `get_device_info`.
@@ -34,6 +36,7 @@ pub const MAX_DEVICE_KIND_LEN: usize = 32;
 pub const MAX_FIRMWARE_VERSION_LEN: usize = 64;
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_CAPABILITY_LEN: usize = 32;
+pub const MAX_TAP_SCRIPT_LEN: usize = 10_000;
 
 /// Reject signer-supplied strings that contain control characters. Strings are
 /// surfaced verbatim in CLI/UI output, so any C0/C1 control codes would corrupt
@@ -429,6 +432,85 @@ impl Nip46Client {
             validate_metadata_field("capability label", cap, 1, MAX_CAPABILITY_LEN)?;
         }
         Ok(info)
+    }
+
+    /// Request a taproot script-spend signature from the remote signer for a
+    /// recovery-tier PSBT input. The signer is expected to:
+    ///   1. Look up the descriptor it has previously registered (the descriptor
+    ///      string is passed for display/confirmation; it MUST match a record).
+    ///   2. Locate the secret key matching `xonly_pubkey` (e.g. by deriving
+    ///      every script-path key in its registered policy).
+    ///   3. Display the script and leaf hash for user confirmation.
+    ///   4. Schnorr-sign `sighash` under that key.
+    ///
+    /// All five params are hex-encoded except `descriptor`.
+    pub async fn sign_tap_script(
+        &self,
+        sighash: &[u8; 32],
+        xonly_pubkey: &[u8; 32],
+        leaf_hash: &[u8; 32],
+        script_bytes: &[u8],
+        descriptor: &str,
+    ) -> Result<[u8; SCHNORR_SIG_LEN]> {
+        if script_bytes.len() > MAX_TAP_SCRIPT_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "tap script exceeds {MAX_TAP_SCRIPT_LEN} bytes"
+            )));
+        }
+        if descriptor.is_empty() {
+            return Err(KeepError::InvalidInput(
+                "descriptor must not be empty".into(),
+            ));
+        }
+        if descriptor.len() > MAX_DESCRIPTOR_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
+            )));
+        }
+
+        let id = new_request_id();
+        let mut response = self
+            .request_with_timeout(
+                &id,
+                "sign_tap_script",
+                vec![
+                    Zeroizing::new(hex::encode(sighash)),
+                    Zeroizing::new(hex::encode(xonly_pubkey)),
+                    Zeroizing::new(hex::encode(leaf_hash)),
+                    Zeroizing::new(hex::encode(script_bytes)),
+                    Zeroizing::new(descriptor.to_string()),
+                ],
+                SIGN_TAP_SCRIPT_TIMEOUT,
+            )
+            .await?;
+
+        if let Some(err) = response.error {
+            return Err(
+                NetworkError::response(format!("sign_tap_script rejected: {err}")).into(),
+            );
+        }
+
+        let hex_str = response.result.as_mut().ok_or_else(|| {
+            NetworkError::response("sign_tap_script returned no result".to_string())
+        })?;
+        let trimmed_len = hex_str.trim().len();
+        if trimmed_len != SCHNORR_SIG_LEN * 2 {
+            hex_str.zeroize();
+            return Err(KeepError::InvalidInput(format!(
+                "sign_tap_script signature must be {} hex chars, got {}",
+                SCHNORR_SIG_LEN * 2,
+                trimmed_len
+            )));
+        }
+        let decode_result = hex::decode(hex_str.trim());
+        hex_str.zeroize();
+        let decoded = decode_result.map_err(|e| {
+            StorageError::invalid_format(format!("sign_tap_script signature hex: {e}"))
+        })?;
+        let sig: [u8; SCHNORR_SIG_LEN] = decoded.as_slice().try_into().map_err(|_| {
+            KeepError::InvalidInput("sign_tap_script signature wrong length".into())
+        })?;
+        Ok(sig)
     }
 
     async fn request(
