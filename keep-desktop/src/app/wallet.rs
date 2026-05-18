@@ -88,7 +88,8 @@ impl App {
                 session_id,
                 fingerprint,
                 bunker_uri,
-            } => self.begin_approve_psbt(session_id, fingerprint, bunker_uri),
+                psbt_hash,
+            } => self.begin_approve_psbt(session_id, fingerprint, bunker_uri, psbt_hash),
             wallet::Event::StartSpend { wallet_idx } => {
                 if let Screen::Wallet(ws) = &mut self.screen {
                     if let Some(entry) = ws.descriptors.get(wallet_idx).cloned() {
@@ -308,10 +309,7 @@ impl App {
                                 s.approve = None;
                             }
                         }
-                        self.set_toast(
-                            "PSBT signature submitted".into(),
-                            ToastKind::Success,
-                        );
+                        self.set_toast("PSBT signature submitted".into(), ToastKind::Success);
                     }
                     Err(e) => {
                         if let Screen::Wallet(s) = &mut self.screen {
@@ -579,7 +577,8 @@ impl App {
         &mut self,
         session_id: [u8; 32],
         fingerprint: String,
-        bunker_uri: String,
+        bunker_uri: zeroize::Zeroizing<String>,
+        snapshot_psbt_hash: [u8; 32],
     ) -> Task<Message> {
         let Some(node) = self.get_frost_node() else {
             return Task::done(Message::ApprovePsbtResult(
@@ -596,6 +595,20 @@ impl App {
                 let psbt_bytes = node
                     .psbt_session_proposal_psbt(&session_id)
                     .ok_or_else(|| "session has no proposal PSBT".to_string())?;
+
+                // SEC: Re-hash the in-flight proposal PSBT and compare to the
+                // hash captured at the moment the operator opened the
+                // approve pane. Catches proposer-side swaps in the
+                // preview/sign window. Fail closed.
+                {
+                    use keep_bitcoin::bitcoin::hashes::{sha256, Hash as _};
+                    let recomputed: [u8; 32] = sha256::Hash::hash(&psbt_bytes).to_byte_array();
+                    if recomputed != snapshot_psbt_hash {
+                        return Err(
+                            "PSBT hash changed between preview and sign; aborting".to_string()
+                        );
+                    }
+                }
 
                 let group_pubkey = *node.group_pubkey();
                 let descriptor = tokio::task::spawn_blocking(move || {
@@ -614,41 +627,66 @@ impl App {
                     .ok_or_else(|| "Descriptor has no persisted WalletPolicy".to_string())?;
                 let policy: keep_frost_net::WalletPolicy = serde_json::from_value(policy_value)
                     .map_err(|e| format!("invalid persisted policy: {e}"))?;
+                // SEC: re-derive the policy hash and require it equals the
+                // hash stored alongside the descriptor. Otherwise a tampered
+                // policy could swap our resolved External slot xpub.
+                let recomputed_hash = keep_frost_net::derive_policy_hash(&policy);
+                if recomputed_hash != descriptor.policy_hash {
+                    return Err(
+                        "persisted policy hash does not match stored descriptor.policy_hash; refusing"
+                            .to_string(),
+                    );
+                }
                 let tier = policy
                     .recovery_tiers
                     .get(tier_index as usize)
                     .ok_or_else(|| format!("tier {tier_index} not in persisted policy"))?;
-                let xpub_str = tier
-                    .key_slots
-                    .iter()
-                    .find_map(|s| match s {
-                        keep_frost_net::KeySlot::External { xpub, fingerprint: fp }
-                            if fp.eq_ignore_ascii_case(&fingerprint) =>
-                        {
-                            Some(xpub.clone())
+                let mut xpub_str: Option<String> = None;
+                for slot in &tier.key_slots {
+                    if let keep_frost_net::KeySlot::External {
+                        xpub,
+                        fingerprint: fp,
+                    } = slot
+                    {
+                        if fp.eq_ignore_ascii_case(&fingerprint) {
+                            if xpub_str.is_some() {
+                                return Err(format!(
+                                    "tier {tier_index} has more than one External slot with fingerprint {fingerprint}; ambiguous responder"
+                                ));
+                            }
+                            xpub_str = Some(xpub.clone());
                         }
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        format!("no External key slot with fingerprint {fingerprint}")
-                    })?;
+                    }
+                }
+                let xpub_str = xpub_str.ok_or_else(|| {
+                    format!("no External key slot with fingerprint {fingerprint}")
+                })?;
 
-                let network = <keep_bitcoin::Network as std::str::FromStr>::from_str(
-                    &descriptor.network,
-                )
-                .map_err(|e| format!("invalid network: {e}"))?;
+                let network =
+                    <keep_bitcoin::Network as std::str::FromStr>::from_str(&descriptor.network)
+                        .map_err(|e| format!("invalid network: {e}"))?;
                 let xonly_bytes = keep_bitcoin::xpub_to_x_only(&xpub_str, network)
                     .map_err(|e| format!("xpub_to_x_only: {e}"))?;
                 let xonly = keep_bitcoin::bitcoin::XOnlyPublicKey::from_slice(&xonly_bytes)
                     .map_err(|e| format!("xonly decode: {e}"))?;
 
-                let mut psbt =
-                    keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
-                        .map_err(|e| format!("decode PSBT: {e}"))?;
-                let sighashes = keep_bitcoin::script_spend_sighashes(&psbt)
-                    .map_err(|e| format!("compute sighashes: {e}"))?;
-                if sighashes.is_empty() {
+                let mut psbt = keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+                    .map_err(|e| format!("decode PSBT: {e}"))?;
+                if psbt.inputs.is_empty() {
                     return Err("PSBT has no inputs".to_string());
+                }
+
+                // SEC: verify every input's tap_scripts entry is bound to
+                // its witness_utxo and references our x-only key BEFORE
+                // forwarding any sighash to the bunker. Fail closed.
+                let mut sighashes = Vec::with_capacity(psbt.inputs.len());
+                for i in 0..psbt.inputs.len() {
+                    let bundle =
+                        keep_bitcoin::verify_script_spend_input_binding(&psbt, i, &xonly_bytes)
+                            .map_err(|e| {
+                                format!("PSBT input {i} binding verification failed: {e}")
+                            })?;
+                    sighashes.push(bundle);
                 }
 
                 let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
@@ -679,6 +717,7 @@ impl App {
                             sh.input_index,
                             xonly,
                             sh.leaf_hash,
+                            &sh.sighash,
                             sig,
                         )
                         .map_err(|e| format!("merge sig: {e}"))?;
