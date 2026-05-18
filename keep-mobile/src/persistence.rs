@@ -239,6 +239,13 @@ pub(crate) struct StoredDeviceRegistration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hmac: Option<String>,
     pub registered_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<String>,
+    /// Hex-encoded 8 chars (4-byte BIP32 master fingerprint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_version: Option<String>,
 }
 
 const HMAC_SHA256_HEX_LEN: usize = 64;
@@ -382,6 +389,9 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
                 wallet_name: r.wallet_name,
                 hmac: r.hmac,
                 registered_at: r.registered_at,
+                device_kind: r.device_kind,
+                fingerprint_hex: r.fingerprint_hex,
+                firmware_version: r.firmware_version,
             })
         })
         .collect();
@@ -412,6 +422,9 @@ fn info_to_stored(info: &WalletDescriptorInfo) -> StoredDescriptor {
                 wallet_name: r.wallet_name.clone(),
                 hmac: r.hmac.clone(),
                 registered_at: r.registered_at,
+                device_kind: r.device_kind.clone(),
+                fingerprint_hex: r.fingerprint_hex.clone(),
+                firmware_version: r.firmware_version.clone(),
             })
             .collect(),
     }

@@ -18,11 +18,19 @@ use crate::types::Nip46Response;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
+const GET_DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_HMAC_HEX_LEN: usize = 128;
 const HMAC_SHA256_LEN: usize = 32;
 pub const MAX_WALLET_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTOR_LEN: usize = 4096;
+/// Size cap on the JSON result string returned by `get_device_info`.
+pub const MAX_DEVICE_INFO_JSON_LEN: usize = 2048;
+/// Size caps on individual fields of `DeviceInfo`.
+const MAX_DEVICE_KIND_LEN: usize = 32;
+const MAX_FIRMWARE_VERSION_LEN: usize = 64;
+const MAX_CAPABILITIES: usize = 32;
+const MAX_CAPABILITY_LEN: usize = 32;
 
 /// Outcome of a successful `register_wallet` request.
 ///
@@ -45,6 +53,67 @@ impl std::fmt::Debug for RegisterWalletResponse {
                     .map(|h| format!("<redacted; {} bytes>", h.len())),
             )
             .finish()
+    }
+}
+
+/// Device kind reported by a remote signer in response to `get_device_info`.
+///
+/// Free-form `Other(String)` arm preserves forward compatibility with signers
+/// that report a model name not yet known to this client. Stricter callers can
+/// match on the named variants and fall back to the user-supplied value for
+/// `Other`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeviceKind {
+    Coldcard,
+    Ledger,
+    BitBox02,
+    Jade,
+    Trezor,
+    Other(String),
+}
+
+impl DeviceKind {
+    /// Display name for the device, suitable for persisting in
+    /// `DeviceRegistration::device_kind`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Coldcard => "Coldcard",
+            Self::Ledger => "Ledger",
+            Self::BitBox02 => "BitBox02",
+            Self::Jade => "Jade",
+            Self::Trezor => "Trezor",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+}
+
+/// Typed `get_device_info` response.
+///
+/// `fingerprint` is the BIP32 master key fingerprint as a hex string (8 chars);
+/// `capabilities` is a free-form list. Both are validated when received: the
+/// fingerprint must decode to exactly 4 bytes and capability strings are
+/// length-capped.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceInfo {
+    pub kind: DeviceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_version: Option<String>,
+    /// 8 hex chars; BIP32 master key fingerprint.
+    pub fingerprint: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl DeviceInfo {
+    /// Decode the hex fingerprint into 4 bytes, if well-formed.
+    pub fn fingerprint_bytes(&self) -> Option<[u8; 4]> {
+        let s = self.fingerprint.trim();
+        if s.len() != 8 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bytes = hex::decode(s).ok()?;
+        bytes.try_into().ok()
     }
 }
 
@@ -259,6 +328,66 @@ impl Nip46Client {
         Ok(RegisterWalletResponse { hmac })
     }
 
+    /// Request `DeviceInfo` from the remote signer.
+    ///
+    /// This is best-effort: callers should treat any error as "info unavailable"
+    /// and fall back to user-supplied values rather than aborting wallet
+    /// registration.
+    pub async fn get_device_info(&self) -> Result<DeviceInfo> {
+        let id = new_request_id();
+        let response = self
+            .request_with_timeout(&id, "get_device_info", Vec::new(), GET_DEVICE_INFO_TIMEOUT)
+            .await?;
+
+        if let Some(err) = response.error {
+            return Err(NetworkError::response(format!("get_device_info rejected: {err}")).into());
+        }
+
+        let result = response
+            .result
+            .ok_or_else(|| NetworkError::response("get_device_info returned no result"))?;
+        if result.len() > MAX_DEVICE_INFO_JSON_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "get_device_info payload exceeds {MAX_DEVICE_INFO_JSON_LEN} bytes"
+            )));
+        }
+        let info: DeviceInfo = serde_json::from_str(&result)
+            .map_err(|e| StorageError::invalid_format(format!("get_device_info payload: {e}")))?;
+
+        if let DeviceKind::Other(ref s) = info.kind {
+            if s.is_empty() || s.len() > MAX_DEVICE_KIND_LEN {
+                return Err(KeepError::InvalidInput(format!(
+                    "device kind 'Other' label must be 1..={MAX_DEVICE_KIND_LEN} bytes"
+                )));
+            }
+        }
+        if let Some(ref fw) = info.firmware_version {
+            if fw.len() > MAX_FIRMWARE_VERSION_LEN {
+                return Err(KeepError::InvalidInput(format!(
+                    "firmware_version exceeds {MAX_FIRMWARE_VERSION_LEN} bytes"
+                )));
+            }
+        }
+        if info.fingerprint_bytes().is_none() {
+            return Err(KeepError::InvalidInput(
+                "fingerprint must be 8 hex characters (4 bytes)".into(),
+            ));
+        }
+        if info.capabilities.len() > MAX_CAPABILITIES {
+            return Err(KeepError::InvalidInput(format!(
+                "capabilities list exceeds {MAX_CAPABILITIES} entries"
+            )));
+        }
+        for cap in &info.capabilities {
+            if cap.is_empty() || cap.len() > MAX_CAPABILITY_LEN {
+                return Err(KeepError::InvalidInput(format!(
+                    "capability label must be 1..={MAX_CAPABILITY_LEN} bytes"
+                )));
+            }
+        }
+        Ok(info)
+    }
+
     async fn request(
         &self,
         id: &str,
@@ -413,6 +542,42 @@ fn append_json_string(buf: &mut Zeroizing<String>, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_device_info_roundtrip_named_kind() {
+        let json = r#"{"kind":"Coldcard","firmware_version":"1.2.3","fingerprint":"deadbeef","capabilities":["miniscript","tapminiscript"]}"#;
+        let info: DeviceInfo = serde_json::from_str(json).expect("parse named kind");
+        assert_eq!(info.kind, DeviceKind::Coldcard);
+        assert_eq!(info.fingerprint_bytes(), Some([0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(info.kind.as_str(), "Coldcard");
+    }
+
+    #[test]
+    fn test_device_info_roundtrip_other_kind() {
+        let json = r#"{"kind":{"Other":"Foundation"},"fingerprint":"00112233","capabilities":[]}"#;
+        let info: DeviceInfo = serde_json::from_str(json).expect("parse other kind");
+        assert_eq!(info.kind, DeviceKind::Other("Foundation".into()));
+        assert_eq!(info.kind.as_str(), "Foundation");
+        assert!(info.firmware_version.is_none());
+    }
+
+    #[test]
+    fn test_device_info_rejects_unknown_fields() {
+        let json = r#"{"kind":"Ledger","fingerprint":"deadbeef","capabilities":[],"extra":"nope"}"#;
+        let err = serde_json::from_str::<DeviceInfo>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_fingerprint_bytes_rejects_malformed() {
+        let info = DeviceInfo {
+            kind: DeviceKind::Trezor,
+            firmware_version: None,
+            fingerprint: "zz".into(),
+            capabilities: Vec::new(),
+        };
+        assert!(info.fingerprint_bytes().is_none());
+    }
 
     #[test]
     fn test_new_request_id_is_unique() {

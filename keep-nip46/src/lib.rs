@@ -20,7 +20,10 @@ pub use audit::{AuditAction, AuditEntry, AuditLog};
 pub use bunker::{
     generate_bunker_url, parse_bunker_url, parse_nostrconnect_uri, NostrConnectRequest,
 };
-pub use client::{Nip46Client, RegisterWalletResponse, MAX_DESCRIPTOR_LEN, MAX_WALLET_NAME_LEN};
+pub use client::{
+    DeviceInfo, DeviceKind, Nip46Client, RegisterWalletResponse, MAX_DESCRIPTOR_LEN,
+    MAX_DEVICE_INFO_JSON_LEN, MAX_WALLET_NAME_LEN,
+};
 pub use error::Result;
 pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;

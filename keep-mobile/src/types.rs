@@ -104,6 +104,9 @@ pub struct DeviceRegistrationInfo {
     pub wallet_name: String,
     pub hmac: Option<String>,
     pub registered_at: u64,
+    pub device_kind: Option<String>,
+    pub fingerprint_hex: Option<String>,
+    pub firmware_version: Option<String>,
 }
 
 impl std::fmt::Debug for DeviceRegistrationInfo {
@@ -113,6 +116,9 @@ impl std::fmt::Debug for DeviceRegistrationInfo {
             .field("wallet_name", &self.wallet_name)
             .field("hmac", &self.hmac.as_ref().map(|_| "<redacted>"))
             .field("registered_at", &self.registered_at)
+            .field("device_kind", &self.device_kind)
+            .field("fingerprint_hex", &self.fingerprint_hex)
+            .field("firmware_version", &self.firmware_version)
             .finish()
     }
 }

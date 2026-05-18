@@ -211,6 +211,12 @@ pub(crate) enum WalletCommands {
         name: Option<String>,
         #[arg(long, help = "Print the registration token (HMAC) to the terminal")]
         show_token: bool,
+        #[arg(long, help = "Device kind label (e.g. Coldcard, Ledger, BitBox02)")]
+        kind: Option<String>,
+        #[arg(long, help = "BIP32 master key fingerprint, 8 hex chars")]
+        fingerprint: Option<String>,
+        #[arg(long, help = "Firmware version string reported by the signer")]
+        firmware_version: Option<String>,
     },
     /// List hardware signers that have registered a stored wallet
     Registrations {

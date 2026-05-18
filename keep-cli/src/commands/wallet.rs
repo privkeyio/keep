@@ -219,6 +219,7 @@ pub fn cmd_wallet_descriptor(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_wallet_register(
     out: &Output,
     path: &Path,
@@ -226,8 +227,16 @@ pub fn cmd_wallet_register(
     device_uri: &str,
     name: Option<&str>,
     show_token: bool,
+    kind_arg: Option<&str>,
+    fingerprint_arg: Option<&str>,
+    firmware_version_arg: Option<&str>,
 ) -> Result<()> {
     debug!(group, device = %mask_secret(device_uri), "wallet register");
+
+    let fingerprint_arg_bytes = match fingerprint_arg {
+        Some(s) => Some(parse_fingerprint_hex(s)?),
+        None => None,
+    };
 
     let group_pubkey = parse_group_id(group)?;
 
@@ -292,13 +301,24 @@ pub fn cmd_wallet_register(
                 .map_err(|e| KeepError::Runtime(format!("handshake: {e}")))?;
             spinner.finish();
 
+            // Best-effort device info probe; failure must not block registration.
+            let spinner = out.spinner("Probing device info...");
+            let device_info = match client.get_device_info().await {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    debug!("get_device_info failed (best-effort): {e}");
+                    None
+                }
+            };
+            spinner.finish();
+
             let spinner = out.spinner("Registering wallet on device (confirm on device)...");
             let response = client
                 .register_wallet(&wallet_name, &multipath)
                 .await
                 .map_err(|e| KeepError::Runtime(format!("register_wallet: {e}")))?;
             spinner.finish();
-            Ok::<_, KeepError>(response)
+            Ok::<_, KeepError>((response, device_info))
         }
         .await;
 
@@ -309,7 +329,7 @@ pub fn cmd_wallet_register(
     // runtime down; avoids aborting in-flight disconnect cleanup.
     rt.shutdown_timeout(Duration::from_secs(2));
 
-    let (signer_pubkey, response) = register_outcome?;
+    let (signer_pubkey, (response, device_info)) = register_outcome?;
 
     let signer_bytes = signer_pubkey.to_bytes();
     let signer_hex = hex::encode(signer_bytes);
@@ -318,11 +338,32 @@ pub fn cmd_wallet_register(
         .unwrap_or_default()
         .as_secs();
 
+    // CLI flags take precedence; fall back to the device-reported values.
+    let device_kind = kind_arg
+        .map(|s| s.to_string())
+        .or_else(|| device_info.as_ref().map(|d| d.kind.as_str().to_string()));
+    let fingerprint =
+        fingerprint_arg_bytes.or_else(|| device_info.as_ref().and_then(|d| d.fingerprint_bytes()));
+    let firmware_version = firmware_version_arg.map(|s| s.to_string()).or_else(|| {
+        device_info
+            .as_ref()
+            .and_then(|d| d.firmware_version.clone())
+    });
+
     // Surface the device-side outcome before attempting local persistence so an
     // operator knows registration already took effect on the signer if the
     // local save errors below. Re-running register is idempotent.
     out.success("Device accepted the wallet registration");
     out.field("Signer pubkey", &signer_hex);
+    if let Some(k) = device_kind.as_deref() {
+        out.field("Device kind", k);
+    }
+    if let Some(fp) = fingerprint {
+        out.field("Fingerprint", &hex::encode(fp));
+    }
+    if let Some(fw) = firmware_version.as_deref() {
+        out.field("Firmware version", fw);
+    }
     match response.hmac.as_deref() {
         Some(hmac) => out.field("Registration token", &format_token(hmac, show_token)),
         None => out.info("Device did not return a registration token."),
@@ -340,6 +381,9 @@ pub fn cmd_wallet_register(
             wallet_name: wallet_name.clone(),
             hmac: response.hmac.clone(),
             registered_at: now,
+            device_kind,
+            fingerprint,
+            firmware_version,
         },
     )
     .map_err(|e| {
@@ -386,6 +430,15 @@ pub fn cmd_wallet_registrations(
         out.field("Signer pubkey", &hex::encode(reg.signer_pubkey));
         out.field("Wallet name", &reg.wallet_name);
         out.field("Registered at", &format_registered_at(reg.registered_at));
+        if let Some(k) = reg.device_kind.as_deref() {
+            out.field("Device kind", k);
+        }
+        if let Some(fp) = reg.fingerprint {
+            out.field("Fingerprint", &hex::encode(fp));
+        }
+        if let Some(fw) = reg.firmware_version.as_deref() {
+            out.field("Firmware version", fw);
+        }
         if let Some(hmac) = reg.hmac.as_deref() {
             out.field("Registration token", &format_token(hmac, show_token));
         }
@@ -424,6 +477,20 @@ fn truncate_relay_for_log(relay: &str) -> String {
     }
     let prefix: String = relay.chars().take(PREFIX_LEN).collect();
     format!("{prefix}...")
+}
+
+fn parse_fingerprint_hex(s: &str) -> Result<[u8; 4]> {
+    let trimmed = s.trim().trim_start_matches("0x");
+    if trimmed.len() != 8 {
+        return Err(KeepError::InvalidInput(
+            "fingerprint must be 8 hex characters (4 bytes)".into(),
+        ));
+    }
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| KeepError::InvalidInput(format!("invalid fingerprint hex: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| KeepError::InvalidInput("fingerprint must be 4 bytes".into()))
 }
 
 fn format_token(hmac: &[u8], show_token: bool) -> String {
