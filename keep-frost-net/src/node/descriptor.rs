@@ -305,7 +305,7 @@ impl KfpNode {
                     }
                 }
                 Ok(None) => {}
-                Err(()) => {
+                Err(_) => {
                     return Err(FrostNetError::Session(
                         "Descriptor migrate could not query persisted descriptors (vault unavailable); refusing to proceed".into(),
                     ));

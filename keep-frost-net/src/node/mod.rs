@@ -38,6 +38,21 @@ use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
 
+/// Error returned by [`PersistedDescriptorLookup::latest_version_for`] when
+/// the underlying descriptor store cannot be queried (e.g. vault locked or
+/// mutex poisoned). Callers must fail-closed rather than treating this as
+/// "no descriptor known".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorLookupUnavailable;
+
+impl std::fmt::Display for DescriptorLookupUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("persisted descriptor store unavailable")
+    }
+}
+
+impl std::error::Error for DescriptorLookupUnavailable {}
+
 /// Fallback lookup for finalized wallet descriptors that have been persisted
 /// outside of the in-memory `DescriptorSessionManager` (e.g. stored by the
 /// host application). Used when a PSBT coordination message arrives for a
@@ -61,14 +76,17 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     }
 
     /// Return the largest persisted descriptor version for the given group,
-    /// `Ok(None)` if no descriptor exists, or `Err(())` if the underlying
-    /// store could not be queried (e.g. vault locked). Used to validate that
-    /// an inbound `DescriptorMigrate` strictly increases the version. No
-    /// default impl is provided: silently returning `Ok(None)` would disable
-    /// the monotonic version check, allowing downgrade replay of
-    /// `DescriptorMigrate`. Callers must fail-closed on `Err(())` rather than
-    /// treating it as "no descriptor known".
-    fn latest_version_for(&self, group: &[u8; 32]) -> std::result::Result<Option<u32>, ()>;
+    /// `Ok(None)` if no descriptor exists, or `Err(DescriptorLookupUnavailable)`
+    /// if the underlying store could not be queried (e.g. vault locked). Used
+    /// to validate that an inbound `DescriptorMigrate` strictly increases the
+    /// version. No default impl is provided: silently returning `Ok(None)`
+    /// would disable the monotonic version check, allowing downgrade replay
+    /// of `DescriptorMigrate`. Callers must fail-closed on `Err(_)` rather
+    /// than treating it as "no descriptor known".
+    fn latest_version_for(
+        &self,
+        group: &[u8; 32],
+    ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable>;
 }
 
 /// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
@@ -126,13 +144,16 @@ where
         self.lookup(|d| Some(d.network.clone()), group, hash)
     }
 
-    fn latest_version_for(&self, group: &[u8; 32]) -> std::result::Result<Option<u32>, ()> {
+    fn latest_version_for(
+        &self,
+        group: &[u8; 32],
+    ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable> {
         let Some(descriptors) = (self.fetch)() else {
             tracing::warn!(
                 group = %hex::encode(group),
                 "KeepDescriptorLookup could not read persisted descriptors for latest_version_for (vault locked or unavailable); failing closed",
             );
-            return Err(());
+            return Err(DescriptorLookupUnavailable);
         };
         Ok(descriptors
             .iter()
