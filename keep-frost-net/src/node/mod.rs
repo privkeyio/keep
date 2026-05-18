@@ -494,6 +494,9 @@ impl std::fmt::Debug for KfpNodeEvent {
     }
 }
 
+/// Map key is `(session_id, new_descriptor_hash)`; value is `created_at`.
+pub(crate) type SeenDescriptorMigrates = RwLock<HashMap<([u8; 32], [u8; 32]), u64>>;
+
 pub struct KfpNode {
     pub(crate) keys: Keys,
     pub(crate) client: Client,
@@ -517,7 +520,7 @@ pub struct KfpNode {
     /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
     /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
     /// replay-window pruning.
-    pub(crate) seen_descriptor_migrates: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
+    pub(crate) seen_descriptor_migrates: SeenDescriptorMigrates,
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
     pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
