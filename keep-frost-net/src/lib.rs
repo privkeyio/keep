@@ -70,6 +70,7 @@ mod peer;
 pub mod proof;
 mod protocol;
 mod psbt_session;
+mod recovery_signers;
 mod session;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
@@ -118,6 +119,9 @@ pub use protocol::{
 };
 pub use psbt_session::{
     derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,
+};
+pub use recovery_signers::{
+    InMemoryRecoverySignerRegistry, RecoverySignerHandle, RecoverySignerRegistry,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

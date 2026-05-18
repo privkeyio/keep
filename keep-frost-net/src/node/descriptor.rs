@@ -905,7 +905,13 @@ impl KfpNode {
 
         let our_index = self.share.metadata.identifier;
 
-        let (reconstruction_result, session_network, our_xpub, session_policy_version) = {
+        let (
+            reconstruction_result,
+            session_network,
+            our_xpub,
+            session_policy_version,
+            session_policy,
+        ) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
@@ -913,6 +919,7 @@ impl KfpNode {
 
             let network = session.network().to_string();
             let policy_version = session.policy().version;
+            let policy = session.policy().clone();
 
             let initiator = session.initiator().ok_or_else(|| {
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -955,7 +962,7 @@ impl KfpNode {
                 )
                 .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
             };
-            (result, network, our_xpub, policy_version)
+            (result, network, our_xpub, policy_version, policy)
         };
 
         let (expected_external, expected_internal) = match reconstruction_result {
@@ -1099,6 +1106,7 @@ impl KfpNode {
             network: session_network,
             policy_hash: payload.policy_hash,
             version: session_policy_version,
+            policy: session_policy,
         });
 
         Ok(())
@@ -1302,6 +1310,7 @@ impl KfpNode {
                         network: session.network().to_string(),
                         policy_hash: desc.policy_hash,
                         version: session.policy().version,
+                        policy: session.policy().clone(),
                     });
                 }
             }

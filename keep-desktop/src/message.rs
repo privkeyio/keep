@@ -281,6 +281,7 @@ pub enum FrostNodeMsg {
         external_descriptor: String,
         internal_descriptor: String,
         policy_hash: [u8; 32],
+        policy: Option<serde_json::Value>,
     },
     DescriptorAcked {
         session_id: [u8; 32],

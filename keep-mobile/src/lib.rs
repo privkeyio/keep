@@ -1797,6 +1797,10 @@ impl KeepMobile {
                 }
                 None => None,
             };
+            let policy = d
+                .policy_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),
@@ -1807,6 +1811,7 @@ impl KeepMobile {
                 policy_hash,
                 version: d.version,
                 previous_descriptor_hash,
+                policy,
             });
         }
 
@@ -1990,6 +1995,7 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(wd.policy_hash))
             };
+            let policy_json = wd.policy.as_ref().and_then(|v| serde_json::to_string(v).ok());
             prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),
@@ -2012,6 +2018,7 @@ impl KeepMobile {
                 policy_hash_hex,
                 version: wd.version,
                 previous_descriptor_hash_hex: wd.previous_descriptor_hash.map(hex::encode),
+                policy_json,
             });
         }
 
@@ -2767,7 +2774,9 @@ impl KeepMobile {
                             network,
                             policy_hash,
                             version,
+                            policy,
                         }) => {
+                            let policy_json = serde_json::to_string(&policy).ok();
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
                             }
@@ -2796,6 +2805,7 @@ impl KeepMobile {
                                 internal_descriptor,
                                 policy_hash,
                                 version,
+                                policy_json,
                             )
                             .await;
                         }
@@ -2892,6 +2902,7 @@ impl KeepMobile {
         internal_descriptor: String,
         policy_hash: [u8; 32],
         version: u32,
+        policy_json: Option<String>,
     ) {
         let group_pubkey = hex::encode(node.group_pubkey());
         let created_at = std::time::SystemTime::now()
@@ -3008,6 +3019,7 @@ impl KeepMobile {
             },
             version,
             previous_descriptor_hash_hex,
+            policy_json,
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

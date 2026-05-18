@@ -197,6 +197,7 @@ pub fn cmd_wallet_descriptor(
         policy_hash: [0u8; 32],
         version: INITIAL_DESCRIPTOR_VERSION,
         previous_descriptor_hash: None,
+        policy: None,
     };
 
     let mut keep = Keep::open(path)?;
@@ -843,6 +844,8 @@ pub fn cmd_wallet_propose(
     let total_shares = share.metadata.total_shares;
 
     let policy = parse_recovery_policy(recovery, total_shares)?;
+    let policy_json = serde_json::to_value(&policy)
+        .map_err(|e| KeepError::Runtime(format!("serialize policy: {e}")))?;
 
     out.newline();
     out.header("Wallet Descriptor Proposal");
@@ -1082,6 +1085,7 @@ pub fn cmd_wallet_propose(
             policy_hash: finalized_policy_hash,
             version: INITIAL_DESCRIPTOR_VERSION,
             previous_descriptor_hash: None,
+            policy: Some(policy_json),
         };
 
         keep.lock()

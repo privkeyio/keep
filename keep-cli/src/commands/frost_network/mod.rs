@@ -182,6 +182,7 @@ pub fn cmd_frost_network_serve(
                         network,
                         policy_hash,
                         version,
+                        policy,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -196,6 +197,7 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            let policy_value = serde_json::to_value(&policy).ok();
                             // The predecessor lookup and the subsequent store
                             // are not held under a single critical section
                             // beyond `keep.lock()`; a second migrate event
@@ -247,6 +249,7 @@ pub fn cmd_frost_network_serve(
                                 policy_hash,
                                 version,
                                 previous_descriptor_hash,
+                                policy: policy_value,
                             };
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
