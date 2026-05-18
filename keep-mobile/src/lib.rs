@@ -1741,6 +1741,11 @@ impl KeepMobile {
                         }
                         let mut arr = [0u8; 4];
                         arr.copy_from_slice(&bytes);
+                        if arr == [0u8; 4] {
+                            return Err(KeepMobileError::BackupError {
+                                msg: "device_registration.fingerprint_hex 00000000 is reserved by BIP32 for 'no parent'".into(),
+                            });
+                        }
                         Some(arr)
                     }
                     None => None,

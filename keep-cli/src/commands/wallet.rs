@@ -576,9 +576,15 @@ fn parse_fingerprint_hex(s: &str) -> Result<[u8; 4]> {
     }
     let bytes = hex::decode(&trimmed)
         .map_err(|e| KeepError::InvalidInput(format!("invalid fingerprint hex: {e}")))?;
-    bytes
+    let arr: [u8; 4] = bytes
         .try_into()
-        .map_err(|_| KeepError::InvalidInput("fingerprint must be 4 bytes".into()))
+        .map_err(|_| KeepError::InvalidInput("fingerprint must be 4 bytes".into()))?;
+    if arr == [0u8; 4] {
+        return Err(KeepError::InvalidInput(
+            "fingerprint 00000000 is reserved by BIP32 for 'no parent'".into(),
+        ));
+    }
+    Ok(arr)
 }
 
 fn format_token(hmac: &[u8], show_token: bool) -> String {

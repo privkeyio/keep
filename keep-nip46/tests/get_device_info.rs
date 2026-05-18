@@ -346,6 +346,17 @@ async fn test_get_device_info_rejects_oversize_other_label() {
 }
 
 #[tokio::test]
+async fn test_get_device_info_rejects_zero_fingerprint() {
+    let payload =
+        r#"{"kind":"Coldcard","fingerprint":"00000000","capabilities":[]}"#.to_string();
+    let err = expect_error_for_payload(payload).await;
+    match err {
+        KeepError::InvalidInput(msg) => assert!(msg.contains("00000000")),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_get_device_info_rejects_control_chars_in_other() {
     let payload =
         r#"{"kind":{"Other":"Cold\ncard"},"fingerprint":"deadbeef","capabilities":[]}"#.to_string();
