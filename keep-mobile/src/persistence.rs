@@ -343,6 +343,11 @@ pub(crate) fn persist_descriptor(
     storage: &Arc<dyn SecureStorage>,
     info: &WalletDescriptorInfo,
 ) -> Result<(), KeepMobileError> {
+    if info.version == 0 {
+        return Err(KeepMobileError::StorageError {
+            msg: "refusing to persist descriptor with version 0 (versions start at 1)".into(),
+        });
+    }
     match info.policy_hash_hex.as_deref() {
         Some(h) if h.len() == POLICY_HASH_HEX_LEN && h.chars().all(|c| c.is_ascii_hexdigit()) => {
             if h.chars().all(|c| c == '0') {

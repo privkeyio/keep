@@ -140,7 +140,10 @@ pub struct WalletDescriptor {
     /// initial descriptor and increments on each migration. Records persisted
     /// before versioning materialize as `1` via `#[serde(default)]` +
     /// [`default_descriptor_version`].
-    #[serde(default = "default_descriptor_version")]
+    #[serde(
+        default = "default_descriptor_version",
+        deserialize_with = "deserialize_nonzero_version"
+    )]
     pub version: u32,
     /// Canonical hash of the descriptor this one supersedes, when this is a
     /// migration. `None` for the initial descriptor.
@@ -156,6 +159,20 @@ pub const INITIAL_DESCRIPTOR_VERSION: u32 = 1;
 /// records that predate the versioning field.
 pub fn default_descriptor_version() -> u32 {
     INITIAL_DESCRIPTOR_VERSION
+}
+
+fn deserialize_nonzero_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = u32::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(serde::de::Error::custom(
+            "descriptor version must be >= 1 (versions start at INITIAL_DESCRIPTOR_VERSION)",
+        ));
+    }
+    Ok(v)
 }
 
 /// Domain-separated version suffix folded into the canonical descriptor hash
@@ -209,6 +226,16 @@ impl WalletDescriptor {
     /// coordination protocol.
     pub fn canonical_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
+        // Version 0 is invalid by construction: descriptor versions start at 1
+        // (INITIAL_DESCRIPTOR_VERSION) and increment monotonically. Hashing a
+        // zero-version descriptor would produce a value that no other code
+        // path can match (since v1 omits the version suffix and v2+ folds it
+        // in) and silently propagating it would corrupt lineage. Panic here
+        // rather than emit a meaningless hash.
+        assert!(
+            self.version > 0,
+            "WalletDescriptor::canonical_hash called with version == 0 (versions start at 1)"
+        );
         let mut h = Sha256::new();
         h.update((self.external_descriptor.len() as u64).to_le_bytes());
         h.update(self.external_descriptor.as_bytes());

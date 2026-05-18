@@ -61,11 +61,14 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     }
 
     /// Return the largest persisted descriptor version for the given group,
-    /// or `None` if no descriptor exists. Used to validate that an inbound
-    /// `DescriptorMigrate` strictly increases the version. No default impl
-    /// is provided: silently returning `None` would disable the monotonic
-    /// version check, allowing downgrade replay of `DescriptorMigrate`.
-    fn latest_version_for(&self, group: &[u8; 32]) -> Option<u32>;
+    /// `Ok(None)` if no descriptor exists, or `Err(())` if the underlying
+    /// store could not be queried (e.g. vault locked). Used to validate that
+    /// an inbound `DescriptorMigrate` strictly increases the version. No
+    /// default impl is provided: silently returning `Ok(None)` would disable
+    /// the monotonic version check, allowing downgrade replay of
+    /// `DescriptorMigrate`. Callers must fail-closed on `Err(())` rather than
+    /// treating it as "no descriptor known".
+    fn latest_version_for(&self, group: &[u8; 32]) -> std::result::Result<Option<u32>, ()>;
 }
 
 /// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
@@ -123,13 +126,19 @@ where
         self.lookup(|d| Some(d.network.clone()), group, hash)
     }
 
-    fn latest_version_for(&self, group: &[u8; 32]) -> Option<u32> {
-        let descriptors = (self.fetch)()?;
-        descriptors
+    fn latest_version_for(&self, group: &[u8; 32]) -> std::result::Result<Option<u32>, ()> {
+        let Some(descriptors) = (self.fetch)() else {
+            tracing::warn!(
+                group = %hex::encode(group),
+                "KeepDescriptorLookup could not read persisted descriptors for latest_version_for (vault locked or unavailable); failing closed",
+            );
+            return Err(());
+        };
+        Ok(descriptors
             .iter()
             .filter(|d| &d.group_pubkey == group)
             .map(|d| d.version)
-            .max()
+            .max())
     }
 }
 
@@ -269,6 +278,12 @@ pub enum KfpNodeEvent {
         internal_descriptor: String,
         network: String,
         policy_hash: [u8; 32],
+        /// Monotonic version of the finalized descriptor (from the session
+        /// policy). The persistence layer must record this rather than
+        /// hard-coding [`keep_core::wallet::INITIAL_DESCRIPTOR_VERSION`] so
+        /// migration lineage is preserved when this completion was a v2+
+        /// descriptor.
+        version: u32,
     },
     DescriptorAcked {
         session_id: [u8; 32],

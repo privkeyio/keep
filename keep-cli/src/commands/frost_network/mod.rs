@@ -181,6 +181,7 @@ pub fn cmd_frost_network_serve(
                         internal_descriptor,
                         network,
                         policy_hash,
+                        version,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -195,6 +196,19 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            let guard = keep.lock().expect("keep mutex poisoned");
+                            let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
+                                match guard.get_wallet_descriptor(&group_pubkey) {
+                                    Ok(Some(prev)) => Some(prev.canonical_hash()),
+                                    Ok(None) => None,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "could not load predecessor descriptor for lineage");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let descriptor = WalletDescriptor {
                                 group_pubkey,
                                 external_descriptor,
@@ -203,10 +217,9 @@ pub fn cmd_frost_network_serve(
                                 created_at: now,
                                 device_registrations: Vec::new(),
                                 policy_hash,
-                                version: INITIAL_DESCRIPTOR_VERSION,
-                                previous_descriptor_hash: None,
+                                version,
+                                previous_descriptor_hash,
                             };
-                            let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
                                     tracing::info!("wallet descriptor stored");

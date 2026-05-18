@@ -204,6 +204,32 @@ impl KfpNode {
                             "Descriptor migrate new_version does not match session policy".into(),
                         ));
                     }
+                    // Bind sender to the session initiator: only the proposer
+                    // who drove the session to completion may announce its
+                    // migrate link. Without this any authorized proposer could
+                    // hijack the announcement.
+                    match session.initiator() {
+                        Some(init) if init == &sender => {}
+                        Some(_) => {
+                            return Err(FrostNetError::Session(
+                                "Descriptor migrate sender is not the session initiator".into(),
+                            ));
+                        }
+                        None => {
+                            return Err(FrostNetError::Session(
+                                "Descriptor migrate session has no recorded initiator".into(),
+                            ));
+                        }
+                    }
+                    // Require the session to be in Complete state. A merely
+                    // Finalized session has not received the full ACK quorum,
+                    // so its descriptor must not be promoted as authoritative
+                    // via a migrate link yet.
+                    if !session.is_complete() {
+                        return Err(FrostNetError::Session(
+                            "Descriptor migrate references a session that is not complete".into(),
+                        ));
+                    }
                     let finalized = session.descriptor().ok_or_else(|| {
                         FrostNetError::Session(
                             "Descriptor migrate references a session that has not finalized".into(),
@@ -255,14 +281,34 @@ impl KfpNode {
                         .into(),
                 ));
             }
-            // Enforce monotonic version bump strictly above whatever we
-            // currently have persisted for this group.
-            if let Some(current) = lookup.latest_version_for(&payload.group_pubkey) {
-                if payload.new_version <= current {
-                    return Err(FrostNetError::Session(format!(
-                        "Descriptor migrate new_version {} is not strictly greater than current {}",
-                        payload.new_version, current
-                    )));
+            // Enforce monotonic version bump above whatever we currently have
+            // persisted for this group. Equality is permitted only when the
+            // persisted descriptor at that version is the exact one being
+            // announced (already stored via DescriptorComplete, so this link
+            // is just attaching `previous_descriptor_hash` lineage). Vault
+            // failure fails closed.
+            match lookup.latest_version_for(&payload.group_pubkey) {
+                Ok(Some(current)) => {
+                    if payload.new_version < current {
+                        return Err(FrostNetError::Session(format!(
+                            "Descriptor migrate new_version {} is below current {}",
+                            payload.new_version, current
+                        )));
+                    }
+                    if payload.new_version == current
+                        && !lookup.find_by_hash(&payload.group_pubkey, &payload.new_descriptor_hash)
+                    {
+                        return Err(FrostNetError::Session(format!(
+                            "Descriptor migrate new_version {} equals current but new_descriptor_hash does not match a persisted descriptor",
+                            payload.new_version
+                        )));
+                    }
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    return Err(FrostNetError::Session(
+                        "Descriptor migrate could not query persisted descriptors (vault unavailable); refusing to proceed".into(),
+                    ));
                 }
             }
         }
@@ -1013,6 +1059,7 @@ impl KfpNode {
             internal_descriptor: payload.internal_descriptor,
             network: session_network,
             policy_hash: payload.policy_hash,
+            version: session_policy_version,
         });
 
         Ok(())
@@ -1215,6 +1262,7 @@ impl KfpNode {
                         internal_descriptor: desc.internal.clone(),
                         network: session.network().to_string(),
                         policy_hash: desc.policy_hash,
+                        version: session.policy().version,
                     });
                 }
             }
