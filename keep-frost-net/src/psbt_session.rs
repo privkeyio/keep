@@ -303,30 +303,6 @@ impl PsbtSession {
         Ok(())
     }
 
-    /// Roll back a locally-recorded signature. Intended for the caller that
-    /// optimistically committed a contribution under `add_signature` and
-    /// then saw the wire send fail; keeps local state consistent with what
-    /// other peers have observed. If the rollback empties the signature set
-    /// the session transitions back to `Proposed`.
-    pub fn remove_signature(&mut self, signer: &SignerId) -> bool {
-        let removed = self.received_sigs.remove(signer);
-        self.partial_psbts.remove(signer);
-        if removed {
-            // current_psbt is snapshot-display only; after a rollback we can't
-            // deterministically choose a "representative" partial, so always
-            // fall back to the proposal PSBT. Aggregation at finalize time
-            // uses the full partial_psbts map regardless.
-            self.current_psbt = self.proposal_psbt.clone();
-            if self.received_sigs.is_empty() {
-                self.first_sig_at = None;
-                if matches!(self.state, PsbtSessionState::Signing) {
-                    self.state = PsbtSessionState::Proposed;
-                }
-            }
-        }
-        removed
-    }
-
     /// Atomic claim-to-finalize check, intended to gate a single caller when
     /// concurrent signatures cross the threshold. Returns `true` exactly once
     /// per session: when the session is in `Signing`, threshold is met, and
