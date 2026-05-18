@@ -526,18 +526,16 @@ fn dispatch_wallet(
             signer_bunker,
             share,
             relay,
-            auto,
         } => {
             let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
             commands::wallet::cmd_wallet_approve_psbt(
                 out,
                 path,
                 &group,
-                session.as_deref(),
+                &session,
                 &signer_bunker,
                 share,
                 relay,
-                auto,
             )
         }
     }

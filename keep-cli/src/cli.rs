@@ -291,9 +291,10 @@ pub(crate) enum WalletCommands {
         group: String,
         #[arg(
             long,
-            help = "Specific PSBT session id (hex, 64 chars). Required unless --auto."
+            help = "PSBT session id to approve (hex, 64 chars).",
+            required = true
         )]
-        session: Option<String>,
+        session: String,
         #[arg(
             long,
             help = "Local signer mapping 'fingerprint:bunker://...' (8 hex fp, colon, URI). Repeatable.",
@@ -304,11 +305,6 @@ pub(crate) enum WalletCommands {
         share: Option<u16>,
         #[arg(short, long, help = "Nostr relay URL")]
         relay: Option<String>,
-        #[arg(
-            long,
-            help = "Headless mode: stay connected and auto-approve every matching PSBT proposal."
-        )]
-        auto: bool,
     },
 }
 
