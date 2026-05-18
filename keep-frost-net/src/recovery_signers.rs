@@ -56,14 +56,13 @@ impl InMemoryRecoverySignerRegistry {
     }
 
     /// Insert or replace the handle for `fingerprint`. Fingerprint matching
-    /// is case-insensitive; the key is stored lowercase.
-    pub fn insert(&self, fingerprint: &str, label: String, bunker_uri: String) {
+    /// is case-insensitive; the key is stored lowercase. The bunker URI is
+    /// taken as `Zeroizing<String>` so callers can preserve the wrapper end-
+    /// to-end and avoid a plain-`String` hop across the boundary.
+    pub fn insert(&self, fingerprint: &str, label: String, bunker_uri: Zeroizing<String>) {
         self.entries.write().insert(
             fingerprint.to_ascii_lowercase(),
-            RecoverySignerHandle {
-                label,
-                bunker_uri: Zeroizing::new(bunker_uri),
-            },
+            RecoverySignerHandle { label, bunker_uri },
         );
     }
 
@@ -94,7 +93,11 @@ mod tests {
     #[test]
     fn resolve_is_case_insensitive() {
         let reg = InMemoryRecoverySignerRegistry::new();
-        reg.insert("ABCDEF01", "coldcard-backup".into(), "bunker://x".into());
+        reg.insert(
+            "ABCDEF01",
+            "coldcard-backup".into(),
+            Zeroizing::new("bunker://x".into()),
+        );
         let h = reg.resolve("abcdef01").expect("resolves lowercase");
         assert_eq!(h.label, "coldcard-backup");
         assert_eq!(&*h.bunker_uri, "bunker://x");
@@ -105,7 +108,11 @@ mod tests {
     #[test]
     fn remove_returns_handle_and_clears() {
         let reg = InMemoryRecoverySignerRegistry::new();
-        reg.insert("a1b2c3d4", "sig".into(), "bunker://y".into());
+        reg.insert(
+            "a1b2c3d4",
+            "sig".into(),
+            Zeroizing::new("bunker://y".into()),
+        );
         let removed = reg.remove("A1B2C3D4").expect("removed");
         assert_eq!(removed.label, "sig");
         assert!(reg.resolve("a1b2c3d4").is_none());
