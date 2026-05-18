@@ -241,30 +241,15 @@ pub fn cmd_wallet_register(
         None => None,
     };
     if let Some(k) = kind_arg {
-        if k.is_empty() || k.len() > keep_nip46::MAX_DEVICE_KIND_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "--kind must be 1..={} bytes",
-                keep_nip46::MAX_DEVICE_KIND_LEN
-            )));
-        }
-        if keep_nip46::contains_control_chars(k) {
-            return Err(KeepError::InvalidInput(
-                "--kind must not contain control characters".to_string(),
-            ));
-        }
+        keep_nip46::validate_metadata_field("--kind", k, 1, keep_nip46::MAX_DEVICE_KIND_LEN)?;
     }
     if let Some(fw) = firmware_version_arg {
-        if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "--firmware-version exceeds {} bytes",
-                keep_nip46::MAX_FIRMWARE_VERSION_LEN
-            )));
-        }
-        if keep_nip46::contains_control_chars(fw) {
-            return Err(KeepError::InvalidInput(
-                "--firmware-version must not contain control characters".to_string(),
-            ));
-        }
+        keep_nip46::validate_metadata_field(
+            "--firmware-version",
+            fw,
+            0,
+            keep_nip46::MAX_FIRMWARE_VERSION_LEN,
+        )?;
     }
 
     let group_pubkey = parse_group_id(group)?;

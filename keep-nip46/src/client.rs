@@ -42,6 +42,28 @@ pub fn contains_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
+/// Validate a free-form metadata string from a signer or operator: enforce
+/// `min_len..=max_len` byte length and reject control characters. `field` is
+/// used only for error messages.
+pub fn validate_metadata_field(
+    field: &str,
+    value: &str,
+    min_len: usize,
+    max_len: usize,
+) -> Result<()> {
+    if value.len() < min_len || value.len() > max_len {
+        return Err(KeepError::InvalidInput(format!(
+            "{field} must be {min_len}..={max_len} bytes"
+        )));
+    }
+    if contains_control_chars(value) {
+        return Err(KeepError::InvalidInput(format!(
+            "{field} contains control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Outcome of a successful `register_wallet` request.
 ///
 /// `hmac` is an opaque device-returned token. It is **not** cryptographically
@@ -384,28 +406,10 @@ impl Nip46Client {
         info.kind = info.kind.normalize();
 
         if let DeviceKind::Other(ref s) = info.kind {
-            if s.is_empty() || s.len() > MAX_DEVICE_KIND_LEN {
-                return Err(KeepError::InvalidInput(format!(
-                    "device kind 'Other' label must be 1..={MAX_DEVICE_KIND_LEN} bytes"
-                )));
-            }
-            if contains_control_chars(s) {
-                return Err(KeepError::InvalidInput(
-                    "device kind 'Other' label contains control characters".into(),
-                ));
-            }
+            validate_metadata_field("device kind 'Other' label", s, 1, MAX_DEVICE_KIND_LEN)?;
         }
         if let Some(ref fw) = info.firmware_version {
-            if fw.len() > MAX_FIRMWARE_VERSION_LEN {
-                return Err(KeepError::InvalidInput(format!(
-                    "firmware_version exceeds {MAX_FIRMWARE_VERSION_LEN} bytes"
-                )));
-            }
-            if contains_control_chars(fw) {
-                return Err(KeepError::InvalidInput(
-                    "firmware_version contains control characters".into(),
-                ));
-            }
+            validate_metadata_field("firmware_version", fw, 0, MAX_FIRMWARE_VERSION_LEN)?;
         }
         let fp_bytes = info.fingerprint_bytes().ok_or_else(|| {
             KeepError::InvalidInput("fingerprint must be 8 hex characters (4 bytes)".into())
@@ -415,8 +419,6 @@ impl Nip46Client {
                 "fingerprint 00000000 is reserved by BIP32 for 'no parent' and cannot identify a device".into(),
             ));
         }
-        // Normalize hex to lower-case-no-whitespace so later comparisons /
-        // serialization are stable regardless of what the signer sent.
         info.fingerprint = hex::encode(fp_bytes);
         if info.capabilities.len() > MAX_CAPABILITIES {
             return Err(KeepError::InvalidInput(format!(
@@ -424,16 +426,7 @@ impl Nip46Client {
             )));
         }
         for cap in &info.capabilities {
-            if cap.is_empty() || cap.len() > MAX_CAPABILITY_LEN {
-                return Err(KeepError::InvalidInput(format!(
-                    "capability label must be 1..={MAX_CAPABILITY_LEN} bytes"
-                )));
-            }
-            if contains_control_chars(cap) {
-                return Err(KeepError::InvalidInput(
-                    "capability label contains control characters".into(),
-                ));
-            }
+            validate_metadata_field("capability label", cap, 1, MAX_CAPABILITY_LEN)?;
         }
         Ok(info)
     }

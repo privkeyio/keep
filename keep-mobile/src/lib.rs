@@ -1751,25 +1751,22 @@ impl KeepMobile {
                     None => None,
                 };
                 if let Some(ref k) = reg.device_kind {
-                    if k.len() > keep_nip46::MAX_DEVICE_KIND_LEN
-                        || keep_nip46::contains_control_chars(k)
-                    {
-                        return Err(KeepMobileError::BackupError {
-                            msg:
-                                "device_registration device_kind invalid (length or control chars)"
-                                    .into(),
-                        });
-                    }
+                    keep_nip46::validate_metadata_field(
+                        "device_registration.device_kind",
+                        k,
+                        0,
+                        keep_nip46::MAX_DEVICE_KIND_LEN,
+                    )
+                    .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
                 }
                 if let Some(ref fw) = reg.firmware_version {
-                    if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN
-                        || keep_nip46::contains_control_chars(fw)
-                    {
-                        return Err(KeepMobileError::BackupError {
-                            msg: "device_registration firmware_version invalid (length or control chars)"
-                                .into(),
-                        });
-                    }
+                    keep_nip46::validate_metadata_field(
+                        "device_registration.firmware_version",
+                        fw,
+                        0,
+                        keep_nip46::MAX_FIRMWARE_VERSION_LEN,
+                    )
+                    .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
                 }
                 device_registrations.push(keep_core::DeviceRegistration {
                     signer_pubkey,
