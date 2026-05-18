@@ -168,14 +168,14 @@ impl RecoveryTxBuilder {
     pub fn finalize_recovery(&self, psbt: &mut Psbt, tier_index: usize) -> Result<Transaction> {
         let tier = self.get_tier(tier_index)?;
         let control_block = self.control_block(tier)?;
-        // Defensive check: number of script signature slots must equal the
-        // number of keys in the tier. If RecoveryConfig::build ever emits a
-        // non-CHECKSIGADD layout this assert catches it before producing an
-        // invalid witness.
-        assert!(
-            !tier.keys.is_empty(),
-            "tier {tier_index} has no keys; finalize_recovery cannot build CHECKSIGADD witness",
-        );
+        // Defensive check: a CHECKSIGADD witness needs one push per key, so a
+        // tier with zero keys cannot be finalized. Fail closed rather than
+        // panic — a malformed RecoveryConfig must not crash the node.
+        if tier.keys.is_empty() {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {tier_index} has no keys; cannot build CHECKSIGADD witness"
+            )));
+        }
 
         let sig_count = psbt.inputs[0]
             .tap_script_sigs
@@ -429,6 +429,21 @@ pub fn verify_script_spend_input_binding(
         script: script.clone(),
         control_block: control_block.clone(),
     })
+}
+
+/// Verify every PSBT input's script-spend binding upfront and return the
+/// per-input [`ScriptSpendSighash`] bundles. Errors with the offending
+/// input index if any input fails the security-critical binding check in
+/// [`verify_script_spend_input_binding`].
+pub fn verify_all_script_spend_input_bindings(
+    psbt: &Psbt,
+    local_xonly: &[u8; 32],
+) -> Result<Vec<ScriptSpendSighash>> {
+    let mut out = Vec::with_capacity(psbt.inputs.len());
+    for i in 0..psbt.inputs.len() {
+        out.push(verify_script_spend_input_binding(psbt, i, local_xonly)?);
+    }
+    Ok(out)
 }
 
 /// Scan `script` opcodes for any 32-byte push equal to `xonly`. Recovery
