@@ -282,6 +282,34 @@ pub(crate) enum WalletCommands {
         #[arg(long, help = "Session timeout in seconds (max 86400)")]
         timeout: Option<u64>,
     },
+    /// Approve a pending recovery-tier PSBT proposal as an external signer
+    /// holder (responder side). Resolves the locally-held NIP-46 signer for
+    /// the matching xpub fingerprint, signs the tap script, merges the sig,
+    /// and contributes it back to the initiator.
+    ApprovePsbt {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(
+            long,
+            help = "Specific PSBT session id (hex, 64 chars). Required unless --auto."
+        )]
+        session: Option<String>,
+        #[arg(
+            long,
+            help = "Local signer mapping 'fingerprint:bunker://...' (8 hex fp, colon, URI). Repeatable.",
+            required = true
+        )]
+        signer_bunker: Vec<String>,
+        #[arg(long, help = "Share index to use for participation")]
+        share: Option<u16>,
+        #[arg(short, long, help = "Nostr relay URL")]
+        relay: Option<String>,
+        #[arg(
+            long,
+            help = "Headless mode: stay connected and auto-approve every matching PSBT proposal."
+        )]
+        auto: bool,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]

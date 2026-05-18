@@ -4,6 +4,7 @@ use console::{style, Term};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Output {
     term: Term,
 }
