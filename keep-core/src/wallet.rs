@@ -136,6 +136,41 @@ pub struct WalletDescriptor {
     /// `sha256(len(ext) || ext || len(int) || int || policy_hash)`).
     #[serde(default)]
     pub policy_hash: [u8; 32],
+    /// Monotonic version of the descriptor for this group. Starts at 1 for the
+    /// initial descriptor and increments on each migration. Records persisted
+    /// before versioning materialize as `1` via `#[serde(default)]` +
+    /// [`default_descriptor_version`].
+    #[serde(default = "default_descriptor_version")]
+    pub version: u32,
+    /// Canonical hash of the descriptor this one supersedes, when this is a
+    /// migration. `None` for the initial descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_descriptor_hash: Option<[u8; 32]>,
+}
+
+/// The version assigned to the initial wallet descriptor for a group.
+/// Subsequent migrations increment this monotonically.
+pub const INITIAL_DESCRIPTOR_VERSION: u32 = 1;
+
+/// Default value for [`WalletDescriptor::version`] when deserializing legacy
+/// records that predate the versioning field.
+pub fn default_descriptor_version() -> u32 {
+    INITIAL_DESCRIPTOR_VERSION
+}
+
+/// Domain-separated version suffix folded into the canonical descriptor hash
+/// for v2+ descriptors. v1 hashes intentionally omit this suffix to remain
+/// bit-identical to records written before descriptor versioning existed.
+///
+/// Centralizing the fold keeps every site that recomputes the descriptor hash
+/// (initiator, ack verifier, migrate verifier, persisted hash) in lockstep.
+/// TODO: drop the conditional in vN+1 once all v1 records are migrated.
+pub fn fold_descriptor_version_suffix(hasher: &mut sha2::Sha256, version: u32) {
+    use sha2::Digest;
+    if version > INITIAL_DESCRIPTOR_VERSION {
+        hasher.update(b"keep/descriptor/version");
+        hasher.update(version.to_le_bytes());
+    }
 }
 
 impl WalletDescriptor {
@@ -161,7 +196,14 @@ impl WalletDescriptor {
 
     /// Canonical descriptor hash with length framing to avoid collisions
     /// when the split between external/internal shifts:
-    /// `sha256(u64_le(ext.len) || ext || u64_le(int.len) || int || policy_hash)`.
+    /// `sha256(u64_le(ext.len) || ext || u64_le(int.len) || int || policy_hash
+    ///   [|| "keep/descriptor/version" || u32_le(version) when version > 1])`.
+    ///
+    /// The version suffix is only folded in for v2+ so v1 hashes remain
+    /// bit-identical to records written before descriptor versioning existed
+    /// (mirroring the conditional fold in `hash_policy`).
+    /// TODO: drop the conditional suffix in vN+1 once all v1 records are
+    /// migrated.
     ///
     /// Must match the on-wire `descriptor_hash` used by the FROST PSBT
     /// coordination protocol.
@@ -173,6 +215,7 @@ impl WalletDescriptor {
         h.update((self.internal_descriptor.len() as u64).to_le_bytes());
         h.update(self.internal_descriptor.as_bytes());
         h.update(self.policy_hash);
+        fold_descriptor_version_suffix(&mut h, self.version);
         h.finalize().into()
     }
 }
@@ -192,6 +235,8 @@ mod tests {
         }"#;
         let desc: WalletDescriptor = serde_json::from_str(json).expect("back-compat deserialize");
         assert!(desc.device_registrations.is_empty());
+        assert_eq!(desc.version, 1);
+        assert!(desc.previous_descriptor_hash.is_none());
     }
 
     #[test]
@@ -204,6 +249,8 @@ mod tests {
             created_at: 0,
             device_registrations: Vec::new(),
             policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
         };
         let signer = [7u8; 32];
         desc.upsert_device_registration(DeviceRegistration {
@@ -291,6 +338,8 @@ mod tests {
             created_at: 1700000000,
             device_registrations: vec![reg],
             policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: WalletDescriptor = serde_json::from_str(&json).unwrap();
@@ -305,6 +354,58 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_hash_v1_matches_legacy_pre_upgrade_bytes() {
+        // Regression: a descriptor with the default version (1) and no
+        // previous_descriptor_hash must produce the same canonical_hash as
+        // before descriptor versioning was introduced. The expected hash is
+        // pinned here so any change to the v1 hashing path is caught.
+        let desc = WalletDescriptor {
+            group_pubkey: [0u8; 32],
+            external_descriptor: "tr(xpub.../0/*)#abc".into(),
+            internal_descriptor: "tr(xpub.../1/*)#def".into(),
+            network: "testnet".into(),
+            created_at: 0,
+            device_registrations: Vec::new(),
+            policy_hash: [0xAAu8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
+        };
+        // Pinned bytes computed against the legacy formula:
+        // sha256(le_u64(len(ext)) || ext || le_u64(len(int)) || int || policy_hash)
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update((desc.external_descriptor.len() as u64).to_le_bytes());
+            h.update(desc.external_descriptor.as_bytes());
+            h.update((desc.internal_descriptor.len() as u64).to_le_bytes());
+            h.update(desc.internal_descriptor.as_bytes());
+            h.update(desc.policy_hash);
+            let out: [u8; 32] = h.finalize().into();
+            out
+        };
+        assert_eq!(desc.canonical_hash(), expected);
+    }
+
+    #[test]
+    fn test_canonical_hash_differs_for_v2() {
+        let mut v1 = WalletDescriptor {
+            group_pubkey: [0u8; 32],
+            external_descriptor: "ext".into(),
+            internal_descriptor: "int".into(),
+            network: "testnet".into(),
+            created_at: 0,
+            device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
+        };
+        let h1 = v1.canonical_hash();
+        v1.version = 2;
+        let h2 = v1.canonical_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
     fn test_empty_registrations_roundtrip_omits_field() {
         let desc = WalletDescriptor {
             group_pubkey: [0u8; 32],
@@ -314,6 +415,8 @@ mod tests {
             created_at: 1,
             device_registrations: Vec::new(),
             policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("device_registrations"));

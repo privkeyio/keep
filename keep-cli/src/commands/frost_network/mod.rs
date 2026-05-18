@@ -9,7 +9,7 @@ use secrecy::ExposeSecret;
 use tracing::debug;
 
 use keep_core::error::{FrostError, KeepError, NetworkError, Result};
-use keep_core::wallet::WalletDescriptor;
+use keep_core::wallet::{WalletDescriptor, INITIAL_DESCRIPTOR_VERSION};
 use keep_core::Keep;
 
 use crate::output::Output;
@@ -203,6 +203,8 @@ pub fn cmd_frost_network_serve(
                                 created_at: now,
                                 device_registrations: Vec::new(),
                                 policy_hash,
+                                version: INITIAL_DESCRIPTOR_VERSION,
+                                previous_descriptor_hash: None,
                             };
                             let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {

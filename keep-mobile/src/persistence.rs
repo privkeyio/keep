@@ -224,6 +224,18 @@ struct StoredDescriptor {
     /// written before the field was introduced; new records always set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_hash_hex: Option<String>,
+    /// Monotonic descriptor version. Defaults to `1` for records written
+    /// before versioning was introduced.
+    #[serde(default = "default_stored_version")]
+    version: u32,
+    /// Hex-encoded 32-byte canonical hash of the descriptor this one
+    /// supersedes. `None` for initial descriptors and legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_descriptor_hash_hex: Option<String>,
+}
+
+fn default_stored_version() -> u32 {
+    1
 }
 
 /// At-rest schema for a hardware-signer registration record.
@@ -403,6 +415,8 @@ fn stored_to_info(stored: StoredDescriptor) -> WalletDescriptorInfo {
         created_at: stored.created_at,
         device_registrations,
         policy_hash_hex: stored.policy_hash_hex,
+        version: stored.version,
+        previous_descriptor_hash_hex: stored.previous_descriptor_hash_hex,
     }
 }
 
@@ -427,6 +441,8 @@ fn info_to_stored(info: &WalletDescriptorInfo) -> StoredDescriptor {
                 firmware_version: r.firmware_version.clone(),
             })
             .collect(),
+        version: info.version,
+        previous_descriptor_hash_hex: info.previous_descriptor_hash_hex.clone(),
     }
 }
 

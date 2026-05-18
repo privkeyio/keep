@@ -1133,6 +1133,9 @@ mod descriptor_lookup_tests {
             assert_eq!(hash, &self.expected_hash);
             self.responds_true
         }
+        fn latest_version_for(&self, _group: &[u8; 32]) -> Option<u32> {
+            None
+        }
     }
 
     fn fixture() -> ([u8; 32], [u8; 32]) {

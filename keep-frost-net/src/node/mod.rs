@@ -59,6 +59,13 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         let _ = (group, hash);
         None
     }
+
+    /// Return the largest persisted descriptor version for the given group,
+    /// or `None` if no descriptor exists. Used to validate that an inbound
+    /// `DescriptorMigrate` strictly increases the version. No default impl
+    /// is provided: silently returning `None` would disable the monotonic
+    /// version check, allowing downgrade replay of `DescriptorMigrate`.
+    fn latest_version_for(&self, group: &[u8; 32]) -> Option<u32>;
 }
 
 /// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
@@ -114,6 +121,15 @@ where
 
     fn network_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
         self.lookup(|d| Some(d.network.clone()), group, hash)
+    }
+
+    fn latest_version_for(&self, group: &[u8; 32]) -> Option<u32> {
+        let descriptors = (self.fetch)()?;
+        descriptors
+            .iter()
+            .filter(|d| &d.group_pubkey == group)
+            .map(|d| d.version)
+            .max()
     }
 }
 
@@ -269,6 +285,16 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+    /// A peer announced a descriptor-migration link (old → new).
+    /// Receivers should persist `previous_descriptor_hash` on the matching
+    /// new descriptor record.
+    DescriptorMigrateReceived {
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        old_descriptor_hash: [u8; 32],
+        new_descriptor_hash: [u8; 32],
+        new_version: u32,
+    },
     XpubAnnounced {
         share_index: u16,
         recovery_xpubs: Vec<AnnouncedXpub>,
@@ -393,6 +419,20 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
                 .finish(),
+            Self::DescriptorMigrateReceived {
+                session_id,
+                group_pubkey,
+                old_descriptor_hash,
+                new_descriptor_hash,
+                new_version,
+            } => f
+                .debug_struct("DescriptorMigrateReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("group_pubkey", &hex::encode(group_pubkey))
+                .field("old_descriptor_hash", &hex::encode(old_descriptor_hash))
+                .field("new_descriptor_hash", &hex::encode(new_descriptor_hash))
+                .field("new_version", new_version)
+                .finish(),
             Self::XpubAnnounced {
                 share_index,
                 recovery_xpubs,
@@ -473,6 +513,11 @@ pub struct KfpNode {
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
+    /// Per-session de-duplication for `DescriptorMigrate` link broadcasts.
+    /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
+    /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
+    /// replay-window pruning.
+    pub(crate) seen_descriptor_migrates: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
     pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
@@ -639,6 +684,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
+            seen_descriptor_migrates: RwLock::new(HashMap::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
             local_recovery_xpubs: RwLock::new(Vec::new()),
@@ -1038,6 +1084,9 @@ impl KfpNode {
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
                         });
+                        self.seen_descriptor_migrates.write().retain(|_, ts| {
+                            now.saturating_sub(window) <= *ts
+                        });
                     }
                 }
                 notification = notifications.recv() => {
@@ -1149,6 +1198,10 @@ impl KfpNode {
             }
             KfpMessage::DescriptorNack(payload) => {
                 self.handle_descriptor_nack(event.pubkey, payload).await?;
+            }
+            KfpMessage::DescriptorMigrate(payload) => {
+                self.handle_descriptor_migrate(event.pubkey, payload)
+                    .await?;
             }
             KfpMessage::XpubAnnounce(payload) => {
                 self.handle_xpub_announce(event.pubkey, payload).await?;

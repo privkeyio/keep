@@ -12,6 +12,7 @@ use rand::RngExt as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use keep_core::wallet::INITIAL_DESCRIPTOR_VERSION;
 use keep_core::Keep;
 
 use crate::app::{
@@ -787,6 +788,13 @@ pub(crate) async fn frost_event_listener(
                             FrostNodeMsg::PsbtAborted { session_id, reason },
                         );
                     }
+                    Ok(KfpNodeEvent::DescriptorMigrateReceived { session_id, new_version, .. }) => {
+                        log!(EventLogType::Descriptor, format!(
+                            "Descriptor migrate link ({}) v{}",
+                            &hex::encode(session_id)[..8],
+                            new_version,
+                        ));
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -1402,6 +1410,8 @@ impl App {
             created_at,
             device_registrations: Vec::new(),
             policy_hash,
+            version: INITIAL_DESCRIPTOR_VERSION,
+            previous_descriptor_hash: None,
         };
 
         let store_result = {

@@ -30,6 +30,279 @@ impl KfpNode {
             .await
     }
 
+    /// Orchestrate a descriptor migration. This is a thin wrapper over
+    /// [`request_descriptor`] that asserts `policy.version > 1` so the
+    /// resulting descriptor records its monotonic bump. After the session
+    /// completes (the caller observes `DescriptorComplete`), the caller is
+    /// responsible for:
+    ///   1. Building a `WalletDescriptor` with `previous_descriptor_hash`
+    ///      set to the predecessor's `canonical_hash()`.
+    ///   2. Persisting it via `Keep::store_wallet_descriptor`.
+    ///   3. Broadcasting the link via [`send_descriptor_migrate`].
+    ///
+    /// There is no automatic on-chain sweep; that remains an explicit
+    /// follow-up via `request_psbt_propose`.
+    pub async fn request_descriptor_migrate(
+        &self,
+        old_group_pubkey: [u8; 32],
+        policy: WalletPolicy,
+        network: &str,
+        own_xpub: &str,
+        own_fingerprint: &str,
+    ) -> Result<[u8; 32]> {
+        if policy.version < MIN_DESCRIPTOR_MIGRATION_VERSION {
+            return Err(FrostNetError::Session(
+                "request_descriptor_migrate requires policy.version >= 2".into(),
+            ));
+        }
+        // A descriptor migration stays on the same FROST group; only the
+        // policy/descriptor bumps. Reject calls that look like they intended
+        // to rotate the group (which is not supported by this helper) so the
+        // caller's expectations and what we coordinate cannot drift apart.
+        if old_group_pubkey != self.group_pubkey {
+            return Err(FrostNetError::Session(
+                "request_descriptor_migrate: old_group_pubkey must equal this node's group_pubkey (descriptor migration does not rotate the FROST group)".into(),
+            ));
+        }
+        debug!(
+            old_group = %hex::encode(old_group_pubkey),
+            new_version = policy.version,
+            "Starting descriptor migration"
+        );
+        self.request_descriptor(policy, network, own_xpub, own_fingerprint)
+            .await
+    }
+
+    /// Broadcast a `DescriptorMigrate` link message announcing that the
+    /// new descriptor (identified by `new_descriptor_hash` at version
+    /// `new_version`) supersedes the descriptor identified by
+    /// `old_descriptor_hash`.
+    pub async fn send_descriptor_migrate(
+        &self,
+        session_id: [u8; 32],
+        old_descriptor_hash: [u8; 32],
+        new_descriptor_hash: [u8; 32],
+        new_version: u32,
+    ) -> Result<()> {
+        let payload = DescriptorMigratePayload::new(
+            session_id,
+            self.group_pubkey,
+            old_descriptor_hash,
+            new_descriptor_hash,
+            new_version,
+        );
+        payload
+            .validate()
+            .map_err(|e| FrostNetError::Session(e.to_string()))?;
+        let msg = KfpMessage::DescriptorMigrate(payload);
+        let json = msg.to_json()?;
+
+        let target_peers: Vec<PublicKey> = {
+            let peers = self.peers.read();
+            peers
+                .get_online_peers()
+                .iter()
+                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .map(|p| p.pubkey)
+                .collect()
+        };
+
+        for pubkey in &target_peers {
+            let encrypted =
+                nip44::encrypt(self.keys.secret_key(), pubkey, &json, nip44::Version::V2)
+                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+                .tag(Tag::public_key(*pubkey))
+                .tag(Tag::custom(
+                    TagKind::custom("g"),
+                    [hex::encode(self.group_pubkey)],
+                ))
+                .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+                .tag(Tag::custom(TagKind::custom("t"), ["descriptor_migrate"]))
+                .sign_with_keys(&self.keys)
+                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        }
+
+        info!(
+            session_id = %hex::encode(session_id),
+            new_version,
+            "Broadcast descriptor migrate link"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn handle_descriptor_migrate(
+        &self,
+        sender: PublicKey,
+        payload: DescriptorMigratePayload,
+    ) -> Result<()> {
+        if payload.group_pubkey != self.group_pubkey {
+            return Ok(());
+        }
+
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to send descriptor migrate"
+            )));
+        }
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            return Err(FrostNetError::ReplayDetected(
+                "Descriptor migrate outside replay window".into(),
+            ));
+        }
+
+        let sender_share_index = {
+            let peers = self.peers.read();
+            peers
+                .get_peer_by_pubkey(&sender)
+                .map(|p| p.share_index)
+                .ok_or_else(|| FrostNetError::UntrustedPeer(sender.to_string()))?
+        };
+        self.check_proposer_authorized(sender_share_index)?;
+
+        // Per-session de-duplication: drop replays of the same (session,
+        // new_descriptor_hash) link, even when each instance is individually
+        // within the replay window. Checked BEFORE binding validation so a
+        // duplicate can short-circuit, but the entry is only INSERTED after
+        // validation succeeds — otherwise an attacker could pre-poison the
+        // set with forged tuples to suppress a legitimate later message.
+        // Bounded prune happens in the main loop.
+        {
+            let seen = self.seen_descriptor_migrates.read();
+            let key = (payload.session_id, payload.new_descriptor_hash);
+            if seen.contains_key(&key) {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Dropping duplicate descriptor migrate link"
+                );
+                return Ok(());
+            }
+        }
+
+        // Bind `new_descriptor_hash` to a session we observed completing for
+        // this `session_id`. Without this, the link could announce any pair
+        // of hashes the sender chose.
+        {
+            let sessions = self.descriptor_sessions.read();
+            match sessions.get_session(&payload.session_id) {
+                Some(session) => {
+                    if session.group_pubkey() != &payload.group_pubkey {
+                        return Err(FrostNetError::Session(
+                            "Descriptor migrate group_pubkey does not match session".into(),
+                        ));
+                    }
+                    if session.policy().version != payload.new_version {
+                        return Err(FrostNetError::Session(
+                            "Descriptor migrate new_version does not match session policy".into(),
+                        ));
+                    }
+                    let finalized = session.descriptor().ok_or_else(|| {
+                        FrostNetError::Session(
+                            "Descriptor migrate references a session that has not finalized".into(),
+                        )
+                    })?;
+                    let mut hasher = Sha256::new();
+                    hasher.update((finalized.external.len() as u64).to_le_bytes());
+                    hasher.update(finalized.external.as_bytes());
+                    hasher.update((finalized.internal.len() as u64).to_le_bytes());
+                    hasher.update(finalized.internal.as_bytes());
+                    hasher.update(finalized.policy_hash);
+                    keep_core::wallet::fold_descriptor_version_suffix(
+                        &mut hasher,
+                        session.policy().version,
+                    );
+                    let expected: [u8; 32] = hasher.finalize().into();
+                    if expected != payload.new_descriptor_hash {
+                        return Err(FrostNetError::Session(
+                            "Descriptor migrate new_descriptor_hash does not match session"
+                                .into(),
+                        ));
+                    }
+                }
+                None => {
+                    // The session is no longer held in memory. Fall back to
+                    // the persisted descriptor lookup; if that also misses,
+                    // refuse to act on an unauthenticated link.
+                    let known = self
+                        .descriptor_lookup
+                        .as_ref()
+                        .map(|l| l.find_by_hash(&payload.group_pubkey, &payload.new_descriptor_hash))
+                        .unwrap_or(false);
+                    if !known {
+                        return Err(FrostNetError::Session(
+                            "Descriptor migrate references unknown session and unknown new descriptor".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Bind `old_descriptor_hash` to a descriptor we already hold for
+        // this group. Without this, the link could supersede any record.
+        if let Some(lookup) = self.descriptor_lookup.as_ref() {
+            if !lookup.find_by_hash(&payload.group_pubkey, &payload.old_descriptor_hash) {
+                return Err(FrostNetError::Session(
+                    "Descriptor migrate old_descriptor_hash does not match any local descriptor"
+                        .into(),
+                ));
+            }
+            // Enforce monotonic version bump strictly above whatever we
+            // currently have persisted for this group.
+            if let Some(current) = lookup.latest_version_for(&payload.group_pubkey) {
+                if payload.new_version <= current {
+                    return Err(FrostNetError::Session(format!(
+                        "Descriptor migrate new_version {} is not strictly greater than current {}",
+                        payload.new_version, current
+                    )));
+                }
+            }
+        }
+
+        // Record only after binding checks succeeded so a forged tuple
+        // cannot suppress a legitimate future message.
+        {
+            let mut seen = self.seen_descriptor_migrates.write();
+            let key = (payload.session_id, payload.new_descriptor_hash);
+            seen.insert(key, payload.created_at);
+            const MAX_SEEN_DESCRIPTOR_MIGRATES: usize = 10_000;
+            if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
+                let now = Timestamp::now().as_secs();
+                let window = self
+                    .replay_window_secs
+                    .saturating_add(super::MAX_FUTURE_SKEW_SECS);
+                seen.retain(|_, ts| now.saturating_sub(window) <= *ts);
+                if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
+                    seen.clear();
+                    seen.insert(key, payload.created_at);
+                }
+            }
+        }
+
+        info!(
+            session_id = %hex::encode(payload.session_id),
+            new_version = payload.new_version,
+            "Received descriptor migrate link"
+        );
+
+        let _ = self.event_tx.send(KfpNodeEvent::DescriptorMigrateReceived {
+            session_id: payload.session_id,
+            group_pubkey: payload.group_pubkey,
+            old_descriptor_hash: payload.old_descriptor_hash,
+            new_descriptor_hash: payload.new_descriptor_hash,
+            new_version: payload.new_version,
+        });
+
+        Ok(())
+    }
+
     pub async fn request_descriptor_with_timeout(
         &self,
         policy: WalletPolicy,
@@ -543,13 +816,14 @@ impl KfpNode {
 
         let our_index = self.share.metadata.identifier;
 
-        let (reconstruction_result, session_network, our_xpub) = {
+        let (reconstruction_result, session_network, our_xpub, session_policy_version) = {
             let sessions = self.descriptor_sessions.read();
             let session = sessions
                 .get_session(&payload.session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown descriptor session".into()))?;
 
             let network = session.network().to_string();
+            let policy_version = session.policy().version;
 
             let initiator = session.initiator().ok_or_else(|| {
                 let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -592,7 +866,7 @@ impl KfpNode {
                 )
                 .map_err(|e| format!("Descriptor reconstruction failed: {e}"))
             };
-            (result, network, our_xpub)
+            (result, network, our_xpub, policy_version)
         };
 
         let (expected_external, expected_internal) = match reconstruction_result {
@@ -639,6 +913,13 @@ impl KfpNode {
             hasher.update((payload.internal_descriptor.len() as u64).to_le_bytes());
             hasher.update(payload.internal_descriptor.as_bytes());
             hasher.update(payload.policy_hash);
+            // We captured `session_policy_version` under the earlier session
+            // read so an eviction between reads cannot silently regress to
+            // the v1 formula and produce a mismatch.
+            keep_core::wallet::fold_descriptor_version_suffix(
+                &mut hasher,
+                session_policy_version,
+            );
             hasher.finalize().into()
         };
 

@@ -374,6 +374,7 @@ impl DescriptorSession {
         hasher.update((finalized.internal.len() as u64).to_le_bytes());
         hasher.update(finalized.internal.as_bytes());
         hasher.update(finalized.policy_hash);
+        keep_core::wallet::fold_descriptor_version_suffix(&mut hasher, self.policy.version);
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
         if !bool::from(descriptor_hash.ct_eq(&expected_hash)) {
@@ -797,6 +798,14 @@ impl Default for DescriptorSessionManager {
 }
 
 fn hash_policy(hasher: &mut Sha256, policy: &WalletPolicy) {
+    // Only fold the policy version into the hash when it is greater than 1, so
+    // v1 hashes remain bit-identical to records written before descriptor
+    // versioning existed. v2+ uses a dedicated domain-separated suffix.
+    // TODO: drop the conditional in vN+1 once all v1 records are migrated.
+    if policy.version > 1 {
+        hasher.update(b"keep/descriptor-policy/version");
+        hasher.update(policy.version.to_le_bytes());
+    }
     hasher.update((policy.recovery_tiers.len() as u32).to_le_bytes());
     for tier in &policy.recovery_tiers {
         hasher.update(tier.threshold.to_le_bytes());
@@ -990,6 +999,7 @@ mod tests {
                 ],
                 timelock_months: 6,
             }],
+            version: 1,
         }
     }
 
@@ -1394,6 +1404,7 @@ mod tests {
 
         let different_policy = WalletPolicy {
             recovery_tiers: vec![],
+            version: 1,
         };
         let id4 = derive_descriptor_session_id(&group_pubkey, &different_policy, 1000);
         assert_ne!(id1, id4);

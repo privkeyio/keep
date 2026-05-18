@@ -1793,6 +1793,21 @@ impl KeepMobile {
                 created_at: d.created_at,
                 device_registrations,
                 policy_hash,
+                version: {
+                    if d.version == 0 {
+                        return Err(KeepMobileError::BackupError {
+                            msg: "descriptor version must be >= 1".into(),
+                        });
+                    }
+                    d.version
+                },
+                previous_descriptor_hash: match d.previous_descriptor_hash_hex.as_deref() {
+                    Some(h) => {
+                        let bytes = decode_hex(h, "descriptor previous_descriptor_hash")?;
+                        Some(bytes_to_32(&bytes, "descriptor previous_descriptor_hash")?)
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -1996,6 +2011,8 @@ impl KeepMobile {
                     })
                     .collect(),
                 policy_hash_hex,
+                version: wd.version,
+                previous_descriptor_hash_hex: wd.previous_descriptor_hash.map(hex::encode),
             });
         }
 
@@ -2235,7 +2252,10 @@ fn build_wallet_policy(
         })
         .collect();
 
-    Ok(WalletPolicy { recovery_tiers })
+    Ok(WalletPolicy {
+        recovery_tiers,
+        version: keep_core::wallet::INITIAL_DESCRIPTOR_VERSION,
+    })
 }
 
 impl KeepMobile {
@@ -2889,6 +2909,8 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(policy_hash))
             },
+            version: keep_core::wallet::INITIAL_DESCRIPTOR_VERSION,
+            previous_descriptor_hash_hex: None,
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {
