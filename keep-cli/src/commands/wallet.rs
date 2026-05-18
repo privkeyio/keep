@@ -345,6 +345,11 @@ pub fn cmd_wallet_register(
                 keep_nip46::MAX_DEVICE_KIND_LEN
             )));
         }
+        if k.chars().any(|c| c.is_control()) {
+            return Err(KeepError::InvalidInput(
+                "--kind must not contain control characters".to_string(),
+            ));
+        }
     }
     if let Some(fw) = firmware_version_arg {
         if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN {
@@ -352,6 +357,11 @@ pub fn cmd_wallet_register(
                 "--firmware-version exceeds {} bytes",
                 keep_nip46::MAX_FIRMWARE_VERSION_LEN
             )));
+        }
+        if fw.chars().any(|c| c.is_control()) {
+            return Err(KeepError::InvalidInput(
+                "--firmware-version must not contain control characters".to_string(),
+            ));
         }
     }
 

@@ -1747,8 +1747,9 @@ impl KeepMobile {
                         || k.chars().any(|c| c.is_control())
                     {
                         return Err(KeepMobileError::BackupError {
-                            msg: "device_registration device_kind invalid (length or control chars)"
-                                .into(),
+                            msg:
+                                "device_registration device_kind invalid (length or control chars)"
+                                    .into(),
                         });
                     }
                 }

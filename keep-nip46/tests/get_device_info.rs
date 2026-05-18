@@ -310,9 +310,8 @@ async fn test_get_device_info_rejects_oversize_json() {
 #[tokio::test]
 async fn test_get_device_info_rejects_oversize_capability_label() {
     let big_cap = "x".repeat(33);
-    let payload = format!(
-        r#"{{"kind":"Ledger","fingerprint":"00112233","capabilities":["{big_cap}"]}}"#
-    );
+    let payload =
+        format!(r#"{{"kind":"Ledger","fingerprint":"00112233","capabilities":["{big_cap}"]}}"#);
     let err = expect_error_for_payload(payload).await;
     match err {
         KeepError::InvalidInput(msg) => assert!(msg.contains("capability label")),
@@ -337,9 +336,8 @@ async fn test_get_device_info_rejects_too_many_capabilities() {
 #[tokio::test]
 async fn test_get_device_info_rejects_oversize_other_label() {
     let label = "z".repeat(33);
-    let payload = format!(
-        r#"{{"kind":{{"Other":"{label}"}},"fingerprint":"deadbeef","capabilities":[]}}"#
-    );
+    let payload =
+        format!(r#"{{"kind":{{"Other":"{label}"}},"fingerprint":"deadbeef","capabilities":[]}}"#);
     let err = expect_error_for_payload(payload).await;
     match err {
         KeepError::InvalidInput(msg) => assert!(msg.contains("'Other' label")),
@@ -350,8 +348,7 @@ async fn test_get_device_info_rejects_oversize_other_label() {
 #[tokio::test]
 async fn test_get_device_info_rejects_control_chars_in_other() {
     let payload =
-        r#"{"kind":{"Other":"Cold\ncard"},"fingerprint":"deadbeef","capabilities":[]}"#
-            .to_string();
+        r#"{"kind":{"Other":"Cold\ncard"},"fingerprint":"deadbeef","capabilities":[]}"#.to_string();
     let err = expect_error_for_payload(payload).await;
     match err {
         KeepError::InvalidInput(msg) => assert!(msg.contains("control")),

@@ -406,6 +406,16 @@ impl App {
                         "device metadata is self-reported by signer and not cryptographically verified",
                     );
                 }
+                if let Some(ref k) = user_device_kind {
+                    if k.chars().any(|c| c.is_control()) {
+                        warn!(
+                            group = %group_hex,
+                            signer = %signer_hex,
+                            "user-supplied device kind contains control characters; rejecting",
+                        );
+                        return Err("device kind must not contain control characters".to_string());
+                    }
+                }
                 let device_kind = match (user_device_kind.as_deref(), device_info.as_ref()) {
                     (Some(k), Some(d)) if k != d.kind.as_str() => {
                         warn!(
