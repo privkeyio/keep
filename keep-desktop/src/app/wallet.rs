@@ -625,42 +625,15 @@ impl App {
                     .policy
                     .clone()
                     .ok_or_else(|| "Descriptor has no persisted WalletPolicy".to_string())?;
-                let policy: keep_frost_net::WalletPolicy = serde_json::from_value(policy_value)
-                    .map_err(|e| format!("invalid persisted policy: {e}"))?;
-                // SEC: re-derive the policy hash and require it equals the
-                // hash stored alongside the descriptor. Otherwise a tampered
-                // policy could swap our resolved External slot xpub.
-                let recomputed_hash = keep_frost_net::derive_policy_hash(&policy);
-                if recomputed_hash != descriptor.policy_hash {
-                    return Err(
-                        "persisted policy hash does not match stored descriptor.policy_hash; refusing"
-                            .to_string(),
-                    );
-                }
-                let tier = policy
-                    .recovery_tiers
-                    .get(tier_index as usize)
-                    .ok_or_else(|| format!("tier {tier_index} not in persisted policy"))?;
-                let mut xpub_str: Option<String> = None;
-                for slot in &tier.key_slots {
-                    if let keep_frost_net::KeySlot::External {
-                        xpub,
-                        fingerprint: fp,
-                    } = slot
-                    {
-                        if fp.eq_ignore_ascii_case(&fingerprint) {
-                            if xpub_str.is_some() {
-                                return Err(format!(
-                                    "tier {tier_index} has more than one External slot with fingerprint {fingerprint}; ambiguous responder"
-                                ));
-                            }
-                            xpub_str = Some(xpub.clone());
-                        }
-                    }
-                }
-                let xpub_str = xpub_str.ok_or_else(|| {
-                    format!("no External key slot with fingerprint {fingerprint}")
-                })?;
+                let policy = keep_frost_net::load_verified_wallet_policy(
+                    &policy_value,
+                    &descriptor.policy_hash,
+                )?;
+                let xpub_str = keep_frost_net::find_local_external_xpub_in_tier(
+                    &policy,
+                    tier_index,
+                    &fingerprint,
+                )?;
 
                 let network =
                     <keep_bitcoin::Network as std::str::FromStr>::from_str(&descriptor.network)
@@ -676,18 +649,12 @@ impl App {
                     return Err("PSBT has no inputs".to_string());
                 }
 
-                // SEC: verify every input's tap_scripts entry is bound to
-                // its witness_utxo and references our x-only key BEFORE
-                // forwarding any sighash to the bunker. Fail closed.
-                let mut sighashes = Vec::with_capacity(psbt.inputs.len());
-                for i in 0..psbt.inputs.len() {
-                    let bundle =
-                        keep_bitcoin::verify_script_spend_input_binding(&psbt, i, &xonly_bytes)
-                            .map_err(|e| {
-                                format!("PSBT input {i} binding verification failed: {e}")
-                            })?;
-                    sighashes.push(bundle);
-                }
+                // SEC: verify every input upfront so we only forward sighashes
+                // for outputs we actually control. Fail closed before contacting
+                // the bunker.
+                let sighashes =
+                    keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
+                        .map_err(|e| format!("PSBT binding verification failed: {e}"))?;
 
                 let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
                     .await

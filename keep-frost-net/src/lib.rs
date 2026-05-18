@@ -77,10 +77,11 @@ pub use attestation::{derive_attestation_nonce, verify_peer_attestation, Expecte
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
-    DescriptorSession, DescriptorSessionManager, DescriptorSessionState, DescriptorSessionStore,
-    FinalizedDescriptor, PersistedDescriptorSession, PersistedFinalizedDescriptor,
-    PersistedSessionState, XpubContribution,
+    derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
+    load_verified_wallet_policy, participant_indices, reconstruct_descriptor, DescriptorSession,
+    DescriptorSessionManager, DescriptorSessionState, DescriptorSessionStore, FinalizedDescriptor,
+    PersistedDescriptorSession, PersistedFinalizedDescriptor, PersistedSessionState,
+    XpubContribution,
 };
 pub use descriptor_session_store::FileDescriptorSessionStore;
 pub use ecdh::{

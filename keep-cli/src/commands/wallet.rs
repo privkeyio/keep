@@ -1597,57 +1597,6 @@ fn parse_session_id(s: &str) -> Result<[u8; 32]> {
 /// Deserialize a persisted `WalletPolicy` JSON value and verify its
 /// integrity by recomputing `derive_policy_hash` and comparing it to
 /// `expected_policy_hash`. Returns the verified `WalletPolicy` on success.
-fn load_verified_policy(
-    policy_json: &serde_json::Value,
-    expected_policy_hash: &[u8; 32],
-) -> Result<keep_frost_net::WalletPolicy> {
-    let policy: keep_frost_net::WalletPolicy = serde_json::from_value(policy_json.clone())
-        .map_err(|e| KeepError::InvalidInput(format!("invalid persisted wallet policy: {e}")))?;
-    let recomputed = keep_frost_net::derive_policy_hash(&policy);
-    if &recomputed != expected_policy_hash {
-        return Err(KeepError::InvalidInput(
-            "persisted wallet policy hash does not match stored descriptor.policy_hash; refusing to use it".into(),
-        ));
-    }
-    Ok(policy)
-}
-
-/// Resolve a tier's external `(xpub, fingerprint)` slot whose fingerprint
-/// matches `local_fp`. Returns the xpub string. Errors if more than one
-/// External slot in the tier shares the same fingerprint, since that
-/// makes responder selection ambiguous.
-fn find_local_external_xpub(
-    policy: &keep_frost_net::WalletPolicy,
-    tier_index: u32,
-    local_fp: &str,
-) -> Result<String> {
-    let tier = policy
-        .recovery_tiers
-        .get(tier_index as usize)
-        .ok_or_else(|| {
-            KeepError::InvalidInput(format!("tier {tier_index} not present in persisted policy"))
-        })?;
-    let lower = local_fp.to_ascii_lowercase();
-    let mut found: Option<String> = None;
-    for slot in &tier.key_slots {
-        if let keep_frost_net::KeySlot::External { xpub, fingerprint } = slot {
-            if fingerprint.eq_ignore_ascii_case(&lower) {
-                if found.is_some() {
-                    return Err(KeepError::InvalidInput(format!(
-                        "tier {tier_index} has more than one External slot with fingerprint {lower}; ambiguous responder",
-                    )));
-                }
-                found = Some(xpub.clone());
-            }
-        }
-    }
-    found.ok_or_else(|| {
-        KeepError::InvalidInput(format!(
-            "no External key slot with fingerprint {lower} found in tier {tier_index}"
-        ))
-    })
-}
-
 /// Execute the full responder approval chain for a single PSBT session: load
 /// the descriptor, verify the policy integrity, verify the PSBT is bound to
 /// the recovery tier we expect, derive the local x-only pubkey, build the
@@ -1700,8 +1649,10 @@ async fn approve_psbt_session(
         )
     })?;
 
-    let policy = load_verified_policy(&policy_json, &descriptor.policy_hash)?;
-    let xpub_str = find_local_external_xpub(&policy, tier_index, &local_fp)?;
+    let policy = keep_frost_net::load_verified_wallet_policy(&policy_json, &descriptor.policy_hash)
+        .map_err(KeepError::InvalidInput)?;
+    let xpub_str = keep_frost_net::find_local_external_xpub_in_tier(&policy, tier_index, &local_fp)
+        .map_err(KeepError::InvalidInput)?;
     let network = <keep_bitcoin::Network as std::str::FromStr>::from_str(&descriptor.network)
         .map_err(|e| KeepError::InvalidInput(format!("invalid network: {e}")))?;
     let xonly_bytes = keep_bitcoin::xpub_to_x_only(&xpub_str, network)
@@ -1715,18 +1666,10 @@ async fn approve_psbt_session(
         return Err(KeepError::InvalidInput("PSBT has no inputs to sign".into()));
     }
 
-    // Verify every input's tap_scripts entry is bound to its witness_utxo and
-    // references our local x-only key BEFORE asking the bunker to sign.
-    // Failing closed here turns the responder from a blind signing oracle
-    // into one that only signs for outputs it actually controls.
-    let mut sighashes = Vec::with_capacity(psbt.inputs.len());
-    for i in 0..psbt.inputs.len() {
-        let bundle = keep_bitcoin::verify_script_spend_input_binding(&psbt, i, &xonly_bytes)
-            .map_err(|e| {
-                KeepError::InvalidInput(format!("PSBT input {i} binding verification failed: {e}"))
-            })?;
-        sighashes.push(bundle);
-    }
+    // Verify every input upfront so the responder only forwards sighashes for
+    // outputs it actually controls; fail closed before contacting the bunker.
+    let sighashes = keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
+        .map_err(|e| KeepError::InvalidInput(format!("PSBT binding verification failed: {e}")))?;
 
     out.info(&format!(
         "Approving session {} (tier {}, {} input(s)) via signer {}",
@@ -1864,7 +1807,7 @@ pub fn cmd_wallet_approve_psbt(
     rt.block_on(async {
         let registry = Arc::new(keep_frost_net::InMemoryRecoverySignerRegistry::new());
         for (fp, uri) in &registry_entries {
-            registry.insert(fp, format!("signer-{fp}"), uri.as_str().to_string());
+            registry.insert(fp, format!("signer-{fp}"), uri.clone());
         }
 
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
