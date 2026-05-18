@@ -520,6 +520,24 @@ fn dispatch_wallet(
                 timeout,
             )
         }
+        WalletCommands::ApprovePsbt {
+            group,
+            session,
+            signer_bunker,
+            share,
+            relay,
+        } => {
+            let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
+            commands::wallet::cmd_wallet_approve_psbt(
+                out,
+                path,
+                &group,
+                &session,
+                &signer_bunker,
+                share,
+                relay,
+            )
+        }
     }
 }
 

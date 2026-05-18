@@ -216,6 +216,11 @@ pub enum Message {
     CancelRegister,
     SubmitRegister,
     RejectPsbt([u8; 32]),
+    StartApprovePsbt([u8; 32]),
+    ApproveBunkerUriChanged(String),
+    ApproveFingerprintChanged(String),
+    CancelApprovePsbt,
+    SubmitApprovePsbt,
     StartSpend(usize),
     SpendTierChanged(String),
     SpendPsbtChanged(String),
@@ -260,6 +265,16 @@ impl std::fmt::Debug for Message {
             Self::CancelRegister => write!(f, "CancelRegister"),
             Self::SubmitRegister => write!(f, "SubmitRegister"),
             Self::RejectPsbt(id) => f.debug_tuple("RejectPsbt").field(&hex::encode(id)).finish(),
+            Self::StartApprovePsbt(id) => f
+                .debug_tuple("StartApprovePsbt")
+                .field(&hex::encode(id))
+                .finish(),
+            Self::ApproveBunkerUriChanged(_) => write!(f, "ApproveBunkerUriChanged(<redacted>)"),
+            Self::ApproveFingerprintChanged(v) => {
+                f.debug_tuple("ApproveFingerprintChanged").field(v).finish()
+            }
+            Self::CancelApprovePsbt => write!(f, "CancelApprovePsbt"),
+            Self::SubmitApprovePsbt => write!(f, "SubmitApprovePsbt"),
             Self::StartSpend(i) => f.debug_tuple("StartSpend").field(i).finish(),
             Self::SpendTierChanged(v) => f.debug_tuple("SpendTierChanged").field(v).finish(),
             Self::SpendPsbtChanged(_) => write!(f, "SpendPsbtChanged(<redacted>)"),
@@ -303,6 +318,16 @@ pub enum Event {
         device_kind: Option<String>,
     },
     RejectPsbt([u8; 32]),
+    ApprovePsbt {
+        session_id: [u8; 32],
+        fingerprint: String,
+        bunker_uri: zeroize::Zeroizing<String>,
+        /// PSBT hash captured at the moment the operator opened the approve
+        /// pane (i.e. while reviewing the snapshot). If the in-flight
+        /// proposal PSBT no longer hashes to this value at sign time, the
+        /// approval must abort.
+        psbt_hash: [u8; 32],
+    },
     StartSpend {
         wallet_idx: usize,
     },
@@ -346,6 +371,25 @@ pub struct State {
     pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
     pub pending_psbt_signatures: Vec<PsbtPendingDisplay>,
     pub spend: Option<Box<SpendState>>,
+    pub approve: Option<Box<ApprovePsbtState>>,
+}
+
+/// Modal state for approving an incoming PSBT signature request. Only shown
+/// after the user clicks "Review & Approve" on a pending PSBT card *and* that
+/// card's snapshot decoded successfully (so destinations are visible).
+pub struct ApprovePsbtState {
+    pub session_id: [u8; 32],
+    /// Bunker URI buffer. Wrapped in `Zeroizing` because operators may paste
+    /// URIs that embed a single-use connect secret; we don't want stale
+    /// copies left in the UI heap after the pane closes.
+    pub bunker_uri: zeroize::Zeroizing<String>,
+    pub fingerprint: String,
+    pub error: Option<String>,
+    pub submitting: bool,
+    /// PSBT hash captured from the snapshot at the moment the operator
+    /// opened this approval pane. Sent through to the signer task so it can
+    /// re-verify the proposal PSBT hasn't been swapped mid-review.
+    pub snapshot_psbt_hash: [u8; 32],
 }
 
 pub struct SetupState {
@@ -369,6 +413,7 @@ impl State {
             peer_xpubs: HashMap::new(),
             pending_psbt_signatures: Vec::new(),
             spend: None,
+            approve: None,
         }
     }
 
@@ -475,6 +520,74 @@ impl State {
             }
             Message::CopyDescriptor(desc) => Some(Event::CopyDescriptor(desc)),
             Message::RejectPsbt(id) => Some(Event::RejectPsbt(id)),
+            Message::StartApprovePsbt(session_id) => {
+                let entry = self
+                    .pending_psbt_signatures
+                    .iter()
+                    .find(|e| e.session_id == session_id)
+                    .cloned();
+                if let Some(entry) = entry {
+                    if let Some(snap) = entry.snapshot.as_ref() {
+                        // Only open the approve pane when the snapshot
+                        // decoded fully (caller already gates the button
+                        // on this, but defense in depth).
+                        self.approve = Some(Box::new(ApprovePsbtState {
+                            session_id,
+                            bunker_uri: zeroize::Zeroizing::new(String::new()),
+                            fingerprint: String::new(),
+                            error: None,
+                            submitting: false,
+                            snapshot_psbt_hash: snap.psbt_hash,
+                        }));
+                    }
+                }
+                None
+            }
+            Message::ApproveBunkerUriChanged(v) => {
+                if let Some(a) = &mut self.approve {
+                    a.bunker_uri =
+                        zeroize::Zeroizing::new(v.chars().take(MAX_DEVICE_URI_LEN).collect());
+                }
+                None
+            }
+            Message::ApproveFingerprintChanged(v) => {
+                if let Some(a) = &mut self.approve {
+                    a.fingerprint = v
+                        .chars()
+                        .filter(|c| c.is_ascii_hexdigit())
+                        .take(8)
+                        .collect();
+                }
+                None
+            }
+            Message::CancelApprovePsbt => {
+                self.approve = None;
+                None
+            }
+            Message::SubmitApprovePsbt => {
+                let Some(a) = &mut self.approve else {
+                    return None;
+                };
+                let uri = zeroize::Zeroizing::new(a.bunker_uri.trim().to_string());
+                let fp = a.fingerprint.trim().to_ascii_lowercase();
+                if !uri.starts_with("bunker://") {
+                    a.error = Some("Bunker URI must start with bunker://".into());
+                    return None;
+                }
+                if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+                    a.error = Some("Fingerprint must be 8 hex characters".into());
+                    return None;
+                }
+                a.error = None;
+                a.submitting = true;
+                let snapshot_psbt_hash = a.snapshot_psbt_hash;
+                Some(Event::ApprovePsbt {
+                    session_id: a.session_id,
+                    fingerprint: fp,
+                    bunker_uri: uri,
+                    psbt_hash: snapshot_psbt_hash,
+                })
+            }
             Message::StartRegister(i) => {
                 if let Some(entry) = self.descriptors.get(i) {
                     let default_name = hex::encode(&entry.group_pubkey[..4]);
@@ -1643,6 +1756,52 @@ impl State {
             .into()
     }
 
+    fn view_approve_pane<'a>(&self, state: &'a ApprovePsbtState) -> Element<'a, Message> {
+        let uri_input = text_input("bunker://...", &state.bunker_uri)
+            .on_input(Message::ApproveBunkerUriChanged)
+            .padding(theme::space::SM);
+        let fp_input = text_input("8 hex chars", &state.fingerprint)
+            .on_input(Message::ApproveFingerprintChanged)
+            .padding(theme::space::SM)
+            .width(120);
+
+        let uri_valid = state.bunker_uri.trim().starts_with("bunker://");
+        let fp_valid = state.fingerprint.len() == 8
+            && state.fingerprint.chars().all(|c| c.is_ascii_hexdigit());
+        let can_submit = uri_valid && fp_valid && !state.submitting;
+
+        let mut submit_btn = button(text("Confirm Approve").size(theme::size::SMALL))
+            .style(theme::primary_button)
+            .padding([theme::space::XS, theme::space::MD]);
+        if can_submit {
+            submit_btn = submit_btn.on_press(Message::SubmitApprovePsbt);
+        }
+
+        let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
+            .on_press(Message::CancelApprovePsbt)
+            .style(theme::secondary_button)
+            .padding([theme::space::XS, theme::space::MD]);
+
+        let mut content = column![
+            text("Approve via NIP-46 signer")
+                .size(theme::size::SMALL)
+                .color(theme::color::TEXT_MUTED),
+            theme::label("Bunker URI"),
+            uri_input,
+            theme::label("Local xpub fingerprint"),
+            fp_input,
+            row![submit_btn, cancel_btn].spacing(theme::space::SM),
+        ]
+        .spacing(theme::space::XS);
+        if let Some(err) = &state.error {
+            content = content.push(theme::error_text(err.as_str()));
+        }
+        container(content)
+            .padding(theme::space::SM)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn pending_psbt_signatures_section(&self) -> Element<'_, Message> {
         let mut request_list = column![].spacing(theme::space::SM);
 
@@ -1696,9 +1855,61 @@ impl State {
                     ]
                     .spacing(theme::space::XS);
 
+                    let mut outputs_col = column![text("Destinations:")
+                        .size(theme::size::TINY)
+                        .color(theme::color::TEXT_MUTED)]
+                    .spacing(theme::space::XS);
+                    // Show every output's FULL address (or fail-closed marker
+                    // for un-decodable scripts). Left-truncation here is a
+                    // homograph footgun — the prefix of a benign-looking
+                    // address can be identical to a malicious one.
+                    let mut all_outputs_decoded = !snap.outputs.is_empty();
+                    for (addr, sats) in &snap.outputs {
+                        if addr.starts_with("script:") {
+                            all_outputs_decoded = false;
+                        }
+                        outputs_col = outputs_col.push(
+                            text(format!("  {addr}  ->  {sats} sats"))
+                                .size(theme::size::TINY)
+                                .color(theme::color::TEXT_DIM),
+                        );
+                    }
+
+                    // Gate the Approve button on snapshot presence AND every
+                    // output decoding to an address. A `script:` fallback
+                    // means the operator can't actually verify the
+                    // destination, so we must not offer a one-click sign.
+                    let preview_decoded = all_outputs_decoded;
+                    let approve_btn: Element<'_, Message> = if preview_decoded
+                        && self.approve.as_ref().map(|a| a.session_id) != Some(entry.session_id)
+                    {
+                        button(text("Review & Approve").size(theme::size::SMALL))
+                            .on_press(Message::StartApprovePsbt(entry.session_id))
+                            .style(theme::primary_button)
+                            .padding([theme::space::XS, theme::space::MD])
+                            .into()
+                    } else {
+                        text("").into()
+                    };
+
+                    let approve_pane: Element<'_, Message> = match self
+                        .approve
+                        .as_ref()
+                        .filter(|a| a.session_id == entry.session_id)
+                    {
+                        Some(a) => self.view_approve_pane(a),
+                        None => text("").into(),
+                    };
+
                     container(
-                        column![header, details, row![reject_btn].spacing(theme::space::SM)]
-                            .spacing(theme::space::XS),
+                        column![
+                            header,
+                            details,
+                            outputs_col,
+                            approve_pane,
+                            row![reject_btn, approve_btn].spacing(theme::space::SM),
+                        ]
+                        .spacing(theme::space::XS),
                     )
                     .style(theme::warning_style)
                     .padding(theme::space::MD)

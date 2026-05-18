@@ -70,16 +70,18 @@ mod peer;
 pub mod proof;
 mod protocol;
 mod psbt_session;
+mod recovery_signers;
 mod session;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
-    derive_descriptor_session_id, derive_policy_hash, participant_indices, reconstruct_descriptor,
-    DescriptorSession, DescriptorSessionManager, DescriptorSessionState, DescriptorSessionStore,
-    FinalizedDescriptor, PersistedDescriptorSession, PersistedFinalizedDescriptor,
-    PersistedSessionState, XpubContribution,
+    derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
+    load_verified_wallet_policy, participant_indices, reconstruct_descriptor, DescriptorSession,
+    DescriptorSessionManager, DescriptorSessionState, DescriptorSessionStore, FinalizedDescriptor,
+    PersistedDescriptorSession, PersistedFinalizedDescriptor, PersistedSessionState,
+    XpubContribution,
 };
 pub use descriptor_session_store::FileDescriptorSessionStore;
 pub use ecdh::{
@@ -117,6 +119,9 @@ pub use protocol::{
 };
 pub use psbt_session::{
     derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,
+};
+pub use recovery_signers::{
+    InMemoryRecoverySignerRegistry, RecoverySignerHandle, RecoverySignerRegistry,
 };
 pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
 

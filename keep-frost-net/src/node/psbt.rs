@@ -3,6 +3,7 @@
 //! WDC PSBT coordination handlers (recovery tier / scriptpath spends).
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
 use bitcoin::hashes::Hash;
 use nostr_sdk::prelude::*;
@@ -32,6 +33,12 @@ pub struct PsbtSessionSnapshot {
     pub network: String,
     pub threshold: u32,
     pub expected_signers_len: u32,
+    /// Per-output (address string, value sats) decoded from the PSBT's
+    /// unsigned transaction. Entries whose script does not yield a
+    /// network-valid address are rendered as a hex script prefixed with
+    /// `script:` so the UI surfaces *something* rather than dropping the
+    /// output silently.
+    pub outputs: Vec<(String, u64)>,
 }
 
 impl KfpNode {
@@ -50,6 +57,7 @@ impl KfpNode {
             .as_deref()
             .and_then(|l| l.network_for(&self.group_pubkey, &descriptor_hash))
             .unwrap_or_else(|| "unknown".to_string());
+        let outputs = decode_psbt_outputs(session.proposal_psbt(), &network);
         Some(PsbtSessionSnapshot {
             session_id: *session.session_id(),
             tier_index: session.tier_index(),
@@ -60,8 +68,32 @@ impl KfpNode {
             network,
             threshold: session.required_threshold(),
             expected_signers_len: session.expected_signers().len() as u32,
+            outputs,
         })
     }
+    /// Return the proposal PSBT bytes for the given session, or `None` if
+    /// the session is unknown. Used by responders to reconstruct the
+    /// script-spend sighash before forwarding it to a NIP-46 signer.
+    pub fn psbt_session_proposal_psbt(&self, session_id: &[u8; 32]) -> Option<Vec<u8>> {
+        self.psbt_sessions
+            .read()
+            .get_session(session_id)
+            .map(|s| s.proposal_psbt().to_vec())
+    }
+
+    /// Return `(initiator_pubkey, descriptor_hash, tier_index)` for the given
+    /// PSBT session, or `None` if the session is unknown or has no recorded
+    /// initiator.
+    pub fn psbt_session_routing(
+        &self,
+        session_id: &[u8; 32],
+    ) -> Option<(PublicKey, [u8; 32], u32)> {
+        let sessions = self.psbt_sessions.read();
+        let session = sessions.get_session(session_id)?;
+        let initiator = *session.initiator()?;
+        Some((initiator, *session.descriptor_hash(), session.tier_index()))
+    }
+
     /// Propose a PSBT for a recovery tier spend. Publishes `PsbtPropose` to all
     /// expected signers over NIP-44 encrypted channel.
     ///
@@ -578,9 +610,28 @@ impl KfpNode {
 
         let msg = KfpMessage::PsbtSign(payload);
 
-        // Commit the signature to our local session before sending so we
-        // reject duplicate local contributions on retry, but capture enough
-        // information to roll back if the wire send fails.
+        // SEC/cancel-safety: send the wire event FIRST, then commit to the
+        // local session. The previous order (commit-then-send) leaked a
+        // dangling local signature when the awaiting task was cancelled
+        // between the two steps. Swapping the order means that on a
+        // user-triggered retry of a cancelled `contribute_psbt_signature`
+        // the local `add_signature` call may return "Duplicate signature",
+        // which is the correct behavior since the peer has already counted
+        // our contribution once.
+        let event = KfpEventBuilder::psbt_event(
+            &self.keys,
+            initiator_pubkey,
+            &self.group_pubkey,
+            &session_id,
+            "psbt_sign",
+            &msg,
+        )?;
+
+        self.client
+            .send_event(&event)
+            .await
+            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
         {
             let mut sessions = self.psbt_sessions.write();
             let session = sessions
@@ -589,40 +640,8 @@ impl KfpNode {
             session.add_signature(signer.clone(), merged_psbt.clone())?;
         }
 
-        let event = match KfpEventBuilder::psbt_event(
-            &self.keys,
-            initiator_pubkey,
-            &self.group_pubkey,
-            &session_id,
-            "psbt_sign",
-            &msg,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                self.rollback_local_signature(&session_id, &signer);
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = self.client.send_event(&event).await {
-            self.rollback_local_signature(&session_id, &signer);
-            return Err(FrostNetError::Transport(e.to_string()));
-        }
-
         info!(session_id = %hex::encode(session_id), "Sent PSBT signature contribution");
         Ok(())
-    }
-
-    fn rollback_local_signature(&self, session_id: &[u8; 32], signer: &SignerId) {
-        let mut sessions = self.psbt_sessions.write();
-        if let Some(session) = sessions.get_session_mut(session_id) {
-            if !session.remove_signature(signer) {
-                debug!(
-                    session_id = %hex::encode(session_id),
-                    "rollback_local_signature: no local signature to remove"
-                );
-            }
-        }
     }
 
     pub(crate) async fn handle_psbt_sign(
@@ -695,7 +714,12 @@ impl KfpNode {
             session.add_signature(signer.clone(), payload.psbt)?;
 
             let is_initiator = session.initiator() == Some(&self.keys.public_key());
-            let should_finalize = is_initiator && session.begin_finalize();
+            // Defensive: only attempt to finalize once threshold is met.
+            // `begin_finalize` already gates on threshold_met(), but spell
+            // it out here so the invariant survives future refactors of
+            // PsbtSession.
+            let threshold_met = (session.signature_count() as u32) >= session.required_threshold();
+            let should_finalize = is_initiator && threshold_met && session.begin_finalize();
             let (aggregated, agg_err) = if should_finalize {
                 match aggregate_partial_psbts(
                     session.proposal_psbt(),
@@ -868,6 +892,33 @@ impl KfpNode {
                     return Err(FrostNetError::Session(
                         "PsbtFinalize txid does not match final_tx bytes".into(),
                     ));
+                }
+                // SEC: bind the announced final_tx back to the proposal PSBT
+                // we agreed to coordinate on. compute_txid() ignores witness
+                // data by design, so this compares the input prevouts +
+                // outputs the initiator originally proposed against the
+                // ones in the broadcast tx; a swap is rejected.
+                {
+                    let proposal_psbt = {
+                        let sessions = self.psbt_sessions.read();
+                        sessions
+                            .get_session(&payload.session_id)
+                            .map(|s| s.proposal_psbt().to_vec())
+                    };
+                    if let Some(bytes) = proposal_psbt {
+                        let proposal = bitcoin::psbt::Psbt::deserialize(&bytes).map_err(|e| {
+                            FrostNetError::Session(format!(
+                                "PsbtFinalize: cannot decode proposal PSBT: {e}"
+                            ))
+                        })?;
+                        let proposal_txid: [u8; 32] =
+                            proposal.unsigned_tx.compute_txid().to_byte_array();
+                        if proposal_txid != id {
+                            return Err(FrostNetError::Session(
+                                "PsbtFinalize final_tx does not match the proposal's unsigned-tx txid".into(),
+                            ));
+                        }
+                    }
                 }
                 Some((tx, id))
             }
@@ -1050,10 +1101,45 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
     Some((psbt_hash, output_count, fee_sats))
 }
 
+/// Decode each output of `psbt_bytes` into a `(display_string, value_sats)`
+/// pair. Addresses are rendered for the canonical network when known; outputs
+/// whose script does not resolve to a network-valid address fall back to
+/// `script:<hex>` so the UI never silently drops a destination.
+///
+/// Returns an empty vector on decode failure (fail-closed; callers that need
+/// destinations to gate approval must treat empty as "no preview available").
+fn decode_psbt_outputs(psbt_bytes: &[u8], network_str: &str) -> Vec<(String, u64)> {
+    use bitcoin::Address;
+    let Ok(psbt) = bitcoin::psbt::Psbt::deserialize(psbt_bytes) else {
+        return Vec::new();
+    };
+    let network = bitcoin::Network::from_str(network_str).ok();
+    psbt.unsigned_tx
+        .output
+        .iter()
+        .map(|o| {
+            let s = match network {
+                Some(net) => match Address::from_script(&o.script_pubkey, net) {
+                    Ok(addr) => addr.to_string(),
+                    Err(_) => format!("script:{}", hex::encode(o.script_pubkey.as_bytes())),
+                },
+                None => format!("script:{}", hex::encode(o.script_pubkey.as_bytes())),
+            };
+            (s, o.value.to_sat())
+        })
+        .collect()
+}
+
 /// Combine every signer's merged PSBT with the proposal PSBT using
 /// `Psbt::combine`. Fails if any partial is undecodable, combination fails,
-/// or fewer than `required_threshold` distinct tap_script / partial
-/// signatures are present on every input of the aggregated PSBT.
+/// or any input on the aggregated PSBT carries fewer than
+/// `required_threshold` distinct `tap_script_sigs` entries for the same
+/// leaf hash.
+///
+/// Signers are combined in a deterministic order (sorted by SignerId)
+/// because `Psbt::combine` is order-sensitive for fields that aren't pure
+/// set-union — sorting ensures the aggregated bytes are reproducible across
+/// peers.
 fn aggregate_partial_psbts(
     proposal_psbt: &[u8],
     partial_psbts: &std::collections::HashMap<SignerId, Vec<u8>>,
@@ -1061,7 +1147,9 @@ fn aggregate_partial_psbts(
 ) -> Result<Vec<u8>> {
     let mut aggregated = bitcoin::psbt::Psbt::deserialize(proposal_psbt)
         .map_err(|e| FrostNetError::Session(format!("proposal PSBT decode failed: {e}")))?;
-    for (signer, bytes) in partial_psbts {
+    let mut sorted: Vec<(&SignerId, &Vec<u8>)> = partial_psbts.iter().collect();
+    sorted.sort_by(|(a, _), (b, _)| signer_id_sort_key(a).cmp(&signer_id_sort_key(b)));
+    for (signer, bytes) in sorted {
         let partial = bitcoin::psbt::Psbt::deserialize(bytes).map_err(|e| {
             FrostNetError::Session(format!("partial PSBT decode failed for {signer:?}: {e}"))
         })?;
@@ -1069,21 +1157,37 @@ fn aggregate_partial_psbts(
             FrostNetError::Session(format!("PSBT combine failed for {signer:?}: {e}"))
         })?;
     }
-    // Threshold check assumes recovery-tier (tap_script_sigs) or classic multisig
-    // (partial_sigs) semantics where each signer contributes a distinct signature.
-    // FROST key-path spends produce a single aggregated tap_key_sig regardless of
-    // threshold; this check must be revised before reuse on that path.
+    // Threshold check for the recovery-tier (tap-script) path: each input
+    // must carry `required_threshold` distinct tap_script_sigs for the same
+    // leaf hash. Counting partial_sigs / tap_key_sig here would let a single
+    // attacker satisfy the threshold via the wrong signature family
+    // (e.g. one classic ECDSA partial_sig plus their own tap_script_sig).
+    // FROST key-path spends produce a single aggregated tap_key_sig regardless
+    // of threshold and must use a different aggregator.
     for (idx, input) in aggregated.inputs.iter().enumerate() {
-        let sig_count = input.partial_sigs.len()
-            + input.tap_script_sigs.len()
-            + usize::from(input.tap_key_sig.is_some());
-        if (sig_count as u32) < required_threshold {
+        let mut per_leaf: std::collections::HashMap<bitcoin::taproot::TapLeafHash, u32> =
+            std::collections::HashMap::new();
+        for (_, leaf_hash) in input.tap_script_sigs.keys() {
+            *per_leaf.entry(*leaf_hash).or_default() += 1;
+        }
+        let max_for_one_leaf = per_leaf.values().copied().max().unwrap_or(0);
+        if max_for_one_leaf < required_threshold {
             return Err(FrostNetError::Session(format!(
-                "aggregated PSBT input {idx} has {sig_count} signatures, below threshold {required_threshold}"
+                "aggregated PSBT input {idx} has at most {max_for_one_leaf} tap_script_sigs for any single leaf, below threshold {required_threshold}"
             )));
         }
     }
     Ok(aggregated.serialize())
+}
+
+/// Total ordering for `SignerId` so `aggregate_partial_psbts` combines in
+/// a deterministic order. `Share` < `Fingerprint`; within each variant we
+/// order by the numeric / lexicographic key.
+fn signer_id_sort_key(s: &SignerId) -> (u8, u16, String) {
+    match s {
+        SignerId::Share(i) => (0u8, *i, String::new()),
+        SignerId::Fingerprint(fp) => (1u8, 0u16, fp.clone()),
+    }
 }
 
 /// Apply the descriptor_hash verification policy given an in-memory match
@@ -1278,5 +1382,32 @@ mod snapshot_decode_tests {
     fn decode_psbt_garbage_returns_none() {
         assert!(decode_psbt_for_snapshot(&[0u8, 1, 2, 3]).is_none());
         assert!(decode_psbt_for_snapshot(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_outputs_emits_address_per_output_on_known_network() {
+        let bytes = fixture_psbt(true);
+        let outs = super::decode_psbt_outputs(&bytes, "regtest");
+        assert_eq!(outs.len(), 1);
+        let (addr, sats) = &outs[0];
+        assert_eq!(*sats, 50_000);
+        assert!(
+            addr.starts_with("bcrt1p"),
+            "expected regtest p2tr bech32m address, got {addr}"
+        );
+    }
+
+    #[test]
+    fn decode_outputs_unknown_network_falls_back_to_script_hex() {
+        let bytes = fixture_psbt(true);
+        let outs = super::decode_psbt_outputs(&bytes, "no-such-network");
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].0.starts_with("script:"));
+    }
+
+    #[test]
+    fn decode_outputs_garbage_returns_empty() {
+        let outs = super::decode_psbt_outputs(&[0u8, 1, 2], "regtest");
+        assert!(outs.is_empty());
     }
 }

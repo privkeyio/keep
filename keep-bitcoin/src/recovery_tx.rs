@@ -2,15 +2,21 @@
 // SPDX-License-Identifier: MIT
 use crate::error::{BitcoinError, Result};
 use crate::recovery::{RecoveryOutput, TierInfo};
+use bitcoin::hashes::Hash as _;
 use bitcoin::key::Secp256k1;
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{All, Keypair, Message};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature};
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-use zeroize::Zeroize;
+use bitcoin::taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature, TapLeafHash};
+use bitcoin::{
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+};
+use zeroize::Zeroizing;
 
 const MAX_FEE_SATS: u64 = 100_000_000; // 1 BTC
+/// Bitcoin Core's default dust threshold for taproot (P2TR) outputs in sats.
+/// Outputs smaller than this are non-standard and unlikely to relay.
+pub const TAPROOT_DUST_LIMIT_SATS: u64 = 330;
 
 pub struct RecoveryTxBuilder {
     recovery_output: RecoveryOutput,
@@ -44,10 +50,10 @@ impl RecoveryTxBuilder {
             return Err(BitcoinError::Recovery("insufficient funds".into()));
         }
         let output_value = utxo_value - fee_sats;
-        if output_value < 330 {
-            return Err(BitcoinError::Recovery(
-                "output below dust threshold (330 sats)".into(),
-            ));
+        if output_value < TAPROOT_DUST_LIMIT_SATS {
+            return Err(BitcoinError::Recovery(format!(
+                "output below dust threshold ({TAPROOT_DUST_LIMIT_SATS} sats)"
+            )));
         }
 
         let sequence = match tier.timelock_blocks {
@@ -86,6 +92,12 @@ impl RecoveryTxBuilder {
         Ok(psbt)
     }
 
+    /// Sign the single input of `psbt` for the given recovery tier.
+    ///
+    /// `psbt` MUST contain exactly one input. This is the recovery-tier
+    /// invariant: every PSBT produced by [`Self::build_recovery_psbt`] is
+    /// single-input, and finalize_recovery / aggregate_partial_psbts assume
+    /// the same shape. Multi-input PSBTs are rejected.
     pub fn sign_recovery(
         &self,
         psbt: &mut Psbt,
@@ -93,12 +105,15 @@ impl RecoveryTxBuilder {
         secret_key: &[u8; 32],
     ) -> Result<()> {
         let tier = self.get_tier(tier_index)?;
-        let mut sk_bytes = *secret_key;
-        let keypair = Keypair::from_seckey_slice(&self.secp, &sk_bytes).map_err(|e| {
-            sk_bytes.zeroize();
-            BitcoinError::InvalidSecretKey(e.to_string())
-        })?;
-        sk_bytes.zeroize();
+        if psbt.inputs.len() != 1 {
+            return Err(BitcoinError::Recovery(format!(
+                "sign_recovery requires exactly one PSBT input, got {}",
+                psbt.inputs.len()
+            )));
+        }
+        let sk_bytes = Zeroizing::new(*secret_key);
+        let keypair = Keypair::from_seckey_slice(&self.secp, &*sk_bytes)
+            .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))?;
         let (x_only, _) = keypair.x_only_public_key();
 
         let prevouts: Vec<TxOut> = psbt
@@ -144,9 +159,23 @@ impl RecoveryTxBuilder {
         Ok(())
     }
 
+    /// Finalize a recovery PSBT by attaching the witness stack for the given
+    /// tier. Assumes `tier.script` is the CHECKSIGADD-style multisig script
+    /// produced by `RecoveryConfig::build` (one stack push per key, in
+    /// reverse-key order, followed by the leaf script and control block).
+    /// `RecoveryConfig::build` is the only sanctioned producer of tier
+    /// scripts, so this layout is guaranteed by construction.
     pub fn finalize_recovery(&self, psbt: &mut Psbt, tier_index: usize) -> Result<Transaction> {
         let tier = self.get_tier(tier_index)?;
         let control_block = self.control_block(tier)?;
+        // Defensive check: a CHECKSIGADD witness needs one push per key, so a
+        // tier with zero keys cannot be finalized. Fail closed rather than
+        // panic — a malformed RecoveryConfig must not crash the node.
+        if tier.keys.is_empty() {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {tier_index} has no keys; cannot build CHECKSIGADD witness"
+            )));
+        }
 
         let sig_count = psbt.inputs[0]
             .tap_script_sigs
@@ -197,6 +226,239 @@ impl RecoveryTxBuilder {
             .control_block(&(tier.script.clone(), LeafVersion::TapScript))
             .ok_or_else(|| BitcoinError::Recovery("no control block for tier script".into()))
     }
+}
+
+/// Per-input recovery-tier script-spend sighash bundle.
+///
+/// Returned by [`script_spend_sighashes`]. Each entry contains the BIP-341
+/// sighash bytes the remote signer must sign, plus the leaf hash, leaf script,
+/// and control block needed to merge the resulting Schnorr signature back into
+/// the PSBT via [`merge_tap_script_sig`].
+#[derive(Clone, Debug)]
+pub struct ScriptSpendSighash {
+    pub input_index: usize,
+    pub sighash: [u8; 32],
+    pub leaf_hash: TapLeafHash,
+    pub script: ScriptBuf,
+    pub control_block: ControlBlock,
+}
+
+/// Compute the BIP-341 script-spend sighash for every input of `psbt` using
+/// the tap_scripts entries already attached to the PSBT. Each input must carry
+/// exactly one `tap_scripts` entry (as inserted by [`RecoveryTxBuilder::build_recovery_psbt`])
+/// and a `witness_utxo`. Returns one [`ScriptSpendSighash`] per input.
+pub fn script_spend_sighashes(psbt: &Psbt) -> Result<Vec<ScriptSpendSighash>> {
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input
+                .witness_utxo
+                .clone()
+                .ok_or(BitcoinError::MissingWitnessUtxo(i))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let mut out = Vec::with_capacity(psbt.inputs.len());
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        let mut iter = input.tap_scripts.iter();
+        let (control_block, (script, leaf_version)) = iter
+            .next()
+            .ok_or_else(|| BitcoinError::Recovery(format!("input {i} has no tap_scripts entry")))?;
+        if iter.next().is_some() {
+            return Err(BitcoinError::Recovery(format!(
+                "input {i} has more than one tap_scripts entry; ambiguous tier"
+            )));
+        }
+        let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+        let sighash = sighash_cache
+            .taproot_script_spend_signature_hash(
+                i,
+                &Prevouts::All(&prevouts),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
+        out.push(ScriptSpendSighash {
+            input_index: i,
+            sighash: sighash.to_byte_array(),
+            leaf_hash,
+            script: script.clone(),
+            control_block: control_block.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Insert a remote Schnorr signature into `psbt.inputs[input_index].tap_script_sigs`
+/// keyed by `(xonly_pubkey, leaf_hash)` with `SIGHASH_DEFAULT`.
+///
+/// `sighash` MUST be the BIP-341 script-spend sighash bytes for this input
+/// (typically the value taken from the corresponding [`ScriptSpendSighash`]).
+/// The signature is verified against `(sighash, xonly_pubkey)` before being
+/// inserted; an invalid signature is rejected so callers cannot silently
+/// merge garbage from a malicious or buggy remote signer.
+pub fn merge_tap_script_sig(
+    psbt: &mut Psbt,
+    input_index: usize,
+    xonly_pubkey: bitcoin::XOnlyPublicKey,
+    leaf_hash: TapLeafHash,
+    sighash: &[u8; 32],
+    schnorr_sig: [u8; 64],
+) -> Result<()> {
+    let input = psbt
+        .inputs
+        .get_mut(input_index)
+        .ok_or_else(|| BitcoinError::Recovery(format!("input {input_index} out of range")))?;
+    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&schnorr_sig)
+        .map_err(|e| BitcoinError::Signing(format!("invalid schnorr sig: {e}")))?;
+    let msg = Message::from_digest_slice(sighash)
+        .map_err(|e| BitcoinError::Signing(format!("invalid sighash: {e}")))?;
+    let secp = Secp256k1::verification_only();
+    secp.verify_schnorr(&signature, &msg, &xonly_pubkey)
+        .map_err(|e| BitcoinError::Signing(format!("schnorr verify failed: {e}")))?;
+    input.tap_script_sigs.insert(
+        (xonly_pubkey, leaf_hash),
+        TaprootSignature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        },
+    );
+    Ok(())
+}
+
+/// Verify that the script-spend bundle for `input_index` of `psbt` is bound
+/// to the input's `witness_utxo` and that the leaf script commits to
+/// `local_xonly`.
+///
+/// This is the security-critical gate that turns a "blind sighash signer"
+/// into one that can only sign for outputs it actually controls. It enforces:
+///
+/// 1. `witness_utxo` is set and is a 34-byte P2TR script (so the output
+///    key can be extracted).
+/// 2. The PSBT input carries exactly one `tap_scripts` entry. Multiple
+///    candidate scripts make the leaf-hash ambiguous and are rejected.
+/// 3. The `(control_block, script, leaf_version)` triple committed to the
+///    `witness_utxo`'s taproot output key — i.e. the leaf is provably part
+///    of the taproot tree being spent.
+/// 4. The leaf script contains `local_xonly` as a 32-byte push. This binds
+///    the responder's signing key to a key actually present in the leaf;
+///    without it a malicious proposer could ask the responder to sign for
+///    an unrelated taproot leaf that happens to commit to the same output.
+///
+/// Returns the verified [`ScriptSpendSighash`] for this input on success.
+pub fn verify_script_spend_input_binding(
+    psbt: &Psbt,
+    input_index: usize,
+    local_xonly: &[u8; 32],
+) -> Result<ScriptSpendSighash> {
+    let input = psbt
+        .inputs
+        .get(input_index)
+        .ok_or_else(|| BitcoinError::Recovery(format!("input {input_index} out of range")))?;
+
+    let wu = input
+        .witness_utxo
+        .as_ref()
+        .ok_or(BitcoinError::MissingWitnessUtxo(input_index))?;
+    let spk = wu.script_pubkey.as_bytes();
+    if !wu.script_pubkey.is_p2tr() || spk.len() != 34 {
+        return Err(BitcoinError::Recovery(format!(
+            "input {input_index} witness_utxo is not a P2TR output",
+        )));
+    }
+    let mut output_key_bytes = [0u8; 32];
+    output_key_bytes.copy_from_slice(&spk[2..34]);
+    let output_key = XOnlyPublicKey::from_slice(&output_key_bytes).map_err(|e| {
+        BitcoinError::Recovery(format!(
+            "input {input_index} witness_utxo output key invalid: {e}"
+        ))
+    })?;
+
+    let mut iter = input.tap_scripts.iter();
+    let (control_block, (script, leaf_version)) = iter.next().ok_or_else(|| {
+        BitcoinError::Recovery(format!("input {input_index} has no tap_scripts entry"))
+    })?;
+    if iter.next().is_some() {
+        return Err(BitcoinError::Recovery(format!(
+            "input {input_index} has more than one tap_scripts entry; ambiguous tier"
+        )));
+    }
+
+    let secp = Secp256k1::verification_only();
+    if !control_block.verify_taproot_commitment(&secp, output_key, script) {
+        return Err(BitcoinError::Recovery(format!(
+            "input {input_index} tap_scripts entry does not commit to the witness_utxo output key",
+        )));
+    }
+
+    if !script_contains_xonly(script, local_xonly) {
+        return Err(BitcoinError::Recovery(format!(
+            "input {input_index} leaf script does not reference the local responder x-only key",
+        )));
+    }
+
+    let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, inp)| {
+            inp.witness_utxo
+                .clone()
+                .ok_or(BitcoinError::MissingWitnessUtxo(i))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let sighash = sighash_cache
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &Prevouts::All(&prevouts),
+            leaf_hash,
+            TapSighashType::Default,
+        )
+        .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
+
+    Ok(ScriptSpendSighash {
+        input_index,
+        sighash: sighash.to_byte_array(),
+        leaf_hash,
+        script: script.clone(),
+        control_block: control_block.clone(),
+    })
+}
+
+/// Verify every PSBT input's script-spend binding upfront and return the
+/// per-input [`ScriptSpendSighash`] bundles. Errors with the offending
+/// input index if any input fails the security-critical binding check in
+/// [`verify_script_spend_input_binding`].
+pub fn verify_all_script_spend_input_bindings(
+    psbt: &Psbt,
+    local_xonly: &[u8; 32],
+) -> Result<Vec<ScriptSpendSighash>> {
+    let mut out = Vec::with_capacity(psbt.inputs.len());
+    for i in 0..psbt.inputs.len() {
+        out.push(verify_script_spend_input_binding(psbt, i, local_xonly)?);
+    }
+    Ok(out)
+}
+
+/// Scan `script` opcodes for any 32-byte push equal to `xonly`. Recovery
+/// tier leaves built by `RecoveryConfig::build` push each x-only key with
+/// `OP_PUSHBYTES_32`, so any participating key shows up as such a push.
+fn script_contains_xonly(script: &bitcoin::Script, xonly: &[u8; 32]) -> bool {
+    use bitcoin::script::Instruction;
+    for instr in script.instructions() {
+        if let Ok(Instruction::PushBytes(b)) = instr {
+            if b.as_bytes() == xonly.as_slice() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

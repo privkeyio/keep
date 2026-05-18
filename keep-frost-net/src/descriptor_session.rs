@@ -839,6 +839,55 @@ pub fn derive_policy_hash(policy: &WalletPolicy) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Deserialize a persisted `WalletPolicy` and require its content hash
+/// equals `expected_policy_hash`. A tampered policy could swap the
+/// responder's resolved External slot xpub, so we fail closed.
+pub fn load_verified_wallet_policy(
+    policy_json: &serde_json::Value,
+    expected_policy_hash: &[u8; 32],
+) -> std::result::Result<WalletPolicy, String> {
+    let policy: WalletPolicy = serde_json::from_value(policy_json.clone())
+        .map_err(|e| format!("invalid persisted wallet policy: {e}"))?;
+    if &derive_policy_hash(&policy) != expected_policy_hash {
+        return Err(
+            "persisted wallet policy hash does not match stored descriptor.policy_hash; refusing"
+                .into(),
+        );
+    }
+    Ok(policy)
+}
+
+/// Resolve the External `(xpub, fingerprint)` slot in `tier_index` whose
+/// fingerprint matches `local_fp`. Errors if more than one External slot in
+/// the tier shares the same fingerprint, since that makes responder
+/// selection ambiguous.
+pub fn find_local_external_xpub_in_tier(
+    policy: &WalletPolicy,
+    tier_index: u32,
+    local_fp: &str,
+) -> std::result::Result<String, String> {
+    let tier = policy
+        .recovery_tiers
+        .get(tier_index as usize)
+        .ok_or_else(|| format!("tier {tier_index} not present in persisted policy"))?;
+    let mut found: Option<String> = None;
+    for slot in &tier.key_slots {
+        if let KeySlot::External { xpub, fingerprint } = slot {
+            if fingerprint.eq_ignore_ascii_case(local_fp) {
+                if found.is_some() {
+                    return Err(format!(
+                        "tier {tier_index} has more than one External slot with fingerprint {local_fp}; ambiguous responder"
+                    ));
+                }
+                found = Some(xpub.clone());
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        format!("no External key slot with fingerprint {local_fp} found in tier {tier_index}")
+    })
+}
+
 pub fn derive_descriptor_session_id(
     group_pubkey: &[u8; 32],
     policy: &WalletPolicy,

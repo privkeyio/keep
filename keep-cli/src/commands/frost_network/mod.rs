@@ -181,6 +181,7 @@ pub fn cmd_frost_network_serve(
                         internal_descriptor,
                         network,
                         policy_hash,
+                        policy,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -195,6 +196,7 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            let policy_value = serde_json::to_value(&policy).ok();
                             let descriptor = WalletDescriptor {
                                 group_pubkey,
                                 external_descriptor,
@@ -203,6 +205,7 @@ pub fn cmd_frost_network_serve(
                                 created_at: now,
                                 device_registrations: Vec::new(),
                                 policy_hash,
+                                policy: policy_value,
                             };
                             let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {
