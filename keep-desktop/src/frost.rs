@@ -1431,6 +1431,7 @@ impl App {
                     internal_descriptor,
                     network,
                     created_at,
+                    device_registrations: Vec::new(),
                 });
             }
         }

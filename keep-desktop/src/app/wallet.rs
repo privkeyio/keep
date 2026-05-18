@@ -1,5 +1,5 @@
 use iced::Task;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::message::Message;
 use crate::screen::wallet::{self, DescriptorProgress, SetupPhase};
@@ -73,11 +73,13 @@ impl App {
                 external_descriptor,
                 device_uri,
                 wallet_name,
+                device_kind,
             } => self.begin_register_on_device(
                 group_pubkey,
                 external_descriptor,
                 device_uri,
                 wallet_name,
+                device_kind,
             ),
             wallet::Event::RejectPsbt(session_id) => {
                 Task::done(Message::RejectPsbtSignature(session_id))
@@ -316,6 +318,7 @@ impl App {
         external_descriptor: String,
         device_uri: String,
         wallet_name: String,
+        user_device_kind: Option<String>,
     ) -> Task<Message> {
         let multipath = match keep_bitcoin::multipath_from_external(&external_descriptor) {
             Ok(m) => m,
@@ -359,7 +362,19 @@ impl App {
                         );
                         format!("handshake: {e}")
                     })?;
-                    client
+                    // Best-effort: failure must not block registration.
+                    let device_info = match client.get_device_info().await {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            debug!(
+                                group = %group_hex,
+                                signer = %signer_hex,
+                                "get_device_info failed (best-effort): {e}",
+                            );
+                            None
+                        }
+                    };
+                    let resp = client
                         .register_wallet(&wallet_name, &multipath)
                         .await
                         .map_err(|e| {
@@ -369,18 +384,57 @@ impl App {
                                 "register_wallet rejected: {e}",
                             );
                             format!("register_wallet: {e}")
-                        })
+                        })?;
+                    Ok::<_, String>((resp, device_info))
                 }
                 .await;
 
                 client.disconnect().await;
-                let response = register_outcome?;
+                let (response, device_info) = register_outcome?;
 
                 let signer_bytes = signer.to_bytes();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+
+                if let Some(ref info) = device_info {
+                    warn!(
+                        group = %group_hex,
+                        signer = %signer_hex,
+                        kind = info.kind.as_str(),
+                        "device metadata is self-reported by signer and not cryptographically verified",
+                    );
+                }
+                if let Some(ref k) = user_device_kind {
+                    if keep_nip46::contains_control_chars(k) {
+                        warn!(
+                            group = %group_hex,
+                            signer = %signer_hex,
+                            "user-supplied device kind contains control characters; rejecting",
+                        );
+                        return Err("device kind must not contain control characters".to_string());
+                    }
+                }
+                let device_kind = match (user_device_kind.as_deref(), device_info.as_ref()) {
+                    (Some(k), Some(d)) if k != d.kind.as_str() => {
+                        warn!(
+                            group = %group_hex,
+                            signer = %signer_hex,
+                            user_kind = %k,
+                            device_kind = d.kind.as_str(),
+                            "user-supplied device kind overrides device-reported value",
+                        );
+                        Some(k.to_string())
+                    }
+                    (Some(k), _) => Some(k.to_string()),
+                    (None, Some(d)) => Some(d.kind.as_str().to_string()),
+                    (None, None) => None,
+                };
+                let fingerprint = device_info.as_ref().and_then(|d| d.fingerprint_bytes());
+                let firmware_version = device_info
+                    .as_ref()
+                    .and_then(|d| d.firmware_version.clone());
 
                 let group_hex_for_save = group_hex.clone();
                 let signer_hex_for_save = signer_hex.clone();
@@ -394,6 +448,9 @@ impl App {
                                 wallet_name: wallet_name_saved,
                                 hmac: response.hmac.clone(),
                                 registered_at: now,
+                                device_kind,
+                                fingerprint,
+                                firmware_version,
                             },
                         )
                         .map_err(friendly_err)

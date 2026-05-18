@@ -475,6 +475,9 @@ fn dispatch_wallet(
             device,
             name,
             show_token,
+            kind,
+            fingerprint,
+            firmware_version,
         } => commands::wallet::cmd_wallet_register(
             out,
             path,
@@ -482,6 +485,9 @@ fn dispatch_wallet(
             &device,
             name.as_deref(),
             show_token,
+            kind.as_deref(),
+            fingerprint.as_deref(),
+            firmware_version.as_deref(),
         ),
         WalletCommands::Registrations { group, show_token } => {
             commands::wallet::cmd_wallet_registrations(out, path, &group, show_token)

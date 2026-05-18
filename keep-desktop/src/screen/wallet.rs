@@ -62,6 +62,15 @@ fn parse_psbt_text(input: &str) -> Result<Vec<u8>, String> {
 }
 
 #[derive(Debug, Clone)]
+pub struct WalletEntryDeviceRegistration {
+    pub signer_pubkey_hex: String,
+    pub wallet_name: String,
+    pub device_kind: Option<String>,
+    pub fingerprint_hex: Option<String>,
+    pub firmware_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct WalletEntry {
     #[allow(dead_code)]
     pub group_pubkey: [u8; 32],
@@ -70,11 +79,23 @@ pub struct WalletEntry {
     pub internal_descriptor: String,
     pub network: String,
     pub created_at: u64,
+    pub device_registrations: Vec<WalletEntryDeviceRegistration>,
 }
 
 impl WalletEntry {
     pub fn from_descriptor(d: &keep_core::WalletDescriptor) -> Self {
         let group_hex = hex::encode(d.group_pubkey);
+        let device_registrations = d
+            .device_registrations
+            .iter()
+            .map(|r| WalletEntryDeviceRegistration {
+                signer_pubkey_hex: hex::encode(r.signer_pubkey),
+                wallet_name: r.wallet_name.clone(),
+                device_kind: r.device_kind.clone(),
+                fingerprint_hex: r.fingerprint.map(hex::encode),
+                firmware_version: r.firmware_version.clone(),
+            })
+            .collect();
         Self {
             group_pubkey: d.group_pubkey,
             group_hex,
@@ -82,6 +103,7 @@ impl WalletEntry {
             internal_descriptor: d.internal_descriptor.clone(),
             network: d.network.clone(),
             created_at: d.created_at,
+            device_registrations,
         }
     }
 
@@ -135,6 +157,7 @@ pub struct RegisterState {
     pub default_wallet_name: String,
     pub device_uri: String,
     pub wallet_name: String,
+    pub device_kind: String,
     pub error: Option<String>,
     pub submitting: bool,
 }
@@ -189,6 +212,7 @@ pub enum Message {
     StartRegister(usize),
     RegisterDeviceUriChanged(String),
     RegisterNameChanged(String),
+    RegisterDeviceKindChanged(String),
     CancelRegister,
     SubmitRegister,
     RejectPsbt([u8; 32]),
@@ -230,6 +254,9 @@ impl std::fmt::Debug for Message {
                 write!(f, "RegisterDeviceUriChanged(<redacted>)")
             }
             Self::RegisterNameChanged(n) => f.debug_tuple("RegisterNameChanged").field(n).finish(),
+            Self::RegisterDeviceKindChanged(n) => {
+                f.debug_tuple("RegisterDeviceKindChanged").field(n).finish()
+            }
             Self::CancelRegister => write!(f, "CancelRegister"),
             Self::SubmitRegister => write!(f, "SubmitRegister"),
             Self::RejectPsbt(id) => f.debug_tuple("RejectPsbt").field(&hex::encode(id)).finish(),
@@ -273,6 +300,7 @@ pub enum Event {
         external_descriptor: String,
         device_uri: String,
         wallet_name: String,
+        device_kind: Option<String>,
     },
     RejectPsbt([u8; 32]),
     StartSpend {
@@ -456,6 +484,7 @@ impl State {
                         default_wallet_name: format!("keep-{default_name}"),
                         device_uri: String::new(),
                         wallet_name: String::new(),
+                        device_kind: String::new(),
                         error: None,
                         submitting: false,
                     });
@@ -464,13 +493,25 @@ impl State {
             }
             Message::RegisterDeviceUriChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.device_uri = truncate_to_bytes(&v, MAX_DEVICE_URI_LEN);
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.device_uri = truncate_to_bytes(&cleaned, MAX_DEVICE_URI_LEN);
                 }
                 None
             }
             Message::RegisterNameChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.wallet_name = truncate_to_bytes(&v, keep_nip46::MAX_WALLET_NAME_LEN);
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.wallet_name = truncate_to_bytes(&cleaned, keep_nip46::MAX_WALLET_NAME_LEN);
+                }
+                None
+            }
+            Message::RegisterDeviceKindChanged(v) => {
+                if let Some(r) = &mut self.register {
+                    // Drop control chars as the user types so they never enter
+                    // the field, instead of being surfaced as a post-submit
+                    // error. Length-cap after stripping.
+                    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+                    r.device_kind = truncate_to_bytes(&cleaned, keep_nip46::MAX_DEVICE_KIND_LEN);
                 }
                 None
             }
@@ -552,6 +593,12 @@ impl State {
                 } else {
                     name_trimmed.to_string()
                 };
+                let device_kind_trimmed = r.device_kind.trim();
+                let device_kind = if device_kind_trimmed.is_empty() {
+                    None
+                } else {
+                    Some(device_kind_trimmed.to_string())
+                };
                 r.error = None;
                 r.submitting = true;
                 Some(Event::SubmitRegister {
@@ -559,6 +606,7 @@ impl State {
                     external_descriptor: r.external_descriptor.clone(),
                     device_uri,
                     wallet_name,
+                    device_kind,
                 })
             }
         }
@@ -1207,17 +1255,47 @@ impl State {
 
             let actions_row = row![register_btn, spend_btn].spacing(theme::space::SM);
 
-            let details = column![
+            let mut details = column![
                 ext_row,
                 ext_value,
                 int_row,
                 int_value,
                 hex_full,
                 created_text,
-                Space::new().height(theme::space::SM),
-                actions_row,
             ]
             .spacing(theme::space::XS);
+
+            if !entry.device_registrations.is_empty() {
+                details = details.push(Space::new().height(theme::space::SM));
+                details = details.push(
+                    text("Registered devices (self-reported, unverified)")
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),
+                );
+                for reg in &entry.device_registrations {
+                    let kind = reg.device_kind.as_deref().unwrap_or("unknown");
+                    let fp = reg.fingerprint_hex.as_deref().unwrap_or("--");
+                    let fw = reg.firmware_version.as_deref().unwrap_or("");
+                    let line = if fw.is_empty() {
+                        format!("- {} [{}] ({})", reg.wallet_name, kind, fp)
+                    } else {
+                        format!("- {} [{} {}] ({})", reg.wallet_name, kind, fw, fp)
+                    };
+                    details = details.push(
+                        text(line)
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                    );
+                    details = details.push(
+                        text(format!("  signer: {}", reg.signer_pubkey_hex))
+                            .size(theme::size::TINY)
+                            .color(theme::color::TEXT_DIM),
+                    );
+                }
+            }
+
+            details = details.push(Space::new().height(theme::space::SM));
+            details = details.push(actions_row);
 
             card_content = card_content.push(details);
         }
@@ -1342,6 +1420,15 @@ impl State {
             name_input = name_input.on_input(Message::RegisterNameChanged);
         }
 
+        let mut kind_input = text_input(
+            "auto-detected if signer supports get_device_info",
+            &state.device_kind,
+        )
+        .padding(theme::space::SM);
+        if !state.submitting {
+            kind_input = kind_input.on_input(Message::RegisterDeviceKindChanged);
+        }
+
         let can_submit = !state.submitting && !state.device_uri.trim().is_empty();
         let submit_label = if state.submitting {
             "Registering..."
@@ -1365,6 +1452,9 @@ impl State {
             Space::new().height(theme::space::XS),
             theme::label("Wallet name (optional)"),
             name_input,
+            Space::new().height(theme::space::XS),
+            theme::label("Device kind (optional)"),
+            kind_input,
             Space::new().height(theme::space::MD),
             submit_btn,
         ]

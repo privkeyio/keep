@@ -1186,24 +1186,42 @@ impl KeepMobile {
                 msg: format!("build multipath descriptor: {e}"),
             })?;
 
-        let (signer_hex, hmac_hex) = self.runtime.block_on(async {
+        let (signer_hex, hmac_hex, device_info) = self.runtime.block_on(async {
             let client = keep_nip46::Nip46Client::connect_to(&device_uri)
                 .await
                 .map_err(nip46_to_mobile_error)?;
             let signer_hex = hex::encode(client.signer_pubkey().to_bytes());
 
-            let outcome: Result<Option<String>, KeepMobileError> = async {
-                client.connect().await.map_err(nip46_to_mobile_error)?;
-                let response = client
-                    .register_wallet(&name, &multipath)
-                    .await
-                    .map_err(nip46_to_mobile_error)?;
-                Ok(response.hmac.as_deref().map(|h| hex::encode(h.as_slice())))
-            }
-            .await;
+            let outcome: Result<(Option<String>, Option<keep_nip46::DeviceInfo>), KeepMobileError> =
+                async {
+                    client.connect().await.map_err(nip46_to_mobile_error)?;
+                    // Best-effort: failure must not block registration.
+                    let device_info = match client.get_device_info().await {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            tracing::warn!("get_device_info failed (best-effort): {e}");
+                            None
+                        }
+                    };
+                    if let Some(ref info) = device_info {
+                        tracing::warn!(
+                            kind = info.kind.as_str(),
+                            "device metadata is self-reported by signer and not cryptographically verified",
+                        );
+                    }
+                    let response = client
+                        .register_wallet(&name, &multipath)
+                        .await
+                        .map_err(nip46_to_mobile_error)?;
+                    Ok((
+                        response.hmac.as_deref().map(|h| hex::encode(h.as_slice())),
+                        device_info,
+                    ))
+                }
+                .await;
 
             client.disconnect().await;
-            outcome.map(|hmac_hex| (signer_hex, hmac_hex))
+            outcome.map(|(hmac_hex, info)| (signer_hex, hmac_hex, info))
         })?;
 
         let now = std::time::SystemTime::now()
@@ -1226,6 +1244,14 @@ impl KeepMobile {
                 wallet_name: name,
                 hmac: hmac_hex,
                 registered_at: now,
+                device_kind: device_info.as_ref().map(|d| d.kind.as_str().to_string()),
+                fingerprint_hex: device_info
+                    .as_ref()
+                    .and_then(|d| d.fingerprint_bytes())
+                    .map(hex::encode),
+                firmware_version: device_info
+                    .as_ref()
+                    .and_then(|d| d.firmware_version.clone()),
             };
             if let Some(slot) = desc
                 .device_registrations
@@ -1702,11 +1728,54 @@ impl KeepMobile {
                     }
                     None => None,
                 };
+                let fingerprint = match reg.fingerprint_hex.as_deref() {
+                    Some(s) => {
+                        let bytes = decode_hex(s, "device_registration.fingerprint_hex")?;
+                        if bytes.len() != 4 {
+                            return Err(KeepMobileError::BackupError {
+                                msg: format!(
+                                    "device_registration.fingerprint_hex must decode to 4 bytes, got {}",
+                                    bytes.len()
+                                ),
+                            });
+                        }
+                        let mut arr = [0u8; 4];
+                        arr.copy_from_slice(&bytes);
+                        if arr == [0u8; 4] {
+                            return Err(KeepMobileError::BackupError {
+                                msg: "device_registration.fingerprint_hex 00000000 is reserved by BIP32 for 'no parent'".into(),
+                            });
+                        }
+                        Some(arr)
+                    }
+                    None => None,
+                };
+                if let Some(ref k) = reg.device_kind {
+                    keep_nip46::validate_metadata_field(
+                        "device_registration.device_kind",
+                        k,
+                        0,
+                        keep_nip46::MAX_DEVICE_KIND_LEN,
+                    )
+                    .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
+                }
+                if let Some(ref fw) = reg.firmware_version {
+                    keep_nip46::validate_metadata_field(
+                        "device_registration.firmware_version",
+                        fw,
+                        0,
+                        keep_nip46::MAX_FIRMWARE_VERSION_LEN,
+                    )
+                    .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?;
+                }
                 device_registrations.push(keep_core::DeviceRegistration {
                     signer_pubkey,
                     wallet_name: reg.wallet_name.clone(),
                     hmac,
                     registered_at: reg.registered_at,
+                    device_kind: reg.device_kind.clone(),
+                    fingerprint,
+                    firmware_version: reg.firmware_version.clone(),
                 });
             }
             let policy_hash = match d.policy_hash_hex.as_deref() {
@@ -1921,6 +1990,9 @@ impl KeepMobile {
                         wallet_name: r.wallet_name.clone(),
                         hmac: r.hmac.as_deref().map(hex::encode),
                         registered_at: r.registered_at,
+                        device_kind: r.device_kind.clone(),
+                        fingerprint_hex: r.fingerprint.map(hex::encode),
+                        firmware_version: r.firmware_version.clone(),
                     })
                     .collect(),
                 policy_hash_hex,

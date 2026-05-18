@@ -164,6 +164,9 @@ dictionary DeviceRegistrationInfo {
     string wallet_name;
     string? hmac;
     u64 registered_at;
+    string? device_kind;
+    string? fingerprint_hex;
+    string? firmware_version;
 };
 
 dictionary RecoveryTierConfig {
