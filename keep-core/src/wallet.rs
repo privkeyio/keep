@@ -273,6 +273,38 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_descriptor_roundtrip_preserves_device_registrations() {
+        let reg = DeviceRegistration {
+            signer_pubkey: [7u8; 32],
+            wallet_name: "primary".into(),
+            hmac: Some(Zeroizing::new(vec![0xaa; 32])),
+            registered_at: 1234,
+            device_kind: Some("Ledger".into()),
+            fingerprint: Some([0x01, 0x02, 0x03, 0x04]),
+            firmware_version: Some("2.1.0".into()),
+        };
+        let desc = WalletDescriptor {
+            group_pubkey: [9u8; 32],
+            external_descriptor: "tr(xpub.../0/*)".into(),
+            internal_descriptor: "tr(xpub.../1/*)".into(),
+            network: "bitcoin".into(),
+            created_at: 1700000000,
+            device_registrations: vec![reg],
+            policy_hash: [0u8; 32],
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let back: WalletDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.device_registrations.len(), 1);
+        let r = &back.device_registrations[0];
+        assert_eq!(r.signer_pubkey, [7u8; 32]);
+        assert_eq!(r.wallet_name, "primary");
+        assert_eq!(r.device_kind.as_deref(), Some("Ledger"));
+        assert_eq!(r.fingerprint, Some([0x01, 0x02, 0x03, 0x04]));
+        assert_eq!(r.firmware_version.as_deref(), Some("2.1.0"));
+        assert_eq!(r.hmac.as_deref().map(|h| h.to_vec()), Some(vec![0xaa; 32]));
+    }
+
+    #[test]
     fn test_empty_registrations_roundtrip_omits_field() {
         let desc = WalletDescriptor {
             group_pubkey: [0u8; 32],

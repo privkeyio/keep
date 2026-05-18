@@ -27,10 +27,17 @@ pub const MAX_DESCRIPTOR_LEN: usize = 4096;
 /// Size cap on the JSON result string returned by `get_device_info`.
 pub const MAX_DEVICE_INFO_JSON_LEN: usize = 2048;
 /// Size caps on individual fields of `DeviceInfo`.
-const MAX_DEVICE_KIND_LEN: usize = 32;
-const MAX_FIRMWARE_VERSION_LEN: usize = 64;
-const MAX_CAPABILITIES: usize = 32;
-const MAX_CAPABILITY_LEN: usize = 32;
+pub const MAX_DEVICE_KIND_LEN: usize = 32;
+pub const MAX_FIRMWARE_VERSION_LEN: usize = 64;
+pub const MAX_CAPABILITIES: usize = 32;
+pub const MAX_CAPABILITY_LEN: usize = 32;
+
+/// Reject signer-supplied strings that contain control characters. Strings are
+/// surfaced verbatim in CLI/UI output, so any C0/C1 control codes would corrupt
+/// the terminal or hide content. Accept all other printable Unicode.
+fn contains_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
+}
 
 /// Outcome of a successful `register_wallet` request.
 ///
@@ -83,6 +90,22 @@ impl DeviceKind {
             Self::Jade => "Jade",
             Self::Trezor => "Trezor",
             Self::Other(s) => s.as_str(),
+        }
+    }
+
+    /// Promote `Other("Coldcard")` etc. to the matching named variant so two
+    /// registrations of the same device do not appear distinct.
+    fn normalize(self) -> Self {
+        match self {
+            Self::Other(s) => match s.as_str() {
+                "Coldcard" => Self::Coldcard,
+                "Ledger" => Self::Ledger,
+                "BitBox02" => Self::BitBox02,
+                "Jade" => Self::Jade,
+                "Trezor" => Self::Trezor,
+                _ => Self::Other(s),
+            },
+            other => other,
         }
     }
 }
@@ -351,8 +374,9 @@ impl Nip46Client {
                 "get_device_info payload exceeds {MAX_DEVICE_INFO_JSON_LEN} bytes"
             )));
         }
-        let info: DeviceInfo = serde_json::from_str(&result)
+        let mut info: DeviceInfo = serde_json::from_str(&result)
             .map_err(|e| StorageError::invalid_format(format!("get_device_info payload: {e}")))?;
+        info.kind = info.kind.normalize();
 
         if let DeviceKind::Other(ref s) = info.kind {
             if s.is_empty() || s.len() > MAX_DEVICE_KIND_LEN {
@@ -360,12 +384,22 @@ impl Nip46Client {
                     "device kind 'Other' label must be 1..={MAX_DEVICE_KIND_LEN} bytes"
                 )));
             }
+            if contains_control_chars(s) {
+                return Err(KeepError::InvalidInput(
+                    "device kind 'Other' label contains control characters".into(),
+                ));
+            }
         }
         if let Some(ref fw) = info.firmware_version {
             if fw.len() > MAX_FIRMWARE_VERSION_LEN {
                 return Err(KeepError::InvalidInput(format!(
                     "firmware_version exceeds {MAX_FIRMWARE_VERSION_LEN} bytes"
                 )));
+            }
+            if contains_control_chars(fw) {
+                return Err(KeepError::InvalidInput(
+                    "firmware_version contains control characters".into(),
+                ));
             }
         }
         if info.fingerprint_bytes().is_none() {
@@ -383,6 +417,11 @@ impl Nip46Client {
                 return Err(KeepError::InvalidInput(format!(
                     "capability label must be 1..={MAX_CAPABILITY_LEN} bytes"
                 )));
+            }
+            if contains_control_chars(cap) {
+                return Err(KeepError::InvalidInput(
+                    "capability label contains control characters".into(),
+                ));
             }
         }
         Ok(info)
@@ -577,6 +616,30 @@ mod tests {
             capabilities: Vec::new(),
         };
         assert!(info.fingerprint_bytes().is_none());
+    }
+
+    #[test]
+    fn test_device_kind_normalize_promotes_other() {
+        assert_eq!(
+            DeviceKind::Other("Coldcard".into()).normalize(),
+            DeviceKind::Coldcard
+        );
+        assert_eq!(
+            DeviceKind::Other("Ledger".into()).normalize(),
+            DeviceKind::Ledger
+        );
+        assert_eq!(
+            DeviceKind::Other("Foundation".into()).normalize(),
+            DeviceKind::Other("Foundation".into())
+        );
+    }
+
+    #[test]
+    fn test_contains_control_chars_rejects_c0() {
+        assert!(contains_control_chars("hello\nworld"));
+        assert!(contains_control_chars("ansi\x1b[31mred"));
+        assert!(!contains_control_chars("ColdcardMk4"));
+        assert!(!contains_control_chars("1.2.3-beta"));
     }
 
     #[test]

@@ -398,9 +398,29 @@ impl App {
                     .unwrap_or_default()
                     .as_secs();
 
-                let device_kind = user_device_kind
-                    .clone()
-                    .or_else(|| device_info.as_ref().map(|d| d.kind.as_str().to_string()));
+                if let Some(ref info) = device_info {
+                    warn!(
+                        group = %group_hex,
+                        signer = %signer_hex,
+                        kind = info.kind.as_str(),
+                        "device metadata is self-reported by signer and not cryptographically verified",
+                    );
+                }
+                let device_kind = match (user_device_kind.as_deref(), device_info.as_ref()) {
+                    (Some(k), Some(d)) if k != d.kind.as_str() => {
+                        warn!(
+                            group = %group_hex,
+                            signer = %signer_hex,
+                            user_kind = %k,
+                            device_kind = d.kind.as_str(),
+                            "user-supplied device kind overrides device-reported value",
+                        );
+                        Some(k.to_string())
+                    }
+                    (Some(k), _) => Some(k.to_string()),
+                    (None, Some(d)) => Some(d.kind.as_str().to_string()),
+                    (None, None) => None,
+                };
                 let fingerprint = device_info.as_ref().and_then(|d| d.fingerprint_bytes());
                 let firmware_version = device_info
                     .as_ref()

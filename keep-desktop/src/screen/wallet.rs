@@ -505,7 +505,7 @@ impl State {
             }
             Message::RegisterDeviceKindChanged(v) => {
                 if let Some(r) = &mut self.register {
-                    r.device_kind = truncate_to_bytes(&v, 32);
+                    r.device_kind = truncate_to_bytes(&v, keep_nip46::MAX_DEVICE_KIND_LEN);
                 }
                 None
             }
@@ -1262,7 +1262,7 @@ impl State {
             if !entry.device_registrations.is_empty() {
                 details = details.push(Space::new().height(theme::space::SM));
                 details = details.push(
-                    text("Registered devices")
+                    text("Registered devices (self-reported, unverified)")
                         .size(theme::size::SMALL)
                         .color(theme::color::TEXT_MUTED),
                 );

@@ -1196,7 +1196,19 @@ impl KeepMobile {
                 async {
                     client.connect().await.map_err(nip46_to_mobile_error)?;
                     // Best-effort: failure must not block registration.
-                    let device_info = client.get_device_info().await.ok();
+                    let device_info = match client.get_device_info().await {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            tracing::warn!("get_device_info failed (best-effort): {e}");
+                            None
+                        }
+                    };
+                    if let Some(ref info) = device_info {
+                        tracing::warn!(
+                            kind = info.kind.as_str(),
+                            "device metadata is self-reported by signer and not cryptographically verified",
+                        );
+                    }
                     let response = client
                         .register_wallet(&name, &multipath)
                         .await
@@ -1233,10 +1245,7 @@ impl KeepMobile {
                 hmac: hmac_hex,
                 registered_at: now,
                 device_kind: device_info.as_ref().map(|d| d.kind.as_str().to_string()),
-                fingerprint_hex: device_info
-                    .as_ref()
-                    .and_then(|d| d.fingerprint_bytes())
-                    .map(hex::encode),
+                fingerprint_hex: device_info.as_ref().map(|d| d.fingerprint.clone()),
                 firmware_version: device_info
                     .as_ref()
                     .and_then(|d| d.firmware_version.clone()),
@@ -1730,6 +1739,26 @@ impl KeepMobile {
                     }
                     None => None,
                 };
+                if let Some(ref k) = reg.device_kind {
+                    if k.len() > keep_nip46::MAX_DEVICE_KIND_LEN
+                        || k.chars().any(|c| c.is_control())
+                    {
+                        return Err(KeepMobileError::BackupError {
+                            msg: "device_registration device_kind invalid (length or control chars)"
+                                .into(),
+                        });
+                    }
+                }
+                if let Some(ref fw) = reg.firmware_version {
+                    if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN
+                        || fw.chars().any(|c| c.is_control())
+                    {
+                        return Err(KeepMobileError::BackupError {
+                            msg: "device_registration firmware_version invalid (length or control chars)"
+                                .into(),
+                        });
+                    }
+                }
                 device_registrations.push(keep_core::DeviceRegistration {
                     signer_pubkey,
                     wallet_name: reg.wallet_name.clone(),

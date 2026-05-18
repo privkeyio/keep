@@ -338,12 +338,56 @@ pub fn cmd_wallet_register(
         .unwrap_or_default()
         .as_secs();
 
+    if let Some(k) = kind_arg {
+        if k.is_empty() || k.len() > keep_nip46::MAX_DEVICE_KIND_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "--kind must be 1..={} bytes",
+                keep_nip46::MAX_DEVICE_KIND_LEN
+            )));
+        }
+    }
+    if let Some(fw) = firmware_version_arg {
+        if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "--firmware-version exceeds {} bytes",
+                keep_nip46::MAX_FIRMWARE_VERSION_LEN
+            )));
+        }
+    }
+
     // CLI flags take precedence; fall back to the device-reported values.
-    let device_kind = kind_arg
-        .map(|s| s.to_string())
-        .or_else(|| device_info.as_ref().map(|d| d.kind.as_str().to_string()));
-    let fingerprint =
-        fingerprint_arg_bytes.or_else(|| device_info.as_ref().and_then(|d| d.fingerprint_bytes()));
+    // Warn loudly when the operator overrides what the device reported, so the
+    // mismatch is visible in audit output.
+    let device_kind = match (kind_arg, device_info.as_ref()) {
+        (Some(k), Some(d)) if k != d.kind.as_str() => {
+            out.warn(&format!(
+                "--kind '{}' overrides device-reported '{}'",
+                k,
+                d.kind.as_str()
+            ));
+            Some(k.to_string())
+        }
+        (Some(k), _) => Some(k.to_string()),
+        (None, Some(d)) => Some(d.kind.as_str().to_string()),
+        (None, None) => None,
+    };
+    let fingerprint = match (fingerprint_arg_bytes, device_info.as_ref()) {
+        (Some(fp), Some(d)) => {
+            if let Some(dfp) = d.fingerprint_bytes() {
+                if fp != dfp {
+                    out.warn(&format!(
+                        "--fingerprint {} overrides device-reported {}",
+                        hex::encode(fp),
+                        hex::encode(dfp),
+                    ));
+                }
+            }
+            Some(fp)
+        }
+        (Some(fp), None) => Some(fp),
+        (None, Some(d)) => d.fingerprint_bytes(),
+        (None, None) => None,
+    };
     let firmware_version = firmware_version_arg.map(|s| s.to_string()).or_else(|| {
         device_info
             .as_ref()
@@ -355,6 +399,9 @@ pub fn cmd_wallet_register(
     // local save errors below. Re-running register is idempotent.
     out.success("Device accepted the wallet registration");
     out.field("Signer pubkey", &signer_hex);
+    if device_info.is_some() {
+        out.info("Device metadata below is self-reported by the signer and not cryptographically verified.");
+    }
     if let Some(k) = device_kind.as_deref() {
         out.field("Device kind", k);
     }
@@ -480,13 +527,13 @@ fn truncate_relay_for_log(relay: &str) -> String {
 }
 
 fn parse_fingerprint_hex(s: &str) -> Result<[u8; 4]> {
-    let trimmed = s.trim().trim_start_matches("0x");
+    let trimmed = s.trim().trim_start_matches("0x").to_ascii_lowercase();
     if trimmed.len() != 8 {
         return Err(KeepError::InvalidInput(
             "fingerprint must be 8 hex characters (4 bytes)".into(),
         ));
     }
-    let bytes = hex::decode(trimmed)
+    let bytes = hex::decode(&trimmed)
         .map_err(|e| KeepError::InvalidInput(format!("invalid fingerprint hex: {e}")))?;
     bytes
         .try_into()
