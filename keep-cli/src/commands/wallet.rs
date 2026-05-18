@@ -233,10 +233,39 @@ pub fn cmd_wallet_register(
 ) -> Result<()> {
     debug!(group, device = %mask_secret(device_uri), "wallet register");
 
+    // Validate ALL host-supplied flags up front, before any signer RPC or
+    // local mutation. A bad flag combined with a successful device-side
+    // register_wallet would leave the host and signer out of sync.
     let fingerprint_arg_bytes = match fingerprint_arg {
         Some(s) => Some(parse_fingerprint_hex(s)?),
         None => None,
     };
+    if let Some(k) = kind_arg {
+        if k.is_empty() || k.len() > keep_nip46::MAX_DEVICE_KIND_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "--kind must be 1..={} bytes",
+                keep_nip46::MAX_DEVICE_KIND_LEN
+            )));
+        }
+        if keep_nip46::contains_control_chars(k) {
+            return Err(KeepError::InvalidInput(
+                "--kind must not contain control characters".to_string(),
+            ));
+        }
+    }
+    if let Some(fw) = firmware_version_arg {
+        if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN {
+            return Err(KeepError::InvalidInput(format!(
+                "--firmware-version exceeds {} bytes",
+                keep_nip46::MAX_FIRMWARE_VERSION_LEN
+            )));
+        }
+        if keep_nip46::contains_control_chars(fw) {
+            return Err(KeepError::InvalidInput(
+                "--firmware-version must not contain control characters".to_string(),
+            ));
+        }
+    }
 
     let group_pubkey = parse_group_id(group)?;
 
@@ -338,36 +367,10 @@ pub fn cmd_wallet_register(
         .unwrap_or_default()
         .as_secs();
 
-    if let Some(k) = kind_arg {
-        if k.is_empty() || k.len() > keep_nip46::MAX_DEVICE_KIND_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "--kind must be 1..={} bytes",
-                keep_nip46::MAX_DEVICE_KIND_LEN
-            )));
-        }
-        if k.chars().any(|c| c.is_control()) {
-            return Err(KeepError::InvalidInput(
-                "--kind must not contain control characters".to_string(),
-            ));
-        }
-    }
-    if let Some(fw) = firmware_version_arg {
-        if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "--firmware-version exceeds {} bytes",
-                keep_nip46::MAX_FIRMWARE_VERSION_LEN
-            )));
-        }
-        if fw.chars().any(|c| c.is_control()) {
-            return Err(KeepError::InvalidInput(
-                "--firmware-version must not contain control characters".to_string(),
-            ));
-        }
-    }
-
     // CLI flags take precedence; fall back to the device-reported values.
     // Warn loudly when the operator overrides what the device reported, so the
-    // mismatch is visible in audit output.
+    // mismatch is visible both interactively (out.warn) and in audit logs
+    // (tracing::warn). Flag validation already happened up front.
     let device_kind = match (kind_arg, device_info.as_ref()) {
         (Some(k), Some(d)) if k != d.kind.as_str() => {
             out.warn(&format!(
@@ -375,6 +378,12 @@ pub fn cmd_wallet_register(
                 k,
                 d.kind.as_str()
             ));
+            tracing::warn!(
+                signer = %signer_hex,
+                user_kind = %k,
+                device_kind = d.kind.as_str(),
+                "--kind flag overrides device-reported kind",
+            );
             Some(k.to_string())
         }
         (Some(k), _) => Some(k.to_string()),
@@ -390,6 +399,12 @@ pub fn cmd_wallet_register(
                         hex::encode(fp),
                         hex::encode(dfp),
                     ));
+                    tracing::warn!(
+                        signer = %signer_hex,
+                        user_fingerprint = %hex::encode(fp),
+                        device_fingerprint = %hex::encode(dfp),
+                        "--fingerprint flag overrides device-reported fingerprint",
+                    );
                 }
             }
             Some(fp)
@@ -398,11 +413,27 @@ pub fn cmd_wallet_register(
         (None, Some(d)) => d.fingerprint_bytes(),
         (None, None) => None,
     };
-    let firmware_version = firmware_version_arg.map(|s| s.to_string()).or_else(|| {
-        device_info
-            .as_ref()
-            .and_then(|d| d.firmware_version.clone())
-    });
+    let firmware_version = match (firmware_version_arg, device_info.as_ref()) {
+        (Some(fw), Some(d)) => {
+            if let Some(dfw) = d.firmware_version.as_deref() {
+                if fw != dfw {
+                    out.warn(&format!(
+                        "--firmware-version '{fw}' overrides device-reported '{dfw}'"
+                    ));
+                    tracing::warn!(
+                        signer = %signer_hex,
+                        user_firmware = %fw,
+                        device_firmware = %dfw,
+                        "--firmware-version flag overrides device-reported firmware",
+                    );
+                }
+            }
+            Some(fw.to_string())
+        }
+        (Some(fw), None) => Some(fw.to_string()),
+        (None, Some(d)) => d.firmware_version.clone(),
+        (None, None) => None,
+    };
 
     // Surface the device-side outcome before attempting local persistence so an
     // operator knows registration already took effect on the signer if the
