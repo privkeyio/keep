@@ -270,10 +270,9 @@ impl std::fmt::Debug for Message {
                 .field(&hex::encode(id))
                 .finish(),
             Self::ApproveBunkerUriChanged(_) => write!(f, "ApproveBunkerUriChanged(<redacted>)"),
-            Self::ApproveFingerprintChanged(v) => f
-                .debug_tuple("ApproveFingerprintChanged")
-                .field(v)
-                .finish(),
+            Self::ApproveFingerprintChanged(v) => {
+                f.debug_tuple("ApproveFingerprintChanged").field(v).finish()
+            }
             Self::CancelApprovePsbt => write!(f, "CancelApprovePsbt"),
             Self::SubmitApprovePsbt => write!(f, "SubmitApprovePsbt"),
             Self::StartSpend(i) => f.debug_tuple("StartSpend").field(i).finish(),
@@ -322,7 +321,12 @@ pub enum Event {
     ApprovePsbt {
         session_id: [u8; 32],
         fingerprint: String,
-        bunker_uri: String,
+        bunker_uri: zeroize::Zeroizing<String>,
+        /// PSBT hash captured at the moment the operator opened the approve
+        /// pane (i.e. while reviewing the snapshot). If the in-flight
+        /// proposal PSBT no longer hashes to this value at sign time, the
+        /// approval must abort.
+        psbt_hash: [u8; 32],
     },
     StartSpend {
         wallet_idx: usize,
@@ -367,7 +371,7 @@ pub struct State {
     pub peer_xpubs: HashMap<u16, Vec<AnnouncedXpub>>,
     pub pending_psbt_signatures: Vec<PsbtPendingDisplay>,
     pub spend: Option<Box<SpendState>>,
-    pub approve: Option<ApprovePsbtState>,
+    pub approve: Option<Box<ApprovePsbtState>>,
 }
 
 /// Modal state for approving an incoming PSBT signature request. Only shown
@@ -375,10 +379,17 @@ pub struct State {
 /// card's snapshot decoded successfully (so destinations are visible).
 pub struct ApprovePsbtState {
     pub session_id: [u8; 32],
-    pub bunker_uri: String,
+    /// Bunker URI buffer. Wrapped in `Zeroizing` because operators may paste
+    /// URIs that embed a single-use connect secret; we don't want stale
+    /// copies left in the UI heap after the pane closes.
+    pub bunker_uri: zeroize::Zeroizing<String>,
     pub fingerprint: String,
     pub error: Option<String>,
     pub submitting: bool,
+    /// PSBT hash captured from the snapshot at the moment the operator
+    /// opened this approval pane. Sent through to the signer task so it can
+    /// re-verify the proposal PSBT hasn't been swapped mid-review.
+    pub snapshot_psbt_hash: [u8; 32],
 }
 
 pub struct SetupState {
@@ -515,23 +526,27 @@ impl State {
                     .iter()
                     .find(|e| e.session_id == session_id)
                     .cloned();
-                match entry {
-                    Some(entry) if entry.snapshot.is_some() => {
-                        self.approve = Some(ApprovePsbtState {
+                if let Some(entry) = entry {
+                    if let Some(snap) = entry.snapshot.as_ref() {
+                        // Only open the approve pane when the snapshot
+                        // decoded fully (caller already gates the button
+                        // on this, but defense in depth).
+                        self.approve = Some(Box::new(ApprovePsbtState {
                             session_id,
-                            bunker_uri: String::new(),
+                            bunker_uri: zeroize::Zeroizing::new(String::new()),
                             fingerprint: String::new(),
                             error: None,
                             submitting: false,
-                        });
+                            snapshot_psbt_hash: snap.psbt_hash,
+                        }));
                     }
-                    _ => {}
                 }
                 None
             }
             Message::ApproveBunkerUriChanged(v) => {
                 if let Some(a) = &mut self.approve {
-                    a.bunker_uri = v.chars().take(MAX_DEVICE_URI_LEN).collect();
+                    a.bunker_uri =
+                        zeroize::Zeroizing::new(v.chars().take(MAX_DEVICE_URI_LEN).collect());
                 }
                 None
             }
@@ -553,7 +568,7 @@ impl State {
                 let Some(a) = &mut self.approve else {
                     return None;
                 };
-                let uri = a.bunker_uri.trim().to_string();
+                let uri = zeroize::Zeroizing::new(a.bunker_uri.trim().to_string());
                 let fp = a.fingerprint.trim().to_ascii_lowercase();
                 if !uri.starts_with("bunker://") {
                     a.error = Some("Bunker URI must start with bunker://".into());
@@ -565,10 +580,12 @@ impl State {
                 }
                 a.error = None;
                 a.submitting = true;
+                let snapshot_psbt_hash = a.snapshot_psbt_hash;
                 Some(Event::ApprovePsbt {
                     session_id: a.session_id,
                     fingerprint: fp,
                     bunker_uri: uri,
+                    psbt_hash: snapshot_psbt_hash,
                 })
             }
             Message::StartRegister(i) => {
@@ -1842,16 +1859,27 @@ impl State {
                         .size(theme::size::TINY)
                         .color(theme::color::TEXT_MUTED)]
                     .spacing(theme::space::XS);
+                    // Show every output's FULL address (or fail-closed marker
+                    // for un-decodable scripts). Left-truncation here is a
+                    // homograph footgun — the prefix of a benign-looking
+                    // address can be identical to a malicious one.
+                    let mut all_outputs_decoded = !snap.outputs.is_empty();
                     for (addr, sats) in &snap.outputs {
-                        let addr_short = addr.get(..40).unwrap_or(addr.as_str());
+                        if addr.starts_with("script:") {
+                            all_outputs_decoded = false;
+                        }
                         outputs_col = outputs_col.push(
-                            text(format!("  {addr_short}  →  {sats} sats"))
+                            text(format!("  {addr}  ->  {sats} sats"))
                                 .size(theme::size::TINY)
                                 .color(theme::color::TEXT_DIM),
                         );
                     }
 
-                    let preview_decoded = !snap.outputs.is_empty();
+                    // Gate the Approve button on snapshot presence AND every
+                    // output decoding to an address. A `script:` fallback
+                    // means the operator can't actually verify the
+                    // destination, so we must not offer a one-click sign.
+                    let preview_decoded = all_outputs_decoded;
                     let approve_btn: Element<'_, Message> = if preview_decoded
                         && self.approve.as_ref().map(|a| a.session_id) != Some(entry.session_id)
                     {
@@ -1864,11 +1892,14 @@ impl State {
                         text("").into()
                     };
 
-                    let approve_pane: Element<'_, Message> =
-                        match self.approve.as_ref().filter(|a| a.session_id == entry.session_id) {
-                            Some(a) => self.view_approve_pane(a),
-                            None => text("").into(),
-                        };
+                    let approve_pane: Element<'_, Message> = match self
+                        .approve
+                        .as_ref()
+                        .filter(|a| a.session_id == entry.session_id)
+                    {
+                        Some(a) => self.view_approve_pane(a),
+                        None => text("").into(),
+                    };
 
                     container(
                         column![
