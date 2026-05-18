@@ -1730,10 +1730,13 @@ impl KeepMobile {
                 };
                 let fingerprint = match reg.fingerprint_hex.as_deref() {
                     Some(s) => {
-                        let bytes = decode_hex(s, "device_registration fingerprint")?;
+                        let bytes = decode_hex(s, "device_registration.fingerprint_hex")?;
                         if bytes.len() != 4 {
                             return Err(KeepMobileError::BackupError {
-                                msg: "device_registration fingerprint must be 4 bytes".into(),
+                                msg: format!(
+                                    "device_registration.fingerprint_hex must decode to 4 bytes, got {}",
+                                    bytes.len()
+                                ),
                             });
                         }
                         let mut arr = [0u8; 4];
@@ -1744,7 +1747,7 @@ impl KeepMobile {
                 };
                 if let Some(ref k) = reg.device_kind {
                     if k.len() > keep_nip46::MAX_DEVICE_KIND_LEN
-                        || k.chars().any(|c| c.is_control())
+                        || keep_nip46::contains_control_chars(k)
                     {
                         return Err(KeepMobileError::BackupError {
                             msg:
@@ -1755,7 +1758,7 @@ impl KeepMobile {
                 }
                 if let Some(ref fw) = reg.firmware_version {
                     if fw.len() > keep_nip46::MAX_FIRMWARE_VERSION_LEN
-                        || fw.chars().any(|c| c.is_control())
+                        || keep_nip46::contains_control_chars(fw)
                     {
                         return Err(KeepMobileError::BackupError {
                             msg: "device_registration firmware_version invalid (length or control chars)"
