@@ -200,10 +200,20 @@ pub fn cmd_frost_network_serve(
                             let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
                                 match guard.get_wallet_descriptor(&group_pubkey) {
                                     Ok(Some(prev)) => Some(prev.canonical_hash()),
-                                    Ok(None) => None,
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            version,
+                                            "refusing to persist migrated descriptor: no predecessor descriptor found"
+                                        );
+                                        return;
+                                    }
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "could not load predecessor descriptor for lineage");
-                                        None
+                                        tracing::error!(
+                                            error = %e,
+                                            version,
+                                            "refusing to persist migrated descriptor: failed to load predecessor"
+                                        );
+                                        return;
                                     }
                                 }
                             } else {
