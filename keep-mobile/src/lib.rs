@@ -1245,7 +1245,10 @@ impl KeepMobile {
                 hmac: hmac_hex,
                 registered_at: now,
                 device_kind: device_info.as_ref().map(|d| d.kind.as_str().to_string()),
-                fingerprint_hex: device_info.as_ref().map(|d| d.fingerprint.clone()),
+                fingerprint_hex: device_info
+                    .as_ref()
+                    .and_then(|d| d.fingerprint_bytes())
+                    .map(hex::encode),
                 firmware_version: device_info
                     .as_ref()
                     .and_then(|d| d.firmware_version.clone()),

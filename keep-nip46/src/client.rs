@@ -29,8 +29,8 @@ pub const MAX_DEVICE_INFO_JSON_LEN: usize = 2048;
 /// Size caps on individual fields of `DeviceInfo`.
 pub const MAX_DEVICE_KIND_LEN: usize = 32;
 pub const MAX_FIRMWARE_VERSION_LEN: usize = 64;
-pub const MAX_CAPABILITIES: usize = 32;
-pub const MAX_CAPABILITY_LEN: usize = 32;
+const MAX_CAPABILITIES: usize = 32;
+const MAX_CAPABILITY_LEN: usize = 32;
 
 /// Reject signer-supplied strings that contain control characters. Strings are
 /// surfaced verbatim in CLI/UI output, so any C0/C1 control codes would corrupt
@@ -132,11 +132,10 @@ impl DeviceInfo {
     /// Decode the hex fingerprint into 4 bytes, if well-formed.
     pub fn fingerprint_bytes(&self) -> Option<[u8; 4]> {
         let s = self.fingerprint.trim();
-        if s.len() != 8 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        if s.len() != 8 {
             return None;
         }
-        let bytes = hex::decode(s).ok()?;
-        bytes.try_into().ok()
+        hex::decode(s).ok()?.try_into().ok()
     }
 }
 

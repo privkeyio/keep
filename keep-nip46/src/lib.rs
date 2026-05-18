@@ -21,9 +21,8 @@ pub use bunker::{
     generate_bunker_url, parse_bunker_url, parse_nostrconnect_uri, NostrConnectRequest,
 };
 pub use client::{
-    DeviceInfo, DeviceKind, Nip46Client, RegisterWalletResponse, MAX_CAPABILITIES,
-    MAX_CAPABILITY_LEN, MAX_DESCRIPTOR_LEN, MAX_DEVICE_INFO_JSON_LEN, MAX_DEVICE_KIND_LEN,
-    MAX_FIRMWARE_VERSION_LEN, MAX_WALLET_NAME_LEN,
+    DeviceInfo, DeviceKind, Nip46Client, RegisterWalletResponse, MAX_DESCRIPTOR_LEN,
+    MAX_DEVICE_INFO_JSON_LEN, MAX_DEVICE_KIND_LEN, MAX_FIRMWARE_VERSION_LEN, MAX_WALLET_NAME_LEN,
 };
 pub use error::Result;
 pub use frost_signer::{FrostSigner, NetworkFrostSigner};
