@@ -235,17 +235,13 @@ impl KfpNode {
                             "Descriptor migrate references a session that has not finalized".into(),
                         )
                     })?;
-                    let mut hasher = Sha256::new();
-                    hasher.update((finalized.external.len() as u64).to_le_bytes());
-                    hasher.update(finalized.external.as_bytes());
-                    hasher.update((finalized.internal.len() as u64).to_le_bytes());
-                    hasher.update(finalized.internal.as_bytes());
-                    hasher.update(finalized.policy_hash);
-                    keep_core::wallet::fold_descriptor_version_suffix(
-                        &mut hasher,
+                    let expected = keep_core::wallet::canonical_descriptor_hash(
+                        &finalized.external,
+                        &finalized.internal,
+                        &finalized.policy_hash,
                         session.policy().version,
-                    );
-                    let expected: [u8; 32] = hasher.finalize().into();
+                    )
+                    .map_err(|e| FrostNetError::Session(e.to_string()))?;
                     if expected != payload.new_descriptor_hash {
                         return Err(FrostNetError::Session(
                             "Descriptor migrate new_descriptor_hash does not match session".into(),
@@ -953,19 +949,16 @@ impl KfpNode {
             "Received finalized descriptor"
         );
 
-        let descriptor_hash: [u8; 32] = {
-            let mut hasher = Sha256::new();
-            hasher.update((payload.external_descriptor.len() as u64).to_le_bytes());
-            hasher.update(payload.external_descriptor.as_bytes());
-            hasher.update((payload.internal_descriptor.len() as u64).to_le_bytes());
-            hasher.update(payload.internal_descriptor.as_bytes());
-            hasher.update(payload.policy_hash);
-            // We captured `session_policy_version` under the earlier session
-            // read so an eviction between reads cannot silently regress to
-            // the v1 formula and produce a mismatch.
-            keep_core::wallet::fold_descriptor_version_suffix(&mut hasher, session_policy_version);
-            hasher.finalize().into()
-        };
+        // We captured `session_policy_version` under the earlier session read
+        // so an eviction between reads cannot silently regress to the v1
+        // formula and produce a mismatch.
+        let descriptor_hash = keep_core::wallet::canonical_descriptor_hash(
+            &payload.external_descriptor,
+            &payload.internal_descriptor,
+            &payload.policy_hash,
+            session_policy_version,
+        )
+        .map_err(|e| FrostNetError::Session(e.to_string()))?;
 
         let key_proof_psbt_bytes = match self.build_key_proof(
             &payload.session_id,

@@ -2901,43 +2901,99 @@ impl KeepMobile {
             .as_secs();
 
         // For v2+ completions, look up the currently-persisted descriptor for
-        // this group (if any) and record its canonical hash as the predecessor
-        // so lineage is preserved at the moment of persistence. For v1
-        // (initial descriptor) there is no lineage by definition.
+        // this group and record its canonical hash as the predecessor so
+        // lineage is preserved at the moment of persistence. For v1 (initial
+        // descriptor) there is no lineage by definition. Mirror the CLI's
+        // immediate-predecessor check: refuse to persist a migration whose
+        // predecessor is missing, malformed, or not at `version - 1`.
         let previous_descriptor_hash_hex = if version
             > keep_core::wallet::INITIAL_DESCRIPTOR_VERSION
         {
-            match persistence::load_descriptor(storage, &group_pubkey) {
-                Ok(prev) => {
-                    use sha2::{Digest, Sha256};
-                    let prev_policy_hash = match prev.policy_hash_hex.as_deref() {
-                        Some(h) => match hex::decode(h)
-                            .ok()
-                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                        {
-                            Some(arr) => arr,
-                            None => {
-                                tracing::warn!(
-                                    "Predecessor descriptor has invalid policy_hash_hex; skipping lineage"
-                                );
-                                [0u8; 32]
-                            }
-                        },
-                        None => [0u8; 32],
-                    };
-                    let mut h = Sha256::new();
-                    h.update((prev.external_descriptor.len() as u64).to_le_bytes());
-                    h.update(prev.external_descriptor.as_bytes());
-                    h.update((prev.internal_descriptor.len() as u64).to_le_bytes());
-                    h.update(prev.internal_descriptor.as_bytes());
-                    h.update(prev_policy_hash);
-                    keep_core::wallet::fold_descriptor_version_suffix(&mut h, prev.version);
-                    let hash: [u8; 32] = h.finalize().into();
-                    Some(hex::encode(hash))
-                }
+            let prev = match persistence::load_descriptor(storage, &group_pubkey) {
+                Ok(prev) => prev,
                 Err(e) => {
-                    tracing::warn!("No predecessor descriptor found for migration: {e}");
-                    None
+                    tracing::error!(
+                        version,
+                        error = %e,
+                        "refusing to persist migrated descriptor: no predecessor descriptor found"
+                    );
+                    if let Some(cb) = cbs.read().await.as_ref() {
+                        let _ = cb.on_failed(
+                            hex::encode(session_id),
+                            format!("Missing predecessor descriptor for v{version}: {e}"),
+                        );
+                    }
+                    return;
+                }
+            };
+            if prev.version != version - 1 {
+                tracing::error!(
+                    version,
+                    predecessor_version = prev.version,
+                    "refusing to persist migrated descriptor: predecessor is not the immediate predecessor"
+                );
+                if let Some(cb) = cbs.read().await.as_ref() {
+                    let _ = cb.on_failed(
+                        hex::encode(session_id),
+                        format!(
+                            "Predecessor descriptor v{} is not the immediate predecessor of v{}",
+                            prev.version, version
+                        ),
+                    );
+                }
+                return;
+            }
+            let prev_policy_hash = match prev.policy_hash_hex.as_deref() {
+                Some(h) => match hex::decode(h)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    Some(arr) => arr,
+                    None => {
+                        tracing::error!(
+                            "refusing to persist migrated descriptor: predecessor policy_hash_hex is malformed"
+                        );
+                        if let Some(cb) = cbs.read().await.as_ref() {
+                            let _ = cb.on_failed(
+                                hex::encode(session_id),
+                                "Predecessor descriptor has malformed policy_hash_hex".into(),
+                            );
+                        }
+                        return;
+                    }
+                },
+                None => {
+                    tracing::error!(
+                        "refusing to persist migrated descriptor: predecessor policy_hash_hex is missing"
+                    );
+                    if let Some(cb) = cbs.read().await.as_ref() {
+                        let _ = cb.on_failed(
+                            hex::encode(session_id),
+                            "Predecessor descriptor has no policy_hash_hex".into(),
+                        );
+                    }
+                    return;
+                }
+            };
+            match keep_core::wallet::canonical_descriptor_hash(
+                &prev.external_descriptor,
+                &prev.internal_descriptor,
+                &prev_policy_hash,
+                prev.version,
+            ) {
+                Ok(hash) => Some(hex::encode(hash)),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "refusing to persist migrated descriptor: predecessor hash computation failed"
+                    );
+                    if let Some(cb) = cbs.read().await.as_ref() {
+                        let _ = cb.on_failed(
+                            hex::encode(session_id),
+                            format!("Predecessor hash computation failed: {e}"),
+                        );
+                    }
+                    return;
                 }
             }
         } else {

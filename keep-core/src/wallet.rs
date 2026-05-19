@@ -190,6 +190,56 @@ pub fn fold_descriptor_version_suffix(hasher: &mut sha2::Sha256, version: u32) {
     }
 }
 
+/// Compute the canonical descriptor hash from its constituent parts.
+/// Centralizing this avoids drift between sites that recompute the hash
+/// (initiator, ack verifier, migrate verifier, persisted descriptor, mobile
+/// completion handler). Must match [`WalletDescriptor::canonical_hash`] and the
+/// on-wire `descriptor_hash` used by the FROST PSBT coordination protocol.
+///
+/// Returns an error if `version == 0`, which is invalid by construction
+/// (descriptor versions start at 1 and increment monotonically). A
+/// zero-version hash cannot match any other code path's computation since the
+/// v2+ fold and v1 omission diverge, so producing one would silently corrupt
+/// lineage.
+pub fn canonical_descriptor_hash(
+    external_descriptor: &str,
+    internal_descriptor: &str,
+    policy_hash: &[u8; 32],
+    version: u32,
+) -> std::result::Result<[u8; 32], CanonicalHashError> {
+    use sha2::{Digest, Sha256};
+    if version == 0 {
+        return Err(CanonicalHashError::ZeroVersion);
+    }
+    let mut h = Sha256::new();
+    h.update((external_descriptor.len() as u64).to_le_bytes());
+    h.update(external_descriptor.as_bytes());
+    h.update((internal_descriptor.len() as u64).to_le_bytes());
+    h.update(internal_descriptor.as_bytes());
+    h.update(policy_hash);
+    fold_descriptor_version_suffix(&mut h, version);
+    Ok(h.finalize().into())
+}
+
+/// Error produced when [`canonical_descriptor_hash`] is given invalid inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalHashError {
+    /// `version == 0` was supplied (versions start at 1).
+    ZeroVersion,
+}
+
+impl std::fmt::Display for CanonicalHashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CanonicalHashError::ZeroVersion => f.write_str(
+                "canonical descriptor hash requested for version 0 (versions start at 1)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalHashError {}
+
 impl WalletDescriptor {
     /// Return the registration record for a signer pubkey, if any.
     pub fn device_registration(&self, signer_pubkey: &[u8; 32]) -> Option<&DeviceRegistration> {
@@ -225,25 +275,25 @@ impl WalletDescriptor {
     /// Must match the on-wire `descriptor_hash` used by the FROST PSBT
     /// coordination protocol.
     pub fn canonical_hash(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        // Version 0 is invalid by construction: descriptor versions start at 1
-        // (INITIAL_DESCRIPTOR_VERSION) and increment monotonically. Hashing a
-        // zero-version descriptor would produce a value that no other code
-        // path can match (since v1 omits the version suffix and v2+ folds it
-        // in) and silently propagating it would corrupt lineage. Panic here
-        // rather than emit a meaningless hash.
-        assert!(
-            self.version > 0,
-            "WalletDescriptor::canonical_hash called with version == 0 (versions start at 1)"
-        );
-        let mut h = Sha256::new();
-        h.update((self.external_descriptor.len() as u64).to_le_bytes());
-        h.update(self.external_descriptor.as_bytes());
-        h.update((self.internal_descriptor.len() as u64).to_le_bytes());
-        h.update(self.internal_descriptor.as_bytes());
-        h.update(self.policy_hash);
-        fold_descriptor_version_suffix(&mut h, self.version);
-        h.finalize().into()
+        // `WalletDescriptor::version` is enforced non-zero by
+        // `deserialize_nonzero_version` and by every in-process constructor, so
+        // this unwrap is unreachable. `try_canonical_hash` is the fallible
+        // entry point for callers that handle raw byte buffers directly.
+        self.try_canonical_hash()
+            .expect("WalletDescriptor::canonical_hash: version invariant (>= 1) violated")
+    }
+
+    /// Fallible variant of [`canonical_hash`] that returns an error rather
+    /// than panicking when `version == 0`. Prefer this in code paths that
+    /// hash freshly-deserialized inputs without re-validating the version
+    /// invariant.
+    pub fn try_canonical_hash(&self) -> std::result::Result<[u8; 32], CanonicalHashError> {
+        canonical_descriptor_hash(
+            &self.external_descriptor,
+            &self.internal_descriptor,
+            &self.policy_hash,
+            self.version,
+        )
     }
 }
 
