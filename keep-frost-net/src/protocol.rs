@@ -1132,9 +1132,28 @@ pub struct WalletPolicy {
     /// Monotonic version of the descriptor this policy is associated with.
     /// Defaults to `1` so existing on-wire payloads and stored sessions
     /// continue to deserialize unchanged. The value is folded into the policy
-    /// hash only when `> 1`, preserving v1 canonical hashes.
-    #[serde(default = "default_policy_version")]
+    /// hash only when `> 1`, preserving v1 canonical hashes. A value of `0`
+    /// is rejected at deserialize time so the canonical hash domain (which
+    /// only differs for v>=2) can never alias.
+    #[serde(
+        default = "default_policy_version",
+        deserialize_with = "deserialize_nonzero_policy_version"
+    )]
     pub version: u32,
+}
+
+fn deserialize_nonzero_policy_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = u32::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(serde::de::Error::custom(
+            "WalletPolicy.version must be >= 1",
+        ));
+    }
+    Ok(v)
 }
 
 /// Default value for [`WalletPolicy::version`] used when deserializing legacy

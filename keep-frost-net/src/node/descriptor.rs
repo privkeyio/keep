@@ -207,7 +207,11 @@ impl KfpNode {
                     // Bind sender to the session initiator: only the proposer
                     // who drove the session to completion may announce its
                     // migrate link. Without this any authorized proposer could
-                    // hijack the announcement.
+                    // hijack the announcement. Both `sender` and the stored
+                    // initiator are `nostr_sdk::PublicKey` (x-only schnorr,
+                    // 32 bytes) sourced from event signers, so equality is on
+                    // the same key form by construction; no projection or
+                    // re-derivation is involved.
                     match session.initiator() {
                         Some(init) if init == &sender => {}
                         Some(_) => {
@@ -270,7 +274,15 @@ impl KfpNode {
 
         // Bind `old_descriptor_hash` to a descriptor we already hold for
         // this group. Without this, the link could supersede any record.
-        if let Some(lookup) = self.descriptor_lookup.as_ref() {
+        // `descriptor_lookup` is also mandatory to enforce the monotonic
+        // version invariant below; refusing to handle the message when it is
+        // unconfigured avoids a silent bypass of those checks.
+        let Some(lookup) = self.descriptor_lookup.as_ref() else {
+            return Err(FrostNetError::Session(
+                "Descriptor migrate cannot be processed without a configured descriptor lookup; refusing to bypass version/binding checks".into(),
+            ));
+        };
+        {
             if !lookup.find_by_hash(&payload.group_pubkey, &payload.old_descriptor_hash) {
                 return Err(FrostNetError::Session(
                     "Descriptor migrate old_descriptor_hash does not match any local descriptor"
@@ -299,6 +311,18 @@ impl KfpNode {
                             payload.new_version
                         )));
                     }
+                    // Cap to the immediate next version: a migrate that
+                    // skips intermediate versions would deny-of-future-
+                    // migrations by jumping the counter forward. Receivers
+                    // must process migrations one step at a time so the
+                    // `previous_descriptor_hash` chain stays contiguous.
+                    let max_allowed = current.saturating_add(1);
+                    if payload.new_version > max_allowed {
+                        return Err(FrostNetError::Session(format!(
+                            "Descriptor migrate new_version {} exceeds current+1 ({})",
+                            payload.new_version, max_allowed
+                        )));
+                    }
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -310,10 +334,20 @@ impl KfpNode {
         }
 
         // Record only after binding checks succeeded so a forged tuple
-        // cannot suppress a legitimate future message.
+        // cannot suppress a legitimate future message. Use a single write
+        // guard for the check-then-insert: dropping the read lock before
+        // acquiring the write lock would let two concurrent handlers both
+        // pass the earlier `contains_key` probe and both proceed.
         {
             let mut seen = self.seen_descriptor_migrates.write();
             let key = (payload.session_id, payload.new_descriptor_hash);
+            if seen.contains_key(&key) {
+                debug!(
+                    session_id = %hex::encode(payload.session_id),
+                    "Dropping duplicate descriptor migrate link (race on insert)"
+                );
+                return Ok(());
+            }
             seen.insert(key, payload.created_at);
             const MAX_SEEN_DESCRIPTOR_MIGRATES: usize = 10_000;
             if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
@@ -322,9 +356,19 @@ impl KfpNode {
                     .replay_window_secs
                     .saturating_add(super::MAX_FUTURE_SKEW_SECS);
                 seen.retain(|_, ts| now.saturating_sub(window) <= *ts);
+                // If pruning by replay window still leaves the map oversized,
+                // evict the oldest entries (by created_at) rather than
+                // clearing the whole set: a `clear()` would discard every
+                // previously-seen tuple and re-enable replays of links that
+                // were already observed within the replay window.
                 if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
-                    seen.clear();
-                    seen.insert(key, payload.created_at);
+                    let evict = seen.len() - MAX_SEEN_DESCRIPTOR_MIGRATES;
+                    let mut by_ts: Vec<(([u8; 32], [u8; 32]), u64)> =
+                        seen.iter().map(|(k, v)| (*k, *v)).collect();
+                    by_ts.sort_unstable_by_key(|(_, ts)| *ts);
+                    for (k, _) in by_ts.into_iter().take(evict) {
+                        seen.remove(&k);
+                    }
                 }
             }
         }
