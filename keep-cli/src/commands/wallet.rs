@@ -1625,7 +1625,7 @@ async fn approve_psbt_session(
     bunker_uri: zeroize::Zeroizing<String>,
     expected_psbt_hash: Option<[u8; 32]>,
 ) -> Result<()> {
-    let (initiator_pubkey, _descriptor_hash, tier_index) =
+    let (initiator_pubkey, session_descriptor_hash, tier_index) =
         node.psbt_session_routing(&session_id)
             .ok_or_else(|| KeepError::Frost("unknown PSBT session id".into()))?;
     let psbt_bytes = node
@@ -1648,6 +1648,11 @@ async fn approve_psbt_session(
             .get_wallet_descriptor(&group_pubkey)?
             .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?
     };
+    if descriptor.canonical_hash() != session_descriptor_hash {
+        return Err(KeepError::Frost(
+            "stored descriptor hash does not match PSBT session descriptor_hash".into(),
+        ));
+    }
     let policy_json = descriptor.policy.clone().ok_or_else(|| {
         KeepError::InvalidInput(
             "persisted descriptor has no WalletPolicy; cannot derive recovery tier metadata".into(),
@@ -1856,8 +1861,26 @@ pub fn cmd_wallet_approve_psbt(
                         let h: [u8; 32] = Sha256::digest(&bytes).into();
                         h
                     });
-                    let fp = registry_entries[0].0.clone();
-                    let bunker = registry_entries[0].1.clone();
+                    let expected_fps = node
+                        .psbt_session_expected_fingerprints(&session_id)
+                        .unwrap_or_default();
+                    let match_idx = registry_entries.iter().position(|(fp, _)| {
+                        expected_fps
+                            .iter()
+                            .any(|e| e.eq_ignore_ascii_case(fp))
+                    });
+                    let idx = match match_idx {
+                        Some(i) => i,
+                        None => {
+                            node_handle.abort();
+                            return Err(KeepError::InvalidInput(format!(
+                                "no --signer-bunker fingerprint matches an expected external signer for session {}",
+                                hex::encode(&session_id[..8])
+                            )));
+                        }
+                    };
+                    let fp = registry_entries[idx].0.clone();
+                    let bunker = registry_entries[idx].1.clone();
                     approve_psbt_session(
                         out,
                         keep.clone(),

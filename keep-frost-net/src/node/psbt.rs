@@ -94,6 +94,27 @@ impl KfpNode {
         Some((initiator, *session.descriptor_hash(), session.tier_index()))
     }
 
+    /// Return the lowercase xpub fingerprints listed as expected external
+    /// signers for the given PSBT session. Returns `None` if the session is
+    /// unknown. Share-based signers are not included.
+    pub fn psbt_session_expected_fingerprints(
+        &self,
+        session_id: &[u8; 32],
+    ) -> Option<Vec<String>> {
+        let sessions = self.psbt_sessions.read();
+        let session = sessions.get_session(session_id)?;
+        Some(
+            session
+                .expected_signers()
+                .iter()
+                .filter_map(|s| match s {
+                    crate::psbt_session::SignerId::Fingerprint(fp) => Some(fp.clone()),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Propose a PSBT for a recovery tier spend. Publishes `PsbtPropose` to all
     /// expected signers over NIP-44 encrypted channel.
     ///

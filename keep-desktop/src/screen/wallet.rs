@@ -1759,6 +1759,7 @@ impl State {
     fn view_approve_pane<'a>(&self, state: &'a ApprovePsbtState) -> Element<'a, Message> {
         let uri_input = text_input("bunker://...", &state.bunker_uri)
             .on_input(Message::ApproveBunkerUriChanged)
+            .secure(true)
             .padding(theme::space::SM);
         let fp_input = text_input("8 hex chars", &state.fingerprint)
             .on_input(Message::ApproveFingerprintChanged)

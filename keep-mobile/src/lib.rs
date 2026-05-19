@@ -1797,10 +1797,14 @@ impl KeepMobile {
                 }
                 None => None,
             };
-            let policy = d
-                .policy_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+            let policy = match d.policy_json.as_deref() {
+                Some(s) => Some(serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
+                    KeepMobileError::BackupError {
+                        msg: format!("descriptor policy_json is not valid JSON: {e}"),
+                    }
+                })?),
+                None => None,
+            };
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),

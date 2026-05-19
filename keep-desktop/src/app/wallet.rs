@@ -589,7 +589,7 @@ impl App {
         let keep_arc = self.keep.clone();
         Task::perform(
             async move {
-                let (initiator_pubkey, _descriptor_hash, tier_index) = node
+                let (initiator_pubkey, session_descriptor_hash, tier_index) = node
                     .psbt_session_routing(&session_id)
                     .ok_or_else(|| "unknown PSBT session".to_string())?;
                 let psbt_bytes = node
@@ -620,6 +620,16 @@ impl App {
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
+
+                // SEC: confirm the locally stored descriptor matches the one
+                // the session was coordinated against. Fail closed on mismatch
+                // to prevent signing under a substituted descriptor.
+                if descriptor.canonical_hash() != session_descriptor_hash {
+                    return Err(
+                        "stored descriptor hash does not match PSBT session descriptor_hash"
+                            .to_string(),
+                    );
+                }
 
                 let policy_value = descriptor
                     .policy

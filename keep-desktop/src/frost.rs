@@ -648,7 +648,17 @@ pub(crate) async fn frost_event_listener(
                         ..
                     }) => {
                         log!(EventLogType::Descriptor, "Descriptor complete".to_string());
-                        let policy_value = serde_json::to_value(&policy).ok();
+                        let policy_value = match serde_json::to_value(&policy) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    session = %hex::encode(&session_id[..8]),
+                                    "failed to serialize WalletPolicy to JSON (recovery-tier verification will be unavailable for this descriptor)",
+                                );
+                                None
+                            }
+                        };
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorComplete {

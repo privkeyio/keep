@@ -197,7 +197,18 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let policy_value = serde_json::to_value(&policy).ok();
+                            let policy_value = match serde_json::to_value(&policy) {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        session = %hex::encode(&session_id[..8]),
+                                        group = %hex::encode(group_pubkey),
+                                        "failed to serialize WalletPolicy to JSON (recovery-tier verification will be unavailable for this descriptor)",
+                                    );
+                                    None
+                                }
+                            };
                             // The predecessor lookup and the subsequent store
                             // are not held under a single critical section
                             // beyond `keep.lock()`; a second migrate event
