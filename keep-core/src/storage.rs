@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::backend::{
     RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
@@ -577,9 +577,16 @@ impl Storage {
         }
     }
 
-    /// Store a wallet descriptor.
+    /// Store a wallet descriptor. The storage key is
+    /// `group_pubkey || version_be(version)` so multiple versions for the
+    /// same group can coexist; replacing an existing version is a no-op
+    /// upsert against the same key.
     pub fn store_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
-        debug!(group = %hex::encode(descriptor.group_pubkey), "storing wallet descriptor");
+        debug!(
+            group = %hex::encode(descriptor.group_pubkey),
+            version = descriptor.version,
+            "storing wallet descriptor"
+        );
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
@@ -590,21 +597,52 @@ impl Storage {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        backend.put(
-            DESCRIPTORS_TABLE,
-            &descriptor.group_pubkey,
-            &encrypted_bytes,
-        )?;
+        let key = descriptor_storage_key(&descriptor.group_pubkey, descriptor.version);
+        backend.put(DESCRIPTORS_TABLE, &key, &encrypted_bytes)?;
         Ok(())
     }
 
-    /// Get a wallet descriptor by group public key.
+    /// Get the latest-version wallet descriptor for a group public key.
+    /// Returns `None` if no descriptor is stored for the group.
+    ///
+    /// Only one row is decrypted (the highest-versioned one) regardless of
+    /// how many versions exist for the group. The latest version is
+    /// determined by the trailing 4 big-endian bytes of the key, so the
+    /// payload only needs to be touched once we know which row to read.
     pub fn get_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<Option<WalletDescriptor>> {
-        trace!(group = %hex::encode(group_pubkey), "loading wallet descriptor");
+        trace!(group = %hex::encode(group_pubkey), "loading latest wallet descriptor");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
+        let mut latest_version: Option<u32> = None;
+        for k in &keys {
+            let version = require_versioned_descriptor_key(k)?;
+            if latest_version.is_none_or(|cur| version > cur) {
+                latest_version = Some(version);
+            }
+        }
+        match latest_version {
+            Some(v) => self.get_descriptor_version(group_pubkey, v),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a specific version of the wallet descriptor for a group.
+    pub fn get_descriptor_version(
+        &self,
+        group_pubkey: &[u8; 32],
+        version: u32,
+    ) -> Result<Option<WalletDescriptor>> {
+        trace!(
+            group = %hex::encode(group_pubkey),
+            version,
+            "loading wallet descriptor version"
+        );
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let Some(encrypted_bytes) = backend.get(DESCRIPTORS_TABLE, group_pubkey)? else {
+        let key = descriptor_storage_key(group_pubkey, version);
+        let Some(encrypted_bytes) = backend.get(DESCRIPTORS_TABLE, &key)? else {
             return Ok(None);
         };
 
@@ -616,9 +654,51 @@ impl Storage {
         Ok(Some(descriptor))
     }
 
-    /// List all stored wallet descriptors.
+    /// List the latest-version wallet descriptor for every group. Older
+    /// versions are not returned; use [`list_all_descriptor_versions`] when
+    /// every row is required (e.g. backup, rotation).
+    ///
+    /// [`list_all_descriptor_versions`]: Self::list_all_descriptor_versions
     pub fn list_descriptors(&self) -> Result<Vec<WalletDescriptor>> {
-        trace!("listing wallet descriptors");
+        trace!("listing latest wallet descriptors (one per group)");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, &[])?;
+        // Pick the highest-versioned key per group from the trailing 4 BE
+        // bytes of each row key, then decrypt only those rows.
+        let mut latest: std::collections::HashMap<[u8; 32], u32> = std::collections::HashMap::new();
+        for key in &keys {
+            // Mirror `get_descriptor`: fail closed on unexpected key lengths
+            // rather than silently hiding a group whose row survived an
+            // incomplete v4->v5 migration.
+            let version = require_versioned_descriptor_key(key)?;
+            let mut group = [0u8; 32];
+            group.copy_from_slice(&key[..32]);
+            latest
+                .entry(group)
+                .and_modify(|cur| {
+                    if version > *cur {
+                        *cur = version;
+                    }
+                })
+                .or_insert(version);
+        }
+        let mut descriptors = Vec::with_capacity(latest.len());
+        for (group, version) in latest {
+            if let Some(desc) = self.get_descriptor_version(&group, version)? {
+                descriptors.push(desc);
+            }
+        }
+        Ok(descriptors)
+    }
+
+    /// List every stored wallet descriptor row across all groups and
+    /// versions. Decrypts every row; prefer [`list_descriptors`] when only the
+    /// latest version per group is needed.
+    ///
+    /// [`list_descriptors`]: Self::list_descriptors
+    pub fn list_all_descriptor_versions(&self) -> Result<Vec<WalletDescriptor>> {
+        trace!("listing all wallet descriptor versions");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
@@ -637,9 +717,42 @@ impl Storage {
         Ok(descriptors)
     }
 
-    /// Atomically insert or update a device registration on the descriptor
-    /// for the given group. Serialized under `descriptor_lock` so concurrent
-    /// callers cannot lose each other's updates across the read-modify-write.
+    /// List all stored descriptor versions for a single group public key,
+    /// sorted ascending by version. Decrypts only rows whose key prefix
+    /// matches the group, avoiding a full-table scan.
+    pub fn list_descriptors_for_group(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Vec<WalletDescriptor>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
+        let mut versions: Vec<u32> = keys
+            .iter()
+            .filter_map(|k| parse_versioned_descriptor_key(k, group_pubkey, "list"))
+            .collect();
+        versions.sort_unstable();
+
+        let mut out = Vec::with_capacity(versions.len());
+        for v in versions {
+            if let Some(d) = self.get_descriptor_version(group_pubkey, v)? {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Atomically insert or update a device registration on the latest
+    /// descriptor for the given group. Serialized under `descriptor_lock` so
+    /// concurrent callers cannot lose each other's updates across the
+    /// read-modify-write.
+    ///
+    /// Only the latest version row is mutated: registrations on superseded
+    /// descriptor versions are not reachable through this path. This matches
+    /// the protocol's "latest descriptor is authoritative" invariant. No
+    /// other path iterates `list_descriptors` and re-stores entries, so older
+    /// versions remain frozen at the registrations they captured at the time
+    /// of the corresponding descriptor finalization.
     pub fn upsert_device_registration(
         &self,
         group_pubkey: &[u8; 32],
@@ -659,16 +772,44 @@ impl Storage {
         self.store_descriptor(&descriptor)
     }
 
-    /// Delete a wallet descriptor.
+    /// Delete every stored version of the wallet descriptor for a group.
+    /// All version rows are removed via the backend's `delete_batch`; on
+    /// backends that implement it atomically (redb does) a crash mid-delete
+    /// cannot leave a partial set behind.
     pub fn delete_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
-        debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor");
+        debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor (all versions)");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.delete(DESCRIPTORS_TABLE, group_pubkey)? {
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
+        // Delete every row under the group prefix regardless of key length:
+        // skipping a stray legacy 32-byte row here would leave it behind
+        // forever and make subsequent reads inconsistent. The v4->v5
+        // migration is expected to have rewritten such rows, so the only way
+        // we observe one is partial migration; the safest action is to drop
+        // it along with the versioned rows.
+        if keys.is_empty() {
+            return Err(KeepError::KeyNotFound(format!(
+                "wallet descriptor for group {} not found",
+                hex::encode(group_pubkey)
+            )));
+        }
+
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        backend.delete_batch(DESCRIPTORS_TABLE, &refs)?;
+        Ok(())
+    }
+
+    /// Delete a single version of a wallet descriptor for a group.
+    pub fn delete_descriptor_version(&self, group_pubkey: &[u8; 32], version: u32) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let key = descriptor_storage_key(group_pubkey, version);
+        if backend.delete(DESCRIPTORS_TABLE, &key)? {
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(
-                "wallet descriptor for group {} not found",
-                hex::encode(group_pubkey)
+                "wallet descriptor for group {} version {} not found",
+                hex::encode(group_pubkey),
+                version
             )))
         }
     }
@@ -881,6 +1022,60 @@ impl Storage {
 
 fn health_status_key(group_pubkey: &[u8; 32], share_index: u16) -> String {
     format!("{}:{}", hex::encode(group_pubkey), share_index)
+}
+
+/// Compose the storage key for a wallet descriptor row:
+/// `group_pubkey (32) || version_be (4)`.
+pub(crate) fn descriptor_storage_key(group_pubkey: &[u8; 32], version: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(group_pubkey);
+    key[32..36].copy_from_slice(&version.to_be_bytes());
+    key
+}
+
+/// Extract the version from the trailing 4 big-endian bytes of a descriptor
+/// row key. Caller must have verified `key.len() == 36`.
+fn descriptor_key_version(key: &[u8]) -> u32 {
+    let mut v_bytes = [0u8; 4];
+    v_bytes.copy_from_slice(&key[32..36]);
+    u32::from_be_bytes(v_bytes)
+}
+
+/// Strictly parse a descriptor row key, returning its version. Fails closed on
+/// any non-36-byte key: post-migration every row is `group||version_be`, so an
+/// unexpected length means the v4->v5 migration did not complete and the caller
+/// must not silently miss data.
+fn require_versioned_descriptor_key(key: &[u8]) -> Result<u32> {
+    if key.len() != 36 {
+        return Err(KeepError::Other(format!(
+            "wallet_descriptors row has unexpected key length {} (expected 36); migration to v5 incomplete",
+            key.len()
+        )));
+    }
+    Ok(descriptor_key_version(key))
+}
+
+/// Parse a descriptor row key produced by [`descriptor_storage_key`] and
+/// return its version. Returns `None` for any legacy 32-byte row that
+/// matches the group prefix; the v4->v5 migration was expected to rewrite
+/// those, so a remaining row is logged as a warning rather than silently
+/// dropped. `op` tags the call site (e.g. `"lookup"`, `"delete"`) so log
+/// readers can tell which scan surfaced the leftover.
+fn parse_versioned_descriptor_key(
+    key: &[u8],
+    group_pubkey: &[u8; 32],
+    op: &'static str,
+) -> Option<u32> {
+    if key.len() != 36 {
+        warn!(
+            group = %hex::encode(group_pubkey),
+            key_len = key.len(),
+            op,
+            "skipping non-versioned descriptor row under group prefix (expected migration to v5)"
+        );
+        return None;
+    }
+    Some(descriptor_key_version(key))
 }
 
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {

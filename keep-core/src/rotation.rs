@@ -19,7 +19,9 @@ use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::relay::RelayConfig;
-use crate::storage::{bincode_options, share_id, validate_new_password, Header, Storage};
+use crate::storage::{
+    bincode_options, descriptor_storage_key, share_id, validate_new_password, Header, Storage,
+};
 use crate::wallet::WalletDescriptor;
 
 fn secure_delete(path: &Path) -> std::io::Result<()> {
@@ -228,7 +230,23 @@ impl Storage {
 
         let keys = self.list_keys()?;
         let shares = self.list_shares()?;
-        let descriptors = self.list_descriptors()?;
+        let descriptors = self.list_all_descriptor_versions()?;
+        // Migration v4->v5 rekeys every legacy 32-byte descriptor row to a
+        // versioned 36-byte key, and `Storage::open` runs all pending
+        // migrations before rotation can be invoked. Guard that invariant
+        // here so the re-encrypt count equality below cannot be subverted by
+        // any straggler legacy row that would otherwise be silently skipped
+        // by versioned-key parsers post-rotation.
+        {
+            let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+            let all_keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, &[])?;
+            if let Some(bad) = all_keys.iter().find(|k| k.len() != 36) {
+                return Err(KeepError::RotationFailed(format!(
+                    "legacy descriptor row with key length {} remains pre-rotation; refusing to rotate",
+                    bad.len()
+                )));
+            }
+        }
         let relay_configs = self.list_relay_configs()?;
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
@@ -387,11 +405,8 @@ impl Storage {
             let serialized = serde_json::to_vec(descriptor)
                 .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
             let encrypted = crypto::encrypt(&serialized, new_data_key)?;
-            backend.put(
-                DESCRIPTORS_TABLE,
-                &descriptor.group_pubkey,
-                &encrypted.to_bytes(),
-            )?;
+            let key = descriptor_storage_key(&descriptor.group_pubkey, descriptor.version);
+            backend.put(DESCRIPTORS_TABLE, &key, &encrypted.to_bytes())?;
         }
 
         for config in relay_configs {
@@ -497,14 +512,14 @@ impl Storage {
         }
 
         for original in original_descriptors {
-            let encrypted_bytes = backend
-                .get(DESCRIPTORS_TABLE, &original.group_pubkey)?
-                .ok_or_else(|| {
-                    KeepError::RotationFailed(format!(
-                        "descriptor for group {} missing after rotation",
-                        hex::encode(original.group_pubkey)
-                    ))
-                })?;
+            let key = descriptor_storage_key(&original.group_pubkey, original.version);
+            let encrypted_bytes = backend.get(DESCRIPTORS_TABLE, &key)?.ok_or_else(|| {
+                KeepError::RotationFailed(format!(
+                    "descriptor for group {} version {} missing after rotation",
+                    hex::encode(original.group_pubkey),
+                    original.version
+                ))
+            })?;
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
@@ -515,10 +530,15 @@ impl Storage {
                 || descriptor.internal_descriptor != original.internal_descriptor
                 || descriptor.network != original.network
                 || descriptor.created_at != original.created_at
+                || descriptor.version != original.version
+                || descriptor.previous_descriptor_hash != original.previous_descriptor_hash
+                || descriptor.policy_hash != original.policy_hash
+                || descriptor.device_registrations != original.device_registrations
             {
                 return Err(KeepError::RotationFailed(format!(
-                    "descriptor for group {} content mismatch after rotation",
-                    hex::encode(original.group_pubkey)
+                    "descriptor for group {} version {} content mismatch after rotation",
+                    hex::encode(original.group_pubkey),
+                    original.version
                 )));
             }
         }

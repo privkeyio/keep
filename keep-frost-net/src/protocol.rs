@@ -98,6 +98,7 @@ pub enum KfpMessage {
     DescriptorFinalize(DescriptorFinalizePayload),
     DescriptorAck(DescriptorAckPayload),
     DescriptorNack(DescriptorNackPayload),
+    DescriptorMigrate(DescriptorMigratePayload),
     XpubAnnounce(XpubAnnouncePayload),
     PsbtPropose(PsbtProposePayload),
     PsbtSign(PsbtSignPayload),
@@ -128,6 +129,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(_) => "descriptor_finalize",
             KfpMessage::DescriptorAck(_) => "descriptor_ack",
             KfpMessage::DescriptorNack(_) => "descriptor_nack",
+            KfpMessage::DescriptorMigrate(_) => "descriptor_migrate",
             KfpMessage::XpubAnnounce(_) => "xpub_announce",
             KfpMessage::PsbtPropose(_) => "psbt_propose",
             KfpMessage::PsbtSign(_) => "psbt_sign",
@@ -157,6 +159,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.session_id),
             KfpMessage::DescriptorAck(p) => Some(&p.session_id),
             KfpMessage::DescriptorNack(p) => Some(&p.session_id),
+            KfpMessage::DescriptorMigrate(p) => Some(&p.session_id),
             KfpMessage::PsbtPropose(p) => Some(&p.session_id),
             KfpMessage::PsbtSign(p) => Some(&p.session_id),
             KfpMessage::PsbtFinalize(p) => Some(&p.session_id),
@@ -177,6 +180,7 @@ impl KfpMessage {
             KfpMessage::DescriptorFinalize(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorAck(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
+            KfpMessage::DescriptorMigrate(p) => Some(&p.group_pubkey),
             KfpMessage::XpubAnnounce(p) => Some(&p.group_pubkey),
             KfpMessage::PsbtPropose(p) => Some(&p.group_pubkey),
             KfpMessage::PsbtSign(p) => Some(&p.group_pubkey),
@@ -327,6 +331,9 @@ impl KfpMessage {
                 if !is_valid_fingerprint(&p.initiator_fingerprint) {
                     return Err("Initiator fingerprint must be exactly 8 hex characters");
                 }
+                if p.policy.version == 0 {
+                    return Err("Policy version must be >= 1");
+                }
                 if p.policy.recovery_tiers.is_empty() {
                     return Err("Policy must have at least one recovery tier");
                 }
@@ -424,6 +431,9 @@ impl KfpMessage {
                 if p.reason.len() > MAX_NACK_REASON_LENGTH {
                     return Err("Nack reason exceeds maximum length");
                 }
+            }
+            KfpMessage::DescriptorMigrate(p) => {
+                p.validate()?;
             }
             KfpMessage::PsbtPropose(p) => {
                 if p.psbt.is_empty() {
@@ -1119,6 +1129,37 @@ impl RefreshCompletePayload {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WalletPolicy {
     pub recovery_tiers: Vec<PolicyTier>,
+    /// Monotonic version of the descriptor this policy is associated with.
+    /// Defaults to `1` so existing on-wire payloads and stored sessions
+    /// continue to deserialize unchanged. The value is folded into the policy
+    /// hash only when `> 1`, preserving v1 canonical hashes. A value of `0`
+    /// is rejected at deserialize time so the canonical hash domain (which
+    /// only differs for v>=2) can never alias.
+    #[serde(
+        default = "default_policy_version",
+        deserialize_with = "deserialize_nonzero_policy_version"
+    )]
+    pub version: u32,
+}
+
+fn deserialize_nonzero_policy_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = u32::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(serde::de::Error::custom(
+            "WalletPolicy.version must be >= 1",
+        ));
+    }
+    Ok(v)
+}
+
+/// Default value for [`WalletPolicy::version`] used when deserializing legacy
+/// payloads that predate descriptor versioning.
+pub fn default_policy_version() -> u32 {
+    1
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1313,6 +1354,67 @@ impl DescriptorNackPayload {
 
     pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
         within_replay_window(self.created_at, window_secs)
+    }
+}
+
+/// Single-shot link announcement that the descriptor identified by
+/// `new_descriptor_hash` (at version `new_version`) supersedes
+/// `old_descriptor_hash`. Sent by the migration initiator after the
+/// `DescriptorComplete` event has fired for both ends. Peers persist the
+/// linkage on their own WalletDescriptor record (via
+/// `previous_descriptor_hash`); there is no new FROST sub-protocol.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DescriptorMigratePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub old_descriptor_hash: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub new_descriptor_hash: [u8; 32],
+    pub new_version: u32,
+    pub created_at: u64,
+}
+
+/// Minimum policy/descriptor version that may participate in a
+/// `DescriptorMigrate` link (the predecessor is the implicit v1, so the
+/// migrated descriptor must be at least v2).
+pub const MIN_DESCRIPTOR_MIGRATION_VERSION: u32 = 2;
+
+impl DescriptorMigratePayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        old_descriptor_hash: [u8; 32],
+        new_descriptor_hash: [u8; 32],
+        new_version: u32,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            old_descriptor_hash,
+            new_descriptor_hash,
+            new_version,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+
+    /// Wire-format invariants checked at both encode and decode time.
+    /// Centralized so initiator-side helpers and inbound `KfpMessage::validate`
+    /// do not drift apart.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.new_version < MIN_DESCRIPTOR_MIGRATION_VERSION {
+            return Err("Descriptor migrate new_version must be >= 2");
+        }
+        if self.old_descriptor_hash == self.new_descriptor_hash {
+            return Err("Descriptor migrate hashes must differ");
+        }
+        Ok(())
     }
 }
 

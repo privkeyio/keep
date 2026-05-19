@@ -9,7 +9,7 @@ use secrecy::ExposeSecret;
 use tracing::debug;
 
 use keep_core::error::{FrostError, KeepError, NetworkError, Result};
-use keep_core::wallet::WalletDescriptor;
+use keep_core::wallet::{WalletDescriptor, INITIAL_DESCRIPTOR_VERSION};
 use keep_core::Keep;
 
 use crate::output::Output;
@@ -181,6 +181,7 @@ pub fn cmd_frost_network_serve(
                         internal_descriptor,
                         network,
                         policy_hash,
+                        version,
                     }) => {
                         let session = hex::encode(&session_id[..8]);
                         let desc_short = match external_descriptor.get(..40) {
@@ -195,6 +196,47 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            // The predecessor lookup and the subsequent store
+                            // are not held under a single critical section
+                            // beyond `keep.lock()`; a second migrate event
+                            // could in principle race here. In the CLI this
+                            // is acceptable because event handling for a
+                            // single node is serialized through this task
+                            // and only one migration can be in flight per
+                            // group at the protocol layer.
+                            let guard = keep.lock().expect("keep mutex poisoned");
+                            let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
+                                match guard.get_wallet_descriptor(&group_pubkey) {
+                                    Ok(Some(prev)) => {
+                                        if prev.version != version - 1 {
+                                            tracing::error!(
+                                                version,
+                                                predecessor_version = prev.version,
+                                                "refusing to persist migrated descriptor: predecessor version is not the immediate predecessor"
+                                            );
+                                            return;
+                                        }
+                                        Some(prev.canonical_hash())
+                                    }
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            version,
+                                            "refusing to persist migrated descriptor: no predecessor descriptor found"
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            version,
+                                            "refusing to persist migrated descriptor: failed to load predecessor"
+                                        );
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let descriptor = WalletDescriptor {
                                 group_pubkey,
                                 external_descriptor,
@@ -203,8 +245,9 @@ pub fn cmd_frost_network_serve(
                                 created_at: now,
                                 device_registrations: Vec::new(),
                                 policy_hash,
+                                version,
+                                previous_descriptor_hash,
                             };
-                            let guard = keep.lock().expect("keep mutex poisoned");
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
                                     tracing::info!("wallet descriptor stored");

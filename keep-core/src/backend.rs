@@ -41,6 +41,27 @@ pub trait StorageBackend: Send + Sync {
     /// Create a table if it doesn't exist.
     fn create_table(&self, table: &str) -> Result<()>;
 
+    /// List only the keys (no values) in the specified table whose bytes
+    /// start with `prefix`. The default implementation falls back to a full
+    /// scan and is suitable for backends without a native prefix iterator.
+    fn list_keys_with_prefix(&self, table: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .list(table)?
+            .into_iter()
+            .filter_map(|(k, _)| if k.starts_with(prefix) { Some(k) } else { None })
+            .collect())
+    }
+
+    /// Delete multiple keys from the specified table in a single atomic
+    /// operation. The default implementation calls `delete` per key and is
+    /// not atomic; backends with transaction support should override this.
+    fn delete_batch(&self, table: &str, keys: &[&[u8]]) -> Result<()> {
+        for key in keys {
+            self.delete(table, key)?;
+        }
+        Ok(())
+    }
+
     /// Store multiple key-value pairs in a single atomic operation.
     fn put_batch(&self, table: &str, entries: &[(&[u8], &[u8])]) -> Result<()> {
         for (key, value) in entries {
@@ -391,6 +412,32 @@ impl StorageBackend for RedbBackend {
         }
         wtxn.commit()?;
         Ok(())
+    }
+
+    fn delete_batch(&self, table: &str, keys: &[&[u8]]) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut tbl = wtxn.open_table(self.table_def(table)?)?;
+            for key in keys {
+                tbl.remove(*key)?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn list_keys_with_prefix(&self, table: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(self.table_def(table)?)?;
+        let mut out = Vec::new();
+        for entry in tbl.iter()? {
+            let (k, _) = entry?;
+            let bytes = k.value();
+            if bytes.starts_with(prefix) {
+                out.push(bytes.to_vec());
+            }
+        }
+        Ok(out)
     }
 
     fn schema_version(&self) -> Result<u32> {

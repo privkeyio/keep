@@ -190,6 +190,7 @@ mod tests {
                     ],
                     timelock_months: 6,
                 }],
+                version: 1,
             },
             network: "signet".into(),
             initiator: None,
