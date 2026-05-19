@@ -2962,18 +2962,13 @@ impl KeepMobile {
                         return;
                     }
                 },
-                None => {
-                    tracing::error!(
-                        "refusing to persist migrated descriptor: predecessor policy_hash_hex is missing"
-                    );
-                    if let Some(cb) = cbs.read().await.as_ref() {
-                        let _ = cb.on_failed(
-                            hex::encode(session_id),
-                            "Predecessor descriptor has no policy_hash_hex".into(),
-                        );
-                    }
-                    return;
-                }
+                // Legacy descriptors written before `policy_hash` was added
+                // serialize the field as `[0u8; 32]` via `#[serde(default)]`,
+                // and the mobile surface maps that zero value back to `None`.
+                // The predecessor's canonical hash was originally computed
+                // with zeros, so matching that is the correct recomputation,
+                // not a fail-closed condition.
+                None => [0u8; 32],
             };
             match keep_core::wallet::canonical_descriptor_hash(
                 &prev.external_descriptor,

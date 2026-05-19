@@ -682,12 +682,14 @@ impl Storage {
         let mut latest: std::collections::HashMap<[u8; 32], u32> =
             std::collections::HashMap::new();
         for key in &keys {
+            // Mirror `get_descriptor`: fail closed on unexpected key lengths
+            // rather than silently hiding a group whose row survived an
+            // incomplete v4->v5 migration.
             if key.len() != 36 {
-                warn!(
-                    key_len = key.len(),
-                    "skipping non-versioned descriptor row (expected migration to v5)"
-                );
-                continue;
+                return Err(KeepError::Other(format!(
+                    "wallet_descriptors row has unexpected key length {} (expected 36); migration to v5 incomplete",
+                    key.len()
+                )));
             }
             let mut group = [0u8; 32];
             group.copy_from_slice(&key[..32]);
@@ -812,16 +814,6 @@ impl Storage {
                 "wallet descriptor for group {} not found",
                 hex::encode(group_pubkey)
             )));
-        }
-
-        for k in &keys {
-            if k.len() != 32 && k.len() != 36 {
-                return Err(KeepError::Other(format!(
-                    "wallet_descriptors row for group {} has unexpected key length {}",
-                    hex::encode(group_pubkey),
-                    k.len()
-                )));
-            }
         }
 
         let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();

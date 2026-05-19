@@ -348,19 +348,22 @@ impl KfpNode {
                 );
                 return Ok(());
             }
-            seen.insert(key, payload.created_at);
+            // Store local receive time, not attacker-supplied
+            // `payload.created_at`, so eviction ordering and replay-window
+            // pruning cannot be skewed by a peer backdating their links.
+            let now = Timestamp::now().as_secs();
+            seen.insert(key, now);
             const MAX_SEEN_DESCRIPTOR_MIGRATES: usize = 10_000;
             if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
-                let now = Timestamp::now().as_secs();
                 let window = self
                     .replay_window_secs
                     .saturating_add(super::MAX_FUTURE_SKEW_SECS);
                 seen.retain(|_, ts| now.saturating_sub(window) <= *ts);
                 // If pruning by replay window still leaves the map oversized,
-                // evict the oldest entries (by created_at) rather than
-                // clearing the whole set: a `clear()` would discard every
-                // previously-seen tuple and re-enable replays of links that
-                // were already observed within the replay window.
+                // evict the oldest entries (by local receive time) rather
+                // than clearing the whole set: a `clear()` would discard
+                // every previously-seen tuple and re-enable replays of links
+                // that were already observed within the replay window.
                 if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
                     let evict = seen.len() - MAX_SEEN_DESCRIPTOR_MIGRATES;
                     let mut by_ts: Vec<(([u8; 32], [u8; 32]), u64)> =
