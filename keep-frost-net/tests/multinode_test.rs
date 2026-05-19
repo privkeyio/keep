@@ -482,6 +482,7 @@ async fn test_descriptor_coordination_flow() {
             ],
             timelock_months: 6,
         }],
+        version: 1,
     };
 
     let session_id = node1
@@ -664,6 +665,7 @@ async fn test_request_descriptor_fails_with_no_peers() {
             ],
             timelock_months: 6,
         }],
+        version: 1,
     };
 
     let result = node1

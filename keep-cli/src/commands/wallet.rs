@@ -9,7 +9,7 @@ use secrecy::ExposeSecret;
 use tracing::debug;
 
 use keep_core::error::{KeepError, Result};
-use keep_core::wallet::WalletDescriptor;
+use keep_core::wallet::{WalletDescriptor, INITIAL_DESCRIPTOR_VERSION};
 use keep_core::Keep;
 
 use crate::cli::WalletExportFormat;
@@ -195,6 +195,8 @@ pub fn cmd_wallet_descriptor(
         created_at: now,
         device_registrations: Vec::new(),
         policy_hash: [0u8; 32],
+        version: INITIAL_DESCRIPTOR_VERSION,
+        previous_descriptor_hash: None,
     };
 
     let mut keep = Keep::open(path)?;
@@ -784,6 +786,7 @@ fn parse_recovery_policy(
 
     Ok(keep_frost_net::WalletPolicy {
         recovery_tiers: tiers,
+        version: INITIAL_DESCRIPTOR_VERSION,
     })
 }
 
@@ -1077,6 +1080,8 @@ pub fn cmd_wallet_propose(
             created_at: now,
             device_registrations: Vec::new(),
             policy_hash: finalized_policy_hash,
+            version: INITIAL_DESCRIPTOR_VERSION,
+            previous_descriptor_hash: None,
         };
 
         keep.lock()

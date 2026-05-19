@@ -82,6 +82,13 @@ pub struct WalletDescriptorInfo {
     pub created_at: u64,
     pub device_registrations: Vec<DeviceRegistrationInfo>,
     pub policy_hash_hex: Option<String>,
+    /// Monotonic version of this descriptor for the group. `1` for the
+    /// initial descriptor; increments on each migration.
+    pub version: u32,
+    /// Hex-encoded 32-byte canonical hash of the descriptor this one
+    /// supersedes, when this is a migration. `None` for the initial
+    /// descriptor or for legacy records persisted before versioning.
+    pub previous_descriptor_hash_hex: Option<String>,
 }
 
 impl std::fmt::Debug for WalletDescriptorInfo {
@@ -94,6 +101,11 @@ impl std::fmt::Debug for WalletDescriptorInfo {
             .field("created_at", &self.created_at)
             .field("device_registrations", &self.device_registrations.len())
             .field("policy_hash_hex", &self.policy_hash_hex)
+            .field("version", &self.version)
+            .field(
+                "previous_descriptor_hash_hex",
+                &self.previous_descriptor_hash_hex,
+            )
             .finish()
     }
 }

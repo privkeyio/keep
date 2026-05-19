@@ -1793,6 +1793,21 @@ impl KeepMobile {
                 created_at: d.created_at,
                 device_registrations,
                 policy_hash,
+                version: {
+                    if d.version == 0 {
+                        return Err(KeepMobileError::BackupError {
+                            msg: "descriptor version must be >= 1".into(),
+                        });
+                    }
+                    d.version
+                },
+                previous_descriptor_hash: match d.previous_descriptor_hash_hex.as_deref() {
+                    Some(h) => {
+                        let bytes = decode_hex(h, "descriptor previous_descriptor_hash")?;
+                        Some(bytes_to_32(&bytes, "descriptor previous_descriptor_hash")?)
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -1996,6 +2011,8 @@ impl KeepMobile {
                     })
                     .collect(),
                 policy_hash_hex,
+                version: wd.version,
+                previous_descriptor_hash_hex: wd.previous_descriptor_hash.map(hex::encode),
             });
         }
 
@@ -2235,7 +2252,10 @@ fn build_wallet_policy(
         })
         .collect();
 
-    Ok(WalletPolicy { recovery_tiers })
+    Ok(WalletPolicy {
+        recovery_tiers,
+        version: keep_core::wallet::INITIAL_DESCRIPTOR_VERSION,
+    })
 }
 
 impl KeepMobile {
@@ -2747,6 +2767,7 @@ impl KeepMobile {
                             internal_descriptor,
                             network,
                             policy_hash,
+                            version,
                         }) => {
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
@@ -2775,6 +2796,7 @@ impl KeepMobile {
                                 external_descriptor,
                                 internal_descriptor,
                                 policy_hash,
+                                version,
                             )
                             .await;
                         }
@@ -2870,12 +2892,57 @@ impl KeepMobile {
         external_descriptor: String,
         internal_descriptor: String,
         policy_hash: [u8; 32],
+        version: u32,
     ) {
         let group_pubkey = hex::encode(node.group_pubkey());
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // For v2+ completions, look up the currently-persisted descriptor for
+        // this group (if any) and record its canonical hash as the predecessor
+        // so lineage is preserved at the moment of persistence. For v1
+        // (initial descriptor) there is no lineage by definition.
+        let previous_descriptor_hash_hex = if version
+            > keep_core::wallet::INITIAL_DESCRIPTOR_VERSION
+        {
+            match persistence::load_descriptor(storage, &group_pubkey) {
+                Ok(prev) => {
+                    use sha2::{Digest, Sha256};
+                    let prev_policy_hash = match prev.policy_hash_hex.as_deref() {
+                        Some(h) => match hex::decode(h)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                        {
+                            Some(arr) => arr,
+                            None => {
+                                tracing::warn!(
+                                    "Predecessor descriptor has invalid policy_hash_hex; skipping lineage"
+                                );
+                                [0u8; 32]
+                            }
+                        },
+                        None => [0u8; 32],
+                    };
+                    let mut h = Sha256::new();
+                    h.update((prev.external_descriptor.len() as u64).to_le_bytes());
+                    h.update(prev.external_descriptor.as_bytes());
+                    h.update((prev.internal_descriptor.len() as u64).to_le_bytes());
+                    h.update(prev.internal_descriptor.as_bytes());
+                    h.update(prev_policy_hash);
+                    keep_core::wallet::fold_descriptor_version_suffix(&mut h, prev.version);
+                    let hash: [u8; 32] = h.finalize().into();
+                    Some(hex::encode(hash))
+                }
+                Err(e) => {
+                    tracing::warn!("No predecessor descriptor found for migration: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let info = WalletDescriptorInfo {
             group_pubkey,
@@ -2889,6 +2956,8 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(policy_hash))
             },
+            version,
+            previous_descriptor_hash_hex,
         };
 
         if let Err(e) = persistence::persist_descriptor(storage, &info) {

@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::backend::{
     RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
@@ -577,9 +577,16 @@ impl Storage {
         }
     }
 
-    /// Store a wallet descriptor.
+    /// Store a wallet descriptor. The storage key is
+    /// `group_pubkey || version_be(version)` so multiple versions for the
+    /// same group can coexist; replacing an existing version is a no-op
+    /// upsert against the same key.
     pub fn store_descriptor(&self, descriptor: &WalletDescriptor) -> Result<()> {
-        debug!(group = %hex::encode(descriptor.group_pubkey), "storing wallet descriptor");
+        debug!(
+            group = %hex::encode(descriptor.group_pubkey),
+            version = descriptor.version,
+            "storing wallet descriptor"
+        );
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
@@ -590,21 +597,54 @@ impl Storage {
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
-        backend.put(
-            DESCRIPTORS_TABLE,
-            &descriptor.group_pubkey,
-            &encrypted_bytes,
-        )?;
+        let key = descriptor_storage_key(&descriptor.group_pubkey, descriptor.version);
+        backend.put(DESCRIPTORS_TABLE, &key, &encrypted_bytes)?;
         Ok(())
     }
 
-    /// Get a wallet descriptor by group public key.
+    /// Get the latest-version wallet descriptor for a group public key.
+    /// Returns `None` if no descriptor is stored for the group.
+    ///
+    /// Only one row is decrypted (the highest-versioned one) regardless of
+    /// how many versions exist for the group. The latest version is
+    /// determined by the trailing 4 big-endian bytes of the key, so the
+    /// payload only needs to be touched once we know which row to read.
     pub fn get_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<Option<WalletDescriptor>> {
-        trace!(group = %hex::encode(group_pubkey), "loading wallet descriptor");
+        trace!(group = %hex::encode(group_pubkey), "loading latest wallet descriptor");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
+        let mut latest_version: Option<u32> = None;
+        for k in &keys {
+            let Some(version) = parse_versioned_descriptor_key(k, group_pubkey, "lookup") else {
+                continue;
+            };
+            if latest_version.is_none_or(|cur| version > cur) {
+                latest_version = Some(version);
+            }
+        }
+        match latest_version {
+            Some(v) => self.get_descriptor_version(group_pubkey, v),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a specific version of the wallet descriptor for a group.
+    pub fn get_descriptor_version(
+        &self,
+        group_pubkey: &[u8; 32],
+        version: u32,
+    ) -> Result<Option<WalletDescriptor>> {
+        trace!(
+            group = %hex::encode(group_pubkey),
+            version,
+            "loading wallet descriptor version"
+        );
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let Some(encrypted_bytes) = backend.get(DESCRIPTORS_TABLE, group_pubkey)? else {
+        let key = descriptor_storage_key(group_pubkey, version);
+        let Some(encrypted_bytes) = backend.get(DESCRIPTORS_TABLE, &key)? else {
             return Ok(None);
         };
 
@@ -616,7 +656,7 @@ impl Storage {
         Ok(Some(descriptor))
     }
 
-    /// List all stored wallet descriptors.
+    /// List all stored wallet descriptors across every group and version.
     pub fn list_descriptors(&self) -> Result<Vec<WalletDescriptor>> {
         trace!("listing wallet descriptors");
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
@@ -637,9 +677,25 @@ impl Storage {
         Ok(descriptors)
     }
 
-    /// Atomically insert or update a device registration on the descriptor
-    /// for the given group. Serialized under `descriptor_lock` so concurrent
-    /// callers cannot lose each other's updates across the read-modify-write.
+    /// List all stored descriptor versions for a single group public key,
+    /// sorted ascending by version.
+    pub fn list_descriptors_for_group(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Vec<WalletDescriptor>> {
+        let mut matching: Vec<WalletDescriptor> = self
+            .list_descriptors()?
+            .into_iter()
+            .filter(|d| &d.group_pubkey == group_pubkey)
+            .collect();
+        matching.sort_by_key(|d| d.version);
+        Ok(matching)
+    }
+
+    /// Atomically insert or update a device registration on the latest
+    /// descriptor for the given group. Serialized under `descriptor_lock` so
+    /// concurrent callers cannot lose each other's updates across the
+    /// read-modify-write.
     pub fn upsert_device_registration(
         &self,
         group_pubkey: &[u8; 32],
@@ -659,16 +715,43 @@ impl Storage {
         self.store_descriptor(&descriptor)
     }
 
-    /// Delete a wallet descriptor.
+    /// Delete every stored version of the wallet descriptor for a group.
+    /// All version rows are removed via the backend's `delete_batch`; on
+    /// backends that implement it atomically (redb does) a crash mid-delete
+    /// cannot leave a partial set behind.
     pub fn delete_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
-        debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor");
+        debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor (all versions)");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.delete(DESCRIPTORS_TABLE, group_pubkey)? {
+
+        let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
+        let keys: Vec<Vec<u8>> = keys
+            .into_iter()
+            .filter(|k| parse_versioned_descriptor_key(k, group_pubkey, "delete").is_some())
+            .collect();
+
+        if keys.is_empty() {
+            return Err(KeepError::KeyNotFound(format!(
+                "wallet descriptor for group {} not found",
+                hex::encode(group_pubkey)
+            )));
+        }
+
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        backend.delete_batch(DESCRIPTORS_TABLE, &refs)?;
+        Ok(())
+    }
+
+    /// Delete a single version of a wallet descriptor for a group.
+    pub fn delete_descriptor_version(&self, group_pubkey: &[u8; 32], version: u32) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let key = descriptor_storage_key(group_pubkey, version);
+        if backend.delete(DESCRIPTORS_TABLE, &key)? {
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(
-                "wallet descriptor for group {} not found",
-                hex::encode(group_pubkey)
+                "wallet descriptor for group {} version {} not found",
+                hex::encode(group_pubkey),
+                version
             )))
         }
     }
@@ -881,6 +964,40 @@ impl Storage {
 
 fn health_status_key(group_pubkey: &[u8; 32], share_index: u16) -> String {
     format!("{}:{}", hex::encode(group_pubkey), share_index)
+}
+
+/// Compose the storage key for a wallet descriptor row:
+/// `group_pubkey (32) || version_be (4)`.
+pub(crate) fn descriptor_storage_key(group_pubkey: &[u8; 32], version: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(group_pubkey);
+    key[32..36].copy_from_slice(&version.to_be_bytes());
+    key
+}
+
+/// Parse a descriptor row key produced by [`descriptor_storage_key`] and
+/// return its version. Returns `None` for any legacy 32-byte row that
+/// matches the group prefix; the v4->v5 migration was expected to rewrite
+/// those, so a remaining row is logged as a warning rather than silently
+/// dropped. `op` tags the call site (e.g. `"lookup"`, `"delete"`) so log
+/// readers can tell which scan surfaced the leftover.
+fn parse_versioned_descriptor_key(
+    key: &[u8],
+    group_pubkey: &[u8; 32],
+    op: &'static str,
+) -> Option<u32> {
+    if key.len() != 36 {
+        warn!(
+            group = %hex::encode(group_pubkey),
+            key_len = key.len(),
+            op,
+            "skipping non-versioned descriptor row under group prefix (expected migration to v5)"
+        );
+        return None;
+    }
+    let mut v_bytes = [0u8; 4];
+    v_bytes.copy_from_slice(&key[32..36]);
+    Some(u32::from_be_bytes(v_bytes))
 }
 
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {

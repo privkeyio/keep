@@ -38,6 +38,21 @@ use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
 
+/// Error returned by [`PersistedDescriptorLookup::latest_version_for`] when
+/// the underlying descriptor store cannot be queried (e.g. vault locked or
+/// mutex poisoned). Callers must fail-closed rather than treating this as
+/// "no descriptor known".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorLookupUnavailable;
+
+impl std::fmt::Display for DescriptorLookupUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("persisted descriptor store unavailable")
+    }
+}
+
+impl std::error::Error for DescriptorLookupUnavailable {}
+
 /// Fallback lookup for finalized wallet descriptors that have been persisted
 /// outside of the in-memory `DescriptorSessionManager` (e.g. stored by the
 /// host application). Used when a PSBT coordination message arrives for a
@@ -59,6 +74,19 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         let _ = (group, hash);
         None
     }
+
+    /// Return the largest persisted descriptor version for the given group,
+    /// `Ok(None)` if no descriptor exists, or `Err(DescriptorLookupUnavailable)`
+    /// if the underlying store could not be queried (e.g. vault locked). Used
+    /// to validate that an inbound `DescriptorMigrate` strictly increases the
+    /// version. No default impl is provided: silently returning `Ok(None)`
+    /// would disable the monotonic version check, allowing downgrade replay
+    /// of `DescriptorMigrate`. Callers must fail-closed on `Err(_)` rather
+    /// than treating it as "no descriptor known".
+    fn latest_version_for(
+        &self,
+        group: &[u8; 32],
+    ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable>;
 }
 
 /// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
@@ -114,6 +142,24 @@ where
 
     fn network_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
         self.lookup(|d| Some(d.network.clone()), group, hash)
+    }
+
+    fn latest_version_for(
+        &self,
+        group: &[u8; 32],
+    ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable> {
+        let Some(descriptors) = (self.fetch)() else {
+            tracing::warn!(
+                group = %hex::encode(group),
+                "KeepDescriptorLookup could not read persisted descriptors for latest_version_for (vault locked or unavailable); failing closed",
+            );
+            return Err(DescriptorLookupUnavailable);
+        };
+        Ok(descriptors
+            .iter()
+            .filter(|d| &d.group_pubkey == group)
+            .map(|d| d.version)
+            .max())
     }
 }
 
@@ -253,6 +299,12 @@ pub enum KfpNodeEvent {
         internal_descriptor: String,
         network: String,
         policy_hash: [u8; 32],
+        /// Monotonic version of the finalized descriptor (from the session
+        /// policy). The persistence layer must record this rather than
+        /// hard-coding [`keep_core::wallet::INITIAL_DESCRIPTOR_VERSION`] so
+        /// migration lineage is preserved when this completion was a v2+
+        /// descriptor.
+        version: u32,
     },
     DescriptorAcked {
         session_id: [u8; 32],
@@ -268,6 +320,16 @@ pub enum KfpNodeEvent {
     DescriptorFailed {
         session_id: [u8; 32],
         error: String,
+    },
+    /// A peer announced a descriptor-migration link (old → new).
+    /// Receivers should persist `previous_descriptor_hash` on the matching
+    /// new descriptor record.
+    DescriptorMigrateReceived {
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        old_descriptor_hash: [u8; 32],
+        new_descriptor_hash: [u8; 32],
+        new_version: u32,
     },
     XpubAnnounced {
         share_index: u16,
@@ -393,6 +455,20 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
                 .finish(),
+            Self::DescriptorMigrateReceived {
+                session_id,
+                group_pubkey,
+                old_descriptor_hash,
+                new_descriptor_hash,
+                new_version,
+            } => f
+                .debug_struct("DescriptorMigrateReceived")
+                .field("session_id", &hex::encode(session_id))
+                .field("group_pubkey", &hex::encode(group_pubkey))
+                .field("old_descriptor_hash", &hex::encode(old_descriptor_hash))
+                .field("new_descriptor_hash", &hex::encode(new_descriptor_hash))
+                .field("new_version", new_version)
+                .finish(),
             Self::XpubAnnounced {
                 share_index,
                 recovery_xpubs,
@@ -454,6 +530,9 @@ impl std::fmt::Debug for KfpNodeEvent {
     }
 }
 
+/// Map key is `(session_id, new_descriptor_hash)`; value is `created_at`.
+pub(crate) type SeenDescriptorMigrates = RwLock<HashMap<([u8; 32], [u8; 32]), u64>>;
+
 pub struct KfpNode {
     pub(crate) keys: Keys,
     pub(crate) client: Client,
@@ -473,6 +552,11 @@ pub struct KfpNode {
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
+    /// Per-session de-duplication for `DescriptorMigrate` link broadcasts.
+    /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
+    /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
+    /// replay-window pruning.
+    pub(crate) seen_descriptor_migrates: SeenDescriptorMigrates,
     pub(crate) descriptor_proposers: RwLock<HashSet<u16>>,
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
     pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
@@ -639,6 +723,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
+            seen_descriptor_migrates: RwLock::new(HashMap::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
             local_recovery_xpubs: RwLock::new(Vec::new()),
@@ -1038,6 +1123,9 @@ impl KfpNode {
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
                         });
+                        self.seen_descriptor_migrates.write().retain(|_, ts| {
+                            now.saturating_sub(window) <= *ts
+                        });
                     }
                 }
                 notification = notifications.recv() => {
@@ -1149,6 +1237,10 @@ impl KfpNode {
             }
             KfpMessage::DescriptorNack(payload) => {
                 self.handle_descriptor_nack(event.pubkey, payload).await?;
+            }
+            KfpMessage::DescriptorMigrate(payload) => {
+                self.handle_descriptor_migrate(event.pubkey, payload)
+                    .await?;
             }
             KfpMessage::XpubAnnounce(payload) => {
                 self.handle_xpub_announce(event.pubkey, payload).await?;

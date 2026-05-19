@@ -536,6 +536,7 @@ impl App {
 
     pub(crate) fn begin_descriptor_coordination(&mut self) -> Task<Message> {
         use crate::message::ConnectionStatus;
+        use keep_core::wallet::INITIAL_DESCRIPTOR_VERSION;
         use keep_frost_net::{KeySlot, PolicyTier, WalletPolicy};
 
         let (share, network, policy) = match &mut self.screen {
@@ -579,6 +580,7 @@ impl App {
 
                 let policy = WalletPolicy {
                     recovery_tiers: tiers,
+                    version: INITIAL_DESCRIPTOR_VERSION,
                 };
 
                 s.error = None;
