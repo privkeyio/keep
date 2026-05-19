@@ -97,10 +97,7 @@ impl KfpNode {
     /// Return the lowercase xpub fingerprints listed as expected external
     /// signers for the given PSBT session. Returns `None` if the session is
     /// unknown. Share-based signers are not included.
-    pub fn psbt_session_expected_fingerprints(
-        &self,
-        session_id: &[u8; 32],
-    ) -> Option<Vec<String>> {
+    pub fn psbt_session_expected_fingerprints(&self, session_id: &[u8; 32]) -> Option<Vec<String>> {
         let sessions = self.psbt_sessions.read();
         let session = sessions.get_session(session_id)?;
         Some(

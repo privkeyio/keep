@@ -1625,9 +1625,9 @@ async fn approve_psbt_session(
     bunker_uri: zeroize::Zeroizing<String>,
     expected_psbt_hash: Option<[u8; 32]>,
 ) -> Result<()> {
-    let (initiator_pubkey, session_descriptor_hash, tier_index) =
-        node.psbt_session_routing(&session_id)
-            .ok_or_else(|| KeepError::Frost("unknown PSBT session id".into()))?;
+    let (initiator_pubkey, session_descriptor_hash, tier_index) = node
+        .psbt_session_routing(&session_id)
+        .ok_or_else(|| KeepError::Frost("unknown PSBT session id".into()))?;
     let psbt_bytes = node
         .psbt_session_proposal_psbt(&session_id)
         .ok_or_else(|| KeepError::Frost("session has no proposal PSBT".into()))?;
