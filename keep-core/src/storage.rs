@@ -616,20 +616,7 @@ impl Storage {
         let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, group_pubkey.as_slice())?;
         let mut latest_version: Option<u32> = None;
         for k in &keys {
-            // Post-migration every descriptor row is keyed by `group||version_be`
-            // (36 bytes). Encountering any other length here means the
-            // v4->v5 migration did not complete; fail closed so the caller
-            // does not silently miss data.
-            if k.len() != 36 {
-                return Err(KeepError::Other(format!(
-                    "wallet_descriptors row for group {} has unexpected key length {} (expected 36); migration to v5 incomplete",
-                    hex::encode(group_pubkey),
-                    k.len()
-                )));
-            }
-            let mut v_bytes = [0u8; 4];
-            v_bytes.copy_from_slice(&k[32..36]);
-            let version = u32::from_be_bytes(v_bytes);
+            let version = require_versioned_descriptor_key(k)?;
             if latest_version.is_none_or(|cur| version > cur) {
                 latest_version = Some(version);
             }
@@ -685,17 +672,9 @@ impl Storage {
             // Mirror `get_descriptor`: fail closed on unexpected key lengths
             // rather than silently hiding a group whose row survived an
             // incomplete v4->v5 migration.
-            if key.len() != 36 {
-                return Err(KeepError::Other(format!(
-                    "wallet_descriptors row has unexpected key length {} (expected 36); migration to v5 incomplete",
-                    key.len()
-                )));
-            }
+            let version = require_versioned_descriptor_key(key)?;
             let mut group = [0u8; 32];
             group.copy_from_slice(&key[..32]);
-            let mut v_bytes = [0u8; 4];
-            v_bytes.copy_from_slice(&key[32..36]);
-            let version = u32::from_be_bytes(v_bytes);
             latest
                 .entry(group)
                 .and_modify(|cur| {
@@ -1055,6 +1034,28 @@ pub(crate) fn descriptor_storage_key(group_pubkey: &[u8; 32], version: u32) -> [
     key
 }
 
+/// Extract the version from the trailing 4 big-endian bytes of a descriptor
+/// row key. Caller must have verified `key.len() == 36`.
+fn descriptor_key_version(key: &[u8]) -> u32 {
+    let mut v_bytes = [0u8; 4];
+    v_bytes.copy_from_slice(&key[32..36]);
+    u32::from_be_bytes(v_bytes)
+}
+
+/// Strictly parse a descriptor row key, returning its version. Fails closed on
+/// any non-36-byte key: post-migration every row is `group||version_be`, so an
+/// unexpected length means the v4->v5 migration did not complete and the caller
+/// must not silently miss data.
+fn require_versioned_descriptor_key(key: &[u8]) -> Result<u32> {
+    if key.len() != 36 {
+        return Err(KeepError::Other(format!(
+            "wallet_descriptors row has unexpected key length {} (expected 36); migration to v5 incomplete",
+            key.len()
+        )));
+    }
+    Ok(descriptor_key_version(key))
+}
+
 /// Parse a descriptor row key produced by [`descriptor_storage_key`] and
 /// return its version. Returns `None` for any legacy 32-byte row that
 /// matches the group prefix; the v4->v5 migration was expected to rewrite
@@ -1075,9 +1076,7 @@ fn parse_versioned_descriptor_key(
         );
         return None;
     }
-    let mut v_bytes = [0u8; 4];
-    v_bytes.copy_from_slice(&key[32..36]);
-    Some(u32::from_be_bytes(v_bytes))
+    Some(descriptor_key_version(key))
 }
 
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {

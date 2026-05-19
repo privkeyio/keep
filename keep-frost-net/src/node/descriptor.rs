@@ -366,9 +366,8 @@ impl KfpNode {
                 // that were already observed within the replay window.
                 if seen.len() > MAX_SEEN_DESCRIPTOR_MIGRATES {
                     let evict = seen.len() - MAX_SEEN_DESCRIPTOR_MIGRATES;
-                    let mut by_ts: Vec<(([u8; 32], [u8; 32]), u64)> =
-                        seen.iter().map(|(k, v)| (*k, *v)).collect();
-                    by_ts.sort_unstable_by_key(|(_, ts)| *ts);
+                    let mut by_ts: Vec<_> = seen.iter().map(|(k, v)| (*k, *v)).collect();
+                    by_ts.sort_unstable_by_key(|&(_, ts)| ts);
                     for (k, _) in by_ts.into_iter().take(evict) {
                         seen.remove(&k);
                     }

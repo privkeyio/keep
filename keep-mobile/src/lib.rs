@@ -1785,6 +1785,18 @@ impl KeepMobile {
                 }
                 None => [0u8; 32],
             };
+            if d.version == 0 {
+                return Err(KeepMobileError::BackupError {
+                    msg: "descriptor version must be >= 1".into(),
+                });
+            }
+            let previous_descriptor_hash = match d.previous_descriptor_hash_hex.as_deref() {
+                Some(h) => {
+                    let bytes = decode_hex(h, "descriptor previous_descriptor_hash")?;
+                    Some(bytes_to_32(&bytes, "descriptor previous_descriptor_hash")?)
+                }
+                None => None,
+            };
             core_descriptors.push(keep_core::wallet::WalletDescriptor {
                 group_pubkey,
                 external_descriptor: d.external_descriptor.clone(),
@@ -1793,21 +1805,8 @@ impl KeepMobile {
                 created_at: d.created_at,
                 device_registrations,
                 policy_hash,
-                version: {
-                    if d.version == 0 {
-                        return Err(KeepMobileError::BackupError {
-                            msg: "descriptor version must be >= 1".into(),
-                        });
-                    }
-                    d.version
-                },
-                previous_descriptor_hash: match d.previous_descriptor_hash_hex.as_deref() {
-                    Some(h) => {
-                        let bytes = decode_hex(h, "descriptor previous_descriptor_hash")?;
-                        Some(bytes_to_32(&bytes, "descriptor previous_descriptor_hash")?)
-                    }
-                    None => None,
-                },
+                version: d.version,
+                previous_descriptor_hash,
             });
         }
 
