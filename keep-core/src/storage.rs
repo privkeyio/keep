@@ -666,8 +666,7 @@ impl Storage {
         let keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, &[])?;
         // Pick the highest-versioned key per group from the trailing 4 BE
         // bytes of each row key, then decrypt only those rows.
-        let mut latest: std::collections::HashMap<[u8; 32], u32> =
-            std::collections::HashMap::new();
+        let mut latest: std::collections::HashMap<[u8; 32], u32> = std::collections::HashMap::new();
         for key in &keys {
             // Mirror `get_descriptor`: fail closed on unexpected key lengths
             // rather than silently hiding a group whose row survived an
