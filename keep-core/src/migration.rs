@@ -62,21 +62,22 @@ fn migrate_v4_to_v5(db: &Database) -> Result<()> {
     let wtxn = db.begin_write()?;
     {
         let mut table = wtxn.open_table(DESCRIPTORS_TABLE_DEF)?;
-        // Collect (old_key, new_key, value) for every legacy 32-byte row.
+        // Collect only the legacy 32-byte keys up front. Avoid materializing
+        // the encrypted payloads here: on large vaults / mobile, doubling
+        // every row in memory before rewriting is wasteful. The payload is
+        // re-read row-by-row below inside the same transaction.
+        //
         // Rows already in versioned form (36 bytes) are left untouched so
         // re-running the migration is a no-op.
-        let mut rekey: Vec<([u8; 32], [u8; 36], Vec<u8>)> = Vec::new();
+        let mut legacy_keys: Vec<[u8; 32]> = Vec::new();
         for entry in table.iter()? {
-            let (k, v) = entry?;
+            let (k, _v) = entry?;
             let key_bytes = k.value();
             match key_bytes.len() {
                 32 => {
                     let mut old = [0u8; 32];
                     old.copy_from_slice(key_bytes);
-                    let mut new_key = [0u8; 36];
-                    new_key[..32].copy_from_slice(&old);
-                    new_key[32..36].copy_from_slice(&1u32.to_be_bytes());
-                    rekey.push((old, new_key, v.value().to_vec()));
+                    legacy_keys.push(old);
                 }
                 36 => {}
                 other => {
@@ -86,7 +87,10 @@ fn migrate_v4_to_v5(db: &Database) -> Result<()> {
                 }
             }
         }
-        for (old, new_key, value) in rekey {
+        for old in legacy_keys {
+            let mut new_key = [0u8; 36];
+            new_key[..32].copy_from_slice(&old);
+            new_key[32..36].copy_from_slice(&1u32.to_be_bytes());
             // Refuse to overwrite an existing v5 row at the rekeyed location.
             // Such a row should never exist (the source is a legacy 32-byte
             // key for the same group at version 1), but if it does, we must
@@ -97,6 +101,16 @@ fn migrate_v4_to_v5(db: &Database) -> Result<()> {
                     hex::encode(new_key)
                 )));
             }
+            let value: Vec<u8> = table
+                .get(old.as_slice())?
+                .ok_or_else(|| {
+                    KeepError::Migration(format!(
+                        "wallet_descriptors row {} vanished mid-migration",
+                        hex::encode(old)
+                    ))
+                })?
+                .value()
+                .to_vec();
             table.insert(new_key.as_slice(), value.as_slice())?;
             table.remove(old.as_slice())?;
         }

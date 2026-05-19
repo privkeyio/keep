@@ -196,6 +196,14 @@ pub fn cmd_frost_network_serve(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            // The predecessor lookup and the subsequent store
+                            // are not held under a single critical section
+                            // beyond `keep.lock()`; a second migrate event
+                            // could in principle race here. In the CLI this
+                            // is acceptable because event handling for a
+                            // single node is serialized through this task
+                            // and only one migration can be in flight per
+                            // group at the protocol layer.
                             let guard = keep.lock().expect("keep mutex poisoned");
                             let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
                                 match guard.get_wallet_descriptor(&group_pubkey) {
