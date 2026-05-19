@@ -199,7 +199,17 @@ pub fn cmd_frost_network_serve(
                             let guard = keep.lock().expect("keep mutex poisoned");
                             let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
                                 match guard.get_wallet_descriptor(&group_pubkey) {
-                                    Ok(Some(prev)) => Some(prev.canonical_hash()),
+                                    Ok(Some(prev)) => {
+                                        if prev.version != version - 1 {
+                                            tracing::error!(
+                                                version,
+                                                predecessor_version = prev.version,
+                                                "refusing to persist migrated descriptor: predecessor version is not the immediate predecessor"
+                                            );
+                                            return;
+                                        }
+                                        Some(prev.canonical_hash())
+                                    }
                                     Ok(None) => {
                                         tracing::error!(
                                             version,
