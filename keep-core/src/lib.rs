@@ -674,12 +674,27 @@ impl Keep {
         self.storage.get_descriptor(group_pubkey)
     }
 
-    /// List all stored wallet descriptors.
+    /// List the latest-version wallet descriptor for every group. Older
+    /// descriptor versions are not returned; use
+    /// [`list_all_wallet_descriptor_versions`] when every row is required
+    /// (backup, rotation re-encryption verification, etc.).
+    ///
+    /// [`list_all_wallet_descriptor_versions`]: Self::list_all_wallet_descriptor_versions
     pub fn list_wallet_descriptors(&self) -> Result<Vec<WalletDescriptor>> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
         self.storage.list_descriptors()
+    }
+
+    /// List every persisted wallet descriptor row across all groups and
+    /// versions. Used by backup and rotation paths that must round-trip every
+    /// stored record.
+    pub fn list_all_wallet_descriptor_versions(&self) -> Result<Vec<WalletDescriptor>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_all_descriptor_versions()
     }
 
     /// Delete a wallet descriptor.

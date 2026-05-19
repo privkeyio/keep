@@ -230,7 +230,23 @@ impl Storage {
 
         let keys = self.list_keys()?;
         let shares = self.list_shares()?;
-        let descriptors = self.list_descriptors()?;
+        let descriptors = self.list_all_descriptor_versions()?;
+        // Migration v4->v5 rekeys every legacy 32-byte descriptor row to a
+        // versioned 36-byte key, and `Storage::open` runs all pending
+        // migrations before rotation can be invoked. Guard that invariant
+        // here so the re-encrypt count equality below cannot be subverted by
+        // any straggler legacy row that would otherwise be silently skipped
+        // by versioned-key parsers post-rotation.
+        {
+            let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+            let all_keys = backend.list_keys_with_prefix(DESCRIPTORS_TABLE, &[])?;
+            if let Some(bad) = all_keys.iter().find(|k| k.len() != 36) {
+                return Err(KeepError::RotationFailed(format!(
+                    "legacy descriptor row with key length {} remains pre-rotation; refusing to rotate",
+                    bad.len()
+                )));
+            }
+        }
         let relay_configs = self.list_relay_configs()?;
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;

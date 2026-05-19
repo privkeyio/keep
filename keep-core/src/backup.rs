@@ -287,7 +287,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
         });
     }
 
-    let descriptors = keep.list_wallet_descriptors()?;
+    let descriptors = keep.list_all_wallet_descriptor_versions()?;
     let relay_configs = keep.list_relay_configs()?;
     let health_statuses = keep.list_health_statuses()?;
     let kill_switch = keep.get_kill_switch()?;
