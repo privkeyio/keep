@@ -658,6 +658,16 @@ impl keep_frost_net::PersistedDescriptorLookup for StaticDescriptorLookup {
             None
         }
     }
+    fn latest_version_for(
+        &self,
+        group: &[u8; 32],
+    ) -> std::result::Result<Option<u32>, keep_frost_net::DescriptorLookupUnavailable> {
+        if &self.descriptor.group_pubkey == group {
+            Ok(Some(self.descriptor.version))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[tokio::test]
@@ -747,6 +757,7 @@ async fn test_psbt_recovery_spend_end_to_end() {
             }],
             timelock_months: 6,
         }],
+        version: 1,
     };
     let policy_hash = keep_frost_net::derive_policy_hash(&policy);
 
@@ -765,6 +776,8 @@ async fn test_psbt_recovery_spend_end_to_end() {
         created_at: 0,
         device_registrations: Vec::new(),
         policy_hash,
+        version: 1,
+        previous_descriptor_hash: None,
         policy: policy_value,
     };
     let descriptor_hash = wallet_descriptor.canonical_hash();

@@ -454,6 +454,7 @@ mod tests {
             policy_hash: [0xAAu8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         // Pinned bytes computed against the legacy formula:
         // sha256(le_u64(len(ext)) || ext || le_u64(len(int)) || int || policy_hash)
@@ -483,6 +484,7 @@ mod tests {
             policy_hash: [0u8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         let h1 = v1.canonical_hash();
         v1.version = 2;
@@ -542,6 +544,8 @@ mod tests {
             created_at: 1,
             device_registrations: Vec::new(),
             policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
             policy: Some(policy.clone()),
         };
         let json = serde_json::to_string(&desc).unwrap();
