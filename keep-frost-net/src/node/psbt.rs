@@ -1195,10 +1195,25 @@ fn aggregate_partial_psbts(
             )));
         }
         let proposed_leaf = bitcoin::taproot::TapLeafHash::from_script(script, *leaf_version);
+        // Collect the x-only keys actually committed inside the leaf script so
+        // that signatures for keys not present in the leaf cannot be counted
+        // toward the threshold.
+        let mut committed_keys = HashSet::new();
+        for instr in script.instructions_minimal() {
+            if let Ok(bitcoin::blockdata::script::Instruction::PushBytes(push)) = instr {
+                if push.len() == 32 {
+                    if let Ok(xonly) =
+                        bitcoin::secp256k1::XOnlyPublicKey::from_slice(push.as_bytes())
+                    {
+                        committed_keys.insert(xonly);
+                    }
+                }
+            }
+        }
         let matching = input
             .tap_script_sigs
             .keys()
-            .filter(|(_, leaf_hash)| *leaf_hash == proposed_leaf)
+            .filter(|(pk, leaf_hash)| *leaf_hash == proposed_leaf && committed_keys.contains(pk))
             .count() as u32;
         if matching < required_threshold {
             return Err(FrostNetError::Session(format!(
