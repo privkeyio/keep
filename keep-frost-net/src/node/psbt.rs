@@ -1221,33 +1221,38 @@ fn aggregate_partial_psbts(
                 }
             }
         }
-        let sighash = bitcoin::sighash::SighashCache::new(&aggregated.unsigned_tx)
-            .taproot_script_spend_signature_hash(
-                idx,
-                &bitcoin::sighash::Prevouts::All(&prevouts),
-                proposed_leaf,
-                bitcoin::sighash::TapSighashType::Default,
-            )
-            .map_err(|e| {
-                FrostNetError::Session(format!("aggregated PSBT input {idx} sighash failed: {e}"))
-            })?;
-        let msg =
-            bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref()).map_err(|e| {
-                FrostNetError::Session(format!("aggregated PSBT input {idx} invalid sighash: {e}"))
-            })?;
         // Count only signatures that actually verify against the proposed leaf's
         // sighash so a signer cannot pad its partial with bogus tap_script_sigs
-        // for other committed keys to satisfy the threshold.
-        let matching = input
-            .tap_script_sigs
-            .iter()
-            .filter(|((pk, leaf_hash), sig)| {
-                *leaf_hash == proposed_leaf
-                    && committed_keys.contains(pk)
-                    && sig.sighash_type == bitcoin::sighash::TapSighashType::Default
-                    && secp.verify_schnorr(&sig.signature, &msg, pk).is_ok()
-            })
-            .count() as u32;
+        // for other committed keys to satisfy the threshold. The sighash is
+        // recomputed per signature using that signature's own sighash_type so a
+        // legitimate non-default sighash is verified rather than silently dropped.
+        let mut matching = 0u32;
+        for ((pk, leaf_hash), sig) in input.tap_script_sigs.iter() {
+            if *leaf_hash != proposed_leaf || !committed_keys.contains(pk) {
+                continue;
+            }
+            let sighash = bitcoin::sighash::SighashCache::new(&aggregated.unsigned_tx)
+                .taproot_script_spend_signature_hash(
+                    idx,
+                    &bitcoin::sighash::Prevouts::All(&prevouts),
+                    proposed_leaf,
+                    sig.sighash_type,
+                )
+                .map_err(|e| {
+                    FrostNetError::Session(format!(
+                        "aggregated PSBT input {idx} sighash failed: {e}"
+                    ))
+                })?;
+            let msg =
+                bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref()).map_err(|e| {
+                    FrostNetError::Session(format!(
+                        "aggregated PSBT input {idx} invalid sighash: {e}"
+                    ))
+                })?;
+            if secp.verify_schnorr(&sig.signature, &msg, pk).is_ok() {
+                matching += 1;
+            }
+        }
         if matching < required_threshold {
             return Err(FrostNetError::Session(format!(
                 "aggregated PSBT input {idx} has {matching} tap_script_sigs for the proposed leaf, below threshold {required_threshold}"
