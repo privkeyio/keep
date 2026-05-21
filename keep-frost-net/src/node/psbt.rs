@@ -1187,9 +1187,30 @@ fn aggregate_partial_psbts(
         .iter()
         .enumerate()
         .map(|(i, input)| {
-            input.witness_utxo.clone().ok_or_else(|| {
-                FrostNetError::Session(format!("aggregated PSBT input {i} missing witness_utxo"))
-            })
+            if let Some(txout) = input.witness_utxo.clone() {
+                return Ok(txout);
+            }
+            if let Some(tx) = input.non_witness_utxo.as_ref() {
+                let vout = aggregated
+                    .unsigned_tx
+                    .input
+                    .get(i)
+                    .ok_or_else(|| {
+                        FrostNetError::Session(format!(
+                            "aggregated PSBT input {i} has no matching unsigned_tx input"
+                        ))
+                    })?
+                    .previous_output
+                    .vout as usize;
+                return tx.output.get(vout).cloned().ok_or_else(|| {
+                    FrostNetError::Session(format!(
+                        "aggregated PSBT input {i} non_witness_utxo has no output at index {vout}"
+                    ))
+                });
+            }
+            Err(FrostNetError::Session(format!(
+                "aggregated PSBT input {i} missing witness_utxo and non_witness_utxo"
+            )))
         })
         .collect::<Result<Vec<_>>>()?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
