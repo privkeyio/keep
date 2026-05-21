@@ -1182,6 +1182,17 @@ fn aggregate_partial_psbts(
     // (e.g. one classic ECDSA partial_sig plus their own tap_script_sig).
     // FROST key-path spends produce a single aggregated tap_key_sig regardless
     // of threshold and must use a different aggregator.
+    let prevouts: Vec<_> = aggregated
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input.witness_utxo.clone().ok_or_else(|| {
+                FrostNetError::Session(format!("aggregated PSBT input {i} missing witness_utxo"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     for (idx, input) in aggregated.inputs.iter().enumerate() {
         let mut iter = input.tap_scripts.iter();
         let (_, (script, leaf_version)) = iter.next().ok_or_else(|| {
@@ -1210,10 +1221,32 @@ fn aggregate_partial_psbts(
                 }
             }
         }
+        let sighash = bitcoin::sighash::SighashCache::new(&aggregated.unsigned_tx)
+            .taproot_script_spend_signature_hash(
+                idx,
+                &bitcoin::sighash::Prevouts::All(&prevouts),
+                proposed_leaf,
+                bitcoin::sighash::TapSighashType::Default,
+            )
+            .map_err(|e| {
+                FrostNetError::Session(format!("aggregated PSBT input {idx} sighash failed: {e}"))
+            })?;
+        let msg =
+            bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref()).map_err(|e| {
+                FrostNetError::Session(format!("aggregated PSBT input {idx} invalid sighash: {e}"))
+            })?;
+        // Count only signatures that actually verify against the proposed leaf's
+        // sighash so a signer cannot pad its partial with bogus tap_script_sigs
+        // for other committed keys to satisfy the threshold.
         let matching = input
             .tap_script_sigs
-            .keys()
-            .filter(|(pk, leaf_hash)| *leaf_hash == proposed_leaf && committed_keys.contains(pk))
+            .iter()
+            .filter(|((pk, leaf_hash), sig)| {
+                *leaf_hash == proposed_leaf
+                    && committed_keys.contains(pk)
+                    && sig.sighash_type == bitcoin::sighash::TapSighashType::Default
+                    && secp.verify_schnorr(&sig.signature, &msg, pk).is_ok()
+            })
             .count() as u32;
         if matching < required_threshold {
             return Err(FrostNetError::Session(format!(
