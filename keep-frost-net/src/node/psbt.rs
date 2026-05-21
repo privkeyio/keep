@@ -1183,15 +1183,26 @@ fn aggregate_partial_psbts(
     // FROST key-path spends produce a single aggregated tap_key_sig regardless
     // of threshold and must use a different aggregator.
     for (idx, input) in aggregated.inputs.iter().enumerate() {
-        let mut per_leaf: std::collections::HashMap<bitcoin::taproot::TapLeafHash, u32> =
-            std::collections::HashMap::new();
-        for (_, leaf_hash) in input.tap_script_sigs.keys() {
-            *per_leaf.entry(*leaf_hash).or_default() += 1;
-        }
-        let max_for_one_leaf = per_leaf.values().copied().max().unwrap_or(0);
-        if max_for_one_leaf < required_threshold {
+        let mut iter = input.tap_scripts.iter();
+        let (_, (script, leaf_version)) = iter.next().ok_or_else(|| {
+            FrostNetError::Session(format!(
+                "aggregated PSBT input {idx} has no tap_scripts entry; cannot determine proposed leaf"
+            ))
+        })?;
+        if iter.next().is_some() {
             return Err(FrostNetError::Session(format!(
-                "aggregated PSBT input {idx} has at most {max_for_one_leaf} tap_script_sigs for any single leaf, below threshold {required_threshold}"
+                "aggregated PSBT input {idx} has more than one tap_scripts entry; ambiguous proposed leaf"
+            )));
+        }
+        let proposed_leaf = bitcoin::taproot::TapLeafHash::from_script(script, *leaf_version);
+        let matching = input
+            .tap_script_sigs
+            .keys()
+            .filter(|(_, leaf_hash)| *leaf_hash == proposed_leaf)
+            .count() as u32;
+        if matching < required_threshold {
+            return Err(FrostNetError::Session(format!(
+                "aggregated PSBT input {idx} has {matching} tap_script_sigs for the proposed leaf, below threshold {required_threshold}"
             )));
         }
     }

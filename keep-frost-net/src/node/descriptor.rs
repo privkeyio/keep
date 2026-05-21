@@ -1397,6 +1397,7 @@ impl KfpNode {
             let Some(peer) = peers.get_peer_mut(payload.share_index) else {
                 return Ok(());
             };
+            peer.touch();
             peer.set_recovery_xpubs(payload.recovery_xpubs.clone());
         }
 

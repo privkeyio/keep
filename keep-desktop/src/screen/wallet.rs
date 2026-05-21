@@ -1778,10 +1778,12 @@ impl State {
             submit_btn = submit_btn.on_press(Message::SubmitApprovePsbt);
         }
 
-        let cancel_btn = button(text("Cancel").size(theme::size::SMALL))
-            .on_press(Message::CancelApprovePsbt)
+        let mut cancel_btn = button(text("Cancel").size(theme::size::SMALL))
             .style(theme::secondary_button)
             .padding([theme::space::XS, theme::space::MD]);
+        if !state.submitting {
+            cancel_btn = cancel_btn.on_press(Message::CancelApprovePsbt);
+        }
 
         let mut content = column![
             text("Approve via NIP-46 signer")

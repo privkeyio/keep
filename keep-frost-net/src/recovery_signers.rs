@@ -61,7 +61,7 @@ impl InMemoryRecoverySignerRegistry {
     /// to-end and avoid a plain-`String` hop across the boundary.
     pub fn insert(&self, fingerprint: &str, label: String, bunker_uri: Zeroizing<String>) {
         self.entries.write().insert(
-            fingerprint.to_ascii_lowercase(),
+            fingerprint.trim().to_ascii_lowercase(),
             RecoverySignerHandle { label, bunker_uri },
         );
     }
@@ -69,7 +69,7 @@ impl InMemoryRecoverySignerRegistry {
     pub fn remove(&self, fingerprint: &str) -> Option<RecoverySignerHandle> {
         self.entries
             .write()
-            .remove(&fingerprint.to_ascii_lowercase())
+            .remove(&fingerprint.trim().to_ascii_lowercase())
     }
 
     pub fn fingerprints(&self) -> Vec<String> {
@@ -81,7 +81,7 @@ impl RecoverySignerRegistry for InMemoryRecoverySignerRegistry {
     fn resolve(&self, fingerprint: &str) -> Option<RecoverySignerHandle> {
         self.entries
             .read()
-            .get(&fingerprint.to_ascii_lowercase())
+            .get(&fingerprint.trim().to_ascii_lowercase())
             .cloned()
     }
 }

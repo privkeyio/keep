@@ -167,6 +167,12 @@ impl RecoveryTxBuilder {
     /// scripts, so this layout is guaranteed by construction.
     pub fn finalize_recovery(&self, psbt: &mut Psbt, tier_index: usize) -> Result<Transaction> {
         let tier = self.get_tier(tier_index)?;
+        if psbt.inputs.len() != 1 || psbt.unsigned_tx.input.len() != 1 {
+            return Err(BitcoinError::Recovery(format!(
+                "finalize_recovery requires exactly one PSBT input, got {}",
+                psbt.inputs.len()
+            )));
+        }
         let control_block = self.control_block(tier)?;
         // Defensive check: a CHECKSIGADD witness needs one push per key, so a
         // tier with zero keys cannot be finalized. Fail closed rather than
