@@ -1714,14 +1714,11 @@ async fn approve_psbt_session(
     }
     // Inputs on the recovery path always carry witness_utxo (enforced by the
     // binding verification above), so the fee is computable and worth showing.
-    let total_in: Option<u64> = psbt
-        .inputs
-        .iter()
-        .try_fold(0u64, |acc, inp| {
-            inp.witness_utxo
-                .as_ref()
-                .and_then(|t| acc.checked_add(t.value.to_sat()))
-        });
+    let total_in: Option<u64> = psbt.inputs.iter().try_fold(0u64, |acc, inp| {
+        inp.witness_utxo
+            .as_ref()
+            .and_then(|t| acc.checked_add(t.value.to_sat()))
+    });
     if let Some(fee) = total_in.and_then(|i| i.checked_sub(total_out)) {
         out.field("Fee", &format!("{fee} sats"));
     }
