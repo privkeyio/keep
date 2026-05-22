@@ -819,8 +819,16 @@ async fn test_psbt_recovery_spend_end_to_end() {
         let mut n2 = 0u32;
         loop {
             tokio::select! {
-                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => n1 += 1,
-                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => n2 += 1,
+                ev = rx1.recv() => {
+                    if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = ev {
+                        n1 += 1;
+                    }
+                }
+                ev = rx2.recv() => {
+                    if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = ev {
+                        n2 += 1;
+                    }
+                }
             }
             if n1 >= 1 && n2 >= 1 {
                 return;
@@ -861,6 +869,29 @@ async fn test_psbt_recovery_spend_end_to_end() {
         graceful_shutdown(shutdown1, node1_handle).await;
         graceful_shutdown(shutdown2, node2_handle).await;
         panic!("did not receive responder's XpubAnnounce");
+    }
+
+    // The XpubAnnounced event only signals the announce was ingested; under load
+    // the peer's stored xpub may lag the event observer. Poll node1's peer view
+    // until the responder fingerprint is present so target_peers filtering by
+    // fingerprint deterministically succeeds before we propose.
+    let xpub_stored = timeout(Duration::from_secs(15), async {
+        loop {
+            if node1
+                .get_peer_recovery_xpubs(2)
+                .map(|xpubs| xpubs.iter().any(|x| x.fingerprint == responder_fp))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if xpub_stored.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        panic!("node1 did not store responder's recovery xpub");
     }
 
     // Build an unsigned recovery-spend PSBT for a 1-input/1-output tx against
