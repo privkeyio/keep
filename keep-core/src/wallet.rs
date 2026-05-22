@@ -149,6 +149,12 @@ pub struct WalletDescriptor {
     /// migration. `None` for the initial descriptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_descriptor_hash: Option<[u8; 32]>,
+    /// The wallet policy that produced this descriptor, persisted as an opaque
+    /// JSON value so `keep-core` does not depend on `keep-frost-net`. Callers
+    /// reconstruct `WalletPolicy` via `serde_json::from_value`. Older records
+    /// without this field deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<serde_json::Value>,
 }
 
 /// The version assigned to the initial wallet descriptor for a group.
@@ -328,6 +334,7 @@ mod tests {
             policy_hash: [0u8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         let signer = [7u8; 32];
         desc.upsert_device_registration(DeviceRegistration {
@@ -417,6 +424,7 @@ mod tests {
             policy_hash: [0u8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: WalletDescriptor = serde_json::from_str(&json).unwrap();
@@ -446,6 +454,7 @@ mod tests {
             policy_hash: [0xAAu8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         // Pinned bytes computed against the legacy formula:
         // sha256(le_u64(len(ext)) || ext || le_u64(len(int)) || int || policy_hash)
@@ -475,6 +484,7 @@ mod tests {
             policy_hash: [0u8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         let h1 = v1.canonical_hash();
         v1.version = 2;
@@ -494,8 +504,52 @@ mod tests {
             policy_hash: [0u8; 32],
             version: 1,
             previous_descriptor_hash: None,
+            policy: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("device_registrations"));
+        assert!(!json.contains("\"policy\""));
+    }
+
+    #[test]
+    fn test_descriptor_back_compat_deserializes_without_policy() {
+        let json = r#"{
+            "group_pubkey": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "external_descriptor": "tr(xpub.../0/*)#abc",
+            "internal_descriptor": "tr(xpub.../1/*)#def",
+            "network": "testnet",
+            "created_at": 1700000000
+        }"#;
+        let desc: WalletDescriptor = serde_json::from_str(json).expect("back-compat deserialize");
+        assert!(desc.policy.is_none());
+    }
+
+    #[test]
+    fn test_descriptor_policy_roundtrips() {
+        let policy = serde_json::json!({
+            "recovery_tiers": [{
+                "threshold": 2,
+                "timelock_months": 6,
+                "key_slots": [
+                    {"type": "participant", "share_index": 1},
+                    {"type": "external", "xpub": "xpub6...", "fingerprint": "abcdef01"}
+                ]
+            }]
+        });
+        let desc = WalletDescriptor {
+            group_pubkey: [0u8; 32],
+            external_descriptor: "a".into(),
+            internal_descriptor: "b".into(),
+            network: "testnet".into(),
+            created_at: 1,
+            device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
+            version: 1,
+            previous_descriptor_hash: None,
+            policy: Some(policy.clone()),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let parsed: WalletDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.policy.as_ref(), Some(&policy));
     }
 }

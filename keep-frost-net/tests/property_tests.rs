@@ -9,8 +9,17 @@ use keep_frost_net::{
 };
 use proptest::prelude::*;
 
-const TEST_XPUB: &str = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
-const TEST_TPUB: &str = "tpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxy5eYgMRkvksmGH3BPAxxxxxxxxxxxxxxxxxxxxxxxx";
+const TEST_XPUBS: &[&str] = &[
+    "xpub68E4m4SzytZD9PJBwUjEk7s86ZnsLBS8yUmkewPaPFGCAfZz65rB4CnaEvmtFSxECi2oxEHxoEhzt7mue7TdZtrcfmFJfjtSJSdQzQsj6Wq",
+    "xpub68E4m4SzytZDB5dS961HDkDSY6HrjFgjfPcuyjkNURXMiTKb44rWeDY7ZSbzMgrZkhPXkFaB6hR6BBUzNCTroSd1ewTw6JRdB8cq2vkjSH1",
+    "xpub68E4m4SzytZDDWGUyToUTSAut4zeTPT8jchUXSETF4qer2ydy2oGHYrquHCjjGsnHjwGby8vCVg1aMxrWQxv7D2MKan6yW6zotuejYJ5xo2",
+    "xpub68E4m4SzytZDFXvZ3ef7TaNeyRwHpPVjxQVTNm3Byi5VPZYYDF9BZJGNsTR9d1Q86HTL2BY91sJTHLJ36KvkZx6kuSDLoG2YxQRwU1XbTSS",
+    "xpub68E4m4SzytZDJmnj987w1PrY4qsz62CCZUsnkqQtq6hbzZvw14i9Hj7wXtk2N15AzwUftoQhVU7Tixaakv1DMwehkLFr9FWbuJ1e3DdZwFv",
+];
+const TEST_XPUB: &str = TEST_XPUBS[0];
+const TEST_TPUB: &str = "tpubD8bhHJGghAWfRBV3PfiKx3CVRgtXKZwCX7N41VSijA25uxEhAJhGCeTQUxrfmwuTzcZiZooqLLY3aJGX2yJsTLJujMzcMGYftQDpkS2iZz8";
+// SLIP-132 P2WSH-multisig extended key; accepted by prefix+length, not BIP32-parsed.
+const TEST_SLIP132_XPUB: &str = "Vpub5fTdGxqcFV2csN5LDRcyA21vURYEfJ8jTXNz1QsM11LqgeWSMAuKuCLE1DpBp4sHctsBKs6xm8PQEiAYVwnZ7uc5mYxruKiTeimzoDrSihv";
 
 fn roundtrip(msg: KfpMessage) -> KfpMessage {
     let json = msg.to_json().unwrap();
@@ -177,7 +186,7 @@ proptest! {
         let fingerprint = format!("{fingerprint_byte:08x}");
         let xpubs: Vec<AnnouncedXpub> = (0..xpub_count)
             .map(|i| AnnouncedXpub {
-                xpub: format!("{TEST_XPUB}{i:02}"),
+                xpub: TEST_XPUBS[i].into(),
                 fingerprint: fingerprint.clone(),
                 label: None,
             })
@@ -345,6 +354,11 @@ fn valid_xpub_announce_passes_validation() {
             xpub: TEST_TPUB.into(),
             fingerprint: "00112233".into(),
             label: None,
+        },
+        AnnouncedXpub {
+            xpub: TEST_SLIP132_XPUB.into(),
+            fingerprint: "44556677".into(),
+            label: Some("p2wsh".into()),
         },
     ];
     let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);

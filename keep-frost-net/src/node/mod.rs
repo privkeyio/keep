@@ -305,6 +305,7 @@ pub enum KfpNodeEvent {
         /// migration lineage is preserved when this completion was a v2+
         /// descriptor.
         version: u32,
+        policy: WalletPolicy,
     },
     DescriptorAcked {
         session_id: [u8; 32],
@@ -561,6 +562,8 @@ pub struct KfpNode {
     pub(crate) psbt_proposers: RwLock<HashSet<u16>>,
     pub(crate) local_recovery_xpubs: RwLock<Vec<AnnouncedXpub>>,
     pub(crate) descriptor_lookup: Option<Arc<dyn PersistedDescriptorLookup>>,
+    pub(crate) recovery_signer_registry:
+        Option<Arc<dyn crate::recovery_signers::RecoverySignerRegistry>>,
 }
 
 /// Strip control characters, clamp to `MAX_NACK_REASON_LENGTH`, and return a
@@ -728,12 +731,37 @@ impl KfpNode {
             psbt_proposers: RwLock::new(HashSet::new()),
             local_recovery_xpubs: RwLock::new(Vec::new()),
             descriptor_lookup: None,
+            recovery_signer_registry: None,
         })
     }
 
     pub fn with_descriptor_lookup(mut self, lookup: Arc<dyn PersistedDescriptorLookup>) -> Self {
         self.descriptor_lookup = Some(lookup);
         self
+    }
+
+    /// Attach a registry mapping recovery-tier xpub fingerprints to external
+    /// NIP-46 signers. Callers handling `PsbtSignatureNeeded` events use
+    /// `resolve_recovery_signer` to look up the configured bunker URI for a
+    /// given fingerprint.
+    pub fn with_recovery_signer_registry(
+        mut self,
+        registry: Arc<dyn crate::recovery_signers::RecoverySignerRegistry>,
+    ) -> Self {
+        self.recovery_signer_registry = Some(registry);
+        self
+    }
+
+    /// Resolve a recovery-tier xpub fingerprint to a registered external
+    /// signer, or `None` if no registry is attached or the fingerprint has
+    /// no entry.
+    pub fn resolve_recovery_signer(
+        &self,
+        fingerprint: &str,
+    ) -> Option<crate::recovery_signers::RecoverySignerHandle> {
+        self.recovery_signer_registry
+            .as_ref()
+            .and_then(|r| r.resolve(fingerprint))
     }
 
     pub fn with_descriptor_session_store(

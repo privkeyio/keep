@@ -89,6 +89,7 @@ pub struct WalletDescriptorInfo {
     /// supersedes, when this is a migration. `None` for the initial
     /// descriptor or for legacy records persisted before versioning.
     pub previous_descriptor_hash_hex: Option<String>,
+    pub policy_json: Option<String>,
 }
 
 impl std::fmt::Debug for WalletDescriptorInfo {

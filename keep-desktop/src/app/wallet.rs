@@ -84,6 +84,12 @@ impl App {
             wallet::Event::RejectPsbt(session_id) => {
                 Task::done(Message::RejectPsbtSignature(session_id))
             }
+            wallet::Event::ApprovePsbt {
+                session_id,
+                fingerprint,
+                bunker_uri,
+                psbt_hash,
+            } => self.begin_approve_psbt(session_id, fingerprint, bunker_uri, psbt_hash),
             wallet::Event::StartSpend { wallet_idx } => {
                 if let Screen::Wallet(ws) = &mut self.screen {
                     if let Some(entry) = ws.descriptors.get(wallet_idx).cloned() {
@@ -287,6 +293,34 @@ impl App {
                     }
                     Err(e) => {
                         self.set_toast(format!("PSBT reject failed: {e}"), ToastKind::Error);
+                    }
+                }
+                Task::none()
+            }
+            Message::ApprovePsbtResult(session_id, result) => {
+                match result {
+                    Ok(()) => {
+                        self.pending_psbt_signatures
+                            .retain(|e| e.session_id != session_id);
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            s.pending_psbt_signatures
+                                .retain(|e| e.session_id != session_id);
+                            if s.approve.as_ref().map(|a| a.session_id) == Some(session_id) {
+                                s.approve = None;
+                            }
+                        }
+                        self.set_toast("PSBT signature submitted".into(), ToastKind::Success);
+                    }
+                    Err(e) => {
+                        if let Screen::Wallet(s) = &mut self.screen {
+                            if let Some(a) = s.approve.as_mut() {
+                                if a.session_id == session_id {
+                                    a.submitting = false;
+                                    a.error = Some(e.clone());
+                                }
+                            }
+                        }
+                        self.set_toast(format!("Approve failed: {e}"), ToastKind::Error);
                     }
                 }
                 Task::none()
@@ -531,6 +565,159 @@ impl App {
                 .map_err(|e| format!("{e}"))
             },
             Message::SpendStartedResult,
+        )
+    }
+
+    /// Run the responder approve chain for a single PSBT session: resolve the
+    /// xpub for `fingerprint` from the persisted `WalletPolicy`, compute the
+    /// script-spend sighash from the in-flight proposal PSBT, request a
+    /// Schnorr signature from the NIP-46 signer at `bunker_uri`, merge it,
+    /// and contribute the partial PSBT back to the initiator.
+    pub(crate) fn begin_approve_psbt(
+        &mut self,
+        session_id: [u8; 32],
+        fingerprint: String,
+        bunker_uri: zeroize::Zeroizing<String>,
+        snapshot_psbt_hash: [u8; 32],
+    ) -> Task<Message> {
+        let Some(node) = self.get_frost_node() else {
+            return Task::done(Message::ApprovePsbtResult(
+                session_id,
+                Err("Relay not connected".into()),
+            ));
+        };
+        let keep_arc = self.keep.clone();
+        Task::perform(
+            async move {
+                let (initiator_pubkey, session_descriptor_hash, tier_index) = node
+                    .psbt_session_routing(&session_id)
+                    .ok_or_else(|| "unknown PSBT session".to_string())?;
+                let psbt_bytes = node
+                    .psbt_session_proposal_psbt(&session_id)
+                    .ok_or_else(|| "session has no proposal PSBT".to_string())?;
+
+                // SEC: Re-hash the in-flight proposal PSBT and compare to the
+                // hash captured at the moment the operator opened the
+                // approve pane. Catches proposer-side swaps in the
+                // preview/sign window. Fail closed.
+                {
+                    use keep_bitcoin::bitcoin::hashes::{sha256, Hash as _};
+                    let recomputed: [u8; 32] = sha256::Hash::hash(&psbt_bytes).to_byte_array();
+                    if recomputed != snapshot_psbt_hash {
+                        return Err(
+                            "PSBT hash changed between preview and sign; aborting".to_string()
+                        );
+                    }
+                }
+
+                let group_pubkey = *node.group_pubkey();
+                let descriptor = tokio::task::spawn_blocking(move || {
+                    with_keep_blocking(&keep_arc, "Failed to load descriptor", move |keep| {
+                        keep.get_wallet_descriptor(&group_pubkey)
+                            .map_err(friendly_err)?
+                            .ok_or_else(|| "No wallet descriptor for this group".to_string())
+                    })
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
+
+                // SEC: confirm the locally stored descriptor matches the one
+                // the session was coordinated against. Fail closed on mismatch
+                // to prevent signing under a substituted descriptor.
+                if descriptor.canonical_hash() != session_descriptor_hash {
+                    return Err(
+                        "stored descriptor hash does not match PSBT session descriptor_hash"
+                            .to_string(),
+                    );
+                }
+
+                let policy_value = descriptor
+                    .policy
+                    .clone()
+                    .ok_or_else(|| "Descriptor has no persisted WalletPolicy".to_string())?;
+                let policy = keep_frost_net::load_verified_wallet_policy(
+                    &policy_value,
+                    &descriptor.policy_hash,
+                )?;
+                let xpub_str = keep_frost_net::find_local_external_xpub_in_tier(
+                    &policy,
+                    tier_index,
+                    &fingerprint,
+                )?;
+
+                let network =
+                    <keep_bitcoin::Network as std::str::FromStr>::from_str(&descriptor.network)
+                        .map_err(|e| format!("invalid network: {e}"))?;
+                let xonly_bytes = keep_bitcoin::xpub_to_x_only(&xpub_str, network)
+                    .map_err(|e| format!("xpub_to_x_only: {e}"))?;
+                let xonly = keep_bitcoin::bitcoin::XOnlyPublicKey::from_slice(&xonly_bytes)
+                    .map_err(|e| format!("xonly decode: {e}"))?;
+
+                let mut psbt = keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+                    .map_err(|e| format!("decode PSBT: {e}"))?;
+                if psbt.inputs.is_empty() {
+                    return Err("PSBT has no inputs".to_string());
+                }
+
+                // SEC: verify every input upfront so we only forward sighashes
+                // for outputs we actually control. Fail closed before contacting
+                // the bunker.
+                let sighashes =
+                    keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
+                        .map_err(|e| format!("PSBT binding verification failed: {e}"))?;
+
+                let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
+                    .await
+                    .map_err(|e| format!("NIP-46 connect: {e}"))?;
+                let outcome: Result<(), String> = async {
+                    client
+                        .connect()
+                        .await
+                        .map_err(|e| format!("NIP-46 handshake: {e}"))?;
+                    for sh in &sighashes {
+                        let leaf_hash_bytes: [u8; 32] = {
+                            use keep_bitcoin::bitcoin::hashes::Hash as _;
+                            sh.leaf_hash.to_byte_array()
+                        };
+                        let sig = client
+                            .sign_tap_script(
+                                &sh.sighash,
+                                &xonly_bytes,
+                                &leaf_hash_bytes,
+                                sh.script.as_bytes(),
+                                &descriptor.external_descriptor,
+                            )
+                            .await
+                            .map_err(|e| format!("sign_tap_script: {e}"))?;
+                        keep_bitcoin::merge_tap_script_sig(
+                            &mut psbt,
+                            sh.input_index,
+                            xonly,
+                            sh.leaf_hash,
+                            &sh.sighash,
+                            sig,
+                        )
+                        .map_err(|e| format!("merge sig: {e}"))?;
+                    }
+                    Ok(())
+                }
+                .await;
+                client.disconnect().await;
+                outcome?;
+
+                let merged = psbt.serialize();
+                node.contribute_psbt_signature(
+                    session_id,
+                    &initiator_pubkey,
+                    keep_frost_net::SignerId::Fingerprint(fingerprint.clone()),
+                    merged,
+                )
+                .await
+                .map_err(|e| format!("contribute_psbt_signature: {e}"))?;
+
+                Ok::<(), String>(())
+            },
+            move |r| Message::ApprovePsbtResult(session_id, r),
         )
     }
 

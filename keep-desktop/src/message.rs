@@ -194,6 +194,7 @@ pub enum Message {
     WalletRegisterResult(Result<(), String>),
     RejectPsbtSignature([u8; 32]),
     RejectPsbtSignatureResult([u8; 32], Result<(), String>),
+    ApprovePsbtResult([u8; 32], Result<(), String>),
     CancelSpendResult([u8; 32], Result<(), String>),
     SpendStartedResult(Result<[u8; 32], String>),
 
@@ -281,6 +282,7 @@ pub enum FrostNodeMsg {
         external_descriptor: String,
         internal_descriptor: String,
         policy_hash: [u8; 32],
+        policy: Option<serde_json::Value>,
     },
     DescriptorAcked {
         session_id: [u8; 32],
@@ -513,6 +515,11 @@ impl fmt::Debug for Message {
                 .finish(),
             Self::RejectPsbtSignatureResult(id, r) => f
                 .debug_tuple("RejectPsbtSignatureResult")
+                .field(&hex::encode(id))
+                .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
+                .finish(),
+            Self::ApprovePsbtResult(id, r) => f
+                .debug_tuple("ApprovePsbtResult")
                 .field(&hex::encode(id))
                 .field(&r.as_ref().map(|_| "ok").map_err(|e| e.as_str()))
                 .finish(),

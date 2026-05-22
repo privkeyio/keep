@@ -125,8 +125,16 @@ impl PeerManager {
         self
     }
 
-    pub fn add_peer(&mut self, peer: Peer) {
+    pub fn add_peer(&mut self, mut peer: Peer) {
         if peer.share_index != self.our_share_index {
+            // PeerAnnounce carries no recovery xpubs; preserve any previously
+            // announced (and replay-validated) xpubs across re-announcements so
+            // a duplicate PeerAnnounce does not wipe stored recovery xpubs.
+            if peer.recovery_xpubs.is_empty() {
+                if let Some(existing) = self.peers.get(&peer.share_index) {
+                    peer.recovery_xpubs = existing.recovery_xpubs.clone();
+                }
+            }
             self.peers.insert(peer.share_index, peer);
         }
     }

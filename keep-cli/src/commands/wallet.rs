@@ -15,7 +15,7 @@ use keep_core::Keep;
 use crate::cli::WalletExportFormat;
 use crate::output::Output;
 
-use super::get_password;
+use super::{get_confirm, get_password};
 
 /// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
 /// and returns no match when the vault is locked or the mutex is poisoned.
@@ -197,6 +197,7 @@ pub fn cmd_wallet_descriptor(
         policy_hash: [0u8; 32],
         version: INITIAL_DESCRIPTOR_VERSION,
         previous_descriptor_hash: None,
+        policy: None,
     };
 
     let mut keep = Keep::open(path)?;
@@ -843,6 +844,8 @@ pub fn cmd_wallet_propose(
     let total_shares = share.metadata.total_shares;
 
     let policy = parse_recovery_policy(recovery, total_shares)?;
+    let policy_json = serde_json::to_value(&policy)
+        .map_err(|e| KeepError::Runtime(format!("serialize policy: {e}")))?;
 
     out.newline();
     out.header("Wallet Descriptor Proposal");
@@ -1082,6 +1085,7 @@ pub fn cmd_wallet_propose(
             policy_hash: finalized_policy_hash,
             version: INITIAL_DESCRIPTOR_VERSION,
             previous_descriptor_hash: None,
+            policy: Some(policy_json),
         };
 
         keep.lock()
@@ -1554,6 +1558,406 @@ pub fn cmd_wallet_spend(
             }
             Err(e) => return Err(e),
         }
+        Ok::<_, KeepError>(())
+    })?;
+
+    Ok(())
+}
+
+/// Parse a `--signer-bunker fp:bunker://...` argument into `(fingerprint, uri)`.
+fn parse_signer_bunker(spec: &str) -> Result<(String, String)> {
+    let (fp, uri) = spec.split_once(':').ok_or_else(|| {
+        KeepError::InvalidInput(
+            "--signer-bunker expects 'fingerprint:bunker://...' (8 hex fingerprint, colon, URI)"
+                .into(),
+        )
+    })?;
+    let fp = fp.trim().to_ascii_lowercase();
+    if fp.len() != 8 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(KeepError::InvalidInput(format!(
+            "--signer-bunker fingerprint '{fp}' must be 8 hex characters"
+        )));
+    }
+    let uri = uri.trim().to_string();
+    if !uri.starts_with("bunker://") {
+        return Err(KeepError::InvalidInput(
+            "--signer-bunker URI must start with bunker://".into(),
+        ));
+    }
+    Ok((fp, uri))
+}
+
+/// Parse a session id hex string (32 bytes / 64 hex chars).
+fn parse_session_id(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s)
+        .map_err(|e| KeepError::InvalidInput(format!("invalid session id hex: {e}")))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        KeepError::InvalidInput(format!(
+            "session id must be exactly 32 bytes, got {}",
+            v.len()
+        ))
+    })
+}
+
+/// Execute the full responder approval chain for a single PSBT session: load
+/// the descriptor, verify the policy integrity, verify the PSBT is bound to
+/// the recovery tier we expect, derive the local x-only pubkey, build the
+/// script-spend sighash for every input, request a Schnorr signature per
+/// input from the NIP-46 signer at `bunker_uri`, merge the signatures (with
+/// signature verification on each merge), and contribute the PSBT back to
+/// the initiator.
+///
+/// `expected_psbt_hash`, when `Some`, must equal `sha256(proposal_psbt)`
+/// captured at the time the operator approved the session; mismatches abort
+/// the approval. This closes the preview/sign decoupling window where the
+/// proposer could swap the PSBT between review and sign.
+#[allow(clippy::too_many_arguments)]
+async fn approve_psbt_session(
+    out: &Output,
+    keep: Arc<Mutex<Keep>>,
+    node: Arc<keep_frost_net::KfpNode>,
+    session_id: [u8; 32],
+    group_pubkey: [u8; 32],
+    local_fp: String,
+    bunker_uri: zeroize::Zeroizing<String>,
+    expected_psbt_hash: Option<[u8; 32]>,
+) -> Result<()> {
+    let (initiator_pubkey, session_descriptor_hash, tier_index) = node
+        .psbt_session_routing(&session_id)
+        .ok_or_else(|| KeepError::Frost("unknown PSBT session id".into()))?;
+    let psbt_bytes = node
+        .psbt_session_proposal_psbt(&session_id)
+        .ok_or_else(|| KeepError::Frost("session has no proposal PSBT".into()))?;
+
+    if let Some(expected) = expected_psbt_hash {
+        use sha2::{Digest, Sha256};
+        let recomputed: [u8; 32] = Sha256::digest(&psbt_bytes).into();
+        if recomputed != expected {
+            return Err(KeepError::Frost(
+                "PSBT hash changed between preview and sign; aborting".into(),
+            ));
+        }
+    }
+
+    let descriptor = {
+        let guard = keep.lock().expect("keep mutex poisoned");
+        guard
+            .get_wallet_descriptor(&group_pubkey)?
+            .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?
+    };
+    if descriptor.canonical_hash() != session_descriptor_hash {
+        return Err(KeepError::Frost(
+            "stored descriptor hash does not match PSBT session descriptor_hash".into(),
+        ));
+    }
+    let policy_json = descriptor.policy.clone().ok_or_else(|| {
+        KeepError::InvalidInput(
+            "persisted descriptor has no WalletPolicy; cannot derive recovery tier metadata".into(),
+        )
+    })?;
+
+    let policy = keep_frost_net::load_verified_wallet_policy(&policy_json, &descriptor.policy_hash)
+        .map_err(KeepError::InvalidInput)?;
+    let xpub_str = keep_frost_net::find_local_external_xpub_in_tier(&policy, tier_index, &local_fp)
+        .map_err(KeepError::InvalidInput)?;
+    let network = <keep_bitcoin::Network as std::str::FromStr>::from_str(&descriptor.network)
+        .map_err(|e| KeepError::InvalidInput(format!("invalid network: {e}")))?;
+    let xonly_bytes = keep_bitcoin::xpub_to_x_only(&xpub_str, network)
+        .map_err(|e| KeepError::InvalidInput(format!("xpub_to_x_only: {e}")))?;
+    let xonly = keep_bitcoin::bitcoin::XOnlyPublicKey::from_slice(&xonly_bytes)
+        .map_err(|e| KeepError::InvalidInput(format!("xonly_pubkey decode: {e}")))?;
+
+    let mut psbt = keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+        .map_err(|e| KeepError::InvalidInput(format!("decode PSBT: {e}")))?;
+    if psbt.inputs.is_empty() {
+        return Err(KeepError::InvalidInput("PSBT has no inputs to sign".into()));
+    }
+
+    // Verify every input upfront so the responder only forwards sighashes for
+    // outputs it actually controls; fail closed before contacting the bunker.
+    let sighashes = keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
+        .map_err(|e| KeepError::InvalidInput(format!("PSBT binding verification failed: {e}")))?;
+
+    // Display every destination (address + amount) and require explicit
+    // operator confirmation before signing. The input-binding check above only
+    // proves we control the spent UTXOs; it says nothing about where the funds
+    // go. Without this gate a malicious initiator could propose a spend that
+    // sweeps a recovered UTXO to an attacker address and the signer would sign
+    // it blindly (the bunker only ever sees an opaque sighash). Fail closed if
+    // outputs cannot be decoded.
+    use keep_bitcoin::bitcoin::Address;
+    let mut total_out: u64 = 0;
+    out.newline();
+    out.header(&format!(
+        "Recovery spend destinations (tier {}, {} input(s))",
+        tier_index,
+        sighashes.len()
+    ));
+    if psbt.unsigned_tx.output.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "PSBT has no outputs to confirm; refusing to sign".into(),
+        ));
+    }
+    for (i, o) in psbt.unsigned_tx.output.iter().enumerate() {
+        let dest = match Address::from_script(&o.script_pubkey, network) {
+            Ok(addr) => addr.to_string(),
+            Err(_) => format!("script:{}", hex::encode(o.script_pubkey.as_bytes())),
+        };
+        let sats = o.value.to_sat();
+        total_out = total_out.checked_add(sats).ok_or_else(|| {
+            KeepError::InvalidInput("PSBT output total overflows; refusing to sign".into())
+        })?;
+        out.field(&format!("Output {i}"), &format!("{dest}  ({sats} sats)"));
+    }
+    // Inputs on the recovery path always carry witness_utxo (enforced by the
+    // binding verification above), so the fee is computable and worth showing.
+    let total_in: Option<u64> = psbt.inputs.iter().try_fold(0u64, |acc, inp| {
+        inp.witness_utxo
+            .as_ref()
+            .and_then(|t| acc.checked_add(t.value.to_sat()))
+    });
+    if let Some(fee) = total_in.and_then(|i| i.checked_sub(total_out)) {
+        out.field("Fee", &format!("{fee} sats"));
+    }
+    out.newline();
+
+    if !get_confirm("Sign this recovery spend?")? {
+        return Err(KeepError::InvalidInput(
+            "operator declined PSBT approval".into(),
+        ));
+    }
+
+    out.info(&format!(
+        "Approving session {} (tier {}, {} input(s)) via signer {}",
+        hex::encode(&session_id[..8]),
+        tier_index,
+        sighashes.len(),
+        local_fp
+    ));
+
+    let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
+        .await
+        .map_err(|e| KeepError::Frost(format!("NIP-46 connect: {e}")))?;
+    let signed_outcome = async {
+        client
+            .connect()
+            .await
+            .map_err(|e| format!("NIP-46 handshake: {e}"))?;
+        for sh in &sighashes {
+            let leaf_hash_bytes: [u8; 32] = {
+                use keep_bitcoin::bitcoin::hashes::Hash as _;
+                sh.leaf_hash.to_byte_array()
+            };
+            let sig = client
+                .sign_tap_script(
+                    &sh.sighash,
+                    &xonly_bytes,
+                    &leaf_hash_bytes,
+                    sh.script.as_bytes(),
+                    &descriptor.external_descriptor,
+                )
+                .await
+                .map_err(|e| format!("sign_tap_script: {e}"))?;
+            keep_bitcoin::merge_tap_script_sig(
+                &mut psbt,
+                sh.input_index,
+                xonly,
+                sh.leaf_hash,
+                &sh.sighash,
+                sig,
+            )
+            .map_err(|e| format!("merge sig: {e}"))?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    client.disconnect().await;
+    signed_outcome.map_err(KeepError::Frost)?;
+
+    let merged = psbt.serialize();
+    node.contribute_psbt_signature(
+        session_id,
+        &initiator_pubkey,
+        keep_frost_net::SignerId::Fingerprint(local_fp.clone()),
+        merged,
+    )
+    .await
+    .map_err(|e| KeepError::Frost(format!("contribute_psbt_signature: {e}")))?;
+
+    out.success(&format!(
+        "Submitted signature for session {}",
+        hex::encode(&session_id[..8])
+    ));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_wallet_approve_psbt(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    session_hex: &str,
+    signer_bunker: &[String],
+    share_index: Option<u16>,
+    relay: &str,
+) -> Result<()> {
+    debug!(group, session_hex, relay, "wallet approve-psbt");
+
+    if signer_bunker.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "at least one --signer-bunker fp:bunker:// is required".into(),
+        ));
+    }
+
+    // Bunker URIs may embed single-use connect secrets; keep them in
+    // Zeroizing<String> end-to-end and never format them into log/output.
+    let mut registry_entries: Vec<(String, zeroize::Zeroizing<String>)> =
+        Vec::with_capacity(signer_bunker.len());
+    for spec in signer_bunker {
+        let (fp, uri) = parse_signer_bunker(spec)?;
+        registry_entries.push((fp, zeroize::Zeroizing::new(uri)));
+    }
+    let mut seen_fps = std::collections::HashSet::new();
+    for (fp, _) in &registry_entries {
+        if !seen_fps.insert(fp.clone()) {
+            return Err(KeepError::InvalidInput(format!(
+                "duplicate --signer-bunker fingerprint: {fp}"
+            )));
+        }
+    }
+
+    let session_id = parse_session_id(session_hex)?;
+    let group_pubkey = parse_group_id(group)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    out.newline();
+    out.header("WDC Recovery Spend Approval");
+    out.field("Group", &hex::encode(group_pubkey));
+    out.field("Session", &hex::encode(&session_id[..8]));
+    out.field(
+        "Local signers",
+        &registry_entries
+            .iter()
+            .map(|(fp, _)| fp.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.field("Relay", relay);
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    let keep = Arc::new(Mutex::new(keep));
+
+    rt.block_on(async {
+        let registry = Arc::new(keep_frost_net::InMemoryRecoverySignerRegistry::new());
+        for (fp, uri) in &registry_entries {
+            registry.insert(fp, format!("signer-{fp}"), uri.clone());
+        }
+
+        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = node.with_recovery_signer_registry(registry.clone());
+        let node = Arc::new(node);
+
+        node.announce()
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        let mut event_rx = node.subscribe();
+        let node_handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!(error = %e, "FROST node error");
+                }
+            }
+        });
+
+        const PROPOSAL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+        const POST_APPROVAL_DRAIN: Duration = Duration::from_secs(2);
+        let target_sid = session_id;
+        let spinner = out.spinner("Waiting for proposal...");
+        let deadline = tokio::time::Instant::now() + PROPOSAL_WAIT_TIMEOUT;
+        let mut approved = false;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Ok(keep_frost_net::KfpNodeEvent::PsbtSignatureNeeded {
+                    session_id, ..
+                })) if session_id == target_sid => {
+                    spinner.finish();
+                    // Capture the PSBT hash NOW (before any user/operator
+                    // review window) and pass it through to approve so that
+                    // a swap by the proposer between snapshot and sign is
+                    // detected and aborted.
+                    let expected_hash = node.psbt_session_proposal_psbt(&session_id).map(|bytes| {
+                        use sha2::{Digest, Sha256};
+                        let h: [u8; 32] = Sha256::digest(&bytes).into();
+                        h
+                    });
+                    let expected_fps = node
+                        .psbt_session_expected_fingerprints(&session_id)
+                        .unwrap_or_default();
+                    let match_idx = registry_entries.iter().position(|(fp, _)| {
+                        expected_fps
+                            .iter()
+                            .any(|e| e.eq_ignore_ascii_case(fp))
+                    });
+                    let idx = match match_idx {
+                        Some(i) => i,
+                        None => {
+                            node_handle.abort();
+                            return Err(KeepError::InvalidInput(format!(
+                                "no --signer-bunker fingerprint matches an expected external signer for session {}",
+                                hex::encode(&session_id[..8])
+                            )));
+                        }
+                    };
+                    let fp = registry_entries[idx].0.clone();
+                    let bunker = registry_entries[idx].1.clone();
+                    approve_psbt_session(
+                        out,
+                        keep.clone(),
+                        node.clone(),
+                        session_id,
+                        group_pubkey,
+                        fp,
+                        bunker,
+                        expected_hash,
+                    )
+                    .await?;
+                    approved = true;
+                    break;
+                }
+                Ok(Err(_)) => break,
+                Err(_) => break,
+                _ => {}
+            }
+        }
+        if !approved {
+            node_handle.abort();
+            return Err(KeepError::Frost(format!(
+                "did not receive PsbtSignatureNeeded for session {} within {}s",
+                hex::encode(&target_sid[..8]),
+                PROPOSAL_WAIT_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(POST_APPROVAL_DRAIN).await;
+        node_handle.abort();
         Ok::<_, KeepError>(())
     })?;
 

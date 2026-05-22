@@ -644,9 +644,21 @@ pub(crate) async fn frost_event_listener(
                         external_descriptor,
                         internal_descriptor,
                         policy_hash,
+                        policy,
                         ..
                     }) => {
                         log!(EventLogType::Descriptor, "Descriptor complete".to_string());
+                        let policy_value = match serde_json::to_value(&policy) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    session = %hex::encode(&session_id[..8]),
+                                    "failed to serialize WalletPolicy to JSON (recovery-tier verification will be unavailable for this descriptor)",
+                                );
+                                None
+                            }
+                        };
                         push_frost_event(
                             &frost_events,
                             FrostNodeMsg::DescriptorComplete {
@@ -654,6 +666,7 @@ pub(crate) async fn frost_event_listener(
                                 external_descriptor,
                                 internal_descriptor,
                                 policy_hash,
+                                policy: policy_value,
                             },
                         );
                     }
@@ -1012,12 +1025,14 @@ impl App {
                 external_descriptor,
                 internal_descriptor,
                 policy_hash,
+                policy,
             } => {
                 self.handle_descriptor_complete(
                     session_id,
                     external_descriptor,
                     internal_descriptor,
                     policy_hash,
+                    policy,
                 );
             }
             FrostNodeMsg::DescriptorNacked {
@@ -1394,6 +1409,7 @@ impl App {
         external_descriptor: String,
         internal_descriptor: String,
         policy_hash: [u8; 32],
+        policy: Option<serde_json::Value>,
     ) {
         let Some(coord) = self.active_coordinations.remove(&session_id) else {
             return;
@@ -1412,6 +1428,7 @@ impl App {
             policy_hash,
             version: INITIAL_DESCRIPTOR_VERSION,
             previous_descriptor_hash: None,
+            policy,
         };
 
         let store_result = {
