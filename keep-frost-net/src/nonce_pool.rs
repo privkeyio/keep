@@ -12,9 +12,11 @@
 //! are rebuilt by idle replenishment after a restart. Commitments are public
 //! and may be shared freely.
 //!
-//! Single-use is strictly enforced. Both the local secret nonces and the
-//! received peer commitments are *removed* on consume; there is no
-//! peek-without-consume in the signing path.
+//! Single-use is strictly enforced for secret material: the local secret
+//! nonces are *removed* on consume. Peer commitments are public and may be
+//! authenticated against an echoed copy without consuming (see
+//! [`NoncePool::matches_peer`]); they are removed on reservation/consume so a
+//! given pooled commitment is bound to one session.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,28 +105,17 @@ impl NoncePool {
         Some(nonces)
     }
 
-    /// Record a peer's pre-exchanged commitment. Evicts the oldest commitment
-    /// for that peer if it exceeds [`MAX_POOL_ENTRIES`].
+    /// Record a peer's pre-exchanged commitment. Evicts the oldest stored
+    /// commitment (across all peers) if the total exceeds [`MAX_POOL_ENTRIES`].
     pub fn store_peer(&self, share_index: u16, nonce_id: NonceId, commitment: SigningCommitments) {
         let mut inner = self.inner.lock();
         let key = (share_index, nonce_id);
         if inner.peer.insert(key, commitment).is_none() {
             inner.peer_order.push(key);
         }
-        let count = inner
-            .peer_order
-            .iter()
-            .filter(|(idx, _)| *idx == share_index)
-            .count();
-        if count > MAX_POOL_ENTRIES {
-            if let Some(pos) = inner
-                .peer_order
-                .iter()
-                .position(|(idx, _)| *idx == share_index)
-            {
-                let evict = inner.peer_order.remove(pos);
-                inner.peer.remove(&evict);
-            }
+        while inner.peer_order.len() > MAX_POOL_ENTRIES {
+            let evict = inner.peer_order.remove(0);
+            inner.peer.remove(&evict);
         }
     }
 
@@ -140,7 +131,30 @@ impl NoncePool {
 
     /// Whether the pool already holds a commitment for `(share_index, nonce_id)`.
     pub fn contains_peer(&self, share_index: u16, nonce_id: &NonceId) -> bool {
-        self.inner.lock().peer.contains_key(&(share_index, *nonce_id))
+        self.inner
+            .lock()
+            .peer
+            .contains_key(&(share_index, *nonce_id))
+    }
+
+    /// Whether the pool holds a commitment for `(share_index, nonce_id)` whose
+    /// serialized bytes equal `commitment_bytes`. Used to authenticate echoed
+    /// commitments against what the peer actually advertised to us, without
+    /// consuming the pooled entry.
+    pub fn matches_peer(
+        &self,
+        share_index: u16,
+        nonce_id: &NonceId,
+        commitment_bytes: &[u8],
+    ) -> bool {
+        let inner = self.inner.lock();
+        match inner.peer.get(&(share_index, *nonce_id)) {
+            Some(c) => c
+                .serialize()
+                .map(|b| b.as_slice() == commitment_bytes)
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     /// Consume a peer's pre-exchanged commitment, removing it from the pool.
@@ -167,13 +181,13 @@ impl NoncePool {
         let mut chosen: Vec<(u16, NonceId)> = Vec::with_capacity(peers.len());
         for &idx in peers {
             let next = inner
-                .peer
-                .keys()
-                .find(|(i, _)| *i == idx)
-                .map(|(i, id)| (*i, *id));
+                .peer_order
+                .iter()
+                .find(|(i, id)| *i == idx && !chosen.contains(&(*i, *id)))
+                .copied();
             match next {
-                Some(key) if !chosen.contains(&key) => chosen.push(key),
-                _ => return None,
+                Some(key) => chosen.push(key),
+                None => return None,
             }
         }
 
@@ -257,6 +271,47 @@ mod tests {
         // Reserved commitments are removed (single-use).
         assert_eq!(pool.peer_available(2), 0);
         assert_eq!(pool.peer_available(3), 0);
+    }
+
+    #[test]
+    fn matches_peer_authenticates_echoed_commitment() {
+        let pool = NoncePool::new();
+        let (_n, commitment) = make_pair();
+        let id = [5u8; 32];
+        let bytes = commitment.serialize().unwrap().to_vec();
+        pool.store_peer(2, id, commitment);
+
+        assert!(pool.matches_peer(2, &id, &bytes));
+        // Wrong bytes, wrong id, and wrong index all fail.
+        assert!(!pool.matches_peer(2, &id, &[0u8; 33]));
+        assert!(!pool.matches_peer(2, &[6u8; 32], &bytes));
+        assert!(!pool.matches_peer(3, &id, &bytes));
+    }
+
+    #[test]
+    fn peer_eviction_bounds_total_memory() {
+        let pool = NoncePool::new();
+        for i in 0..(MAX_POOL_ENTRIES + 10) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let idx = (i % 4) as u16 + 1;
+            let (_n, c) = make_pair();
+            pool.store_peer(idx, id, c);
+        }
+        let total: usize = (1..=4).map(|idx| pool.peer_available(idx)).sum();
+        assert_eq!(total, MAX_POOL_ENTRIES);
+    }
+
+    #[test]
+    fn reserve_consumes_oldest_first() {
+        let pool = NoncePool::new();
+        let (_n1, c1) = make_pair();
+        let (_n2, c2) = make_pair();
+        pool.store_peer(2, [1u8; 32], c1);
+        pool.store_peer(2, [2u8; 32], c2);
+
+        let reserved = pool.reserve_for(&[2]).expect("peer available");
+        assert_eq!(reserved[0].1, [1u8; 32]);
     }
 
     #[test]

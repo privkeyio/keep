@@ -239,9 +239,20 @@ impl KfpMessage {
                 if p.nonce_refs.len() > MAX_PARTICIPANTS {
                     return Err("Nonce refs exceed maximum size");
                 }
+                let mut seen_refs: HashSet<u16> = HashSet::new();
+                let mut sentinel_refs = 0usize;
                 for nref in &p.nonce_refs {
                     if nref.commitment.len() > MAX_COMMITMENT_SIZE {
                         return Err("Nonce ref commitment exceeds maximum size");
+                    }
+                    if !seen_refs.insert(nref.share_index) {
+                        return Err("Duplicate share_index in nonce_refs");
+                    }
+                    if nref.nonce_id == [0u8; 32] {
+                        sentinel_refs += 1;
+                        if sentinel_refs > 1 {
+                            return Err("Multiple sentinel nonce_refs");
+                        }
                     }
                 }
             }
