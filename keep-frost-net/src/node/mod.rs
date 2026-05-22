@@ -32,6 +32,7 @@ use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
+use crate::nonce_pool::{NonceId, NoncePool};
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
@@ -540,6 +541,7 @@ pub struct KfpNode {
     pub(crate) share: SharePackage,
     pub(crate) group_pubkey: [u8; 32],
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
+    pub(crate) nonce_pool: NoncePool,
     pub(crate) ecdh_sessions: Arc<RwLock<EcdhSessionManager>>,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
@@ -713,6 +715,7 @@ impl KfpNode {
             share,
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
+            nonce_pool: NoncePool::new(),
             ecdh_sessions: Arc::new(RwLock::new(ecdh_manager)),
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
@@ -823,6 +826,16 @@ impl KfpNode {
 
     pub fn online_peers(&self) -> usize {
         self.peers.read().online_count()
+    }
+
+    /// Number of our own pre-generated nonces currently available in the pool.
+    pub fn nonce_pool_own_available(&self) -> usize {
+        self.nonce_pool.own_available()
+    }
+
+    /// Number of pre-exchanged commitments pooled for the given peer.
+    pub fn nonce_pool_peer_available(&self, share_index: u16) -> usize {
+        self.nonce_pool.peer_available(share_index)
     }
 
     pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
@@ -1115,6 +1128,9 @@ impl KfpNode {
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(120));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut replenish_interval = tokio::time::interval(Duration::from_secs(30));
+        replenish_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -1124,6 +1140,13 @@ impl KfpNode {
                 _ = announce_interval.tick() => {
                     if let Err(e) = self.announce().await {
                         warn!(error = %e, "Failed to re-announce");
+                    }
+                }
+                _ = replenish_interval.tick() => {
+                    if self.nonce_pool.own_deficit() > 0 {
+                        if let Err(e) = self.replenish_nonce_pool().await {
+                            warn!(error = %e, "Failed to replenish nonce pool");
+                        }
                     }
                 }
                 _ = cleanup_interval.tick() => {
@@ -1220,6 +1243,9 @@ impl KfpNode {
             }
             KfpMessage::SignRequest(payload) => {
                 self.handle_sign_request(event.pubkey, payload).await?;
+            }
+            KfpMessage::NonceCommitment(payload) => {
+                self.handle_nonce_commitment(event.pubkey, payload).await?;
             }
             KfpMessage::Commitment(payload) => {
                 self.handle_commitment(event.pubkey, payload).await?;

@@ -13,9 +13,121 @@ use crate::event::KfpEventBuilder;
 use crate::protocol::*;
 use crate::session::derive_session_id;
 
-use super::{KfpNode, KfpNodeEvent, SessionInfo};
+use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 
 impl KfpNode {
+    /// Generate fresh round-1 nonces to top the local pool back up to its
+    /// target and broadcast the matching commitments to online peers. Secret
+    /// nonces are stored in memory only; only commitments leave this node.
+    pub async fn replenish_nonce_pool(&self) -> Result<()> {
+        let deficit = self.nonce_pool.own_deficit();
+        if deficit == 0 {
+            return Ok(());
+        }
+
+        let key_package = self.share.key_package()?;
+        let mut commitments = Vec::with_capacity(deficit);
+        for _ in 0..deficit {
+            let nonce_id: NonceId = keep_core::crypto::random_bytes::<32>();
+            let (nonces, commitment) =
+                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+
+            let commit_bytes = commitment
+                .serialize()
+                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+
+            self.nonce_pool.store_own(nonce_id, nonces);
+            commitments.push(PreExchangedCommitment {
+                nonce_id,
+                commitment: commit_bytes.to_vec(),
+            });
+        }
+
+        let payload = NonceCommitmentPayload::new(
+            self.group_pubkey,
+            self.share.metadata.identifier,
+            commitments,
+        );
+
+        let peer_pubkeys: Vec<PublicKey> = self
+            .peers
+            .read()
+            .get_online_peers()
+            .iter()
+            .map(|p| p.pubkey)
+            .collect();
+
+        for pubkey in peer_pubkeys {
+            let event = KfpEventBuilder::nonce_commitment(&self.keys, &pubkey, payload.clone())?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        }
+
+        debug!(
+            count = payload.commitments.len(),
+            "Broadcast pre-exchanged nonce commitments"
+        );
+
+        Ok(())
+    }
+
+    pub(crate) async fn handle_nonce_commitment(
+        &self,
+        from: PublicKey,
+        payload: NonceCommitmentPayload,
+    ) -> Result<()> {
+        if payload.group_pubkey != self.group_pubkey {
+            return Ok(());
+        }
+
+        self.verify_peer_share_index(from, payload.share_index)?;
+
+        if !payload.is_within_replay_window(self.replay_window_secs) {
+            warn!(
+                share_index = payload.share_index,
+                created_at = payload.created_at,
+                "Rejecting nonce commitment: outside replay window"
+            );
+            return Err(FrostNetError::ReplayDetected(format!(
+                "Nonce commitment created_at {} outside {} second window",
+                payload.created_at, self.replay_window_secs
+            )));
+        }
+
+        if !self.can_receive_from(&from) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {from} not allowed to send nonce commitments"
+            )));
+        }
+
+        let mut stored = 0usize;
+        for entry in payload.commitments {
+            let commitment = match frost_secp256k1_tr::round1::SigningCommitments::deserialize(
+                &entry.commitment,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(error = %e, "Skipping invalid pre-exchanged commitment");
+                    continue;
+                }
+            };
+            self.nonce_pool
+                .store_peer(payload.share_index, entry.nonce_id, commitment);
+            stored += 1;
+        }
+
+        self.peers.write().update_last_seen(payload.share_index);
+
+        debug!(
+            share_index = payload.share_index,
+            stored, "Stored pre-exchanged commitments from peer"
+        );
+
+        Ok(())
+    }
+
     pub(crate) async fn handle_sign_request(
         &self,
         from: PublicKey,
@@ -115,7 +227,25 @@ impl KfpNode {
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
 
-        let commitment = {
+        // If the requester referenced a pre-exchanged nonce of ours, consume it
+        // (single-use, removed from the pool). If it is missing — e.g. the pool
+        // was rebuilt after a restart — fall back to a fresh interactive nonce.
+        let pooled_nonces = request
+            .nonce_refs
+            .iter()
+            .find(|nref| nref.share_index == self.share.metadata.identifier)
+            .and_then(|nref| self.nonce_pool.consume_own(&nref.nonce_id));
+
+        if pooled_nonces.is_some() {
+            debug!(
+                session_id = %hex::encode(request.session_id),
+                "Using pre-exchanged nonce for sign request"
+            );
+        }
+
+        let used_pre_exchange = pooled_nonces.is_some();
+
+        let (commitment, proceed_to_round2) = {
             let mut sessions = self.sessions.write();
 
             let session = sessions.get_or_create_session(
@@ -125,16 +255,44 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            let (nonces, commitment) =
-                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+            let (nonces, commitment) = match pooled_nonces {
+                Some(nonces) => {
+                    let commitment = *nonces.commitments();
+                    (nonces, commitment)
+                }
+                None => frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng),
+            };
 
             session.set_our_nonces(nonces);
             session.set_our_commitment(commitment);
             session.add_commitment(self.share.metadata.identifier, commitment)?;
 
+            // When pre-exchange is used, the requester includes every
+            // participant's commitment (including its own) in `nonce_refs`. Add
+            // them so the session is complete from this single message, with no
+            // dependence on commitment-event ordering. Our own ref was already
+            // applied above; skip it and any malformed entries.
+            if used_pre_exchange {
+                for nref in &request.nonce_refs {
+                    if nref.share_index == self.share.metadata.identifier {
+                        continue;
+                    }
+                    match frost_secp256k1_tr::round1::SigningCommitments::deserialize(
+                        &nref.commitment,
+                    ) {
+                        Ok(c) => session.add_commitment(nref.share_index, c)?,
+                        Err(e) => {
+                            debug!(error = %e, share_index = nref.share_index, "Skipping invalid nonce ref commitment");
+                        }
+                    }
+                }
+            }
+
+            let proceed = used_pre_exchange && session.has_all_commitments();
+
             sessions.record_nonce_consumption(&request.session_id)?;
 
-            commitment
+            (commitment, proceed)
         };
 
         let commit_bytes = commitment
@@ -166,6 +324,15 @@ impl KfpNode {
             self.share.metadata.identifier,
             SigningOperation::CommitmentSent,
         );
+
+        // With pre-exchange, the full commitment set arrived in this request, so
+        // we can move straight to round 2 without waiting for commitment events.
+        if proceed_to_round2 {
+            if let Err(e) = self.generate_and_send_share(&request.session_id).await {
+                self.sessions.write().complete_session(&request.session_id);
+                return Err(e);
+            }
+        }
 
         Ok(())
     }
@@ -474,13 +641,55 @@ impl KfpNode {
             SigningOperation::SignRequestInitiated,
         );
 
+        let key_package = self.share.key_package()?;
+        let (nonces, our_commitment) =
+            frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+
+        // Try to use pre-exchanged commitments for the selected peers. If every
+        // peer has a pooled commitment, reserve them (single-use; removed from
+        // the pool) so the interactive commitment round can be skipped.
+        let peer_indices: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
+        let reserved = self.nonce_pool.reserve_for(&peer_indices);
+
+        let our_commit_bytes = our_commitment
+            .serialize()
+            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+
+        let mut nonce_refs: Vec<NonceRef> = Vec::new();
+        let mut reserved_commitments: Vec<(u16, frost_secp256k1_tr::round1::SigningCommitments)> =
+            Vec::new();
+        if let Some(entries) = &reserved {
+            for (idx, nonce_id, commitment) in entries {
+                let commit_bytes = commitment
+                    .serialize()
+                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+                nonce_refs.push(NonceRef {
+                    share_index: *idx,
+                    nonce_id: *nonce_id,
+                    commitment: commit_bytes.to_vec(),
+                });
+                reserved_commitments.push((*idx, *commitment));
+            }
+            // Include the requester's own commitment so each participant has the
+            // complete commitment set from the single sign request, removing any
+            // dependence on commitment-event ordering. The zero `nonce_id` is a
+            // sentinel: participants never consume the requester's nonce, they
+            // only read the commitment.
+            nonce_refs.push(NonceRef {
+                share_index: self.share.metadata.identifier,
+                nonce_id: [0u8; 32],
+                commitment: our_commit_bytes.clone(),
+            });
+        }
+
         let request = SignRequestPayload::new(
             session_id,
             self.group_pubkey,
             message.clone(),
             message_type,
             participants.clone(),
-        );
+        )
+        .with_nonce_refs(nonce_refs);
 
         let session_info = SessionInfo {
             session_id,
@@ -491,10 +700,6 @@ impl KfpNode {
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
-
-        let key_package = self.share.key_package()?;
-        let (nonces, our_commitment) =
-            frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
         {
             let mut sessions = self.sessions.write();
@@ -509,16 +714,20 @@ impl KfpNode {
             session.set_our_commitment(our_commitment);
             session.add_commitment(self.share.metadata.identifier, our_commitment)?;
 
+            for (idx, commitment) in &reserved_commitments {
+                session.add_commitment(*idx, *commitment)?;
+            }
+
             sessions.record_nonce_consumption(&session_id)?;
         }
 
-        let our_commit_bytes = our_commitment
-            .serialize()
-            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+        // When pre-exchange is used the sign request already carries the full
+        // commitment set, so the separate interactive commitment is redundant.
+        let using_pre_exchange = reserved.is_some();
         let our_commit_payload = CommitmentPayload::new(
             session_id,
             self.share.metadata.identifier,
-            our_commit_bytes.to_vec(),
+            our_commit_bytes.clone(),
         );
 
         for (share_index, pubkey) in participant_peers {
@@ -528,20 +737,24 @@ impl KfpNode {
                 .await
                 .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-            let commit_event =
-                KfpEventBuilder::commitment(&self.keys, &pubkey, our_commit_payload.clone())?;
-            self.client
-                .send_event(&commit_event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            if !using_pre_exchange {
+                let commit_event =
+                    KfpEventBuilder::commitment(&self.keys, &pubkey, our_commit_payload.clone())?;
+                self.client
+                    .send_event(&commit_event)
+                    .await
+                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            }
 
-            debug!(share_index, "Sent sign request and commitment");
+            debug!(share_index, using_pre_exchange, "Sent sign request");
         }
 
         let mut rx = self.event_tx.subscribe();
 
-        // For single-participant (threshold=1), all commitments are already present.
-        // Must subscribe before generating share so we don't miss SignatureComplete.
+        // All commitments may already be present: for single-participant
+        // (threshold=1), or when peer commitments were pre-exchanged and
+        // reserved above. Must subscribe before generating share so we don't
+        // miss SignatureComplete.
         let all_committed = {
             let sessions = self.sessions.read();
             sessions
