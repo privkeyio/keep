@@ -104,6 +104,12 @@ impl KfpNode {
 
         let mut stored = 0usize;
         for entry in payload.commitments {
+            if self
+                .nonce_pool
+                .contains_peer(payload.share_index, &entry.nonce_id)
+            {
+                continue;
+            }
             let commitment = match frost_secp256k1_tr::round1::SigningCommitments::deserialize(
                 &entry.commitment,
             ) {

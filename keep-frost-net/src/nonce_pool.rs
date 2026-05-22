@@ -138,6 +138,11 @@ impl NoncePool {
             .count()
     }
 
+    /// Whether the pool already holds a commitment for `(share_index, nonce_id)`.
+    pub fn contains_peer(&self, share_index: u16, nonce_id: &NonceId) -> bool {
+        self.inner.lock().peer.contains_key(&(share_index, *nonce_id))
+    }
+
     /// Consume a peer's pre-exchanged commitment, removing it from the pool.
     ///
     /// Returns `None` if no matching commitment is available.
