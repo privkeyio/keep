@@ -1999,10 +1999,14 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(wd.policy_hash))
             };
-            let policy_json = wd
-                .policy
-                .as_ref()
-                .and_then(|v| serde_json::to_string(v).ok());
+            let policy_json = match wd.policy.as_ref() {
+                Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                    KeepMobileError::BackupError {
+                        msg: format!("failed to serialize descriptor policy: {e}"),
+                    }
+                })?),
+                None => None,
+            };
             prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),
@@ -2783,7 +2787,26 @@ impl KeepMobile {
                             version,
                             policy,
                         }) => {
-                            let policy_json = serde_json::to_string(&policy).ok();
+                            let policy_json = match serde_json::to_string(&policy) {
+                                Ok(s) => Some(s),
+                                Err(e) => {
+                                    tracing::error!("Failed to serialize descriptor policy: {e}");
+                                    clear_descriptor_state(
+                                        &desc.networks,
+                                        &desc.pending,
+                                        &session_id,
+                                    );
+                                    if let Some(cb) = desc.callbacks.read().await.as_ref() {
+                                        if let Err(e2) = cb.on_failed(
+                                            hex::encode(session_id),
+                                            format!("Failed to serialize descriptor policy: {e}"),
+                                        ) {
+                                            tracing::error!("Descriptor callback error: {e2}");
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
                             if let Ok(mut p) = desc.pending.lock() {
                                 p.remove(&session_id);
                             }
