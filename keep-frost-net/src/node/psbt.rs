@@ -571,14 +571,15 @@ impl KfpNode {
                     continue;
                 };
                 saw_any_finalized = true;
-                let Ok(expected) = keep_core::wallet::canonical_descriptor_hash(
+                let expected = keep_core::wallet::canonical_descriptor_hash(
                     &finalized.external,
                     &finalized.internal,
                     &finalized.policy_hash,
                     session.policy().version,
-                ) else {
-                    continue;
-                };
+                )
+                .map_err(|e| {
+                    FrostNetError::Session(format!("canonical descriptor hash failed: {e}"))
+                })?;
                 if &expected == descriptor_hash {
                     matched = true;
                     break;

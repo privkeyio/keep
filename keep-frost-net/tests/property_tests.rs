@@ -18,6 +18,8 @@ const TEST_XPUBS: &[&str] = &[
 ];
 const TEST_XPUB: &str = TEST_XPUBS[0];
 const TEST_TPUB: &str = "tpubD8bhHJGghAWfRBV3PfiKx3CVRgtXKZwCX7N41VSijA25uxEhAJhGCeTQUxrfmwuTzcZiZooqLLY3aJGX2yJsTLJujMzcMGYftQDpkS2iZz8";
+// SLIP-132 P2WSH-multisig extended key; accepted by prefix+length, not BIP32-parsed.
+const TEST_SLIP132_XPUB: &str = "Vpub5fTdGxqcFV2csN5LDRcyA21vURYEfJ8jTXNz1QsM11LqgeWSMAuKuCLE1DpBp4sHctsBKs6xm8PQEiAYVwnZ7uc5mYxruKiTeimzoDrSihv";
 
 fn roundtrip(msg: KfpMessage) -> KfpMessage {
     let json = msg.to_json().unwrap();
@@ -352,6 +354,11 @@ fn valid_xpub_announce_passes_validation() {
             xpub: TEST_TPUB.into(),
             fingerprint: "00112233".into(),
             label: None,
+        },
+        AnnouncedXpub {
+            xpub: TEST_SLIP132_XPUB.into(),
+            fingerprint: "44556677".into(),
+            label: Some("p2wsh".into()),
         },
     ];
     let payload = XpubAnnouncePayload::new([1u8; 32], 1, xpubs);
