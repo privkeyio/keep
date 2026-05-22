@@ -1599,9 +1599,6 @@ fn parse_session_id(s: &str) -> Result<[u8; 32]> {
     })
 }
 
-/// Deserialize a persisted `WalletPolicy` JSON value and verify its
-/// integrity by recomputing `derive_policy_hash` and comparing it to
-/// `expected_policy_hash`. Returns the verified `WalletPolicy` on success.
 /// Execute the full responder approval chain for a single PSBT session: load
 /// the descriptor, verify the policy integrity, verify the PSBT is bound to
 /// the recovery tier we expect, derive the local x-only pubkey, build the
@@ -1874,7 +1871,7 @@ pub fn cmd_wallet_approve_psbt(
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = node.with_recovery_signer_registry(registry.clone());
-        let node = std::sync::Arc::new(node);
+        let node = Arc::new(node);
 
         node.announce()
             .await
