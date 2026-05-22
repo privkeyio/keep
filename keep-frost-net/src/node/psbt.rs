@@ -1191,7 +1191,7 @@ fn aggregate_partial_psbts(
                 return Ok(txout);
             }
             if let Some(tx) = input.non_witness_utxo.as_ref() {
-                let vout = aggregated
+                let prevout = aggregated
                     .unsigned_tx
                     .input
                     .get(i)
@@ -1200,8 +1200,18 @@ fn aggregate_partial_psbts(
                             "aggregated PSBT input {i} has no matching unsigned_tx input"
                         ))
                     })?
-                    .previous_output
-                    .vout as usize;
+                    .previous_output;
+                // Bind the non_witness_utxo to the input's previous_output.txid
+                // before trusting its value/script. Without this a malicious
+                // partial PSBT could supply an unrelated transaction whose
+                // output at this vout carries an altered value/script, changing
+                // the sighash recomputed below.
+                if tx.compute_txid() != prevout.txid {
+                    return Err(FrostNetError::Session(format!(
+                        "aggregated PSBT input {i} non_witness_utxo txid does not match previous_output"
+                    )));
+                }
+                let vout = prevout.vout as usize;
                 return tx.output.get(vout).cloned().ok_or_else(|| {
                     FrostNetError::Session(format!(
                         "aggregated PSBT input {i} non_witness_utxo has no output at index {vout}"

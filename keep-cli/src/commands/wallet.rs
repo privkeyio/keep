@@ -15,7 +15,7 @@ use keep_core::Keep;
 use crate::cli::WalletExportFormat;
 use crate::output::Output;
 
-use super::get_password;
+use super::{get_confirm, get_password};
 
 /// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
 /// and returns no match when the vault is locked or the mutex is poisoned.
@@ -1680,6 +1680,58 @@ async fn approve_psbt_session(
     // outputs it actually controls; fail closed before contacting the bunker.
     let sighashes = keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
         .map_err(|e| KeepError::InvalidInput(format!("PSBT binding verification failed: {e}")))?;
+
+    // Display every destination (address + amount) and require explicit
+    // operator confirmation before signing. The input-binding check above only
+    // proves we control the spent UTXOs; it says nothing about where the funds
+    // go. Without this gate a malicious initiator could propose a spend that
+    // sweeps a recovered UTXO to an attacker address and the signer would sign
+    // it blindly (the bunker only ever sees an opaque sighash). Fail closed if
+    // outputs cannot be decoded.
+    use keep_bitcoin::bitcoin::Address;
+    let mut total_out: u64 = 0;
+    out.newline();
+    out.header(&format!(
+        "Recovery spend destinations (tier {}, {} input(s))",
+        tier_index,
+        sighashes.len()
+    ));
+    if psbt.unsigned_tx.output.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "PSBT has no outputs to confirm; refusing to sign".into(),
+        ));
+    }
+    for (i, o) in psbt.unsigned_tx.output.iter().enumerate() {
+        let dest = match Address::from_script(&o.script_pubkey, network) {
+            Ok(addr) => addr.to_string(),
+            Err(_) => format!("script:{}", hex::encode(o.script_pubkey.as_bytes())),
+        };
+        let sats = o.value.to_sat();
+        total_out = total_out.checked_add(sats).ok_or_else(|| {
+            KeepError::InvalidInput("PSBT output total overflows; refusing to sign".into())
+        })?;
+        out.field(&format!("Output {i}"), &format!("{dest}  ({sats} sats)"));
+    }
+    // Inputs on the recovery path always carry witness_utxo (enforced by the
+    // binding verification above), so the fee is computable and worth showing.
+    let total_in: Option<u64> = psbt
+        .inputs
+        .iter()
+        .try_fold(0u64, |acc, inp| {
+            inp.witness_utxo
+                .as_ref()
+                .and_then(|t| acc.checked_add(t.value.to_sat()))
+        });
+    if let Some(fee) = total_in.and_then(|i| i.checked_sub(total_out)) {
+        out.field("Fee", &format!("{fee} sats"));
+    }
+    out.newline();
+
+    if !get_confirm("Sign this recovery spend?")? {
+        return Err(KeepError::InvalidInput(
+            "operator declined PSBT approval".into(),
+        ));
+    }
 
     out.info(&format!(
         "Approving session {} (tier {}, {} input(s)) via signer {}",
