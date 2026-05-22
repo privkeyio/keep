@@ -600,7 +600,12 @@ impl KfpMessage {
                     if !seen_xpubs.insert(&xpub.xpub) {
                         return Err("Duplicate recovery xpub");
                     }
-                    if xpub.xpub.parse::<bitcoin::bip32::Xpub>().is_err() {
+                    // rust-bitcoin only parses standard BIP32 version bytes
+                    // (xpub/tpub); SLIP-132 Vpub/Upub keys are validated by
+                    // prefix+length above and accepted by the descriptor flow.
+                    if (xpub.xpub.starts_with("xpub") || xpub.xpub.starts_with("tpub"))
+                        && xpub.xpub.parse::<bitcoin::bip32::Xpub>().is_err()
+                    {
                         return Err("Recovery xpub is not a valid extended public key");
                     }
                     if !is_valid_fingerprint(&xpub.fingerprint) {
