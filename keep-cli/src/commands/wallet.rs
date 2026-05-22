@@ -1890,9 +1890,11 @@ pub fn cmd_wallet_approve_psbt(
             }
         });
 
+        const PROPOSAL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+        const POST_APPROVAL_DRAIN: Duration = Duration::from_secs(2);
         let target_sid = session_id;
         let spinner = out.spinner("Waiting for proposal...");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + PROPOSAL_WAIT_TIMEOUT;
         let mut approved = false;
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline - tokio::time::Instant::now();
@@ -1952,11 +1954,12 @@ pub fn cmd_wallet_approve_psbt(
         if !approved {
             node_handle.abort();
             return Err(KeepError::Frost(format!(
-                "did not receive PsbtSignatureNeeded for session {} within 60s",
-                hex::encode(&target_sid[..8])
+                "did not receive PsbtSignatureNeeded for session {} within {}s",
+                hex::encode(&target_sid[..8]),
+                PROPOSAL_WAIT_TIMEOUT.as_secs()
             )));
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(POST_APPROVAL_DRAIN).await;
         node_handle.abort();
         Ok::<_, KeepError>(())
     })?;

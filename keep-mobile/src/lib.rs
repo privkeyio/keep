@@ -1999,14 +1999,15 @@ impl KeepMobile {
             } else {
                 Some(hex::encode(wd.policy_hash))
             };
-            let policy_json = match wd.policy.as_ref() {
-                Some(v) => Some(serde_json::to_string(v).map_err(|e| {
-                    KeepMobileError::BackupError {
-                        msg: format!("failed to serialize descriptor policy: {e}"),
-                    }
-                })?),
-                None => None,
-            };
+            let policy_json =
+                match wd.policy.as_ref() {
+                    Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                        KeepMobileError::BackupError {
+                            msg: format!("failed to serialize descriptor policy: {e}"),
+                        }
+                    })?),
+                    None => None,
+                };
             prepared_descriptors.push(WalletDescriptorInfo {
                 group_pubkey: hex::encode(wd.group_pubkey),
                 external_descriptor: wd.external_descriptor.clone(),

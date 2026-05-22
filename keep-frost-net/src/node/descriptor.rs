@@ -1355,6 +1355,12 @@ impl KfpNode {
             return Ok(());
         }
 
+        if !self.can_receive_from(&sender) {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "Peer {sender} not allowed to announce recovery xpubs"
+            )));
+        }
+
         if !payload.is_within_replay_window(self.replay_window_secs) {
             return Err(FrostNetError::ReplayDetected(
                 "XpubAnnounce timestamp outside replay window".into(),

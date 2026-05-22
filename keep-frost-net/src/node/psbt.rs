@@ -571,13 +571,14 @@ impl KfpNode {
                     continue;
                 };
                 saw_any_finalized = true;
-                let mut hasher = Sha256::new();
-                hasher.update((finalized.external.len() as u64).to_le_bytes());
-                hasher.update(finalized.external.as_bytes());
-                hasher.update((finalized.internal.len() as u64).to_le_bytes());
-                hasher.update(finalized.internal.as_bytes());
-                hasher.update(finalized.policy_hash);
-                let expected: [u8; 32] = hasher.finalize().into();
+                let Ok(expected) = keep_core::wallet::canonical_descriptor_hash(
+                    &finalized.external,
+                    &finalized.internal,
+                    &finalized.policy_hash,
+                    session.policy().version,
+                ) else {
+                    continue;
+                };
                 if &expected == descriptor_hash {
                     matched = true;
                     break;
@@ -1258,11 +1259,12 @@ fn aggregate_partial_psbts(
         // recomputed per signature using that signature's own sighash_type so a
         // legitimate non-default sighash is verified rather than silently dropped.
         let mut matching = 0u32;
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&aggregated.unsigned_tx);
         for ((pk, leaf_hash), sig) in input.tap_script_sigs.iter() {
             if *leaf_hash != proposed_leaf || !committed_keys.contains(pk) {
                 continue;
             }
-            let sighash = bitcoin::sighash::SighashCache::new(&aggregated.unsigned_tx)
+            let sighash = sighash_cache
                 .taproot_script_spend_signature_hash(
                     idx,
                     &bitcoin::sighash::Prevouts::All(&prevouts),

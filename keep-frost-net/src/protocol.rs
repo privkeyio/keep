@@ -600,6 +600,9 @@ impl KfpMessage {
                     if !seen_xpubs.insert(&xpub.xpub) {
                         return Err("Duplicate recovery xpub");
                     }
+                    if xpub.xpub.parse::<bitcoin::bip32::Xpub>().is_err() {
+                        return Err("Recovery xpub is not a valid extended public key");
+                    }
                     if !is_valid_fingerprint(&xpub.fingerprint) {
                         return Err(
                             "Recovery fingerprint must be exactly 8 lowercase hex characters",
