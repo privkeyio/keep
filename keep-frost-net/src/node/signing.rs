@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::audit::SigningOperation;
@@ -105,6 +106,54 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Send all currently available own commitments directly to one peer. Used
+    /// when a peer is newly discovered after the pool was already replenished,
+    /// so it does not have to wait for the next replenish broadcast (which only
+    /// carries freshly generated commitments) to enable instant signing.
+    pub(crate) async fn send_nonce_pool_to(&self, pubkey: &PublicKey) -> Result<()> {
+        let available = self.nonce_pool.own_commitments();
+        if available.is_empty() {
+            return Ok(());
+        }
+
+        let mut commitments = Vec::with_capacity(available.len());
+        for (nonce_id, commitment) in available {
+            commitments.push(PreExchangedCommitment {
+                nonce_id,
+                commitment: serialize_commitment(&commitment)?,
+            });
+        }
+
+        let payload = NonceCommitmentPayload::new(
+            self.group_pubkey,
+            self.share.metadata.identifier,
+            commitments,
+        );
+        let event = KfpEventBuilder::nonce_commitment(&self.keys, pubkey, payload)?;
+        self.client
+            .send_event(&event)
+            .await
+            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Build and send a session-scoped error event to a single peer.
+    async fn send_session_error(
+        &self,
+        to: &PublicKey,
+        code: &str,
+        message: &str,
+        session_id: [u8; 32],
+    ) -> Result<()> {
+        let event = KfpEventBuilder::error(&self.keys, to, code, message, Some(session_id))?;
+        self.client
+            .send_event(&event)
+            .await
+            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        Ok(())
+    }
+
     pub(crate) async fn handle_nonce_commitment(
         &self,
         from: PublicKey,
@@ -114,24 +163,65 @@ impl KfpNode {
             return Ok(());
         }
 
-        self.verify_peer_share_index(from, payload.share_index)?;
-
+        // A NonceCommitment is an unsolicited fire-and-forget broadcast, so a
+        // stale, off-policy, or spoofed one is dropped silently rather than
+        // erroring. Gate order mirrors `handle_sign_request`: replay window and
+        // receive policy before peer-identity verification.
         if !payload.is_within_replay_window(self.replay_window_secs) {
-            warn!(
+            debug!(
                 share_index = payload.share_index,
                 created_at = payload.created_at,
-                "Rejecting nonce commitment: outside replay window"
+                "Dropping nonce commitment: outside replay window"
             );
-            return Err(FrostNetError::ReplayDetected(format!(
-                "Nonce commitment created_at {} outside {} second window",
-                payload.created_at, self.replay_window_secs
-            )));
+            return Ok(());
         }
 
         if !self.can_receive_from(&from) {
-            return Err(FrostNetError::PolicyViolation(format!(
-                "Peer {from} not allowed to send nonce commitments"
-            )));
+            return Ok(());
+        }
+
+        if self
+            .verify_peer_share_index(from, payload.share_index)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        // De-duplicate repeated batches from a peer within the replay window so
+        // a misbehaving peer cannot impose unbounded deserialization work by
+        // re-sending the same commitments. Key on a content hash of the sorted
+        // commitment set rather than the sender-controlled timestamp: distinct
+        // same-second batches stay distinct, and perturbing `created_at` cannot
+        // bypass the dedup to force repeated secp256k1 deserialization.
+        let content_hash = {
+            let mut entries: Vec<&PreExchangedCommitment> = payload.commitments.iter().collect();
+            entries.sort_by(|a, b| {
+                a.nonce_id
+                    .cmp(&b.nonce_id)
+                    .then(a.commitment.cmp(&b.commitment))
+            });
+            let mut hasher = Sha256::new();
+            hasher.update(b"keep-nonce-commitment-dedup-v1");
+            hasher.update(payload.share_index.to_be_bytes());
+            for entry in entries {
+                hasher.update(entry.nonce_id);
+                hasher.update((entry.commitment.len() as u32).to_be_bytes());
+                hasher.update(&entry.commitment);
+            }
+            let digest: [u8; 32] = hasher.finalize().into();
+            digest
+        };
+        if self
+            .seen_nonce_commitments
+            .write()
+            .insert((payload.share_index, content_hash), payload.created_at)
+            .is_some()
+        {
+            debug!(
+                share_index = payload.share_index,
+                "Dropping duplicate nonce commitment batch"
+            );
+            return Ok(());
         }
 
         let mut stored = 0usize;
@@ -275,17 +365,45 @@ impl KfpNode {
         hooks.pre_sign(&session_info)?;
 
         // Locate the requester's reference to our own pre-exchanged nonce, if
-        // any. Pre-exchange applies only when we still hold the referenced
-        // single-use secret nonce; check availability without consuming so the
-        // nonce_refs can be fully validated before the nonce is burned.
+        // any. The sentinel id ([0u8; 32]) marks the requester's echo-only
+        // commitment, never our consumable nonce, so it is excluded here.
+        // Pre-exchange applies only when we still hold the referenced single-use
+        // secret nonce; check availability without consuming so the nonce_refs
+        // can be fully validated before the nonce is burned.
         let own_nonce_id = request
             .nonce_refs
             .iter()
-            .find(|nref| nref.share_index == self.share.metadata.identifier)
+            .find(|nref| {
+                nref.share_index == self.share.metadata.identifier && nref.nonce_id != [0u8; 32]
+            })
             .map(|nref| nref.nonce_id);
         let used_pre_exchange = own_nonce_id
             .map(|id| self.nonce_pool.contains_own(&id))
             .unwrap_or(false);
+
+        // The requester reserved one of our pooled commitments and already
+        // embedded it in its own session, skipping the interactive commitment
+        // round. If we no longer hold the referenced secret nonce (consumed,
+        // evicted, or lost on restart), we cannot reproduce that commitment:
+        // sending a fresh one would collide on the requester as a duplicate and
+        // hang it until timeout. Signal the requester so it fails fast.
+        if let Some(missing) = own_nonce_id {
+            if !used_pre_exchange {
+                warn!(
+                    session_id = %hex::encode(request.session_id),
+                    nonce_id = %hex::encode(missing),
+                    "Referenced pre-exchanged nonce unavailable; signaling requester"
+                );
+                self.send_session_error(
+                    &from,
+                    "stale_nonce",
+                    "Referenced pre-exchanged nonce no longer available",
+                    request.session_id,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
 
         // When pre-exchange is used, the requester includes every participant's
         // commitment (including its own) in `nonce_refs`. Validate and
@@ -331,7 +449,31 @@ impl KfpNode {
             }
         }
 
-        let (commitment, proceed_to_round2) = {
+        // A pre-exchange request must carry the full commitment set. If the
+        // validated refs plus our own commitment fall short of threshold we can
+        // neither instant-sign nor safely fall back: the requester already
+        // embedded our pooled commitment in its session and would reject a fresh
+        // one as a duplicate. Signal it to fall back rather than letting it hang,
+        // and avoid burning our pooled nonce on a session that cannot complete.
+        if used_pre_exchange && peer_refs.len() + 1 < self.share.metadata.threshold as usize {
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                "Pre-exchange request below threshold; signaling requester"
+            );
+            self.send_session_error(
+                &from,
+                "incomplete_pre_exchange",
+                "Pre-exchange request did not cover threshold participants",
+                request.session_id,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // `None` signals that the pre-exchange path required a pooled nonce that
+        // vanished (consumed, evicted, or lost on restart) between validation
+        // and consume, so the session cannot proceed and must be torn down.
+        let commit_result = {
             let mut sessions = self.sessions.write();
 
             let session = sessions.get_or_create_session(
@@ -341,46 +483,75 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            // All nonce_refs have now been validated above. The single-use own
-            // nonce is consumed only here, so neither session creation nor a
-            // poisoned/invalid commitment set can burn it.
+            // All nonce_refs have now been validated above, and a pre-exchange
+            // request that reaches here covers the full threshold set. The
+            // single-use own nonce is consumed only here, so neither session
+            // creation nor a poisoned commitment set can burn it.
             let pooled_nonces = if used_pre_exchange {
                 own_nonce_id.and_then(|nonce_id| self.nonce_pool.consume_own(&nonce_id))
             } else {
                 None
             };
-            let used_pre_exchange = pooled_nonces.is_some();
 
-            if used_pre_exchange {
-                debug!(
+            // We cannot reproduce the commitment the requester already embedded,
+            // so a fresh one would collide as a duplicate and hang it. Bail out
+            // and signal stale_nonce after dropping the session lock.
+            if used_pre_exchange && pooled_nonces.is_none() {
+                None
+            } else {
+                let used_pre_exchange = pooled_nonces.is_some();
+
+                if used_pre_exchange {
+                    debug!(
+                        session_id = %hex::encode(request.session_id),
+                        "Using pre-exchanged nonce for sign request"
+                    );
+                }
+
+                let (nonces, commitment) = match pooled_nonces {
+                    Some(nonces) => {
+                        let commitment = *nonces.commitments();
+                        (nonces, commitment)
+                    }
+                    None => {
+                        frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng)
+                    }
+                };
+
+                session.set_our_nonces(nonces);
+                session.set_our_commitment(commitment);
+                session.add_commitment(self.share.metadata.identifier, commitment)?;
+
+                if used_pre_exchange {
+                    for (share_index, c) in &peer_refs {
+                        session.add_commitment(*share_index, *c)?;
+                    }
+                }
+
+                let proceed = used_pre_exchange && session.has_all_commitments();
+
+                sessions.record_nonce_consumption(&request.session_id)?;
+
+                Some((commitment, proceed))
+            }
+        };
+
+        let (commitment, proceed_to_round2) = match commit_result {
+            Some(ready) => ready,
+            None => {
+                warn!(
                     session_id = %hex::encode(request.session_id),
-                    "Using pre-exchanged nonce for sign request"
+                    "Referenced pre-exchanged nonce vanished before consume; signaling requester"
                 );
+                self.send_session_error(
+                    &from,
+                    "stale_nonce",
+                    "Referenced pre-exchanged nonce no longer available",
+                    request.session_id,
+                )
+                .await?;
+                return Ok(());
             }
-
-            let (nonces, commitment) = match pooled_nonces {
-                Some(nonces) => {
-                    let commitment = *nonces.commitments();
-                    (nonces, commitment)
-                }
-                None => frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng),
-            };
-
-            session.set_our_nonces(nonces);
-            session.set_our_commitment(commitment);
-            session.add_commitment(self.share.metadata.identifier, commitment)?;
-
-            if used_pre_exchange {
-                for (share_index, c) in &peer_refs {
-                    session.add_commitment(*share_index, *c)?;
-                }
-            }
-
-            let proceed = used_pre_exchange && session.has_all_commitments();
-
-            sessions.record_nonce_consumption(&request.session_id)?;
-
-            (commitment, proceed)
         };
 
         let commit_bytes = serialize_commitment(&commitment)?;

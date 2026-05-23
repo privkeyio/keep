@@ -555,6 +555,13 @@ pub struct KfpNode {
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
+    /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
+    /// `(share_index, content_hash)` where `content_hash` covers the sorted
+    /// nonce_id/commitment set. Keying on content rather than the sender
+    /// controlled `created_at` avoids dropping distinct same-second batches and
+    /// stops a peer forcing repeated secp256k1 deserialization by perturbing the
+    /// timestamp. Value is `created_at` for time-based retention.
+    pub(crate) seen_nonce_commitments: RwLock<HashMap<(u16, [u8; 32]), u64>>,
     /// Per-session de-duplication for `DescriptorMigrate` link broadcasts.
     /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
     /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
@@ -729,6 +736,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
+            seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_descriptor_migrates: RwLock::new(HashMap::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
@@ -1174,6 +1182,9 @@ impl KfpNode {
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
                         });
+                        self.seen_nonce_commitments.write().retain(|_, ts| {
+                            now.saturating_sub(window) <= *ts
+                        });
                         self.seen_descriptor_migrates.write().retain(|_, ts| {
                             now.saturating_sub(window) <= *ts
                         });
@@ -1323,6 +1334,39 @@ impl KfpNode {
                     message = %payload.message,
                     "Received error from peer"
                 );
+                // A session-scoped error from a participant means that peer
+                // cannot continue the session (e.g. it no longer holds a
+                // referenced pre-exchanged nonce). Surface it so an in-flight
+                // `request_signature` fails fast instead of waiting for timeout.
+                if let Some(session_id) = payload.session_id {
+                    let is_participant = {
+                        let sessions = self.sessions.read();
+                        match sessions.get_session(&session_id) {
+                            Some(session) => {
+                                let peers = self.peers.read();
+                                session.participants().iter().any(|&idx| {
+                                    peers
+                                        .get_peer(idx)
+                                        .map(|p| p.pubkey == event.pubkey)
+                                        .unwrap_or(false)
+                                })
+                            }
+                            None => false,
+                        }
+                    };
+                    if is_participant {
+                        // Future improvement: on `stale_nonce` /
+                        // `incomplete_pre_exchange` the requester could retry
+                        // this session with a fresh interactive commitment round
+                        // instead of failing, since these are recoverable
+                        // pre-exchange misses rather than fatal errors. For now
+                        // we fail fast so the caller can decide to retry.
+                        let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
+                            session_id,
+                            error: format!("Peer reported error: {}", payload.code),
+                        });
+                    }
+                }
             }
         }
 
@@ -1398,6 +1442,8 @@ impl KfpNode {
 
         peer = peer.with_attestation_status(attestation_status);
 
+        let is_new_peer = self.peers.read().get_peer(payload.share_index).is_none();
+
         let name_clone = peer.name.clone();
         self.peers.write().add_peer(peer);
 
@@ -1411,6 +1457,15 @@ impl KfpNode {
             share_index: payload.share_index,
             name: name_clone,
         });
+
+        // A newly discovered peer may have come online after we last replenished
+        // (whose broadcast only carries freshly generated commitments). Send it
+        // our currently available pool so it can instant-sign with us right away.
+        if is_new_peer && self.can_send_to(&pubkey) {
+            if let Err(e) = self.send_nonce_pool_to(&pubkey).await {
+                warn!(peer = %pubkey, error = %e, "Failed to send nonce pool to new peer");
+            }
+        }
 
         Ok(())
     }

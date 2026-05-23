@@ -104,6 +104,19 @@ impl NoncePool {
         self.inner.lock().own.len()
     }
 
+    /// Commitments for all currently available own nonces, in generation order.
+    /// Used to (re)broadcast the pool to a peer that comes online after the
+    /// pool was last replenished. Only public commitments are exposed; secret
+    /// nonces never leave the pool.
+    pub fn own_commitments(&self) -> Vec<(NonceId, SigningCommitments)> {
+        let inner = self.inner.lock();
+        inner
+            .own_order
+            .iter()
+            .filter_map(|id| inner.own.get(id).map(|n| (*id, *n.commitments())))
+            .collect()
+    }
+
     /// How many additional own nonces should be generated to reach the target.
     pub fn own_deficit(&self) -> usize {
         self.target.saturating_sub(self.own_available())
