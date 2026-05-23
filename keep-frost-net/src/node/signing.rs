@@ -14,7 +14,7 @@ use crate::protocol::*;
 use crate::session::derive_session_id;
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
-use crate::nonce_pool::NoncePool;
+use crate::nonce_pool::{serialize_commitment, NoncePool};
 
 /// Restores peer commitments reserved from the [`NoncePool`] back into the pool
 /// if a signing request aborts before the reservation is committed to a live
@@ -65,14 +65,12 @@ impl KfpNode {
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
-            let commit_bytes = commitment
-                .serialize()
-                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+            let commit_bytes = serialize_commitment(&commitment)?;
 
             self.nonce_pool.store_own(nonce_id, nonces);
             commitments.push(PreExchangedCommitment {
                 nonce_id,
-                commitment: commit_bytes.to_vec(),
+                commitment: commit_bytes,
             });
         }
 
@@ -142,6 +140,17 @@ impl KfpNode {
                 .nonce_pool
                 .contains_peer(payload.share_index, &entry.nonce_id)
             {
+                if !self.nonce_pool.matches_peer(
+                    payload.share_index,
+                    &entry.nonce_id,
+                    &entry.commitment,
+                ) {
+                    warn!(
+                        share_index = payload.share_index,
+                        nonce_id = %hex::encode(entry.nonce_id),
+                        "Conflicting commitment for existing nonce_id; keeping first-write-wins value (possible equivocation)"
+                    );
+                }
                 continue;
             }
             let commitment = match frost_secp256k1_tr::round1::SigningCommitments::deserialize(
@@ -223,14 +232,12 @@ impl KfpNode {
                 session_id = %hex::encode(request.session_id),
                 "Resending existing commitment for session"
             );
-            let commit_bytes = existing
-                .serialize()
-                .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+            let commit_bytes = serialize_commitment(&existing)?;
 
             let payload = CommitmentPayload::new(
                 request.session_id,
                 self.share.metadata.identifier,
-                commit_bytes.to_vec(),
+                commit_bytes,
             );
 
             let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
@@ -268,14 +275,61 @@ impl KfpNode {
         hooks.pre_sign(&session_info)?;
 
         // Locate the requester's reference to our own pre-exchanged nonce, if
-        // any. The secret nonce is consumed only AFTER the session is validated
-        // and created below, so a session-creation failure cannot burn the
-        // single-use nonce.
+        // any. Pre-exchange applies only when we still hold the referenced
+        // single-use secret nonce; check availability without consuming so the
+        // nonce_refs can be fully validated before the nonce is burned.
         let own_nonce_id = request
             .nonce_refs
             .iter()
             .find(|nref| nref.share_index == self.share.metadata.identifier)
             .map(|nref| nref.nonce_id);
+        let used_pre_exchange = own_nonce_id
+            .map(|id| self.nonce_pool.contains_own(&id))
+            .unwrap_or(false);
+
+        // When pre-exchange is used, the requester includes every participant's
+        // commitment (including its own) in `nonce_refs`. Validate and
+        // deserialize all of them BEFORE consuming our single-use own nonce, so
+        // a malicious requester cannot drain our own-nonce pool by sending a
+        // valid own_nonce_id alongside bogus peer commitments.
+        //
+        // Each non-self, non-sentinel commitment is cross-checked against our
+        // own authenticated pool: the echoed bytes must match the commitment we
+        // received directly from that peer via `handle_nonce_commitment`. The
+        // requester's own commitment (sentinel nonce_id == [0u8; 32]) is
+        // legitimately absent from the pool and accepted echo-only.
+        let mut peer_refs: Vec<(u16, frost_secp256k1_tr::round1::SigningCommitments)> = Vec::new();
+        if used_pre_exchange {
+            for nref in &request.nonce_refs {
+                if nref.share_index == self.share.metadata.identifier {
+                    continue;
+                }
+                if !request.participants.contains(&nref.share_index) {
+                    return Err(FrostNetError::Protocol(format!(
+                        "Nonce ref for non-participant share_index {}",
+                        nref.share_index
+                    )));
+                }
+                let c =
+                    frost_secp256k1_tr::round1::SigningCommitments::deserialize(&nref.commitment)
+                        .map_err(|e| {
+                        FrostNetError::Crypto(format!("Deserialize nonce ref commitment: {e}"))
+                    })?;
+                if nref.nonce_id != [0u8; 32]
+                    && !self.nonce_pool.matches_peer(
+                        nref.share_index,
+                        &nref.nonce_id,
+                        &nref.commitment,
+                    )
+                {
+                    return Err(FrostNetError::Protocol(format!(
+                        "Echoed commitment for share_index {} does not match our pooled commitment",
+                        nref.share_index
+                    )));
+                }
+                peer_refs.push((nref.share_index, c));
+            }
+        }
 
         let (commitment, proceed_to_round2) = {
             let mut sessions = self.sessions.write();
@@ -287,8 +341,14 @@ impl KfpNode {
                 request.participants.clone(),
             )?;
 
-            let pooled_nonces =
-                own_nonce_id.and_then(|nonce_id| self.nonce_pool.consume_own(&nonce_id));
+            // All nonce_refs have now been validated above. The single-use own
+            // nonce is consumed only here, so neither session creation nor a
+            // poisoned/invalid commitment set can burn it.
+            let pooled_nonces = if used_pre_exchange {
+                own_nonce_id.and_then(|nonce_id| self.nonce_pool.consume_own(&nonce_id))
+            } else {
+                None
+            };
             let used_pre_exchange = pooled_nonces.is_some();
 
             if used_pre_exchange {
@@ -310,50 +370,9 @@ impl KfpNode {
             session.set_our_commitment(commitment);
             session.add_commitment(self.share.metadata.identifier, commitment)?;
 
-            // When pre-exchange is used, the requester includes every
-            // participant's commitment (including its own) in `nonce_refs`. Add
-            // them so the session is complete from this single message, with no
-            // dependence on commitment-event ordering. Our own ref was already
-            // applied above.
-            //
-            // Each non-self, non-sentinel commitment is cross-checked against
-            // our own authenticated pool: the echoed bytes must match the
-            // commitment we received directly from that peer via
-            // `handle_nonce_commitment`. This prevents a malicious requester
-            // from poisoning the session with arbitrary commitments and burning
-            // our single-use nonce on a session that can never aggregate. The
-            // requester's own commitment (sentinel nonce_id == [0u8; 32]) is
-            // legitimately absent from the pool and accepted echo-only.
             if used_pre_exchange {
-                for nref in &request.nonce_refs {
-                    if nref.share_index == self.share.metadata.identifier {
-                        continue;
-                    }
-                    if !request.participants.contains(&nref.share_index) {
-                        return Err(FrostNetError::Protocol(format!(
-                            "Nonce ref for non-participant share_index {}",
-                            nref.share_index
-                        )));
-                    }
-                    let c = frost_secp256k1_tr::round1::SigningCommitments::deserialize(
-                        &nref.commitment,
-                    )
-                    .map_err(|e| {
-                        FrostNetError::Crypto(format!("Deserialize nonce ref commitment: {e}"))
-                    })?;
-                    if nref.nonce_id != [0u8; 32]
-                        && !self.nonce_pool.matches_peer(
-                            nref.share_index,
-                            &nref.nonce_id,
-                            &nref.commitment,
-                        )
-                    {
-                        return Err(FrostNetError::Protocol(format!(
-                            "Echoed commitment for share_index {} does not match our pooled commitment",
-                            nref.share_index
-                        )));
-                    }
-                    session.add_commitment(nref.share_index, c)?;
+                for (share_index, c) in &peer_refs {
+                    session.add_commitment(*share_index, *c)?;
                 }
             }
 
@@ -364,14 +383,12 @@ impl KfpNode {
             (commitment, proceed)
         };
 
-        let commit_bytes = commitment
-            .serialize()
-            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+        let commit_bytes = serialize_commitment(&commitment)?;
 
         let payload = CommitmentPayload::new(
             request.session_id,
             self.share.metadata.identifier,
-            commit_bytes.to_vec(),
+            commit_bytes,
         );
 
         let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
@@ -397,6 +414,14 @@ impl KfpNode {
         // With pre-exchange, the full commitment set arrived in this request, so
         // we can move straight to round 2 without waiting for commitment events.
         if proceed_to_round2 {
+            info!(
+                session_id = %hex::encode(request.session_id),
+                "Instant-signing: full commitment set pre-exchanged, proceeding to round 2"
+            );
+            // The own nonce was already consumed (single-use) and used to
+            // compute the signature share, which may have been partially sent.
+            // Do NOT restore it on send failure: reusing a nonce that produced
+            // a share is a key-leak risk. Tear down the session instead.
             if let Err(e) = self.generate_and_send_share(&request.session_id).await {
                 self.sessions.write().complete_session(&request.session_id);
                 return Err(e);
@@ -723,22 +748,18 @@ impl KfpNode {
         // must go back into the pool so they are not leaked permanently.
         let mut reservation_guard = ReservationGuard::new(&self.nonce_pool, reserved.clone());
 
-        let our_commit_bytes = our_commitment
-            .serialize()
-            .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+        let our_commit_bytes = serialize_commitment(&our_commitment)?;
 
         let mut nonce_refs: Vec<NonceRef> = Vec::new();
         let mut reserved_commitments: Vec<(u16, frost_secp256k1_tr::round1::SigningCommitments)> =
             Vec::new();
         if let Some(entries) = &reserved {
             for (idx, nonce_id, commitment) in entries {
-                let commit_bytes = commitment
-                    .serialize()
-                    .map_err(|e| FrostNetError::Crypto(format!("Serialize commitment: {e}")))?;
+                let commit_bytes = serialize_commitment(commitment)?;
                 nonce_refs.push(NonceRef {
                     share_index: *idx,
                     nonce_id: *nonce_id,
-                    commitment: commit_bytes.to_vec(),
+                    commitment: commit_bytes,
                 });
                 reserved_commitments.push((*idx, *commitment));
             }

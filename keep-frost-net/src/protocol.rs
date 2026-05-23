@@ -245,6 +245,9 @@ impl KfpMessage {
                     }
                     let expected: HashSet<u16> = p.participants.iter().copied().collect();
                     let mut seen_refs: HashSet<u16> = HashSet::new();
+                    // An all-zero `nonce_id` is the sentinel marking the
+                    // requester's own commitment (echo-only, never consumed).
+                    // Exactly one ref must carry it.
                     let mut sentinel_refs = 0usize;
                     for nref in &p.nonce_refs {
                         if nref.commitment.len() > MAX_COMMITMENT_SIZE {
