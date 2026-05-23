@@ -87,6 +87,7 @@ impl KfpNode {
             .read()
             .get_online_peers()
             .iter()
+            .filter(|p| self.can_send_to(&p.pubkey))
             .map(|p| p.pubkey)
             .collect();
 

@@ -239,20 +239,32 @@ impl KfpMessage {
                 if p.nonce_refs.len() > MAX_PARTICIPANTS {
                     return Err("Nonce refs exceed maximum size");
                 }
-                let mut seen_refs: HashSet<u16> = HashSet::new();
-                let mut sentinel_refs = 0usize;
-                for nref in &p.nonce_refs {
-                    if nref.commitment.len() > MAX_COMMITMENT_SIZE {
-                        return Err("Nonce ref commitment exceeds maximum size");
+                if !p.nonce_refs.is_empty() {
+                    if p.nonce_refs.len() != p.participants.len() {
+                        return Err("Nonce refs must cover all participants");
                     }
-                    if !seen_refs.insert(nref.share_index) {
-                        return Err("Duplicate share_index in nonce_refs");
-                    }
-                    if nref.nonce_id == [0u8; 32] {
-                        sentinel_refs += 1;
-                        if sentinel_refs > 1 {
-                            return Err("Multiple sentinel nonce_refs");
+                    let expected: HashSet<u16> = p.participants.iter().copied().collect();
+                    let mut seen_refs: HashSet<u16> = HashSet::new();
+                    let mut sentinel_refs = 0usize;
+                    for nref in &p.nonce_refs {
+                        if nref.commitment.len() > MAX_COMMITMENT_SIZE {
+                            return Err("Nonce ref commitment exceeds maximum size");
                         }
+                        if !seen_refs.insert(nref.share_index) {
+                            return Err("Duplicate share_index in nonce_refs");
+                        }
+                        if !expected.contains(&nref.share_index) {
+                            return Err("Nonce ref share_index not in participants");
+                        }
+                        if nref.nonce_id == [0u8; 32] {
+                            sentinel_refs += 1;
+                        }
+                    }
+                    if seen_refs != expected {
+                        return Err("Nonce refs must match participant share indices");
+                    }
+                    if sentinel_refs != 1 {
+                        return Err("Nonce refs must contain exactly one sentinel");
                     }
                 }
             }
