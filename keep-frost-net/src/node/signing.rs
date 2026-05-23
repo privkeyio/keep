@@ -218,8 +218,7 @@ impl KfpNode {
         // commitment set rather than the sender-controlled timestamp: distinct
         // same-second batches stay distinct, and perturbing `created_at` cannot
         // bypass the dedup to force repeated secp256k1 deserialization.
-        let content_hash =
-            nonce_commitment_content_hash(payload.share_index, &payload.commitments);
+        let content_hash = nonce_commitment_content_hash(payload.share_index, &payload.commitments);
         if self
             .seen_nonce_commitments
             .write()
@@ -434,6 +433,16 @@ impl KfpNode {
                 if !request.participants.contains(&nref.share_index) {
                     return Err(FrostNetError::Protocol(format!(
                         "Nonce ref for non-participant share_index {}",
+                        nref.share_index
+                    )));
+                }
+                // The sentinel (echo-only, unauthenticated against our pool) is
+                // legitimate only for the requester's own commitment. Reject it
+                // for any other share_index so a requester cannot substitute a
+                // forged commitment for an honest peer by bypassing matches_peer.
+                if nref.nonce_id == [0u8; 32] && nref.share_index != requester {
+                    return Err(FrostNetError::Protocol(format!(
+                        "Sentinel nonce ref allowed only for requester, got share_index {}",
                         nref.share_index
                     )));
                 }
@@ -1012,23 +1021,38 @@ impl KfpNode {
             our_commit_bytes.clone(),
         );
 
-        for (share_index, pubkey) in participant_peers {
-            let event = KfpEventBuilder::sign_request(&self.keys, &pubkey, request.clone())?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-
-            if !using_pre_exchange {
-                let commit_event =
-                    KfpEventBuilder::commitment(&self.keys, &pubkey, our_commit_payload.clone())?;
+        // Reservations are already consumed and committed to the live session,
+        // so on a send failure tear the session down (matching the timeout and
+        // share-generation paths below) rather than leaving it active until it
+        // expires.
+        let send_result: Result<()> = async {
+            for (share_index, pubkey) in participant_peers {
+                let event = KfpEventBuilder::sign_request(&self.keys, &pubkey, request.clone())?;
                 self.client
-                    .send_event(&commit_event)
+                    .send_event(&event)
                     .await
                     .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-            }
 
-            debug!(share_index, using_pre_exchange, "Sent sign request");
+                if !using_pre_exchange {
+                    let commit_event = KfpEventBuilder::commitment(
+                        &self.keys,
+                        &pubkey,
+                        our_commit_payload.clone(),
+                    )?;
+                    self.client
+                        .send_event(&commit_event)
+                        .await
+                        .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                }
+
+                debug!(share_index, using_pre_exchange, "Sent sign request");
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = send_result {
+            self.sessions.write().complete_session(&session_id);
+            return Err(e);
         }
 
         let mut rx = self.event_tx.subscribe();
