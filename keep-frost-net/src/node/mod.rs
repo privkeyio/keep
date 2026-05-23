@@ -32,6 +32,7 @@ use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
+use crate::nonce_pool::{NonceId, NoncePool};
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
@@ -540,6 +541,7 @@ pub struct KfpNode {
     pub(crate) share: SharePackage,
     pub(crate) group_pubkey: [u8; 32],
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
+    pub(crate) nonce_pool: NoncePool,
     pub(crate) ecdh_sessions: Arc<RwLock<EcdhSessionManager>>,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
@@ -553,6 +555,13 @@ pub struct KfpNode {
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
+    /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
+    /// `(share_index, content_hash)` where `content_hash` covers the sorted
+    /// nonce_id/commitment set. Keying on content rather than the sender
+    /// controlled `created_at` avoids dropping distinct same-second batches and
+    /// stops a peer forcing repeated secp256k1 deserialization by perturbing the
+    /// timestamp. Value is `created_at` for time-based retention.
+    pub(crate) seen_nonce_commitments: RwLock<HashMap<(u16, [u8; 32]), u64>>,
     /// Per-session de-duplication for `DescriptorMigrate` link broadcasts.
     /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
     /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
@@ -713,6 +722,7 @@ impl KfpNode {
             share,
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
+            nonce_pool: NoncePool::new(),
             ecdh_sessions: Arc::new(RwLock::new(ecdh_manager)),
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
@@ -726,6 +736,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
+            seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_descriptor_migrates: RwLock::new(HashMap::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
@@ -823,6 +834,16 @@ impl KfpNode {
 
     pub fn online_peers(&self) -> usize {
         self.peers.read().online_count()
+    }
+
+    /// Number of our own pre-generated nonces currently available in the pool.
+    pub fn nonce_pool_own_available(&self) -> usize {
+        self.nonce_pool.own_available()
+    }
+
+    /// Number of pre-exchanged commitments pooled for the given peer.
+    pub fn nonce_pool_peer_available(&self, share_index: u16) -> usize {
+        self.nonce_pool.peer_available(share_index)
     }
 
     pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
@@ -1115,6 +1136,9 @@ impl KfpNode {
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(120));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut replenish_interval = tokio::time::interval(Duration::from_secs(30));
+        replenish_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -1124,6 +1148,13 @@ impl KfpNode {
                 _ = announce_interval.tick() => {
                     if let Err(e) = self.announce().await {
                         warn!(error = %e, "Failed to re-announce");
+                    }
+                }
+                _ = replenish_interval.tick() => {
+                    if self.nonce_pool.own_deficit() > 0 {
+                        if let Err(e) = self.replenish_nonce_pool().await {
+                            warn!(error = %e, "Failed to replenish nonce pool");
+                        }
                     }
                 }
                 _ = cleanup_interval.tick() => {
@@ -1150,6 +1181,9 @@ impl KfpNode {
                         let window = self.replay_window_secs + MAX_FUTURE_SKEW_SECS;
                         self.seen_xpub_announces.write().retain(|&(_, ts, _)| {
                             now.saturating_sub(window) <= ts
+                        });
+                        self.seen_nonce_commitments.write().retain(|_, ts| {
+                            now.saturating_sub(window) <= *ts
                         });
                         self.seen_descriptor_migrates.write().retain(|_, ts| {
                             now.saturating_sub(window) <= *ts
@@ -1220,6 +1254,9 @@ impl KfpNode {
             }
             KfpMessage::SignRequest(payload) => {
                 self.handle_sign_request(event.pubkey, payload).await?;
+            }
+            KfpMessage::NonceCommitment(payload) => {
+                self.handle_nonce_commitment(event.pubkey, payload).await?;
             }
             KfpMessage::Commitment(payload) => {
                 self.handle_commitment(event.pubkey, payload).await?;
@@ -1297,6 +1334,39 @@ impl KfpNode {
                     message = %payload.message,
                     "Received error from peer"
                 );
+                // A session-scoped error from a participant means that peer
+                // cannot continue the session (e.g. it no longer holds a
+                // referenced pre-exchanged nonce). Surface it so an in-flight
+                // `request_signature` fails fast instead of waiting for timeout.
+                if let Some(session_id) = payload.session_id {
+                    let is_participant = {
+                        let sessions = self.sessions.read();
+                        match sessions.get_session(&session_id) {
+                            Some(session) => {
+                                let peers = self.peers.read();
+                                session.participants().iter().any(|&idx| {
+                                    peers
+                                        .get_peer(idx)
+                                        .map(|p| p.pubkey == event.pubkey)
+                                        .unwrap_or(false)
+                                })
+                            }
+                            None => false,
+                        }
+                    };
+                    if is_participant {
+                        // Future improvement: on `stale_nonce` /
+                        // `incomplete_pre_exchange` the requester could retry
+                        // this session with a fresh interactive commitment round
+                        // instead of failing, since these are recoverable
+                        // pre-exchange misses rather than fatal errors. For now
+                        // we fail fast so the caller can decide to retry.
+                        let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
+                            session_id,
+                            error: format!("Peer reported error: {}", payload.code),
+                        });
+                    }
+                }
             }
         }
 
@@ -1372,6 +1442,8 @@ impl KfpNode {
 
         peer = peer.with_attestation_status(attestation_status);
 
+        let is_new_peer = self.peers.read().get_peer(payload.share_index).is_none();
+
         let name_clone = peer.name.clone();
         self.peers.write().add_peer(peer);
 
@@ -1385,6 +1457,15 @@ impl KfpNode {
             share_index: payload.share_index,
             name: name_clone,
         });
+
+        // A newly discovered peer may have come online after we last replenished
+        // (whose broadcast only carries freshly generated commitments). Send it
+        // our currently available pool so it can instant-sign with us right away.
+        if is_new_peer && self.can_send_to(&pubkey) {
+            if let Err(e) = self.send_nonce_pool_to(&pubkey).await {
+                warn!(peer = %pubkey, error = %e, "Failed to send nonce pool to new peer");
+            }
+        }
 
         Ok(())
     }

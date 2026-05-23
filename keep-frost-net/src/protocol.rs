@@ -12,6 +12,8 @@ pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 300;
 
 pub const MAX_MESSAGE_SIZE: usize = 65536;
 pub const MAX_COMMITMENT_SIZE: usize = 128;
+/// Maximum number of pre-exchanged commitments in a single `NonceCommitment`.
+pub const MAX_NONCE_COMMITMENTS: usize = 256;
 pub const MAX_SIGNATURE_SHARE_SIZE: usize = 64;
 pub const MAX_PARTICIPANTS: usize = 255;
 pub const MAX_NAME_LENGTH: usize = 256;
@@ -83,6 +85,7 @@ pub(crate) fn is_valid_fingerprint(fp: &str) -> bool {
 pub enum KfpMessage {
     Announce(AnnouncePayload),
     SignRequest(SignRequestPayload),
+    NonceCommitment(NonceCommitmentPayload),
     Commitment(CommitmentPayload),
     SignatureShare(SignatureSharePayload),
     SignatureComplete(SignatureCompletePayload),
@@ -114,6 +117,7 @@ impl KfpMessage {
         match self {
             KfpMessage::Announce(_) => "announce",
             KfpMessage::SignRequest(_) => "sign_request",
+            KfpMessage::NonceCommitment(_) => "nonce_commitment",
             KfpMessage::Commitment(_) => "commitment",
             KfpMessage::SignatureShare(_) => "signature_share",
             KfpMessage::SignatureComplete(_) => "signature_complete",
@@ -173,6 +177,7 @@ impl KfpMessage {
         match self {
             KfpMessage::Announce(p) => Some(&p.group_pubkey),
             KfpMessage::SignRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::NonceCommitment(p) => Some(&p.group_pubkey),
             KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
             KfpMessage::RefreshRequest(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorPropose(p) => Some(&p.group_pubkey),
@@ -230,6 +235,53 @@ impl KfpMessage {
                 }
                 if p.participants.len() > MAX_PARTICIPANTS {
                     return Err("Participants list exceeds maximum size");
+                }
+                if p.nonce_refs.len() > MAX_PARTICIPANTS {
+                    return Err("Nonce refs exceed maximum size");
+                }
+                if !p.nonce_refs.is_empty() {
+                    if p.nonce_refs.len() != p.participants.len() {
+                        return Err("Nonce refs must cover all participants");
+                    }
+                    let expected: HashSet<u16> = p.participants.iter().copied().collect();
+                    let mut seen_refs: HashSet<u16> = HashSet::new();
+                    // An all-zero `nonce_id` is the sentinel marking the
+                    // requester's own commitment (echo-only, never consumed).
+                    // Exactly one ref must carry it.
+                    let mut sentinel_refs = 0usize;
+                    for nref in &p.nonce_refs {
+                        if nref.commitment.len() > MAX_COMMITMENT_SIZE {
+                            return Err("Nonce ref commitment exceeds maximum size");
+                        }
+                        if !seen_refs.insert(nref.share_index) {
+                            return Err("Duplicate share_index in nonce_refs");
+                        }
+                        if !expected.contains(&nref.share_index) {
+                            return Err("Nonce ref share_index not in participants");
+                        }
+                        if nref.nonce_id == [0u8; 32] {
+                            sentinel_refs += 1;
+                        }
+                    }
+                    if seen_refs != expected {
+                        return Err("Nonce refs must match participant share indices");
+                    }
+                    if sentinel_refs != 1 {
+                        return Err("Nonce refs must contain exactly one sentinel");
+                    }
+                }
+            }
+            KfpMessage::NonceCommitment(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
+                if p.commitments.len() > MAX_NONCE_COMMITMENTS {
+                    return Err("Too many nonce commitments");
+                }
+                for c in &p.commitments {
+                    if c.commitment.len() > MAX_COMMITMENT_SIZE {
+                        return Err("Commitment exceeds maximum size");
+                    }
                 }
             }
             KfpMessage::Commitment(p) => {
@@ -775,6 +827,29 @@ pub struct SignRequestPayload {
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Optional references to pre-exchanged round-1 nonces, one per participant.
+    /// When present, each referenced participant consumes the matching pooled
+    /// nonce instead of running the interactive commitment round. An empty (or
+    /// absent) list falls back to the interactive round. Kept `#[serde(default)]`
+    /// for wire compatibility with peers that predate nonce pre-exchange.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nonce_refs: Vec<NonceRef>,
+}
+
+/// A reference to a single pre-exchanged nonce/commitment pair.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NonceRef {
+    /// Participant the reference applies to.
+    pub share_index: u16,
+    /// Identifier of the pooled nonce the participant must consume. A zero id
+    /// is a sentinel meaning "commitment only" (e.g. the requester's own
+    /// commitment), which participants read but never consume.
+    #[serde(with = "hex_bytes")]
+    pub nonce_id: [u8; 32],
+    /// The participant's pre-exchanged commitment, echoed so the requester's
+    /// signing package is self-contained.
+    #[serde(with = "hex_vec")]
+    pub commitment: Vec<u8>,
 }
 
 impl SignRequestPayload {
@@ -793,11 +868,17 @@ impl SignRequestPayload {
             participants,
             created_at: Timestamp::now().as_secs(),
             metadata: None,
+            nonce_refs: Vec::new(),
         }
     }
 
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_nonce_refs(mut self, nonce_refs: Vec<NonceRef>) -> Self {
+        self.nonce_refs = nonce_refs;
         self
     }
 
@@ -822,6 +903,45 @@ impl CommitmentPayload {
             share_index,
             commitment,
         }
+    }
+}
+
+/// A single pre-exchanged commitment entry within a `NonceCommitment` broadcast.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PreExchangedCommitment {
+    #[serde(with = "hex_bytes")]
+    pub nonce_id: [u8; 32],
+    #[serde(with = "hex_vec")]
+    pub commitment: Vec<u8>,
+}
+
+/// Broadcast of pre-generated round-1 commitments offered for future signing
+/// sessions. Secret nonces remain local; only commitments are shared.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NonceCommitmentPayload {
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub share_index: u16,
+    pub commitments: Vec<PreExchangedCommitment>,
+    pub created_at: u64,
+}
+
+impl NonceCommitmentPayload {
+    pub fn new(
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        commitments: Vec<PreExchangedCommitment>,
+    ) -> Self {
+        Self {
+            group_pubkey,
+            share_index,
+            commitments,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
     }
 }
 
@@ -2443,5 +2563,98 @@ mod tests {
             }
             _ => panic!("expected Announce"),
         }
+    }
+
+    #[test]
+    fn test_sign_request_without_nonce_refs_omits_field() {
+        let payload =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], b"msg".to_vec(), "raw", vec![1, 3]);
+        let msg = KfpMessage::SignRequest(payload);
+        let json = msg.to_json().unwrap();
+        // Wire compatibility: absent refs are not serialized.
+        assert!(!json.contains("nonce_refs"));
+    }
+
+    #[test]
+    fn test_sign_request_legacy_json_deserializes() {
+        // A payload produced by a peer predating nonce pre-exchange has no
+        // `nonce_refs` field at all; it must still parse to an empty list.
+        let legacy = r#"{"type":"sign_request","session_id":"0101010101010101010101010101010101010101010101010101010101010101","group_pubkey":"0202020202020202020202020202020202020202020202020202020202020202","message":"6d7367","message_type":"raw","participants":[1,3],"created_at":1700000000}"#;
+        let parsed = KfpMessage::from_json(legacy).unwrap();
+        match parsed {
+            KfpMessage::SignRequest(p) => assert!(p.nonce_refs.is_empty()),
+            _ => panic!("expected SignRequest"),
+        }
+    }
+
+    #[test]
+    fn test_sign_request_with_nonce_refs_roundtrip() {
+        let refs = vec![
+            NonceRef {
+                share_index: 1,
+                nonce_id: [9u8; 32],
+                commitment: vec![1, 2, 3],
+            },
+            NonceRef {
+                share_index: 3,
+                nonce_id: [0u8; 32],
+                commitment: vec![4, 5, 6],
+            },
+        ];
+        let payload =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], b"msg".to_vec(), "raw", vec![1, 3])
+                .with_nonce_refs(refs.clone());
+        let msg = KfpMessage::SignRequest(payload);
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::SignRequest(p) => assert_eq!(p.nonce_refs, refs),
+            _ => panic!("expected SignRequest"),
+        }
+    }
+
+    #[test]
+    fn test_nonce_commitment_roundtrip() {
+        let payload = NonceCommitmentPayload::new(
+            [7u8; 32],
+            2,
+            vec![PreExchangedCommitment {
+                nonce_id: [5u8; 32],
+                commitment: vec![1, 2, 3, 4],
+            }],
+        );
+        let msg = KfpMessage::NonceCommitment(payload);
+        assert_eq!(msg.message_type(), "nonce_commitment");
+        assert_eq!(msg.group_pubkey(), Some(&[7u8; 32]));
+        assert_eq!(msg.session_id(), None);
+
+        let json = msg.to_json().unwrap();
+        let parsed = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::NonceCommitment(p) => {
+                assert_eq!(p.share_index, 2);
+                assert_eq!(p.commitments.len(), 1);
+                assert_eq!(p.commitments[0].nonce_id, [5u8; 32]);
+            }
+            _ => panic!("expected NonceCommitment"),
+        }
+    }
+
+    #[test]
+    fn test_nonce_commitment_rejects_zero_share_index() {
+        let payload = NonceCommitmentPayload::new([7u8; 32], 0, vec![]);
+        assert!(KfpMessage::NonceCommitment(payload).validate().is_err());
+    }
+
+    #[test]
+    fn test_nonce_commitment_rejects_too_many() {
+        let commitments = (0..(MAX_NONCE_COMMITMENTS + 1))
+            .map(|_| PreExchangedCommitment {
+                nonce_id: [1u8; 32],
+                commitment: vec![1],
+            })
+            .collect();
+        let payload = NonceCommitmentPayload::new([7u8; 32], 1, commitments);
+        assert!(KfpMessage::NonceCommitment(payload).validate().is_err());
     }
 }

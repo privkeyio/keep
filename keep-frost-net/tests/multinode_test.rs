@@ -1120,3 +1120,144 @@ async fn test_request_descriptor_fails_with_no_peers() {
         "Expected 'No online peers' error, got: {err}"
     );
 }
+
+#[tokio::test]
+#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
+async fn test_signing_flow_with_nonce_pre_exchange() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-nonce-pre-exchange").unwrap();
+
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 1");
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 2");
+    let mut node3 = KfpNode::new(share3, vec![relay])
+        .await
+        .expect("Failed to create node 3");
+
+    let mut rx3 = node3.subscribe();
+
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node3 = Arc::new(node3);
+
+    let n1 = Arc::clone(&node1);
+    let n2 = Arc::clone(&node2);
+    let n3 = Arc::clone(&node3);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = n1.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = n2.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = n3.run().await;
+    });
+
+    let mut peers_discovered = 0u32;
+    let discovery_timeout = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+
+    if discovery_timeout.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
+    }
+
+    // Wait until node1 and node2 have also discovered node3, so their
+    // broadcasts will reach the signer.
+    let peers_ready = timeout(Duration::from_secs(45), async {
+        loop {
+            if node1.online_peers() >= 2 && node2.online_peers() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if peers_ready.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("node1/node2 did not discover all peers");
+    }
+
+    // Each peer pre-exchanges round-1 commitments. node3 (the signer) needs
+    // pooled commitments from node1 and node2.
+    node1.replenish_nonce_pool().await.expect("node1 replenish");
+    node2.replenish_nonce_pool().await.expect("node2 replenish");
+
+    // Allow the broadcast NonceCommitment events to propagate to node3.
+    let pool_ready = timeout(Duration::from_secs(20), async {
+        loop {
+            if node3.nonce_pool_peer_available(1) > 0 && node3.nonce_pool_peer_available(2) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    if pool_ready.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Pre-exchanged commitments did not propagate to signer");
+    }
+
+    let before_1 = node3.nonce_pool_peer_available(1);
+    let before_2 = node3.nonce_pool_peer_available(2);
+
+    let message = b"pre-exchanged nonce signing".to_vec();
+    let sign_result = timeout(Duration::from_secs(60), async {
+        node3.request_signature(message, "raw").await
+    })
+    .await;
+
+    // The signer should have consumed exactly one pooled commitment per peer.
+    let after_1 = node3.nonce_pool_peer_available(1);
+    let after_2 = node3.nonce_pool_peer_available(2);
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+
+    match sign_result {
+        Ok(Ok(signature)) => assert_eq!(signature.len(), 64),
+        Ok(Err(e)) => panic!("Signing failed: {e:?}"),
+        Err(_) => panic!("Signing timed out after 60 seconds"),
+    }
+
+    // A 2-of-3 signing selects exactly one peer besides the requester, so
+    // exactly one pooled commitment must have been consumed (single-use).
+    let consumed = (before_1 - after_1) + (before_2 - after_2);
+    assert_eq!(
+        consumed, 1,
+        "expected exactly one pooled commitment consumed across selected peers"
+    );
+}

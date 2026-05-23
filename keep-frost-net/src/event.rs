@@ -80,6 +80,30 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    pub fn nonce_commitment(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: NonceCommitmentPayload,
+    ) -> Result<Event> {
+        let group_pubkey = payload.group_pubkey;
+        let msg = KfpMessage::NonceCommitment(payload);
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["nonce_commitment"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn commitment(
         keys: &Keys,
         recipient: &PublicKey,
