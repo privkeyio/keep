@@ -633,6 +633,10 @@ impl SessionManager {
             .expect("just inserted"))
     }
 
+    pub fn abandon_session(&mut self, session_id: &[u8; 32]) {
+        self.active_sessions.remove(session_id);
+    }
+
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {
         self.active_sessions.remove(session_id);
 

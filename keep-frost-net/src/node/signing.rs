@@ -49,7 +49,54 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
+/// Content hash over a peer's nonce commitment batch, used to de-duplicate
+/// repeated broadcasts without trusting the sender-controlled timestamp. The
+/// set is sorted so reordering cannot bypass the dedup, and the length prefix
+/// keeps distinct commitments from colliding under concatenation.
+fn nonce_commitment_content_hash(
+    share_index: u16,
+    commitments: &[PreExchangedCommitment],
+) -> [u8; 32] {
+    let mut entries: Vec<&PreExchangedCommitment> = commitments.iter().collect();
+    entries.sort_by(|a, b| {
+        a.nonce_id
+            .cmp(&b.nonce_id)
+            .then(a.commitment.cmp(&b.commitment))
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep-nonce-commitment-dedup-v1");
+    hasher.update(share_index.to_be_bytes());
+    for entry in entries {
+        hasher.update(entry.nonce_id);
+        hasher.update((entry.commitment.len() as u32).to_be_bytes());
+        hasher.update(&entry.commitment);
+    }
+    hasher.finalize().into()
+}
+
 impl KfpNode {
+    /// Build a [`NonceCommitmentPayload`] from a set of pooled commitments,
+    /// serializing each into wire bytes.
+    fn build_nonce_commitment_payload(
+        &self,
+        commitments: impl IntoIterator<Item = (NonceId, frost_secp256k1_tr::round1::SigningCommitments)>,
+    ) -> Result<NonceCommitmentPayload> {
+        let commitments = commitments
+            .into_iter()
+            .map(|(nonce_id, commitment)| {
+                Ok(PreExchangedCommitment {
+                    nonce_id,
+                    commitment: serialize_commitment(&commitment)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(NonceCommitmentPayload::new(
+            self.group_pubkey,
+            self.share.metadata.identifier,
+            commitments,
+        ))
+    }
+
     /// Generate fresh round-1 nonces to top the local pool back up to its
     /// target and broadcast the matching commitments to online peers. Secret
     /// nonces are stored in memory only; only commitments leave this node.
@@ -60,26 +107,16 @@ impl KfpNode {
         }
 
         let key_package = self.share.key_package()?;
-        let mut commitments = Vec::with_capacity(deficit);
+        let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
             let nonce_id: NonceId = keep_core::crypto::random_bytes::<32>();
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
-
-            let commit_bytes = serialize_commitment(&commitment)?;
-
             self.nonce_pool.store_own(nonce_id, nonces);
-            commitments.push(PreExchangedCommitment {
-                nonce_id,
-                commitment: commit_bytes,
-            });
+            fresh.push((nonce_id, commitment));
         }
 
-        let payload = NonceCommitmentPayload::new(
-            self.group_pubkey,
-            self.share.metadata.identifier,
-            commitments,
-        );
+        let payload = self.build_nonce_commitment_payload(fresh)?;
 
         let peer_pubkeys: Vec<PublicKey> = self
             .peers
@@ -116,19 +153,7 @@ impl KfpNode {
             return Ok(());
         }
 
-        let mut commitments = Vec::with_capacity(available.len());
-        for (nonce_id, commitment) in available {
-            commitments.push(PreExchangedCommitment {
-                nonce_id,
-                commitment: serialize_commitment(&commitment)?,
-            });
-        }
-
-        let payload = NonceCommitmentPayload::new(
-            self.group_pubkey,
-            self.share.metadata.identifier,
-            commitments,
-        );
+        let payload = self.build_nonce_commitment_payload(available)?;
         let event = KfpEventBuilder::nonce_commitment(&self.keys, pubkey, payload)?;
         self.client
             .send_event(&event)
@@ -193,24 +218,8 @@ impl KfpNode {
         // commitment set rather than the sender-controlled timestamp: distinct
         // same-second batches stay distinct, and perturbing `created_at` cannot
         // bypass the dedup to force repeated secp256k1 deserialization.
-        let content_hash = {
-            let mut entries: Vec<&PreExchangedCommitment> = payload.commitments.iter().collect();
-            entries.sort_by(|a, b| {
-                a.nonce_id
-                    .cmp(&b.nonce_id)
-                    .then(a.commitment.cmp(&b.commitment))
-            });
-            let mut hasher = Sha256::new();
-            hasher.update(b"keep-nonce-commitment-dedup-v1");
-            hasher.update(payload.share_index.to_be_bytes());
-            for entry in entries {
-                hasher.update(entry.nonce_id);
-                hasher.update((entry.commitment.len() as u32).to_be_bytes());
-                hasher.update(&entry.commitment);
-            }
-            let digest: [u8; 32] = hasher.finalize().into();
-            digest
-        };
+        let content_hash =
+            nonce_commitment_content_hash(payload.share_index, &payload.commitments);
         if self
             .seen_nonce_commitments
             .write()
@@ -497,6 +506,10 @@ impl KfpNode {
             // so a fresh one would collide as a duplicate and hang it. Bail out
             // and signal stale_nonce after dropping the session lock.
             if used_pre_exchange && pooled_nonces.is_none() {
+                // Drop the session we just created so a vanished-nonce request
+                // cannot leave dead sessions filling the active slot cap. Not
+                // marked completed so a legitimate retry is not flagged replay.
+                sessions.abandon_session(&request.session_id);
                 None
             } else {
                 let used_pre_exchange = pooled_nonces.is_some();
