@@ -202,6 +202,27 @@ pub fn address_at(descriptor: &str, index: u32, network: Network) -> Result<bitc
         .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
 }
 
+/// Derive the `script_pubkey` for a descriptor string. Ranged descriptors are
+/// resolved at `index`; definite (non-ranged) descriptors ignore `index` and
+/// yield their single output. Used to bind a supplied [`crate::RecoveryOutput`]
+/// to the descriptor identified by a canonical hash before sweeping its coins.
+pub fn descriptor_script_pubkey(descriptor: &str, index: u32) -> Result<bitcoin::ScriptBuf> {
+    let body = descriptor.split('#').next().unwrap_or(descriptor);
+    let parsed: Descriptor<DescriptorPublicKey> = body
+        .parse()
+        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    let definite = if parsed.has_wildcard() {
+        parsed
+            .at_derivation_index(index)
+            .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?
+    } else {
+        parsed
+            .at_derivation_index(0)
+            .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?
+    };
+    Ok(definite.script_pubkey())
+}
+
 fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
     let body = body.split('#').next().unwrap_or(body);
     let parsed: Descriptor<DescriptorPublicKey> = body

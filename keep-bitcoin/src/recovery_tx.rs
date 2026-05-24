@@ -17,6 +17,9 @@ const MAX_FEE_SATS: u64 = 100_000_000; // 1 BTC
 /// Bitcoin Core's default dust threshold for taproot (P2TR) outputs in sats.
 /// Outputs smaller than this are non-standard and unlikely to relay.
 pub const TAPROOT_DUST_LIMIT_SATS: u64 = 330;
+/// Maximum number of inputs in a single consolidating sweep. A larger tx would
+/// exceed standardness limits and fail to relay, so reject it at build time.
+pub const MAX_SWEEP_INPUTS: usize = 500;
 
 /// A single UTXO under the recovery output being consolidated by
 /// [`RecoveryTxBuilder::build_sweep_psbt`].
@@ -122,6 +125,12 @@ impl RecoveryTxBuilder {
             return Err(BitcoinError::Recovery(
                 "sweep requires at least one UTXO".into(),
             ));
+        }
+        if utxos.len() > MAX_SWEEP_INPUTS {
+            return Err(BitcoinError::Recovery(format!(
+                "sweep input count {} exceeds maximum {MAX_SWEEP_INPUTS}",
+                utxos.len()
+            )));
         }
         if fee_sats > MAX_FEE_SATS {
             return Err(BitcoinError::Recovery(format!(
