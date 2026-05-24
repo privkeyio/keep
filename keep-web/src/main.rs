@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let vault_path = PathBuf::from(env_or("KEEP_PATH", "/data"));
     let relay = env_or("KEEP_RELAY", "wss://relay.damus.io");
-    let ui_dir = PathBuf::from(env_or("KEEP_WEB_UI_DIR", "ui"));
+    let ui_dir = PathBuf::from(env_or("KEEP_WEB_UI_DIR", "ui/dist"));
     let listen: SocketAddr = env_or("KEEP_WEB_LISTEN", "0.0.0.0:8080").parse()?;
     let password = std::env::var("KEEP_PASSWORD")
         .map_err(|_| "KEEP_PASSWORD must be set for headless unlock")?;
