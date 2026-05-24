@@ -80,10 +80,9 @@ struct CoSignerPolicy {
 impl SigningHooks for CoSignerPolicy {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
         let detail = format!(
-            "session {} · {}-of-{} · {} participants",
+            "session {} · threshold {} · {} participants",
             short_id(&session.session_id),
             session.threshold,
-            session.participants.len(),
             session.participants.len(),
         );
         if self.auto_approve {
