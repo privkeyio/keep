@@ -267,8 +267,7 @@ mod tests {
     fn test_address_at_rejects_non_ranged_descriptor() {
         let group = test_group_pubkey();
         // tr(<xonly>) has no wildcard.
-        let export =
-            DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
+        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
         let err = address_at(&export.descriptor, 0, Network::Testnet).unwrap_err();
         assert!(err.to_string().contains("wildcard"));
     }

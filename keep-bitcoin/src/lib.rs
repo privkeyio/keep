@@ -14,8 +14,7 @@ mod signer;
 
 pub use address::{AddressDerivation, DerivedAddress};
 pub use descriptor::{
-    address_at, descriptor_script_pubkey, multipath_from_external, xpub_to_x_only,
-    DescriptorExport,
+    address_at, descriptor_script_pubkey, multipath_from_external, xpub_to_x_only, DescriptorExport,
 };
 pub use error::{BitcoinError, Result};
 pub use key_proof::{build_key_proof_psbt, sign_key_proof, verify_key_proof};

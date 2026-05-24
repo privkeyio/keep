@@ -177,9 +177,9 @@ impl KfpNode {
         //    a descriptor the group has not fully validated.
         let (new_external, new_internal, new_network, new_policy_hash, new_version) = {
             let sessions = self.descriptor_sessions.read();
-            let session = sessions.get_session(&migration_session_id).ok_or_else(|| {
-                FrostNetError::Session("unknown migration session".into())
-            })?;
+            let session = sessions
+                .get_session(&migration_session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown migration session".into()))?;
             if session.group_pubkey() != &self.group_pubkey {
                 return Err(FrostNetError::Session(
                     "migration session belongs to a different group".into(),
@@ -227,9 +227,8 @@ impl KfpNode {
             ));
         }
 
-        let network = bitcoin::Network::from_str(&new_network).map_err(|e| {
-            FrostNetError::Session(format!("invalid network {new_network}: {e}"))
-        })?;
+        let network = bitcoin::Network::from_str(&new_network)
+            .map_err(|e| FrostNetError::Session(format!("invalid network {new_network}: {e}")))?;
 
         // 3. Bind `old_recovery` to `old_descriptor_hash`. The PSBT body
         //    (witness_utxo script, tap_scripts, control blocks) is built
@@ -786,7 +785,9 @@ impl KfpNode {
                 &finalized.policy_hash,
                 session.policy().version,
             )
-            .map_err(|e| FrostNetError::Session(format!("canonical descriptor hash failed: {e}")))?;
+            .map_err(|e| {
+                FrostNetError::Session(format!("canonical descriptor hash failed: {e}"))
+            })?;
             if &expected == descriptor_hash {
                 return Ok(Some(finalized.external.clone()));
             }

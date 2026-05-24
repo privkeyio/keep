@@ -147,9 +147,9 @@ impl RecoveryTxBuilder {
                     utxo.outpoint
                 )));
             }
-            total_in = total_in.checked_add(utxo.value_sats).ok_or_else(|| {
-                BitcoinError::Recovery("sweep input value overflow".into())
-            })?;
+            total_in = total_in
+                .checked_add(utxo.value_sats)
+                .ok_or_else(|| BitcoinError::Recovery("sweep input value overflow".into()))?;
         }
 
         if total_in <= fee_sats {
