@@ -177,6 +177,31 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
     Ok(canonical)
 }
 
+/// Derive the receive address at `index` from a ranged external descriptor
+/// string (e.g. `tr(...)/0/*`). Used to pick a fresh destination on the new
+/// descriptor when sweeping funds after a migration.
+///
+/// The descriptor must be ranged (contain a wildcard `*`); a definite
+/// descriptor with no wildcard is rejected so callers don't silently reuse a
+/// single address.
+pub fn address_at(descriptor: &str, index: u32, network: Network) -> Result<bitcoin::Address> {
+    let body = descriptor.split('#').next().unwrap_or(descriptor);
+    let parsed: Descriptor<DescriptorPublicKey> = body
+        .parse()
+        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    if !parsed.has_wildcard() {
+        return Err(BitcoinError::Descriptor(
+            "descriptor has no wildcard; cannot derive a ranged receive address".into(),
+        ));
+    }
+    let definite = parsed
+        .at_derivation_index(index)
+        .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?;
+    definite
+        .address(network)
+        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
+}
+
 fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
     let body = body.split('#').next().unwrap_or(body);
     let parsed: Descriptor<DescriptorPublicKey> = body
@@ -204,6 +229,28 @@ mod tests {
         assert!(export.descriptor.contains("tr("));
         assert!(export.descriptor.contains("86'/1'/0'"));
         assert!(export.descriptor.contains("#"));
+    }
+
+    #[test]
+    fn test_address_at_derives_distinct_ranged_addresses() {
+        let secret = [7u8; 32];
+        let derivation = AddressDerivation::new(&secret, Network::Testnet).unwrap();
+        let export = DescriptorExport::from_derivation(&derivation, 0).unwrap();
+
+        let a0 = address_at(&export.descriptor, 0, Network::Testnet).unwrap();
+        let a1 = address_at(&export.descriptor, 1, Network::Testnet).unwrap();
+        assert_ne!(a0, a1);
+        assert!(a0.to_string().starts_with("tb1p"));
+    }
+
+    #[test]
+    fn test_address_at_rejects_non_ranged_descriptor() {
+        let group = test_group_pubkey();
+        // tr(<xonly>) has no wildcard.
+        let export =
+            DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
+        let err = address_at(&export.descriptor, 0, Network::Testnet).unwrap_err();
+        assert!(err.to_string().contains("wildcard"));
     }
 
     #[test]
