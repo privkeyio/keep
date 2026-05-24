@@ -84,9 +84,28 @@
   <h2>Connection</h2>
   <div class="panel">
     {#if bunker}
+      <div class="kv">
+        <span>mode</span>
+        {#if bunker.mode === 'network-frost'}
+          <code>network FROST co-signer</code>
+        {:else}
+          <code class="warn">single-key (no threshold security)</code>
+        {/if}
+      </div>
+      {#if bunker.group}
+        <div class="kv"><span>group</span><code>{bunker.group}</code></div>
+      {/if}
+      {#if bunker.threshold}
+        <div class="kv"><span>threshold</span><code>{bunker.threshold}</code></div>
+      {/if}
       <div class="kv"><span>npub</span><code>{bunker.npub}</code></div>
       <div class="kv"><span>bunker</span><code>{bunker.url}</code></div>
-      <div class="kv"><span>relay</span><code>{bunker.relay}</code></div>
+      <div class="kv"><span>bunker relay</span><code>{bunker.relay}</code></div>
+      {#if bunker.frost_relays.length}
+        <div class="kv">
+          <span>frost relays</span><code>{bunker.frost_relays.join(', ')}</code>
+        </div>
+      {/if}
     {:else}
       <p class="muted">Connecting…</p>
     {/if}

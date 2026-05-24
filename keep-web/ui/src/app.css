@@ -125,6 +125,10 @@ button:disabled {
   color: var(--no);
 }
 
+code.warn {
+  color: #e3b341;
+}
+
 textarea,
 input {
   width: 100%;

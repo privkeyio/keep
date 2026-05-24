@@ -22,9 +22,18 @@ pub struct AppState {
 
 #[derive(Clone, Serialize)]
 pub struct BunkerInfo {
+    /// "network-frost" (always-on co-signer) or "single-key" (fallback).
+    pub mode: String,
     pub url: String,
     pub npub: String,
+    /// NIP-46 bunker transport relay.
     pub relay: String,
+    /// FROST peer-coordination relays (network mode only).
+    pub frost_relays: Vec<String>,
+    /// Group npub this node co-signs for (network mode only).
+    pub group: Option<String>,
+    /// Threshold as "t-of-n" (network mode only).
+    pub threshold: Option<String>,
 }
 
 /// An event pushed to connected WebSocket clients.

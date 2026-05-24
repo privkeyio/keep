@@ -1,7 +1,11 @@
 export interface BunkerInfo {
+  mode: string
   url: string
   npub: string
   relay: string
+  frost_relays: string[]
+  group: string | null
+  threshold: string | null
 }
 
 export interface Share {
