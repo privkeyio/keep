@@ -11,6 +11,7 @@ members = [
     "keep-nip46",
     "keep-mobile",
     "keep-desktop",
+    "keep-web",
 ]
 exclude = [
     "keep-enclave/enclave",

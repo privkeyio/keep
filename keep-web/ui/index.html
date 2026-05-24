@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keep</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+      code { background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }
+      .ev { font-size: 0.85rem; border-bottom: 1px solid #eee; padding: 0.25rem 0; }
+      button { margin-right: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Keep — FROST Bunker</h1>
+    <p>Bunker: <code id="url">…</code></p>
+    <p>npub: <code id="npub">…</code></p>
+    <h2>Shares</h2>
+    <ul id="shares"></ul>
+    <h2>Activity</h2>
+    <div id="log"></div>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      fetch('/api/bunker').then(r => r.json()).then(b => {
+        $('url').textContent = b.url;
+        $('npub').textContent = b.npub;
+      });
+      fetch('/api/shares').then(r => r.json()).then(rows => {
+        $('shares').innerHTML = rows.map(s =>
+          `<li>${s.name} — ${s.threshold}-of-${s.total_shares} (signed ${s.sign_count})</li>`
+        ).join('') || '<li>No shares imported yet.</li>';
+      });
+      const ws = new WebSocket(`ws://${location.host}/api/events`);
+      ws.onmessage = (m) => {
+        const e = JSON.parse(m.data);
+        const div = document.createElement('div');
+        div.className = 'ev';
+        if (e.type === 'approval') {
+          div.innerHTML = `<b>${e.app}</b> requests ${e.method}. ` +
+            `<button data-ok>Approve</button><button data-no>Deny</button>`;
+          const send = (approve) => fetch(`/api/approvals/${e.id}`, {
+            method: 'POST', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({ approve })
+          }).then(() => div.append(' → ' + (approve ? 'approved' : 'denied')));
+          div.querySelector('[data-ok]').onclick = () => send(true);
+          div.querySelector('[data-no]').onclick = () => send(false);
+        } else {
+          div.textContent = `${e.app}: ${e.action} ${e.success ? '✓' : '✗'}` +
+            (e.detail ? ` (${e.detail})` : '');
+        }
+        $('log').prepend(div);
+      };
+    </script>
+  </body>
+</html>
