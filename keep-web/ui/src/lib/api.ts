@@ -43,6 +43,21 @@ export async function getShares(): Promise<Share[]> {
   return r.json()
 }
 
+export async function importShare(
+  data: string,
+  passphrase: string,
+  name: string,
+): Promise<void> {
+  const r = await fetch('/api/shares/import', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data, passphrase, name: name || null }),
+  })
+  if (!r.ok && r.status !== 204) {
+    throw new Error((await r.text()) || `import failed: ${r.status}`)
+  }
+}
+
 export async function resolveApproval(id: number, approve: boolean): Promise<void> {
   const r = await fetch(`/api/approvals/${id}`, {
     method: 'POST',

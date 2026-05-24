@@ -4,6 +4,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use keep_core::frost::ShareExport;
+
 use crate::state::AppState;
 
 pub async fn health() -> &'static str {
@@ -39,6 +41,34 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
                 .collect();
             Json(dto).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ImportRequest {
+    pub data: String,
+    pub passphrase: String,
+    pub name: Option<String>,
+}
+
+/// Imports a FROST share export (bech32 `kshare1…` or JSON) into the vault.
+///
+/// The share is persisted immediately and appears in `GET /api/shares`. The
+/// running bunker only loads shares at startup, so signing with a newly
+/// imported share requires a service restart.
+pub async fn import_share(
+    State(state): State<AppState>,
+    Json(body): Json<ImportRequest>,
+) -> impl IntoResponse {
+    let export = match ShareExport::parse(body.data.trim()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let name = body.name.unwrap_or_else(|| "imported".to_string());
+    let mut keep = state.keep.lock().await;
+    match keep.frost_import_share(&export, &body.passphrase, &name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

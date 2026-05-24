@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/health", get(api::health))
         .route("/api/bunker", get(api::bunker))
         .route("/api/shares", get(api::shares))
+        .route("/api/shares/import", post(api::import_share))
         .route("/api/approvals/{id}", post(api::resolve_approval))
         .route("/api/events", get(ws::events))
         .fallback_service(static_files)

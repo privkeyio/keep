@@ -3,6 +3,7 @@
   import {
     getBunker,
     getShares,
+    importShare,
     resolveApproval,
     connectEvents,
     type BunkerInfo,
@@ -19,13 +20,41 @@
   let approvals = $state<PendingApproval[]>([])
   let logs = $state<LogEvent[]>([])
 
+  let importData = $state('')
+  let importPass = $state('')
+  let importName = $state('')
+  let importing = $state(false)
+  let importMsg = $state<string | null>(null)
+
+  function refreshShares() {
+    getShares()
+      .then((s) => (shares = s))
+      .catch((e) => (error = String(e)))
+  }
+
+  async function submitImport(e: Event) {
+    e.preventDefault()
+    importing = true
+    importMsg = null
+    try {
+      await importShare(importData, importPass, importName)
+      importMsg = 'Share imported. Restart the service for the bunker to sign with it.'
+      importData = ''
+      importPass = ''
+      importName = ''
+      refreshShares()
+    } catch (err) {
+      importMsg = String(err)
+    } finally {
+      importing = false
+    }
+  }
+
   onMount(() => {
     getBunker()
       .then((b) => (bunker = b))
       .catch((e) => (error = String(e)))
-    getShares()
-      .then((s) => (shares = s))
-      .catch((e) => (error = String(e)))
+    refreshShares()
 
     const ws = connectEvents((e) => {
       if (e.type === 'approval') {
@@ -75,6 +104,30 @@
     {:else}
       <p class="muted">No shares imported yet.</p>
     {/each}
+  </div>
+
+  <h2>Import Share</h2>
+  <div class="panel">
+    <form onsubmit={submitImport}>
+      <textarea
+        bind:value={importData}
+        placeholder="Paste share export (kshare1… or JSON)"
+        rows="3"
+      ></textarea>
+      <div class="row">
+        <input
+          type="password"
+          bind:value={importPass}
+          placeholder="Passphrase"
+          autocomplete="off"
+        />
+        <input type="text" bind:value={importName} placeholder="Name (optional)" />
+        <button class="ok" type="submit" disabled={importing || !importData || !importPass}>
+          {importing ? 'Importing…' : 'Import'}
+        </button>
+      </div>
+      {#if importMsg}<p class="muted">{importMsg}</p>{/if}
+    </form>
   </div>
 
   <h2>Activity</h2>

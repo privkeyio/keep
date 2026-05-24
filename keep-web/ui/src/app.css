@@ -124,3 +124,31 @@ button:disabled {
 .fail {
   color: var(--no);
 }
+
+textarea,
+input {
+  width: 100%;
+  background: #0f131a;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 0.5rem;
+  font-size: 0.88rem;
+  font-family: inherit;
+}
+
+textarea {
+  resize: vertical;
+  font-family: ui-monospace, monospace;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  align-items: center;
+}
+
+.row button {
+  white-space: nowrap;
+}
