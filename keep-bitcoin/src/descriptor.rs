@@ -185,42 +185,41 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
 /// descriptor with no wildcard is rejected so callers don't silently reuse a
 /// single address.
 pub fn address_at(descriptor: &str, index: u32, network: Network) -> Result<bitcoin::Address> {
-    let body = descriptor.split('#').next().unwrap_or(descriptor);
-    let parsed: Descriptor<DescriptorPublicKey> = body
-        .parse()
-        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    let parsed = parse_descriptor_body(descriptor)?;
     if !parsed.has_wildcard() {
         return Err(BitcoinError::Descriptor(
             "descriptor has no wildcard; cannot derive a ranged receive address".into(),
         ));
     }
-    let definite = parsed
+    parsed
         .at_derivation_index(index)
-        .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?;
-    definite
+        .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?
         .address(network)
         .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
 }
 
-/// Derive the `script_pubkey` for a descriptor string. Ranged descriptors are
-/// resolved at `index`; definite (non-ranged) descriptors ignore `index` and
-/// yield their single output. Used to bind a supplied [`crate::RecoveryOutput`]
-/// to the descriptor identified by a canonical hash before sweeping its coins.
-pub fn descriptor_script_pubkey(descriptor: &str, index: u32) -> Result<bitcoin::ScriptBuf> {
-    let body = descriptor.split('#').next().unwrap_or(descriptor);
-    let parsed: Descriptor<DescriptorPublicKey> = body
-        .parse()
-        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
-    let definite = if parsed.has_wildcard() {
-        parsed
-            .at_derivation_index(index)
-            .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?
-    } else {
-        parsed
-            .at_derivation_index(0)
-            .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?
-    };
+/// Derive the `script_pubkey` for a definite (non-ranged) descriptor string.
+/// Used to bind a supplied [`crate::RecoveryOutput`] to the descriptor
+/// identified by a canonical hash before sweeping its coins. A recovery output
+/// is by definition a single, non-ranged output, so a ranged descriptor is
+/// rejected rather than silently resolved at an arbitrary index.
+pub fn descriptor_script_pubkey(descriptor: &str) -> Result<bitcoin::ScriptBuf> {
+    let parsed = parse_descriptor_body(descriptor)?;
+    if parsed.has_wildcard() {
+        return Err(BitcoinError::Descriptor(
+            "descriptor is ranged; expected a definite recovery output".into(),
+        ));
+    }
+    let definite = parsed
+        .at_derivation_index(0)
+        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?;
     Ok(definite.script_pubkey())
+}
+
+fn parse_descriptor_body(descriptor: &str) -> Result<Descriptor<DescriptorPublicKey>> {
+    let body = descriptor.split('#').next().unwrap_or(descriptor);
+    body.parse()
+        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))
 }
 
 fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {

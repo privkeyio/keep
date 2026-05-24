@@ -46,11 +46,10 @@ pub struct PsbtSessionSnapshot {
 /// the new descriptor's used range, not an arbitrarily deep index.
 const MAX_SWEEP_RECEIVE_INDEX: u32 = 1_000;
 
-/// Reject a sweep whose fee exceeds this fraction of total input value. Guards
-/// against a fee-griefing proposal that burns swept funds while still passing
-/// the absolute `MAX_FEE_SATS` cap in the builder.
-const MAX_SWEEP_FEE_NUMERATOR: u64 = 1;
-const MAX_SWEEP_FEE_DENOMINATOR: u64 = 4;
+/// Reject a sweep whose fee exceeds `1 / MAX_SWEEP_FEE_FRACTION` of total input
+/// value. Guards against a fee-griefing proposal that burns swept funds while
+/// still passing the absolute `MAX_FEE_SATS` cap in the builder.
+const MAX_SWEEP_FEE_FRACTION: u64 = 4;
 
 impl KfpNode {
     /// Return a display-safe snapshot for the given PSBT session. Returns
@@ -247,7 +246,7 @@ impl KfpNode {
                         .into(),
                 )
             })?;
-        let old_spk = keep_bitcoin::descriptor_script_pubkey(&old_external, 0)
+        let old_spk = keep_bitcoin::descriptor_script_pubkey(&old_external)
             .map_err(|e| FrostNetError::Session(format!("old descriptor script_pubkey: {e}")))?;
         if old_spk != old_recovery.address.script_pubkey() {
             return Err(FrostNetError::Session(
@@ -269,10 +268,10 @@ impl KfpNode {
             .iter()
             .try_fold(0u64, |acc, u| acc.checked_add(u.value_sats))
             .ok_or_else(|| FrostNetError::Session("sweep input value overflow".into()))?;
-        let fee_cap = total_in.saturating_mul(MAX_SWEEP_FEE_NUMERATOR) / MAX_SWEEP_FEE_DENOMINATOR;
+        let fee_cap = total_in / MAX_SWEEP_FEE_FRACTION;
         if fee_sats > fee_cap {
             return Err(FrostNetError::Session(format!(
-                "sweep fee {fee_sats} exceeds {MAX_SWEEP_FEE_NUMERATOR}/{MAX_SWEEP_FEE_DENOMINATOR} of total input {total_in}"
+                "sweep fee {fee_sats} exceeds 1/{MAX_SWEEP_FEE_FRACTION} of total input {total_in}"
             )));
         }
 
@@ -307,7 +306,7 @@ impl KfpNode {
             "Proposing migration sweep"
         );
 
-        // 5. Drive through the existing PSBT propose/sign coordination.
+        // 7. Drive through the existing PSBT propose/sign coordination.
         self.request_psbt_spend(
             old_descriptor_hash,
             tier_index,
