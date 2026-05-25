@@ -146,10 +146,7 @@ impl Nip55Handler {
         request: Nip55Request,
         caller_id: String,
     ) -> Result<Nip55Response, KeepMobileError> {
-        if matches!(
-            request.request_type,
-            Nip55RequestType::SignEvent | Nip55RequestType::GetPublicKey
-        ) {
+        if is_rate_limited_type(&request.request_type) {
             self.check_rate_limit(&caller_id)?;
         }
 
@@ -190,10 +187,7 @@ impl Nip55Handler {
             response.id = request_id;
         }
 
-        if matches!(
-            request.request_type,
-            Nip55RequestType::SignEvent | Nip55RequestType::GetPublicKey
-        ) {
+        if is_rate_limited_type(&request.request_type) {
             self.record_result(&caller_id, result.is_ok());
         }
         result
@@ -713,6 +707,19 @@ fn is_valid_package_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
+fn is_rate_limited_type(t: &Nip55RequestType) -> bool {
+    matches!(
+        t,
+        Nip55RequestType::SignEvent
+            | Nip55RequestType::GetPublicKey
+            | Nip55RequestType::Nip04Encrypt
+            | Nip55RequestType::Nip04Decrypt
+            | Nip55RequestType::Nip44Encrypt
+            | Nip55RequestType::Nip44Decrypt
+            | Nip55RequestType::DecryptZapEvent
+    )
+}
+
 fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> {
     match value {
         "get_public_key" => Ok(Nip55RequestType::GetPublicKey),
@@ -760,7 +767,7 @@ fn parse_pubkey_to_compressed(pubkey_hex: &str) -> Result<[u8; 33], KeepMobileEr
     }
 }
 
-fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError> {
+pub(crate) fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError> {
     if !event.is_object() {
         return Err(KeepMobileError::InvalidSession);
     }

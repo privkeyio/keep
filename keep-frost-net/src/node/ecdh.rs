@@ -293,10 +293,16 @@ impl KfpNode {
             self.ecdh_sessions
                 .write()
                 .complete_session(&session_id);
-            let _ = self.event_tx.send(KfpNodeEvent::EcdhComplete {
+            if let Err(e) = self.event_tx.send(KfpNodeEvent::EcdhComplete {
                 session_id,
                 shared_secret: Zeroizing::new(*secret),
-            });
+            }) {
+                warn!(
+                    session_id = %hex::encode(session_id),
+                    error = %e,
+                    "Failed to send EcdhComplete event (single-party)"
+                );
+            }
         }
 
         let timeout = Duration::from_secs(30);

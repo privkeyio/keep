@@ -217,6 +217,8 @@ const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
 const MAX_STORED_SHARES: usize = 100;
+const MAX_PRE_APPROVED_HASHES: usize = 100;
+const PRE_APPROVAL_TTL: Duration = Duration::from_secs(300);
 const MAX_SHARE_NAME_LENGTH: usize = 64;
 
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
@@ -304,7 +306,8 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
-    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
+    pre_approved_hashes:
+        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     /// Read on every round so the kill switch ("Signing Disabled") gates FROST
     /// co-signing too, not just the NIP-55/NIP-46 paths.
     storage: Arc<dyn SecureStorage>,
@@ -314,11 +317,13 @@ impl MobileSigningHooks {
     fn consume_pre_approval(&self, message: &[u8]) -> bool {
         use sha2::{Digest, Sha256};
         let msg_hash: [u8; 32] = Sha256::digest(message).into();
+        let now = std::time::Instant::now();
         let mut guard = self
             .pre_approved_hashes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.remove(&msg_hash)
+        guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
+        guard.remove(&msg_hash).is_some()
     }
 }
 
@@ -400,7 +405,7 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
+    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -539,7 +544,7 @@ impl KeepMobile {
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -675,15 +680,24 @@ impl KeepMobile {
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();
-        self.pre_approved_hashes
+        let now = std::time::Instant::now();
+        let mut guard = self
+            .pre_approved_hashes
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(hash);
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
+        if guard.len() >= MAX_PRE_APPROVED_HASHES {
+            if let Some(&oldest) = guard.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k) {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(hash, now);
     }
 
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
         let event: serde_json::Value = serde_json::from_str(&event_json)
             .map_err(|_| KeepMobileError::InvalidSession)?;
+        crate::nip55::validate_nostr_event(&event)?;
         let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
         self.set_signing_pre_approved(event_hash.to_vec());
         Ok(())
