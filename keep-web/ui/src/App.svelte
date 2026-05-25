@@ -25,6 +25,19 @@
   let importName = $state('')
   let importing = $state(false)
   let importMsg = $state<string | null>(null)
+  let importOk = $state(false)
+
+  // What the Connection panel shows once a share is imported and the
+  // co-signer is running.
+  const fieldLegend: [string, string][] = [
+    ['mode', 'network FROST co-signer once running (vs. setup)'],
+    ['group', 'the FROST group npub this node co-signs for'],
+    ['threshold', 'signatures needed, e.g. 2-of-3'],
+    ['npub', "this signer's own public key"],
+    ['bunker', 'NIP-46 connection string to paste into a Nostr client'],
+    ['bunker relay', 'relay where clients reach the bunker'],
+    ['frost relays', 'relays used to coordinate signing rounds with your devices'],
+  ]
 
   function refreshShares() {
     getShares()
@@ -38,12 +51,14 @@
     importMsg = null
     try {
       await importShare(importData, importPass, importName)
-      importMsg = 'Share imported. Restart the service for the bunker to sign with it.'
+      importOk = true
+      importMsg = null
       importData = ''
       importPass = ''
       importName = ''
       refreshShares()
     } catch (err) {
+      importOk = false
       importMsg = String(err)
     } finally {
       importing = false
@@ -83,8 +98,21 @@
 
   {#if bunker && bunker.mode === 'setup'}
     <div class="panel setup">
-      <strong>⚙ Setup required.</strong> No FROST share is loaded yet. Import your
-      share below, then restart the service to start the co-signer.
+      <strong>⚙ Setup required.</strong> No FROST share is loaded yet — this node
+      isn't signing.
+      <h3>Tasks to finish setup</h3>
+      <ol class="tasks">
+        <li>Import your FROST share below (export it from the device that holds it).</li>
+        <li>
+          Open the <strong>Configure</strong> action and set <strong>FROST Relays</strong>
+          to match the relays your other share-holders use.
+        </li>
+        <li><strong>Restart the service</strong> to start the co-signer.</li>
+        <li>
+          Copy the bunker connection string (shown here after restart) into your
+          Nostr client.
+        </li>
+      </ol>
     </div>
   {/if}
 
@@ -101,6 +129,18 @@
           <code class="warn">single-key (no threshold security)</code>
         {/if}
       </div>
+      {#if bunker.mode === 'setup'}
+        <p class="muted legend-intro">
+          Once a share is imported and the service is restarted, this panel will
+          show:
+        </p>
+        <dl class="legend">
+          {#each fieldLegend as [field, desc]}
+            <dt>{field}</dt>
+            <dd>{desc}</dd>
+          {/each}
+        </dl>
+      {/if}
       {#if bunker.group}
         <div class="kv"><span>group</span><code>{bunker.group}</code></div>
       {/if}
@@ -165,7 +205,14 @@
           {importing ? 'Importing…' : 'Import'}
         </button>
       </div>
-      {#if importMsg}<p class="muted">{importMsg}</p>{/if}
+      {#if importOk}
+        <div class="import-ok">
+          <strong>✓ Share imported.</strong>
+          <span>Now <strong>restart the service</strong> to start the co-signer.</span>
+        </div>
+      {:else if importMsg}
+        <p class="fail">{importMsg}</p>
+      {/if}
     </form>
   </div>
 
