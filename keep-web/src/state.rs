@@ -36,6 +36,22 @@ pub struct BunkerInfo {
     pub threshold: Option<String>,
 }
 
+impl BunkerInfo {
+    /// Not yet provisioned: the admin UI is served, but no bunker/co-signer is
+    /// running. The operator imports a share, then restarts the service.
+    pub fn setup() -> Self {
+        Self {
+            mode: "setup".into(),
+            url: String::new(),
+            npub: String::new(),
+            relay: String::new(),
+            frost_relays: Vec::new(),
+            group: None,
+            threshold: None,
+        }
+    }
+}
+
 /// An event pushed to connected WebSocket clients.
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

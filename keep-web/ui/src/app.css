@@ -129,6 +129,12 @@ code.warn {
   color: #e3b341;
 }
 
+.panel.setup {
+  border-color: #e3b341;
+  background: #2a2410;
+  margin-bottom: 0.5rem;
+}
+
 textarea,
 input {
   width: 100%;
