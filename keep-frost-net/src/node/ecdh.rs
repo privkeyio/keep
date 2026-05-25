@@ -290,9 +290,7 @@ impl KfpNode {
                 session_id = %hex::encode(session_id),
                 "ECDH complete (single-party)!"
             );
-            self.ecdh_sessions
-                .write()
-                .complete_session(&session_id);
+            self.ecdh_sessions.write().complete_session(&session_id);
             if let Err(e) = self.event_tx.send(KfpNodeEvent::EcdhComplete {
                 session_id,
                 shared_secret: Zeroizing::new(*secret),

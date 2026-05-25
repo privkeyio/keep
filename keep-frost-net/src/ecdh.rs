@@ -397,21 +397,27 @@ mod tests {
             0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
             0xdd, 0xee, 0xff, 0x01,
         ];
-        let recipient_pk: [u8; 33] = hex::decode(
-            "02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let recipient_pk: [u8; 33] =
+            hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let partial = compute_partial_ecdh(&signing_share, &recipient_pk).unwrap();
         let result = aggregate_ecdh_shares(&[(1u16, partial)], &[1u16]);
-        assert!(result.is_ok(), "single-party aggregate failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-party aggregate failed: {:?}",
+            result.err()
+        );
 
         let session_id = [0u8; 32];
         let mut session = EcdhSession::new(session_id, recipient_pk, 1, vec![1]);
         session.add_partial(1, partial).unwrap();
         let secret = session.try_complete().expect("try_complete should succeed");
-        assert!(secret.is_some(), "single-party session should produce secret");
+        assert!(
+            secret.is_some(),
+            "single-party session should produce secret"
+        );
     }
 
     #[test]

@@ -342,49 +342,61 @@ impl SigningHooks for MobileSigningHooks {
             return Ok(());
         }
 
-        // If we're already running inside a tokio runtime (i.e. the auto-sign /
-        // ContentProvider background path), we can't safely block here. The caller
-        // should have set a pre-approval via set_signing_pre_approved before invoking
-        // the signer. Fail loudly instead of panicking via block_on.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(keep_frost_net::FrostNetError::Session(
-                "Sign request not pre-approved (background context)".into(),
-            ));
-        }
-
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        let request_tx = self.request_tx.clone();
-        let session = session.clone();
 
-        // `pre_sign` is a sync hook invoked from keep-frost-net's async signing
-        // handler, i.e. on a tokio worker thread. `blocking_send`/`Handle::block_on`
-        // panic there ("cannot block the current thread from within a runtime"),
-        // which silently killed the co-sign task (request received, no prompt, no
-        // response, initiator timeout). `block_in_place` hands the worker back to
-        // the scheduler so blocking here is safe. INVARIANT: this requires a
-        // multi-thread tokio runtime; `block_in_place` panics on a current-thread
-        // runtime. The node task runs on the `new_multi_thread()` runtime built
-        // in `KeepMobile::new` (below), which satisfies this. Mirrors
-        // keep-desktop's hook.
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::try_current()
-                .map_err(|_| keep_frost_net::FrostNetError::Session("No tokio runtime".into()))?;
-            handle.block_on(async {
-                request_tx
-                    .send((session, response_tx))
-                    .await
-                    .map_err(|_| keep_frost_net::FrostNetError::Session("Channel closed".into()))?;
-
-                match tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await {
-                    Ok(Some(true)) => Ok(()),
-                    Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
-                        "Request rejected".into(),
-                    )),
-                    Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
-                    Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+        // The interactive approval path runs inside the node's async message
+        // handler, so a current runtime is present. We must neither block a
+        // worker thread (blocking_send) nor start a nested runtime
+        // (Runtime::block_on panics inside a runtime). Use block_in_place to move
+        // off the worker, then drive the send + wait on the current handle.
+        // INVARIANT: block_in_place panics on a current-thread runtime; the node
+        // task runs on the `new_multi_thread()` runtime built in `KeepMobile::new`
+        // (below), which satisfies this. Outside a runtime (no current handle),
+        // fall back to a blocking send and an owned current-thread runtime.
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let request_tx = self.request_tx.clone();
+                let session = session.clone();
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        request_tx.send((session, response_tx)).await.map_err(|_| {
+                            keep_frost_net::FrostNetError::Session("Channel closed".into())
+                        })?;
+                        Ok::<_, keep_frost_net::FrostNetError>(
+                            tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv())
+                                .await,
+                        )
+                    })
+                })?
+            }
+            Err(_) => {
+                if self
+                    .request_tx
+                    .blocking_send((session.clone(), response_tx))
+                    .is_err()
+                {
+                    return Err(keep_frost_net::FrostNetError::Session(
+                        "Channel closed".into(),
+                    ));
                 }
-            })
-        })
+                let owned_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
+                owned_rt.block_on(async {
+                    tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await
+                })
+            }
+        };
+
+        match result {
+            Ok(Some(true)) => Ok(()),
+            Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
+                "Request rejected".into(),
+            )),
+            Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
+            Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+        }
     }
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
@@ -405,7 +417,8 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hashes: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    pre_approved_hashes:
+        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -695,8 +708,8 @@ impl KeepMobile {
     }
 
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
-        let event: serde_json::Value = serde_json::from_str(&event_json)
-            .map_err(|_| KeepMobileError::InvalidSession)?;
+        let event: serde_json::Value =
+            serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
         crate::nip55::validate_nostr_event(&event)?;
         let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
         self.set_signing_pre_approved(event_hash.to_vec());
