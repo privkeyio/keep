@@ -70,6 +70,21 @@ pub fn sign_with_local_shares(shares: &[SharePackage], message: &[u8]) -> Result
 
     let signing_shares = &shares[..threshold];
 
+    let group_pubkey = signing_shares[0].metadata.group_pubkey;
+    let mut seen_ids = std::collections::HashSet::new();
+    for share in signing_shares {
+        if share.metadata.group_pubkey != group_pubkey {
+            return Err(KeepError::Frost(
+                "Shares belong to different groups".into(),
+            ));
+        }
+        if !seen_ids.insert(share.metadata.identifier) {
+            return Err(KeepError::Frost(
+                "Duplicate share identifier".into(),
+            ));
+        }
+    }
+
     let mut key_packages: BTreeMap<Identifier, frost::keys::KeyPackage> = BTreeMap::new();
     let mut fresh: BTreeMap<Identifier, FreshNonces> = BTreeMap::new();
     let mut commitments_map: BTreeMap<Identifier, round1::SigningCommitments> = BTreeMap::new();

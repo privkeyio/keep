@@ -862,7 +862,7 @@ pub fn cmd_sign_file(
     let sig_path = output
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| with_sig_extension(file));
-    std::fs::write(&sig_path, signature.encode())
+    std::fs::write(&sig_path, signature.encode()?)
         .map_err(|e| KeepError::InvalidInput(format!("cannot write signature: {e}")))?;
 
     out.newline();

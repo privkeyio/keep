@@ -67,6 +67,27 @@ pub const ALG_LEGACY: [u8; 2] = *b"Ed";
 /// Signature algorithm: BLAKE2b-512 prehashed Ed25519 (`"ED"`).
 pub const ALG_PREHASHED: [u8; 2] = *b"ED";
 
+/// Maximum allowed length of a minisign comment field, in bytes.
+pub const MAX_COMMENT_LEN: usize = 1024;
+
+/// Validate a minisign comment field for the line-oriented `.sig`/`.pub` format.
+///
+/// Rejects embedded `\n`/`\r` (which would corrupt the line structure) and
+/// comments longer than [`MAX_COMMENT_LEN`] bytes.
+pub fn validate_comment(field: &str, comment: &str) -> Result<()> {
+    if comment.len() > MAX_COMMENT_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "{field} comment exceeds {MAX_COMMENT_LEN} bytes"
+        )));
+    }
+    if comment.contains('\n') || comment.contains('\r') {
+        return Err(KeepError::InvalidInput(format!(
+            "{field} comment must not contain newline characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Deterministic 8-byte minisign key id for a group verifying key.
 pub fn key_id(group_pubkey: &[u8; 32]) -> [u8; 8] {
     let mut hasher = Blake2b512::new();
@@ -114,19 +135,22 @@ pub struct MinisignSignature {
 
 impl MinisignSignature {
     /// Render to the 4-line minisign `.sig` text format.
-    pub fn encode(&self) -> String {
+    pub fn encode(&self) -> Result<String> {
+        validate_comment("untrusted", &self.untrusted_comment)?;
+        validate_comment("trusted", &self.trusted_comment)?;
+
         let mut sig_blob = Vec::with_capacity(2 + 8 + 64);
         sig_blob.extend_from_slice(&self.sig_alg);
         sig_blob.extend_from_slice(&self.key_id);
         sig_blob.extend_from_slice(&self.signature);
 
-        format!(
+        Ok(format!(
             "untrusted comment: {}\n{}\ntrusted comment: {}\n{}\n",
             self.untrusted_comment,
             B64.encode(&sig_blob),
             self.trusted_comment,
             B64.encode(self.global_signature),
-        )
+        ))
     }
 
     /// Parse the 4-line minisign `.sig` text format.
@@ -178,6 +202,12 @@ impl MinisignSignature {
         }
         let mut global_signature = [0u8; 64];
         global_signature.copy_from_slice(&global);
+
+        if lines.any(|l| !l.trim().is_empty()) {
+            return Err(KeepError::InvalidInput(
+                "unexpected trailing content after signature".into(),
+            ));
+        }
 
         Ok(Self {
             sig_alg,
@@ -282,7 +312,7 @@ mod tests {
             untrusted_comment: "signature from keep".to_string(),
             trusted_comment: "timestamp:123\tfile:x".to_string(),
         };
-        let encoded = sig.encode();
+        let encoded = sig.encode().unwrap();
         let parsed = MinisignSignature::parse(&encoded).unwrap();
         assert_eq!(parsed.sig_alg, sig.sig_alg);
         assert_eq!(parsed.key_id, sig.key_id);
