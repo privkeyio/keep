@@ -1795,6 +1795,7 @@ impl KeepMobile {
                 did_backup: share_meta.did_backup,
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
+                ciphersuite: keep_core::frost::Ciphersuite::Secp256k1Tr,
             });
         }
 

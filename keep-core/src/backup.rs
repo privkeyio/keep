@@ -102,6 +102,13 @@ pub struct BackupShare {
     pub key_package: String,
     /// Hex-encoded serialized public key package.
     pub pubkey_package: String,
+    /// FROST ciphersuite of this share.
+    ///
+    /// Defaults to `Secp256k1Tr` so backups written before this field existed
+    /// restore unchanged.
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub ciphersuite: crate::frost::Ciphersuite,
 }
 
 /// Configuration stored in a backup file.
@@ -282,7 +289,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let mut backup_shares = Vec::with_capacity(stored_shares.len());
     for share in &stored_shares {
         let encrypted = EncryptedData::from_bytes(&share.encrypted_key_package)?;
-        let decrypted = crypto::decrypt(&encrypted, &data_key)?;
+        let decrypted = crypto::decrypt_with_aad(&encrypted, share.ciphersuite.aad(), &data_key)?;
         let key_package_bytes = decrypted.as_slice()?;
         backup_shares.push(BackupShare {
             identifier: share.metadata.identifier,
@@ -296,6 +303,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             did_backup: share.metadata.did_backup,
             key_package: hex::encode(key_package_bytes.as_slice()),
             pubkey_package: hex::encode(&share.pubkey_package),
+            ciphersuite: share.ciphersuite,
         });
     }
 
@@ -470,7 +478,8 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
     for bs in &backup.shares {
         let key_package_bytes = hex::decode(&bs.key_package)
             .map_err(|e| KeepError::Other(format!("hex decode key_package: {e}")))?;
-        let encrypted = crypto::encrypt(&key_package_bytes, &data_key)?;
+        let encrypted =
+            crypto::encrypt_with_aad(&key_package_bytes, bs.ciphersuite.aad(), &data_key)?;
 
         let pubkey_package = hex::decode(&bs.pubkey_package)
             .map_err(|e| KeepError::Other(format!("hex decode pubkey_package: {e}")))?;
@@ -491,6 +500,7 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
             },
             encrypted_key_package: encrypted.to_bytes(),
             pubkey_package,
+            ciphersuite: bs.ciphersuite,
         };
         keep.restore_stored_share(&share)?;
     }
