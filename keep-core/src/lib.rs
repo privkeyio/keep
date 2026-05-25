@@ -1676,7 +1676,7 @@ mod tests {
         Keep::frost_verify_ed25519_minisign(&group_pubkey, message, &sig).unwrap();
 
         // Survives encode/parse round-trip.
-        let encoded = sig.encode();
+        let encoded = sig.encode().unwrap();
         let parsed = MinisignSignature::parse(&encoded).unwrap();
         Keep::frost_verify_ed25519_minisign(&group_pubkey, message, &parsed).unwrap();
 
@@ -1730,7 +1730,7 @@ mod tests {
             )
             .unwrap();
         let sig_path = dir.path().join("artifact.bin.minisig");
-        std::fs::write(&sig_path, sig.encode()).unwrap();
+        std::fs::write(&sig_path, sig.encode().unwrap()).unwrap();
 
         let pk = MinisignPublicKey::from_group_pubkey(&group_pubkey, "keep test".into());
         let pk_path = dir.path().join("keep.pub");
