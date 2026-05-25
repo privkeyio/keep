@@ -135,6 +135,14 @@ code.warn {
   margin-bottom: 0.5rem;
 }
 
+.note {
+  margin: 0 0 0.75rem;
+  font-size: 0.82rem;
+  color: #e3b341;
+  border-left: 2px solid #e3b341;
+  padding-left: 0.6rem;
+}
+
 textarea,
 input {
   width: 100%;

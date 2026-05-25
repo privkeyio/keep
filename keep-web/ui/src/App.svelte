@@ -142,6 +142,11 @@
 
   <h2>Import Share</h2>
   <div class="panel">
+    <p class="note">
+      The FROST relay must match the one your other share-holders use, or you
+      won't find each other for signing rounds. Set it with the Configure
+      action; the current relays are shown above.
+    </p>
     <form onsubmit={submitImport}>
       <textarea
         bind:value={importData}
