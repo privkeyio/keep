@@ -43,8 +43,8 @@ impl TrustedDealer {
             .map_err(|e| KeepError::Frost(format!("Failed to serialize pubkey package: {e}")))?;
 
         let packages: Result<Vec<SharePackage>> = shares
-            .into_iter()
-            .map(|(_, secret_share)| {
+            .into_values()
+            .map(|secret_share| {
                 let key_package = KeyPackage::try_from(secret_share)
                     .map_err(|e| KeepError::Frost(format!("KeyPackage conversion failed: {e}")))?;
                 let key_package_bytes = key_package.serialize().map_err(|e| {
