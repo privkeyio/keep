@@ -281,6 +281,9 @@ struct StoredShareData {
     // Relies on SecureStorage (Android Keystore / iOS Keychain) for encryption at rest
     #[serde(default)]
     plaintext_mnemonic: Option<Zeroizing<Vec<u8>>>,
+    // Defaults to Secp256k1Tr so shares written before this field existed parse unchanged.
+    #[serde(default)]
+    ciphersuite: keep_core::frost::Ciphersuite,
 }
 
 #[uniffi::export(with_foreign)]
@@ -624,6 +627,12 @@ impl KeepMobile {
         let passphrase = Zeroizing::new(passphrase);
         let export = ShareExport::parse(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        if export.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Only secp256k1 (Bitcoin/Nostr) shares are supported on mobile".into(),
+            });
+        }
 
         let share = export
             .to_share(&passphrase, &name)
@@ -1795,7 +1804,7 @@ impl KeepMobile {
                 did_backup: share_meta.did_backup,
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
-                ciphersuite: keep_core::frost::Ciphersuite::Secp256k1Tr,
+                ciphersuite: stored.ciphersuite,
             });
         }
 
@@ -2049,6 +2058,7 @@ impl KeepMobile {
                 ),
                 pubkey_package_bytes,
                 plaintext_mnemonic: None,
+                ciphersuite: bs.ciphersuite,
             };
 
             let serialized = serde_json::to_vec(&stored)
@@ -2659,6 +2669,7 @@ impl KeepMobile {
                 }
             })?,
             plaintext_mnemonic,
+            ciphersuite: keep_core::frost::Ciphersuite::Secp256k1Tr,
         };
 
         Ok((metadata_info, stored))
@@ -2758,6 +2769,7 @@ impl KeepMobile {
                     msg: format!("Serialization failed: {e}"),
                 })?,
             plaintext_mnemonic: None,
+            ciphersuite: keep_core::frost::Ciphersuite::Secp256k1Tr,
         };
 
         let serialized = serde_json::to_vec(&stored)
@@ -3197,6 +3209,12 @@ impl KeepMobile {
             if display_name != metadata.name {
                 metadata.name = display_name;
             }
+        }
+
+        if stored.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Only secp256k1 (Bitcoin/Nostr) shares are supported on mobile".into(),
+            });
         }
 
         let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(

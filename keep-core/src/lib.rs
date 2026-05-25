@@ -1096,6 +1096,14 @@ impl Keep {
             self.storage.store_share(&stored)?;
         }
 
+        let group_pubkey = *shares[0].group_pubkey();
+        let participants: Vec<u16> = (1..=total_shares).collect();
+        self.audit_event(AuditEventType::FrostGenerate, |e| {
+            e.with_group(&group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
         Ok(shares)
     }
 
@@ -1734,7 +1742,7 @@ mod tests {
 
         let pk = MinisignPublicKey::from_group_pubkey(&group_pubkey, "keep test".into());
         let pk_path = dir.path().join("keep.pub");
-        std::fs::write(&pk_path, pk.encode()).unwrap();
+        std::fs::write(&pk_path, pk.encode().unwrap()).unwrap();
 
         let output = match verifier {
             "minisign" => Command::new("minisign")

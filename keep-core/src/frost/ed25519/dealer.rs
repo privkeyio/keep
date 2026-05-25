@@ -44,15 +44,14 @@ impl TrustedDealer {
 
         let packages: Result<Vec<SharePackage>> = shares
             .into_iter()
-            .enumerate()
-            .map(|(idx, (_, secret_share))| {
+            .map(|(_, secret_share)| {
                 let key_package = KeyPackage::try_from(secret_share)
                     .map_err(|e| KeepError::Frost(format!("KeyPackage conversion failed: {e}")))?;
                 let key_package_bytes = key_package.serialize().map_err(|e| {
                     KeepError::Frost(format!("Failed to serialize key package: {e}"))
                 })?;
 
-                let identifier = (idx + 1) as u16;
+                let identifier = identifier_to_u16(key_package.identifier())?;
 
                 let metadata = ShareMetadata::new(
                     identifier,
@@ -72,6 +71,16 @@ impl TrustedDealer {
 
         Ok((packages?, pubkey_pkg))
     }
+}
+
+fn identifier_to_u16(identifier: &frost::Identifier) -> Result<u16> {
+    let bytes = identifier.serialize();
+    if bytes.len() != 32 || bytes[2..].iter().any(|&b| b != 0) {
+        return Err(KeepError::Frost(
+            "FROST identifier does not fit in u16".into(),
+        ));
+    }
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn extract_group_pubkey(pubkey_pkg: &PublicKeyPackage) -> Result<[u8; 32]> {

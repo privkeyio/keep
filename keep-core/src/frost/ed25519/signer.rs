@@ -74,14 +74,10 @@ pub fn sign_with_local_shares(shares: &[SharePackage], message: &[u8]) -> Result
     let mut seen_ids = std::collections::HashSet::new();
     for share in signing_shares {
         if share.metadata.group_pubkey != group_pubkey {
-            return Err(KeepError::Frost(
-                "Shares belong to different groups".into(),
-            ));
+            return Err(KeepError::Frost("Shares belong to different groups".into()));
         }
         if !seen_ids.insert(share.metadata.identifier) {
-            return Err(KeepError::Frost(
-                "Duplicate share identifier".into(),
-            ));
+            return Err(KeepError::Frost("Duplicate share identifier".into()));
         }
     }
 

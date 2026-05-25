@@ -16,6 +16,23 @@ use crate::ExportFormat;
 
 use super::{get_confirm, get_password, get_password_with_confirm};
 
+const MAX_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+
+fn read_input_file(file: &Path) -> Result<Vec<u8>> {
+    let len = file
+        .metadata()
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?
+        .len();
+    if len > MAX_INPUT_BYTES {
+        return Err(KeepError::InvalidInput(format!(
+            "{} exceeds maximum input size of {MAX_INPUT_BYTES} bytes",
+            file.display()
+        )));
+    }
+    std::fs::read(file)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
+}
+
 fn resolve_group_pubkey(
     shares: &[keep_core::frost::StoredShare],
     group_id: &str,
@@ -45,6 +62,12 @@ pub fn cmd_frost_generate(
         threshold,
         total_shares, name, ed25519, "generating FROST key"
     );
+
+    if pubkey_out.is_some() && !ed25519 {
+        return Err(KeepError::InvalidInput(
+            "--pubkey-out is only supported with --ed25519 mode".into(),
+        ));
+    }
 
     out.newline();
     out.warn("WARNING: Trusted dealer mode - for testing/development only.");
@@ -87,7 +110,7 @@ pub fn cmd_frost_generate(
                 group_pubkey,
                 format!("minisign public key for keep FROST group {name}"),
             );
-            std::fs::write(pubkey_path, pk.encode())
+            std::fs::write(pubkey_path, pk.encode()?)
                 .map_err(|e| KeepError::InvalidInput(format!("cannot write public key: {e}")))?;
             out.field("Minisign pubkey", &pubkey_path.display().to_string());
         }
@@ -827,8 +850,7 @@ pub fn cmd_sign_file(
     debug!(file = %file.display(), group, "signing file with FROST-Ed25519");
 
     let group_pubkey = parse_group_pubkey(group)?;
-    let message = std::fs::read(file)
-        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?;
+    let message = read_input_file(file)?;
 
     let file_name = file
         .file_name()
@@ -880,8 +902,7 @@ pub fn cmd_verify_file(out: &Output, file: &Path, sig: &Path, group: &str) -> Re
     debug!(file = %file.display(), sig = %sig.display(), group, "verifying file signature");
 
     let group_pubkey = resolve_verify_pubkey(group)?;
-    let message = std::fs::read(file)
-        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?;
+    let message = read_input_file(file)?;
     let sig_text = std::fs::read_to_string(sig)
         .map_err(|e| KeepError::InvalidInput(format!("cannot read signature: {e}")))?;
 

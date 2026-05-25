@@ -241,16 +241,18 @@ impl MinisignPublicKey {
     }
 
     /// Render to the 2-line minisign public-key text format.
-    pub fn encode(&self) -> String {
+    pub fn encode(&self) -> Result<String> {
+        validate_comment("untrusted", &self.untrusted_comment)?;
+
         let mut blob = Vec::with_capacity(2 + 8 + 32);
         blob.extend_from_slice(&ALG_LEGACY);
         blob.extend_from_slice(&self.key_id);
         blob.extend_from_slice(&self.public_key);
-        format!(
+        Ok(format!(
             "untrusted comment: {}\n{}\n",
             self.untrusted_comment,
             B64.encode(&blob),
-        )
+        ))
     }
 
     /// Parse the 2-line minisign public-key text format.
@@ -326,7 +328,7 @@ mod tests {
     fn pubkey_round_trips() {
         let group_pubkey = [42u8; 32];
         let pk = MinisignPublicKey::from_group_pubkey(&group_pubkey, "keep pubkey".to_string());
-        let encoded = pk.encode();
+        let encoded = pk.encode().unwrap();
         let parsed = MinisignPublicKey::parse(&encoded).unwrap();
         assert_eq!(parsed.key_id, key_id(&group_pubkey));
         assert_eq!(parsed.public_key, group_pubkey);
