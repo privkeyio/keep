@@ -183,7 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_token = auth::AuthToken::from_env();
 
     let api = Router::new()
-        .route("/api/health", get(api::health))
         .route("/api/bunker", get(api::bunker))
         .route("/api/shares", get(api::shares))
         .route("/api/shares/import", post(api::import_share))
@@ -203,7 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth::require_auth,
         ));
 
-    let app = api.fallback_service(static_files);
+    // Health stays unauthenticated so StartOS/Docker probes work without a token.
+    let public = Router::new().route("/api/health", get(api::health));
+
+    let app = public.merge(api).fallback_service(static_files);
 
     tracing::info!(%listen, "serving web admin");
     let listener = tokio::net::TcpListener::bind(listen).await?;

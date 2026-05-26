@@ -61,20 +61,120 @@ pub async fn require_auth(
 
 fn bearer_from_header(request: &Request) -> Option<String> {
     let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    value
-        .strip_prefix("Bearer ")
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 fn token_from_query(request: &Request) -> Option<String> {
     let query = request.uri().query()?;
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        if k == "access_token" {
-            Some(v.to_string())
-        } else {
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "access_token")
+        .map(|(_, v)| v.into_owned())
+        .filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn token(t: &str) -> AuthToken {
+        AuthToken(Arc::new(t.to_string()))
+    }
+
+    fn req(builder: axum::http::request::Builder) -> Request {
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn matches_is_exact() {
+        let t = token("s3cret");
+        assert!(t.matches("s3cret"));
+        assert!(!t.matches("s3cre"));
+        assert!(!t.matches("s3crett"));
+        assert!(!t.matches(""));
+        assert!(!t.matches("wrong"));
+    }
+
+    #[test]
+    fn bearer_header_parsing() {
+        let pull = |b: axum::http::request::Builder| bearer_from_header(&req(b));
+        assert_eq!(
+            pull(Request::builder().header(header::AUTHORIZATION, "Bearer abc")),
+            Some("abc".into())
+        );
+        assert_eq!(
+            pull(Request::builder().header(header::AUTHORIZATION, "bearer abc")),
+            Some("abc".into())
+        );
+        assert_eq!(
+            pull(Request::builder().header(header::AUTHORIZATION, "Bearer ")),
             None
-        }
-    })
+        );
+        assert_eq!(
+            pull(Request::builder().header(header::AUTHORIZATION, "Basic abc")),
+            None
+        );
+        assert_eq!(pull(Request::builder()), None);
+    }
+
+    #[test]
+    fn query_token_parsing() {
+        let pull = |uri: &str| token_from_query(&req(Request::builder().uri(uri)));
+        assert_eq!(pull("/api/events?access_token=abc"), Some("abc".into()));
+        assert_eq!(pull("/api/events?foo=1&access_token=abc"), Some("abc".into()));
+        assert_eq!(pull("/api/events?access_token=a%2Bb%3D"), Some("a+b=".into()));
+        assert_eq!(pull("/api/events?access_token="), None);
+        assert_eq!(pull("/api/events"), None);
+    }
+
+    fn app() -> Router {
+        Router::new()
+            .route("/api/x", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                token("s3cret"),
+                require_auth,
+            ))
+    }
+
+    async fn status(builder: axum::http::request::Builder) -> StatusCode {
+        app().oneshot(req(builder)).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn middleware_gates_requests() {
+        assert_eq!(
+            status(Request::builder().uri("/api/x")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/x")
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                Request::builder()
+                    .uri("/api/x")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(Request::builder().uri("/api/x?access_token=s3cret")).await,
+            StatusCode::OK
+        );
+    }
 }

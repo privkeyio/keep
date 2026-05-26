@@ -4441,6 +4441,7 @@ name = "keep-web"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "form_urlencoded",
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
@@ -4449,6 +4450,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
