@@ -363,9 +363,9 @@
     <div class="panel setup">
       <strong>🔒 Sign in</strong>
       <p>
-        Enter your Web Admin password. On StartOS, find it under the <span class="token"
-          >Show Login Credentials</span
-        > action; otherwise it is the <span class="token">KEEP_WEB_AUTH_TOKEN</span> value.
+        Enter your Web Admin password. Find your username and password under the <span
+          class="token">Show Login Credentials</span
+        > action.
       </p>
       <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
         <input type="text" value="admin" readonly autocomplete="username" aria-label="Username" />
