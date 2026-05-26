@@ -78,16 +78,20 @@ impl ServerCallbacks for WebCallbacks {
         // `block_in_place` requires a multi-thread runtime; both spawners use
         // `Runtime::new()` (multi-thread), so this is sound. Do not switch them
         // to a current-thread runtime without changing this to `spawn_blocking`.
-        // `recv_timeout` also doubles as the backstop that drops the channel
-        // (and lets the resolver-or-here `remove`) so the approvals map cannot
-        // grow unbounded even if a request is never resolved via the API.
-        let decision =
-            tokio::task::block_in_place(|| rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false));
+        let decision = tokio::task::block_in_place(|| await_decision(&rx, APPROVAL_TIMEOUT));
         if let Ok(mut map) = self.approvals.lock() {
             map.remove(&id);
         }
         decision
     }
+}
+
+/// Blocks until the browser resolves the request or the timeout fires. Fails
+/// closed: a timeout or a dropped sender (no decision) denies. The timeout also
+/// backstops the approvals map so it cannot grow unbounded if a request is
+/// never resolved via the API.
+fn await_decision(rx: &Receiver<bool>, timeout: Duration) -> bool {
+    rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 fn short_id(id: &[u8; 32]) -> String {
@@ -328,7 +332,7 @@ pub fn spawn_single_key(
 
 #[cfg(test)]
 mod tests {
-    use super::random_approval_id;
+    use super::*;
 
     #[test]
     fn approval_id_is_js_safe() {
@@ -336,5 +340,53 @@ mod tests {
         for _ in 0..10_000 {
             assert!(random_approval_id() <= MAX_SAFE);
         }
+    }
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            session_id: [7u8; 32],
+            message: vec![1, 2, 3],
+            threshold: 2,
+            participants: vec![1, 2, 3],
+            requester: 1,
+        }
+    }
+
+    #[test]
+    fn pre_sign_respects_kill_switch() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let policy = CoSignerPolicy {
+            events: tx,
+            enabled: enabled.clone(),
+        };
+
+        assert!(policy.pre_sign(&session()).is_ok());
+        enabled.store(false, Ordering::SeqCst);
+        assert!(policy.pre_sign(&session()).is_err());
+
+        // Each decision is streamed for observability (co-signing, then refused).
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn await_decision_fails_closed() {
+        // Explicit approval and rejection pass through.
+        let (tx, rx) = channel();
+        tx.send(true).unwrap();
+        assert!(await_decision(&rx, Duration::from_secs(1)));
+        let (tx, rx) = channel();
+        tx.send(false).unwrap();
+        assert!(!await_decision(&rx, Duration::from_secs(1)));
+
+        // Timeout with no decision denies.
+        let (_tx, rx) = channel::<bool>();
+        assert!(!await_decision(&rx, Duration::from_millis(10)));
+
+        // A dropped sender (no decision possible) denies.
+        let (tx, rx) = channel::<bool>();
+        drop(tx);
+        assert!(!await_decision(&rx, Duration::from_secs(1)));
     }
 }

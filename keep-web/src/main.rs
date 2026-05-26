@@ -22,6 +22,33 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Reads a secret from `{key}_FILE` (preferred) or the `{key}` env var. A file
+/// keeps the secret off the process environment (which leaks via /proc,
+/// container inspection, and crash dumps). Warns if the file is group/world
+/// accessible.
+fn secret_from(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var(format!("{key}_FILE")) {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Ok(Some(read_secret_file(path)?));
+        }
+    }
+    Ok(std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty()))
+}
+
+fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(path, mode = format!("{mode:o}"), "secret file is group/world accessible; tighten to 0600");
+    }
+    Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
 fn parse_relays(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -87,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_approve = env_or("KEEP_FROST_AUTO_APPROVE", "false") == "true";
     let ui_dir = PathBuf::from(env_or("KEEP_WEB_UI_DIR", "ui/dist"));
     let listen: SocketAddr = env_or("KEEP_WEB_LISTEN", "0.0.0.0:8080").parse()?;
-    let password = std::env::var("KEEP_PASSWORD")
-        .map_err(|_| "KEEP_PASSWORD must be set for headless unlock")?;
+    let password = secret_from("KEEP_PASSWORD")?
+        .ok_or("KEEP_PASSWORD or KEEP_PASSWORD_FILE must be set for headless unlock")?;
 
     // First-run provisioning: create the vault if this is a fresh install
     // (e.g. first StartOS boot) rather than crashing.
@@ -114,12 +141,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before the share has been imported.
     let resolved_group = resolve_group(&keep, frost_group.as_deref())?;
 
+    // Single-key mode puts the full primary key on this box (no threshold
+    // security), so it requires both the opt-in flag and an explicit
+    // acknowledgement to guard against accidental enablement.
     let allow_single_key = env_or("KEEP_ALLOW_SINGLE_KEY", "false") == "true";
+    let single_key_ack = env_or("KEEP_SINGLE_KEY_ACK", "") == "i-understand";
+    if allow_single_key && !single_key_ack {
+        tracing::warn!(
+            "KEEP_ALLOW_SINGLE_KEY set without KEEP_SINGLE_KEY_ACK=i-understand; refusing single-key mode"
+        );
+    }
+    let single_key = allow_single_key && single_key_ack;
 
     let mut node = None;
+    let mut active_identifier = None;
     let bunker_info = if let Some((group_pubkey, group_npub)) = resolved_group {
         match keep.frost_get_share(&group_pubkey) {
             Ok(share) => {
+                active_identifier = Some(share.metadata.identifier);
                 let frost_relays = parse_relays(&env_or("KEEP_FROST_RELAY", ""));
                 let frost_relays = if frost_relays.is_empty() {
                     bunker_relays.clone()
@@ -147,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 BunkerInfo::setup()
             }
         }
-    } else if allow_single_key && keep.keyring().get_primary().is_some() {
+    } else if single_key && keep.keyring().get_primary().is_some() {
         // Explicit opt-in: sign with the vault's primary key alone (no
         // threshold security — the full key lives on this box).
         tracing::warn!("KEEP_ALLOW_SINGLE_KEY set; single-key bunker (no threshold security)");
@@ -170,8 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         keep,
         bunker: bunker_info,
+        active_identifier,
         events,
         approvals,
+        ws_tickets: state::TicketStore::default(),
         signing_enabled,
         node,
     };
@@ -179,10 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serve_index = ServeFile::new(ui_dir.join("index.html"));
     let static_files = ServeDir::new(&ui_dir).fallback(serve_index);
 
-    // Fail-closed bearer-token gate on every /api/* route and the WS upgrade.
-    let auth_token = auth::AuthToken::from_env();
+    // Fail-closed bearer-token gate on every sensitive /api/* route.
+    let auth_token = auth::AuthToken::resolve(secret_from("KEEP_WEB_AUTH_TOKEN")?);
 
-    let api = Router::new()
+    let authed = Router::new()
         .route("/api/bunker", get(api::bunker))
         .route("/api/shares", get(api::shares))
         .route("/api/shares/import", post(api::import_share))
@@ -195,17 +236,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::killswitch_status).post(api::set_killswitch),
         )
         .route("/api/approvals/{id}", post(api::resolve_approval))
-        .route("/api/events", get(ws::events))
-        .with_state(state)
+        .route("/api/ws-ticket", post(api::ws_ticket))
+        .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             auth_token,
             auth::require_auth,
         ));
 
-    // Health stays unauthenticated so StartOS/Docker probes work without a token.
-    let public = Router::new().route("/api/health", get(api::health));
+    // Unauthenticated: health for StartOS/Docker probes; the WS upgrade gates
+    // itself on a single-use ticket (minted via the authed /api/ws-ticket) so
+    // the durable token never appears in a URL or proxy access log.
+    let public = Router::new()
+        .route("/api/health", get(api::health))
+        .route("/api/events", get(ws::events))
+        .with_state(state);
 
-    let app = public.merge(api).fallback_service(static_files);
+    let app = public.merge(authed).fallback_service(static_files);
 
     tracing::info!(%listen, "serving web admin");
     let listener = tokio::net::TcpListener::bind(listen).await?;

@@ -36,6 +36,21 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
+#[derive(Serialize)]
+pub struct WsTicket {
+    ticket: String,
+}
+
+/// Issues a single-use, short-lived ticket authorizing one WebSocket upgrade.
+/// Gated by the bearer middleware; the ticket (not the durable token) is what
+/// rides in the WS URL.
+pub async fn ws_ticket(State(state): State<AppState>) -> impl IntoResponse {
+    let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+    let ticket: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    state.ws_tickets.issue(ticket.clone());
+    Json(WsTicket { ticket })
+}
+
 /// Returns the bunker connection details. The `url` carries the connection
 /// `?secret=`, which is sensitive — this endpoint is gated behind bearer auth.
 pub async fn bunker(State(state): State<AppState>) -> impl IntoResponse {
@@ -157,17 +172,13 @@ pub async fn delete_share(
     State(state): State<AppState>,
     Json(body): Json<ShareRef>,
 ) -> impl IntoResponse {
-    // Refuse to delete the share the running co-signer is using: the node holds
-    // it in memory and would keep signing with a share that's gone from disk,
-    // leaving an inconsistent state. The operator must reconfigure/stop first.
-    //
-    // We match on the group npub only. The node loads its share via
-    // frost_get_share(group) which returns the first share for that group, so
-    // the exact active identifier is not reliably knowable here. This
-    // over-approximates: deleting any share in the active group is blocked,
-    // even a non-loaded sibling. Acceptable; the operator stops the service to
-    // delete such a share.
-    if state.bunker.group.as_deref() == Some(body.group.as_str()) {
+    // Refuse to delete the exact share the running co-signer is using: the node
+    // holds it in memory and would keep signing with a share that's gone from
+    // disk, leaving an inconsistent state. The operator must reconfigure/stop
+    // first. Sibling shares in the same group are not blocked.
+    if state.bunker.group.as_deref() == Some(body.group.as_str())
+        && state.active_identifier == Some(body.identifier)
+    {
         return (
             StatusCode::CONFLICT,
             "cannot delete the active co-signer's share; reconfigure or stop the service first",

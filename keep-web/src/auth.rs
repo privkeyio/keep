@@ -15,20 +15,20 @@ use subtle::ConstantTimeEq;
 pub struct AuthToken(Arc<String>);
 
 impl AuthToken {
-    /// Resolve the auth token from the environment, generating and logging a
-    /// random one if none is configured.
-    pub fn from_env() -> Self {
-        match std::env::var("KEEP_WEB_AUTH_TOKEN") {
-            Ok(t) if !t.trim().is_empty() => {
-                tracing::info!("KEEP_WEB_AUTH_TOKEN set; bearer auth required on all endpoints");
-                Self(Arc::new(t))
+    /// Resolve the auth token from an optionally-configured value, generating
+    /// and logging a random one if none was supplied (fail-closed: never open).
+    pub fn resolve(configured: Option<String>) -> Self {
+        match configured {
+            Some(t) if !t.trim().is_empty() => {
+                tracing::info!("auth token configured; bearer auth required on all endpoints");
+                Self(Arc::new(t.trim().to_string()))
             }
             _ => {
                 let bytes: [u8; 32] = keep_core::crypto::random_bytes();
                 let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 tracing::warn!(
                     token = %token,
-                    "KEEP_WEB_AUTH_TOKEN not set; generated a random auth token (set the env var to pin it)"
+                    "no auth token configured; generated a random one (set KEEP_WEB_AUTH_TOKEN[_FILE] to pin it)"
                 );
                 Self(Arc::new(token))
             }
@@ -44,16 +44,16 @@ impl AuthToken {
     }
 }
 
-/// Middleware gating all routes: requires `Authorization: Bearer <token>` or,
-/// for the WS upgrade (browsers cannot set headers on `WebSocket`), an
-/// `access_token=<token>` query parameter. Comparison is constant-time.
+/// Middleware gating the API routes: requires `Authorization: Bearer <token>`,
+/// compared in constant time. The WS upgrade is handled separately via
+/// single-use tickets (see `state::TicketStore`) rather than this middleware,
+/// so the durable token never rides in a URL.
 pub async fn require_auth(
     State(token): State<AuthToken>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let presented = bearer_from_header(&request).or_else(|| token_from_query(&request));
-    match presented {
+    match bearer_from_header(&request) {
         Some(t) if token.matches(&t) => Ok(next.run(request).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
@@ -67,14 +67,6 @@ fn bearer_from_header(request: &Request) -> Option<String> {
     }
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
-}
-
-fn token_from_query(request: &Request) -> Option<String> {
-    let query = request.uri().query()?;
-    form_urlencoded::parse(query.as_bytes())
-        .find(|(k, _)| k == "access_token")
-        .map(|(_, v)| v.into_owned())
-        .filter(|t| !t.is_empty())
 }
 
 #[cfg(test)]
@@ -91,6 +83,18 @@ mod tests {
 
     fn req(builder: axum::http::request::Builder) -> Request {
         builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn resolve_uses_configured_or_generates() {
+        let configured = AuthToken::resolve(Some("  pinned  ".into()));
+        assert!(configured.matches("pinned"));
+
+        let a = AuthToken::resolve(None);
+        let b = AuthToken::resolve(Some("".into()));
+        // Generated tokens are random and non-empty.
+        assert!(!a.matches(""));
+        assert!(!a.matches(&b.0));
     }
 
     #[test]
@@ -123,16 +127,6 @@ mod tests {
             None
         );
         assert_eq!(pull(Request::builder()), None);
-    }
-
-    #[test]
-    fn query_token_parsing() {
-        let pull = |uri: &str| token_from_query(&req(Request::builder().uri(uri)));
-        assert_eq!(pull("/api/events?access_token=abc"), Some("abc".into()));
-        assert_eq!(pull("/api/events?foo=1&access_token=abc"), Some("abc".into()));
-        assert_eq!(pull("/api/events?access_token=a%2Bb%3D"), Some("a+b=".into()));
-        assert_eq!(pull("/api/events?access_token="), None);
-        assert_eq!(pull("/api/events"), None);
     }
 
     fn app() -> Router {
@@ -172,9 +166,10 @@ mod tests {
             .await,
             StatusCode::OK
         );
+        // The WS query-param path is gone; a token in the URL is not accepted.
         assert_eq!(
             status(Request::builder().uri("/api/x?access_token=s3cret")).await,
-            StatusCode::OK
+            StatusCode::UNAUTHORIZED
         );
     }
 }
