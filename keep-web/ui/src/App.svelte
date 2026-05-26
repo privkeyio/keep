@@ -132,7 +132,9 @@
   function refreshShares() {
     getShares()
       .then((s) => (shares = s))
-      .catch((e) => (error = friendlyError(e)))
+      .catch((e) => {
+        if (!handleUnauthorized(e)) error = friendlyError(e)
+      })
   }
 
   function refreshSigningLog() {
