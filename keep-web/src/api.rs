@@ -28,6 +28,10 @@ fn hex8(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn parse_group(npub: &str) -> Result<[u8; 32], (StatusCode, &'static str)> {
+    keep_core::keys::npub_to_bytes(npub).map_err(|_| (StatusCode::BAD_REQUEST, "invalid group npub"))
+}
+
 pub async fn health() -> &'static str {
     "ok"
 }
@@ -96,9 +100,9 @@ pub async fn rename_share(
     State(state): State<AppState>,
     Json(body): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    let group = match keep_core::keys::npub_to_bytes(&body.group) {
+    let group = match parse_group(&body.group) {
         Ok(g) => g,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
+        Err(e) => return e.into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_rename_share(&group, body.identifier, &body.name) {
@@ -116,9 +120,9 @@ pub async fn export_share(
     State(state): State<AppState>,
     Json(body): Json<ExportRequest>,
 ) -> impl IntoResponse {
-    let group = match keep_core::keys::npub_to_bytes(&body.group) {
+    let group = match parse_group(&body.group) {
         Ok(g) => g,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
+        Err(e) => return e.into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_export_share(&group, body.identifier, &body.passphrase) {
@@ -170,9 +174,9 @@ pub async fn delete_share(
         )
             .into_response();
     }
-    let group = match keep_core::keys::npub_to_bytes(&body.group) {
+    let group = match parse_group(&body.group) {
         Ok(g) => g,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
+        Err(e) => return e.into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_delete_share(&group, body.identifier) {
