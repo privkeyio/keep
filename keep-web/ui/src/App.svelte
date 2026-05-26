@@ -381,21 +381,35 @@
   {:else}
   {#if bunker && bunker.mode === 'setup'}
     <div class="panel setup">
-      <strong>⚙ Setup required.</strong> No FROST share is loaded yet; this node
-      isn't signing.
-      <h3>Tasks to finish setup</h3>
-      <ol class="tasks">
-        <li>Import your FROST share below (export it from the device that holds it).</li>
-        <li>
-          Open the <strong>Configure</strong> action and set <strong>FROST Relays</strong>
-          to match the relays your other share-holders use.
-        </li>
-        <li><strong>Restart the service</strong> to start the co-signer.</li>
-        <li>
-          Copy the bunker connection string (shown here after restart) into your
-          Nostr client.
-        </li>
-      </ol>
+      {#if shares.length > 0}
+        <strong>⚙ Almost done — restart to finish.</strong>
+        <p>
+          Your share is imported, but the co-signer hasn't started yet.
+          <strong>Restart the service</strong> to bring it online (on StartOS, use the
+          <strong>Restart</strong> button on this service's page). The connection details
+          appear here once it's up.
+        </p>
+      {:else}
+        <strong>⚙ Setup required.</strong> No FROST share is loaded yet; this node
+        isn't signing.
+        <h3>Tasks to finish setup</h3>
+        <ol class="tasks">
+          <li>Import your FROST share below (export it from the device that holds it).</li>
+          <li>
+            Open the <strong>Configure</strong> action and set <strong>FROST Relays</strong>
+            to match the relays your other share-holders use.
+          </li>
+          <li>
+            <strong>Restart the service</strong> to start the co-signer. On StartOS, use the
+            <strong>Restart</strong> button on this service's page; this page then shows the
+            connection details.
+          </li>
+          <li>
+            Copy the bunker connection string (shown here after restart) into your
+            Nostr client.
+          </li>
+        </ol>
+      {/if}
     </div>
   {/if}
 
@@ -415,7 +429,11 @@
       <div class="conn-status">
         {#if bunker.mode === 'setup'}
           <span class="dot warn"></span>
-          <span>Not signing yet. Import a share and restart to begin.</span>
+          {#if shares.length > 0}
+            <span>Share imported. Restart the service to bring the co-signer online.</span>
+          {:else}
+            <span>Not signing yet. Import a share, then restart to begin.</span>
+          {/if}
         {:else if signingEnabled === false}
           <span class="dot warn"></span>
           <span>Online, but <strong>co-signing is off</strong>. It won't sign until you enable it.</span>
@@ -622,7 +640,15 @@
       {#if importOk}
         <div class="import-ok">
           <strong>✓ Share imported.</strong>
-          <span>Now <strong>restart the service</strong> to start the co-signer.</span>
+          {#if bunker?.mode === 'setup'}
+            <span>
+              The co-signer isn't running yet. <strong>Restart the service</strong> to bring
+              it online (on StartOS, use the <strong>Restart</strong> button on this service's
+              page). The connection details appear here once it's up.
+            </span>
+          {:else}
+            <span>It's saved to the vault. The running co-signer is unaffected.</span>
+          {/if}
         </div>
       {:else if importMsg}
         <p class="fail">{importMsg}</p>
