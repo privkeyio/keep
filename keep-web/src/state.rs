@@ -1,0 +1,80 @@
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use serde::Serialize;
+use tokio::sync::{broadcast, Mutex};
+
+use keep_core::Keep;
+use keep_frost_net::KfpNode;
+
+/// Shared application state handed to every axum handler.
+#[derive(Clone)]
+pub struct AppState {
+    /// Unlocked vault, used for read-only queries (share listing, etc.).
+    pub keep: Arc<Mutex<Keep>>,
+    /// Bunker connection details, populated once the server is up.
+    pub bunker: BunkerInfo,
+    /// Live event stream (logs + approval requests) for WebSocket clients.
+    pub events: broadcast::Sender<Event>,
+    /// Pending approval requests awaiting a browser decision, keyed by id.
+    pub approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
+    /// Kill switch: when false, the co-signer refuses to participate. Toggled
+    /// live (no restart); the policy hook reads it on every round.
+    pub signing_enabled: Arc<AtomicBool>,
+    /// The running FROST node (network mode only), for reading the signing
+    /// audit log and peer state.
+    pub node: Option<Arc<KfpNode>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct BunkerInfo {
+    /// "network-frost" (always-on co-signer) or "single-key" (fallback).
+    pub mode: String,
+    pub url: String,
+    pub npub: String,
+    /// NIP-46 bunker transport relay.
+    pub relay: String,
+    /// FROST peer-coordination relays (network mode only).
+    pub frost_relays: Vec<String>,
+    /// Group npub this node co-signs for (network mode only).
+    pub group: Option<String>,
+    /// Threshold as "t-of-n" (network mode only).
+    pub threshold: Option<String>,
+}
+
+impl BunkerInfo {
+    /// Not yet provisioned: the admin UI is served, but no bunker/co-signer is
+    /// running. The operator imports a share, then restarts the service.
+    pub fn setup() -> Self {
+        Self {
+            mode: "setup".into(),
+            url: String::new(),
+            npub: String::new(),
+            relay: String::new(),
+            frost_relays: Vec::new(),
+            group: None,
+            threshold: None,
+        }
+    }
+}
+
+/// An event pushed to connected WebSocket clients.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    Log {
+        app: String,
+        action: String,
+        success: bool,
+        detail: Option<String>,
+    },
+    Approval {
+        id: u64,
+        app: String,
+        method: String,
+        kind: Option<u16>,
+        preview: Option<String>,
+    },
+}

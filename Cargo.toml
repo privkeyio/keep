@@ -11,6 +11,7 @@ members = [
     "keep-nip46",
     "keep-mobile",
     "keep-desktop",
+    "keep-web",
 ]
 exclude = [
     "keep-enclave/enclave",
@@ -20,7 +21,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

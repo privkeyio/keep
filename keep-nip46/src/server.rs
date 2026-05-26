@@ -17,7 +17,7 @@ use crate::bunker::generate_bunker_url;
 use crate::error::Result;
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::handler::SignerHandler;
-use crate::permissions::PermissionManager;
+use crate::permissions::{Permission, PermissionManager};
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
@@ -29,6 +29,11 @@ pub struct ServerConfig {
     pub auto_approve: bool,
     pub expected_secret: Option<String>,
     pub kill_switch: Option<Arc<AtomicBool>>,
+    /// Permissions granted when a client connects without requesting any.
+    /// Defaults to least-privilege `Permission::DEFAULT`; an always-on bunker
+    /// (keep-web) sets this to `Permission::ALL` so approving a connection lets
+    /// the client sign.
+    pub connect_grant: Permission,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +45,7 @@ impl Default for ServerConfig {
             auto_approve: false,
             expected_secret: None,
             kill_switch: None,
+            connect_grant: Permission::DEFAULT,
         }
     }
 }
@@ -233,7 +239,8 @@ impl Server {
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
-            .with_auto_approve(config.auto_approve);
+            .with_auto_approve(config.auto_approve)
+            .with_connect_grant(config.connect_grant);
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
@@ -330,7 +337,8 @@ impl Server {
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)
-            .with_auto_approve(config.auto_approve);
+            .with_auto_approve(config.auto_approve)
+            .with_connect_grant(config.connect_grant);
         let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
         Ok(Self::build(

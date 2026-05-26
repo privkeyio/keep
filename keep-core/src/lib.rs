@@ -616,6 +616,33 @@ impl Keep {
         Ok(())
     }
 
+    /// Rename a stored FROST share (updates its display name only).
+    pub fn frost_rename_share(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+        name: &str,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepError::InvalidInput(
+                "share name must not be empty".into(),
+            ));
+        }
+        if name.chars().count() > 64 {
+            return Err(KeepError::InvalidInput(
+                "share name must not exceed 64 characters".into(),
+            ));
+        }
+        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
+        stored.metadata.name = name.to_string();
+        self.storage.store_share(&stored)?;
+        Ok(())
+    }
+
     /// Get the hex-encoded group pubkey of the active share, if set.
     pub fn get_active_share_key(&self) -> Option<String> {
         std::fs::read_to_string(self.active_share_path())
