@@ -54,6 +54,8 @@
 
   // undefined = status not yet loaded (interaction disabled until known).
   let signingEnabled = $state<boolean | undefined>(undefined)
+  // Set once the active share is deleted: signing is locked off until a restart.
+  let signerRetired = $state(false)
   let signingLoadError = $state<string | null>(null)
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
@@ -158,7 +160,9 @@
 
   async function toggleKillswitch() {
     try {
-      signingEnabled = await setKillswitch(!signingEnabled)
+      const status = await setKillswitch(!signingEnabled)
+      signingEnabled = status.enabled
+      signerRetired = status.retired
     } catch (e) {
       error = String(e)
     }
@@ -169,7 +173,9 @@
       return
     try {
       await deleteShare(s.group, s.identifier)
-      refreshShares()
+      // Deleting the active share retires the signer; refresh the full state
+      // (not just the share list) so the killswitch/retired status updates too.
+      refreshState()
     } catch (e) {
       error = String(e)
     }
@@ -242,8 +248,9 @@
       })
     refreshShares()
     getKillswitch()
-      .then((e) => {
-        signingEnabled = e
+      .then((s) => {
+        signingEnabled = s.enabled
+        signerRetired = s.retired
         signingLoadError = null
       })
       .catch((err) => {
@@ -438,7 +445,17 @@
     </div>
   {/if}
 
-  {#if bunker && bunker.mode !== 'setup' && signingEnabled === false}
+  {#if bunker && bunker.mode !== 'setup' && signerRetired}
+    <div class="panel disabled-banner">
+      <div>
+        <strong>⚠ Co-signer retired.</strong>
+        The active share was deleted, so this node will <strong>not sign</strong>.
+        <strong>Restart the service</strong> to finalize (on StartOS, use the
+        <strong>Restart</strong> button on this service's page). It then comes back using
+        any remaining shares, or in setup mode if none are left.
+      </div>
+    </div>
+  {:else if bunker && bunker.mode !== 'setup' && signingEnabled === false}
     <div class="panel disabled-banner">
       <div>
         <strong>⏸ Co-signing is disabled.</strong>
@@ -459,6 +476,9 @@
           {:else}
             <span>Not signing yet. Import a share, then restart to begin.</span>
           {/if}
+        {:else if signerRetired}
+          <span class="dot warn"></span>
+          <span>Active share deleted. <strong>Restart the service</strong> to finalize.</span>
         {:else if signingEnabled === false}
           <span class="dot warn"></span>
           <span>Online, but <strong>co-signing is off</strong>. It won't sign until you enable it.</span>
@@ -529,6 +549,9 @@
           </span>
           {#if signingEnabled === undefined}
             <span class="status-pill warn">unknown</span>
+          {:else if signerRetired}
+            <span class="status-pill off">Retired</span>
+            <span class="muted">restart to finalize</span>
           {:else}
             <span class="status-pill {signingEnabled ? 'on' : 'off'}">
               {signingEnabled ? 'Enabled' : 'Disabled'}
