@@ -50,18 +50,6 @@
   let importMsg = $state<string | null>(null)
   let importOk = $state(false)
 
-  // What the Connection panel shows once a share is imported and the
-  // co-signer is running.
-  const fieldLegend: [string, string][] = [
-    ['mode', 'network FROST co-signer once running (vs. setup)'],
-    ['group', 'the FROST group npub this node co-signs for'],
-    ['threshold', 'signatures needed, e.g. 2-of-3'],
-    ['npub', "this signer's own public key"],
-    ['bunker', 'NIP-46 connection string to paste into a Nostr client'],
-    ['bunker relay', 'relay where clients reach the bunker'],
-    ['frost relays', 'relays used to coordinate signing rounds with your devices'],
-  ]
-
   // undefined = status not yet loaded (interaction disabled until known).
   let signingEnabled = $state<boolean | undefined>(undefined)
   let signingLoadError = $state<string | null>(null)
@@ -141,6 +129,20 @@
         signingVerified = r.verified
       })
       .catch(() => {})
+  }
+
+  function exportSigningLog() {
+    const data = JSON.stringify(
+      { verified: signingVerified, exported_at: new Date().toISOString(), entries: signingLog },
+      null,
+      2,
+    )
+    const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `keep-signing-log-${Date.now()}.json`
+    a.click()
+    URL.revokeObjectURL(url)
   }
 
   async function toggleKillswitch() {
@@ -273,12 +275,30 @@
   }
 </script>
 
-{#snippet copyField(label: string, value: string)}
+{#snippet tip(text: string)}
+  <span class="tip" data-tip={text}>
+    <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.3" />
+      <circle cx="8" cy="4.7" r="0.95" fill="currentColor" />
+      <rect x="7.1" y="6.7" width="1.8" height="5" rx="0.9" fill="currentColor" />
+    </svg>
+  </span>
+{/snippet}
+
+{#snippet copyField(label: string, value: string, hint: string)}
   <div class="field">
-    <span class="field-label">{label}</span>
-    <span class="field-value" title={value}>{value}</span>
-    <button class="copy-btn" onclick={() => copy(value, label + value)}>
-      {copied === label + value ? '✓ Copied' : 'Copy'}
+    <span class="field-label">
+      {label}{@render tip(hint)}
+    </span>
+    <button
+      class="field-value copyable"
+      title="Click to copy"
+      onclick={() => copy(value, 'f' + value)}
+    >
+      <span class="cv-text">{value}</span>
+      <span class="cv-icon" class:done={copied === 'f' + value}>
+        {copied === 'f' + value ? '✓ copied' : 'copy'}
+      </span>
     </button>
   </div>
 {/snippet}
@@ -309,7 +329,7 @@
     <div class="panel setup">
       <strong>🔒 Authentication required.</strong>
       <p>
-        Enter the auth token. It is set via <code>KEEP_WEB_AUTH_TOKEN</code>, or, if
+        Enter the auth token. It is set via <span class="token">KEEP_WEB_AUTH_TOKEN</span>, or, if
         unset, generated once at startup and printed to the service logs.
       </p>
       <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
@@ -343,50 +363,95 @@
     </div>
   {/if}
 
+  {#if bunker && bunker.mode !== 'setup' && signingEnabled === false}
+    <div class="panel disabled-banner">
+      <div>
+        <strong>⏸ Co-signing is disabled.</strong>
+        This node is online but will <strong>not sign</strong> until you enable it.
+      </div>
+      <button class="ok" onclick={toggleKillswitch}>Enable signing</button>
+    </div>
+  {/if}
+
   <h2>Connection</h2>
   <div class="panel">
     {#if bunker}
-      <div class="kv">
-        <span>mode</span>
-        {#if bunker.mode === 'network-frost'}
-          <code>network FROST co-signer</code>
-        {:else if bunker.mode === 'setup'}
-          <code class="warn">setup (not signing yet)</code>
+      <div class="conn-status">
+        {#if bunker.mode === 'setup'}
+          <span class="dot warn"></span>
+          <span>Not signing yet. Import a share and restart to begin.</span>
+        {:else if signingEnabled === false}
+          <span class="dot warn"></span>
+          <span>Online, but <strong>co-signing is off</strong>. It won't sign until you enable it.</span>
+        {:else if bunker.mode === 'single-key'}
+          <span class="dot warn"></span>
+          <span>Single-key mode (no threshold security).</span>
         {:else}
-          <code class="warn">single-key (no threshold security)</code>
+          <span class="dot ok"></span>
+          <span>Co-signer online and coordinating with your devices.</span>
         {/if}
       </div>
       {#if bunker.mode === 'setup'}
-        <p class="muted legend-intro">
-          Once a share is imported and the service is restarted, this panel will
-          show:
+        <p class="muted setup-hint">
+          Once your share is imported and the service is restarted, this card
+          shows the bunker connection string, the group it co-signs for, and the
+          relays it uses.
         </p>
-        <dl class="legend">
-          {#each fieldLegend as [field, desc]}
-            <dt>{field}</dt>
-            <dd>{desc}</dd>
-          {/each}
-        </dl>
       {/if}
       {#if bunker.threshold}
-        <div class="kv"><span>threshold</span><strong>{bunker.threshold}</strong></div>
+        <div class="kv">
+          <span>
+            threshold{@render tip(
+              'Signatures required to sign, out of the total shares (e.g. 2-of-3).',
+            )}
+          </span>
+          <strong>{bunker.threshold}</strong>
+        </div>
       {/if}
-      {#if bunker.group}{@render copyField('group', bunker.group)}{/if}
-      {#if bunker.npub}{@render copyField('npub', bunker.npub)}{/if}
-      {#if bunker.url}{@render copyField('bunker', bunker.url)}{/if}
-      {#if bunker.relay}{@render copyField('bunker relay', bunker.relay)}{/if}
+      {#if bunker.group}
+        {@render copyField(
+          'group',
+          bunker.group,
+          'The FROST group this node co-signs for (its public key / npub).',
+        )}
+      {/if}
+      {#if bunker.npub}
+        {@render copyField('npub', bunker.npub, "This signer node's own public key.")}
+      {/if}
+      {#if bunker.url}
+        {@render copyField(
+          'bunker',
+          bunker.url,
+          'NIP-46 connection string. Paste this into a Nostr client to sign through this node.',
+        )}
+      {/if}
+      {#if bunker.relay}
+        {@render copyField(
+          'bunker relay',
+          bunker.relay,
+          'Relay where Nostr clients reach the bunker.',
+        )}
+      {/if}
       {#each bunker.frost_relays as r (r)}
-        {@render copyField('frost relay', r)}
+        {@render copyField(
+          'frost relay',
+          r,
+          'Relay used to coordinate signing rounds with your other devices. Must match the relay they use.',
+        )}
       {/each}
       {#if bunker.mode !== 'setup'}
         <div class="kv killswitch">
-          <span>co-signing</span>
+          <span>
+            co-signing{@render tip(
+              'When off, this node refuses to join signing rounds (a kill switch). New installs start off until you enable it.',
+            )}
+          </span>
           {#if signingEnabled === undefined}
-            <code class="warn">unknown{signingLoadError ? ` (${signingLoadError})` : ''}</code>
+            <span class="status-pill warn">unknown</span>
           {:else}
-            <code class={signingEnabled ? '' : 'warn'}>
-              {signingEnabled ? 'enabled' : 'DISABLED (kill switch)'}
-            </code>
+            <span class="status-pill {signingEnabled ? 'on' : 'off'}">
+              {signingEnabled ? 'Enabled' : 'Disabled'}
+            </span>
             <button class={signingEnabled ? 'no' : 'ok'} onclick={toggleKillswitch}>
               {signingEnabled ? 'Disable signing' : 'Enable signing'}
             </button>
@@ -403,14 +468,17 @@
     <div class="panel group-panel">
       <div class="group-head">
         <span class="group-label">Group</span>
-        <code class="group-npub" title={g.group}>{shortNpub(g.group)}</code>
+        <button
+          class="group-npub copyable"
+          title="Click to copy the full group npub"
+          onclick={() => copy(g.group, 'g' + g.group)}
+        >
+          {copied === 'g' + g.group ? '✓ copied' : shortNpub(g.group)}
+        </button>
         <span class="share-tag">{g.items[0].threshold}-of-{g.items[0].total_shares}</span>
         {#if bunker?.group === g.group}
           <span class="badge active-badge">active co-signer</span>
         {/if}
-        <button class="copy-btn group-copy" onclick={() => copy(g.group, 'g' + g.group)}>
-          {copied === 'g' + g.group ? '✓ Copied' : 'Copy npub'}
-        </button>
       </div>
       {#each g.items as s (s.identifier)}
         <div class="share">
@@ -427,7 +495,11 @@
               <div class="share-head">
                 <span class="share-name">{s.name}</span>
                 <span class="share-idx">#{s.identifier}</span>
-                {#if !s.did_backup}<span class="badge warn-badge">not backed up</span>{/if}
+                {#if !s.did_backup}<span
+                    class="badge warn-badge"
+                    title="This share hasn't been exported anywhere. Export it (below) to back it up; the badge clears once you do."
+                    >not backed up</span
+                  >{/if}
               </div>
             {/if}
             <dl class="meta-grid">
@@ -450,13 +522,17 @@
         {#if exportFor === s.group + ':' + s.identifier}
           <div class="export-box">
             {#if exportResult}
-              <div class="export-head">
-                <span class="muted">Encrypted export (back this up):</span>
-                <button class="copy-btn" onclick={() => copy(exportResult, 'export')}>
-                  {copied === 'export' ? '✓ Copied' : 'Copy'}
-                </button>
-              </div>
-              <textarea readonly rows="3">{exportResult}</textarea>
+              <span class="muted">Encrypted export (back this up):</span>
+              <button
+                class="field-value copyable export-value"
+                title="Click to copy"
+                onclick={() => copy(exportResult, 'export')}
+              >
+                <span class="cv-text">{exportResult}</span>
+                <span class="cv-icon" class:done={copied === 'export'}>
+                  {copied === 'export' ? '✓ copied' : 'copy'}
+                </span>
+              </button>
             {:else}
               <div class="row">
                 <input
@@ -552,12 +628,13 @@
       <span class="verify {signingVerified ? 'ok' : 'fail'}">
         {signingVerified ? '✓ chain verified' : '✗ chain INVALID'}
       </span>
+      <button class="link-btn" onclick={exportSigningLog}>Export</button>
     {/if}
   </h2>
   <div class="panel">
     {#each signingLog as e (e.timestamp_ms + ':' + e.session + ':' + e.operation)}
       <div class="event">
-        <code>{e.session}</code>
+        <span class="token">{e.session}</span>
         <span>{e.operation}</span>
         <span class="muted">
           · participants {e.participants.join(',')} · {new Date(

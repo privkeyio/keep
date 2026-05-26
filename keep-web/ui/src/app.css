@@ -170,7 +170,7 @@ code {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.55rem 0;
+  padding: 0.4rem 0;
   border-top: 1px solid var(--border-soft);
 }
 
@@ -178,41 +178,65 @@ code {
   border-top: none;
 }
 
+/* Fixed width so every value box lines up regardless of label length. */
 .field-label {
+  flex: none;
+  width: 7.5rem;
+  display: flex;
+  align-items: center;
   color: var(--faint);
-  min-width: 6rem;
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
-.field-value {
+/* Click-to-copy value (no separate Copy button). */
+.field-value.copyable {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: left;
   font-family: 'SF Mono', ui-monospace, monospace;
   font-size: 0.8rem;
-  letter-spacing: 0.01em;
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
   padding: 0.45rem 0.65rem;
+  cursor: pointer;
+}
+
+.field-value.copyable:hover {
+  border-color: var(--accent);
+}
+
+.cv-text {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.copy-btn {
+.cv-icon {
   flex: none;
-  min-width: 5.2rem;
-  background: var(--panel-2);
-  color: var(--muted);
-  border: 1px solid var(--border);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity 0.12s ease;
 }
 
-.copy-btn:hover {
-  color: var(--text);
-  border-color: var(--accent);
+.field-value.copyable:hover .cv-icon,
+.cv-icon.done {
+  opacity: 1;
+}
+
+.cv-icon.done {
+  color: var(--ok);
 }
 
 /* ---- Buttons ---- */
@@ -269,9 +293,10 @@ button:disabled {
   border-top: 1px solid var(--border-soft);
 }
 
-.share:first-of-type {
+/* First share sits right under the group-head divider; don't double the line. */
+.group-head + .share {
   border-top: none;
-  padding-top: 0.25rem;
+  padding-top: 0.5rem;
 }
 
 .share-main {
@@ -307,27 +332,38 @@ button:disabled {
   color: var(--faint);
 }
 
-.group-npub {
+.group-npub.copyable {
   color: var(--text);
   font-size: 0.8rem;
+  font-family: 'SF Mono', ui-monospace, monospace;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.55rem;
+  cursor: pointer;
 }
 
-.group-copy {
-  margin-left: auto;
+.group-npub.copyable:hover {
+  border-color: var(--accent);
 }
 
 .active-badge {
+  margin-left: auto;
   color: var(--ok);
   background: rgba(47, 143, 91, 0.12);
   border: 1px solid var(--accent-soft);
 }
 
-.export-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.4rem;
+.export-value {
+  align-items: flex-start;
+  margin-top: 0.4rem;
+  max-height: 5.5rem;
+  overflow: auto;
+}
+
+.export-value .cv-text {
+  white-space: normal;
+  word-break: break-all;
 }
 
 .share-head {
@@ -466,28 +502,158 @@ textarea:focus {
   padding: 0.55rem 0.75rem;
 }
 
-.legend-intro {
-  margin: 0.4rem 0 0.5rem;
-  font-size: 0.85rem;
+.conn-status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.95rem;
+  padding: 0.1rem 0 0.3rem;
 }
 
-dl.legend {
-  margin: 0;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.35rem 0.85rem;
-  font-size: 0.85rem;
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
 }
 
-dl.legend dt {
+.dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 8px 1px rgba(63, 185, 80, 0.5);
+}
+
+.dot.warn {
+  background: var(--warn);
+  box-shadow: 0 0 8px 1px rgba(227, 179, 65, 0.4);
+}
+
+.setup-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.disabled-banner {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  border-color: #3a3320;
+  background: linear-gradient(180deg, #211d10 0%, #1a1810 100%);
+  margin-bottom: 0.5rem;
+}
+
+.disabled-banner > div {
+  flex: 1;
+  font-size: 0.9rem;
+}
+
+.disabled-banner strong {
+  color: var(--warn);
+}
+
+.disabled-banner button {
+  flex: none;
+}
+
+/* Inline SVG info marker with a styled hover tooltip. */
+.tip {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.35rem;
+  color: var(--faint);
+  vertical-align: middle;
+  cursor: help;
+  position: relative;
+}
+
+.tip svg {
+  display: block;
+}
+
+.tip:hover {
   color: var(--accent);
-  font-family: ui-monospace, monospace;
-  white-space: nowrap;
 }
 
-dl.legend dd {
-  margin: 0;
+/* Status pill (co-signing on/off/unknown) — not code-styled. */
+.status-pill {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
   color: var(--muted);
+}
+
+.status-pill.on {
+  color: var(--ok);
+  background: rgba(47, 143, 91, 0.12);
+  border-color: var(--accent-soft);
+}
+
+.status-pill.off,
+.status-pill.warn {
+  color: var(--warn);
+  background: rgba(227, 179, 65, 0.1);
+  border-color: #3a3320;
+}
+
+/* Inline technical token (env var, session id) — subtle, not a code block. */
+.token {
+  font-family: 'SF Mono', ui-monospace, monospace;
+  font-size: 0.82em;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+/* Text-style action button (e.g. signing-log Export). */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  background: none;
+  text-decoration: underline;
+}
+
+.tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 230px;
+  padding: 0.55rem 0.7rem;
+  background: #0b0e13;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: normal;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 20;
+}
+
+.tip:hover::after {
+  opacity: 1;
 }
 
 ol.tasks {
