@@ -173,6 +173,9 @@
       return
     try {
       await deleteShare(s.group, s.identifier)
+      // Clear the post-import "restart to come online" notice: it's stale once
+      // the share is gone.
+      importOk = false
       // Deleting the active share retires the signer; refresh the full state
       // (not just the share list) so the killswitch/retired status updates too.
       refreshState()
