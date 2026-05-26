@@ -11,7 +11,7 @@ use keep_core::frost::SharePackage;
 use keep_core::keyring::Keyring;
 use keep_frost_net::{KfpNode, SessionInfo, SigningHooks};
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
-use keep_nip46::{NetworkFrostSigner, Server, ServerConfig};
+use keep_nip46::{NetworkFrostSigner, Permission, Server, ServerConfig};
 
 use crate::state::{BunkerInfo, Event};
 
@@ -195,7 +195,10 @@ pub fn spawn_network_frost(
                 transport_key,
                 &cfg.bunker_relays,
                 Some(callbacks),
-                ServerConfig::default(),
+                ServerConfig {
+                    connect_grant: Permission::ALL,
+                    ..ServerConfig::default()
+                },
             )
             .await
             {
@@ -256,14 +259,25 @@ pub fn spawn_single_key(
                 approvals,
                 next_id: AtomicU64::new(1),
             });
-            let mut server =
-                match Server::new(keyring, std::slice::from_ref(&relay), Some(callbacks)).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = info_tx.send(Err(format!("bunker start: {e}")));
-                        return;
-                    }
-                };
+            let mut server = match Server::new_with_config(
+                keyring,
+                None,
+                None,
+                std::slice::from_ref(&relay),
+                Some(callbacks),
+                ServerConfig {
+                    connect_grant: Permission::ALL,
+                    ..ServerConfig::default()
+                },
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = info_tx.send(Err(format!("bunker start: {e}")));
+                    return;
+                }
+            };
             let info = BunkerInfo {
                 mode: "single-key".into(),
                 url: server.bunker_url(),

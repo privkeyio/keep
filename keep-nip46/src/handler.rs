@@ -99,6 +99,11 @@ pub struct SignerHandler {
     new_conn_timestamps: Mutex<VecDeque<Instant>>,
     expected_secret: Option<Zeroizing<String>>,
     auto_approve: bool,
+    /// Permissions granted to a client that connects without requesting any
+    /// (many clients, e.g. nostr-tools, send no `connect` permissions). The
+    /// act of approving the connection is the grant. Defaults to the
+    /// least-privilege `Permission::DEFAULT`.
+    connect_grant: Permission,
     relay_urls: Vec<String>,
     kill_switch: Arc<AtomicBool>,
 }
@@ -122,6 +127,7 @@ impl SignerHandler {
             new_conn_timestamps: Mutex::new(VecDeque::new()),
             expected_secret: None,
             auto_approve: false,
+            connect_grant: Permission::DEFAULT,
             relay_urls: Vec::new(),
             kill_switch: Arc::new(AtomicBool::new(false)),
         }
@@ -129,6 +135,11 @@ impl SignerHandler {
 
     pub fn with_expected_secret(mut self, secret: String) -> Self {
         self.expected_secret = Some(Zeroizing::new(secret));
+        self
+    }
+
+    pub fn with_connect_grant(mut self, grant: Permission) -> Self {
+        self.connect_grant = grant;
         self
     }
 
@@ -316,7 +327,7 @@ impl SignerHandler {
         let (requested_perms, auto_kinds) = permissions
             .as_deref()
             .map(parse_permission_string)
-            .unwrap_or((Permission::DEFAULT, HashSet::new()));
+            .unwrap_or((self.connect_grant, HashSet::new()));
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
@@ -594,7 +605,7 @@ impl SignerHandler {
 
         let (requested_perms, auto_kinds) = permissions_str
             .map(parse_permission_string)
-            .unwrap_or((Permission::DEFAULT, HashSet::new()));
+            .unwrap_or((self.connect_grant, HashSet::new()));
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
