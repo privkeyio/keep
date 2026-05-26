@@ -1,23 +1,31 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, Mutex};
 
 use keep_core::Keep;
+use keep_frost_net::KfpNode;
 
 /// Shared application state handed to every axum handler.
 #[derive(Clone)]
 pub struct AppState {
     /// Unlocked vault, used for read-only queries (share listing, etc.).
-    pub keep: std::sync::Arc<Mutex<Keep>>,
+    pub keep: Arc<Mutex<Keep>>,
     /// Bunker connection details, populated once the server is up.
     pub bunker: BunkerInfo,
     /// Live event stream (logs + approval requests) for WebSocket clients.
     pub events: broadcast::Sender<Event>,
     /// Pending approval requests awaiting a browser decision, keyed by id.
-    pub approvals: std::sync::Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
+    pub approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
+    /// Kill switch: when false, the co-signer refuses to participate. Toggled
+    /// live (no restart); the policy hook reads it on every round.
+    pub signing_enabled: Arc<AtomicBool>,
+    /// The running FROST node (network mode only), for reading the signing
+    /// audit log and peer state.
+    pub node: Option<Arc<KfpNode>>,
 }
 
 #[derive(Clone, Serialize)]

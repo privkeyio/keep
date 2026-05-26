@@ -10,10 +10,19 @@ export interface BunkerInfo {
 
 export interface Share {
   name: string
+  group: string
   identifier: number
   threshold: number
   total_shares: number
   sign_count: number
+}
+
+export interface SigningEntry {
+  timestamp_ms: number
+  session: string
+  operation: string
+  participants: number[]
+  our_index: number
 }
 
 export interface LogEvent {
@@ -60,6 +69,56 @@ export async function importShare(
   if (!r.ok && r.status !== 204) {
     throw new Error((await r.text()) || `import failed: ${r.status}`)
   }
+}
+
+export async function exportShare(
+  group: string,
+  identifier: number,
+  passphrase: string,
+): Promise<string> {
+  const r = await fetch('/api/shares/export', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ group, identifier, passphrase }),
+  })
+  if (!r.ok) throw new Error((await r.text()) || `export failed: ${r.status}`)
+  return (await r.json()).export
+}
+
+export async function deleteShare(group: string, identifier: number): Promise<void> {
+  const r = await fetch('/api/shares/delete', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ group, identifier }),
+  })
+  if (!r.ok && r.status !== 204) {
+    throw new Error((await r.text()) || `delete failed: ${r.status}`)
+  }
+}
+
+export async function getSigningLog(): Promise<{
+  verified: boolean
+  entries: SigningEntry[]
+}> {
+  const r = await fetch('/api/signing-log')
+  if (!r.ok) throw new Error(`signing log: ${r.status}`)
+  return r.json()
+}
+
+export async function getKillswitch(): Promise<boolean> {
+  const r = await fetch('/api/killswitch')
+  if (!r.ok) throw new Error(`killswitch: ${r.status}`)
+  return (await r.json()).enabled
+}
+
+export async function setKillswitch(enabled: boolean): Promise<boolean> {
+  const r = await fetch('/api/killswitch', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+  if (!r.ok) throw new Error(`killswitch: ${r.status}`)
+  return (await r.json()).enabled
 }
 
 export async function resolveApproval(id: number, approve: boolean): Promise<void> {

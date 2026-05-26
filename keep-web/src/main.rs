@@ -97,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (events, _) = broadcast::channel(256);
     let approvals = Arc::new(StdMutex::new(HashMap::new()));
+    // Kill switch shared with the co-signer policy; starts from the env default.
+    let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(auto_approve));
 
     // Resolve which FROST group this node co-signs for: an explicit
     // KEEP_FROST_GROUP, otherwise the single group present in the vault.
@@ -106,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let allow_single_key = env_or("KEEP_ALLOW_SINGLE_KEY", "false") == "true";
 
+    let mut node = None;
     let bunker_info = if let Some((group_pubkey, group_npub)) = resolved_group {
         match keep.frost_get_share(&group_pubkey) {
             Ok(share) => {
@@ -115,19 +118,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     frost_relays
                 };
-                bunker::spawn_network_frost(
+                let handle = bunker::spawn_network_frost(
                     bunker::NetworkConfig {
                         share,
                         group_pubkey,
                         group_npub,
                         frost_relays,
                         bunker_relays,
-                        auto_approve,
+                        enabled: signing_enabled.clone(),
                     },
                     events.clone(),
                     approvals.clone(),
                 )
-                .map_err(|e| format!("failed to start co-signer: {e}"))?
+                .map_err(|e| format!("failed to start co-signer: {e}"))?;
+                node = Some(handle.node);
+                handle.info
             }
             Err(_) => {
                 tracing::warn!(group = %group_npub, "group configured but no share present; setup mode");
@@ -156,6 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bunker: bunker_info,
         events,
         approvals,
+        signing_enabled,
+        node,
     };
 
     let serve_index = ServeFile::new(ui_dir.join("index.html"));
@@ -166,6 +173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/bunker", get(api::bunker))
         .route("/api/shares", get(api::shares))
         .route("/api/shares/import", post(api::import_share))
+        .route("/api/shares/export", post(api::export_share))
+        .route("/api/shares/delete", post(api::delete_share))
+        .route("/api/signing-log", get(api::signing_log))
+        .route(
+            "/api/killswitch",
+            get(api::killswitch_status).post(api::set_killswitch),
+        )
         .route("/api/approvals/{id}", post(api::resolve_approval))
         .route("/api/events", get(ws::events))
         .fallback_service(static_files)

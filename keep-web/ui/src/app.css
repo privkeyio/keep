@@ -201,6 +201,53 @@ dl.legend dd {
   color: var(--ok);
 }
 
+.killswitch {
+  align-items: center;
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+.killswitch button {
+  margin-left: auto;
+}
+
+.share-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.share-actions button {
+  padding: 0.25rem 0.6rem;
+  background: var(--border);
+}
+
+.share-actions button.no {
+  background: var(--no);
+}
+
+.export-box {
+  padding: 0.5rem 0 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.verify {
+  font-size: 0.75rem;
+  font-weight: normal;
+  margin-left: 0.5rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.verify.ok {
+  color: var(--ok);
+}
+
+.verify.fail {
+  color: var(--no);
+}
+
 textarea,
 input {
   width: 100%;

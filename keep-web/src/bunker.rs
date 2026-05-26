@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -70,11 +70,12 @@ fn short_id(id: &[u8; 32]) -> String {
 ///
 /// The always-on co-signer auto-participates within policy rather than
 /// prompting a human (the human approval happens on the *initiating* device).
-/// `auto_approve = false` acts as a kill switch: the node refuses to co-sign.
-/// Every decision is streamed to the web UI for observability.
+/// `enabled = false` is the kill switch: the node refuses to co-sign. The flag
+/// is shared with the API so it can be toggled live (no restart). Every
+/// decision is streamed to the web UI for observability.
 struct CoSignerPolicy {
     events: broadcast::Sender<Event>,
-    auto_approve: bool,
+    enabled: Arc<AtomicBool>,
 }
 
 impl SigningHooks for CoSignerPolicy {
@@ -85,7 +86,7 @@ impl SigningHooks for CoSignerPolicy {
             session.threshold,
             session.participants.len(),
         );
-        if self.auto_approve {
+        if self.enabled.load(Ordering::Relaxed) {
             let _ = self.events.send(Event::Log {
                 app: "frost".into(),
                 action: "co-signing".into(),
@@ -123,7 +124,13 @@ pub struct NetworkConfig {
     pub group_npub: String,
     pub frost_relays: Vec<String>,
     pub bunker_relays: Vec<String>,
-    pub auto_approve: bool,
+    pub enabled: Arc<AtomicBool>,
+}
+
+/// What `spawn_network_frost` reports back once the co-signer is up.
+pub struct NetworkHandle {
+    pub info: BunkerInfo,
+    pub node: Arc<KfpNode>,
 }
 
 /// Spawns the always-on network-FROST co-signer: a long-lived `KfpNode` that
@@ -134,8 +141,8 @@ pub fn spawn_network_frost(
     cfg: NetworkConfig,
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
-) -> Result<BunkerInfo, String> {
-    let (info_tx, info_rx) = channel::<Result<BunkerInfo, String>>();
+) -> Result<NetworkHandle, String> {
+    let (info_tx, info_rx) = channel::<Result<NetworkHandle, String>>();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -159,7 +166,7 @@ pub fn spawn_network_frost(
 
             node.set_hooks(Arc::new(CoSignerPolicy {
                 events: events.clone(),
-                auto_approve: cfg.auto_approve,
+                enabled: cfg.enabled,
             }));
 
             if let Err(e) = node.announce().await {
@@ -174,6 +181,7 @@ pub fn spawn_network_frost(
                 }
             });
 
+            let node_for_state = node.clone();
             let signer = NetworkFrostSigner::with_shared_node(cfg.group_pubkey, node);
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
             let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
@@ -207,7 +215,10 @@ pub fn spawn_network_frost(
                 group: Some(cfg.group_npub),
                 threshold: Some(format!("{threshold}-of-{total}")),
             };
-            let _ = info_tx.send(Ok(info));
+            let _ = info_tx.send(Ok(NetworkHandle {
+                info,
+                node: node_for_state,
+            }));
 
             if let Err(e) = server.run().await {
                 tracing::error!(error = %e, "bunker exited");

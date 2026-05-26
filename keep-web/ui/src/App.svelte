@@ -4,10 +4,16 @@
     getBunker,
     getShares,
     importShare,
+    exportShare,
+    deleteShare,
+    getSigningLog,
+    getKillswitch,
+    setKillswitch,
     resolveApproval,
     connectEvents,
     type BunkerInfo,
     type Share,
+    type SigningEntry,
     type LogEvent,
     type ApprovalEvent,
   } from './lib/api'
@@ -39,10 +45,64 @@
     ['frost relays', 'relays used to coordinate signing rounds with your devices'],
   ]
 
+  let signingEnabled = $state(true)
+  let signingLog = $state<SigningEntry[]>([])
+  let signingVerified = $state(true)
+
+  // Per-share export UI state.
+  let exportFor = $state<string | null>(null) // "group:id"
+  let exportPass = $state('')
+  let exportResult = $state('')
+  let exportErr = $state<string | null>(null)
+
   function refreshShares() {
     getShares()
       .then((s) => (shares = s))
       .catch((e) => (error = String(e)))
+  }
+
+  function refreshSigningLog() {
+    getSigningLog()
+      .then((r) => {
+        signingLog = r.entries
+        signingVerified = r.verified
+      })
+      .catch(() => {})
+  }
+
+  async function toggleKillswitch() {
+    try {
+      signingEnabled = await setKillswitch(!signingEnabled)
+    } catch (e) {
+      error = String(e)
+    }
+  }
+
+  async function confirmDelete(s: Share) {
+    if (!confirm(`Delete share "${s.name}" (${s.identifier})? This cannot be undone.`))
+      return
+    try {
+      await deleteShare(s.group, s.identifier)
+      refreshShares()
+    } catch (e) {
+      error = String(e)
+    }
+  }
+
+  function startExport(s: Share) {
+    exportFor = `${s.group}:${s.identifier}`
+    exportPass = ''
+    exportResult = ''
+    exportErr = null
+  }
+
+  async function doExport(s: Share) {
+    exportErr = null
+    try {
+      exportResult = await exportShare(s.group, s.identifier, exportPass)
+    } catch (e) {
+      exportErr = String(e)
+    }
   }
 
   async function submitImport(e: Event) {
@@ -70,12 +130,18 @@
       .then((b) => (bunker = b))
       .catch((e) => (error = String(e)))
     refreshShares()
+    getKillswitch()
+      .then((e) => (signingEnabled = e))
+      .catch(() => {})
+    refreshSigningLog()
 
     const ws = connectEvents((e) => {
       if (e.type === 'approval') {
         approvals = [{ ...e }, ...approvals]
       } else {
         logs = [e, ...logs].slice(0, 100)
+        // A co-sign just happened — refresh the persistent audit log.
+        if (e.app === 'frost') refreshSigningLog()
       }
     })
     return () => ws.close()
@@ -161,6 +227,17 @@
           <span>frost relays</span><code>{bunker.frost_relays.join(', ')}</code>
         </div>
       {/if}
+      {#if bunker.mode !== 'setup'}
+        <div class="kv killswitch">
+          <span>co-signing</span>
+          <code class={signingEnabled ? '' : 'warn'}>
+            {signingEnabled ? 'enabled' : 'DISABLED (kill switch)'}
+          </code>
+          <button class={signingEnabled ? 'no' : 'ok'} onclick={toggleKillswitch}>
+            {signingEnabled ? 'Disable signing' : 'Enable signing'}
+          </button>
+        </div>
+      {/if}
     {:else}
       <p class="muted">Connecting…</p>
     {/if}
@@ -168,13 +245,39 @@
 
   <h2>Shares</h2>
   <div class="panel">
-    {#each shares as s (s.name)}
+    {#each shares as s (s.group + ':' + s.identifier)}
       <div class="share">
         <span>{s.name}</span>
         <span class="muted">
-          {s.threshold}-of-{s.total_shares} · signed {s.sign_count}
+          #{s.identifier} · {s.threshold}-of-{s.total_shares} · signed {s.sign_count}
+        </span>
+        <span class="share-actions">
+          <button onclick={() => startExport(s)}>Export</button>
+          <button class="no" onclick={() => confirmDelete(s)}>Delete</button>
         </span>
       </div>
+      {#if exportFor === s.group + ':' + s.identifier}
+        <div class="export-box">
+          {#if exportResult}
+            <p class="muted">Encrypted export (back this up):</p>
+            <textarea readonly rows="3">{exportResult}</textarea>
+          {:else}
+            <div class="row">
+              <input
+                type="password"
+                bind:value={exportPass}
+                placeholder="Export passphrase"
+                autocomplete="off"
+              />
+              <button class="ok" onclick={() => doExport(s)} disabled={!exportPass}>
+                Export
+              </button>
+              <button onclick={() => (exportFor = null)}>Cancel</button>
+            </div>
+          {/if}
+          {#if exportErr}<p class="fail">{exportErr}</p>{/if}
+        </div>
+      {/if}
     {:else}
       <p class="muted">No shares imported yet.</p>
     {/each}
@@ -239,5 +342,29 @@
     {#if approvals.length === 0 && logs.length === 0}
       <p class="muted">Waiting for signing activity…</p>
     {/if}
+  </div>
+
+  <h2>
+    Signing Log
+    {#if signingLog.length}
+      <span class="verify {signingVerified ? 'ok' : 'fail'}">
+        {signingVerified ? '✓ chain verified' : '✗ chain INVALID'}
+      </span>
+    {/if}
+  </h2>
+  <div class="panel">
+    {#each signingLog as e (e.timestamp_ms + ':' + e.session + ':' + e.operation)}
+      <div class="event">
+        <code>{e.session}</code>
+        <span>{e.operation}</span>
+        <span class="muted">
+          · participants {e.participants.join(',')} · {new Date(
+            e.timestamp_ms,
+          ).toLocaleString()}
+        </span>
+      </div>
+    {:else}
+      <p class="muted">No signatures recorded yet.</p>
+    {/each}
   </div>
 </main>
