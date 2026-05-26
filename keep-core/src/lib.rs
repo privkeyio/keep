@@ -503,7 +503,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let stored = self.find_stored_share(group_pubkey, identifier)?;
+        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
         let data_key = self.get_data_key()?;
         let share = stored.decrypt(&data_key)?;
 
@@ -512,7 +512,19 @@ impl Keep {
                 .with_participants(vec![identifier])
         });
 
-        ShareExport::from_share(&share, passphrase)
+        let export = ShareExport::from_share(&share, passphrase)?;
+
+        // Exporting is the backup action: record it so the UI/clients can stop
+        // nagging "not backed up". Best-effort; a storage error here must not
+        // fail the export the caller already holds.
+        if !stored.metadata.did_backup {
+            stored.metadata.mark_backed_up();
+            if let Err(e) = self.storage.store_share(&stored) {
+                tracing::warn!(error = %e, "failed to persist did_backup after export");
+            }
+        }
+
+        Ok(export)
     }
 
     /// Import a FROST share from an encrypted export.

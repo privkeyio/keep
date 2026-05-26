@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import crest from './assets/keep-crest.png'
   import {
     getBunker,
     getShares,
@@ -12,6 +13,8 @@
     setKillswitch,
     resolveApproval,
     connectEvents,
+    hasAuthToken,
+    setAuthToken,
     type BunkerInfo,
     type Share,
     type SigningEntry,
@@ -22,6 +25,19 @@
   let bunker = $state<BunkerInfo | null>(null)
   let shares = $state<Share[]>([])
   let error = $state<string | null>(null)
+
+  let authed = $state(hasAuthToken())
+  let tokenInput = $state('')
+  let stopStream: (() => void) | undefined
+
+  function submitToken() {
+    if (!tokenInput.trim()) return
+    setAuthToken(tokenInput)
+    tokenInput = ''
+    error = null
+    authed = true
+    load()
+  }
 
   type PendingApproval = ApprovalEvent & { resolved?: 'approved' | 'denied' }
   let approvals = $state<PendingApproval[]>([])
@@ -80,6 +96,22 @@
     if (!secs) return 'never'
     return new Date(secs * 1000).toLocaleString()
   }
+
+  function shortNpub(npub: string): string {
+    return npub.length > 24 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
+  }
+
+  // Shares grouped by their FROST group, so a vault holding more than one
+  // group renders as separate sections instead of one flat pile.
+  let groupedShares = $derived.by(() => {
+    const m = new Map<string, Share[]>()
+    for (const s of shares) {
+      const list = m.get(s.group) ?? []
+      list.push(s)
+      m.set(s.group, list)
+    }
+    return [...m.entries()].map(([group, items]) => ({ group, items }))
+  })
 
   function startRename(s: Share) {
     renameFor = `${s.group}:${s.identifier}`
@@ -141,6 +173,8 @@
     exportErr = null
     try {
       exportResult = await exportShare(s.group, s.identifier, exportPass)
+      // Export marks the share backed up server-side; refresh to clear the badge.
+      refreshShares()
     } catch (e) {
       exportErr = String(e)
     } finally {
@@ -170,10 +204,23 @@
     }
   }
 
-  onMount(() => {
+  function handleUnauthorized(e: unknown): boolean {
+    if (String(e).includes('401')) {
+      authed = false
+      stopStream?.()
+      stopStream = undefined
+      error = 'Authentication required. Enter the auth token.'
+      return true
+    }
+    return false
+  }
+
+  function load() {
     getBunker()
       .then((b) => (bunker = b))
-      .catch((e) => (error = String(e)))
+      .catch((e) => {
+        if (!handleUnauthorized(e)) error = String(e)
+      })
     refreshShares()
     getKillswitch()
       .then((e) => {
@@ -181,6 +228,7 @@
         signingLoadError = null
       })
       .catch((err) => {
+        if (handleUnauthorized(err)) return
         signingEnabled = undefined
         signingLoadError = String(err)
       })
@@ -189,16 +237,27 @@
     const stream = connectEvents(
       (e) => {
         if (e.type === 'approval') {
-          approvals = [{ ...e }, ...approvals]
+          // Cap the list so a long-running session can't grow it unbounded:
+          // keep all still-pending requests, then fill up to 100 with the most
+          // recent resolved ones.
+          const next = [{ ...e }, ...approvals]
+          const pending = next.filter((x) => !x.resolved)
+          const resolved = next.filter((x) => x.resolved)
+          approvals = [...pending, ...resolved].slice(0, 100)
         } else {
           logs = [e, ...logs].slice(0, 100)
-          // A co-sign just happened — refresh the persistent audit log.
+          // A co-sign just happened: refresh the persistent audit log.
           if (e.app === 'frost') refreshSigningLog()
         }
       },
       (connected) => (wsConnected = connected),
     )
-    return () => stream.close()
+    stopStream = () => stream.close()
+  }
+
+  onMount(() => {
+    if (authed) load()
+    return () => stopStream?.()
   })
 
   async function decide(a: PendingApproval, approve: boolean) {
@@ -224,16 +283,49 @@
   </div>
 {/snippet}
 
-<main>
-  <h1>Keep — FROST Bunker</h1>
+<header class="topbar">
+  <img class="logo" src={crest} alt="Keep" />
+  <div class="brand">
+    <span class="brand-name">Keep</span>
+    <span class="brand-sub">FROST threshold co&#8209;signer</span>
+  </div>
+  {#if bunker}
+    <span class="mode-pill {bunker.mode === 'network-frost' ? 'on' : 'warn'}">
+      {bunker.mode === 'network-frost'
+        ? 'co-signer online'
+        : bunker.mode === 'setup'
+          ? 'setup'
+          : 'single-key'}
+    </span>
+  {/if}
+</header>
 
+<main>
   {#if error}
-    <p class="fail">{error}</p>
+    <p class="fail banner">{error}</p>
   {/if}
 
+  {#if !authed}
+    <div class="panel setup">
+      <strong>🔒 Authentication required.</strong>
+      <p>
+        Enter the auth token. It is set via <code>KEEP_WEB_AUTH_TOKEN</code>, or, if
+        unset, generated once at startup and printed to the service logs.
+      </p>
+      <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
+        <input
+          type="password"
+          placeholder="auth token"
+          bind:value={tokenInput}
+          autocomplete="off"
+        />
+        <button type="submit" disabled={!tokenInput.trim()}>Unlock</button>
+      </form>
+    </div>
+  {:else}
   {#if bunker && bunker.mode === 'setup'}
     <div class="panel setup">
-      <strong>⚙ Setup required.</strong> No FROST share is loaded yet — this node
+      <strong>⚙ Setup required.</strong> No FROST share is loaded yet; this node
       isn't signing.
       <h3>Tasks to finish setup</h3>
       <ol class="tasks">
@@ -259,7 +351,7 @@
         {#if bunker.mode === 'network-frost'}
           <code>network FROST co-signer</code>
         {:else if bunker.mode === 'setup'}
-          <code class="warn">setup — not signing yet</code>
+          <code class="warn">setup (not signing yet)</code>
         {:else}
           <code class="warn">single-key (no threshold security)</code>
         {/if}
@@ -307,61 +399,86 @@
   </div>
 
   <h2>Shares</h2>
-  <div class="panel">
-    {#each shares as s (s.group + ':' + s.identifier)}
-      <div class="share">
-        <div class="share-main">
-          {#if renameFor === s.group + ':' + s.identifier}
-            <div class="row">
-              <input type="text" bind:value={renameVal} maxlength="64" />
-              <button class="ok" onclick={() => doRename(s)} disabled={!renameVal.trim()}>
-                Save
-              </button>
-              <button onclick={() => (renameFor = null)}>Cancel</button>
-            </div>
-          {:else}
-            <span class="share-name">{s.name}</span>
-          {/if}
-          <span class="muted share-meta">
-            #{s.identifier} · {s.threshold}-of-{s.total_shares} · signed {s.sign_count}
-            {#if !s.did_backup}· <span class="warn-text">not backed up</span>{/if}
-          </span>
-          <span class="muted share-meta">
-            created {fmtDate(s.created_at)} · last used {fmtDate(s.last_used)}
-          </span>
-        </div>
-        <span class="share-actions">
-          <button onclick={() => startRename(s)}>Rename</button>
-          <button onclick={() => startExport(s)}>Export</button>
-          <button class="no" onclick={() => confirmDelete(s)}>Delete</button>
-        </span>
+  {#each groupedShares as g (g.group)}
+    <div class="panel group-panel">
+      <div class="group-head">
+        <span class="group-label">Group</span>
+        <code class="group-npub" title={g.group}>{shortNpub(g.group)}</code>
+        <span class="share-tag">{g.items[0].threshold}-of-{g.items[0].total_shares}</span>
+        {#if bunker?.group === g.group}
+          <span class="badge active-badge">active co-signer</span>
+        {/if}
+        <button class="copy-btn group-copy" onclick={() => copy(g.group, 'g' + g.group)}>
+          {copied === 'g' + g.group ? '✓ Copied' : 'Copy npub'}
+        </button>
       </div>
-      {#if exportFor === s.group + ':' + s.identifier}
-        <div class="export-box">
-          {#if exportResult}
-            <p class="muted">Encrypted export (back this up):</p>
-            <textarea readonly rows="3">{exportResult}</textarea>
-          {:else}
-            <div class="row">
-              <input
-                type="password"
-                bind:value={exportPass}
-                placeholder="Export passphrase"
-                autocomplete="off"
-              />
-              <button class="ok" onclick={() => doExport(s)} disabled={!exportPass}>
-                Export
-              </button>
-              <button onclick={() => (exportFor = null)}>Cancel</button>
-            </div>
-          {/if}
-          {#if exportErr}<p class="fail">{exportErr}</p>{/if}
+      {#each g.items as s (s.identifier)}
+        <div class="share">
+          <div class="share-main">
+            {#if renameFor === s.group + ':' + s.identifier}
+              <div class="row">
+                <input type="text" bind:value={renameVal} maxlength="64" />
+                <button class="ok" onclick={() => doRename(s)} disabled={!renameVal.trim()}>
+                  Save
+                </button>
+                <button onclick={() => (renameFor = null)}>Cancel</button>
+              </div>
+            {:else}
+              <div class="share-head">
+                <span class="share-name">{s.name}</span>
+                <span class="share-idx">#{s.identifier}</span>
+                {#if !s.did_backup}<span class="badge warn-badge">not backed up</span>{/if}
+              </div>
+            {/if}
+            <dl class="meta-grid">
+              <div><dt>Signatures</dt><dd>{s.sign_count}</dd></div>
+              <div><dt>Created</dt><dd>{fmtDate(s.created_at)}</dd></div>
+              <div>
+                <dt>Last used</dt>
+                <dd>
+                  {#if s.last_used}{fmtDate(s.last_used)}{:else}<span class="never">never</span>{/if}
+                </dd>
+              </div>
+            </dl>
+          </div>
+          <span class="share-actions">
+            <button onclick={() => startRename(s)}>Rename</button>
+            <button onclick={() => startExport(s)}>Export</button>
+            <button class="no" onclick={() => confirmDelete(s)}>Delete</button>
+          </span>
         </div>
-      {/if}
-    {:else}
-      <p class="muted">No shares imported yet.</p>
-    {/each}
-  </div>
+        {#if exportFor === s.group + ':' + s.identifier}
+          <div class="export-box">
+            {#if exportResult}
+              <div class="export-head">
+                <span class="muted">Encrypted export (back this up):</span>
+                <button class="copy-btn" onclick={() => copy(exportResult, 'export')}>
+                  {copied === 'export' ? '✓ Copied' : 'Copy'}
+                </button>
+              </div>
+              <textarea readonly rows="3">{exportResult}</textarea>
+            {:else}
+              <div class="row">
+                <input
+                  type="password"
+                  bind:value={exportPass}
+                  placeholder="Export passphrase"
+                  autocomplete="off"
+                />
+                <button class="ok" onclick={() => doExport(s)} disabled={!exportPass}>
+                  Export
+                </button>
+                <button onclick={() => (exportFor = null)}>Cancel</button>
+              </div>
+            {/if}
+            {#if exportErr}<p class="fail">{exportErr}</p>{/if}
+          </div>
+        {/if}
+      {/each}
+    </div>
+  {:else}
+    <div class="panel"><p class="muted">No shares imported yet.</p></div>
+  {/each}
 
   <h2>Import Share</h2>
   <div class="panel">
@@ -452,4 +569,5 @@
       <p class="muted">No signatures recorded yet.</p>
     {/each}
   </div>
+  {/if}
 </main>

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -41,7 +41,13 @@ fn recv_startup<T>(rx: Receiver<Result<T, String>>) -> Result<T, String> {
 struct WebCallbacks {
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
-    next_id: AtomicU64,
+}
+
+/// Random, unguessable approval id (defense-in-depth alongside the auth gate).
+/// Masked to 53 bits so the value round-trips losslessly through a JS Number
+/// (IEEE-754 double) in the browser client.
+fn random_approval_id() -> u64 {
+    u64::from_le_bytes(keep_core::crypto::random_bytes()) & ((1u64 << 53) - 1)
 }
 
 impl ServerCallbacks for WebCallbacks {
@@ -55,7 +61,7 @@ impl ServerCallbacks for WebCallbacks {
     }
 
     fn request_approval(&self, request: ApprovalRequest) -> bool {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = random_approval_id();
         let (tx, rx) = channel();
         if let Ok(mut map) = self.approvals.lock() {
             map.insert(id, tx);
@@ -69,13 +75,23 @@ impl ServerCallbacks for WebCallbacks {
             preview: request.event_content,
         });
 
-        let decision =
-            tokio::task::block_in_place(|| rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false));
+        // `block_in_place` requires a multi-thread runtime; both spawners use
+        // `Runtime::new()` (multi-thread), so this is sound. Do not switch them
+        // to a current-thread runtime without changing this to `spawn_blocking`.
+        let decision = tokio::task::block_in_place(|| await_decision(&rx, APPROVAL_TIMEOUT));
         if let Ok(mut map) = self.approvals.lock() {
             map.remove(&id);
         }
         decision
     }
+}
+
+/// Blocks until the browser resolves the request or the timeout fires. Fails
+/// closed: a timeout or a dropped sender (no decision) denies. The timeout also
+/// backstops the approvals map so it cannot grow unbounded if a request is
+/// never resolved via the API.
+fn await_decision(rx: &Receiver<bool>, timeout: Duration) -> bool {
+    rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 fn short_id(id: &[u8; 32]) -> String {
@@ -102,7 +118,7 @@ impl SigningHooks for CoSignerPolicy {
             session.threshold,
             session.participants.len(),
         );
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.enabled.load(Ordering::SeqCst) {
             let _ = self.events.send(Event::Log {
                 app: "frost".into(),
                 action: "co-signing".into(),
@@ -200,11 +216,7 @@ pub fn spawn_network_frost(
             let node_for_state = node.clone();
             let signer = NetworkFrostSigner::with_shared_node(cfg.group_pubkey, node);
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
-                events,
-                approvals,
-                next_id: AtomicU64::new(1),
-            });
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
 
             let mut server = match Server::new_network_frost_with_config(
                 signer,
@@ -212,7 +224,9 @@ pub fn spawn_network_frost(
                 &cfg.bunker_relays,
                 Some(callbacks),
                 ServerConfig {
-                    connect_grant: Permission::ALL,
+                    // Least privilege for the co-signer: connect handshake +
+                    // signing only, not NIP-04/44 encrypt/decrypt.
+                    connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                     ..ServerConfig::default()
                 },
             )
@@ -268,11 +282,7 @@ pub fn spawn_single_key(
             }
         };
         rt.block_on(async move {
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
-                events,
-                approvals,
-                next_id: AtomicU64::new(1),
-            });
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
             let mut server = match Server::new_with_config(
                 keyring,
                 None,
@@ -280,7 +290,9 @@ pub fn spawn_single_key(
                 std::slice::from_ref(&relay),
                 Some(callbacks),
                 ServerConfig {
-                    connect_grant: Permission::ALL,
+                    // Least privilege for the single-key fallback: connect +
+                    // signing only.
+                    connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                     ..ServerConfig::default()
                 },
             )
@@ -310,4 +322,65 @@ pub fn spawn_single_key(
     });
 
     recv_startup(info_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_id_is_js_safe() {
+        const MAX_SAFE: u64 = (1u64 << 53) - 1;
+        for _ in 0..10_000 {
+            assert!(random_approval_id() <= MAX_SAFE);
+        }
+    }
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            session_id: [7u8; 32],
+            message: vec![1, 2, 3],
+            threshold: 2,
+            participants: vec![1, 2, 3],
+            requester: 1,
+        }
+    }
+
+    #[test]
+    fn pre_sign_respects_kill_switch() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let policy = CoSignerPolicy {
+            events: tx,
+            enabled: enabled.clone(),
+        };
+
+        assert!(policy.pre_sign(&session()).is_ok());
+        enabled.store(false, Ordering::SeqCst);
+        assert!(policy.pre_sign(&session()).is_err());
+
+        // Each decision is streamed for observability (co-signing, then refused).
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn await_decision_fails_closed() {
+        // Explicit approval and rejection pass through.
+        let (tx, rx) = channel();
+        tx.send(true).unwrap();
+        assert!(await_decision(&rx, Duration::from_secs(1)));
+        let (tx, rx) = channel();
+        tx.send(false).unwrap();
+        assert!(!await_decision(&rx, Duration::from_secs(1)));
+
+        // Timeout with no decision denies.
+        let (_tx, rx) = channel::<bool>();
+        assert!(!await_decision(&rx, Duration::from_millis(10)));
+
+        // A dropped sender (no decision possible) denies.
+        let (tx, rx) = channel::<bool>();
+        drop(tx);
+        assert!(!await_decision(&rx, Duration::from_secs(1)));
+    }
 }

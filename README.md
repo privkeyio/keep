@@ -25,6 +25,7 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 - **Agent SDK** — Constrained signing sessions for AI agents (Python, TypeScript, MCP)
 - **Hidden volumes** — Plausibly deniable storage, cryptographically undetectable
 - **Desktop app** — Iced GUI with system tray, QR scanning, NIP-49 import/export
+- **Always-on co-signer** — Headless network-FROST co-signer with a web admin UI ([`keep-web`](keep-web)), packaged for StartOS ([keep-startos](https://github.com/privkeyio/keep-startos))
 
 ## Quick Start
 

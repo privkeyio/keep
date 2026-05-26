@@ -1,12 +1,28 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::state::AppState;
 
-pub async fn events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle(socket, state))
+#[derive(Deserialize)]
+pub struct TicketQuery {
+    ticket: Option<String>,
+}
+
+pub async fn events(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(q): Query<TicketQuery>,
+) -> impl IntoResponse {
+    match q.ticket {
+        Some(ticket) if state.ws_tickets.consume(&ticket) => ws
+            .on_upgrade(move |socket| handle(socket, state))
+            .into_response(),
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
 }
 
 async fn handle(mut socket: WebSocket, state: AppState) {
