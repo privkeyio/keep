@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use keep_core::error::KeepError;
 use keep_core::frost::ShareExport;
 
-use crate::state::AppState;
+use crate::state::{AppState, Event};
 
 /// Map a keep-core error to an HTTP status: client errors (bad input, missing
 /// share) vs. server-side failures (storage/IO/crypto).
@@ -173,26 +173,35 @@ pub async fn delete_share(
     State(state): State<AppState>,
     Json(body): Json<ShareRef>,
 ) -> impl IntoResponse {
-    // Refuse to delete the exact share the running co-signer is using: the node
-    // holds it in memory and would keep signing with a share that's gone from
-    // disk, leaving an inconsistent state. The operator must reconfigure/stop
-    // first. Sibling shares in the same group are not blocked.
-    if state.bunker.group.as_deref() == Some(body.group.as_str())
-        && state.active_identifier == Some(body.identifier)
-    {
-        return (
-            StatusCode::CONFLICT,
-            "cannot delete the active co-signer's share; reconfigure or stop the service first",
-        )
-            .into_response();
-    }
+    // Deleting any non-active share is harmless. Deleting the share the live
+    // co-signer loaded is special: the node still holds it in memory and would
+    // otherwise keep signing with a share that's gone from disk. We allow it,
+    // but retire the signer (below) so it can't co-sign with the orphaned
+    // in-memory share until a restart re-resolves from whatever remains.
+    let is_active = state.bunker.group.as_deref() == Some(body.group.as_str())
+        && state.active_identifier == Some(body.identifier);
     let group = match parse_group(&body.group) {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_delete_share(&group, body.identifier) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if is_active {
+                // Force-disable and latch: pre_sign refuses while disabled, and
+                // set_killswitch refuses to re-enable while retired.
+                state.signing_enabled.store(false, Ordering::SeqCst);
+                state.signer_retired.store(true, Ordering::SeqCst);
+                let _ = state.events.send(Event::Log {
+                    app: "frost".into(),
+                    action: "co-signer retired (active share deleted)".into(),
+                    success: true,
+                    detail: Some("restart the service to resume with remaining shares".into()),
+                });
+                tracing::warn!("active share deleted; co-signer retired until restart");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "frost_delete_share failed");
             (err_status(&e), "failed to delete share").into_response()
@@ -244,11 +253,15 @@ pub async fn signing_log(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Serialize)]
 pub struct KillswitchStatus {
     enabled: bool,
+    /// True once the active share was deleted at runtime: signing is locked off
+    /// until the service restarts.
+    retired: bool,
 }
 
 pub async fn killswitch_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(KillswitchStatus {
         enabled: state.signing_enabled.load(Ordering::SeqCst),
+        retired: state.signer_retired.load(Ordering::SeqCst),
     })
 }
 
@@ -263,11 +276,27 @@ pub async fn set_killswitch(
     State(state): State<AppState>,
     Json(body): Json<KillswitchRequest>,
 ) -> impl IntoResponse {
+    // Hold the keep lock for the retired-check + enable so it can't interleave
+    // with delete_share, which sets `signer_retired` while holding the same
+    // lock. Without this, a concurrent delete could land between the check and
+    // the store, re-enabling signing for a share that was just deleted.
+    let _guard = state.keep.lock().await;
+    // The active share was deleted; its in-memory copy must not sign again.
+    if body.enabled && state.signer_retired.load(Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            "the active share was deleted; restart the service to resume co-signing",
+        )
+            .into_response();
+    }
     state.signing_enabled.store(body.enabled, Ordering::SeqCst);
+    crate::state::persist_signing_flag(&state.signing_flag_path, body.enabled);
     tracing::warn!(enabled = body.enabled, "co-signing toggled via kill switch");
     Json(KillswitchStatus {
         enabled: body.enabled,
+        retired: state.signer_retired.load(Ordering::SeqCst),
     })
+    .into_response()
 }
 
 #[derive(Deserialize)]

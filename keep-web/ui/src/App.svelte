@@ -26,6 +26,8 @@
   let shares = $state<Share[]>([])
   let error = $state<string | null>(null)
 
+  let openRelays = $state<Record<string, boolean>>({})
+
   let authed = $state(hasAuthToken())
   let tokenInput = $state('')
   let stopStream: (() => void) | undefined
@@ -52,6 +54,8 @@
 
   // undefined = status not yet loaded (interaction disabled until known).
   let signingEnabled = $state<boolean | undefined>(undefined)
+  // Set once the active share is deleted: signing is locked off until a restart.
+  let signerRetired = $state(false)
   let signingLoadError = $state<string | null>(null)
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
@@ -116,10 +120,21 @@
     }
   }
 
+  // A network-level fetch failure (server briefly down, e.g. during a restart)
+  // surfaces as "TypeError: Failed to fetch"; show something reassuring rather
+  // than a raw error, since the WebSocket auto-reconnect will recover it.
+  function friendlyError(e: unknown): string {
+    return String(e).includes('Failed to fetch')
+      ? 'Cannot reach the service. It may be restarting; reconnecting…'
+      : String(e)
+  }
+
   function refreshShares() {
     getShares()
       .then((s) => (shares = s))
-      .catch((e) => (error = String(e)))
+      .catch((e) => {
+        if (!handleUnauthorized(e)) error = friendlyError(e)
+      })
   }
 
   function refreshSigningLog() {
@@ -147,7 +162,9 @@
 
   async function toggleKillswitch() {
     try {
-      signingEnabled = await setKillswitch(!signingEnabled)
+      const status = await setKillswitch(!signingEnabled)
+      signingEnabled = status.enabled
+      signerRetired = status.retired
     } catch (e) {
       error = String(e)
     }
@@ -158,7 +175,12 @@
       return
     try {
       await deleteShare(s.group, s.identifier)
-      refreshShares()
+      // Clear the post-import "restart to come online" notice: it's stale once
+      // the share is gone.
+      importOk = false
+      // Deleting the active share retires the signer; refresh the full state
+      // (not just the share list) so the killswitch/retired status updates too.
+      refreshState()
     } catch (e) {
       error = String(e)
     }
@@ -211,22 +233,29 @@
       authed = false
       stopStream?.()
       stopStream = undefined
-      error = 'Authentication required. Enter the auth token.'
+      error = 'Authentication required. Enter your Web Admin password.'
       return true
     }
     return false
   }
 
-  function load() {
+  // Re-fetch all the snapshot state. Safe to call repeatedly; used on first
+  // load and again whenever the connection is re-established (e.g. after the
+  // service restarts), so the page recovers without a manual reload.
+  function refreshState() {
     getBunker()
-      .then((b) => (bunker = b))
+      .then((b) => {
+        bunker = b
+        error = null
+      })
       .catch((e) => {
-        if (!handleUnauthorized(e)) error = String(e)
+        if (!handleUnauthorized(e)) error = friendlyError(e)
       })
     refreshShares()
     getKillswitch()
-      .then((e) => {
-        signingEnabled = e
+      .then((s) => {
+        signingEnabled = s.enabled
+        signerRetired = s.retired
         signingLoadError = null
       })
       .catch((err) => {
@@ -235,6 +264,10 @@
         signingLoadError = String(err)
       })
     refreshSigningLog()
+  }
+
+  function load() {
+    refreshState()
 
     const stream = connectEvents(
       (e) => {
@@ -252,7 +285,12 @@
           if (e.app === 'frost') refreshSigningLog()
         }
       },
-      (connected) => (wsConnected = connected),
+      (connected) => {
+        // Connection just came back (e.g. after a restart): refresh the
+        // snapshot state so the page reflects the new mode/shares.
+        if (connected && !wsConnected) refreshState()
+        wsConnected = connected
+      },
     )
     stopStream = () => stream.close()
   }
@@ -276,7 +314,7 @@
 </script>
 
 {#snippet tip(text: string)}
-  <span class="tip" data-tip={text}>
+  <span class="tip" data-tip={text} role="img" aria-label={text}>
     <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
       <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.3" />
       <circle cx="8" cy="4.7" r="0.95" fill="currentColor" />
@@ -300,6 +338,38 @@
         {copied === 'f' + value ? '✓ copied' : 'copy'}
       </span>
     </button>
+  </div>
+{/snippet}
+
+{#snippet relayGroup(label: string, hint: string, relays: string[], key: string)}
+  {@const open = openRelays[key] ?? relays.length === 1}
+  <div class="field relay-field">
+    <button
+      class="relay-head"
+      aria-expanded={open}
+      onclick={() => (openRelays[key] = !open)}
+    >
+      <span class="field-label">
+        {label} · {relays.length}{@render tip(hint)}
+      </span>
+      <span class="chev" class:open>▸</span>
+    </button>
+    {#if open}
+      <div class="relay-list">
+        {#each relays as r (r)}
+          <button
+            class="field-value copyable relay-item"
+            title="Click to copy"
+            onclick={() => copy(r, 'r' + r)}
+          >
+            <span class="cv-text">{r}</span>
+            <span class="cv-icon" class:done={copied === 'r' + r}>
+              {copied === 'r' + r ? '✓ copied' : 'copy'}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 {/snippet}
 
@@ -327,43 +397,70 @@
 
   {#if !authed}
     <div class="panel setup">
-      <strong>🔒 Authentication required.</strong>
+      <strong>🔒 Sign in</strong>
       <p>
-        Enter the auth token. It is set via <span class="token">KEEP_WEB_AUTH_TOKEN</span>, or, if
-        unset, generated once at startup and printed to the service logs.
+        Enter your Web Admin password. Find your username and password under the <span
+          class="token">Show Login Credentials</span
+        > action.
       </p>
       <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
+        <input type="text" value="admin" readonly autocomplete="username" aria-label="Username" />
         <input
           type="password"
-          placeholder="auth token"
+          placeholder="password"
           bind:value={tokenInput}
-          autocomplete="off"
+          autocomplete="current-password"
+          aria-label="Password"
         />
-        <button type="submit" disabled={!tokenInput.trim()}>Unlock</button>
+        <button type="submit" disabled={!tokenInput.trim()}>Sign in</button>
       </form>
     </div>
   {:else}
   {#if bunker && bunker.mode === 'setup'}
     <div class="panel setup">
-      <strong>⚙ Setup required.</strong> No FROST share is loaded yet; this node
-      isn't signing.
-      <h3>Tasks to finish setup</h3>
-      <ol class="tasks">
-        <li>Import your FROST share below (export it from the device that holds it).</li>
-        <li>
-          Open the <strong>Configure</strong> action and set <strong>FROST Relays</strong>
-          to match the relays your other share-holders use.
-        </li>
-        <li><strong>Restart the service</strong> to start the co-signer.</li>
-        <li>
-          Copy the bunker connection string (shown here after restart) into your
-          Nostr client.
-        </li>
-      </ol>
+      {#if shares.length > 0}
+        <strong>⚙ Almost done — restart to finish.</strong>
+        <p>
+          Your share is imported, but the co-signer hasn't started yet.
+          <strong>Restart the service</strong> to bring it online (on StartOS, use the
+          <strong>Restart</strong> button on this service's page). The connection details
+          appear here once it's up.
+        </p>
+      {:else}
+        <strong>⚙ Setup required.</strong> No FROST share is loaded yet; this node
+        isn't signing.
+        <h3>Tasks to finish setup</h3>
+        <ol class="tasks">
+          <li>Import your FROST share below (export it from the device that holds it).</li>
+          <li>
+            Open the <strong>Configure</strong> action and set <strong>FROST Relays</strong>
+            to match the relays your other share-holders use.
+          </li>
+          <li>
+            <strong>Restart the service</strong> to start the co-signer. On StartOS, use the
+            <strong>Restart</strong> button on this service's page; this page then shows the
+            connection details.
+          </li>
+          <li>
+            Copy the bunker connection string (shown here after restart) into your
+            Nostr client.
+          </li>
+        </ol>
+      {/if}
     </div>
   {/if}
 
-  {#if bunker && bunker.mode !== 'setup' && signingEnabled === false}
+  {#if bunker && bunker.mode !== 'setup' && signerRetired}
+    <div class="panel disabled-banner">
+      <div>
+        <strong>⚠ Co-signer retired.</strong>
+        The active share was deleted, so this node will <strong>not sign</strong>.
+        <strong>Restart the service</strong> to finalize (on StartOS, use the
+        <strong>Restart</strong> button on this service's page). It then comes back using
+        any remaining shares, or in setup mode if none are left.
+      </div>
+    </div>
+  {:else if bunker && bunker.mode !== 'setup' && signingEnabled === false}
     <div class="panel disabled-banner">
       <div>
         <strong>⏸ Co-signing is disabled.</strong>
@@ -379,7 +476,14 @@
       <div class="conn-status">
         {#if bunker.mode === 'setup'}
           <span class="dot warn"></span>
-          <span>Not signing yet. Import a share and restart to begin.</span>
+          {#if shares.length > 0}
+            <span>Share imported. Restart the service to bring the co-signer online.</span>
+          {:else}
+            <span>Not signing yet. Import a share, then restart to begin.</span>
+          {/if}
+        {:else if signerRetired}
+          <span class="dot warn"></span>
+          <span>Active share deleted. <strong>Restart the service</strong> to finalize.</span>
         {:else if signingEnabled === false}
           <span class="dot warn"></span>
           <span>Online, but <strong>co-signing is off</strong>. It won't sign until you enable it.</span>
@@ -425,20 +529,22 @@
           'NIP-46 connection string. Paste this into a Nostr client to sign through this node.',
         )}
       {/if}
-      {#if bunker.relay}
-        {@render copyField(
-          'bunker relay',
-          bunker.relay,
-          'Relay where Nostr clients reach the bunker.',
+      {#if bunker.bunker_relays.length}
+        {@render relayGroup(
+          'Bunker relays',
+          'Relays where Nostr clients reach the bunker.',
+          bunker.bunker_relays,
+          'bunker',
         )}
       {/if}
-      {#each bunker.frost_relays as r (r)}
-        {@render copyField(
-          'frost relay',
-          r,
-          'Relay used to coordinate signing rounds with your other devices. Must match the relay they use.',
+      {#if bunker.frost_relays.length}
+        {@render relayGroup(
+          'FROST relays',
+          'Relays used to coordinate signing rounds with your other devices. Must match the relays they use.',
+          bunker.frost_relays,
+          'frost',
         )}
-      {/each}
+      {/if}
       {#if bunker.mode !== 'setup'}
         <div class="kv killswitch">
           <span>
@@ -448,6 +554,9 @@
           </span>
           {#if signingEnabled === undefined}
             <span class="status-pill warn">unknown</span>
+          {:else if signerRetired}
+            <span class="status-pill off">Retired</span>
+            <span class="muted">restart to finalize</span>
           {:else}
             <span class="status-pill {signingEnabled ? 'on' : 'off'}">
               {signingEnabled ? 'Enabled' : 'Disabled'}
@@ -584,7 +693,15 @@
       {#if importOk}
         <div class="import-ok">
           <strong>✓ Share imported.</strong>
-          <span>Now <strong>restart the service</strong> to start the co-signer.</span>
+          {#if bunker?.mode === 'setup'}
+            <span>
+              The co-signer isn't running yet. <strong>Restart the service</strong> to bring
+              it online (on StartOS, use the <strong>Restart</strong> button on this service's
+              page). The connection details appear here once it's up.
+            </span>
+          {:else}
+            <span>It's saved to the vault. The running co-signer is unaffected.</span>
+          {/if}
         </div>
       {:else if importMsg}
         <p class="fail">{importMsg}</p>

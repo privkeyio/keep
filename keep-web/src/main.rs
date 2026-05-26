@@ -142,8 +142,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (events, _) = broadcast::channel(256);
     let approvals = Arc::new(StdMutex::new(HashMap::new()));
-    // Kill switch shared with the co-signer policy; starts from the env default.
-    let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(auto_approve));
+    // Kill switch shared with the co-signer policy. A persisted toggle (set via
+    // the live kill switch) wins; otherwise fall back to the boot default so a
+    // restart doesn't silently re-enable signing.
+    let signing_flag_path = state::signing_flag_path(&vault_path);
+    let initial_enabled = state::read_signing_flag(&signing_flag_path).unwrap_or(auto_approve);
+    let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
+    // Set if the active share is deleted at runtime; bars re-enabling signing.
+    let signer_retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Resolve which FROST group this node co-signs for: an explicit
     // KEEP_FROST_GROUP, otherwise the single group present in the vault.
@@ -204,8 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // keyring is intentionally left empty afterwards (the bunker is the
         // only thing that signs in this mode — don't read keep.keyring() below).
         let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
-        let relay = bunker_relays.first().cloned().unwrap_or_default();
-        bunker::spawn_single_key(keyring, relay, events.clone(), approvals.clone())
+        bunker::spawn_single_key(keyring, bunker_relays, events.clone(), approvals.clone())
             .map_err(|e| format!("failed to start bunker: {e}"))?
     } else {
         // Nothing to sign with yet: serve the admin UI so the operator can
@@ -224,6 +229,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         approvals,
         ws_tickets: state::TicketStore::default(),
         signing_enabled,
+        signer_retired,
+        signing_flag_path,
         node,
     };
 

@@ -239,6 +239,58 @@ code {
   color: var(--ok);
 }
 
+/* ---- Collapsible relay groups ---- */
+.relay-field {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.relay-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+}
+
+.relay-head:hover {
+  background: none;
+}
+
+.relay-head:hover .field-label {
+  color: var(--text);
+}
+
+.relay-head .field-label {
+  width: auto;
+  cursor: pointer;
+}
+
+.chev {
+  flex: none;
+  color: var(--faint);
+  font-size: 0.7rem;
+  transition: transform 0.12s ease;
+}
+
+.chev.open {
+  transform: rotate(90deg);
+}
+
+.relay-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.relay-item {
+  width: 100%;
+}
+
 /* ---- Buttons ---- */
 button {
   border: 1px solid transparent;

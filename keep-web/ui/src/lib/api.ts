@@ -2,7 +2,7 @@ export interface BunkerInfo {
   mode: string
   url: string
   npub: string
-  relay: string
+  bunker_relays: string[]
   frost_relays: string[]
   group: string | null
   threshold: string | null
@@ -144,20 +144,25 @@ export async function getSigningLog(): Promise<{
   return r.json()
 }
 
-export async function getKillswitch(): Promise<boolean> {
-  const r = await api('/api/killswitch')
-  if (!r.ok) throw new Error(`killswitch: ${r.status}`)
-  return (await r.json()).enabled
+export interface KillswitchStatus {
+  enabled: boolean
+  retired: boolean
 }
 
-export async function setKillswitch(enabled: boolean): Promise<boolean> {
+export async function getKillswitch(): Promise<KillswitchStatus> {
+  const r = await api('/api/killswitch')
+  if (!r.ok) throw new Error(`killswitch: ${r.status}`)
+  return r.json()
+}
+
+export async function setKillswitch(enabled: boolean): Promise<KillswitchStatus> {
   const r = await api('/api/killswitch', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ enabled }),
   })
   if (!r.ok) throw new Error(`killswitch: ${r.status}`)
-  return (await r.json()).enabled
+  return r.json()
 }
 
 /** Mints a single-use ticket authorizing one WebSocket upgrade. */
