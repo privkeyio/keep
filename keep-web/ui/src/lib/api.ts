@@ -160,6 +160,13 @@ export async function setKillswitch(enabled: boolean): Promise<boolean> {
   return (await r.json()).enabled
 }
 
+/** Mints a single-use ticket authorizing one WebSocket upgrade. */
+export async function getWsTicket(): Promise<string> {
+  const r = await api('/api/ws-ticket', { method: 'POST' })
+  if (!r.ok) throw new Error(`ws-ticket: ${r.status}`)
+  return (await r.json()).ticket
+}
+
 export async function resolveApproval(id: number, approve: boolean): Promise<void> {
   const r = await api(`/api/approvals/${id}`, {
     method: 'POST',
@@ -183,17 +190,32 @@ export function connectEvents(
   onStatus?: (connected: boolean) => void,
 ): EventStream {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  // Browsers cannot set headers on WebSocket; pass the bearer token as a query
-  // param, which the server's auth middleware also accepts.
-  const qs = authToken ? `?access_token=${encodeURIComponent(authToken)}` : ''
-  const url = `${proto}://${location.host}/api/events${qs}`
   let ws: WebSocket | null = null
   let stopped = false
   let backoff = 1000
   let timer: ReturnType<typeof setTimeout> | undefined
 
-  const connect = () => {
+  const retry = () => {
     if (stopped) return
+    timer = setTimeout(connect, backoff)
+    backoff = Math.min(backoff * 2, 30000)
+  }
+
+  // Browsers cannot set headers on a WebSocket, so each connection first mints
+  // a single-use ticket over the authed API and passes that in the URL instead
+  // of the durable token.
+  const connect = async () => {
+    if (stopped) return
+    let ticket: string
+    try {
+      ticket = await getWsTicket()
+    } catch {
+      onStatus?.(false)
+      retry()
+      return
+    }
+    if (stopped) return
+    const url = `${proto}://${location.host}/api/events?ticket=${encodeURIComponent(ticket)}`
     ws = new WebSocket(url)
     ws.onopen = () => {
       backoff = 1000
@@ -209,9 +231,7 @@ export function connectEvents(
     // onclose fires after onerror too, so schedule the reconnect there only.
     ws.onclose = () => {
       onStatus?.(false)
-      if (stopped) return
-      timer = setTimeout(connect, backoff)
-      backoff = Math.min(backoff * 2, 30000)
+      retry()
     }
   }
   connect()
