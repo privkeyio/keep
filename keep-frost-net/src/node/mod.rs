@@ -1130,7 +1130,11 @@ impl KfpNode {
 
         self.announce().await?;
 
-        let mut announce_interval = tokio::time::interval(Duration::from_secs(60));
+        // Re-announce often enough that an initiator with a short discovery
+        // window reliably catches a periodic announce even if the immediate
+        // reciprocal announce (see handle_announce) is missed. Must stay well
+        // under PEER_OFFLINE_THRESHOLD so peers don't flap offline.
+        let mut announce_interval = tokio::time::interval(Duration::from_secs(20));
         announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(120));
@@ -1458,12 +1462,25 @@ impl KfpNode {
             name: name_clone,
         });
 
-        // A newly discovered peer may have come online after we last replenished
-        // (whose broadcast only carries freshly generated commitments). Send it
-        // our currently available pool so it can instant-sign with us right away.
-        if is_new_peer && self.can_send_to(&pubkey) {
-            if let Err(e) = self.send_nonce_pool_to(&pubkey).await {
-                warn!(peer = %pubkey, error = %e, "Failed to send nonce pool to new peer");
+        if is_new_peer {
+            // Reciprocate our own announcement so the new peer discovers us
+            // right away, instead of waiting for our next periodic re-announce.
+            // Without this, an initiator's short discovery window can miss an
+            // already-online co-signer. Gated on `is_new_peer` so the exchange
+            // terminates: once a peer knows us, our announce no longer looks
+            // new to it and it won't reciprocate again.
+            if let Err(e) = self.announce().await {
+                warn!(peer = %pubkey, error = %e, "Failed to reciprocate announce to new peer");
+            }
+
+            // A newly discovered peer may have come online after we last
+            // replenished (whose broadcast only carries freshly generated
+            // commitments). Send it our current pool so it can instant-sign
+            // with us right away.
+            if self.can_send_to(&pubkey) {
+                if let Err(e) = self.send_nonce_pool_to(&pubkey).await {
+                    warn!(peer = %pubkey, error = %e, "Failed to send nonce pool to new peer");
+                }
             }
         }
 
