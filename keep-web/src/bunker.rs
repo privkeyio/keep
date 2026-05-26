@@ -44,8 +44,10 @@ struct WebCallbacks {
 }
 
 /// Random, unguessable approval id (defense-in-depth alongside the auth gate).
+/// Masked to 53 bits so the value round-trips losslessly through a JS Number
+/// (IEEE-754 double) in the browser client.
 fn random_approval_id() -> u64 {
-    u64::from_le_bytes(keep_core::crypto::random_bytes())
+    u64::from_le_bytes(keep_core::crypto::random_bytes()) & ((1u64 << 53) - 1)
 }
 
 impl ServerCallbacks for WebCallbacks {
@@ -322,4 +324,17 @@ pub fn spawn_single_key(
     });
 
     recv_startup(info_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::random_approval_id;
+
+    #[test]
+    fn approval_id_is_js_safe() {
+        const MAX_SAFE: u64 = (1u64 << 53) - 1;
+        for _ in 0..10_000 {
+            assert!(random_approval_id() <= MAX_SAFE);
+        }
+    }
 }
