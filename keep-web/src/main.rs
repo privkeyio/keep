@@ -144,6 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let approvals = Arc::new(StdMutex::new(HashMap::new()));
     // Kill switch shared with the co-signer policy; starts from the env default.
     let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(auto_approve));
+    // Set if the active share is deleted at runtime; bars re-enabling signing.
+    let signer_retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Resolve which FROST group this node co-signs for: an explicit
     // KEEP_FROST_GROUP, otherwise the single group present in the vault.
@@ -224,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         approvals,
         ws_tickets: state::TicketStore::default(),
         signing_enabled,
+        signer_retired,
         node,
     };
 

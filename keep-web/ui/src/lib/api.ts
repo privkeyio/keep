@@ -2,7 +2,7 @@ export interface BunkerInfo {
   mode: string
   url: string
   npub: string
-  relay: string
+  bunker_relays: string[]
   frost_relays: string[]
   group: string | null
   threshold: string | null

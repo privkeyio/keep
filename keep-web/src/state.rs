@@ -60,6 +60,10 @@ pub struct AppState {
     /// Kill switch: when false, the co-signer refuses to participate. Toggled
     /// live (no restart); the policy hook reads it on every round.
     pub signing_enabled: Arc<AtomicBool>,
+    /// Latched once the operator deletes the share the live node loaded. The
+    /// node still holds that share in memory, so co-signing is force-disabled
+    /// and cannot be re-enabled until a restart re-resolves shares from disk.
+    pub signer_retired: Arc<AtomicBool>,
     /// The running FROST node (network mode only), for reading the signing
     /// audit log and peer state.
     pub node: Option<Arc<KfpNode>>,
@@ -71,8 +75,8 @@ pub struct BunkerInfo {
     pub mode: String,
     pub url: String,
     pub npub: String,
-    /// NIP-46 bunker transport relay.
-    pub relay: String,
+    /// NIP-46 bunker transport relays.
+    pub bunker_relays: Vec<String>,
     /// FROST peer-coordination relays (network mode only).
     pub frost_relays: Vec<String>,
     /// Group npub this node co-signs for (network mode only).
@@ -111,7 +115,7 @@ impl BunkerInfo {
             mode: "setup".into(),
             url: String::new(),
             npub: String::new(),
-            relay: String::new(),
+            bunker_relays: Vec::new(),
             frost_relays: Vec::new(),
             group: None,
             threshold: None,

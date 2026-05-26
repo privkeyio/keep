@@ -26,6 +26,8 @@
   let shares = $state<Share[]>([])
   let error = $state<string | null>(null)
 
+  let openRelays = $state<Record<string, boolean>>({})
+
   let authed = $state(hasAuthToken())
   let tokenInput = $state('')
   let stopStream: (() => void) | undefined
@@ -303,6 +305,38 @@
   </div>
 {/snippet}
 
+{#snippet relayGroup(label: string, hint: string, relays: string[], key: string)}
+  {@const open = openRelays[key] ?? relays.length === 1}
+  <div class="field relay-field">
+    <button
+      class="relay-head"
+      aria-expanded={open}
+      onclick={() => (openRelays[key] = !open)}
+    >
+      <span class="field-label">
+        {label} · {relays.length}{@render tip(hint)}
+      </span>
+      <span class="chev" class:open>▸</span>
+    </button>
+    {#if open}
+      <div class="relay-list">
+        {#each relays as r (r)}
+          <button
+            class="field-value copyable relay-item"
+            title="Click to copy"
+            onclick={() => copy(r, 'r' + r)}
+          >
+            <span class="cv-text">{r}</span>
+            <span class="cv-icon" class:done={copied === 'r' + r}>
+              {copied === 'r' + r ? '✓ copied' : 'copy'}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <header class="topbar">
   <img class="logo" src={crest} alt="Keep" />
   <div class="brand">
@@ -425,20 +459,22 @@
           'NIP-46 connection string. Paste this into a Nostr client to sign through this node.',
         )}
       {/if}
-      {#if bunker.relay}
-        {@render copyField(
-          'bunker relay',
-          bunker.relay,
-          'Relay where Nostr clients reach the bunker.',
+      {#if bunker.bunker_relays.length}
+        {@render relayGroup(
+          'Bunker relays',
+          'Relays where Nostr clients reach the bunker.',
+          bunker.bunker_relays,
+          'bunker',
         )}
       {/if}
-      {#each bunker.frost_relays as r (r)}
-        {@render copyField(
-          'frost relay',
-          r,
-          'Relay used to coordinate signing rounds with your other devices. Must match the relay they use.',
+      {#if bunker.frost_relays.length}
+        {@render relayGroup(
+          'FROST relays',
+          'Relays used to coordinate signing rounds with your other devices. Must match the relays they use.',
+          bunker.frost_relays,
+          'frost',
         )}
-      {/each}
+      {/if}
       {#if bunker.mode !== 'setup'}
         <div class="kv killswitch">
           <span>
