@@ -32,6 +32,8 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
+/// Returns the bunker connection details. The `url` carries the connection
+/// `?secret=`, which is sensitive — this endpoint is gated behind bearer auth.
 pub async fn bunker(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.bunker.clone())
 }
@@ -69,7 +71,10 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
                 .collect();
             Json(dto).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "frost_list_shares failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to list shares").into_response()
+        }
     }
 }
 
@@ -93,12 +98,15 @@ pub async fn rename_share(
 ) -> impl IntoResponse {
     let group = match keep_core::keys::npub_to_bytes(&body.group) {
         Ok(g) => g,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_rename_share(&group, body.identifier, &body.name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (err_status(&e), e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "frost_rename_share failed");
+            (err_status(&e), "failed to rename share").into_response()
+        }
     }
 }
 
@@ -110,15 +118,21 @@ pub async fn export_share(
 ) -> impl IntoResponse {
     let group = match keep_core::keys::npub_to_bytes(&body.group) {
         Ok(g) => g,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_export_share(&group, body.identifier, &body.passphrase) {
         Ok(export) => match export.to_bech32() {
             Ok(s) => Json(ExportResponse { export: s }).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "share export to_bech32 failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode export").into_response()
+            }
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "frost_export_share failed");
+            (err_status(&e), "failed to export share").into_response()
+        }
     }
 }
 
@@ -142,6 +156,13 @@ pub async fn delete_share(
     // Refuse to delete the share the running co-signer is using: the node holds
     // it in memory and would keep signing with a share that's gone from disk,
     // leaving an inconsistent state. The operator must reconfigure/stop first.
+    //
+    // We match on the group npub only. The node loads its share via
+    // frost_get_share(group) which returns the first share for that group, so
+    // the exact active identifier is not reliably knowable here. This
+    // over-approximates: deleting any share in the active group is blocked,
+    // even a non-loaded sibling. Acceptable; the operator stops the service to
+    // delete such a share.
     if state.bunker.group.as_deref() == Some(body.group.as_str()) {
         return (
             StatusCode::CONFLICT,
@@ -151,12 +172,15 @@ pub async fn delete_share(
     }
     let group = match keep_core::keys::npub_to_bytes(&body.group) {
         Ok(g) => g,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid group npub").into_response(),
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_delete_share(&group, body.identifier) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (err_status(&e), e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "frost_delete_share failed");
+            (err_status(&e), "failed to delete share").into_response()
+        }
     }
 }
 
@@ -208,7 +232,7 @@ pub struct KillswitchStatus {
 
 pub async fn killswitch_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(KillswitchStatus {
-        enabled: state.signing_enabled.load(Ordering::Relaxed),
+        enabled: state.signing_enabled.load(Ordering::SeqCst),
     })
 }
 
@@ -223,7 +247,7 @@ pub async fn set_killswitch(
     State(state): State<AppState>,
     Json(body): Json<KillswitchRequest>,
 ) -> impl IntoResponse {
-    state.signing_enabled.store(body.enabled, Ordering::Relaxed);
+    state.signing_enabled.store(body.enabled, Ordering::SeqCst);
     tracing::warn!(enabled = body.enabled, "co-signing toggled via kill switch");
     Json(KillswitchStatus {
         enabled: body.enabled,
@@ -248,13 +272,19 @@ pub async fn import_share(
 ) -> impl IntoResponse {
     let export = match ShareExport::parse(body.data.trim()) {
         Ok(e) => e,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::debug!(error = %e, "share import parse failed");
+            return (StatusCode::BAD_REQUEST, "malformed share data").into_response();
+        }
     };
     let name = body.name.unwrap_or_else(|| "imported".to_string());
     let mut keep = state.keep.lock().await;
     match keep.frost_import_share(&export, &body.passphrase, &name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "frost_import_share failed");
+            (err_status(&e), "failed to import share").into_response()
+        }
     }
 }
 

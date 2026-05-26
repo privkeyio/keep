@@ -47,14 +47,35 @@ export interface ApprovalEvent {
 
 export type ServerEvent = LogEvent | ApprovalEvent
 
+const TOKEN_KEY = 'keep_web_auth_token'
+
+let authToken: string =
+  (typeof localStorage !== 'undefined' && localStorage.getItem(TOKEN_KEY)) || ''
+
+export function setAuthToken(token: string): void {
+  authToken = token.trim()
+  if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, authToken)
+}
+
+export function hasAuthToken(): boolean {
+  return authToken.length > 0
+}
+
+/** `fetch` wrapper that attaches the bearer token to every API call. */
+async function api(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
+  if (authToken) headers.set('authorization', `Bearer ${authToken}`)
+  return fetch(input, { ...init, headers })
+}
+
 export async function getBunker(): Promise<BunkerInfo> {
-  const r = await fetch('/api/bunker')
+  const r = await api('/api/bunker')
   if (!r.ok) throw new Error(`bunker: ${r.status}`)
   return r.json()
 }
 
 export async function getShares(): Promise<Share[]> {
-  const r = await fetch('/api/shares')
+  const r = await api('/api/shares')
   if (!r.ok) throw new Error(`shares: ${r.status}`)
   return r.json()
 }
@@ -64,7 +85,7 @@ export async function importShare(
   passphrase: string,
   name: string,
 ): Promise<void> {
-  const r = await fetch('/api/shares/import', {
+  const r = await api('/api/shares/import', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ data, passphrase, name: name || null }),
@@ -79,7 +100,7 @@ export async function exportShare(
   identifier: number,
   passphrase: string,
 ): Promise<string> {
-  const r = await fetch('/api/shares/export', {
+  const r = await api('/api/shares/export', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ group, identifier, passphrase }),
@@ -93,7 +114,7 @@ export async function renameShare(
   identifier: number,
   name: string,
 ): Promise<void> {
-  const r = await fetch('/api/shares/rename', {
+  const r = await api('/api/shares/rename', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ group, identifier, name }),
@@ -104,7 +125,7 @@ export async function renameShare(
 }
 
 export async function deleteShare(group: string, identifier: number): Promise<void> {
-  const r = await fetch('/api/shares/delete', {
+  const r = await api('/api/shares/delete', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ group, identifier }),
@@ -118,19 +139,19 @@ export async function getSigningLog(): Promise<{
   verified: boolean
   entries: SigningEntry[]
 }> {
-  const r = await fetch('/api/signing-log')
+  const r = await api('/api/signing-log')
   if (!r.ok) throw new Error(`signing log: ${r.status}`)
   return r.json()
 }
 
 export async function getKillswitch(): Promise<boolean> {
-  const r = await fetch('/api/killswitch')
+  const r = await api('/api/killswitch')
   if (!r.ok) throw new Error(`killswitch: ${r.status}`)
   return (await r.json()).enabled
 }
 
 export async function setKillswitch(enabled: boolean): Promise<boolean> {
-  const r = await fetch('/api/killswitch', {
+  const r = await api('/api/killswitch', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ enabled }),
@@ -140,7 +161,7 @@ export async function setKillswitch(enabled: boolean): Promise<boolean> {
 }
 
 export async function resolveApproval(id: number, approve: boolean): Promise<void> {
-  const r = await fetch(`/api/approvals/${id}`, {
+  const r = await api(`/api/approvals/${id}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ approve }),
@@ -162,7 +183,10 @@ export function connectEvents(
   onStatus?: (connected: boolean) => void,
 ): EventStream {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  const url = `${proto}://${location.host}/api/events`
+  // Browsers cannot set headers on WebSocket; pass the bearer token as a query
+  // param, which the server's auth middleware also accepts.
+  const qs = authToken ? `?access_token=${encodeURIComponent(authToken)}` : ''
+  const url = `${proto}://${location.host}/api/events${qs}`
   let ws: WebSocket | null = null
   let stopped = false
   let backoff = 1000

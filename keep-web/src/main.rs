@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod bunker;
 mod state;
 mod ws;
@@ -81,7 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env_or("KEEP_RELAY", "wss://relay.damus.io"),
     ));
     let frost_group = std::env::var("KEEP_FROST_GROUP").ok();
-    let auto_approve = env_or("KEEP_FROST_AUTO_APPROVE", "true") != "false";
+    // Fail-closed: signing is off until the operator explicitly enables it
+    // (env at boot or the live kill switch).
+    let auto_approve = env_or("KEEP_FROST_AUTO_APPROVE", "false") == "true";
     let ui_dir = PathBuf::from(env_or("KEEP_WEB_UI_DIR", "ui/dist"));
     let listen: SocketAddr = env_or("KEEP_WEB_LISTEN", "0.0.0.0:8080").parse()?;
     let password = std::env::var("KEEP_PASSWORD")
@@ -176,7 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serve_index = ServeFile::new(ui_dir.join("index.html"));
     let static_files = ServeDir::new(&ui_dir).fallback(serve_index);
 
-    let app = Router::new()
+    // Fail-closed bearer-token gate on every /api/* route and the WS upgrade.
+    let auth_token = auth::AuthToken::from_env();
+
+    let api = Router::new()
         .route("/api/health", get(api::health))
         .route("/api/bunker", get(api::bunker))
         .route("/api/shares", get(api::shares))
@@ -191,8 +197,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/approvals/{id}", post(api::resolve_approval))
         .route("/api/events", get(ws::events))
-        .fallback_service(static_files)
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            auth_token,
+            auth::require_auth,
+        ));
+
+    let app = api.fallback_service(static_files);
 
     tracing::info!(%listen, "serving web admin");
     let listener = tokio::net::TcpListener::bind(listen).await?;

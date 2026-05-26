@@ -12,6 +12,8 @@
     setKillswitch,
     resolveApproval,
     connectEvents,
+    hasAuthToken,
+    setAuthToken,
     type BunkerInfo,
     type Share,
     type SigningEntry,
@@ -22,6 +24,19 @@
   let bunker = $state<BunkerInfo | null>(null)
   let shares = $state<Share[]>([])
   let error = $state<string | null>(null)
+
+  let authed = $state(hasAuthToken())
+  let tokenInput = $state('')
+  let stopStream: (() => void) | undefined
+
+  function submitToken() {
+    if (!tokenInput.trim()) return
+    setAuthToken(tokenInput)
+    tokenInput = ''
+    error = null
+    authed = true
+    load()
+  }
 
   type PendingApproval = ApprovalEvent & { resolved?: 'approved' | 'denied' }
   let approvals = $state<PendingApproval[]>([])
@@ -170,10 +185,23 @@
     }
   }
 
-  onMount(() => {
+  function handleUnauthorized(e: unknown): boolean {
+    if (String(e).includes('401')) {
+      authed = false
+      stopStream?.()
+      stopStream = undefined
+      error = 'Authentication required. Enter the auth token.'
+      return true
+    }
+    return false
+  }
+
+  function load() {
     getBunker()
       .then((b) => (bunker = b))
-      .catch((e) => (error = String(e)))
+      .catch((e) => {
+        if (!handleUnauthorized(e)) error = String(e)
+      })
     refreshShares()
     getKillswitch()
       .then((e) => {
@@ -181,6 +209,7 @@
         signingLoadError = null
       })
       .catch((err) => {
+        if (handleUnauthorized(err)) return
         signingEnabled = undefined
         signingLoadError = String(err)
       })
@@ -189,7 +218,13 @@
     const stream = connectEvents(
       (e) => {
         if (e.type === 'approval') {
-          approvals = [{ ...e }, ...approvals]
+          // Cap the list so a long-running session can't grow it unbounded:
+          // keep all still-pending requests, then fill up to 100 with the most
+          // recent resolved ones.
+          const next = [{ ...e }, ...approvals]
+          const pending = next.filter((x) => !x.resolved)
+          const resolved = next.filter((x) => x.resolved)
+          approvals = [...pending, ...resolved].slice(0, 100)
         } else {
           logs = [e, ...logs].slice(0, 100)
           // A co-sign just happened — refresh the persistent audit log.
@@ -198,7 +233,12 @@
       },
       (connected) => (wsConnected = connected),
     )
-    return () => stream.close()
+    stopStream = () => stream.close()
+  }
+
+  onMount(() => {
+    if (authed) load()
+    return () => stopStream?.()
   })
 
   async function decide(a: PendingApproval, approve: boolean) {
@@ -231,6 +271,24 @@
     <p class="fail">{error}</p>
   {/if}
 
+  {#if !authed}
+    <div class="panel setup">
+      <strong>🔒 Authentication required.</strong>
+      <p>
+        Enter the auth token. It is set via <code>KEEP_WEB_AUTH_TOKEN</code>, or, if
+        unset, generated once at startup and printed to the service logs.
+      </p>
+      <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
+        <input
+          type="password"
+          placeholder="auth token"
+          bind:value={tokenInput}
+          autocomplete="off"
+        />
+        <button type="submit" disabled={!tokenInput.trim()}>Unlock</button>
+      </form>
+    </div>
+  {:else}
   {#if bunker && bunker.mode === 'setup'}
     <div class="panel setup">
       <strong>⚙ Setup required.</strong> No FROST share is loaded yet — this node
@@ -452,4 +510,5 @@
       <p class="muted">No signatures recorded yet.</p>
     {/each}
   </div>
+  {/if}
 </main>

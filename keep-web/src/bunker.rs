@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -41,7 +41,11 @@ fn recv_startup<T>(rx: Receiver<Result<T, String>>) -> Result<T, String> {
 struct WebCallbacks {
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
-    next_id: AtomicU64,
+}
+
+/// Random, unguessable approval id (defense-in-depth alongside the auth gate).
+fn random_approval_id() -> u64 {
+    u64::from_le_bytes(keep_core::crypto::random_bytes())
 }
 
 impl ServerCallbacks for WebCallbacks {
@@ -55,7 +59,7 @@ impl ServerCallbacks for WebCallbacks {
     }
 
     fn request_approval(&self, request: ApprovalRequest) -> bool {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = random_approval_id();
         let (tx, rx) = channel();
         if let Ok(mut map) = self.approvals.lock() {
             map.insert(id, tx);
@@ -69,6 +73,12 @@ impl ServerCallbacks for WebCallbacks {
             preview: request.event_content,
         });
 
+        // `block_in_place` requires a multi-thread runtime; both spawners use
+        // `Runtime::new()` (multi-thread), so this is sound. Do not switch them
+        // to a current-thread runtime without changing this to `spawn_blocking`.
+        // `recv_timeout` also doubles as the backstop that drops the channel
+        // (and lets the resolver-or-here `remove`) so the approvals map cannot
+        // grow unbounded even if a request is never resolved via the API.
         let decision =
             tokio::task::block_in_place(|| rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false));
         if let Ok(mut map) = self.approvals.lock() {
@@ -102,7 +112,7 @@ impl SigningHooks for CoSignerPolicy {
             session.threshold,
             session.participants.len(),
         );
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.enabled.load(Ordering::SeqCst) {
             let _ = self.events.send(Event::Log {
                 app: "frost".into(),
                 action: "co-signing".into(),
@@ -203,7 +213,6 @@ pub fn spawn_network_frost(
             let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
                 events,
                 approvals,
-                next_id: AtomicU64::new(1),
             });
 
             let mut server = match Server::new_network_frost_with_config(
@@ -212,7 +221,9 @@ pub fn spawn_network_frost(
                 &cfg.bunker_relays,
                 Some(callbacks),
                 ServerConfig {
-                    connect_grant: Permission::ALL,
+                    // Least privilege for the co-signer: connect handshake +
+                    // signing only, not NIP-04/44 encrypt/decrypt.
+                    connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                     ..ServerConfig::default()
                 },
             )
@@ -271,7 +282,6 @@ pub fn spawn_single_key(
             let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
                 events,
                 approvals,
-                next_id: AtomicU64::new(1),
             });
             let mut server = match Server::new_with_config(
                 keyring,
@@ -280,7 +290,9 @@ pub fn spawn_single_key(
                 std::slice::from_ref(&relay),
                 Some(callbacks),
                 ServerConfig {
-                    connect_grant: Permission::ALL,
+                    // Least privilege for the single-key fallback: connect +
+                    // signing only.
+                    connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                     ..ServerConfig::default()
                 },
             )
