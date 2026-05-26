@@ -118,10 +118,19 @@
     }
   }
 
+  // A network-level fetch failure (server briefly down, e.g. during a restart)
+  // surfaces as "TypeError: Failed to fetch"; show something reassuring rather
+  // than a raw error, since the WebSocket auto-reconnect will recover it.
+  function friendlyError(e: unknown): string {
+    return String(e).includes('Failed to fetch')
+      ? 'Cannot reach the service. It may be restarting; reconnecting…'
+      : String(e)
+  }
+
   function refreshShares() {
     getShares()
       .then((s) => (shares = s))
-      .catch((e) => (error = String(e)))
+      .catch((e) => (error = friendlyError(e)))
   }
 
   function refreshSigningLog() {
@@ -219,11 +228,17 @@
     return false
   }
 
-  function load() {
+  // Re-fetch all the snapshot state. Safe to call repeatedly; used on first
+  // load and again whenever the connection is re-established (e.g. after the
+  // service restarts), so the page recovers without a manual reload.
+  function refreshState() {
     getBunker()
-      .then((b) => (bunker = b))
+      .then((b) => {
+        bunker = b
+        error = null
+      })
       .catch((e) => {
-        if (!handleUnauthorized(e)) error = String(e)
+        if (!handleUnauthorized(e)) error = friendlyError(e)
       })
     refreshShares()
     getKillswitch()
@@ -237,6 +252,10 @@
         signingLoadError = String(err)
       })
     refreshSigningLog()
+  }
+
+  function load() {
+    refreshState()
 
     const stream = connectEvents(
       (e) => {
@@ -254,7 +273,12 @@
           if (e.app === 'frost') refreshSigningLog()
         }
       },
-      (connected) => (wsConnected = connected),
+      (connected) => {
+        // Connection just came back (e.g. after a restart): refresh the
+        // snapshot state so the page reflects the new mode/shares.
+        if (connected && !wsConnected) refreshState()
+        wsConnected = connected
+      },
     )
     stopStream = () => stream.close()
   }
