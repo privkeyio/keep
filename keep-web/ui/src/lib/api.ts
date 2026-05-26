@@ -15,6 +15,9 @@ export interface Share {
   threshold: number
   total_shares: number
   sign_count: number
+  created_at: number
+  last_used: number | null
+  did_backup: boolean
 }
 
 export interface SigningEntry {
@@ -83,6 +86,21 @@ export async function exportShare(
   })
   if (!r.ok) throw new Error((await r.text()) || `export failed: ${r.status}`)
   return (await r.json()).export
+}
+
+export async function renameShare(
+  group: string,
+  identifier: number,
+  name: string,
+): Promise<void> {
+  const r = await fetch('/api/shares/rename', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ group, identifier, name }),
+  })
+  if (!r.ok && r.status !== 204) {
+    throw new Error((await r.text()) || `rename failed: ${r.status}`)
+  }
 }
 
 export async function deleteShare(group: string, identifier: number): Promise<void> {

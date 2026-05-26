@@ -175,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/shares/import", post(api::import_share))
         .route("/api/shares/export", post(api::export_share))
         .route("/api/shares/delete", post(api::delete_share))
+        .route("/api/shares/rename", post(api::rename_share))
         .route("/api/signing-log", get(api::signing_log))
         .route(
             "/api/killswitch",

@@ -33,6 +33,9 @@ pub struct ShareDto {
     threshold: u16,
     total_shares: u16,
     sign_count: u64,
+    created_at: i64,
+    last_used: Option<i64>,
+    did_backup: bool,
 }
 
 pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
@@ -48,6 +51,9 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
                     threshold: s.metadata.threshold,
                     total_shares: s.metadata.total_shares,
                     sign_count: s.metadata.sign_count,
+                    created_at: s.metadata.created_at,
+                    last_used: s.metadata.last_used,
+                    did_backup: s.metadata.did_backup,
                 })
                 .collect();
             Json(dto).into_response()
@@ -60,6 +66,29 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
 pub struct ShareRef {
     pub group: String,
     pub identifier: u16,
+}
+
+#[derive(Deserialize)]
+pub struct RenameRequest {
+    pub group: String,
+    pub identifier: u16,
+    pub name: String,
+}
+
+/// Renames a stored share.
+pub async fn rename_share(
+    State(state): State<AppState>,
+    Json(body): Json<RenameRequest>,
+) -> impl IntoResponse {
+    let group = match keep_core::keys::npub_to_bytes(&body.group) {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let mut keep = state.keep.lock().await;
+    match keep.frost_rename_share(&group, body.identifier, &body.name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 /// Exports a stored share, re-encrypted under `passphrase`, as a bech32

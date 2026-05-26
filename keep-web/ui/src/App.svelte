@@ -6,6 +6,7 @@
     importShare,
     exportShare,
     deleteShare,
+    renameShare,
     getSigningLog,
     getKillswitch,
     setKillswitch,
@@ -54,6 +55,43 @@
   let exportPass = $state('')
   let exportResult = $state('')
   let exportErr = $state<string | null>(null)
+
+  // Per-share rename UI state.
+  let renameFor = $state<string | null>(null)
+  let renameVal = $state('')
+
+  // Copy-to-clipboard feedback (which value was just copied).
+  let copied = $state<string | null>(null)
+
+  async function copy(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      copied = label
+      setTimeout(() => (copied === label ? (copied = null) : null), 1500)
+    } catch {
+      /* clipboard blocked (non-https); ignore */
+    }
+  }
+
+  function fmtDate(secs: number | null): string {
+    if (!secs) return 'never'
+    return new Date(secs * 1000).toLocaleString()
+  }
+
+  function startRename(s: Share) {
+    renameFor = `${s.group}:${s.identifier}`
+    renameVal = s.name
+  }
+
+  async function doRename(s: Share) {
+    try {
+      await renameShare(s.group, s.identifier, renameVal.trim())
+      renameFor = null
+      refreshShares()
+    } catch (e) {
+      error = String(e)
+    }
+  }
 
   function refreshShares() {
     getShares()
@@ -155,6 +193,16 @@
   }
 </script>
 
+{#snippet copyField(label: string, value: string)}
+  <div class="field">
+    <span class="field-label">{label}</span>
+    <span class="field-value" title={value}>{value}</span>
+    <button class="copy-btn" onclick={() => copy(value, label + value)}>
+      {copied === label + value ? '✓ Copied' : 'Copy'}
+    </button>
+  </div>
+{/snippet}
+
 <main>
   <h1>Keep — FROST Bunker</h1>
 
@@ -207,26 +255,16 @@
           {/each}
         </dl>
       {/if}
-      {#if bunker.group}
-        <div class="kv"><span>group</span><code>{bunker.group}</code></div>
-      {/if}
       {#if bunker.threshold}
-        <div class="kv"><span>threshold</span><code>{bunker.threshold}</code></div>
+        <div class="kv"><span>threshold</span><strong>{bunker.threshold}</strong></div>
       {/if}
-      {#if bunker.npub}
-        <div class="kv"><span>npub</span><code>{bunker.npub}</code></div>
-      {/if}
-      {#if bunker.url}
-        <div class="kv"><span>bunker</span><code>{bunker.url}</code></div>
-      {/if}
-      {#if bunker.relay}
-        <div class="kv"><span>bunker relay</span><code>{bunker.relay}</code></div>
-      {/if}
-      {#if bunker.frost_relays.length}
-        <div class="kv">
-          <span>frost relays</span><code>{bunker.frost_relays.join(', ')}</code>
-        </div>
-      {/if}
+      {#if bunker.group}{@render copyField('group', bunker.group)}{/if}
+      {#if bunker.npub}{@render copyField('npub', bunker.npub)}{/if}
+      {#if bunker.url}{@render copyField('bunker', bunker.url)}{/if}
+      {#if bunker.relay}{@render copyField('bunker relay', bunker.relay)}{/if}
+      {#each bunker.frost_relays as r (r)}
+        {@render copyField('frost relay', r)}
+      {/each}
       {#if bunker.mode !== 'setup'}
         <div class="kv killswitch">
           <span>co-signing</span>
@@ -247,11 +285,28 @@
   <div class="panel">
     {#each shares as s (s.group + ':' + s.identifier)}
       <div class="share">
-        <span>{s.name}</span>
-        <span class="muted">
-          #{s.identifier} · {s.threshold}-of-{s.total_shares} · signed {s.sign_count}
-        </span>
+        <div class="share-main">
+          {#if renameFor === s.group + ':' + s.identifier}
+            <div class="row">
+              <input type="text" bind:value={renameVal} maxlength="64" />
+              <button class="ok" onclick={() => doRename(s)} disabled={!renameVal.trim()}>
+                Save
+              </button>
+              <button onclick={() => (renameFor = null)}>Cancel</button>
+            </div>
+          {:else}
+            <span class="share-name">{s.name}</span>
+          {/if}
+          <span class="muted share-meta">
+            #{s.identifier} · {s.threshold}-of-{s.total_shares} · signed {s.sign_count}
+            {#if !s.did_backup}· <span class="warn-text">not backed up</span>{/if}
+          </span>
+          <span class="muted share-meta">
+            created {fmtDate(s.created_at)} · last used {fmtDate(s.last_used)}
+          </span>
+        </div>
         <span class="share-actions">
+          <button onclick={() => startRename(s)}>Rename</button>
           <button onclick={() => startExport(s)}>Export</button>
           <button class="no" onclick={() => confirmDelete(s)}>Delete</button>
         </span>
