@@ -623,6 +623,9 @@ impl Keep {
         identifier: u16,
         name: &str,
     ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
         let name = name.trim();
         if name.is_empty() {
             return Err(KeepError::InvalidInput(

@@ -6,9 +6,20 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use keep_core::error::KeepError;
 use keep_core::frost::ShareExport;
 
 use crate::state::AppState;
+
+/// Map a keep-core error to an HTTP status: client errors (bad input, missing
+/// share) vs. server-side failures (storage/IO/crypto).
+fn err_status(e: &KeepError) -> StatusCode {
+    match e {
+        KeepError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        KeepError::KeyNotFound(_) | KeepError::NotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 fn hex8(bytes: &[u8]) -> String {
     bytes[..4.min(bytes.len())]
@@ -87,7 +98,7 @@ pub async fn rename_share(
     let mut keep = state.keep.lock().await;
     match keep.frost_rename_share(&group, body.identifier, &body.name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => (err_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -128,6 +139,16 @@ pub async fn delete_share(
     State(state): State<AppState>,
     Json(body): Json<ShareRef>,
 ) -> impl IntoResponse {
+    // Refuse to delete the share the running co-signer is using: the node holds
+    // it in memory and would keep signing with a share that's gone from disk,
+    // leaving an inconsistent state. The operator must reconfigure/stop first.
+    if state.bunker.group.as_deref() == Some(body.group.as_str()) {
+        return (
+            StatusCode::CONFLICT,
+            "cannot delete the active co-signer's share; reconfigure or stop the service first",
+        )
+            .into_response();
+    }
     let group = match keep_core::keys::npub_to_bytes(&body.group) {
         Ok(g) => g,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -135,7 +156,7 @@ pub async fn delete_share(
     let mut keep = state.keep.lock().await;
     match keep.frost_delete_share(&group, body.identifier) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (err_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -247,7 +268,11 @@ pub async fn resolve_approval(
     Path(id): Path<u64>,
     Json(body): Json<ApprovalDecision>,
 ) -> impl IntoResponse {
-    let sender = state.approvals.lock().ok().and_then(|mut m| m.remove(&id));
+    let sender = match state.approvals.lock() {
+        Ok(mut m) => m.remove(&id),
+        // A poisoned mutex is a server-side failure, not a missing approval.
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
     match sender {
         Some(tx) => match tx.send(body.approve) {
             Ok(()) => StatusCode::NO_CONTENT,

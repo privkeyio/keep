@@ -46,9 +46,12 @@
     ['frost relays', 'relays used to coordinate signing rounds with your devices'],
   ]
 
-  let signingEnabled = $state(true)
+  // undefined = status not yet loaded (interaction disabled until known).
+  let signingEnabled = $state<boolean | undefined>(undefined)
+  let signingLoadError = $state<string | null>(null)
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
+  let wsConnected = $state(false)
 
   // Per-share export UI state.
   let exportFor = $state<string | null>(null) // "group:id"
@@ -140,6 +143,9 @@
       exportResult = await exportShare(s.group, s.identifier, exportPass)
     } catch (e) {
       exportErr = String(e)
+    } finally {
+      // Don't leave the passphrase sitting in client memory.
+      exportPass = ''
     }
   }
 
@@ -147,6 +153,7 @@
     e.preventDefault()
     importing = true
     importMsg = null
+    importOk = false
     try {
       await importShare(importData, importPass, importName)
       importOk = true
@@ -169,27 +176,41 @@
       .catch((e) => (error = String(e)))
     refreshShares()
     getKillswitch()
-      .then((e) => (signingEnabled = e))
-      .catch(() => {})
+      .then((e) => {
+        signingEnabled = e
+        signingLoadError = null
+      })
+      .catch((err) => {
+        signingEnabled = undefined
+        signingLoadError = String(err)
+      })
     refreshSigningLog()
 
-    const ws = connectEvents((e) => {
-      if (e.type === 'approval') {
-        approvals = [{ ...e }, ...approvals]
-      } else {
-        logs = [e, ...logs].slice(0, 100)
-        // A co-sign just happened — refresh the persistent audit log.
-        if (e.app === 'frost') refreshSigningLog()
-      }
-    })
-    return () => ws.close()
+    const stream = connectEvents(
+      (e) => {
+        if (e.type === 'approval') {
+          approvals = [{ ...e }, ...approvals]
+        } else {
+          logs = [e, ...logs].slice(0, 100)
+          // A co-sign just happened — refresh the persistent audit log.
+          if (e.app === 'frost') refreshSigningLog()
+        }
+      },
+      (connected) => (wsConnected = connected),
+    )
+    return () => stream.close()
   })
 
   async function decide(a: PendingApproval, approve: boolean) {
-    await resolveApproval(a.id, approve)
-    approvals = approvals.map((x) =>
-      x.id === a.id ? { ...x, resolved: approve ? 'approved' : 'denied' } : x,
-    )
+    try {
+      await resolveApproval(a.id, approve)
+      approvals = approvals.map((x) =>
+        x.id === a.id ? { ...x, resolved: approve ? 'approved' : 'denied' } : x,
+      )
+    } catch (e) {
+      // The request may have already timed out / been resolved on the signer.
+      error = `Could not ${approve ? 'approve' : 'deny'} request: ${e}`
+    }
   }
 </script>
 
@@ -268,12 +289,16 @@
       {#if bunker.mode !== 'setup'}
         <div class="kv killswitch">
           <span>co-signing</span>
-          <code class={signingEnabled ? '' : 'warn'}>
-            {signingEnabled ? 'enabled' : 'DISABLED (kill switch)'}
-          </code>
-          <button class={signingEnabled ? 'no' : 'ok'} onclick={toggleKillswitch}>
-            {signingEnabled ? 'Disable signing' : 'Enable signing'}
-          </button>
+          {#if signingEnabled === undefined}
+            <code class="warn">unknown{signingLoadError ? ` (${signingLoadError})` : ''}</code>
+          {:else}
+            <code class={signingEnabled ? '' : 'warn'}>
+              {signingEnabled ? 'enabled' : 'DISABLED (kill switch)'}
+            </code>
+            <button class={signingEnabled ? 'no' : 'ok'} onclick={toggleKillswitch}>
+              {signingEnabled ? 'Disable signing' : 'Enable signing'}
+            </button>
+          {/if}
         </div>
       {/if}
     {:else}
@@ -374,7 +399,12 @@
     </form>
   </div>
 
-  <h2>Activity</h2>
+  <h2>
+    Activity
+    <span class="verify {wsConnected ? 'ok' : 'fail'}">
+      {wsConnected ? '● live' : '○ reconnecting…'}
+    </span>
+  </h2>
   <div class="panel">
     {#each approvals as a (a.id)}
       <div class="event approval">

@@ -14,8 +14,12 @@ async fn handle(mut socket: WebSocket, state: AppState) {
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let Ok(json) = serde_json::to_string(&event) else {
-                    continue;
+                let json = match serde_json::to_string(&event) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "failed to serialize event for WS");
+                        continue;
+                    }
                 };
                 if socket.send(Message::Text(json.into())).await.is_err() {
                     break;

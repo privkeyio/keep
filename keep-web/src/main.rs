@@ -33,30 +33,35 @@ fn parse_relays(value: &str) -> Vec<String> {
 /// Resolve the FROST group to co-sign for: an explicit npub, else the single
 /// group present in the vault. Returns `None` (→ setup mode) when there is no
 /// share yet or the choice is ambiguous.
-fn resolve_group(keep: &Keep, explicit: Option<&str>) -> Option<([u8; 32], String)> {
+// `Ok(None)` means genuine first-run (no shares → setup mode); `Err` means
+// misconfiguration (bad KEEP_FROST_GROUP, or multiple groups with no choice)
+// and is fatal so the operator sees the problem instead of a silent setup mode.
+fn resolve_group(
+    keep: &Keep,
+    explicit: Option<&str>,
+) -> Result<Option<([u8; 32], String)>, String> {
     if let Some(npub) = explicit {
-        return match keep_core::keys::npub_to_bytes(npub) {
-            Ok(bytes) => Some((bytes, npub.to_string())),
-            Err(e) => {
-                tracing::warn!(error = %e, "invalid KEEP_FROST_GROUP npub");
-                None
-            }
-        };
+        let bytes = keep_core::keys::npub_to_bytes(npub)
+            .map_err(|e| format!("invalid KEEP_FROST_GROUP npub: {e}"))?;
+        return Ok(Some((bytes, npub.to_string())));
     }
-    let shares = keep.frost_list_shares().unwrap_or_default();
+    let shares = match keep.frost_list_shares() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "frost_list_shares failed; treating as no shares");
+            Vec::new()
+        }
+    };
     let mut groups: Vec<[u8; 32]> = shares.iter().map(|s| s.metadata.group_pubkey).collect();
     groups.sort();
     groups.dedup();
     match groups.as_slice() {
-        [g] => Some((*g, keep_core::keys::bytes_to_npub(g))),
-        [] => None,
-        _ => {
-            tracing::warn!(
-                count = groups.len(),
-                "multiple groups present; set KEEP_FROST_GROUP to choose one"
-            );
-            None
-        }
+        [g] => Ok(Some((*g, keep_core::keys::bytes_to_npub(g)))),
+        [] => Ok(None),
+        _ => Err(format!(
+            "multiple FROST groups present ({}); set KEEP_FROST_GROUP to choose one",
+            groups.len()
+        )),
     }
 }
 
@@ -104,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // KEEP_FROST_GROUP, otherwise the single group present in the vault.
     // Auto-resolution avoids the chicken-and-egg of needing the group npub
     // before the share has been imported.
-    let resolved_group = resolve_group(&keep, frost_group.as_deref());
+    let resolved_group = resolve_group(&keep, frost_group.as_deref())?;
 
     let allow_single_key = env_or("KEEP_ALLOW_SINGLE_KEY", "false") == "true";
 
@@ -143,6 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Explicit opt-in: sign with the vault's primary key alone (no
         // threshold security — the full key lives on this box).
         tracing::warn!("KEEP_ALLOW_SINGLE_KEY set; single-key bunker (no threshold security)");
+        // Transfer ownership of the keyring into the bunker thread; `keep`'s
+        // keyring is intentionally left empty afterwards (the bunker is the
+        // only thing that signs in this mode — don't read keep.keyring() below).
         let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
         let relay = bunker_relays.first().cloned().unwrap_or_default();
         bunker::spawn_single_key(keyring, relay, events.clone(), approvals.clone())

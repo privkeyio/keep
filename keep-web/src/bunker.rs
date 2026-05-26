@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -16,6 +16,22 @@ use keep_nip46::{NetworkFrostSigner, Permission, Server, ServerConfig};
 use crate::state::{BunkerInfo, Event};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the main thread waits for the bunker thread to report startup
+/// before giving up (relay connect + announce + server bind). Bounded so a
+/// hung startup surfaces a clear error instead of blocking the daemon forever.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn recv_startup<T>(rx: Receiver<Result<T, String>>) -> Result<T, String> {
+    match rx.recv_timeout(STARTUP_TIMEOUT) {
+        Ok(res) => res,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "bunker did not start within {}s",
+            STARTUP_TIMEOUT.as_secs()
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err("bunker thread terminated before start".into()),
+    }
+}
 
 /// Bridges the bunker's NIP-46 client callbacks onto the web event stream.
 ///
@@ -229,9 +245,7 @@ pub fn spawn_network_frost(
         });
     });
 
-    info_rx
-        .recv()
-        .map_err(|_| "frost co-signer thread terminated before start".to_string())?
+    recv_startup(info_rx)
 }
 
 /// Spawns the single-key fallback bunker (no FROST group configured). The vault
@@ -295,7 +309,5 @@ pub fn spawn_single_key(
         });
     });
 
-    info_rx
-        .recv()
-        .map_err(|_| "bunker thread terminated before start".to_string())?
+    recv_startup(info_rx)
 }
