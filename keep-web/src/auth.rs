@@ -36,11 +36,7 @@ impl AuthToken {
     }
 
     fn matches(&self, candidate: &str) -> bool {
-        candidate
-            .as_bytes()
-            .ct_eq(self.0.as_bytes())
-            .unwrap_u8()
-            == 1
+        candidate.as_bytes().ct_eq(self.0.as_bytes()).unwrap_u8() == 1
     }
 }
 
@@ -60,7 +56,11 @@ pub async fn require_auth(
 }
 
 fn bearer_from_header(request: &Request) -> Option<String> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;
@@ -130,12 +130,9 @@ mod tests {
     }
 
     fn app() -> Router {
-        Router::new()
-            .route("/api/x", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
-                token("s3cret"),
-                require_auth,
-            ))
+        Router::new().route("/api/x", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(token("s3cret"), require_auth),
+        )
     }
 
     async fn status(builder: axum::http::request::Builder) -> StatusCode {

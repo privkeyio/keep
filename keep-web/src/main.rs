@@ -44,7 +44,11 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let meta = std::fs::metadata(path)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        tracing::warn!(path, mode = format!("{mode:o}"), "secret file is group/world accessible; tighten to 0600");
+        tracing::warn!(
+            path,
+            mode = format!("{mode:o}"),
+            "secret file is group/world accessible; tighten to 0600"
+        );
     }
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }

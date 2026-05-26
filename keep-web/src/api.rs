@@ -29,7 +29,8 @@ fn hex8(bytes: &[u8]) -> String {
 }
 
 fn parse_group(npub: &str) -> Result<[u8; 32], (StatusCode, &'static str)> {
-    keep_core::keys::npub_to_bytes(npub).map_err(|_| (StatusCode::BAD_REQUEST, "invalid group npub"))
+    keep_core::keys::npub_to_bytes(npub)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid group npub"))
 }
 
 pub async fn health() -> &'static str {

@@ -18,9 +18,9 @@ pub async fn events(
     Query(q): Query<TicketQuery>,
 ) -> impl IntoResponse {
     match q.ticket {
-        Some(ticket) if state.ws_tickets.consume(&ticket) => {
-            ws.on_upgrade(move |socket| handle(socket, state)).into_response()
-        }
+        Some(ticket) if state.ws_tickets.consume(&ticket) => ws
+            .on_upgrade(move |socket| handle(socket, state))
+            .into_response(),
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }

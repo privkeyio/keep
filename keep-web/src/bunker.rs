@@ -216,10 +216,7 @@ pub fn spawn_network_frost(
             let node_for_state = node.clone();
             let signer = NetworkFrostSigner::with_shared_node(cfg.group_pubkey, node);
             let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
-                events,
-                approvals,
-            });
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
 
             let mut server = match Server::new_network_frost_with_config(
                 signer,
@@ -285,10 +282,7 @@ pub fn spawn_single_key(
             }
         };
         rt.block_on(async move {
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
-                events,
-                approvals,
-            });
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
             let mut server = match Server::new_with_config(
                 keyring,
                 None,
