@@ -267,7 +267,7 @@ pub fn spawn_network_frost(
 /// this one box, so it does not provide threshold security.
 pub fn spawn_single_key(
     keyring: Arc<Mutex<Keyring>>,
-    relay: String,
+    relays: Vec<String>,
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
 ) -> Result<BunkerInfo, String> {
@@ -287,7 +287,7 @@ pub fn spawn_single_key(
                 keyring,
                 None,
                 None,
-                std::slice::from_ref(&relay),
+                &relays,
                 Some(callbacks),
                 ServerConfig {
                     // Least privilege for the single-key fallback: connect +
@@ -308,7 +308,7 @@ pub fn spawn_single_key(
                 mode: "single-key".into(),
                 url: server.bunker_url(),
                 npub: server.pubkey().to_bech32().unwrap_or_default(),
-                bunker_relays: vec![relay],
+                bunker_relays: relays,
                 frost_relays: Vec::new(),
                 group: None,
                 threshold: None,

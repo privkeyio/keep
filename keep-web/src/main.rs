@@ -206,8 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // keyring is intentionally left empty afterwards (the bunker is the
         // only thing that signs in this mode — don't read keep.keyring() below).
         let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
-        let relay = bunker_relays.first().cloned().unwrap_or_default();
-        bunker::spawn_single_key(keyring, relay, events.clone(), approvals.clone())
+        bunker::spawn_single_key(keyring, bunker_relays, events.clone(), approvals.clone())
             .map_err(|e| format!("failed to start bunker: {e}"))?
     } else {
         // Nothing to sign with yet: serve the admin UI so the operator can

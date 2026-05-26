@@ -278,7 +278,7 @@
 </script>
 
 {#snippet tip(text: string)}
-  <span class="tip" data-tip={text}>
+  <span class="tip" data-tip={text} role="img" aria-label={text}>
     <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
       <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.3" />
       <circle cx="8" cy="4.7" r="0.95" fill="currentColor" />
@@ -374,6 +374,7 @@
           placeholder="password"
           bind:value={tokenInput}
           autocomplete="current-password"
+          aria-label="Password"
         />
         <button type="submit" disabled={!tokenInput.trim()}>Sign in</button>
       </form>

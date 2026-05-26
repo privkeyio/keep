@@ -276,6 +276,11 @@ pub async fn set_killswitch(
     State(state): State<AppState>,
     Json(body): Json<KillswitchRequest>,
 ) -> impl IntoResponse {
+    // Hold the keep lock for the retired-check + enable so it can't interleave
+    // with delete_share, which sets `signer_retired` while holding the same
+    // lock. Without this, a concurrent delete could land between the check and
+    // the store, re-enabling signing for a share that was just deleted.
+    let _guard = state.keep.lock().await;
     // The active share was deleted; its in-memory copy must not sign again.
     if body.enabled && state.signer_retired.load(Ordering::SeqCst) {
         return (
