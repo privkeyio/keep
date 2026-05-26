@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -64,6 +65,9 @@ pub struct AppState {
     /// node still holds that share in memory, so co-signing is force-disabled
     /// and cannot be re-enabled until a restart re-resolves shares from disk.
     pub signer_retired: Arc<AtomicBool>,
+    /// Where the kill-switch state is persisted, so a live toggle survives a
+    /// restart instead of reverting to a boot default.
+    pub signing_flag_path: PathBuf,
     /// The running FROST node (network mode only), for reading the signing
     /// audit log and peer state.
     pub node: Option<Arc<KfpNode>>,
@@ -120,6 +124,32 @@ impl BunkerInfo {
             group: None,
             threshold: None,
         }
+    }
+}
+
+/// File (inside the vault dir) holding the persisted kill-switch state.
+pub fn signing_flag_path(vault_dir: &Path) -> PathBuf {
+    vault_dir.join("signing_enabled")
+}
+
+/// Reads the persisted kill-switch state, or `None` if it was never set or is
+/// unreadable (caller falls back to the boot default).
+pub fn read_signing_flag(path: &Path) -> Option<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => match s.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// Persists the kill-switch state so it survives a restart. Best-effort: a write
+/// failure is logged, not surfaced, since the in-memory toggle still applies.
+pub fn persist_signing_flag(path: &Path, enabled: bool) {
+    if let Err(e) = std::fs::write(path, if enabled { "true" } else { "false" }) {
+        tracing::warn!(error = %e, path = %path.display(), "failed to persist kill-switch state");
     }
 }
 

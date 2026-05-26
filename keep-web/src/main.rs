@@ -142,8 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (events, _) = broadcast::channel(256);
     let approvals = Arc::new(StdMutex::new(HashMap::new()));
-    // Kill switch shared with the co-signer policy; starts from the env default.
-    let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(auto_approve));
+    // Kill switch shared with the co-signer policy. A persisted toggle (set via
+    // the live kill switch) wins; otherwise fall back to the boot default so a
+    // restart doesn't silently re-enable signing.
+    let signing_flag_path = state::signing_flag_path(&vault_path);
+    let initial_enabled = state::read_signing_flag(&signing_flag_path).unwrap_or(auto_approve);
+    let signing_enabled = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
     // Set if the active share is deleted at runtime; bars re-enabling signing.
     let signer_retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -226,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_tickets: state::TicketStore::default(),
         signing_enabled,
         signer_retired,
+        signing_flag_path,
         node,
     };
 

@@ -290,6 +290,7 @@ pub async fn set_killswitch(
             .into_response();
     }
     state.signing_enabled.store(body.enabled, Ordering::SeqCst);
+    crate::state::persist_signing_flag(&state.signing_flag_path, body.enabled);
     tracing::warn!(enabled = body.enabled, "co-signing toggled via kill switch");
     Json(KillswitchStatus {
         enabled: body.enabled,
