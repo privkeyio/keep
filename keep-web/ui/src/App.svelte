@@ -213,7 +213,7 @@
       authed = false
       stopStream?.()
       stopStream = undefined
-      error = 'Authentication required. Enter the auth token.'
+      error = 'Authentication required. Enter your Web Admin password.'
       return true
     }
     return false
@@ -361,19 +361,21 @@
 
   {#if !authed}
     <div class="panel setup">
-      <strong>🔒 Authentication required.</strong>
+      <strong>🔒 Sign in</strong>
       <p>
-        Enter the auth token. It is set via <span class="token">KEEP_WEB_AUTH_TOKEN</span>, or, if
-        unset, generated once at startup and printed to the service logs.
+        Enter your Web Admin password. On StartOS, find it under the <span class="token"
+          >Show Login Credentials</span
+        > action; otherwise it is the <span class="token">KEEP_WEB_AUTH_TOKEN</span> value.
       </p>
       <form onsubmit={(e) => (e.preventDefault(), submitToken())}>
+        <input type="text" value="admin" readonly autocomplete="username" aria-label="Username" />
         <input
           type="password"
-          placeholder="auth token"
+          placeholder="password"
           bind:value={tokenInput}
-          autocomplete="off"
+          autocomplete="current-password"
         />
-        <button type="submit" disabled={!tokenInput.trim()}>Unlock</button>
+        <button type="submit" disabled={!tokenInput.trim()}>Sign in</button>
       </form>
     </div>
   {:else}
