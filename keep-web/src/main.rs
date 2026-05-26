@@ -40,15 +40,21 @@ fn secret_from(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> 
 }
 
 fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        tracing::warn!(
-            path,
-            mode = format!("{mode:o}"),
-            "secret file is group/world accessible; tighten to 0600"
-        );
+    // The permission check is Unix-only (keep-web runs on Linux/StartOS); on
+    // other platforms the file is read without the mode warning so the
+    // workspace still builds (e.g. Windows CI).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path,
+                mode = format!("{mode:o}"),
+                "secret file is group/world accessible; tighten to 0600"
+            );
+        }
     }
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
