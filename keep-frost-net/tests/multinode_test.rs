@@ -1261,3 +1261,64 @@ async fn test_signing_flow_with_nonce_pre_exchange() {
         "expected exactly one pooled commitment consumed across selected peers"
     );
 }
+
+// Reproduces consecutive-signing robustness bugs (stale_nonce / Unknown
+// identifier): a persistent initiator must complete many signs in a row as the
+// pre-exchanged nonce pool churns.
+#[tokio::test]
+#[ignore]
+async fn test_repeated_signing() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("repeat-signing").unwrap();
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()]).await.unwrap();
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()]).await.unwrap();
+    let mut node3 = KfpNode::new(share3, vec![relay]).await.unwrap();
+
+    let mut rx3 = node3.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node3 = Arc::new(node3);
+    let node3_for_run = Arc::clone(&node3);
+    let h1 = tokio::spawn(async move { let _ = node1.run().await; });
+    let h2 = tokio::spawn(async move { let _ = node2.run().await; });
+    let h3 = tokio::spawn(async move { let _ = node3_for_run.run().await; });
+
+    let mut peers_discovered = 0u32;
+    let _ = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+
+    let mut failures = Vec::new();
+    for i in 0..6u32 {
+        let msg = format!("repeat-sign-{i}").into_bytes();
+        match timeout(Duration::from_secs(30), node3.request_signature(msg, "raw")).await {
+            Ok(Ok(sig)) => assert_eq!(sig.len(), 64),
+            Ok(Err(e)) => failures.push(format!("sign {i}: {e:?}")),
+            Err(_) => failures.push(format!("sign {i}: timeout")),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    graceful_shutdown(shutdown1, h1).await;
+    graceful_shutdown(shutdown2, h2).await;
+    graceful_shutdown(shutdown3, h3).await;
+
+    assert!(failures.is_empty(), "repeated signing failures: {failures:#?}");
+}
