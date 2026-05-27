@@ -793,6 +793,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_key_override_allows_connect() {
+        // A remote signer's transport (bunker URL) pubkey differs from its
+        // signing identity. A client targets the transport pubkey, so connect
+        // must validate against it, not `our_pubkey()`.
+        let transport = Keys::generate().public_key();
+        let handler = setup_handler().with_transport_pubkey(transport);
+        let app_pubkey = Keys::generate().public_key();
+
+        // `transport` differs from the keyring's signing key (our_pubkey()).
+        let result = handler
+            .handle_connect(app_pubkey, Some(transport), None, None)
+            .await;
+        assert!(result.is_ok());
+
+        // A target that is neither the transport nor signing key is rejected.
+        let other = Keys::generate().public_key();
+        let result = handler
+            .handle_connect(Keys::generate().public_key(), Some(other), None, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_handle_get_public_key() {
         let handler = setup_handler();
         let app_pubkey = Keys::generate().public_key();

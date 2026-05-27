@@ -695,3 +695,29 @@ impl Server {
         self.client.disconnect().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An explicitly-configured `expected_secret` must surface as the bunker
+    // secret, which `bunker_url()` embeds — otherwise clients get a secret-less
+    // URL and reject the connect.
+    #[test]
+    fn expected_secret_surfaces_in_bunker_secret() {
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let config = ServerConfig {
+            expected_secret: Some("my-secret".to_string()),
+            ..ServerConfig::default()
+        };
+
+        let (_handler, bunker_secret) =
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+
+        let secret = bunker_secret.expect("expected_secret should surface as bunker secret");
+        assert_eq!(secret.as_str(), "my-secret");
+    }
+}

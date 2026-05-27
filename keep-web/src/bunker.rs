@@ -184,6 +184,9 @@ pub struct NetworkConfig {
     /// Persisted NIP-46 secret embedded in the bunker URL and required in the
     /// connect handshake. Clients (Amethyst, etc.) reject a secret-less URL.
     pub bunker_secret: String,
+    /// Persisted transport key = the bunker URL's pubkey identity. Stable so the
+    /// URL doesn't change across restarts and saved client connections survive.
+    pub transport_key: [u8; 32],
 }
 
 /// What `spawn_network_frost` reports back once the co-signer is up.
@@ -260,7 +263,9 @@ pub fn spawn_network_frost(
 
             let node_for_state = node.clone();
             let signer = NetworkFrostSigner::with_shared_node(cfg.group_pubkey, node);
-            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+            // Persisted (not freshly generated) so the bunker URL pubkey is
+            // stable across restarts and saved client connections keep working.
+            let transport_key = cfg.transport_key;
             let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
 
             let mut server = match Server::new_network_frost_with_config(
@@ -317,6 +322,7 @@ pub fn spawn_network_frost(
 pub fn spawn_single_key(
     keyring: Arc<Mutex<Keyring>>,
     relays: Vec<String>,
+    bunker_secret: String,
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
 ) -> Result<BunkerInfo, String> {
@@ -342,6 +348,9 @@ pub fn spawn_single_key(
                     // Least privilege for the single-key fallback: connect +
                     // signing only.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+                    // Same secret-in-URL handshake as the network path so
+                    // clients can authenticate.
+                    expected_secret: Some(bunker_secret),
                     ..ServerConfig::default()
                 },
             )

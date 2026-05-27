@@ -153,24 +153,66 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
     }
 }
 
-/// Loads the persisted NIP-46 bunker secret, generating and storing one on
-/// first run. The secret must be stable so the advertised bunker URL (which
-/// embeds it) doesn't change across restarts and saved client connections keep
-/// working.
-pub fn load_or_create_bunker_secret(vault_dir: &Path) -> String {
+/// Writes a credential file, creating it `0600` on Unix. Propagates IO errors:
+/// a credential that can't be persisted must fail startup, not silently rotate.
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.flush()
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Loads the persisted NIP-46 bunker secret, generating and storing one (`0600`)
+/// on first run. Must be stable so the advertised bunker URL (which embeds it)
+/// doesn't change across restarts. A write failure is propagated so startup
+/// fails rather than rotating to an ephemeral secret that breaks saved clients.
+pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String> {
     let path = vault_dir.join("bunker_secret");
     if let Ok(s) = std::fs::read_to_string(&path) {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
     let bytes: [u8; 16] = keep_core::crypto::random_bytes();
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    if let Err(e) = std::fs::write(&path, &secret) {
-        tracing::warn!(error = %e, path = %path.display(), "failed to persist bunker secret");
+    write_secret_file(&path, &secret)?;
+    Ok(secret)
+}
+
+/// Loads the persisted NIP-46 transport key (the bunker URL's own identity),
+/// generating and storing one (`0600`) on first run. Must be stable so the
+/// bunker URL's pubkey doesn't change across restarts and saved client
+/// connections keep working.
+pub fn load_or_create_transport_key(vault_dir: &Path) -> std::io::Result<[u8; 32]> {
+    let path = vault_dir.join("bunker_transport_key");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if let Some(bytes) = decode_hex32(s.trim()) {
+            return Ok(bytes);
+        }
     }
-    secret
+    let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    write_secret_file(&path, &hex)?;
+    Ok(bytes)
 }
 
 /// An event pushed to connected WebSocket clients.
