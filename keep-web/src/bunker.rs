@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use keep_core::frost::SharePackage;
 use keep_core::keyring::Keyring;
-use keep_frost_net::{KfpNode, SessionInfo, SigningHooks};
+use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
 use keep_nip46::{NetworkFrostSigner, Permission, Server, ServerConfig};
 
@@ -149,6 +149,30 @@ impl SigningHooks for CoSignerPolicy {
     }
 }
 
+/// Maps a node lifecycle event to a web activity entry, or `None` for events
+/// the co-signer UI doesn't surface here (signing rounds are already reported
+/// through the signing hooks above).
+fn node_event_to_log(ev: &KfpNodeEvent) -> Option<Event> {
+    match ev {
+        KfpNodeEvent::PeerDiscovered { share_index, name } => Some(Event::Log {
+            app: "frost".into(),
+            action: "peer online".into(),
+            success: true,
+            detail: Some(match name {
+                Some(n) => format!("share {share_index} ({n})"),
+                None => format!("share {share_index}"),
+            }),
+        }),
+        KfpNodeEvent::PeerOffline { share_index } => Some(Event::Log {
+            app: "frost".into(),
+            action: "peer offline".into(),
+            success: false,
+            detail: Some(format!("share {share_index}")),
+        }),
+        _ => None,
+    }
+}
+
 /// Parameters for the always-on network-FROST co-signer.
 pub struct NetworkConfig {
     pub share: SharePackage,
@@ -200,6 +224,24 @@ pub fn spawn_network_frost(
                 events: events.clone(),
                 enabled: cfg.enabled,
             }));
+
+            // Mirror node lifecycle events (peer presence) into the web activity
+            // feed so the UI reflects who is online, not just signing rounds.
+            let mut node_events = node.subscribe();
+            let events_for_feed = events.clone();
+            tokio::spawn(async move {
+                loop {
+                    match node_events.recv().await {
+                        Ok(ev) => {
+                            if let Some(log) = node_event_to_log(&ev) {
+                                let _ = events_for_feed.send(log);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             if let Err(e) = node.announce().await {
                 let _ = info_tx.send(Err(format!("announce: {e}")));
