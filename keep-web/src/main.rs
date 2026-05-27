@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault_path = PathBuf::from(env_or("KEEP_PATH", "/data"));
     let bunker_relays = parse_relays(&env_or(
         "KEEP_BUNKER_RELAY",
-        &env_or("KEEP_RELAY", "wss://relay.damus.io"),
+        &env_or("KEEP_RELAY", "wss://bucket.coracle.social"),
     ));
     let frost_group = std::env::var("KEEP_FROST_GROUP").ok();
     // Fail-closed: signing is off until the operator explicitly enables it
