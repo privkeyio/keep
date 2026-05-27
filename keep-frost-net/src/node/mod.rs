@@ -1076,8 +1076,18 @@ impl KfpNode {
 
         let since = Timestamp::now() - Duration::from_secs(300);
 
+        // Every group member's transport pubkey, derived from public data.
+        // Scoping subscriptions to these `authors` (a) satisfies strict relays
+        // that reject author-less filters (e.g. relay.nsec.app: "please add
+        // authors or #p"), and (b) avoids pulling the relay's entire kind:24242
+        // stream — that kind is shared with Blossom and other FROST groups, so
+        // an unscoped filter floods the node and crowds out real signing
+        // traffic. It also rejects spoofed group events from non-members.
+        let authors = group_member_pubkeys(&self.group_pubkey, self.share.metadata.total_shares);
+
         let group_filter = Filter::new()
             .kind(Kind::Custom(KFP_EVENT_KIND))
+            .authors(authors.clone())
             .custom_tag(
                 SingleLetterTag::lowercase(Alphabet::G),
                 hex::encode(self.group_pubkey),
@@ -1086,6 +1096,7 @@ impl KfpNode {
 
         let direct_filter = Filter::new()
             .kind(Kind::Custom(KFP_EVENT_KIND))
+            .authors(authors.clone())
             .pubkey(self.keys.public_key())
             .since(since);
 
@@ -1101,6 +1112,11 @@ impl KfpNode {
 
         let fetch_filter = Filter::new()
             .kind(Kind::Custom(KFP_EVENT_KIND))
+            .authors(authors)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::G),
+                hex::encode(self.group_pubkey),
+            )
             .since(since);
 
         match self
@@ -1645,15 +1661,37 @@ fn default_relay_opts() -> RelayOptions {
         .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
-fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
+/// Derives a member's transport keypair from public group data. The derivation
+/// is deterministic in `(group_pubkey, identifier)` — both public — so every
+/// member can compute every other member's transport pubkey without discovery.
+/// This is what lets the relay subscriptions filter by `authors`.
+fn derive_member_keys(group_pubkey: &[u8; 32], identifier: u16) -> Result<Keys> {
     let mut hasher = Sha256::new();
     hasher.update(b"keep-frost-node-identity-v2");
-    hasher.update(share.metadata.group_pubkey);
-    hasher.update(share.metadata.identifier.to_be_bytes());
+    hasher.update(group_pubkey);
+    hasher.update(identifier.to_be_bytes());
     let derived: [u8; 32] = hasher.finalize().into();
     let secret_key = SecretKey::from_slice(&derived)
         .map_err(|e| FrostNetError::Crypto(format!("Failed to create secret key: {e}")))?;
     Ok(Keys::new(secret_key))
+}
+
+fn derive_keys_from_share(share: &SharePackage) -> Result<Keys> {
+    derive_member_keys(&share.metadata.group_pubkey, share.metadata.identifier)
+}
+
+/// Transport pubkeys of every member of the group, derived from public data.
+/// Used to scope relay subscriptions to `authors`, which keeps strict relays
+/// happy (they require `authors`/`#p`) and avoids pulling the relay's entire
+/// `kind:24242` stream (shared with Blossom and other groups).
+fn group_member_pubkeys(group_pubkey: &[u8; 32], total_shares: u16) -> Vec<PublicKey> {
+    (1..=total_shares)
+        .filter_map(|i| {
+            derive_member_keys(group_pubkey, i)
+                .ok()
+                .map(|k| k.public_key())
+        })
+        .collect()
 }
 
 fn derive_audit_hmac_key(keys: &Keys, group_pubkey: &[u8; 32]) -> [u8; 32] {
