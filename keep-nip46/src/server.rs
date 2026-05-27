@@ -105,7 +105,9 @@ fn finalize_handler(
         Some(Zeroizing::new(secret))
     } else if let Some(ref secret) = config.expected_secret {
         handler = handler.with_expected_secret(secret.clone());
-        None
+        // Surface the configured secret in the bunker URL so clients (which
+        // require it in the connect handshake) can authenticate.
+        Some(Zeroizing::new(secret.clone()))
     } else {
         None
     };
@@ -240,7 +242,8 @@ impl Server {
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_auto_approve(config.auto_approve)
-            .with_connect_grant(config.connect_grant);
+            .with_connect_grant(config.connect_grant)
+            .with_transport_pubkey(keys.public_key());
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
@@ -338,7 +341,8 @@ impl Server {
         let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)
             .with_auto_approve(config.auto_approve)
-            .with_connect_grant(config.connect_grant);
+            .with_connect_grant(config.connect_grant)
+            .with_transport_pubkey(keys.public_key());
         let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
         Ok(Self::build(

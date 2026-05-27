@@ -181,6 +181,9 @@ pub struct NetworkConfig {
     pub frost_relays: Vec<String>,
     pub bunker_relays: Vec<String>,
     pub enabled: Arc<AtomicBool>,
+    /// Persisted NIP-46 secret embedded in the bunker URL and required in the
+    /// connect handshake. Clients (Amethyst, etc.) reject a secret-less URL.
+    pub bunker_secret: String,
 }
 
 /// What `spawn_network_frost` reports back once the co-signer is up.
@@ -222,7 +225,7 @@ pub fn spawn_network_frost(
 
             node.set_hooks(Arc::new(CoSignerPolicy {
                 events: events.clone(),
-                enabled: cfg.enabled,
+                enabled: cfg.enabled.clone(),
             }));
 
             // Mirror node lifecycle events (peer presence) into the web activity
@@ -269,6 +272,10 @@ pub fn spawn_network_frost(
                     // Least privilege for the co-signer: connect handshake +
                     // signing only, not NIP-04/44 encrypt/decrypt.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+                    // Authenticate clients with a stable secret (embedded in the
+                    // bunker URL) and gate signing on the live kill switch.
+                    expected_secret: Some(cfg.bunker_secret),
+                    kill_switch: Some(cfg.enabled.clone()),
                     ..ServerConfig::default()
                 },
             )

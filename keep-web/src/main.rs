@@ -189,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         frost_relays,
                         bunker_relays,
                         enabled: signing_enabled.clone(),
+                        bunker_secret: state::load_or_create_bunker_secret(&vault_path),
                     },
                     events.clone(),
                     approvals.clone(),

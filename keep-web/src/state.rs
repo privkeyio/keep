@@ -153,6 +153,26 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
     }
 }
 
+/// Loads the persisted NIP-46 bunker secret, generating and storing one on
+/// first run. The secret must be stable so the advertised bunker URL (which
+/// embeds it) doesn't change across restarts and saved client connections keep
+/// working.
+pub fn load_or_create_bunker_secret(vault_dir: &Path) -> String {
+    let path = vault_dir.join("bunker_secret");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let bytes: [u8; 16] = keep_core::crypto::random_bytes();
+    let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if let Err(e) = std::fs::write(&path, &secret) {
+        tracing::warn!(error = %e, path = %path.display(), "failed to persist bunker secret");
+    }
+    secret
+}
+
 /// An event pushed to connected WebSocket clients.
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
