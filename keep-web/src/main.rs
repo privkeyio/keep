@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault_path = PathBuf::from(env_or("KEEP_PATH", "/data"));
     let bunker_relays = parse_relays(&env_or(
         "KEEP_BUNKER_RELAY",
-        &env_or("KEEP_RELAY", "wss://relay.damus.io"),
+        &env_or("KEEP_RELAY", "wss://bucket.coracle.social"),
     ));
     let frost_group = std::env::var("KEEP_FROST_GROUP").ok();
     // Fail-closed: signing is off until the operator explicitly enables it
@@ -189,6 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         frost_relays,
                         bunker_relays,
                         enabled: signing_enabled.clone(),
+                        bunker_secret: state::load_or_create_bunker_secret(&vault_path)?,
+                        transport_key: state::load_or_create_transport_key(&vault_path)?,
                     },
                     events.clone(),
                     approvals.clone(),
@@ -210,8 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // keyring is intentionally left empty afterwards (the bunker is the
         // only thing that signs in this mode — don't read keep.keyring() below).
         let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
-        bunker::spawn_single_key(keyring, bunker_relays, events.clone(), approvals.clone())
-            .map_err(|e| format!("failed to start bunker: {e}"))?
+        let bunker_secret = state::load_or_create_bunker_secret(&vault_path)?;
+        bunker::spawn_single_key(
+            keyring,
+            bunker_relays,
+            bunker_secret,
+            events.clone(),
+            approvals.clone(),
+        )
+        .map_err(|e| format!("failed to start bunker: {e}"))?
     } else {
         // Nothing to sign with yet: serve the admin UI so the operator can
         // import a share, then restart the service to start the co-signer.

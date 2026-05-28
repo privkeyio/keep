@@ -106,6 +106,12 @@ pub struct SignerHandler {
     connect_grant: Permission,
     relay_urls: Vec<String>,
     kill_switch: Arc<AtomicBool>,
+    /// The transport (bunker URL) pubkey clients connect to. For a remote
+    /// signer this differs from the signing identity returned by
+    /// `get_public_key` (network-FROST: transport key vs group key), so the
+    /// `connect` handshake must validate the client's target against this, not
+    /// the signing pubkey.
+    transport_pubkey: Option<PublicKey>,
 }
 
 impl SignerHandler {
@@ -130,7 +136,13 @@ impl SignerHandler {
             connect_grant: Permission::DEFAULT,
             relay_urls: Vec::new(),
             kill_switch: Arc::new(AtomicBool::new(false)),
+            transport_pubkey: None,
         }
+    }
+
+    pub fn with_transport_pubkey(mut self, pubkey: PublicKey) -> Self {
+        self.transport_pubkey = Some(pubkey);
+        self
     }
 
     pub fn with_expected_secret(mut self, secret: String) -> Self {
@@ -318,7 +330,14 @@ impl SignerHandler {
         }
 
         if let Some(expected) = our_pubkey {
-            let actual = self.our_pubkey().await?;
+            // The client targets the transport (bunker URL) pubkey, which for a
+            // remote signer differs from the signing identity. Validate against
+            // the transport pubkey when known, falling back to the signing key
+            // (single-key mode, where they are the same).
+            let actual = match self.transport_pubkey {
+                Some(pk) => pk,
+                None => self.our_pubkey().await?,
+            };
             if expected != actual {
                 return Err(CryptoError::invalid_key("pubkey mismatch").into());
             }
@@ -769,6 +788,29 @@ mod tests {
 
         let result = handler
             .handle_connect(app_pubkey, Some(wrong_pubkey), None, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn transport_key_override_allows_connect() {
+        // A remote signer's transport (bunker URL) pubkey differs from its
+        // signing identity. A client targets the transport pubkey, so connect
+        // must validate against it, not `our_pubkey()`.
+        let transport = Keys::generate().public_key();
+        let handler = setup_handler().with_transport_pubkey(transport);
+        let app_pubkey = Keys::generate().public_key();
+
+        // `transport` differs from the keyring's signing key (our_pubkey()).
+        let result = handler
+            .handle_connect(app_pubkey, Some(transport), None, None)
+            .await;
+        assert!(result.is_ok());
+
+        // A target that is neither the transport nor signing key is rejected.
+        let other = Keys::generate().public_key();
+        let result = handler
+            .handle_connect(Keys::generate().public_key(), Some(other), None, None)
             .await;
         assert!(result.is_err());
     }

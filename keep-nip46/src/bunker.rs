@@ -14,9 +14,12 @@ pub fn generate_bunker_url(
     let mut url = format!("bunker://{}", pubkey.to_hex());
 
     for (i, relay_url) in relay_urls.iter().enumerate() {
-        let relay = urlencoding::encode(relay_url);
+        // Emit the relay unencoded (`relay=wss://...`): it's the de facto
+        // convention, and some clients (e.g. Amethyst Desktop) validate with a
+        // literal `relay=wss://` substring match and reject a percent-encoded
+        // one. The parser accepts both forms.
         let sep = if i == 0 { '?' } else { '&' };
-        url.push_str(&format!("{sep}relay={relay}"));
+        url.push_str(&format!("{sep}relay={relay_url}"));
     }
 
     if let Some(s) = secret {
@@ -188,6 +191,19 @@ mod tests {
         assert_eq!(pubkey, parsed_pk);
         assert_eq!(parsed_relays[0], relays[0]);
         assert_eq!(secret, Some("mysecret".into()));
+    }
+
+    #[test]
+    fn test_bunker_url_relay_is_unencoded() {
+        let keys = Keys::generate();
+        let url = generate_bunker_url(
+            &keys.public_key(),
+            &["wss://nos.lol".to_string()],
+            Some("abcdef0123456789"),
+        );
+        // Clients that do a literal `relay=wss://` check must find it.
+        assert!(url.contains("relay=wss://nos.lol"));
+        assert!(!url.contains("relay=wss%3A"));
     }
 
     #[test]

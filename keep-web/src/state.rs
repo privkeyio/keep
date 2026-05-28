@@ -153,6 +153,121 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
     }
 }
 
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Writes a credential file, creating it `0600` on Unix. Propagates IO errors:
+/// a credential that can't be persisted must fail startup, not silently rotate.
+///
+/// Writes to a sibling temp file, fsyncs, then atomically renames over the
+/// target, so a crash mid-write cannot leave a truncated/empty credential that a
+/// later boot would treat as missing and silently replace.
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    // Per-write temp name (PID + random suffix) so a concurrent writer cannot
+    // clobber an in-flight temp file before its rename.
+    let suffix: [u8; 8] = keep_core::crypto::random_bytes();
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), to_hex(&suffix)));
+
+    let write = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+
+    // On any failure before the rename succeeds, remove the temp so a crash or
+    // transient error cannot leave an unguessable, never-cleaned-up temp file.
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // fsync the parent directory so the rename itself is durable across a crash;
+    // otherwise the file could survive while the directory entry is lost.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Loads the persisted NIP-46 bunker secret, generating and storing one (`0600`)
+/// on first run. Must be stable so the advertised bunker URL (which embeds it)
+/// doesn't change across restarts. A write failure is propagated so startup
+/// fails rather than rotating to an ephemeral secret that breaks saved clients.
+pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String> {
+    let path = vault_dir.join("bunker_secret");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                // The file exists but is empty (e.g. a truncated write): fail
+                // closed rather than mint a new secret that would change the
+                // advertised bunker URL and break saved client connections.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bunker_secret file is empty; refusing to rotate credential",
+                ));
+            }
+            Ok(trimmed.to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes: [u8; 16] = keep_core::crypto::random_bytes();
+            let secret = to_hex(&bytes);
+            write_secret_file(&path, &secret)?;
+            Ok(secret)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Loads the persisted NIP-46 transport key (the bunker URL's own identity),
+/// generating and storing one (`0600`) on first run. Must be stable so the
+/// bunker URL's pubkey doesn't change across restarts and saved client
+/// connections keep working.
+pub fn load_or_create_transport_key(vault_dir: &Path) -> std::io::Result<[u8; 32]> {
+    let path = vault_dir.join("bunker_transport_key");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => decode_hex32(s.trim()).ok_or_else(|| {
+            // The file exists but is malformed (e.g. a truncated write): fail
+            // closed rather than mint a new key that would change the bunker
+            // URL's pubkey and break saved client connections.
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bunker_transport_key file is malformed; refusing to rotate identity",
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+            let hex = to_hex(&bytes);
+            write_secret_file(&path, &hex)?;
+            Ok(bytes)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// An event pushed to connected WebSocket clients.
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

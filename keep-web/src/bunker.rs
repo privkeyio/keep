@@ -41,6 +41,9 @@ fn recv_startup<T>(rx: Receiver<Result<T, String>>) -> Result<T, String> {
 struct WebCallbacks {
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
+    /// Kill switch (network-FROST only). When co-signing is off, sign requests
+    /// are refused without prompting; `None` for single-key (no kill switch).
+    signing_enabled: Option<Arc<AtomicBool>>,
 }
 
 /// Random, unguessable approval id (defense-in-depth alongside the auth gate).
@@ -61,6 +64,22 @@ impl ServerCallbacks for WebCallbacks {
     }
 
     fn request_approval(&self, request: ApprovalRequest) -> bool {
+        // Co-signing is off (kill switch): refuse signing without bothering the
+        // operator with a prompt that would only fail at the FROST layer.
+        if request.method == "sign_event"
+            && self
+                .signing_enabled
+                .as_ref()
+                .is_some_and(|e| !e.load(Ordering::SeqCst))
+        {
+            let _ = self.events.send(Event::Log {
+                app: "frost".into(),
+                action: "refused (co-signing disabled)".into(),
+                success: false,
+                detail: Some("enable co-signing to approve requests".into()),
+            });
+            return false;
+        }
         let id = random_approval_id();
         let (tx, rx) = channel();
         if let Ok(mut map) = self.approvals.lock() {
@@ -181,6 +200,12 @@ pub struct NetworkConfig {
     pub frost_relays: Vec<String>,
     pub bunker_relays: Vec<String>,
     pub enabled: Arc<AtomicBool>,
+    /// Persisted NIP-46 secret embedded in the bunker URL and required in the
+    /// connect handshake. Clients (Amethyst, etc.) reject a secret-less URL.
+    pub bunker_secret: String,
+    /// Persisted transport key = the bunker URL's pubkey identity. Stable so the
+    /// URL doesn't change across restarts and saved client connections survive.
+    pub transport_key: [u8; 32],
 }
 
 /// What `spawn_network_frost` reports back once the co-signer is up.
@@ -222,7 +247,7 @@ pub fn spawn_network_frost(
 
             node.set_hooks(Arc::new(CoSignerPolicy {
                 events: events.clone(),
-                enabled: cfg.enabled,
+                enabled: cfg.enabled.clone(),
             }));
 
             // Mirror node lifecycle events (peer presence) into the web activity
@@ -257,8 +282,14 @@ pub fn spawn_network_frost(
 
             let node_for_state = node.clone();
             let signer = NetworkFrostSigner::with_shared_node(cfg.group_pubkey, node);
-            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
+            // Persisted (not freshly generated) so the bunker URL pubkey is
+            // stable across restarts and saved client connections keep working.
+            let transport_key = cfg.transport_key;
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
+                events,
+                approvals,
+                signing_enabled: Some(cfg.enabled.clone()),
+            });
 
             let mut server = match Server::new_network_frost_with_config(
                 signer,
@@ -269,6 +300,12 @@ pub fn spawn_network_frost(
                     // Least privilege for the co-signer: connect handshake +
                     // signing only, not NIP-04/44 encrypt/decrypt.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+                    // Authenticate clients with a stable secret embedded in the
+                    // bunker URL. The kill switch is enforced at the FROST policy
+                    // layer (CoSignerPolicy) and the approval gate above; we do
+                    // not wire ServerConfig.kill_switch because its polarity is
+                    // inverted relative to `signing_enabled`.
+                    expected_secret: Some(cfg.bunker_secret),
                     ..ServerConfig::default()
                 },
             )
@@ -310,6 +347,7 @@ pub fn spawn_network_frost(
 pub fn spawn_single_key(
     keyring: Arc<Mutex<Keyring>>,
     relays: Vec<String>,
+    bunker_secret: String,
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
 ) -> Result<BunkerInfo, String> {
@@ -324,7 +362,11 @@ pub fn spawn_single_key(
             }
         };
         rt.block_on(async move {
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks { events, approvals });
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
+                events,
+                approvals,
+                signing_enabled: None,
+            });
             let mut server = match Server::new_with_config(
                 keyring,
                 None,
@@ -335,6 +377,9 @@ pub fn spawn_single_key(
                     // Least privilege for the single-key fallback: connect +
                     // signing only.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+                    // Same secret-in-URL handshake as the network path so
+                    // clients can authenticate.
+                    expected_secret: Some(bunker_secret),
                     ..ServerConfig::default()
                 },
             )

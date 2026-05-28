@@ -163,11 +163,15 @@ fn test_message_reordering_shares_before_commitments_complete() {
     let commit1 = generate_test_commitment(1);
     session.add_commitment(1, commit1).unwrap();
 
-    // Deserialization accepts any bytes; validation occurs at aggregation time
+    // Reordered relay delivery: participant 2's signature share arrives before
+    // its commitment. It must be buffered (not rejected) so the round can still
+    // complete once the commitment shows up — aggregation is gated separately on
+    // every participant having both a commitment and a share.
     let fake_share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
-
-    let err = session.add_signature_share(2, fake_share).unwrap_err();
-    assert!(err.to_string().contains("Not accepting"));
+    session
+        .add_signature_share(2, fake_share)
+        .expect("early share is buffered, not rejected");
+    assert!(!session.ready_to_aggregate());
 }
 
 #[test]
@@ -558,9 +562,13 @@ fn test_session_state_machine_integrity() {
 
     assert_eq!(session.state(), SessionState::AwaitingCommitments);
 
-    // Deserialization accepts any bytes; validation occurs at aggregation time
+    // A share arriving before any commitments (reordered relay delivery) is
+    // buffered, not rejected, and does not advance the commitment-driven state.
     let share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
-    assert!(session.add_signature_share(1, share).is_err());
+    session
+        .add_signature_share(1, share)
+        .expect("early share buffered");
+    assert_eq!(session.state(), SessionState::AwaitingCommitments);
 
     let commit1 = generate_test_commitment(1);
     session.add_commitment(1, commit1).unwrap();

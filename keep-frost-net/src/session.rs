@@ -166,7 +166,15 @@ impl NetworkSession {
             ));
         }
 
-        if self.state != SessionState::AwaitingCommitments {
+        // Accept commitments regardless of strict ordering. Real relays reorder
+        // events, so a participant's commitment can arrive after we've already
+        // started collecting shares (or after another participant's share).
+        // Only refuse once the session is settled; aggregation is separately
+        // gated on every participant having both a commitment and a share.
+        if matches!(
+            self.state(),
+            SessionState::Complete | SessionState::Failed | SessionState::Expired
+        ) {
             return Err(FrostNetError::Session("Not accepting commitments".into()));
         }
 
@@ -185,7 +193,9 @@ impl NetworkSession {
 
         self.commitments.insert(id, commitment);
 
-        if self.commitments.len() >= self.threshold as usize {
+        if self.state == SessionState::AwaitingCommitments
+            && self.commitments.len() >= self.threshold as usize
+        {
             self.state = SessionState::AwaitingShares;
         }
 
@@ -200,10 +210,23 @@ impl NetworkSession {
         self.commitments.len() >= self.threshold as usize
     }
 
+    /// Build the FROST signing package from the collected commitments.
+    ///
+    /// Correctness invariant (load-bearing now that delivery order is relaxed):
+    /// every signer must sign over the *identical* commitment subset. A
+    /// `SigningPackage` built from a different commitment set produces shares
+    /// that aggregation will reject. The session only admits exactly `threshold`
+    /// participants, so the commitment map must not exceed that count.
     pub fn get_signing_package(&self) -> Result<SigningPackage> {
         if !self.has_all_commitments() {
             return Err(FrostNetError::Session("Not enough commitments".into()));
         }
+
+        debug_assert!(
+            self.commitments.len() == self.threshold as usize,
+            "signing package must cover exactly `threshold` commitments; \
+             signers diverging on the commitment subset will fail aggregation"
+        );
 
         Ok(SigningPackage::new(self.commitments.clone(), &self.message))
     }
@@ -215,7 +238,13 @@ impl NetworkSession {
             ));
         }
 
-        if self.state != SessionState::AwaitingShares {
+        // Buffer shares even if a peer's share arrives before all commitments
+        // (relay reordering). Aggregation is gated on every participant having
+        // both a commitment and a share, so holding an early share is safe.
+        if matches!(
+            self.state(),
+            SessionState::Complete | SessionState::Failed | SessionState::Expired
+        ) {
             return Err(FrostNetError::Session("Not accepting shares".into()));
         }
 
@@ -245,8 +274,24 @@ impl NetworkSession {
         self.signature_shares.len() >= self.threshold as usize
     }
 
+    /// Every participant has provided both a commitment and a signature share,
+    /// so the commitment set and the share set match exactly — the precondition
+    /// for `frost::aggregate`. Gating on this (rather than a bare share count)
+    /// makes the coordinator tolerant of reordered relay delivery: a share that
+    /// arrives before its commitment is held until the commitment shows up,
+    /// instead of triggering an aggregate over a mismatched id set.
+    pub fn ready_to_aggregate(&self) -> bool {
+        self.participants.iter().all(|&p| {
+            Identifier::try_from(p)
+                .map(|id| {
+                    self.commitments.contains_key(&id) && self.signature_shares.contains_key(&id)
+                })
+                .unwrap_or(false)
+        })
+    }
+
     pub fn try_aggregate(&mut self, pubkey_pkg: &PublicKeyPackage) -> Result<Option<[u8; 64]>> {
-        if !self.has_all_shares() {
+        if !self.ready_to_aggregate() {
             return Ok(None);
         }
 
@@ -280,8 +325,20 @@ impl NetworkSession {
                 Ok(Some(result))
             }
             Err(e) => {
+                let commit_ids: Vec<String> = self
+                    .commitments
+                    .keys()
+                    .map(|id| hex::encode(id.serialize()))
+                    .collect();
+                let share_ids: Vec<String> = self
+                    .signature_shares
+                    .keys()
+                    .map(|id| hex::encode(id.serialize()))
+                    .collect();
                 self.state = SessionState::Failed;
-                Err(FrostNetError::Crypto(format!("Aggregation failed: {e}")))
+                Err(FrostNetError::Crypto(format!(
+                    "Aggregation failed: {e} (commitment_ids={commit_ids:?} share_ids={share_ids:?})"
+                )))
             }
         }
     }
@@ -760,6 +817,67 @@ mod tests {
 
         assert_eq!(session.state(), SessionState::AwaitingCommitments);
         assert_eq!(session.commitments_needed(), 2);
+    }
+
+    // Relays reorder events: a participant's signature share can arrive before
+    // its commitment. The session must buffer both and aggregate only once
+    // every participant has both — never aggregate a share whose commitment is
+    // missing (which used to produce `Aggregation failed: Unknown identifier`).
+    #[test]
+    fn test_aggregation_tolerates_reordered_share_before_commitment() {
+        use frost_secp256k1_tr::rand_core::OsRng;
+        use keep_core::frost::{ThresholdConfig, TrustedDealer};
+
+        let (shares, pubkey_pkg) = TrustedDealer::new(ThresholdConfig::two_of_three())
+            .generate("reorder-test")
+            .unwrap();
+
+        // Participants 1 and 2 (identifiers from shares[0], shares[1]).
+        let kp1 = shares[0].key_package().unwrap();
+        let kp2 = shares[1].key_package().unwrap();
+        let (nonces1, commit1) =
+            frost_secp256k1_tr::round1::commit(kp1.signing_share(), &mut OsRng);
+        let (nonces2, commit2) =
+            frost_secp256k1_tr::round1::commit(kp2.signing_share(), &mut OsRng);
+
+        let message = b"reorder message".to_vec();
+        let participants = vec![1u16, 2u16];
+        let threshold = 2u16;
+        let session_id = derive_session_id(&message, &participants, threshold);
+
+        // Both signers sign over the same full commitment set.
+        let mut commit_map = BTreeMap::new();
+        commit_map.insert(Identifier::try_from(1u16).unwrap(), commit1);
+        commit_map.insert(Identifier::try_from(2u16).unwrap(), commit2);
+        let signing_package = SigningPackage::new(commit_map, &message);
+        let share1 = frost_secp256k1_tr::round2::sign(&signing_package, &nonces1, &kp1).unwrap();
+        let share2 = frost_secp256k1_tr::round2::sign(&signing_package, &nonces2, &kp2).unwrap();
+
+        let mut session = NetworkSession::new(session_id, message, threshold, participants);
+
+        // Worst-case ordering: a share arrives before any commitment.
+        session.add_signature_share(1, share1).unwrap();
+        assert!(
+            session.try_aggregate(&pubkey_pkg).unwrap().is_none(),
+            "must not aggregate with a share but no matching commitment"
+        );
+
+        session.add_commitment(2, commit2).unwrap();
+        session.add_signature_share(2, share2).unwrap();
+        // Threshold shares present, but participant 1's commitment is still
+        // missing: must hold, not error.
+        assert!(
+            session.try_aggregate(&pubkey_pkg).unwrap().is_none(),
+            "must not aggregate until every participant has a commitment"
+        );
+
+        // The late commitment completes the set.
+        session.add_commitment(1, commit1).unwrap();
+        let sig = session
+            .try_aggregate(&pubkey_pkg)
+            .expect("aggregate must not error")
+            .expect("aggregate must produce a signature");
+        assert_eq!(sig.len(), 64);
     }
 
     #[test]

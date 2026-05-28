@@ -97,6 +97,48 @@ impl KfpNode {
         ))
     }
 
+    /// Build the complete group [`PublicKeyPackage`] for `participants`.
+    ///
+    /// A share imported from a transport export carries only its own verifying
+    /// share (the export does not include the other members' shares), so
+    /// `self.share.pubkey_package()` alone is missing the co-signers' verifying
+    /// shares that `frost::aggregate` needs to validate their signature shares —
+    /// without them aggregation fails with "Unknown identifier". Fill the gaps
+    /// from the verifying share each peer announced (authenticated via
+    /// proof-of-share on discovery), reconstructing the dealer's full package.
+    fn aggregation_pubkey_package(
+        &self,
+        participants: &[u16],
+    ) -> Result<frost_secp256k1_tr::keys::PublicKeyPackage> {
+        let base = self.share.pubkey_package()?;
+        let mut verifying_shares = base.verifying_shares().clone();
+        let peers = self.peers.read();
+        for &idx in participants {
+            let id = frost_secp256k1_tr::Identifier::try_from(idx)
+                .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier {idx}: {e}")))?;
+            if verifying_shares.contains_key(&id) {
+                continue;
+            }
+            let vs_bytes = peers
+                .get_peer(idx)
+                .and_then(|p| p.verifying_share)
+                .ok_or_else(|| {
+                    FrostNetError::Session(format!(
+                        "No announced verifying share for participant {idx}"
+                    ))
+                })?;
+            let vs =
+                frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vs_bytes).map_err(|e| {
+                    FrostNetError::Crypto(format!("Invalid verifying share {idx}: {e}"))
+                })?;
+            verifying_shares.insert(id, vs);
+        }
+        Ok(frost_secp256k1_tr::keys::PublicKeyPackage::new(
+            verifying_shares,
+            *base.verifying_key(),
+        ))
+    }
+
     /// Generate fresh round-1 nonces to top the local pool back up to its
     /// target and broadcast the matching commitments to online peers. Secret
     /// nonces are stored in memory only; only commitments leave this node.
@@ -661,56 +703,49 @@ impl KfpNode {
             }
         }
 
+        // A commitment can arrive after every signature share (relay reordering).
+        // In that case the share handler skipped aggregation because
+        // `ready_to_aggregate()` was still false; now that the last commitment is
+        // here, re-attempt aggregation so the session does not stall to timeout.
+        self.try_complete_signature(&payload.session_id)?;
+
         Ok(())
     }
 
-    pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
-        let key_package = self.share.key_package()?;
-
-        let (signing_package, nonces) = {
+    /// Attempt aggregation and emit `SignatureComplete` if every participant has
+    /// supplied both a commitment and a signature share. Safe to call from any
+    /// handler; it is a no-op while `ready_to_aggregate()` is false.
+    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<()> {
+        let completed = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
-                None => return Err(FrostNetError::SessionNotFound(hex::encode(session_id))),
+                None => return Ok(()),
             };
 
-            let signing_package = session.get_signing_package()?;
-            let nonces = session
-                .take_our_nonces()
-                .ok_or_else(|| FrostNetError::Session("No nonces stored for session".into()))?;
-
-            (signing_package, nonces)
-        };
-
-        let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
-            .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
-
-        let self_aggregated = {
-            let mut sessions = self.sessions.write();
-            if let Some(session) = sessions.get_session_mut(session_id) {
-                session.add_signature_share(self.share.metadata.identifier, sig_share)?;
-                if session.has_all_shares() {
-                    let pubkey_pkg = self.share.pubkey_package()?;
-                    let sig = session.try_aggregate(&pubkey_pkg)?;
-                    sig.map(|s| {
-                        (
-                            s,
-                            session.message().to_vec(),
-                            session.participants().to_vec(),
-                        )
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
+            // Idempotent: once aggregation has produced the signature the session
+            // is Complete. `ready_to_aggregate()` stays true (commitments/shares
+            // are never cleared), so without this guard a second call would
+            // re-aggregate and re-emit SignatureComplete / re-run the post-sign
+            // hook (e.g. broadcast the tx twice).
+            if session.is_complete() || !session.ready_to_aggregate() {
+                return Ok(());
             }
+
+            let pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
+            session.try_aggregate(&pubkey_pkg)?.map(|sig| {
+                (
+                    sig,
+                    session.message().to_vec(),
+                    session.participants().to_vec(),
+                )
+            })
         };
 
-        if let Some((sig, session_message, session_participants)) = self_aggregated {
+        if let Some((sig, session_message, session_participants)) = completed {
             info!(
                 session_id = %hex::encode(session_id),
-                "Signature complete (single-participant)!"
+                "Signature complete!"
             );
 
             self.audit_log.log_signing_operation(
@@ -728,8 +763,57 @@ impl KfpNode {
                 session_id: *session_id,
                 signature: sig,
             });
+        }
 
-            return Ok(());
+        Ok(())
+    }
+
+    pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
+        let key_package = self.share.key_package()?;
+
+        let (signing_package, nonces) = {
+            let mut sessions = self.sessions.write();
+            let session = match sessions.get_session_mut(session_id) {
+                Some(s) => s,
+                None => return Err(FrostNetError::SessionNotFound(hex::encode(session_id))),
+            };
+
+            let signing_package = session.get_signing_package()?;
+            // Single-use nonces: if they are already gone, another invocation for
+            // this session has produced and sent our share (e.g. a peer's
+            // commitment arriving after the pre-exchanged set already drove us
+            // into round 2). Treat the repeat as a no-op rather than failing the
+            // whole request on the consumed nonce — aggregation is still driven
+            // by the inbound signature-share handler.
+            let nonces = match session.take_our_nonces() {
+                Some(n) => n,
+                None => return Ok(()),
+            };
+
+            (signing_package, nonces)
+        };
+
+        let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
+            .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
+
+        {
+            let mut sessions = self.sessions.write();
+            if let Some(session) = sessions.get_session_mut(session_id) {
+                session.add_signature_share(self.share.metadata.identifier, sig_share)?;
+            }
+        }
+
+        // Our own share may complete the set (e.g. single-participant, or we were
+        // the last to commit+sign). Gate on `ready_to_aggregate()` so we never
+        // aggregate over a mismatched commitment/share id set under reordering.
+        self.try_complete_signature(session_id)?;
+        {
+            let sessions = self.sessions.read();
+            if let Some(session) = sessions.get_session(session_id) {
+                if session.is_complete() {
+                    return Ok(());
+                }
+            }
         }
 
         let share_bytes = sig_share.serialize();
@@ -791,50 +875,19 @@ impl KfpNode {
 
         self.peers.write().update_last_seen(payload.share_index);
 
-        let (signature, session_message, session_participants) = {
+        {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(&payload.session_id) {
                 Some(s) => s,
                 None => return Ok(()),
             };
-
-            let msg = session.message().to_vec();
-            let parts = session.participants().to_vec();
-
             session.add_signature_share(payload.share_index, sig_share)?;
-
-            let sig = if session.has_all_shares() {
-                let pubkey_pkg = self.share.pubkey_package()?;
-                session.try_aggregate(&pubkey_pkg)?
-            } else {
-                None
-            };
-
-            (sig, msg, parts)
-        };
-
-        if let Some(sig) = signature {
-            info!(
-                session_id = %hex::encode(payload.session_id),
-                "Signature complete!"
-            );
-
-            self.audit_log.log_signing_operation(
-                payload.session_id,
-                &session_message,
-                Some(&sig),
-                session_participants,
-                self.share.metadata.identifier,
-                SigningOperation::SignatureCompleted,
-            );
-
-            self.invoke_post_sign_hook(&payload.session_id, &sig);
-
-            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
-                session_id: payload.session_id,
-                signature: sig,
-            });
         }
+
+        // Aggregate only once every participant has both a commitment and a
+        // share; `try_complete_signature` gates on `ready_to_aggregate()` so a
+        // share arriving before its commitment is buffered rather than dropped.
+        self.try_complete_signature(&payload.session_id)?;
 
         Ok(())
     }
