@@ -50,8 +50,11 @@
   const pendingApprovals = $derived(approvals.filter((a) => !a.resolved))
   // Repeated identical events (e.g. periodic "peer online" announcements) are
   // coalesced into one line with a count so real signal isn't buried.
-  type CountedLog = LogEvent & { count: number; ts: number }
+  // `ts` is first-seen (drives relative time); `lastTs` tracks the latest repeat.
+  // `cid` is a stable client-side id for keyed list rendering.
+  type CountedLog = LogEvent & { count: number; ts: number; lastTs: number; cid: number }
   let logs = $state<CountedLog[]>([])
+  let logCid = 0
 
   let importData = $state('')
   let importPass = $state('')
@@ -163,10 +166,14 @@
     return npub.length > 24 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
   }
 
+  // How often relative timestamps re-render, and how often presence is polled.
+  const REL_TIME_TICK_MS = 30000
+  const PEERS_POLL_MS = 10000
+
   // Ticks so relative timestamps stay current without a new event.
   let nowTick = $state(Date.now())
   $effect(() => {
-    const t = setInterval(() => (nowTick = Date.now()), 30000)
+    const t = setInterval(() => (nowTick = Date.now()), REL_TIME_TICK_MS)
     return () => clearInterval(t)
   })
 
@@ -198,6 +205,24 @@
   let notifyEnabled = $state(canNotify && Notification.permission === 'granted')
   const notifiedApprovals = new Set<number>()
 
+  // Remote NIP-46 clients self-report app/method names; strip control chars and
+  // truncate before placing them in an OS notification to avoid spoofing.
+  function sanitizeForNotification(s: string): string {
+    return (s ?? '')
+      .normalize('NFC')
+      .split('')
+      .filter((ch) => {
+        const c = ch.charCodeAt(0)
+        if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return false // C0/C1 controls
+        if (c === 0x200b || c === 0x200c || c === 0x200d || c === 0xfeff) return false // zero-width
+        if (c >= 0x202a && c <= 0x202e) return false // bidi embedding/override
+        if (c >= 0x2066 && c <= 0x2069) return false // bidi isolates
+        return true
+      })
+      .join('')
+      .slice(0, 64)
+  }
+
   async function toggleNotify() {
     if (!canNotify) return
     if (Notification.permission === 'granted') {
@@ -208,13 +233,21 @@
   }
 
   $effect(() => {
+    // Drop ids that have aged out of the (capped) approvals list so the set
+    // can't grow unbounded on a long-running appliance tab.
+    const live = new Set(approvals.map((a) => a.id))
+    for (const id of notifiedApprovals) {
+      if (!live.has(id)) notifiedApprovals.delete(id)
+    }
     if (!notifyEnabled || !canNotify || Notification.permission !== 'granted') return
     for (const a of pendingApprovals) {
       if (notifiedApprovals.has(a.id)) continue
       notifiedApprovals.add(a.id)
       // Only nag when the page isn't visible; otherwise the banner suffices.
       if (document.hidden) {
-        new Notification('Keep: approval needed', { body: `${a.app} requests ${a.method}` })
+        new Notification('Keep: approval needed', {
+          body: `${sanitizeForNotification(a.app)} requests ${sanitizeForNotification(a.method)}`,
+        })
       }
     }
   })
@@ -397,7 +430,7 @@
   // without a triggering event.
   $effect(() => {
     if (!authed) return
-    const t = setInterval(refreshPeers, 10000)
+    const t = setInterval(refreshPeers, PEERS_POLL_MS)
     return () => clearInterval(t)
   })
 
@@ -423,9 +456,10 @@
             head.detail === e.detail &&
             head.success === e.success
           ) {
-            logs[0] = { ...head, count: head.count + 1, ts: Date.now() }
+            logs[0] = { ...head, count: head.count + 1, lastTs: Date.now() }
           } else {
-            logs = [{ ...e, count: 1, ts: Date.now() }, ...logs].slice(0, 100)
+            const now = Date.now()
+            logs = [{ ...e, count: 1, ts: now, lastTs: now, cid: logCid++ }, ...logs].slice(0, 100)
           }
           // A co-sign just happened: refresh the persistent audit log.
           if (e.app === 'frost') {
@@ -926,7 +960,7 @@
         <span class="muted">→ {a.resolved}</span>
       </div>
     {/each}
-    {#each logs as l, i (i)}
+    {#each logs as l (l.cid)}
       <div class="event">
         <strong>{l.app}</strong>: {l.action}
         <span class:fail={!l.success}>{l.success ? '✓' : '✗'}</span>
