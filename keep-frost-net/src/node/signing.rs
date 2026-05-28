@@ -12,7 +12,7 @@ use crate::audit::SigningOperation;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
-use crate::session::{derive_session_id, SessionState};
+use crate::session::derive_session_id;
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
@@ -723,7 +723,12 @@ impl KfpNode {
                 None => return Ok(()),
             };
 
-            if !session.ready_to_aggregate() {
+            // Idempotent: once aggregation has produced the signature the session
+            // is Complete. `ready_to_aggregate()` stays true (commitments/shares
+            // are never cleared), so without this guard a second call would
+            // re-aggregate and re-emit SignatureComplete / re-run the post-sign
+            // hook (e.g. broadcast the tx twice).
+            if session.is_complete() || !session.ready_to_aggregate() {
                 return Ok(());
             }
 
@@ -805,7 +810,7 @@ impl KfpNode {
         {
             let sessions = self.sessions.read();
             if let Some(session) = sessions.get_session(session_id) {
-                if matches!(session.state(), SessionState::Complete) {
+                if session.is_complete() {
                     return Ok(());
                 }
             }

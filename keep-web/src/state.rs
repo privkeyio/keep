@@ -153,32 +153,43 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
     }
 }
 
-/// Writes a credential file, creating it `0600` on Unix. Propagates IO errors:
-/// a credential that can't be persisted must fail startup, not silently rotate.
-/// Writes to a sibling temp file, fsyncs, then atomically renames over the
-/// target, so a crash mid-write cannot leave a truncated/empty credential that a
-/// later boot would treat as missing and silently replace.
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Writes a credential file, creating it `0600` on Unix. Propagates IO errors:
+/// a credential that can't be persisted must fail startup, not silently rotate.
+///
+/// Writes to a sibling temp file, fsyncs, then atomically renames over the
+/// target, so a crash mid-write cannot leave a truncated/empty credential that a
+/// later boot would treat as missing and silently replace.
 fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     // Per-write temp name (PID + random suffix) so a concurrent writer cannot
     // clobber an in-flight temp file before its rename.
     let suffix: [u8; 8] = keep_core::crypto::random_bytes();
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), to_hex(&suffix)));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+
+    let write = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+
+    // On any failure before the rename succeeds, remove the temp so a crash or
+    // transient error cannot leave an unguessable, never-cleaned-up temp file.
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    let mut f = opts.open(&tmp)?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
 
     // fsync the parent directory so the rename itself is durable across a crash;
     // otherwise the file could survive while the directory entry is lost.
