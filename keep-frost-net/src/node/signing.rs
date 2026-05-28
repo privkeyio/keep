@@ -127,8 +127,10 @@ impl KfpNode {
                         "No announced verifying share for participant {idx}"
                     ))
                 })?;
-            let vs = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vs_bytes)
-                .map_err(|e| FrostNetError::Crypto(format!("Invalid verifying share {idx}: {e}")))?;
+            let vs =
+                frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vs_bytes).map_err(|e| {
+                    FrostNetError::Crypto(format!("Invalid verifying share {idx}: {e}"))
+                })?;
             verifying_shares.insert(id, vs);
         }
         Ok(frost_secp256k1_tr::keys::PublicKeyPackage::new(
@@ -737,8 +739,7 @@ impl KfpNode {
             if let Some(session) = sessions.get_session_mut(session_id) {
                 session.add_signature_share(self.share.metadata.identifier, sig_share)?;
                 if session.has_all_shares() {
-                    let pubkey_pkg =
-                        self.aggregation_pubkey_package(session.participants())?;
+                    let pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
                     let sig = session.try_aggregate(&pubkey_pkg)?;
                     sig.map(|s| {
                         (

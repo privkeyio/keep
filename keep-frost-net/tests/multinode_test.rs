@@ -470,7 +470,9 @@ async fn test_imported_share_can_initiate_signing() {
     }
 
     let sign_result = timeout(Duration::from_secs(60), async {
-        node3.request_signature(b"imported-share signing".to_vec(), "raw").await
+        node3
+            .request_signature(b"imported-share signing".to_vec(), "raw")
+            .await
     })
     .await;
 
@@ -1386,9 +1388,15 @@ async fn test_repeated_signing() {
 
     let node3 = Arc::new(node3);
     let node3_for_run = Arc::clone(&node3);
-    let h1 = tokio::spawn(async move { let _ = node1.run().await; });
-    let h2 = tokio::spawn(async move { let _ = node2.run().await; });
-    let h3 = tokio::spawn(async move { let _ = node3_for_run.run().await; });
+    let h1 = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let h2 = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    let h3 = tokio::spawn(async move {
+        let _ = node3_for_run.run().await;
+    });
 
     let mut peers_discovered = 0u32;
     let discovered = timeout(Duration::from_secs(45), async {
@@ -1421,5 +1429,8 @@ async fn test_repeated_signing() {
     graceful_shutdown(shutdown2, h2).await;
     graceful_shutdown(shutdown3, h3).await;
 
-    assert!(failures.is_empty(), "repeated signing failures: {failures:#?}");
+    assert!(
+        failures.is_empty(),
+        "repeated signing failures: {failures:#?}"
+    );
 }

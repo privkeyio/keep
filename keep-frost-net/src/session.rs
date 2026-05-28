@@ -822,8 +822,10 @@ mod tests {
         // Participants 1 and 2 (identifiers from shares[0], shares[1]).
         let kp1 = shares[0].key_package().unwrap();
         let kp2 = shares[1].key_package().unwrap();
-        let (nonces1, commit1) = frost_secp256k1_tr::round1::commit(kp1.signing_share(), &mut OsRng);
-        let (nonces2, commit2) = frost_secp256k1_tr::round1::commit(kp2.signing_share(), &mut OsRng);
+        let (nonces1, commit1) =
+            frost_secp256k1_tr::round1::commit(kp1.signing_share(), &mut OsRng);
+        let (nonces2, commit2) =
+            frost_secp256k1_tr::round1::commit(kp2.signing_share(), &mut OsRng);
 
         let message = b"reorder message".to_vec();
         let participants = vec![1u16, 2u16];
@@ -838,8 +840,7 @@ mod tests {
         let share1 = frost_secp256k1_tr::round2::sign(&signing_package, &nonces1, &kp1).unwrap();
         let share2 = frost_secp256k1_tr::round2::sign(&signing_package, &nonces2, &kp2).unwrap();
 
-        let mut session =
-            NetworkSession::new(session_id, message, threshold, participants);
+        let mut session = NetworkSession::new(session_id, message, threshold, participants);
 
         // Worst-case ordering: a share arrives before any commitment.
         session.add_signature_share(1, share1).unwrap();
