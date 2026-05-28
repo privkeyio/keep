@@ -819,6 +819,95 @@ ol.tasks li {
   gap: 0.5rem;
 }
 
+/* Readiness pill + co-signer presence list. */
+.status-pill {
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.status-pill.ok {
+  color: var(--ok);
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+}
+
+.status-pill.warn {
+  color: var(--warn);
+  border-color: rgba(227, 179, 65, 0.3);
+  background: rgba(227, 179, 65, 0.1);
+}
+
+.status-pill.fail {
+  color: var(--no);
+  border-color: rgba(229, 83, 75, 0.3);
+  background: rgba(229, 83, 75, 0.1);
+}
+
+.cosigners {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.3rem 0;
+}
+
+.cosigners-label {
+  color: var(--faint);
+  min-width: 6rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.cosigner-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.cosigner-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+}
+
+/* Expandable signing-log session rows. */
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.session-row:hover {
+  background: var(--panel-2);
+}
+
+.caret {
+  color: var(--muted);
+  font-size: 0.7rem;
+  width: 0.8rem;
+}
+
+.session-detail {
+  padding: 0.25rem 0 0.5rem 1.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.op-row {
+  font-size: 0.8rem;
+  display: flex;
+  gap: 0.4rem;
+}
+
 /* Count of coalesced repeated activity lines (e.g. periodic announcements). */
 .count-badge {
   font-size: 0.72rem;

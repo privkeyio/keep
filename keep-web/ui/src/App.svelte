@@ -11,6 +11,7 @@
     getSigningLog,
     getKillswitch,
     setKillswitch,
+    getPeers,
     resolveApproval,
     connectEvents,
     hasAuthToken,
@@ -20,6 +21,7 @@
     type SigningEntry,
     type LogEvent,
     type ApprovalEvent,
+    type PeerInfo,
   } from './lib/api'
 
   let bunker = $state<BunkerInfo | null>(null)
@@ -66,6 +68,44 @@
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
   let wsConnected = $state(false)
+
+  // Live co-signer presence, polled so readiness is a glanceable status rather
+  // than something to reconstruct from the activity stream.
+  let peers = $state<PeerInfo[]>([])
+  let peersOnline = $state(0)
+
+  // Signing-log rows expand to show their underlying operations on demand.
+  let expandedSessions = $state<Record<string, boolean>>({})
+  function toggleSession(id: string) {
+    expandedSessions = { ...expandedSessions, [id]: !expandedSessions[id] }
+  }
+
+  function refreshPeers() {
+    getPeers()
+      .then((p) => {
+        peers = p.peers
+        peersOnline = p.online
+      })
+      .catch(() => {})
+  }
+
+  // Co-signers that must be online besides this node, parsed from "t-of-n".
+  const coSignersNeeded = $derived.by(() => {
+    const t = bunker?.threshold ? parseInt(bunker.threshold.split('-')[0], 10) : NaN
+    return Number.isFinite(t) ? Math.max(0, t - 1) : 0
+  })
+
+  type Readiness = { label: string; cls: 'ok' | 'warn' | 'fail' }
+  const readiness = $derived.by<Readiness>(() => {
+    if (signerRetired) return { label: 'Signer retired — restart required', cls: 'fail' }
+    if (signingEnabled === undefined) return { label: 'Checking…', cls: 'warn' }
+    if (signingEnabled === false) return { label: 'Co-signing off', cls: 'warn' }
+    if (peersOnline >= coSignersNeeded) return { label: 'Ready to sign', cls: 'ok' }
+    return {
+      label: `Waiting for co-signers (${peersOnline}/${coSignersNeeded})`,
+      cls: 'warn',
+    }
+  })
 
   // One row per signing session (the raw log has 3+ operations each). Status is
   // "signed" once a SignatureCompleted entry exists, otherwise "in progress".
@@ -149,6 +189,33 @@
       document.title = pendingApprovals.length
         ? `(${pendingApprovals.length}) Approval needed — Keep`
         : 'Keep'
+    }
+  })
+
+  // Optional OS-level notification when a request arrives while the tab is in
+  // the background — useful for an appliance you only glance at occasionally.
+  const canNotify = typeof Notification !== 'undefined'
+  let notifyEnabled = $state(canNotify && Notification.permission === 'granted')
+  const notifiedApprovals = new Set<number>()
+
+  async function toggleNotify() {
+    if (!canNotify) return
+    if (Notification.permission === 'granted') {
+      notifyEnabled = !notifyEnabled
+      return
+    }
+    notifyEnabled = (await Notification.requestPermission()) === 'granted'
+  }
+
+  $effect(() => {
+    if (!notifyEnabled || !canNotify || Notification.permission !== 'granted') return
+    for (const a of pendingApprovals) {
+      if (notifiedApprovals.has(a.id)) continue
+      notifiedApprovals.add(a.id)
+      // Only nag when the page isn't visible; otherwise the banner suffices.
+      if (document.hidden) {
+        new Notification('Keep: approval needed', { body: `${a.app} requests ${a.method}` })
+      }
     }
   })
 
@@ -323,7 +390,16 @@
         signingLoadError = String(err)
       })
     refreshSigningLog()
+    refreshPeers()
   }
+
+  // Poll presence while authed so an offline/online transition shows up even
+  // without a triggering event.
+  $effect(() => {
+    if (!authed) return
+    const t = setInterval(refreshPeers, 10000)
+    return () => clearInterval(t)
+  })
 
   function load() {
     refreshState()
@@ -352,7 +428,10 @@
             logs = [{ ...e, count: 1, ts: Date.now() }, ...logs].slice(0, 100)
           }
           // A co-sign just happened: refresh the persistent audit log.
-          if (e.app === 'frost') refreshSigningLog()
+          if (e.app === 'frost') {
+            refreshSigningLog()
+            refreshPeers()
+          }
         }
       },
       (connected) => {
@@ -600,6 +679,34 @@
           <strong>{bunker.threshold}</strong>
         </div>
       {/if}
+      {#if bunker.mode === 'network-frost'}
+        <div class="kv">
+          <span>
+            readiness{@render tip(
+              'Whether this node can sign right now: co-signing enabled and enough co-signers online.',
+            )}
+          </span>
+          <span class="status-pill {readiness.cls}">{readiness.label}</span>
+        </div>
+        <div class="cosigners">
+          <span class="cosigners-label">
+            co-signers{@render tip('Your other share-holders, and whether each is reachable now.')}
+          </span>
+          {#if peers.length === 0}
+            <span class="muted">none discovered yet</span>
+          {:else}
+            <ul class="cosigner-list">
+              {#each peers as p (p.share_index)}
+                <li>
+                  <span class="dot {p.online ? 'ok' : 'warn'}"></span>
+                  <span>share {p.share_index}{#if p.name} · {p.name}{/if}</span>
+                  <span class="muted">{p.online ? 'online' : 'offline'}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
       {#if bunker.group}
         {@render copyField(
           'group',
@@ -802,6 +909,15 @@
     <span class="verify {wsConnected ? 'ok' : 'fail'}">
       {wsConnected ? '● live' : '○ reconnecting…'}
     </span>
+    {#if canNotify}
+      <button
+        class="link-btn"
+        onclick={toggleNotify}
+        title="Get a desktop notification when an approval is waiting and this tab is in the background."
+      >
+        {notifyEnabled ? '🔔 notifications on' : '🔕 notify me'}
+      </button>
+    {/if}
   </h2>
   <div class="panel">
     {#each approvals.filter((a) => a.resolved) as a (a.id)}
@@ -837,7 +953,17 @@
   </h2>
   <div class="panel">
     {#each signingSessions as s (s.session)}
-      <div class="event">
+      <div
+        class="event session-row"
+        role="button"
+        tabindex="0"
+        aria-expanded={!!expandedSessions[s.session]}
+        onclick={() => toggleSession(s.session)}
+        onkeydown={(e) =>
+          (e.key === 'Enter' || e.key === ' ') &&
+          (e.preventDefault(), toggleSession(s.session))}
+      >
+        <span class="caret">{expandedSessions[s.session] ? '▾' : '▸'}</span>
         <span class="token">{s.session}</span>
         <span class="verify {s.completed ? 'ok' : 'warn'}">
           {s.completed ? '✓ signed' : '… in progress'}
@@ -846,6 +972,16 @@
           · participants {s.participants.join(',')} · {relTime(s.latest)}
         </span>
       </div>
+      {#if expandedSessions[s.session]}
+        <div class="session-detail">
+          {#each signingLog.filter((e) => e.session === s.session) as op (op.timestamp_ms + ':' + op.operation)}
+            <div class="op-row">
+              <span>{op.operation}</span>
+              <span class="muted">· {new Date(op.timestamp_ms).toLocaleString()}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     {:else}
       <p class="muted">No signatures recorded yet.</p>
     {/each}
