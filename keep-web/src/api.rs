@@ -251,6 +251,44 @@ pub async fn signing_log(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(Serialize)]
+pub struct PeerDto {
+    share_index: u16,
+    name: Option<String>,
+    online: bool,
+}
+
+#[derive(Serialize)]
+pub struct PeersResponse {
+    peers: Vec<PeerDto>,
+    /// Co-signer peers currently online (this node is not counted).
+    online: usize,
+}
+
+/// Live co-signer presence, so the UI can show readiness as a status instead of
+/// reconstructing it from the activity stream. Empty in setup/single-key mode.
+pub async fn peers(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(node) = state.node.as_ref() else {
+        return Json(PeersResponse {
+            peers: Vec::new(),
+            online: 0,
+        })
+        .into_response();
+    };
+    let mut peers: Vec<PeerDto> = node
+        .peer_status()
+        .into_iter()
+        .map(|(share_index, status, name, _pubkey)| PeerDto {
+            share_index,
+            name,
+            online: status == keep_frost_net::PeerStatus::Online,
+        })
+        .collect();
+    peers.sort_by_key(|p| p.share_index);
+    let online = peers.iter().filter(|p| p.online).count();
+    Json(PeersResponse { peers, online }).into_response()
+}
+
+#[derive(Serialize)]
 pub struct KillswitchStatus {
     enabled: bool,
     /// True once the active share was deleted at runtime: signing is locked off

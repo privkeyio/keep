@@ -257,6 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/shares/delete", post(api::delete_share))
         .route("/api/shares/rename", post(api::rename_share))
         .route("/api/signing-log", get(api::signing_log))
+        .route("/api/peers", get(api::peers))
         .route(
             "/api/killswitch",
             get(api::killswitch_status).post(api::set_killswitch),

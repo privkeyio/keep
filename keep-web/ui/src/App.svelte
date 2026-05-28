@@ -11,6 +11,7 @@
     getSigningLog,
     getKillswitch,
     setKillswitch,
+    getPeers,
     resolveApproval,
     connectEvents,
     hasAuthToken,
@@ -20,6 +21,7 @@
     type SigningEntry,
     type LogEvent,
     type ApprovalEvent,
+    type PeerInfo,
   } from './lib/api'
 
   let bunker = $state<BunkerInfo | null>(null)
@@ -43,7 +45,16 @@
 
   type PendingApproval = ApprovalEvent & { resolved?: 'approved' | 'denied' }
   let approvals = $state<PendingApproval[]>([])
-  let logs = $state<LogEvent[]>([])
+  // Still-unresolved requests, surfaced in a prominent banner so they aren't
+  // missed in the activity stream.
+  const pendingApprovals = $derived(approvals.filter((a) => !a.resolved))
+  // Repeated identical events (e.g. periodic "peer online" announcements) are
+  // coalesced into one line with a count so real signal isn't buried.
+  // `ts` is first-seen (drives relative time).
+  // `cid` is a stable client-side id for keyed list rendering.
+  type CountedLog = LogEvent & { count: number; ts: number; cid: number }
+  let logs = $state<CountedLog[]>([])
+  let logCid = 0
 
   let importData = $state('')
   let importPass = $state('')
@@ -60,6 +71,71 @@
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
   let wsConnected = $state(false)
+
+  // Live co-signer presence, polled so readiness is a glanceable status rather
+  // than something to reconstruct from the activity stream.
+  let peers = $state<PeerInfo[]>([])
+  let peersOnline = $state(0)
+
+  // Signing-log rows expand to show their underlying operations on demand.
+  let expandedSessions = $state<Record<string, boolean>>({})
+  function toggleSession(id: string) {
+    expandedSessions = { ...expandedSessions, [id]: !expandedSessions[id] }
+  }
+
+  function refreshPeers() {
+    getPeers()
+      .then((p) => {
+        peers = p.peers
+        peersOnline = p.online
+      })
+      .catch(() => {})
+  }
+
+  // Co-signers that must be online besides this node, parsed from "t-of-n".
+  const coSignersNeeded = $derived.by(() => {
+    const t = bunker?.threshold ? parseInt(bunker.threshold.split('-')[0], 10) : NaN
+    return Number.isFinite(t) ? Math.max(0, t - 1) : 0
+  })
+
+  type Readiness = { label: string; cls: 'ok' | 'warn' | 'fail' }
+  const readiness = $derived.by<Readiness>(() => {
+    if (signerRetired) return { label: 'Signer retired — restart required', cls: 'fail' }
+    if (signingEnabled === undefined) return { label: 'Checking…', cls: 'warn' }
+    if (signingEnabled === false) return { label: 'Co-signing off', cls: 'warn' }
+    if (peersOnline >= coSignersNeeded) return { label: 'Ready to sign', cls: 'ok' }
+    return {
+      label: `Waiting for co-signers (${peersOnline}/${coSignersNeeded})`,
+      cls: 'warn',
+    }
+  })
+
+  // One row per signing session (the raw log has 3+ operations each). Status is
+  // "signed" once a SignatureCompleted entry exists, otherwise "in progress".
+  type SigningSession = {
+    session: string
+    participants: number[]
+    completed: boolean
+    latest: number
+    ops: SigningEntry[]
+  }
+  const signingSessions = $derived.by<SigningSession[]>(() => {
+    const byId = new Map<string, SigningSession>()
+    for (const e of signingLog) {
+      const g = byId.get(e.session) ?? {
+        session: e.session,
+        participants: e.participants,
+        completed: false,
+        latest: e.timestamp_ms,
+        ops: [],
+      }
+      if (e.operation === 'SignatureCompleted') g.completed = true
+      g.latest = Math.max(g.latest, e.timestamp_ms)
+      g.ops.push(e)
+      byId.set(e.session, g)
+    }
+    return [...byId.values()].sort((a, b) => b.latest - a.latest)
+  })
 
   // Per-share export UI state.
   let exportFor = $state<string | null>(null) // "group:id"
@@ -89,9 +165,99 @@
     return new Date(secs * 1000).toLocaleString()
   }
 
+  function fmtTime(ms: number): string {
+    return new Date(ms).toLocaleString()
+  }
+
   function shortNpub(npub: string): string {
     return npub.length > 24 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
   }
+
+  // How often relative timestamps re-render, and how often presence is polled.
+  const REL_TIME_TICK_MS = 30000
+  const PEERS_POLL_MS = 10000
+
+  // Ticks so relative timestamps stay current without a new event.
+  let nowTick = $state(Date.now())
+  $effect(() => {
+    const t = setInterval(() => (nowTick = Date.now()), REL_TIME_TICK_MS)
+    return () => clearInterval(t)
+  })
+
+  // Relative time for activity/log rows; full timestamp shown on hover.
+  function relTime(ms: number): string {
+    const s = Math.max(0, Math.round((nowTick - ms) / 1000))
+    if (s < 5) return 'just now'
+    if (s < 60) return `${s}s ago`
+    const m = Math.round(s / 60)
+    if (m < 60) return `${m}m ago`
+    const h = Math.round(m / 60)
+    if (h < 24) return `${h}h ago`
+    return new Date(ms).toLocaleDateString()
+  }
+
+  // Surface pending approvals in the tab title so a backgrounded tab still
+  // shows that a co-sign decision is waiting.
+  $effect(() => {
+    if (typeof document !== 'undefined') {
+      document.title = pendingApprovals.length
+        ? `(${pendingApprovals.length}) Approval needed — Keep`
+        : 'Keep'
+    }
+  })
+
+  // Optional OS-level notification when a request arrives while the tab is in
+  // the background — useful for an appliance you only glance at occasionally.
+  const canNotify = typeof Notification !== 'undefined'
+  let notifyEnabled = $state(canNotify && Notification.permission === 'granted')
+  const notifiedApprovals = new Set<number>()
+
+  // Remote NIP-46 clients self-report app/method names; strip control chars and
+  // truncate before placing them in an OS notification to avoid spoofing.
+  function sanitizeForNotification(s: string): string {
+    return (s ?? '')
+      .normalize('NFC')
+      .split('')
+      .filter((ch) => {
+        const c = ch.charCodeAt(0)
+        if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return false // C0/C1 controls
+        if (c === 0x200b || c === 0x200c || c === 0x200d || c === 0xfeff) return false // zero-width
+        if (c >= 0x202a && c <= 0x202e) return false // bidi embedding/override
+        if (c >= 0x2066 && c <= 0x2069) return false // bidi isolates
+        return true
+      })
+      .join('')
+      .slice(0, 64)
+  }
+
+  async function toggleNotify() {
+    if (!canNotify) return
+    if (Notification.permission === 'granted') {
+      notifyEnabled = !notifyEnabled
+      return
+    }
+    notifyEnabled = (await Notification.requestPermission()) === 'granted'
+  }
+
+  $effect(() => {
+    // Drop ids that have aged out of the (capped) approvals list so the set
+    // can't grow unbounded on a long-running appliance tab.
+    const live = new Set(approvals.map((a) => a.id))
+    for (const id of notifiedApprovals) {
+      if (!live.has(id)) notifiedApprovals.delete(id)
+    }
+    if (!notifyEnabled || !canNotify || Notification.permission !== 'granted') return
+    for (const a of pendingApprovals) {
+      if (notifiedApprovals.has(a.id)) continue
+      notifiedApprovals.add(a.id)
+      // Only nag when the page isn't visible; otherwise the banner suffices.
+      if (document.hidden) {
+        new Notification('Keep: approval needed', {
+          body: `${sanitizeForNotification(a.app)} requests ${sanitizeForNotification(a.method)}`,
+        })
+      }
+    }
+  })
 
   // Shares grouped by their FROST group, so a vault holding more than one
   // group renders as separate sections instead of one flat pile.
@@ -264,7 +430,16 @@
         signingLoadError = String(err)
       })
     refreshSigningLog()
+    refreshPeers()
   }
+
+  // Poll presence while authed so an offline/online transition shows up even
+  // without a triggering event.
+  $effect(() => {
+    if (!authed) return
+    const t = setInterval(refreshPeers, PEERS_POLL_MS)
+    return () => clearInterval(t)
+  })
 
   function load() {
     refreshState()
@@ -280,9 +455,23 @@
           const resolved = next.filter((x) => x.resolved)
           approvals = [...pending, ...resolved].slice(0, 100)
         } else {
-          logs = [e, ...logs].slice(0, 100)
+          const head = logs[0]
+          if (
+            head &&
+            head.app === e.app &&
+            head.action === e.action &&
+            head.detail === e.detail &&
+            head.success === e.success
+          ) {
+            logs[0] = { ...head, count: head.count + 1 }
+          } else {
+            logs = [{ ...e, count: 1, ts: Date.now(), cid: logCid++ }, ...logs].slice(0, 100)
+          }
           // A co-sign just happened: refresh the persistent audit log.
-          if (e.app === 'frost') refreshSigningLog()
+          if (e.app === 'frost') {
+            refreshSigningLog()
+            refreshPeers()
+          }
         }
       },
       (connected) => {
@@ -393,6 +582,24 @@
 <main>
   {#if error}
     <p class="fail banner">{error}</p>
+  {/if}
+
+  {#if authed && pendingApprovals.length}
+    <div class="approval-bar" role="alert" aria-live="assertive">
+      {#each pendingApprovals as a (a.id)}
+        <div class="approval-bar-row">
+          <span class="approval-bar-text">
+            <strong>{a.app}</strong> requests <strong>{a.method}</strong>{#if a.kind !== null}
+              · kind {a.kind}{/if}
+            {#if a.preview}<span class="muted"> · {a.preview}</span>{/if}
+          </span>
+          <span class="approval-bar-actions">
+            <button class="ok" onclick={() => decide(a, true)}>Approve</button>
+            <button class="no" onclick={() => decide(a, false)}>Deny</button>
+          </span>
+        </div>
+      {/each}
+    </div>
   {/if}
 
   {#if !authed}
@@ -510,6 +717,34 @@
             )}
           </span>
           <strong>{bunker.threshold}</strong>
+        </div>
+      {/if}
+      {#if bunker.mode === 'network-frost'}
+        <div class="kv">
+          <span>
+            readiness{@render tip(
+              'Whether this node can sign right now: co-signing enabled and enough co-signers online.',
+            )}
+          </span>
+          <span class="status-pill {readiness.cls}">{readiness.label}</span>
+        </div>
+        <div class="cosigners">
+          <span class="cosigners-label">
+            co-signers{@render tip('Your other share-holders, and whether each is reachable now.')}
+          </span>
+          {#if peers.length === 0}
+            <span class="muted">none discovered yet</span>
+          {:else}
+            <ul class="cosigner-list">
+              {#each peers as p (p.share_index)}
+                <li>
+                  <span class="dot {p.online ? 'ok' : 'warn'}"></span>
+                  <span>share {p.share_index}{#if p.name} · {p.name}{/if}</span>
+                  <span class="muted">{p.online ? 'online' : 'offline'}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
       {/if}
       {#if bunker.group}
@@ -714,27 +949,35 @@
     <span class="verify {wsConnected ? 'ok' : 'fail'}">
       {wsConnected ? '● live' : '○ reconnecting…'}
     </span>
+    {#if canNotify}
+      <button
+        class="link-btn"
+        onclick={toggleNotify}
+        title="Get a desktop notification when an approval is waiting and this tab is in the background."
+      >
+        {notifyEnabled ? '🔔 notifications on' : '🔕 notify me'}
+      </button>
+    {/if}
   </h2>
   <div class="panel">
-    {#each approvals as a (a.id)}
+    {#each approvals.filter((a) => a.resolved) as a (a.id)}
       <div class="event approval">
-        <span><strong>{a.app}</strong> requests {a.method}</span>
-        {#if a.resolved}
-          <span class="muted">→ {a.resolved}</span>
-        {:else}
-          <button class="ok" onclick={() => decide(a, true)}>Approve</button>
-          <button class="no" onclick={() => decide(a, false)}>Deny</button>
-        {/if}
+        <span><strong>{a.app}</strong> requested {a.method}</span>
+        <span class="muted">→ {a.resolved}</span>
       </div>
     {/each}
-    {#each logs as l, i (i)}
+    {#each logs as l (l.cid)}
       <div class="event">
         <strong>{l.app}</strong>: {l.action}
         <span class:fail={!l.success}>{l.success ? '✓' : '✗'}</span>
+        {#if l.count > 1}<span class="count-badge">×{l.count}</span>{/if}
         {#if l.detail}<span class="muted"> · {l.detail}</span>{/if}
+        <span class="muted row-time" title={fmtTime(l.ts)}>
+          · {relTime(l.ts)}
+        </span>
       </div>
     {/each}
-    {#if approvals.length === 0 && logs.length === 0}
+    {#if approvals.every((a) => !a.resolved) && logs.length === 0}
       <p class="muted">Waiting for signing activity…</p>
     {/if}
   </div>
@@ -749,16 +992,36 @@
     {/if}
   </h2>
   <div class="panel">
-    {#each signingLog as e (e.timestamp_ms + ':' + e.session + ':' + e.operation)}
-      <div class="event">
-        <span class="token">{e.session}</span>
-        <span>{e.operation}</span>
-        <span class="muted">
-          · participants {e.participants.join(',')} · {new Date(
-            e.timestamp_ms,
-          ).toLocaleString()}
+    {#each signingSessions as s (s.session)}
+      <div
+        class="event session-row"
+        role="button"
+        tabindex="0"
+        aria-expanded={!!expandedSessions[s.session]}
+        onclick={() => toggleSession(s.session)}
+        onkeydown={(e) =>
+          (e.key === 'Enter' || e.key === ' ') &&
+          (e.preventDefault(), toggleSession(s.session))}
+      >
+        <span class="caret">{expandedSessions[s.session] ? '▾' : '▸'}</span>
+        <span class="token">{s.session}</span>
+        <span class="verify {s.completed ? 'ok' : 'warn'}">
+          {s.completed ? '✓ signed' : '… in progress'}
+        </span>
+        <span class="muted" title={fmtTime(s.latest)}>
+          · participants {s.participants.join(',')} · {relTime(s.latest)}
         </span>
       </div>
+      {#if expandedSessions[s.session]}
+        <div class="session-detail">
+          {#each s.ops as op (op.timestamp_ms + ':' + op.operation)}
+            <div class="op-row">
+              <span>{op.operation}</span>
+              <span class="muted">· {fmtTime(op.timestamp_ms)}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     {:else}
       <p class="muted">No signatures recorded yet.</p>
     {/each}

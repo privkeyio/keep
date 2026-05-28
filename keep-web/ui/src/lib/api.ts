@@ -144,6 +144,23 @@ export async function getSigningLog(): Promise<{
   return r.json()
 }
 
+export interface PeerInfo {
+  share_index: number
+  name: string | null
+  online: boolean
+}
+
+export interface PeersResponse {
+  peers: PeerInfo[]
+  online: number
+}
+
+export async function getPeers(): Promise<PeersResponse> {
+  const r = await api('/api/peers')
+  if (!r.ok) throw new Error(`peers: ${r.status}`)
+  return r.json()
+}
+
 export interface KillswitchStatus {
   enabled: boolean
   retired: boolean
