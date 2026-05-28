@@ -155,8 +155,12 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
 
 /// Writes a credential file, creating it `0600` on Unix. Propagates IO errors:
 /// a credential that can't be persisted must fail startup, not silently rotate.
+/// Writes to a sibling temp file, fsyncs, then atomically renames over the
+/// target, so a crash mid-write cannot leave a truncated/empty credential that a
+/// later boot would treat as missing and silently replace.
 fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
+    let tmp = path.with_extension("tmp");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -164,9 +168,10 @@ fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
+    let mut f = opts.open(&tmp)?;
     f.write_all(contents.as_bytes())?;
-    f.flush()
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {
@@ -186,16 +191,28 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
 /// fails rather than rotating to an ephemeral secret that breaks saved clients.
 pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String> {
     let path = vault_dir.join("bunker_secret");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                // The file exists but is empty (e.g. a truncated write): fail
+                // closed rather than mint a new secret that would change the
+                // advertised bunker URL and break saved client connections.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bunker_secret file is empty; refusing to rotate credential",
+                ));
+            }
+            Ok(trimmed.to_string())
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes: [u8; 16] = keep_core::crypto::random_bytes();
+            let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            write_secret_file(&path, &secret)?;
+            Ok(secret)
+        }
+        Err(e) => Err(e),
     }
-    let bytes: [u8; 16] = keep_core::crypto::random_bytes();
-    let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    write_secret_file(&path, &secret)?;
-    Ok(secret)
 }
 
 /// Loads the persisted NIP-46 transport key (the bunker URL's own identity),
@@ -204,15 +221,24 @@ pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String>
 /// connections keep working.
 pub fn load_or_create_transport_key(vault_dir: &Path) -> std::io::Result<[u8; 32]> {
     let path = vault_dir.join("bunker_transport_key");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        if let Some(bytes) = decode_hex32(s.trim()) {
-            return Ok(bytes);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => decode_hex32(s.trim()).ok_or_else(|| {
+            // The file exists but is malformed (e.g. a truncated write): fail
+            // closed rather than mint a new key that would change the bunker
+            // URL's pubkey and break saved client connections.
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bunker_transport_key file is malformed; refusing to rotate identity",
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            write_secret_file(&path, &hex)?;
+            Ok(bytes)
         }
+        Err(e) => Err(e),
     }
-    let bytes: [u8; 32] = keep_core::crypto::random_bytes();
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    write_secret_file(&path, &hex)?;
-    Ok(bytes)
 }
 
 /// An event pushed to connected WebSocket clients.

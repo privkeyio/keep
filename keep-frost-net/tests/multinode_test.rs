@@ -1391,7 +1391,7 @@ async fn test_repeated_signing() {
     let h3 = tokio::spawn(async move { let _ = node3_for_run.run().await; });
 
     let mut peers_discovered = 0u32;
-    let _ = timeout(Duration::from_secs(45), async {
+    let discovered = timeout(Duration::from_secs(45), async {
         while peers_discovered < 2 {
             if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
                 peers_discovered += 1;
@@ -1399,6 +1399,12 @@ async fn test_repeated_signing() {
         }
     })
     .await;
+    if discovered.is_err() {
+        graceful_shutdown(shutdown1, h1).await;
+        graceful_shutdown(shutdown2, h2).await;
+        graceful_shutdown(shutdown3, h3).await;
+        panic!("peer discovery timed out: only {peers_discovered} peers discovered");
+    }
 
     let mut failures = Vec::new();
     for i in 0..6u32 {
