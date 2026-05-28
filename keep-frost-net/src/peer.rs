@@ -125,6 +125,10 @@ impl PeerManager {
         self
     }
 
+    pub fn offline_threshold(&self) -> Duration {
+        self.offline_threshold
+    }
+
     pub fn add_peer(&mut self, mut peer: Peer) {
         if peer.share_index != self.our_share_index {
             // PeerAnnounce carries no recovery xpubs; preserve any previously

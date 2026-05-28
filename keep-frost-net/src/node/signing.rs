@@ -960,6 +960,32 @@ impl KfpNode {
         message: Vec<u8>,
         message_type: &str,
     ) -> Result<[u8; 64]> {
+        // Fast path first: pre-exchanged ("instant-signing") nonces. If a peer
+        // reports `stale_nonce`/`incomplete_pre_exchange` — it rotated or
+        // restarted, so a pooled commitment we referenced no longer maps to a
+        // live secret — drop the suspect pooled commitments and retry once with a
+        // fresh interactive commitment round, which cannot go stale.
+        match self
+            .signing_round(message.clone(), message_type, true)
+            .await
+        {
+            Err(FrostNetError::Session(ref e))
+                if e.contains("stale_nonce") || e.contains("incomplete_pre_exchange") =>
+            {
+                self.nonce_pool.clear_all_peers();
+                warn!("pre-exchanged nonce unusable; retrying with a live commitment round");
+                self.signing_round(message, message_type, false).await
+            }
+            other => other,
+        }
+    }
+
+    async fn signing_round(
+        &self,
+        message: Vec<u8>,
+        message_type: &str,
+        use_pre_exchange: bool,
+    ) -> Result<[u8; 64]> {
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
@@ -989,7 +1015,11 @@ impl KfpNode {
         // peer has a pooled commitment, reserve them (single-use; removed from
         // the pool) so the interactive commitment round can be skipped.
         let peer_indices: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
-        let reserved = self.nonce_pool.reserve_for(&peer_indices);
+        let reserved = if use_pre_exchange {
+            self.nonce_pool.reserve_for(&peer_indices)
+        } else {
+            None
+        };
         // If any step below fails after reservation, the reserved commitments
         // must go back into the pool so they are not leaked permanently.
         let mut reservation_guard = ReservationGuard::new(&self.nonce_pool, reserved.clone());

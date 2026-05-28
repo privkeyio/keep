@@ -223,6 +223,16 @@ impl NoncePool {
         Some(commitment)
     }
 
+    /// Drop every stored peer commitment. Used after a peer reports a stale
+    /// pre-exchanged nonce (it rotated/restarted): the pooled commitments can no
+    /// longer be trusted to map to live secrets, so clear them and let peers
+    /// repopulate from fresh broadcasts.
+    pub fn clear_all_peers(&self) {
+        let mut inner = self.inner.lock();
+        inner.peer.clear();
+        inner.peer_order.clear();
+    }
+
     /// Reserve one available commitment per requested peer for a signing
     /// request, returning the chosen `nonce_id`s. The commitments are *removed*
     /// from the pool so they cannot be reused.

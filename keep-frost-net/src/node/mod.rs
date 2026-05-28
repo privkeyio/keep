@@ -847,11 +847,23 @@ impl KfpNode {
     }
 
     pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
-        self.peers
-            .read()
+        let peers = self.peers.read();
+        let threshold = peers.offline_threshold();
+        peers
             .all_peers()
             .iter()
-            .map(|p| (p.share_index, p.status.clone(), p.name.clone(), p.pubkey))
+            .map(|p| {
+                // Report presence from the last-seen timeout, not the stored
+                // status flag: a peer that simply stops announcing is never
+                // explicitly marked offline, so the raw flag would stay
+                // "online" forever (showing a vanished co-signer as available).
+                let status = if p.is_online(threshold) {
+                    PeerStatus::Online
+                } else {
+                    PeerStatus::Offline
+                };
+                (p.share_index, status, p.name.clone(), p.pubkey)
+            })
             .collect()
     }
 
