@@ -312,8 +312,20 @@ impl NetworkSession {
                 Ok(Some(result))
             }
             Err(e) => {
+                let commit_ids: Vec<String> = self
+                    .commitments
+                    .keys()
+                    .map(|id| hex::encode(id.serialize()))
+                    .collect();
+                let share_ids: Vec<String> = self
+                    .signature_shares
+                    .keys()
+                    .map(|id| hex::encode(id.serialize()))
+                    .collect();
                 self.state = SessionState::Failed;
-                Err(FrostNetError::Crypto(format!("Aggregation failed: {e}")))
+                Err(FrostNetError::Crypto(format!(
+                    "Aggregation failed: {e} (commitment_ids={commit_ids:?} share_ids={share_ids:?})"
+                )))
             }
         }
     }

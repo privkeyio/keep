@@ -97,6 +97,46 @@ impl KfpNode {
         ))
     }
 
+    /// Build the complete group [`PublicKeyPackage`] for `participants`.
+    ///
+    /// A share imported from a transport export carries only its own verifying
+    /// share (the export does not include the other members' shares), so
+    /// `self.share.pubkey_package()` alone is missing the co-signers' verifying
+    /// shares that `frost::aggregate` needs to validate their signature shares —
+    /// without them aggregation fails with "Unknown identifier". Fill the gaps
+    /// from the verifying share each peer announced (authenticated via
+    /// proof-of-share on discovery), reconstructing the dealer's full package.
+    fn aggregation_pubkey_package(
+        &self,
+        participants: &[u16],
+    ) -> Result<frost_secp256k1_tr::keys::PublicKeyPackage> {
+        let base = self.share.pubkey_package()?;
+        let mut verifying_shares = base.verifying_shares().clone();
+        let peers = self.peers.read();
+        for &idx in participants {
+            let id = frost_secp256k1_tr::Identifier::try_from(idx)
+                .map_err(|e| FrostNetError::Crypto(format!("Invalid identifier {idx}: {e}")))?;
+            if verifying_shares.contains_key(&id) {
+                continue;
+            }
+            let vs_bytes = peers
+                .get_peer(idx)
+                .and_then(|p| p.verifying_share)
+                .ok_or_else(|| {
+                    FrostNetError::Session(format!(
+                        "No announced verifying share for participant {idx}"
+                    ))
+                })?;
+            let vs = frost_secp256k1_tr::keys::VerifyingShare::deserialize(&vs_bytes)
+                .map_err(|e| FrostNetError::Crypto(format!("Invalid verifying share {idx}: {e}")))?;
+            verifying_shares.insert(id, vs);
+        }
+        Ok(frost_secp256k1_tr::keys::PublicKeyPackage::new(
+            verifying_shares,
+            *base.verifying_key(),
+        ))
+    }
+
     /// Generate fresh round-1 nonces to top the local pool back up to its
     /// target and broadcast the matching commitments to online peers. Secret
     /// nonces are stored in memory only; only commitments leave this node.
@@ -690,7 +730,8 @@ impl KfpNode {
             if let Some(session) = sessions.get_session_mut(session_id) {
                 session.add_signature_share(self.share.metadata.identifier, sig_share)?;
                 if session.has_all_shares() {
-                    let pubkey_pkg = self.share.pubkey_package()?;
+                    let pubkey_pkg =
+                        self.aggregation_pubkey_package(session.participants())?;
                     let sig = session.try_aggregate(&pubkey_pkg)?;
                     sig.map(|s| {
                         (
@@ -804,7 +845,7 @@ impl KfpNode {
             session.add_signature_share(payload.share_index, sig_share)?;
 
             let sig = if session.has_all_shares() {
-                let pubkey_pkg = self.share.pubkey_package()?;
+                let pubkey_pkg = self.aggregation_pubkey_package(&parts)?;
                 session.try_aggregate(&pubkey_pkg)?
             } else {
                 None

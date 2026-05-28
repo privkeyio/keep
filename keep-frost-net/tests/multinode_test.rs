@@ -390,6 +390,101 @@ async fn test_full_signing_flow() {
     }
 }
 
+/// Regression: a share imported from a transport export carries only its own
+/// verifying share, so its `pubkey_package` is missing the co-signers' shares
+/// that `frost::aggregate` needs. The initiator must reconstruct the full
+/// package from peers' announced verifying shares; before that fix this signing
+/// round failed on the initiator with "Aggregation failed: Unknown identifier".
+///
+/// Ignored by default: like the other full signing-flow tests it spins up three
+/// nodes on a shared in-process MockRelay and is timing-sensitive under parallel
+/// suite load (the extra Argon2 export/import here makes it the most sensitive).
+/// Run explicitly with `--ignored`.
+#[tokio::test]
+#[ignore]
+async fn test_imported_share_can_initiate_signing() {
+    use keep_core::frost::ShareExport;
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-import-signing").unwrap();
+
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    // Round-trip the initiator's share through an encrypted export, exactly as
+    // an operator importing into a fresh StartOS box would. The resulting share
+    // has an incomplete pubkey_package (only its own verifying share).
+    let export = ShareExport::from_share(&share3, "pw").expect("export share3");
+    let share3 = export.to_share("pw", "imported").expect("import share3");
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 1");
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 2");
+    let mut node3 = KfpNode::new(share3, vec![relay])
+        .await
+        .expect("Failed to create node 3");
+
+    let mut rx3 = node3.subscribe();
+
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node3 = Arc::new(node3);
+    let node3_for_run = Arc::clone(&node3);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = node3_for_run.run().await;
+    });
+
+    let mut peers_discovered = 0u32;
+    let discovery_timeout = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+
+    if discovery_timeout.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
+    }
+
+    let sign_result = timeout(Duration::from_secs(60), async {
+        node3.request_signature(b"imported-share signing".to_vec(), "raw").await
+    })
+    .await;
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+
+    match sign_result {
+        Ok(Ok(signature)) => assert_eq!(signature.len(), 64),
+        Ok(Err(e)) => panic!("Signing with imported share failed: {e:?}"),
+        Err(_) => panic!("Signing with imported share timed out"),
+    }
+}
+
 #[tokio::test]
 async fn test_descriptor_coordination_flow() {
     use std::collections::BTreeMap;
