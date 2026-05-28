@@ -210,10 +210,23 @@ impl NetworkSession {
         self.commitments.len() >= self.threshold as usize
     }
 
+    /// Build the FROST signing package from the collected commitments.
+    ///
+    /// Correctness invariant (load-bearing now that delivery order is relaxed):
+    /// every signer must sign over the *identical* commitment subset. A
+    /// `SigningPackage` built from a different commitment set produces shares
+    /// that aggregation will reject. The session only admits exactly `threshold`
+    /// participants, so the commitment map must not exceed that count.
     pub fn get_signing_package(&self) -> Result<SigningPackage> {
         if !self.has_all_commitments() {
             return Err(FrostNetError::Session("Not enough commitments".into()));
         }
+
+        debug_assert!(
+            self.commitments.len() == self.threshold as usize,
+            "signing package must cover exactly `threshold` commitments; \
+             signers diverging on the commitment subset will fail aggregation"
+        );
 
         Ok(SigningPackage::new(self.commitments.clone(), &self.message))
     }

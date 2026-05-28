@@ -158,11 +158,18 @@ pub fn persist_signing_flag(path: &Path, enabled: bool) {
 /// Writes to a sibling temp file, fsyncs, then atomically renames over the
 /// target, so a crash mid-write cannot leave a truncated/empty credential that a
 /// later boot would treat as missing and silently replace.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
+    // Per-write temp name (PID + random suffix) so a concurrent writer cannot
+    // clobber an in-flight temp file before its rename.
+    let suffix: [u8; 8] = keep_core::crypto::random_bytes();
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), to_hex(&suffix)));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -171,7 +178,16 @@ fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     let mut f = opts.open(&tmp)?;
     f.write_all(contents.as_bytes())?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+
+    // fsync the parent directory so the rename itself is durable across a crash;
+    // otherwise the file could survive while the directory entry is lost.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {
@@ -207,7 +223,7 @@ pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String>
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let bytes: [u8; 16] = keep_core::crypto::random_bytes();
-            let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let secret = to_hex(&bytes);
             write_secret_file(&path, &secret)?;
             Ok(secret)
         }
@@ -233,7 +249,7 @@ pub fn load_or_create_transport_key(vault_dir: &Path) -> std::io::Result<[u8; 32
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let bytes: [u8; 32] = keep_core::crypto::random_bytes();
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = to_hex(&bytes);
             write_secret_file(&path, &hex)?;
             Ok(bytes)
         }

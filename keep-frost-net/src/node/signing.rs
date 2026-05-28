@@ -12,7 +12,7 @@ use crate::audit::SigningOperation;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
-use crate::session::derive_session_id;
+use crate::session::{derive_session_id, SessionState};
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
@@ -703,6 +703,63 @@ impl KfpNode {
             }
         }
 
+        // A commitment can arrive after every signature share (relay reordering).
+        // In that case the share handler skipped aggregation because
+        // `ready_to_aggregate()` was still false; now that the last commitment is
+        // here, re-attempt aggregation so the session does not stall to timeout.
+        self.try_complete_signature(&payload.session_id)?;
+
+        Ok(())
+    }
+
+    /// Attempt aggregation and emit `SignatureComplete` if every participant has
+    /// supplied both a commitment and a signature share. Safe to call from any
+    /// handler; it is a no-op while `ready_to_aggregate()` is false.
+    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<()> {
+        let completed = {
+            let mut sessions = self.sessions.write();
+            let session = match sessions.get_session_mut(session_id) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            if !session.ready_to_aggregate() {
+                return Ok(());
+            }
+
+            let pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
+            session.try_aggregate(&pubkey_pkg)?.map(|sig| {
+                (
+                    sig,
+                    session.message().to_vec(),
+                    session.participants().to_vec(),
+                )
+            })
+        };
+
+        if let Some((sig, session_message, session_participants)) = completed {
+            info!(
+                session_id = %hex::encode(session_id),
+                "Signature complete!"
+            );
+
+            self.audit_log.log_signing_operation(
+                *session_id,
+                &session_message,
+                Some(&sig),
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureCompleted,
+            );
+
+            self.invoke_post_sign_hook(session_id, &sig);
+
+            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
+                session_id: *session_id,
+                signature: sig,
+            });
+        }
+
         Ok(())
     }
 
@@ -734,51 +791,24 @@ impl KfpNode {
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
 
-        let self_aggregated = {
+        {
             let mut sessions = self.sessions.write();
             if let Some(session) = sessions.get_session_mut(session_id) {
                 session.add_signature_share(self.share.metadata.identifier, sig_share)?;
-                if session.has_all_shares() {
-                    let pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
-                    let sig = session.try_aggregate(&pubkey_pkg)?;
-                    sig.map(|s| {
-                        (
-                            s,
-                            session.message().to_vec(),
-                            session.participants().to_vec(),
-                        )
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
             }
-        };
+        }
 
-        if let Some((sig, session_message, session_participants)) = self_aggregated {
-            info!(
-                session_id = %hex::encode(session_id),
-                "Signature complete (single-participant)!"
-            );
-
-            self.audit_log.log_signing_operation(
-                *session_id,
-                &session_message,
-                Some(&sig),
-                session_participants,
-                self.share.metadata.identifier,
-                SigningOperation::SignatureCompleted,
-            );
-
-            self.invoke_post_sign_hook(session_id, &sig);
-
-            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
-                session_id: *session_id,
-                signature: sig,
-            });
-
-            return Ok(());
+        // Our own share may complete the set (e.g. single-participant, or we were
+        // the last to commit+sign). Gate on `ready_to_aggregate()` so we never
+        // aggregate over a mismatched commitment/share id set under reordering.
+        self.try_complete_signature(session_id)?;
+        {
+            let sessions = self.sessions.read();
+            if let Some(session) = sessions.get_session(session_id) {
+                if matches!(session.state(), SessionState::Complete) {
+                    return Ok(());
+                }
+            }
         }
 
         let share_bytes = sig_share.serialize();
@@ -840,50 +870,19 @@ impl KfpNode {
 
         self.peers.write().update_last_seen(payload.share_index);
 
-        let (signature, session_message, session_participants) = {
+        {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(&payload.session_id) {
                 Some(s) => s,
                 None => return Ok(()),
             };
-
-            let msg = session.message().to_vec();
-            let parts = session.participants().to_vec();
-
             session.add_signature_share(payload.share_index, sig_share)?;
-
-            let sig = if session.has_all_shares() {
-                let pubkey_pkg = self.aggregation_pubkey_package(&parts)?;
-                session.try_aggregate(&pubkey_pkg)?
-            } else {
-                None
-            };
-
-            (sig, msg, parts)
-        };
-
-        if let Some(sig) = signature {
-            info!(
-                session_id = %hex::encode(payload.session_id),
-                "Signature complete!"
-            );
-
-            self.audit_log.log_signing_operation(
-                payload.session_id,
-                &session_message,
-                Some(&sig),
-                session_participants,
-                self.share.metadata.identifier,
-                SigningOperation::SignatureCompleted,
-            );
-
-            self.invoke_post_sign_hook(&payload.session_id, &sig);
-
-            let _ = self.event_tx.send(KfpNodeEvent::SignatureComplete {
-                session_id: payload.session_id,
-                signature: sig,
-            });
         }
+
+        // Aggregate only once every participant has both a commitment and a
+        // share; `try_complete_signature` gates on `ready_to_aggregate()` so a
+        // share arriving before its commitment is buffered rather than dropped.
+        self.try_complete_signature(&payload.session_id)?;
 
         Ok(())
     }
