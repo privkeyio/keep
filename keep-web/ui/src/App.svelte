@@ -50,9 +50,9 @@
   const pendingApprovals = $derived(approvals.filter((a) => !a.resolved))
   // Repeated identical events (e.g. periodic "peer online" announcements) are
   // coalesced into one line with a count so real signal isn't buried.
-  // `ts` is first-seen (drives relative time); `lastTs` tracks the latest repeat.
+  // `ts` is first-seen (drives relative time).
   // `cid` is a stable client-side id for keyed list rendering.
-  type CountedLog = LogEvent & { count: number; ts: number; lastTs: number; cid: number }
+  type CountedLog = LogEvent & { count: number; ts: number; cid: number }
   let logs = $state<CountedLog[]>([])
   let logCid = 0
 
@@ -117,6 +117,7 @@
     participants: number[]
     completed: boolean
     latest: number
+    ops: SigningEntry[]
   }
   const signingSessions = $derived.by<SigningSession[]>(() => {
     const byId = new Map<string, SigningSession>()
@@ -126,9 +127,11 @@
         participants: e.participants,
         completed: false,
         latest: e.timestamp_ms,
+        ops: [],
       }
       if (e.operation === 'SignatureCompleted') g.completed = true
       g.latest = Math.max(g.latest, e.timestamp_ms)
+      g.ops.push(e)
       byId.set(e.session, g)
     }
     return [...byId.values()].sort((a, b) => b.latest - a.latest)
@@ -160,6 +163,10 @@
   function fmtDate(secs: number | null): string {
     if (!secs) return 'never'
     return new Date(secs * 1000).toLocaleString()
+  }
+
+  function fmtTime(ms: number): string {
+    return new Date(ms).toLocaleString()
   }
 
   function shortNpub(npub: string): string {
@@ -456,10 +463,9 @@
             head.detail === e.detail &&
             head.success === e.success
           ) {
-            logs[0] = { ...head, count: head.count + 1, lastTs: Date.now() }
+            logs[0] = { ...head, count: head.count + 1 }
           } else {
-            const now = Date.now()
-            logs = [{ ...e, count: 1, ts: now, lastTs: now, cid: logCid++ }, ...logs].slice(0, 100)
+            logs = [{ ...e, count: 1, ts: Date.now(), cid: logCid++ }, ...logs].slice(0, 100)
           }
           // A co-sign just happened: refresh the persistent audit log.
           if (e.app === 'frost') {
@@ -966,7 +972,7 @@
         <span class:fail={!l.success}>{l.success ? '✓' : '✗'}</span>
         {#if l.count > 1}<span class="count-badge">×{l.count}</span>{/if}
         {#if l.detail}<span class="muted"> · {l.detail}</span>{/if}
-        <span class="muted row-time" title={new Date(l.ts).toLocaleString()}>
+        <span class="muted row-time" title={fmtTime(l.ts)}>
           · {relTime(l.ts)}
         </span>
       </div>
@@ -1002,16 +1008,16 @@
         <span class="verify {s.completed ? 'ok' : 'warn'}">
           {s.completed ? '✓ signed' : '… in progress'}
         </span>
-        <span class="muted" title={new Date(s.latest).toLocaleString()}>
+        <span class="muted" title={fmtTime(s.latest)}>
           · participants {s.participants.join(',')} · {relTime(s.latest)}
         </span>
       </div>
       {#if expandedSessions[s.session]}
         <div class="session-detail">
-          {#each signingLog.filter((e) => e.session === s.session) as op (op.timestamp_ms + ':' + op.operation)}
+          {#each s.ops as op (op.timestamp_ms + ':' + op.operation)}
             <div class="op-row">
               <span>{op.operation}</span>
-              <span class="muted">· {new Date(op.timestamp_ms).toLocaleString()}</span>
+              <span class="muted">· {fmtTime(op.timestamp_ms)}</span>
             </div>
           {/each}
         </div>
