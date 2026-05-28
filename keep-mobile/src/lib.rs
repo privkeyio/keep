@@ -667,6 +667,17 @@ impl KeepMobile {
             .unwrap_or_else(|e| e.into_inner()) = Some(hash);
     }
 
+    /// Pre-approve a specific Nostr event (by its computed event id) so the next
+    /// matching sign request auto-approves without prompting. Convenience wrapper
+    /// over [`set_signing_pre_approved`] for NIP-55 callers holding event JSON.
+    pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
+        let event: serde_json::Value =
+            serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
+        let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
+        self.set_signing_pre_approved(event_hash.to_vec());
+        Ok(())
+    }
+
     pub fn clear_signing_pre_approval(&self) {
         *self
             .pre_approved_hash
