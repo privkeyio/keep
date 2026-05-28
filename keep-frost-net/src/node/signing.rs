@@ -715,9 +715,16 @@ impl KfpNode {
             };
 
             let signing_package = session.get_signing_package()?;
-            let nonces = session
-                .take_our_nonces()
-                .ok_or_else(|| FrostNetError::Session("No nonces stored for session".into()))?;
+            // Single-use nonces: if they are already gone, another invocation for
+            // this session has produced and sent our share (e.g. a peer's
+            // commitment arriving after the pre-exchanged set already drove us
+            // into round 2). Treat the repeat as a no-op rather than failing the
+            // whole request on the consumed nonce — aggregation is still driven
+            // by the inbound signature-share handler.
+            let nonces = match session.take_our_nonces() {
+                Some(n) => n,
+                None => return Ok(()),
+            };
 
             (signing_package, nonces)
         };
