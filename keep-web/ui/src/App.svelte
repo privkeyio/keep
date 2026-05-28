@@ -43,7 +43,13 @@
 
   type PendingApproval = ApprovalEvent & { resolved?: 'approved' | 'denied' }
   let approvals = $state<PendingApproval[]>([])
-  let logs = $state<LogEvent[]>([])
+  // Still-unresolved requests, surfaced in a prominent banner so they aren't
+  // missed in the activity stream.
+  const pendingApprovals = $derived(approvals.filter((a) => !a.resolved))
+  // Repeated identical events (e.g. periodic "peer online" announcements) are
+  // coalesced into one line with a count so real signal isn't buried.
+  type CountedLog = LogEvent & { count: number; ts: number }
+  let logs = $state<CountedLog[]>([])
 
   let importData = $state('')
   let importPass = $state('')
@@ -60,6 +66,30 @@
   let signingLog = $state<SigningEntry[]>([])
   let signingVerified = $state(true)
   let wsConnected = $state(false)
+
+  // One row per signing session (the raw log has 3+ operations each). Status is
+  // "signed" once a SignatureCompleted entry exists, otherwise "in progress".
+  type SigningSession = {
+    session: string
+    participants: number[]
+    completed: boolean
+    latest: number
+  }
+  const signingSessions = $derived.by<SigningSession[]>(() => {
+    const byId = new Map<string, SigningSession>()
+    for (const e of signingLog) {
+      const g = byId.get(e.session) ?? {
+        session: e.session,
+        participants: e.participants,
+        completed: false,
+        latest: e.timestamp_ms,
+      }
+      if (e.operation === 'SignatureCompleted') g.completed = true
+      g.latest = Math.max(g.latest, e.timestamp_ms)
+      byId.set(e.session, g)
+    }
+    return [...byId.values()].sort((a, b) => b.latest - a.latest)
+  })
 
   // Per-share export UI state.
   let exportFor = $state<string | null>(null) // "group:id"
@@ -280,7 +310,18 @@
           const resolved = next.filter((x) => x.resolved)
           approvals = [...pending, ...resolved].slice(0, 100)
         } else {
-          logs = [e, ...logs].slice(0, 100)
+          const head = logs[0]
+          if (
+            head &&
+            head.app === e.app &&
+            head.action === e.action &&
+            head.detail === e.detail &&
+            head.success === e.success
+          ) {
+            logs[0] = { ...head, count: head.count + 1, ts: Date.now() }
+          } else {
+            logs = [{ ...e, count: 1, ts: Date.now() }, ...logs].slice(0, 100)
+          }
           // A co-sign just happened: refresh the persistent audit log.
           if (e.app === 'frost') refreshSigningLog()
         }
@@ -393,6 +434,24 @@
 <main>
   {#if error}
     <p class="fail banner">{error}</p>
+  {/if}
+
+  {#if authed && pendingApprovals.length}
+    <div class="approval-bar">
+      {#each pendingApprovals as a (a.id)}
+        <div class="approval-bar-row">
+          <span class="approval-bar-text">
+            <strong>{a.app}</strong> requests <strong>{a.method}</strong>{#if a.kind !== null}
+              · kind {a.kind}{/if}
+            {#if a.preview}<span class="muted"> · {a.preview}</span>{/if}
+          </span>
+          <span class="approval-bar-actions">
+            <button class="ok" onclick={() => decide(a, true)}>Approve</button>
+            <button class="no" onclick={() => decide(a, false)}>Deny</button>
+          </span>
+        </div>
+      {/each}
+    </div>
   {/if}
 
   {#if !authed}
@@ -716,25 +775,21 @@
     </span>
   </h2>
   <div class="panel">
-    {#each approvals as a (a.id)}
+    {#each approvals.filter((a) => a.resolved) as a (a.id)}
       <div class="event approval">
-        <span><strong>{a.app}</strong> requests {a.method}</span>
-        {#if a.resolved}
-          <span class="muted">→ {a.resolved}</span>
-        {:else}
-          <button class="ok" onclick={() => decide(a, true)}>Approve</button>
-          <button class="no" onclick={() => decide(a, false)}>Deny</button>
-        {/if}
+        <span><strong>{a.app}</strong> requested {a.method}</span>
+        <span class="muted">→ {a.resolved}</span>
       </div>
     {/each}
     {#each logs as l, i (i)}
       <div class="event">
         <strong>{l.app}</strong>: {l.action}
         <span class:fail={!l.success}>{l.success ? '✓' : '✗'}</span>
+        {#if l.count > 1}<span class="count-badge">×{l.count}</span>{/if}
         {#if l.detail}<span class="muted"> · {l.detail}</span>{/if}
       </div>
     {/each}
-    {#if approvals.length === 0 && logs.length === 0}
+    {#if approvals.every((a) => !a.resolved) && logs.length === 0}
       <p class="muted">Waiting for signing activity…</p>
     {/if}
   </div>
@@ -749,14 +804,14 @@
     {/if}
   </h2>
   <div class="panel">
-    {#each signingLog as e (e.timestamp_ms + ':' + e.session + ':' + e.operation)}
+    {#each signingSessions as s (s.session)}
       <div class="event">
-        <span class="token">{e.session}</span>
-        <span>{e.operation}</span>
+        <span class="token">{s.session}</span>
+        <span class="verify {s.completed ? 'ok' : 'warn'}">
+          {s.completed ? '✓ signed' : '… in progress'}
+        </span>
         <span class="muted">
-          · participants {e.participants.join(',')} · {new Date(
-            e.timestamp_ms,
-          ).toLocaleString()}
+          · participants {s.participants.join(',')} · {new Date(s.latest).toLocaleString()}
         </span>
       </div>
     {:else}

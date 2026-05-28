@@ -780,6 +780,57 @@ ol.tasks li {
   color: var(--no);
 }
 
+.verify.warn {
+  color: var(--warn);
+}
+
+/* ---- Pending-approval bar (prominent, can't be missed) ---- */
+.approval-bar {
+  position: sticky;
+  top: 0.5rem;
+  z-index: 10;
+  margin-bottom: 1rem;
+  border: 1px solid var(--accent);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
+}
+
+.approval-bar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.7rem 0.9rem;
+}
+
+.approval-bar-row + .approval-bar-row {
+  border-top: 1px solid var(--accent);
+}
+
+.approval-bar-text {
+  font-size: 0.9rem;
+}
+
+.approval-bar-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* Count of coalesced repeated activity lines (e.g. periodic announcements). */
+.count-badge {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 0 0.4rem;
+  margin-left: 0.25rem;
+}
+
 .muted {
   color: var(--muted);
 }
