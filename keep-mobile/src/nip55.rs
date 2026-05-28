@@ -782,7 +782,9 @@ fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError
     Ok(())
 }
 
-fn compute_nostr_event_id(event: &serde_json::Value) -> Result<[u8; 32], KeepMobileError> {
+pub(crate) fn compute_nostr_event_id(
+    event: &serde_json::Value,
+) -> Result<[u8; 32], KeepMobileError> {
     let serialized = serde_json::json!([
         0,
         event["pubkey"],
