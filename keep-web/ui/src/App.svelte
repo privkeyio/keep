@@ -123,6 +123,35 @@
     return npub.length > 24 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub
   }
 
+  // Ticks so relative timestamps stay current without a new event.
+  let nowTick = $state(Date.now())
+  $effect(() => {
+    const t = setInterval(() => (nowTick = Date.now()), 30000)
+    return () => clearInterval(t)
+  })
+
+  // Relative time for activity/log rows; full timestamp shown on hover.
+  function relTime(ms: number): string {
+    const s = Math.max(0, Math.round((nowTick - ms) / 1000))
+    if (s < 5) return 'just now'
+    if (s < 60) return `${s}s ago`
+    const m = Math.round(s / 60)
+    if (m < 60) return `${m}m ago`
+    const h = Math.round(m / 60)
+    if (h < 24) return `${h}h ago`
+    return new Date(ms).toLocaleDateString()
+  }
+
+  // Surface pending approvals in the tab title so a backgrounded tab still
+  // shows that a co-sign decision is waiting.
+  $effect(() => {
+    if (typeof document !== 'undefined') {
+      document.title = pendingApprovals.length
+        ? `(${pendingApprovals.length}) Approval needed — Keep`
+        : 'Keep'
+    }
+  })
+
   // Shares grouped by their FROST group, so a vault holding more than one
   // group renders as separate sections instead of one flat pile.
   let groupedShares = $derived.by(() => {
@@ -437,7 +466,7 @@
   {/if}
 
   {#if authed && pendingApprovals.length}
-    <div class="approval-bar">
+    <div class="approval-bar" role="alert" aria-live="assertive">
       {#each pendingApprovals as a (a.id)}
         <div class="approval-bar-row">
           <span class="approval-bar-text">
@@ -787,6 +816,9 @@
         <span class:fail={!l.success}>{l.success ? '✓' : '✗'}</span>
         {#if l.count > 1}<span class="count-badge">×{l.count}</span>{/if}
         {#if l.detail}<span class="muted"> · {l.detail}</span>{/if}
+        <span class="muted row-time" title={new Date(l.ts).toLocaleString()}>
+          · {relTime(l.ts)}
+        </span>
       </div>
     {/each}
     {#if approvals.every((a) => !a.resolved) && logs.length === 0}
@@ -810,8 +842,8 @@
         <span class="verify {s.completed ? 'ok' : 'warn'}">
           {s.completed ? '✓ signed' : '… in progress'}
         </span>
-        <span class="muted">
-          · participants {s.participants.join(',')} · {new Date(s.latest).toLocaleString()}
+        <span class="muted" title={new Date(s.latest).toLocaleString()}>
+          · participants {s.participants.join(',')} · {relTime(s.latest)}
         </span>
       </div>
     {:else}
