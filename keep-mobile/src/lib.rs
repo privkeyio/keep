@@ -1552,7 +1552,14 @@ impl KeepMobile {
         }
         let key = relay_config_key(group_pubkey.as_deref());
         let stored = persistence::load_relay_config(&self.storage, &key)?;
-        let config = stored.unwrap_or_default();
+        // No saved config yet: pre-populate the reliable default relay so it
+        // shows in the UI and is used immediately, rather than an empty list the
+        // user has to fill in. An explicitly-saved empty list is left as-is.
+        let config = stored.unwrap_or_else(|| persistence::StoredRelayConfig {
+            frost_relays: keep_core::relay::default_frost_relays(),
+            bunker_relays: keep_core::relay::default_frost_relays(),
+            ..Default::default()
+        });
         Ok(RelayConfigInfo {
             frost_relays: config.frost_relays,
             profile_relays: config.profile_relays,
