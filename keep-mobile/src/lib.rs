@@ -343,9 +343,8 @@ impl SigningHooks for MobileSigningHooks {
         // the scheduler so blocking here is safe (requires the multi-thread runtime
         // this crate builds). Mirrors keep-desktop's hook.
         tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                keep_frost_net::FrostNetError::Session("No tokio runtime".into())
-            })?;
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| keep_frost_net::FrostNetError::Session("No tokio runtime".into()))?;
             handle.block_on(async {
                 request_tx
                     .send((session, response_tx))
