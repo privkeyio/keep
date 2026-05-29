@@ -331,10 +331,11 @@ impl MobileSigningHooks {
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
         // Kill switch: when co-signing is disabled, refuse to take part in any
-        // signing round — including pre-approved requests — without prompting.
-        // Fail-closed, mirroring keep-web's bunker.
-        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(false) {
-            return Err(keep_frost_net::FrostNetError::Session(
+        // signing round, including pre-approved requests, without prompting.
+        // Fail-closed (an unreadable switch is treated as engaged), mirroring
+        // keep-web's bunker.
+        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true) {
+            return Err(keep_frost_net::FrostNetError::PolicyViolation(
                 "co-signing is disabled".into(),
             ));
         }

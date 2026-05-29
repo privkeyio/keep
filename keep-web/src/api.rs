@@ -157,7 +157,10 @@ pub async fn set_active_group(
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return (StatusCode::CONFLICT, "an active-group switch is already in progress")
+        return (
+            StatusCode::CONFLICT,
+            "an active-group switch is already in progress",
+        )
             .into_response();
     }
     if let Err(e) = keep.set_active_share_key(Some(&hex_key)) {
