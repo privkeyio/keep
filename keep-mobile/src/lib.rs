@@ -305,6 +305,9 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
     pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// Read on every round so the kill switch ("Signing Disabled") gates FROST
+    /// co-signing too — not just the NIP-55/NIP-46 paths.
+    storage: Arc<dyn SecureStorage>,
 }
 
 impl MobileSigningHooks {
@@ -327,6 +330,14 @@ impl MobileSigningHooks {
 
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
+        // Kill switch: when co-signing is disabled, refuse to take part in any
+        // signing round — including pre-approved requests — without prompting.
+        // Fail-closed, mirroring keep-web's bunker.
+        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(false) {
+            return Err(keep_frost_net::FrostNetError::Session(
+                "co-signing is disabled".into(),
+            ));
+        }
         if self.consume_pre_approval(&session.message) {
             return Ok(());
         }
@@ -2383,6 +2394,7 @@ impl KeepMobile {
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
                 pre_approved_hash: self.pre_approved_hash.clone(),
+                storage: self.storage.clone(),
             });
             node.set_hooks(hooks);
 
