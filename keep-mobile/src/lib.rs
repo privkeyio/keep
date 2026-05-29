@@ -332,40 +332,35 @@ impl SigningHooks for MobileSigningHooks {
         }
 
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        if self
-            .request_tx
-            .blocking_send((session.clone(), response_tx))
-            .is_err()
-        {
-            return Err(keep_frost_net::FrostNetError::Session(
-                "Channel closed".into(),
-            ));
-        }
+        let request_tx = self.request_tx.clone();
+        let session = session.clone();
 
-        let owned_rt;
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                owned_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
-                owned_rt.handle().clone()
-            }
-        };
+        // `pre_sign` is a sync hook invoked from keep-frost-net's async signing
+        // handler, i.e. on a tokio worker thread. `blocking_send`/`Handle::block_on`
+        // panic there ("cannot block the current thread from within a runtime"),
+        // which silently killed the co-sign task (request received, no prompt, no
+        // response → initiator timeout). `block_in_place` hands the worker back to
+        // the scheduler so blocking here is safe (requires the multi-thread runtime
+        // this crate builds). Mirrors keep-desktop's hook.
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| keep_frost_net::FrostNetError::Session("No tokio runtime".into()))?;
+            handle.block_on(async {
+                request_tx
+                    .send((session, response_tx))
+                    .await
+                    .map_err(|_| keep_frost_net::FrostNetError::Session("Channel closed".into()))?;
 
-        let result = handle.block_on(async {
-            tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await
-        });
-
-        match result {
-            Ok(Some(true)) => Ok(()),
-            Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
-                "Request rejected".into(),
-            )),
-            Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
-            Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
-        }
+                match tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await {
+                    Ok(Some(true)) => Ok(()),
+                    Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
+                        "Request rejected".into(),
+                    )),
+                    Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
+                    Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+                }
+            })
+        })
     }
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}

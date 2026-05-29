@@ -43,11 +43,20 @@ fn main() -> iced::Result {
 
     app::set_pending_nostrconnect(pending_uri);
 
+    // Window/taskbar icon from the Keep crest (decoded via iced's `image`
+    // feature); falls back to no icon if decoding ever fails.
+    let icon =
+        iced::window::icon::from_file_data(include_bytes!("assets/keep-crest.png"), None).ok();
+
     iced::application(App::new, App::update, App::view)
         .title("Keep")
         .theme(Theme::Dark)
         .subscription(App::subscription)
-        .window_size(Size::new(900.0, 600.0))
+        .window(iced::window::Settings {
+            size: Size::new(900.0, 600.0),
+            icon,
+            ..Default::default()
+        })
         .exit_on_close_request(false)
         .run()
 }
