@@ -251,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer_retired,
         signing_flag_path,
         node,
+        switching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let serve_index = ServeFile::new(ui_dir.join("index.html"));

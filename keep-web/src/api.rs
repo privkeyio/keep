@@ -144,7 +144,24 @@ pub async fn set_active_group(
             return (err_status(&e), "failed to list shares").into_response();
         }
     }
+    // No-op when the requested group is already the active one: skip the
+    // pointless persist + co-signer bounce (and the restart-loop DoS vector).
+    if keep.get_active_share_key().as_deref() == Some(&hex_key) {
+        return Json(ActiveGroupResponse { restarting: false }).into_response();
+    }
+    // Single-flight: once a switch is claimed the node is on its way out, so
+    // reject a concurrent switch rather than letting two exit tasks race to
+    // persist different keys.
+    if state
+        .switching
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (StatusCode::CONFLICT, "an active-group switch is already in progress")
+            .into_response();
+    }
     if let Err(e) = keep.set_active_share_key(Some(&hex_key)) {
+        state.switching.store(false, Ordering::SeqCst);
         tracing::error!(error = %e, "set_active_share_key failed");
         return (err_status(&e), "failed to set active group").into_response();
     }
