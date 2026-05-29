@@ -217,7 +217,21 @@ const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
 const MAX_STORED_SHARES: usize = 100;
+const MAX_PRE_APPROVED_HASHES: usize = 100;
+const PRE_APPROVAL_TTL: Duration = Duration::from_secs(300);
 const MAX_SHARE_NAME_LENGTH: usize = 64;
+
+type PreApprovedHashes =
+    Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>;
+
+fn lock_pre_approved(
+    hashes: &PreApprovedHashes,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<[u8; 32], std::time::Instant>> {
+    let now = std::time::Instant::now();
+    let mut guard = hashes.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
+    guard
+}
 
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
@@ -304,27 +318,19 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
-    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    pre_approved_hashes: PreApprovedHashes,
     /// Read on every round so the kill switch ("Signing Disabled") gates FROST
-    /// co-signing too — not just the NIP-55/NIP-46 paths.
+    /// co-signing too, not just the NIP-55/NIP-46 paths.
     storage: Arc<dyn SecureStorage>,
 }
 
 impl MobileSigningHooks {
     fn consume_pre_approval(&self, message: &[u8]) -> bool {
-        let mut guard = self
-            .pre_approved_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(hash) = guard.take() {
-            use sha2::{Digest, Sha256};
-            let msg_hash: [u8; 32] = Sha256::digest(message).into();
-            if hash == msg_hash {
-                return true;
-            }
-            *guard = Some(hash);
-        }
-        false
+        use sha2::{Digest, Sha256};
+        let msg_hash: [u8; 32] = Sha256::digest(message).into();
+        lock_pre_approved(&self.pre_approved_hashes)
+            .remove(&msg_hash)
+            .is_some()
     }
 }
 
@@ -344,35 +350,60 @@ impl SigningHooks for MobileSigningHooks {
         }
 
         let (response_tx, mut response_rx) = mpsc::channel(1);
-        let request_tx = self.request_tx.clone();
-        let session = session.clone();
 
-        // `pre_sign` is a sync hook invoked from keep-frost-net's async signing
-        // handler, i.e. on a tokio worker thread. `blocking_send`/`Handle::block_on`
-        // panic there ("cannot block the current thread from within a runtime"),
-        // which silently killed the co-sign task (request received, no prompt, no
-        // response → initiator timeout). `block_in_place` hands the worker back to
-        // the scheduler so blocking here is safe (requires the multi-thread runtime
-        // this crate builds). Mirrors keep-desktop's hook.
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::try_current()
-                .map_err(|_| keep_frost_net::FrostNetError::Session("No tokio runtime".into()))?;
-            handle.block_on(async {
-                request_tx
-                    .send((session, response_tx))
-                    .await
-                    .map_err(|_| keep_frost_net::FrostNetError::Session("Channel closed".into()))?;
-
-                match tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await {
-                    Ok(Some(true)) => Ok(()),
-                    Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
-                        "Request rejected".into(),
-                    )),
-                    Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
-                    Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+        // The interactive approval path runs inside the node's async message
+        // handler, so a current runtime is present. We must neither block a
+        // worker thread (blocking_send) nor start a nested runtime
+        // (Runtime::block_on panics inside a runtime). Use block_in_place to move
+        // off the worker, then drive the send + wait on the current handle.
+        // INVARIANT: block_in_place panics on a current-thread runtime; the node
+        // task runs on the `new_multi_thread()` runtime built in `KeepMobile::new`
+        // (below), which satisfies this. Outside a runtime (no current handle),
+        // fall back to a blocking send and an owned current-thread runtime.
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let request_tx = self.request_tx.clone();
+                let session = session.clone();
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        request_tx.send((session, response_tx)).await.map_err(|_| {
+                            keep_frost_net::FrostNetError::Session("Channel closed".into())
+                        })?;
+                        Ok::<_, keep_frost_net::FrostNetError>(
+                            tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv())
+                                .await,
+                        )
+                    })
+                })?
+            }
+            Err(_) => {
+                if self
+                    .request_tx
+                    .blocking_send((session.clone(), response_tx))
+                    .is_err()
+                {
+                    return Err(keep_frost_net::FrostNetError::Session(
+                        "Channel closed".into(),
+                    ));
                 }
-            })
-        })
+                let owned_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .map_err(|_| keep_frost_net::FrostNetError::Session("No runtime".into()))?;
+                owned_rt.block_on(async {
+                    tokio::time::timeout(SIGNING_RESPONSE_TIMEOUT, response_rx.recv()).await
+                })
+            }
+        };
+
+        match result {
+            Ok(Some(true)) => Ok(()),
+            Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
+                "Request rejected".into(),
+            )),
+            Ok(None) => Err(keep_frost_net::FrostNetError::Session("No response".into())),
+            Err(_) => Err(keep_frost_net::FrostNetError::Session("Timeout".into())),
+        }
     }
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
@@ -393,7 +424,7 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    pre_approved_hashes: PreApprovedHashes,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -532,7 +563,7 @@ impl KeepMobile {
             pending_contributions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pre_approved_hash: Arc::new(std::sync::Mutex::new(None)),
+            pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -668,10 +699,14 @@ impl KeepMobile {
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();
-        *self
-            .pre_approved_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(hash);
+        let now = std::time::Instant::now();
+        let mut guard = lock_pre_approved(&self.pre_approved_hashes);
+        if guard.len() >= MAX_PRE_APPROVED_HASHES {
+            if let Some(&oldest) = guard.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k) {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(hash, now);
     }
 
     /// Pre-approve a specific Nostr event (by its computed event id) so the next
@@ -680,16 +715,17 @@ impl KeepMobile {
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
         let event: serde_json::Value =
             serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
+        crate::nip55::validate_nostr_event(&event)?;
         let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
         self.set_signing_pre_approved(event_hash.to_vec());
         Ok(())
     }
 
     pub fn clear_signing_pre_approval(&self) {
-        *self
-            .pre_approved_hash
+        self.pre_approved_hashes
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -2394,7 +2430,7 @@ impl KeepMobile {
             let (request_tx, request_rx) = mpsc::channel(32);
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
-                pre_approved_hash: self.pre_approved_hash.clone(),
+                pre_approved_hashes: self.pre_approved_hashes.clone(),
                 storage: self.storage.clone(),
             });
             node.set_hooks(hooks);

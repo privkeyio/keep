@@ -20,7 +20,15 @@ const MAX_TAGS_COUNT: usize = 1000;
 const MAX_EVENT_SIZE: usize = 128 * 1024;
 const TIMESTAMP_DRIFT_SECS: i64 = 15 * 60;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-const MAX_REQUESTS_PER_WINDOW: u32 = 10;
+// Real Nostr clients (e.g. Amethyst sending NIP-17 DMs) easily fire 20-50 sign
+// requests in a short burst: kind 14 rumor + kind 13 seal + per-recipient
+// kind 1059 gift wraps + per-relay kind 22242 NIP-42 auth + reaction signing,
+// all chained. 10/min broke those real-world flows. This is a defense-in-depth
+// in-process cap covering legitimate bursts. The primary throttle is the
+// Kotlin IPC-level RateLimiter (30/sec) plus per-app permissions; that external
+// limiter is a REQUIRED invariant, not optional, since this in-process counter
+// alone is not a sufficient DoS guard.
+const MAX_REQUESTS_PER_WINDOW: u32 = 60;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
@@ -141,7 +149,9 @@ impl Nip55Handler {
         request: Nip55Request,
         caller_id: String,
     ) -> Result<Nip55Response, KeepMobileError> {
-        self.check_rate_limit(&caller_id)?;
+        if is_rate_limited_type(&request.request_type) {
+            self.check_rate_limit(&caller_id)?;
+        }
 
         if let Some(ref current_user) = request.current_user {
             self.validate_current_user(current_user)?;
@@ -180,7 +190,9 @@ impl Nip55Handler {
             response.id = request_id;
         }
 
-        self.record_result(&caller_id, result.is_ok());
+        if is_rate_limited_type(&request.request_type) {
+            self.record_result(&caller_id, result.is_ok());
+        }
         result
     }
 
@@ -698,6 +710,22 @@ fn is_valid_package_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
+fn is_rate_limited_type(t: &Nip55RequestType) -> bool {
+    // GetPublicKey is a cheap cached-metadata read with no FROST/ECDH crypto and
+    // no signing round-trip, so it is exempt. Every other type triggers a signing
+    // or encryption operation and must be rate-limited. Exhaustive match so new
+    // variants force an explicit decision.
+    match t {
+        Nip55RequestType::GetPublicKey => false,
+        Nip55RequestType::SignEvent
+        | Nip55RequestType::Nip04Encrypt
+        | Nip55RequestType::Nip04Decrypt
+        | Nip55RequestType::Nip44Encrypt
+        | Nip55RequestType::Nip44Decrypt
+        | Nip55RequestType::DecryptZapEvent => true,
+    }
+}
+
 fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> {
     match value {
         "get_public_key" => Ok(Nip55RequestType::GetPublicKey),
@@ -745,7 +773,7 @@ fn parse_pubkey_to_compressed(pubkey_hex: &str) -> Result<[u8; 33], KeepMobileEr
     }
 }
 
-fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError> {
+pub(crate) fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError> {
     if !event.is_object() {
         return Err(KeepMobileError::InvalidSession);
     }
