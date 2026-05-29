@@ -26,7 +26,7 @@ fn descriptor_lookup_for(
 > {
     keep_frost_net::KeepDescriptorLookup::new(move || {
         let guard = keep.lock().ok()?;
-        guard.list_wallet_descriptors().ok()
+        guard.list_all_wallet_descriptor_versions().ok()
     })
 }
 

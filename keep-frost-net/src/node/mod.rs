@@ -1753,4 +1753,49 @@ mod tests {
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
     }
+
+    fn descriptor_version(
+        group: [u8; 32],
+        external: &str,
+        version: u32,
+    ) -> keep_core::wallet::WalletDescriptor {
+        keep_core::wallet::WalletDescriptor {
+            group_pubkey: group,
+            external_descriptor: external.to_string(),
+            internal_descriptor: String::new(),
+            network: "regtest".to_string(),
+            created_at: 0,
+            device_registrations: Vec::new(),
+            policy_hash: [0u8; 32],
+            version,
+            previous_descriptor_hash: None,
+            policy: None,
+        }
+    }
+
+    #[test]
+    fn external_for_resolves_superseded_version() {
+        let group = [3u8; 32];
+        let old = descriptor_version(group, "tr(old_external)", 1);
+        let new = descriptor_version(group, "tr(new_external)", 2);
+        let old_hash = old.canonical_hash();
+        let new_hash = new.canonical_hash();
+        assert_ne!(old_hash, new_hash);
+
+        let rows = vec![old.clone(), new.clone()];
+        let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
+
+        assert_eq!(
+            lookup.external_for(&group, &old_hash).as_deref(),
+            Some("tr(old_external)"),
+            "migration sweep must resolve the superseded OLD descriptor across all versions",
+        );
+        assert_eq!(
+            lookup.external_for(&group, &new_hash).as_deref(),
+            Some("tr(new_external)"),
+        );
+        assert_eq!(lookup.latest_version_for(&group), Ok(Some(2)));
+        assert!(lookup.find_by_hash(&group, &old_hash));
+        assert!(lookup.find_by_hash(&group, &new_hash));
+    }
 }

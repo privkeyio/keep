@@ -43,7 +43,7 @@ pub(crate) fn descriptor_lookup_for(
     keep_frost_net::KeepDescriptorLookup::new(move || {
         let guard = keep.lock().ok()?;
         let keep = guard.as_ref()?;
-        keep.list_wallet_descriptors().ok()
+        keep.list_all_wallet_descriptor_versions().ok()
     })
 }
 

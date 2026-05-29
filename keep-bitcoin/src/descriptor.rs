@@ -218,10 +218,7 @@ fn parse_descriptor_body(descriptor: &str) -> Result<Descriptor<DescriptorPublic
 }
 
 fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
-    let body = body.split('#').next().unwrap_or(body);
-    let parsed: Descriptor<DescriptorPublicKey> = body
-        .parse()
-        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    let parsed = parse_descriptor_body(body)?;
     let canonical = parsed.to_string();
     let (_, checksum) = canonical.rsplit_once('#').ok_or_else(|| {
         BitcoinError::Descriptor("rust-miniscript returned descriptor without checksum".into())
