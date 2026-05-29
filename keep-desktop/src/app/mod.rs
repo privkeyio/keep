@@ -71,7 +71,7 @@ const IMPORT_COOLDOWN: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BUNKER_LOG_ENTRIES: usize = 1000;
 pub(crate) const MAX_ACTIVE_COORDINATIONS: usize = 64;
 
-const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://relay.nsec.app"];
+const DEFAULT_BUNKER_RELAYS: &[&str] = &["wss://bucket.coracle.social"];
 
 #[derive(Clone)]
 pub enum ToastKind {

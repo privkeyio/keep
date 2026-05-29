@@ -109,12 +109,11 @@ impl RelayConfig {
 
 /// Default FROST coordination relays.
 pub fn default_frost_relays() -> Vec<String> {
-    vec![
-        "wss://relay.primal.net/".into(),
-        "wss://relay.nsec.app/".into(),
-        "wss://relay.damus.io/".into(),
-        "wss://nos.lol/".into(),
-    ]
+    // coracle's relay reliably delivers the rapid ephemeral (kind 24242) events
+    // FROST coordination depends on; most public relays drop them, which causes
+    // missed or prematurely-rejected signing rounds. Operators can add more in
+    // settings for redundancy.
+    vec!["wss://bucket.coracle.social/".into()]
 }
 
 /// Normalize a relay URL: trim whitespace, lowercase scheme+host, ensure trailing slash.

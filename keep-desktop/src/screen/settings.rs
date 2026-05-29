@@ -467,7 +467,9 @@ impl SettingsScreen {
             .push(proxy_card)
             .push(cert_pins_card)
             .push(backup_card)
-            .push(info_card);
+            .push(info_card)
+            .push(theme::heading("About"))
+            .push(self.about_card());
 
         scrollable(content)
             .width(Length::Fill)
@@ -1011,9 +1013,18 @@ impl SettingsScreen {
 
     fn info_card(&self) -> Element<'_, Message> {
         container(
+            column![theme::label("Vault"), theme::muted(&self.vault_path)]
+                .spacing(theme::space::XS),
+        )
+        .style(theme::card_style)
+        .padding(theme::space::LG)
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn about_card(&self) -> Element<'_, Message> {
+        container(
             column![
-                column![theme::label("Vault"), theme::muted(&self.vault_path),]
-                    .spacing(theme::space::XS),
                 column![
                     theme::label("Version"),
                     theme::muted(env!("CARGO_PKG_VERSION")),
