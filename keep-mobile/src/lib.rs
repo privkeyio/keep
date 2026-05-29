@@ -221,6 +221,18 @@ const MAX_PRE_APPROVED_HASHES: usize = 100;
 const PRE_APPROVAL_TTL: Duration = Duration::from_secs(300);
 const MAX_SHARE_NAME_LENGTH: usize = 64;
 
+type PreApprovedHashes =
+    Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>;
+
+fn lock_pre_approved(
+    hashes: &PreApprovedHashes,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<[u8; 32], std::time::Instant>> {
+    let now = std::time::Instant::now();
+    let mut guard = hashes.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
+    guard
+}
+
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
@@ -306,8 +318,7 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
-    pre_approved_hashes:
-        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    pre_approved_hashes: PreApprovedHashes,
     /// Read on every round so the kill switch ("Signing Disabled") gates FROST
     /// co-signing too, not just the NIP-55/NIP-46 paths.
     storage: Arc<dyn SecureStorage>,
@@ -317,13 +328,9 @@ impl MobileSigningHooks {
     fn consume_pre_approval(&self, message: &[u8]) -> bool {
         use sha2::{Digest, Sha256};
         let msg_hash: [u8; 32] = Sha256::digest(message).into();
-        let now = std::time::Instant::now();
-        let mut guard = self
-            .pre_approved_hashes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
-        guard.remove(&msg_hash).is_some()
+        lock_pre_approved(&self.pre_approved_hashes)
+            .remove(&msg_hash)
+            .is_some()
     }
 }
 
@@ -417,8 +424,7 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hashes:
-        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    pre_approved_hashes: PreApprovedHashes,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -694,11 +700,7 @@ impl KeepMobile {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();
         let now = std::time::Instant::now();
-        let mut guard = self
-            .pre_approved_hashes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, &mut inserted| now.duration_since(inserted) < PRE_APPROVAL_TTL);
+        let mut guard = lock_pre_approved(&self.pre_approved_hashes);
         if guard.len() >= MAX_PRE_APPROVED_HASHES {
             if let Some(&oldest) = guard.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k) {
                 guard.remove(&oldest);
@@ -707,21 +709,13 @@ impl KeepMobile {
         guard.insert(hash, now);
     }
 
-    pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
-        let event: serde_json::Value =
-            serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
-        crate::nip55::validate_nostr_event(&event)?;
-        let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
-        self.set_signing_pre_approved(event_hash.to_vec());
-        Ok(())
-    }
-
     /// Pre-approve a specific Nostr event (by its computed event id) so the next
     /// matching sign request auto-approves without prompting. Convenience wrapper
     /// over [`set_signing_pre_approved`] for NIP-55 callers holding event JSON.
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
         let event: serde_json::Value =
             serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
+        crate::nip55::validate_nostr_event(&event)?;
         let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
         self.set_signing_pre_approved(event_hash.to_vec());
         Ok(())

@@ -711,9 +711,10 @@ fn is_valid_package_name(name: &str) -> bool {
 }
 
 fn is_rate_limited_type(t: &Nip55RequestType) -> bool {
-    // GetPublicKey is a trivial local read of cached share info (no crypto/IPC),
-    // so it is exempt. Every other type triggers FROST/ECDH/IPC work and must be
-    // rate-limited. Exhaustive match so new variants force an explicit decision.
+    // GetPublicKey is a cheap cached-metadata read with no FROST/ECDH crypto and
+    // no signing round-trip, so it is exempt. Every other type triggers a signing
+    // or encryption operation and must be rate-limited. Exhaustive match so new
+    // variants force an explicit decision.
     match t {
         Nip55RequestType::GetPublicKey => false,
         Nip55RequestType::SignEvent
