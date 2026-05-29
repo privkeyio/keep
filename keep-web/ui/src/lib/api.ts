@@ -18,6 +18,7 @@ export interface Share {
   created_at: number
   last_used: number | null
   did_backup: boolean
+  active: boolean
 }
 
 export interface SigningEntry {
@@ -133,6 +134,18 @@ export async function deleteShare(group: string, identifier: number): Promise<vo
   if (!r.ok && r.status !== 204) {
     throw new Error((await r.text()) || `delete failed: ${r.status}`)
   }
+}
+
+export async function setActiveGroup(group: string): Promise<{ restarting: boolean }> {
+  const r = await api('/api/active-group', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ group }),
+  })
+  if (!r.ok) {
+    throw new Error((await r.text()) || `switch group failed: ${r.status}`)
+  }
+  return r.json()
 }
 
 export async function getSigningLog(): Promise<{

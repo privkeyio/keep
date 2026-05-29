@@ -8,6 +8,7 @@
     exportShare,
     deleteShare,
     renameShare,
+    setActiveGroup,
     getSigningLog,
     getKillswitch,
     setKillswitch,
@@ -269,6 +270,28 @@
       m.set(s.group, list)
     }
     return [...m.entries()].map(([group, items]) => ({ group, items }))
+  })
+
+  // Switching the active group: the server persists the choice and restarts to
+  // rebind the co-signer, so we show a reconnecting state until it returns.
+  let switchingGroup = $state<string | null>(null)
+  async function switchGroup(group: string) {
+    if (switchingGroup) return
+    switchingGroup = group
+    try {
+      await setActiveGroup(group)
+    } catch (e) {
+      error = String(e)
+      switchingGroup = null
+    }
+  }
+
+  // Once the restarted co-signer reports the new active group, clear the
+  // reconnecting state so the operator can switch again.
+  $effect(() => {
+    if (switchingGroup && bunker?.group === switchingGroup) {
+      switchingGroup = null
+    }
   })
 
   function startRename(s: Share) {
@@ -822,6 +845,19 @@
         <span class="share-tag">{g.items[0].threshold}-of-{g.items[0].total_shares}</span>
         {#if bunker?.group === g.group}
           <span class="badge active-badge">active co-signer</span>
+        {:else if groupedShares.length > 1}
+          {#if switchingGroup === g.group}
+            <span class="badge">switching… reconnecting</span>
+          {:else}
+            <button
+              class="switch-group"
+              disabled={switchingGroup !== null}
+              title="Co-sign for this group instead. The co-signer restarts to switch."
+              onclick={() => switchGroup(g.group)}
+            >
+              Serve this group
+            </button>
+          {/if}
         {/if}
       </div>
       {#each g.items as s (s.identifier)}

@@ -71,6 +71,10 @@ pub struct AppState {
     /// The running FROST node (network mode only), for reading the signing
     /// audit log and peer state.
     pub node: Option<Arc<KfpNode>>,
+    /// Single-flight latch for active-group switches. Once a switch is claimed,
+    /// the node is on its way to exiting/restarting, so a second concurrent
+    /// switch is rejected rather than racing to persist a different key.
+    pub switching: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Serialize)]

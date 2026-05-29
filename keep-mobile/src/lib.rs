@@ -305,6 +305,9 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
     pre_approved_hash: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    /// Read on every round so the kill switch ("Signing Disabled") gates FROST
+    /// co-signing too — not just the NIP-55/NIP-46 paths.
+    storage: Arc<dyn SecureStorage>,
 }
 
 impl MobileSigningHooks {
@@ -327,6 +330,15 @@ impl MobileSigningHooks {
 
 impl SigningHooks for MobileSigningHooks {
     fn pre_sign(&self, session: &SessionInfo) -> keep_frost_net::Result<()> {
+        // Kill switch: when co-signing is disabled, refuse to take part in any
+        // signing round, including pre-approved requests, without prompting.
+        // Fail-closed (an unreadable switch is treated as engaged), mirroring
+        // keep-web's bunker.
+        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true) {
+            return Err(keep_frost_net::FrostNetError::PolicyViolation(
+                "co-signing is disabled".into(),
+            ));
+        }
         if self.consume_pre_approval(&session.message) {
             return Ok(());
         }
@@ -1552,7 +1564,14 @@ impl KeepMobile {
         }
         let key = relay_config_key(group_pubkey.as_deref());
         let stored = persistence::load_relay_config(&self.storage, &key)?;
-        let config = stored.unwrap_or_default();
+        // No saved config yet: pre-populate the reliable default relay so it
+        // shows in the UI and is used immediately, rather than an empty list the
+        // user has to fill in. An explicitly-saved empty list is left as-is.
+        let config = stored.unwrap_or_else(|| persistence::StoredRelayConfig {
+            frost_relays: keep_core::relay::default_frost_relays(),
+            bunker_relays: keep_core::relay::default_frost_relays(),
+            ..Default::default()
+        });
         Ok(RelayConfigInfo {
             frost_relays: config.frost_relays,
             profile_relays: config.profile_relays,
@@ -2376,6 +2395,7 @@ impl KeepMobile {
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
                 pre_approved_hash: self.pre_approved_hash.clone(),
+                storage: self.storage.clone(),
             });
             node.set_hooks(hooks);
 
