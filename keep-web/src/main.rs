@@ -68,12 +68,12 @@ fn parse_relays(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolve the FROST group to co-sign for: an explicit npub, else the single
-/// group present in the vault. Returns `None` (→ setup mode) when there is no
-/// share yet or the choice is ambiguous.
-// `Ok(None)` means genuine first-run (no shares → setup mode); `Err` means
-// misconfiguration (bad KEEP_FROST_GROUP, or multiple groups with no choice)
-// and is fatal so the operator sees the problem instead of a silent setup mode.
+/// Resolve the FROST group to co-sign for. Precedence: an explicit
+/// `KEEP_FROST_GROUP` npub, then the persisted active-share selection (the same
+/// key keep-desktop/keep-android use), then the first group present (which is
+/// persisted as the new default). The operator can switch the active group from
+/// the Web Admin. `Ok(None)` means genuine first-run (no shares → setup mode);
+/// `Err` only for a malformed `KEEP_FROST_GROUP` npub.
 fn resolve_group(
     keep: &Keep,
     explicit: Option<&str>,
@@ -93,14 +93,24 @@ fn resolve_group(
     let mut groups: Vec<[u8; 32]> = shares.iter().map(|s| s.metadata.group_pubkey).collect();
     groups.sort();
     groups.dedup();
-    match groups.as_slice() {
-        [g] => Ok(Some((*g, keep_core::keys::bytes_to_npub(g)))),
-        [] => Ok(None),
-        _ => Err(format!(
-            "multiple FROST groups present ({}); set KEEP_FROST_GROUP to choose one",
-            groups.len()
-        )),
+    if groups.is_empty() {
+        return Ok(None);
     }
+    // Honor the operator's persisted selection — the same active-share key that
+    // keep-desktop and keep-android use — if it still names a held group.
+    if let Some(active_hex) = keep.get_active_share_key() {
+        if let Some(g) = groups.iter().find(|g| hex::encode(g) == active_hex) {
+            return Ok(Some((*g, keep_core::keys::bytes_to_npub(g))));
+        }
+    }
+    // No valid selection: default to the first group and persist it, so the box
+    // co-signs immediately instead of erroring on ambiguity. The operator can
+    // switch which group is served from the Web Admin.
+    let g = groups[0];
+    if let Err(e) = keep.set_active_share_key(Some(&hex::encode(g))) {
+        tracing::warn!(error = %e, "failed to persist default active group");
+    }
+    Ok(Some((g, keep_core::keys::bytes_to_npub(&g))))
 }
 
 #[tokio::main]
@@ -256,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/shares/export", post(api::export_share))
         .route("/api/shares/delete", post(api::delete_share))
         .route("/api/shares/rename", post(api::rename_share))
+        .route("/api/active-group", post(api::set_active_group))
         .route("/api/signing-log", get(api::signing_log))
         .route("/api/peers", get(api::peers))
         .route(
@@ -284,4 +295,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keep_core::Keep;
+    use tempfile::tempdir;
+
+    fn unlocked_keep(dir: &std::path::Path) -> Keep {
+        let mut keep = Keep::create(&dir.join("vault"), "password").unwrap();
+        keep.unlock("password").unwrap();
+        keep
+    }
+
+    #[test]
+    fn resolve_no_shares_is_setup() {
+        let dir = tempdir().unwrap();
+        let keep = unlocked_keep(dir.path());
+        assert!(resolve_group(&keep, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_single_group() {
+        let dir = tempdir().unwrap();
+        let mut keep = unlocked_keep(dir.path());
+        let g = *keep.frost_generate(2, 3, "g").unwrap()[0].group_pubkey();
+        assert_eq!(resolve_group(&keep, None).unwrap().unwrap().0, g);
+    }
+
+    #[test]
+    fn resolve_multiple_defaults_and_persists() {
+        let dir = tempdir().unwrap();
+        let mut keep = unlocked_keep(dir.path());
+        keep.frost_generate(2, 3, "a").unwrap();
+        keep.frost_generate(2, 3, "b").unwrap();
+        // Must not error on ambiguity: pick a default and persist it.
+        let (bytes, _) = resolve_group(&keep, None).unwrap().unwrap();
+        assert_eq!(
+            keep.get_active_share_key().as_deref(),
+            Some(hex::encode(bytes).as_str())
+        );
+    }
+
+    #[test]
+    fn resolve_honors_active_selection() {
+        let dir = tempdir().unwrap();
+        let mut keep = unlocked_keep(dir.path());
+        let a = *keep.frost_generate(2, 3, "a").unwrap()[0].group_pubkey();
+        let b = *keep.frost_generate(2, 3, "b").unwrap()[0].group_pubkey();
+        let default = resolve_group(&keep, None).unwrap().unwrap().0;
+        let other = if default == a { b } else { a };
+        keep.set_active_share_key(Some(&hex::encode(other)))
+            .unwrap();
+        assert_eq!(resolve_group(&keep, None).unwrap().unwrap().0, other);
+    }
+
+    #[test]
+    fn resolve_explicit_override_wins() {
+        let dir = tempdir().unwrap();
+        let mut keep = unlocked_keep(dir.path());
+        let a = *keep.frost_generate(2, 3, "a").unwrap()[0].group_pubkey();
+        let npub = keep_core::keys::bytes_to_npub(&a);
+        assert_eq!(resolve_group(&keep, Some(&npub)).unwrap().unwrap().0, a);
+    }
 }

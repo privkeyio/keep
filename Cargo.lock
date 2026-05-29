@@ -4441,6 +4441,7 @@ name = "keep-web"
 version = "0.4.5"
 dependencies = [
  "axum",
+ "hex",
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
@@ -4448,6 +4449,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

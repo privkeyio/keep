@@ -406,6 +406,16 @@ button:disabled {
   border: 1px solid var(--accent-soft);
 }
 
+.group-head .badge {
+  margin-left: auto;
+}
+
+.switch-group {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 0.3rem 0.6rem;
+}
+
 .export-value {
   align-items: flex-start;
   margin-top: 0.4rem;

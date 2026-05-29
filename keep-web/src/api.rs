@@ -69,15 +69,19 @@ pub struct ShareDto {
     created_at: i64,
     last_used: Option<i64>,
     did_backup: bool,
+    /// True for the group the co-signer is currently serving (the active share).
+    active: bool,
 }
 
 pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
     let keep = state.keep.lock().await;
+    let active_hex = keep.get_active_share_key();
     match keep.frost_list_shares() {
         Ok(shares) => {
             let dto: Vec<ShareDto> = shares
                 .into_iter()
                 .map(|s| ShareDto {
+                    active: active_hex.as_deref() == Some(&hex::encode(s.metadata.group_pubkey)),
                     name: s.metadata.name,
                     group: keep_core::keys::bytes_to_npub(&s.metadata.group_pubkey),
                     identifier: s.metadata.identifier,
@@ -102,6 +106,56 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
 pub struct ShareRef {
     pub group: String,
     pub identifier: u16,
+}
+
+#[derive(Deserialize)]
+pub struct ActiveGroupRequest {
+    /// Group to co-sign for, as an npub.
+    pub group: String,
+}
+
+#[derive(Serialize)]
+pub struct ActiveGroupResponse {
+    pub restarting: bool,
+}
+
+/// Switches which FROST group the co-signer serves (the persisted active share,
+/// shared with keep-desktop/keep-android). The node rebinds by restarting: the
+/// StartOS supervisor relaunches keep-web on exit, and `resolve_group` picks up
+/// the new selection. Only groups this node holds a share for are accepted.
+pub async fn set_active_group(
+    State(state): State<AppState>,
+    Json(body): Json<ActiveGroupRequest>,
+) -> impl IntoResponse {
+    let group = match parse_group(&body.group) {
+        Ok(g) => g,
+        Err(e) => return e.into_response(),
+    };
+    let hex_key = hex::encode(group);
+    let keep = state.keep.lock().await;
+    match keep.frost_list_shares() {
+        Ok(shares) => {
+            if !shares.iter().any(|s| s.metadata.group_pubkey == group) {
+                return (StatusCode::NOT_FOUND, "no share for that group").into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "frost_list_shares failed");
+            return (err_status(&e), "failed to list shares").into_response();
+        }
+    }
+    if let Err(e) = keep.set_active_share_key(Some(&hex_key)) {
+        tracing::error!(error = %e, "set_active_share_key failed");
+        return (err_status(&e), "failed to set active group").into_response();
+    }
+    drop(keep);
+    tracing::info!(group = %hex_key, "active group switched; restarting co-signer");
+    // Exit after the response flushes; the supervisor relaunches and rebinds.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::process::exit(0);
+    });
+    Json(ActiveGroupResponse { restarting: true }).into_response()
 }
 
 #[derive(Deserialize)]

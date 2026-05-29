@@ -21,6 +21,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 nostr-sdk = { workspace = true }
 subtle = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = { workspace = true }
