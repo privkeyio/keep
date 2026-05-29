@@ -17,6 +17,21 @@ const MAX_FEE_SATS: u64 = 100_000_000; // 1 BTC
 /// Bitcoin Core's default dust threshold for taproot (P2TR) outputs in sats.
 /// Outputs smaller than this are non-standard and unlikely to relay.
 pub const TAPROOT_DUST_LIMIT_SATS: u64 = 330;
+/// Maximum number of inputs in a single consolidating sweep. Taproot
+/// script-path inputs carry a sizable witness (signature, leaf script, control
+/// block), so a large input count both risks the ~100 kvB standardness weight
+/// limit and is costly to sign (one sighash per input per signer). Bound it
+/// conservatively; callers needing to consolidate more must batch into
+/// multiple sweeps.
+pub const MAX_SWEEP_INPUTS: usize = 100;
+
+/// A single UTXO under the recovery output being consolidated by
+/// [`RecoveryTxBuilder::build_sweep_psbt`].
+#[derive(Clone, Debug)]
+pub struct SweepUtxo {
+    pub outpoint: OutPoint,
+    pub value_sats: u64,
+}
 
 pub struct RecoveryTxBuilder {
     recovery_output: RecoveryOutput,
@@ -88,6 +103,109 @@ impl RecoveryTxBuilder {
         psbt.inputs[0]
             .tap_scripts
             .insert(control_block, (tier.script.clone(), LeafVersion::TapScript));
+
+        Ok(psbt)
+    }
+
+    /// Build a consolidating sweep PSBT that spends every UTXO in `utxos`
+    /// (all under this recovery output, via the same `tier_index` scriptpath)
+    /// into a single output paying `destination`. The output value is the sum
+    /// of all UTXO values minus `fee_sats`.
+    ///
+    /// Every input is tagged with the tier's `tap_scripts` entry and
+    /// `witness_utxo`, so each can be signed via [`script_spend_sighashes`] and
+    /// aggregated by the PSBT coordination layer. `utxos` must be non-empty and
+    /// contain no duplicate outpoints.
+    pub fn build_sweep_psbt(
+        &self,
+        tier_index: usize,
+        utxos: &[SweepUtxo],
+        destination: &ScriptBuf,
+        fee_sats: u64,
+    ) -> Result<Psbt> {
+        let tier = self.get_tier(tier_index)?;
+
+        if utxos.is_empty() {
+            return Err(BitcoinError::Recovery(
+                "sweep requires at least one UTXO".into(),
+            ));
+        }
+        if utxos.len() > MAX_SWEEP_INPUTS {
+            return Err(BitcoinError::Recovery(format!(
+                "sweep input count {} exceeds maximum {MAX_SWEEP_INPUTS}",
+                utxos.len()
+            )));
+        }
+        if fee_sats > MAX_FEE_SATS {
+            return Err(BitcoinError::Recovery(format!(
+                "fee {fee_sats} sats exceeds maximum {MAX_FEE_SATS} sats"
+            )));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut total_in: u64 = 0;
+        for utxo in utxos {
+            if !seen.insert(utxo.outpoint) {
+                return Err(BitcoinError::Recovery(format!(
+                    "duplicate UTXO {} in sweep",
+                    utxo.outpoint
+                )));
+            }
+            total_in = total_in
+                .checked_add(utxo.value_sats)
+                .ok_or_else(|| BitcoinError::Recovery("sweep input value overflow".into()))?;
+        }
+
+        if total_in <= fee_sats {
+            return Err(BitcoinError::Recovery("insufficient funds".into()));
+        }
+        let output_value = total_in - fee_sats;
+        if output_value < TAPROOT_DUST_LIMIT_SATS {
+            return Err(BitcoinError::Recovery(format!(
+                "sweep output below dust threshold ({TAPROOT_DUST_LIMIT_SATS} sats)"
+            )));
+        }
+
+        let sequence = match tier.timelock_blocks {
+            Some(timelock_blocks) => crate::recovery::recovery_sequence(timelock_blocks)?,
+            None => Sequence::ENABLE_RBF_NO_LOCKTIME,
+        };
+
+        let input: Vec<TxIn> = utxos
+            .iter()
+            .map(|u| TxIn {
+                previous_output: u.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence,
+                witness: Witness::default(),
+            })
+            .collect();
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input,
+            output: vec![TxOut {
+                value: Amount::from_sat(output_value),
+                script_pubkey: destination.clone(),
+            }],
+        };
+
+        let mut psbt =
+            Psbt::from_unsigned_tx(tx).map_err(|e| BitcoinError::Recovery(e.to_string()))?;
+
+        let control_block = self.control_block(tier)?;
+        let spk = self.recovery_output.address.script_pubkey();
+        for (i, utxo) in utxos.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(utxo.value_sats),
+                script_pubkey: spk.clone(),
+            });
+            psbt.inputs[i].tap_scripts.insert(
+                control_block.clone(),
+                (tier.script.clone(), LeafVersion::TapScript),
+            );
+        }
 
         Ok(psbt)
     }
@@ -220,10 +338,27 @@ impl RecoveryTxBuilder {
     }
 
     fn get_tier(&self, index: usize) -> Result<&TierInfo> {
-        self.recovery_output
+        let tier = self
+            .recovery_output
             .tiers
             .get(index)
-            .ok_or_else(|| BitcoinError::Recovery(format!("tier {index} not found")))
+            .ok_or_else(|| BitcoinError::Recovery(format!("tier {index} not found")))?;
+        if tier.keys.is_empty() {
+            return Err(BitcoinError::Recovery(format!("tier {index} has no keys")));
+        }
+        if tier.threshold < 1 {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {index} threshold must be at least 1"
+            )));
+        }
+        if tier.threshold as usize > tier.keys.len() {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {index} threshold {} exceeds key count {}",
+                tier.threshold,
+                tier.keys.len()
+            )));
+        }
+        Ok(tier)
     }
 
     fn control_block(&self, tier: &TierInfo) -> Result<ControlBlock> {
@@ -559,6 +694,131 @@ mod tests {
 
         let tx = builder.finalize_recovery(&mut psbt, 0).unwrap();
         assert!(!tx.input[0].witness.is_empty());
+    }
+
+    #[test]
+    fn test_build_sweep_psbt_consolidates_utxos() {
+        let (_, pk1) = test_keypair_full(1);
+        let (_, pk2) = test_keypair_full(2);
+        let secp = Secp256k1::new();
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+
+        let output = config.build().unwrap();
+        let builder = RecoveryTxBuilder::new(output);
+
+        let utxos = vec![
+            SweepUtxo {
+                outpoint: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                value_sats: 100_000,
+            },
+            SweepUtxo {
+                outpoint: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 1,
+                },
+                value_sats: 50_000,
+            },
+        ];
+
+        let xonly_pk1 = XOnlyPublicKey::from_slice(&pk1).unwrap();
+        let dest = ScriptBuf::new_p2tr(&secp, xonly_pk1, None);
+
+        let psbt = builder.build_sweep_psbt(0, &utxos, &dest, 2_000).unwrap();
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 2);
+        assert_eq!(psbt.unsigned_tx.output.len(), 1);
+        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 148_000);
+        for input in &psbt.inputs {
+            assert!(input.witness_utxo.is_some());
+            assert_eq!(input.tap_scripts.len(), 1);
+        }
+        assert!(psbt.unsigned_tx.input[0].sequence.is_relative_lock_time());
+    }
+
+    #[test]
+    fn test_build_sweep_psbt_rejects_empty_and_duplicate() {
+        let (_, pk1) = test_keypair_full(1);
+        let (_, pk2) = test_keypair_full(2);
+        let secp = Secp256k1::new();
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        let builder = RecoveryTxBuilder::new(config.build().unwrap());
+        let xonly_pk1 = XOnlyPublicKey::from_slice(&pk1).unwrap();
+        let dest = ScriptBuf::new_p2tr(&secp, xonly_pk1, None);
+
+        assert!(builder.build_sweep_psbt(0, &[], &dest, 1_000).is_err());
+
+        let op = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let dup = vec![
+            SweepUtxo {
+                outpoint: op,
+                value_sats: 100_000,
+            },
+            SweepUtxo {
+                outpoint: op,
+                value_sats: 100_000,
+            },
+        ];
+        let err = builder.build_sweep_psbt(0, &dup, &dest, 1_000).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_build_sweep_psbt_insufficient_funds() {
+        let (_, pk1) = test_keypair_full(1);
+        let (_, pk2) = test_keypair_full(2);
+        let secp = Secp256k1::new();
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        let builder = RecoveryTxBuilder::new(config.build().unwrap());
+        let xonly_pk1 = XOnlyPublicKey::from_slice(&pk1).unwrap();
+        let dest = ScriptBuf::new_p2tr(&secp, xonly_pk1, None);
+        let utxos = vec![SweepUtxo {
+            outpoint: OutPoint {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0,
+            },
+            value_sats: 500,
+        }];
+        assert!(builder.build_sweep_psbt(0, &utxos, &dest, 1_000).is_err());
     }
 
     #[test]

@@ -177,11 +177,48 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
     Ok(canonical)
 }
 
+/// Derive the `script_pubkey` for a definite (non-ranged) descriptor string.
+/// Used to bind a supplied [`crate::RecoveryOutput`] to the descriptor
+/// identified by a canonical hash before sweeping its coins. A recovery output
+/// is by definition a single, non-ranged output, so a ranged descriptor is
+/// rejected rather than silently resolved at an arbitrary index.
+pub fn descriptor_script_pubkey(descriptor: &str) -> Result<bitcoin::ScriptBuf> {
+    let parsed = parse_definite_descriptor(descriptor)?;
+    Ok(parsed.script_pubkey())
+}
+
+/// Derive the address for a definite (non-ranged) descriptor string on
+/// `network`. Used to pick the sweep destination from a finalized FROST wallet
+/// descriptor, which is definite (`tr(<xonly>,<tree>)`, no wildcard).
+pub fn descriptor_address(descriptor: &str, network: Network) -> Result<bitcoin::Address> {
+    let parsed = parse_definite_descriptor(descriptor)?;
+    parsed
+        .address(network)
+        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
+}
+
+fn parse_definite_descriptor(
+    descriptor: &str,
+) -> Result<Descriptor<miniscript::DefiniteDescriptorKey>> {
+    let parsed = parse_descriptor_body(descriptor)?;
+    if parsed.has_wildcard() {
+        return Err(BitcoinError::Descriptor(
+            "descriptor is ranged; expected a definite output".into(),
+        ));
+    }
+    parsed
+        .at_derivation_index(0)
+        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))
+}
+
+fn parse_descriptor_body(descriptor: &str) -> Result<Descriptor<DescriptorPublicKey>> {
+    let body = descriptor.split('#').next().unwrap_or(descriptor);
+    body.parse()
+        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))
+}
+
 fn canonicalize_descriptor(body: &str) -> Result<(String, String)> {
-    let body = body.split('#').next().unwrap_or(body);
-    let parsed: Descriptor<DescriptorPublicKey> = body
-        .parse()
-        .map_err(|e| BitcoinError::Descriptor(format!("invalid descriptor: {e}")))?;
+    let parsed = parse_descriptor_body(body)?;
     let canonical = parsed.to_string();
     let (_, checksum) = canonical.rsplit_once('#').ok_or_else(|| {
         BitcoinError::Descriptor("rust-miniscript returned descriptor without checksum".into())
@@ -204,6 +241,43 @@ mod tests {
         assert!(export.descriptor.contains("tr("));
         assert!(export.descriptor.contains("86'/1'/0'"));
         assert!(export.descriptor.contains("#"));
+    }
+
+    #[test]
+    fn test_descriptor_address_for_definite_frost_wallet() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
+
+        let group = test_group_pubkey();
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![test_keypair(1)],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![test_keypair(2)],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        // Real wallet descriptors are definite: tr(<xonly>,<tree>), no wildcard.
+        let export =
+            DescriptorExport::from_frost_wallet(&group, Some(&config), Network::Testnet).unwrap();
+
+        let addr = descriptor_address(&export.descriptor, Network::Testnet).unwrap();
+        assert!(addr.to_string().starts_with("tb1p"));
+
+        let spk = descriptor_script_pubkey(&export.descriptor).unwrap();
+        assert_eq!(addr.script_pubkey(), spk);
+    }
+
+    #[test]
+    fn test_descriptor_address_rejects_ranged_descriptor() {
+        let secret = [7u8; 32];
+        let derivation = AddressDerivation::new(&secret, Network::Testnet).unwrap();
+        let export = DescriptorExport::from_derivation(&derivation, 0).unwrap();
+        let err = descriptor_address(&export.descriptor, Network::Testnet).unwrap_err();
+        assert!(err.to_string().contains("ranged"));
     }
 
     #[test]

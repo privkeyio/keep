@@ -13,7 +13,10 @@ pub mod recovery_tx;
 mod signer;
 
 pub use address::{AddressDerivation, DerivedAddress};
-pub use descriptor::{multipath_from_external, xpub_to_x_only, DescriptorExport};
+pub use descriptor::{
+    descriptor_address, descriptor_script_pubkey, multipath_from_external, xpub_to_x_only,
+    DescriptorExport,
+};
 pub use error::{BitcoinError, Result};
 pub use key_proof::{build_key_proof_psbt, sign_key_proof, verify_key_proof};
 pub use psbt::{PsbtAnalysis, PsbtSigner};
@@ -22,7 +25,7 @@ pub use recovery::{
 };
 pub use recovery_tx::{
     merge_tap_script_sig, script_spend_sighashes, verify_all_script_spend_input_bindings,
-    verify_script_spend_input_binding, RecoveryTxBuilder, ScriptSpendSighash,
+    verify_script_spend_input_binding, RecoveryTxBuilder, ScriptSpendSighash, SweepUtxo,
     TAPROOT_DUST_LIMIT_SATS,
 };
 pub use signer::BitcoinSigner;

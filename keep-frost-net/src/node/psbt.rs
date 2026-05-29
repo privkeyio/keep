@@ -41,6 +41,11 @@ pub struct PsbtSessionSnapshot {
     pub outputs: Vec<(String, u64)>,
 }
 
+/// Reject a sweep whose fee exceeds `1 / MAX_SWEEP_FEE_FRACTION` of total input
+/// value. Guards against a fee-griefing proposal that burns swept funds while
+/// still passing the absolute `MAX_FEE_SATS` cap in the builder.
+const MAX_SWEEP_FEE_FRACTION: u64 = 4;
+
 impl KfpNode {
     /// Return a display-safe snapshot for the given PSBT session. Returns
     /// `None` if the session does not exist or the stored PSBT fails to
@@ -110,6 +115,220 @@ impl KfpNode {
                 })
                 .collect(),
         )
+    }
+
+    /// Propose a migration sweep: consolidate every UTXO under the OLD
+    /// descriptor (spent via the `tier_index` recovery scriptpath) into a
+    /// single output paying the address of the NEW (definite) descriptor of the
+    /// completed migration `session_id`.
+    ///
+    /// Preconditions, enforced fail-closed:
+    ///   - the migration session must be `Complete` with a finalized descriptor;
+    ///   - the NEW descriptor must be persisted and version-linked, i.e. its
+    ///     canonical hash resolves via the configured `descriptor_lookup`
+    ///     (the `previous_descriptor_hash` chain is written when the migrate
+    ///     link is processed);
+    ///   - the supplied `old_recovery` must resolve to the descriptor
+    ///     identified by `old_descriptor_hash`: the recovery output's
+    ///     `script_pubkey` is compared against the finalized OLD descriptor's
+    ///     output script and a mismatch is rejected, so a proposer cannot
+    ///     sweep coins from an unrelated recovery output.
+    ///
+    /// The sweep is driven through the existing [`Self::request_psbt_spend`]
+    /// coordination keyed on `old_descriptor_hash`, so peers correlate it with
+    /// the descriptor bump via the migrate link that already references the
+    /// same migration `session_id`.
+    ///
+    /// Returns the derived PSBT session id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_descriptor_migration_sweep(
+        &self,
+        migration_session_id: [u8; 32],
+        old_descriptor_hash: [u8; 32],
+        old_recovery: &keep_bitcoin::RecoveryOutput,
+        tier_index: u32,
+        utxos: Vec<keep_bitcoin::SweepUtxo>,
+        fee_sats: u64,
+        required_threshold: u32,
+        expected_share_signers: Vec<u16>,
+        expected_fingerprints: Vec<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<[u8; 32]> {
+        if utxos.is_empty() {
+            return Err(FrostNetError::Session(
+                "migration sweep requires at least one UTXO".into(),
+            ));
+        }
+
+        // 1. Resolve the completed migration session and its finalized NEW
+        //    descriptor in a single lock scope so every field derives from one
+        //    consistent snapshot. Require Complete state so we never sweep into
+        //    a descriptor the group has not fully validated.
+        let (new_external, new_internal, new_network, new_policy_hash, new_version) = {
+            let sessions = self.descriptor_sessions.read();
+            let session = sessions
+                .get_session(&migration_session_id)
+                .ok_or_else(|| FrostNetError::Session("unknown migration session".into()))?;
+            if session.group_pubkey() != &self.group_pubkey {
+                return Err(FrostNetError::Session(
+                    "migration session belongs to a different group".into(),
+                ));
+            }
+            if !matches!(
+                session.state(),
+                crate::descriptor_session::DescriptorSessionState::Complete
+            ) {
+                return Err(FrostNetError::Session(
+                    "migration session is not Complete; refusing to sweep into an unfinalized descriptor".into(),
+                ));
+            }
+            let finalized = session.descriptor().ok_or_else(|| {
+                FrostNetError::Session("migration session has no finalized descriptor".into())
+            })?;
+            (
+                finalized.external.clone(),
+                finalized.internal.clone(),
+                session.network().to_string(),
+                finalized.policy_hash,
+                session.policy().version,
+            )
+        };
+
+        // 2. Require the NEW descriptor be persisted + version-linked. The hash
+        //    is recomputed from the finalized session data and must resolve via
+        //    the descriptor lookup (which reads the same store the migrate link
+        //    writes `previous_descriptor_hash` lineage into).
+        let new_descriptor_hash = keep_core::wallet::canonical_descriptor_hash(
+            &new_external,
+            &new_internal,
+            &new_policy_hash,
+            new_version,
+        )
+        .map_err(|e| FrostNetError::Session(format!("canonical descriptor hash failed: {e}")))?;
+        let lookup = self.descriptor_lookup.as_deref().ok_or_else(|| {
+            FrostNetError::Session(
+                "no descriptor lookup configured; cannot confirm the new descriptor is persisted before sweeping".into(),
+            )
+        })?;
+        if !lookup.find_by_hash(&self.group_pubkey, &new_descriptor_hash) {
+            return Err(FrostNetError::Session(
+                "new descriptor is not persisted (version-linked); finalize and store it before proposing a sweep".into(),
+            ));
+        }
+
+        let network = bitcoin::Network::from_str(&new_network)
+            .map_err(|e| FrostNetError::Session(format!("invalid network {new_network}: {e}")))?;
+
+        // 3. Bind `old_recovery` to `old_descriptor_hash`. The PSBT body
+        //    (witness_utxo script, tap_scripts, control blocks) is built
+        //    entirely from `old_recovery`, while authorization keys only on
+        //    `old_descriptor_hash`. Without this check a proposer could sweep
+        //    coins from an unrelated recovery output that the group never
+        //    finalized. Resolve the finalized OLD descriptor by hash through the
+        //    same persisted lookup used for the new one, so the source of truth
+        //    is consistent and survives session reaping/restart. Require its
+        //    output script equal the recovery output's script_pubkey.
+        let old_external = lookup
+            .external_for(&self.group_pubkey, &old_descriptor_hash)
+            .ok_or_else(|| {
+                FrostNetError::Session(
+                    "old_descriptor_hash does not resolve to a persisted descriptor for this group"
+                        .into(),
+                )
+            })?;
+        let old_spk = keep_bitcoin::descriptor_script_pubkey(&old_external)
+            .map_err(|e| FrostNetError::Session(format!("old descriptor script_pubkey: {e}")))?;
+        if old_spk != old_recovery.address.script_pubkey() {
+            return Err(FrostNetError::Session(
+                "old_recovery output does not match the descriptor identified by old_descriptor_hash"
+                    .into(),
+            ));
+        }
+        if !old_recovery
+            .address
+            .as_unchecked()
+            .is_valid_for_network(network)
+        {
+            return Err(FrostNetError::Session(format!(
+                "old_recovery address is not valid for network {network}"
+            )));
+        }
+
+        // 4. Derive the NEW destination address from the finalized descriptor.
+        //    FROST wallet descriptors are definite (`tr(<xonly>,<tree>)`, no
+        //    wildcard), so derive the single address directly and reuse it for
+        //    both the PSBT destination and the display output.
+        //
+        // NOTE: this destination derivation is proposer-side only. The sweep
+        // rides the generic `request_psbt_spend` path keyed on the OLD
+        // descriptor hash, and responders currently sign the proposed
+        // destination without re-deriving/validating it against the NEW
+        // descriptor. Responder-side destination re-derivation is a broader
+        // change to the general signing path (keep-desktop/keep-cli signing
+        // UIs) and is tracked separately.
+        let dest_addr = keep_bitcoin::descriptor_address(&new_external, network)
+            .map_err(|e| FrostNetError::Session(format!("new receive address: {e}")))?;
+        let destination = dest_addr.script_pubkey();
+
+        // 5. Bound the fee relative to total input value before building, so a
+        //    fee-griefing proposal is rejected ahead of the looser absolute cap
+        //    enforced inside the builder.
+        let total_in: u64 = utxos
+            .iter()
+            .try_fold(0u64, |acc, u| acc.checked_add(u.value_sats))
+            .ok_or_else(|| FrostNetError::Session("sweep input value overflow".into()))?;
+        let fee_cap = total_in / MAX_SWEEP_FEE_FRACTION;
+        if fee_sats > fee_cap {
+            return Err(FrostNetError::Session(format!(
+                "sweep fee {fee_sats} exceeds 1/{MAX_SWEEP_FEE_FRACTION} of total input {total_in}"
+            )));
+        }
+
+        // 6. Build the consolidating sweep PSBT under the OLD recovery tier.
+        let builder = keep_bitcoin::RecoveryTxBuilder::new(old_recovery.clone());
+        let psbt = builder
+            .build_sweep_psbt(tier_index as usize, &utxos, &destination, fee_sats)
+            .map_err(|e| FrostNetError::Session(format!("sweep PSBT build failed: {e}")))?;
+        let psbt_bytes = psbt.serialize();
+
+        let inputs: Vec<PsbtInputInfo> = utxos
+            .iter()
+            .enumerate()
+            .map(|(i, u)| PsbtInputInfo {
+                index: i as u32,
+                value_sats: u.value_sats,
+                address: None,
+            })
+            .collect();
+        let outputs = vec![PsbtOutputInfo {
+            index: 0,
+            value_sats: psbt.unsigned_tx.output[0].value.to_sat(),
+            address: Some(dest_addr.to_string()),
+            is_change: false,
+        }];
+
+        info!(
+            migration_session_id = %hex::encode(migration_session_id),
+            old_descriptor_hash = %hex::encode(old_descriptor_hash),
+            new_descriptor_hash = %hex::encode(new_descriptor_hash),
+            utxos = utxos.len(),
+            "Proposing migration sweep"
+        );
+
+        // 7. Drive through the existing PSBT propose/sign coordination.
+        self.request_psbt_spend(
+            old_descriptor_hash,
+            tier_index,
+            psbt_bytes,
+            fee_sats,
+            required_threshold,
+            expected_share_signers,
+            expected_fingerprints,
+            inputs,
+            outputs,
+            timeout_secs,
+        )
+        .await
     }
 
     /// Propose a PSBT for a recovery tier spend. Publishes `PsbtPropose` to all
