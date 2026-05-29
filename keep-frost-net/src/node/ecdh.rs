@@ -281,7 +281,15 @@ impl KfpNode {
         let single_party_secret = {
             let mut ecdh_sessions = self.ecdh_sessions.write();
             match ecdh_sessions.get_session_mut(&session_id) {
-                Some(s) if s.has_all_shares() => s.try_complete()?,
+                Some(s) if s.has_all_shares() => match s.try_complete() {
+                    Ok(secret) => secret,
+                    Err(e) => {
+                        // Drop the failed session instead of leaving it in
+                        // active_sessions until cleanup_expired reaps it.
+                        ecdh_sessions.complete_session(&session_id);
+                        return Err(e);
+                    }
+                },
                 _ => None,
             }
         };

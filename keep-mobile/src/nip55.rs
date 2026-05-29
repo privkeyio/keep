@@ -23,9 +23,12 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 // Real Nostr clients (e.g. Amethyst sending NIP-17 DMs) easily fire 20-50 sign
 // requests in a short burst: kind 14 rumor + kind 13 seal + per-recipient
 // kind 1059 gift wraps + per-relay kind 22242 NIP-42 auth + reaction signing,
-// all chained. 10/min was a DoS guard that broke real-world flows; the Kotlin
-// IPC-level RateLimiter (30/sec) and per-app permissions already bound abuse.
-const MAX_REQUESTS_PER_WINDOW: u32 = 120;
+// all chained. 10/min broke those real-world flows. This is a defense-in-depth
+// in-process cap covering legitimate bursts. The primary throttle is the
+// Kotlin IPC-level RateLimiter (30/sec) plus per-app permissions; that external
+// limiter is a REQUIRED invariant, not optional, since this in-process counter
+// alone is not a sufficient DoS guard.
+const MAX_REQUESTS_PER_WINDOW: u32 = 60;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
@@ -708,16 +711,18 @@ fn is_valid_package_name(name: &str) -> bool {
 }
 
 fn is_rate_limited_type(t: &Nip55RequestType) -> bool {
-    matches!(
-        t,
+    // GetPublicKey is a trivial local read of cached share info (no crypto/IPC),
+    // so it is exempt. Every other type triggers FROST/ECDH/IPC work and must be
+    // rate-limited. Exhaustive match so new variants force an explicit decision.
+    match t {
+        Nip55RequestType::GetPublicKey => false,
         Nip55RequestType::SignEvent
-            | Nip55RequestType::GetPublicKey
-            | Nip55RequestType::Nip04Encrypt
-            | Nip55RequestType::Nip04Decrypt
-            | Nip55RequestType::Nip44Encrypt
-            | Nip55RequestType::Nip44Decrypt
-            | Nip55RequestType::DecryptZapEvent
-    )
+        | Nip55RequestType::Nip04Encrypt
+        | Nip55RequestType::Nip04Decrypt
+        | Nip55RequestType::Nip44Encrypt
+        | Nip55RequestType::Nip44Decrypt
+        | Nip55RequestType::DecryptZapEvent => true,
+    }
 }
 
 fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> {
