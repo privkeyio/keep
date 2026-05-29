@@ -41,11 +41,6 @@ pub struct PsbtSessionSnapshot {
     pub outputs: Vec<(String, u64)>,
 }
 
-/// Maximum receive index accepted for a migration sweep destination. Bounds
-/// the BIP-44 style gap: a sweep must pay an address within a sane window of
-/// the new descriptor's used range, not an arbitrarily deep index.
-const MAX_SWEEP_RECEIVE_INDEX: u32 = 1_000;
-
 /// Reject a sweep whose fee exceeds `1 / MAX_SWEEP_FEE_FRACTION` of total input
 /// value. Guards against a fee-griefing proposal that burns swept funds while
 /// still passing the absolute `MAX_FEE_SATS` cap in the builder.
@@ -124,8 +119,8 @@ impl KfpNode {
 
     /// Propose a migration sweep: consolidate every UTXO under the OLD
     /// descriptor (spent via the `tier_index` recovery scriptpath) into a
-    /// single output paying a fresh receive address derived from the NEW
-    /// descriptor of the completed migration `session_id`.
+    /// single output paying the address of the NEW (definite) descriptor of the
+    /// completed migration `session_id`.
     ///
     /// Preconditions, enforced fail-closed:
     ///   - the migration session must be `Complete` with a finalized descriptor;
@@ -153,7 +148,6 @@ impl KfpNode {
         old_recovery: &keep_bitcoin::RecoveryOutput,
         tier_index: u32,
         utxos: Vec<keep_bitcoin::SweepUtxo>,
-        new_receive_index: u32,
         fee_sats: u64,
         required_threshold: u32,
         expected_share_signers: Vec<u16>,
@@ -164,11 +158,6 @@ impl KfpNode {
             return Err(FrostNetError::Session(
                 "migration sweep requires at least one UTXO".into(),
             ));
-        }
-        if new_receive_index > MAX_SWEEP_RECEIVE_INDEX {
-            return Err(FrostNetError::Session(format!(
-                "new receive index {new_receive_index} exceeds gap limit {MAX_SWEEP_RECEIVE_INDEX}"
-            )));
         }
 
         // 1. Resolve the completed migration session and its finalized NEW
@@ -235,13 +224,15 @@ impl KfpNode {
         //    entirely from `old_recovery`, while authorization keys only on
         //    `old_descriptor_hash`. Without this check a proposer could sweep
         //    coins from an unrelated recovery output that the group never
-        //    finalized. Resolve the finalized OLD descriptor by hash and require
-        //    its output script equal the recovery output's script_pubkey.
-        let old_external = self
-            .external_descriptor_for_hash(&old_descriptor_hash)?
+        //    finalized. Resolve the finalized OLD descriptor by hash through the
+        //    same persisted lookup used for the new one, so the source of truth
+        //    is consistent and survives session reaping/restart. Require its
+        //    output script equal the recovery output's script_pubkey.
+        let old_external = lookup
+            .external_for(&self.group_pubkey, &old_descriptor_hash)
             .ok_or_else(|| {
                 FrostNetError::Session(
-                    "old_descriptor_hash does not resolve to a finalized descriptor for this group"
+                    "old_descriptor_hash does not resolve to a persisted descriptor for this group"
                         .into(),
                 )
             })?;
@@ -253,10 +244,29 @@ impl KfpNode {
                     .into(),
             ));
         }
+        if !old_recovery
+            .address
+            .as_unchecked()
+            .is_valid_for_network(network)
+        {
+            return Err(FrostNetError::Session(format!(
+                "old_recovery address is not valid for network {network}"
+            )));
+        }
 
-        // 4. Derive the fresh NEW receive address once and reuse it for both the
-        //    PSBT destination and the display output so they cannot diverge.
-        let dest_addr = keep_bitcoin::address_at(&new_external, new_receive_index, network)
+        // 4. Derive the NEW destination address from the finalized descriptor.
+        //    FROST wallet descriptors are definite (`tr(<xonly>,<tree>)`, no
+        //    wildcard), so derive the single address directly and reuse it for
+        //    both the PSBT destination and the display output.
+        //
+        // NOTE: this destination derivation is proposer-side only. The sweep
+        // rides the generic `request_psbt_spend` path keyed on the OLD
+        // descriptor hash, and responders currently sign the proposed
+        // destination without re-deriving/validating it against the NEW
+        // descriptor. Responder-side destination re-derivation is a broader
+        // change to the general signing path (keep-desktop/keep-cli signing
+        // UIs) and is tracked separately.
+        let dest_addr = keep_bitcoin::descriptor_address(&new_external, network)
             .map_err(|e| FrostNetError::Session(format!("new receive address: {e}")))?;
         let destination = dest_addr.script_pubkey();
 
@@ -292,7 +302,7 @@ impl KfpNode {
             .collect();
         let outputs = vec![PsbtOutputInfo {
             index: 0,
-            value_sats: total_in.saturating_sub(fee_sats),
+            value_sats: psbt.unsigned_tx.output[0].value.to_sat(),
             address: Some(dest_addr.to_string()),
             is_change: false,
         }];
@@ -765,34 +775,6 @@ impl KfpNode {
             )));
         }
         Ok(())
-    }
-
-    /// Resolve the external descriptor string of the finalized descriptor whose
-    /// canonical hash equals `descriptor_hash`, scanning in-memory sessions for
-    /// this group. Returns `None` if no finalized descriptor matches.
-    fn external_descriptor_for_hash(&self, descriptor_hash: &[u8; 32]) -> Result<Option<String>> {
-        let sessions = self.descriptor_sessions.read();
-        for (_, session) in sessions.iter_sessions() {
-            if session.group_pubkey() != &self.group_pubkey {
-                continue;
-            }
-            let Some(finalized) = session.descriptor() else {
-                continue;
-            };
-            let expected = keep_core::wallet::canonical_descriptor_hash(
-                &finalized.external,
-                &finalized.internal,
-                &finalized.policy_hash,
-                session.policy().version,
-            )
-            .map_err(|e| {
-                FrostNetError::Session(format!("canonical descriptor hash failed: {e}"))
-            })?;
-            if &expected == descriptor_hash {
-                return Ok(Some(finalized.external.clone()));
-            }
-        }
-        Ok(None)
     }
 
     fn verify_descriptor_hash_against_stored(&self, descriptor_hash: &[u8; 32]) -> Result<()> {

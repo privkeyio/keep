@@ -76,6 +76,15 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         None
     }
 
+    /// Return the external (receive) descriptor string of the persisted
+    /// descriptor whose group + canonical hash match, if any. Used by the
+    /// migration sweep to bind a supplied recovery output to the persisted OLD
+    /// descriptor, so the source of truth survives session reaping/restart.
+    fn external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        let _ = (group, hash);
+        None
+    }
+
     /// Return the largest persisted descriptor version for the given group,
     /// `Ok(None)` if no descriptor exists, or `Err(DescriptorLookupUnavailable)`
     /// if the underlying store could not be queried (e.g. vault locked). Used
@@ -143,6 +152,10 @@ where
 
     fn network_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
         self.lookup(|d| Some(d.network.clone()), group, hash)
+    }
+
+    fn external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        self.lookup(|d| Some(d.external_descriptor.clone()), group, hash)
     }
 
     fn latest_version_for(

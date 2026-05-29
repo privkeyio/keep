@@ -17,9 +17,13 @@ const MAX_FEE_SATS: u64 = 100_000_000; // 1 BTC
 /// Bitcoin Core's default dust threshold for taproot (P2TR) outputs in sats.
 /// Outputs smaller than this are non-standard and unlikely to relay.
 pub const TAPROOT_DUST_LIMIT_SATS: u64 = 330;
-/// Maximum number of inputs in a single consolidating sweep. A larger tx would
-/// exceed standardness limits and fail to relay, so reject it at build time.
-pub const MAX_SWEEP_INPUTS: usize = 500;
+/// Maximum number of inputs in a single consolidating sweep. Taproot
+/// script-path inputs carry a sizable witness (signature, leaf script, control
+/// block), so a large input count both risks the ~100 kvB standardness weight
+/// limit and is costly to sign (one sighash per input per signer). Bound it
+/// conservatively; callers needing to consolidate more must batch into
+/// multiple sweeps.
+pub const MAX_SWEEP_INPUTS: usize = 100;
 
 /// A single UTXO under the recovery output being consolidated by
 /// [`RecoveryTxBuilder::build_sweep_psbt`].
@@ -334,10 +338,27 @@ impl RecoveryTxBuilder {
     }
 
     fn get_tier(&self, index: usize) -> Result<&TierInfo> {
-        self.recovery_output
+        let tier = self
+            .recovery_output
             .tiers
             .get(index)
-            .ok_or_else(|| BitcoinError::Recovery(format!("tier {index} not found")))
+            .ok_or_else(|| BitcoinError::Recovery(format!("tier {index} not found")))?;
+        if tier.keys.is_empty() {
+            return Err(BitcoinError::Recovery(format!("tier {index} has no keys")));
+        }
+        if tier.threshold < 1 {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {index} threshold must be at least 1"
+            )));
+        }
+        if tier.threshold as usize > tier.keys.len() {
+            return Err(BitcoinError::Recovery(format!(
+                "tier {index} threshold {} exceeds key count {}",
+                tier.threshold,
+                tier.keys.len()
+            )));
+        }
+        Ok(tier)
     }
 
     fn control_block(&self, tier: &TierInfo) -> Result<ControlBlock> {

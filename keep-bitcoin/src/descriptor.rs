@@ -177,43 +177,38 @@ pub fn multipath_from_external(external: &str) -> Result<String> {
     Ok(canonical)
 }
 
-/// Derive the receive address at `index` from a ranged external descriptor
-/// string (e.g. `tr(...)/0/*`). Used to pick a fresh destination on the new
-/// descriptor when sweeping funds after a migration.
-///
-/// The descriptor must be ranged (contain a wildcard `*`); a definite
-/// descriptor with no wildcard is rejected so callers don't silently reuse a
-/// single address.
-pub fn address_at(descriptor: &str, index: u32, network: Network) -> Result<bitcoin::Address> {
-    let parsed = parse_descriptor_body(descriptor)?;
-    if !parsed.has_wildcard() {
-        return Err(BitcoinError::Descriptor(
-            "descriptor has no wildcard; cannot derive a ranged receive address".into(),
-        ));
-    }
-    parsed
-        .at_derivation_index(index)
-        .map_err(|e| BitcoinError::Descriptor(format!("derivation index {index}: {e}")))?
-        .address(network)
-        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
-}
-
 /// Derive the `script_pubkey` for a definite (non-ranged) descriptor string.
 /// Used to bind a supplied [`crate::RecoveryOutput`] to the descriptor
 /// identified by a canonical hash before sweeping its coins. A recovery output
 /// is by definition a single, non-ranged output, so a ranged descriptor is
 /// rejected rather than silently resolved at an arbitrary index.
 pub fn descriptor_script_pubkey(descriptor: &str) -> Result<bitcoin::ScriptBuf> {
+    let parsed = parse_definite_descriptor(descriptor)?;
+    Ok(parsed.script_pubkey())
+}
+
+/// Derive the address for a definite (non-ranged) descriptor string on
+/// `network`. Used to pick the sweep destination from a finalized FROST wallet
+/// descriptor, which is definite (`tr(<xonly>,<tree>)`, no wildcard).
+pub fn descriptor_address(descriptor: &str, network: Network) -> Result<bitcoin::Address> {
+    let parsed = parse_definite_descriptor(descriptor)?;
+    parsed
+        .address(network)
+        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
+}
+
+fn parse_definite_descriptor(
+    descriptor: &str,
+) -> Result<Descriptor<miniscript::DefiniteDescriptorKey>> {
     let parsed = parse_descriptor_body(descriptor)?;
     if parsed.has_wildcard() {
         return Err(BitcoinError::Descriptor(
-            "descriptor is ranged; expected a definite recovery output".into(),
+            "descriptor is ranged; expected a definite output".into(),
         ));
     }
-    let definite = parsed
+    parsed
         .at_derivation_index(0)
-        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?;
-    Ok(definite.script_pubkey())
+        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))
 }
 
 fn parse_descriptor_body(descriptor: &str) -> Result<Descriptor<DescriptorPublicKey>> {
@@ -252,24 +247,40 @@ mod tests {
     }
 
     #[test]
-    fn test_address_at_derives_distinct_ranged_addresses() {
-        let secret = [7u8; 32];
-        let derivation = AddressDerivation::new(&secret, Network::Testnet).unwrap();
-        let export = DescriptorExport::from_derivation(&derivation, 0).unwrap();
+    fn test_descriptor_address_for_definite_frost_wallet() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
 
-        let a0 = address_at(&export.descriptor, 0, Network::Testnet).unwrap();
-        let a1 = address_at(&export.descriptor, 1, Network::Testnet).unwrap();
-        assert_ne!(a0, a1);
-        assert!(a0.to_string().starts_with("tb1p"));
+        let group = test_group_pubkey();
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![test_keypair(1)],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![test_keypair(2)],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        // Real wallet descriptors are definite: tr(<xonly>,<tree>), no wildcard.
+        let export =
+            DescriptorExport::from_frost_wallet(&group, Some(&config), Network::Testnet).unwrap();
+
+        let addr = descriptor_address(&export.descriptor, Network::Testnet).unwrap();
+        assert!(addr.to_string().starts_with("tb1p"));
+
+        let spk = descriptor_script_pubkey(&export.descriptor).unwrap();
+        assert_eq!(addr.script_pubkey(), spk);
     }
 
     #[test]
-    fn test_address_at_rejects_non_ranged_descriptor() {
-        let group = test_group_pubkey();
-        // tr(<xonly>) has no wildcard.
-        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
-        let err = address_at(&export.descriptor, 0, Network::Testnet).unwrap_err();
-        assert!(err.to_string().contains("wildcard"));
+    fn test_descriptor_address_rejects_ranged_descriptor() {
+        let secret = [7u8; 32];
+        let derivation = AddressDerivation::new(&secret, Network::Testnet).unwrap();
+        let export = DescriptorExport::from_derivation(&derivation, 0).unwrap();
+        let err = descriptor_address(&export.descriptor, Network::Testnet).unwrap_err();
+        assert!(err.to_string().contains("ranged"));
     }
 
     #[test]
