@@ -40,7 +40,14 @@ pub fn cmd_frost_hardware_ping(out: &Output, device: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
+pub fn cmd_frost_hardware_list(out: &Output, device: Option<&str>) -> Result<()> {
+    match device {
+        Some(d) => list_one(out, d),
+        None => enumerate_and_list(out),
+    }
+}
+
+fn list_one(out: &Output, device: &str) -> Result<()> {
     out.newline();
     out.header("Hardware Signer Shares");
     out.field("Device", device);
@@ -71,6 +78,90 @@ pub fn cmd_frost_hardware_list(out: &Output, device: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn enumerate_and_list(out: &Output) -> Result<()> {
+    use std::time::Duration;
+
+    // Short per-probe timeout so a stuck or non-keep serial device fails fast
+    // rather than blocking the entire scan ~30s. The default constructor's 30s
+    // timeout is still used by `cmd_frost_hardware_list` (single-device path)
+    // and by other hardware commands.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    out.newline();
+    out.header("Hardware Signer Devices");
+    out.newline();
+
+    let candidates = candidate_serial_devices();
+    if candidates.is_empty() {
+        out.info("No candidate serial devices found (looked for /dev/ttyACM*, /dev/ttyUSB*, /dev/cu.usbmodem*).");
+        return Ok(());
+    }
+
+    let mut found = 0usize;
+    for candidate in &candidates {
+        out.field("Probing", candidate);
+        match HardwareSigner::with_timeout(candidate, PROBE_TIMEOUT) {
+            Ok(mut signer) => match signer.ping() {
+                Ok(version) => {
+                    found += 1;
+                    out.field("  Version", &version);
+                    match signer.list_shares() {
+                        Ok(shares) => {
+                            if shares.is_empty() {
+                                out.info("  No shares stored");
+                            } else {
+                                out.info(&format!("  {} share(s):", shares.len()));
+                                for share in shares {
+                                    out.field("    Group", &share);
+                                }
+                            }
+                        }
+                        Err(e) => out.info(&format!("  Could not list shares on {candidate}: {e}")),
+                    }
+                }
+                Err(e) => out.info(&format!("  Not a keep hardware signer: {e}")),
+            },
+            Err(e) => out.info(&format!("  Cannot open: {e}")),
+        }
+    }
+    out.newline();
+    out.info(&format!(
+        "{} keep hardware signer(s) responded out of {} candidate(s).",
+        found,
+        candidates.len()
+    ));
+    Ok(())
+}
+
+fn candidate_serial_devices() -> Vec<String> {
+    let mut out = Vec::new();
+    for pattern in ["/dev/ttyACM", "/dev/ttyUSB", "/dev/cu.usbmodem"] {
+        let dir = std::path::Path::new(pattern)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/dev"));
+        let prefix = std::path::Path::new(pattern)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if name_str.starts_with(prefix) {
+                    if let Some(p) = entry.path().to_str() {
+                        out.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn cmd_frost_hardware_import(

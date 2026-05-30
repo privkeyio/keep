@@ -37,8 +37,16 @@ pub struct HardwareSigner {
 
 impl HardwareSigner {
     pub fn new(device: &str) -> Result<Self> {
+        Self::with_timeout(device, Duration::from_secs(30))
+    }
+
+    /// Open a hardware signer with a custom serial read/write timeout.
+    /// Used by the `frost hardware list` enumeration path so unresponsive
+    /// devices fail fast (1-3s) instead of blocking the full ~30s default
+    /// per candidate.
+    pub fn with_timeout(device: &str, timeout: Duration) -> Result<Self> {
         let port = serialport::new(device, 115200)
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .open()
             .with_context(|| format!("Failed to open serial port: {device}"))?;
 

@@ -29,29 +29,38 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Create a new encrypted vault at the given path
     Init {
         #[arg(long, default_value = "100")]
         size: u64,
     },
+    /// Generate a new Nostr keypair and store it in the vault
     Generate {
         #[arg(short, long, default_value = "default")]
         name: String,
     },
+    /// Import an existing Nostr nsec into the vault
     Import {
         #[arg(short, long, default_value = "imported")]
         name: String,
     },
+    /// List keys stored in the vault
     List,
+    /// Print a raw nsec for the named key (prompts for confirmation)
     Export {
         #[arg(short, long)]
         name: String,
     },
+    /// Remove a key from the vault
     Delete {
         #[arg(short, long)]
         name: String,
     },
+    /// Change the vault unlock password
     RotatePassword,
+    /// Rotate the vault data-encryption key (re-encrypts every secret)
     RotateDataKey,
+    /// Start the NIP-46 bunker (and optional FROST network co-signer)
     Serve {
         #[arg(short, long)]
         relay: Option<String>,
@@ -62,47 +71,60 @@ pub(crate) enum Commands {
         #[arg(long)]
         frost_relay: Option<String>,
     },
+    /// Inspect, verify, export, or prune the audit log
     Audit {
         #[command(subcommand)]
         command: AuditCommands,
     },
+    /// FROST threshold-signature operations (generate, sign, network coordination)
     Frost {
         #[command(subcommand)]
         command: FrostCommands,
     },
+    /// Bitcoin address derivation, descriptor management, and PSBT signing
     Bitcoin {
         #[command(subcommand)]
         command: BitcoinCommands,
     },
+    /// AWS Nitro Enclave operations (attest, generate, sign)
     Enclave {
         #[command(subcommand)]
         command: EnclaveCommands,
     },
+    /// Agent integrations (MCP server, etc.)
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// FROST wallet descriptors, proposals, and PSBT spend coordination
     Wallet {
         #[command(subcommand)]
         command: WalletCommands,
     },
+    /// Inspect or initialize the keep CLI config file
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Inspect or apply on-disk schema migrations
     Migrate {
         #[command(subcommand)]
         command: Option<MigrateCommands>,
     },
+    /// Write a passphrase-encrypted backup of the vault to a file
     Backup {
         #[arg(short, long, help = "Output file path")]
         output: Option<PathBuf>,
     },
+    /// Restore a backup file into a NEW vault at --target
     Restore {
         #[arg(help = "Backup file to restore from")]
         file: PathBuf,
-        #[arg(long, help = "Target vault path")]
-        target: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Target vault path. Required; no default to avoid restoring over the active ~/.keep vault."
+        )]
+        target: PathBuf,
     },
 }
 
@@ -358,6 +380,13 @@ pub(crate) enum FrostCommands {
         format: ExportFormat,
     },
     Import,
+    /// Delete a stored FROST share from the vault (audit-logged)
+    DeleteShare {
+        #[arg(short, long, help = "FROST group npub or hex")]
+        group: String,
+        #[arg(short, long, help = "Share identifier (1-indexed)")]
+        share: u16,
+    },
     Sign {
         #[arg(short, long)]
         message: String,
@@ -510,9 +539,14 @@ pub(crate) enum FrostHardwareCommands {
         #[arg(short, long)]
         device: String,
     },
+    /// Probe attached devices and report which are keep hardware signers
     List {
-        #[arg(short, long)]
-        device: String,
+        #[arg(
+            short,
+            long,
+            help = "Probe a specific device path. If omitted, scan /dev/ttyACM*, /dev/ttyUSB*, /dev/cu.usbmodem*."
+        )]
+        device: Option<String>,
     },
     Import {
         #[arg(short, long)]
