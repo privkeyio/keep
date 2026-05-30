@@ -1284,15 +1284,28 @@ impl KfpNode {
                 Err(e.into())
             }
             Err(_) => {
-                // Exclude only peers that never committed; responsive peers stay
+                // Exclude only peers that never responded; responsive peers stay
                 // eligible for the failover retry so we don't drain the eligible
-                // set or waste healthy peers' single-use nonces. If the session is
-                // already gone, fall back to excluding the whole attempted set.
+                // set or waste healthy peers' single-use nonces. A peer is
+                // unresponsive if it failed to deliver either its commitment or
+                // its signature share -- the latter matters when commitments were
+                // pre-exchanged, so `uncommitted_participants` would be empty even
+                // though shares never arrived. If the session is already gone,
+                // fall back to excluding the whole attempted set.
                 let unresponsive = {
                     let sessions = self.sessions.read();
                     sessions
                         .get_session(&session_id)
-                        .map(|s| s.uncommitted_participants(self.share.metadata.identifier))
+                        .map(|s| {
+                            let our = self.share.metadata.identifier;
+                            let mut idxs = s.uncommitted_participants(our);
+                            for idx in s.participants_missing_shares(our) {
+                                if !idxs.contains(&idx) {
+                                    idxs.push(idx);
+                                }
+                            }
+                            idxs
+                        })
                         .unwrap_or_else(|| attempted.clone())
                 };
                 self.sessions.write().complete_session(&session_id);

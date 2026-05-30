@@ -226,6 +226,23 @@ impl NetworkSession {
             .collect()
     }
 
+    /// Participant indices (excluding `our_index`) that have not submitted a
+    /// signature share. Used by failover when commitments were pre-exchanged
+    /// (so `uncommitted_participants` is empty) but some signers never produced
+    /// a share before the round timed out.
+    pub fn participants_missing_shares(&self, our_index: u16) -> Vec<u16> {
+        self.participants
+            .iter()
+            .copied()
+            .filter(|&idx| idx != our_index)
+            .filter(|&idx| {
+                Identifier::try_from(idx)
+                    .map(|id| !self.signature_shares.contains_key(&id))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
     /// Build the FROST signing package from the collected commitments.
     ///
     /// Correctness invariant (load-bearing now that delivery order is relaxed):
