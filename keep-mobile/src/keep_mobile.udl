@@ -305,6 +305,9 @@ interface KeepMobile {
     void mark_share_backed_up(string group_pubkey);
 
     [Throws=KeepMobileError]
+    void rename_share(string group_pubkey, string name);
+
+    [Throws=KeepMobileError]
     string? get_seed_words(string group_pubkey);
 
     [Throws=KeepMobileError]
