@@ -7,7 +7,20 @@ use tokio::sync::Mutex;
 
 use keep_core::keyring::Keyring;
 use keep_core::keys::{KeyType, NostrKeypair};
+use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
 use keep_nip46::{Server, ServerConfig};
+
+/// Test-only `ServerCallbacks` that approves every request. Used by tests
+/// that need the connect handshake to succeed (and the per-method approval
+/// gate to fire) WITHOUT enabling `auto_approve: true`, which would override
+/// the client's requested permissions with `Permission::ALL`.
+struct AlwaysApprove;
+impl ServerCallbacks for AlwaysApprove {
+    fn on_log(&self, _event: LogEvent) {}
+    fn request_approval(&self, _request: ApprovalRequest) -> bool {
+        true
+    }
+}
 
 fn extract_bunker_secret(bunker_url: &str) -> Option<String> {
     let url = url::Url::parse(bunker_url).ok()?;
@@ -219,14 +232,19 @@ async fn test_bunker_permission_scoping() {
     let relay_url = mock_relay.url().await.to_string();
     let (keyring, signer_pubkey) = setup_keyring();
 
+    // `auto_approve: false` here, with an `AlwaysApprove` callback. This
+    // exercises the real per-permission scoping path: the client's requested
+    // permissions are honored as-is, not silently widened to `Permission::ALL`
+    // by `auto_approve` (see #444 / `handler.rs:351`). The callback lets the
+    // connect handshake succeed in a test that has no human in the loop.
     let server = Server::new_with_config(
         keyring,
         None,
         None,
         std::slice::from_ref(&relay_url),
-        None,
+        Some(Arc::new(AlwaysApprove)),
         ServerConfig {
-            auto_approve: true,
+            auto_approve: false,
             ..Default::default()
         },
     )
