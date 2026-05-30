@@ -113,7 +113,7 @@ pub fn default_frost_relays() -> Vec<String> {
     // FROST coordination depends on; most public relays drop them, which causes
     // missed or prematurely-rejected signing rounds. Operators can add more in
     // settings for redundancy.
-    vec!["wss://bucket.coracle.social/".into()]
+    vec!["wss://bucket.coracle.social".into()]
 }
 
 /// Normalize a relay URL: trim whitespace, lowercase scheme+host, ensure trailing slash.

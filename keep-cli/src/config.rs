@@ -173,6 +173,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_default_relay_fallback_matches_frost_default() {
+        let config = Config::parse("").unwrap();
+        assert!(config.relays.is_empty());
+        assert_eq!(config.default_relay(), "wss://bucket.coracle.social");
+        assert_eq!(
+            config.default_relay(),
+            keep_core::relay::default_frost_relays()[0]
+        );
+    }
+
+    #[test]
     fn test_parse_full_config() {
         let content = r#"
 vault_path = "~/.keep"
