@@ -12,6 +12,15 @@ Keep is an encrypted vault for Nostr and Bitcoin keys. It stores keys locally wi
 
 Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Android/iOS via UniFFI), a StartOS service for always-on FROST co-signing, or inside AWS Nitro Enclaves for hardware-isolated signing. FROST shares can be distributed across phones, hardware signers, StartOS boxes, and cloud enclaves, then coordinated over Nostr relays for multisig signing.
 
+## Ecosystem
+
+| Repo | Lang | Role |
+|------|------|------|
+| this repo | Rust | Encrypted vault, CLI, desktop app, Nitro Enclave signing, and [`keep-web`](keep-web) headless co-signer |
+| [keep-android](https://github.com/privkeyio/keep-android) | Kotlin | FROST mobile signer with NIP-55 and NIP-46 |
+| [keep-esp32](https://github.com/privkeyio/keep-esp32) | C | Air-gapped ESP32-S3 hardware signer |
+| [keep-startos](https://github.com/privkeyio/keep-startos) | TypeScript | Always-on FROST co-signer node packaging |
+
 ## Features
 
 - **Encrypted vault**: Argon2id + XChaCha20-Poly1305, keys zeroized in RAM
@@ -19,13 +28,10 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 - **Threshold signatures**: FROST t-of-n key splitting with distributed key generation (DKG)
 - **Network signing**: Coordinate FROST signing across devices over Nostr relays
 - **Bitcoin**: BIP-86 Taproot addresses, PSBT signing, wallet descriptor coordination
-- **Hardware signers**: Air-gapped FROST shares on [keep-esp32](https://github.com/privkeyio/keep-esp32)
-- **Mobile**: UniFFI library for Android ([keep-android](https://github.com/privkeyio/keep-android)) and iOS
 - **Enclaves**: AWS Nitro Enclave signing with attestation-based KMS
 - **Agent SDK**: Constrained signing sessions for AI agents (Python, TypeScript, MCP)
 - **Hidden volumes**: Plausibly deniable storage, cryptographically undetectable
 - **Desktop app**: Iced GUI with system tray, QR scanning, NIP-49 import/export
-- **Always-on co-signer**: Headless network-FROST co-signer with a web admin UI ([`keep-web`](keep-web)), packaged for StartOS ([keep-startos](https://github.com/privkeyio/keep-startos))
 
 ## Quick Start
 
@@ -40,8 +46,6 @@ keep serve --relay wss://bucket.coracle.social  # Start remote signer
 ```
 
 Keys are stored encrypted at `~/.keep`. See [`docs/USAGE.md`](docs/USAGE.md) for full CLI reference, FROST setup, Bitcoin commands, and more.
-
-For an always-on FROST co-signer on a StartOS box, install the [`keep-startos`](https://github.com/privkeyio/keep-startos) service (ships [`keep-web`](keep-web), a headless network-FROST signer with a browser-based admin UI).
 
 ## Development
 
