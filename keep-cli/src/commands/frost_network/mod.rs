@@ -355,14 +355,24 @@ pub fn cmd_frost_network_peers(
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Peers announce every 20s. A bare 3s sleep was missing most announces.
+        // Poll for up to 25s, exit early as soon as we see anyone.
+        const PEER_DISCOVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(25);
+        const PEER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + PEER_DISCOVERY_WINDOW;
+        while tokio::time::Instant::now() < deadline {
+            if node.online_peers() > 0 {
+                break;
+            }
+            tokio::time::sleep(PEER_POLL_INTERVAL).await;
+        }
         spinner.finish();
         node_handle.abort();
 
         let status = node.peer_status();
 
         if status.is_empty() {
-            out.info("No peers discovered yet.");
+            out.info("No peers discovered yet (waited up to 25s; announce interval is 20s).");
             out.info("Run 'keep frost network serve' on other devices first.");
         } else {
             out.table_header(&[("SHARE", 8), ("STATUS", 10), ("NAME", 20)]);

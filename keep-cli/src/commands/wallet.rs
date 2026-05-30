@@ -101,7 +101,12 @@ pub fn cmd_wallet_show(out: &Output, path: &Path, group_hex: &str) -> Result<()>
     out.header("Wallet Descriptor");
     out.field("Group", &hex::encode(desc.group_pubkey));
     out.field("Network", &desc.network);
-    out.field("Created", &desc.created_at.to_string());
+    let created_human = i64::try_from(desc.created_at)
+        .ok()
+        .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("epoch {}", desc.created_at));
+    out.field("Created", &created_human);
     out.newline();
     out.field("External (receive)", &desc.external_descriptor);
     out.newline();
