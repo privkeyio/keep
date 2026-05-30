@@ -916,11 +916,7 @@ impl KeepMobile {
     }
 
     // Load-modify-store without locking; acceptable in single-user mobile context
-    pub fn rename_share(
-        &self,
-        group_pubkey: String,
-        name: String,
-    ) -> Result<(), KeepMobileError> {
+    pub fn rename_share(&self, group_pubkey: String, name: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
         let name = name.trim();
         if name.is_empty() {
@@ -3192,7 +3188,9 @@ impl KeepMobile {
         if let Some(display_name) = self
             .storage
             .get_share_metadata()
-            .filter(|m| m.group_pubkey == metadata.group_pubkey && m.identifier == metadata.identifier)
+            .filter(|m| {
+                m.group_pubkey == metadata.group_pubkey && m.identifier == metadata.identifier
+            })
             .map(|m| m.name)
         {
             if display_name != metadata.name {
