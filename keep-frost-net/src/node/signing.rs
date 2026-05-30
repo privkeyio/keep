@@ -1019,30 +1019,6 @@ impl KfpNode {
                 .signing_round(round_message, message_type, &excluded, logical_id, attempt)
                 .await;
 
-            // If a peer reported a stale pre-exchanged nonce (it rotated/restarted, so
-            // a pooled commitment we referenced no longer maps to a live secret), drop
-            // the suspect pooled commitments so the *next* request falls back to a
-            // fresh interactive round. We deliberately do NOT retry this request in
-            // place: our single-use nonce was already spent on a share bound to the
-            // stale commitment, the session id is fixed by the message, and the
-            // replay guard would reject re-signing it; retrying would risk nonce
-            // reuse. The stale_nonce/incomplete_pre_exchange branch is a fatal
-            // Session error (not a Timeout), so it intentionally bypasses the
-            // failover retry below and returns to the caller. The signing session
-            // is torn down on failure (see below), so the next attempt starts clean.
-            if let Err(SigningRoundError {
-                error: FrostNetError::Session(ref e),
-                ..
-            }) = result
-            {
-                if e.contains("stale_nonce") || e.contains("incomplete_pre_exchange") {
-                    self.nonce_pool.clear_all_peers();
-                    warn!(
-                        "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
-                    );
-                }
-            }
-
             match result {
                 Ok(sig) => return Ok(sig),
                 Err(SigningRoundError {
@@ -1056,7 +1032,29 @@ impl KfpNode {
                     );
                     excluded.extend(attempted);
                 }
-                Err(e) => return Err(e.error),
+                Err(e) => {
+                    // If a peer reported a stale pre-exchanged nonce (it
+                    // rotated/restarted, so a pooled commitment we referenced no
+                    // longer maps to a live secret), drop the suspect pooled
+                    // commitments so the *next* request falls back to a fresh
+                    // interactive round. We deliberately do NOT retry this request
+                    // in place: our single-use nonce was already spent on a share
+                    // bound to the stale commitment, the session id is fixed by the
+                    // message, and the replay guard would reject re-signing it;
+                    // retrying would risk nonce reuse. This is a fatal Session error
+                    // (not a Timeout), so it returns to the caller rather than
+                    // failing over. The signing session is torn down on failure, so
+                    // the next request starts clean.
+                    if let FrostNetError::Session(ref msg) = e.error {
+                        if msg.contains("stale_nonce") || msg.contains("incomplete_pre_exchange") {
+                            self.nonce_pool.clear_all_peers();
+                            warn!(
+                                "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
+                            );
+                        }
+                    }
+                    return Err(e.error);
+                }
             }
         }
         Err(FrostNetError::Timeout(
