@@ -11,7 +11,7 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::DecryptionFailed | KeepError::RotationFailed(_) => "Operation failed",
         KeepError::KeyNotFound(_) => "Key not found",
         KeepError::KeyAlreadyExists(_) => "Key already exists",
-        KeepError::InvalidNsec | KeepError::InvalidNpub => "Invalid key format",
+        KeepError::InvalidNsec | KeepError::InvalidNpub(_) => "Invalid key format",
         KeepError::KeyringFull(_) => "Storage limit reached",
         KeepError::Locked => "Signer locked",
         KeepError::AlreadyExists(_) | KeepError::NotFound(_) => "Resource error",
