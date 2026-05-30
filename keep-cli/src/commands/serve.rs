@@ -528,62 +528,22 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 /// accept signing requests from previously authorized clients.
 fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
     let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
-    let mut out = Vec::with_capacity(cfg.bunker_permissions.len());
-    for bp in &cfg.bunker_permissions {
-        let pk_bytes = match hex::decode(&bp.pubkey_hex) {
-            Ok(b) if b.len() == 32 => b,
-            _ => {
-                tracing::warn!(
-                    pubkey_hex = %bp.pubkey_hex,
-                    "skipping malformed bunker_permission pubkey on load"
-                );
-                continue;
-            }
-        };
-        let pubkey = match nostr_sdk::PublicKey::from_slice(&pk_bytes) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::warn!(
-                    pubkey_hex = %bp.pubkey_hex,
-                    error = %e,
-                    "skipping bunker_permission with invalid pubkey on load"
-                );
-                continue;
-            }
-        };
-        // Mirror keep-desktop's restore_bunker_permissions: Session grants are
-        // not meant to survive a restart, and already-expired Seconds grants
-        // must not be reactivated. Forever grants always load.
-        let now = nostr_sdk::Timestamp::now().as_secs();
-        let duration = match &bp.duration {
-            keep_core::relay::StoredPermissionDuration::Session => continue,
-            keep_core::relay::StoredPermissionDuration::Seconds(secs) => {
-                if now > bp.connected_at.saturating_add(*secs) {
-                    continue;
-                }
-                keep_nip46::PermissionDuration::Seconds(*secs)
-            }
-            keep_core::relay::StoredPermissionDuration::Forever => {
-                keep_nip46::PermissionDuration::Forever
-            }
-        };
-        let permissions = keep_nip46::Permission::from_bits_truncate(bp.permissions);
-        let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = bp
-            .auto_approve_kinds
-            .iter()
-            .copied()
-            .map(nostr_sdk::Kind::from)
-            .collect();
-        out.push(keep_nip46::PreGrantedApp {
-            pubkey,
-            name: bp.name.clone(),
-            permissions,
-            auto_approve_kinds,
-            duration,
-            connected_at: nostr_sdk::Timestamp::from(bp.connected_at),
-        });
-    }
-    Ok(out)
+    Ok(map_stored_to_pregrants(&cfg.bunker_permissions))
+}
+
+/// Pure mapping persisted permissions → runtime `PreGrantedApp`. Separated
+/// from the I/O wrapper so the boundary is testable and shared with the
+/// desktop's restore path. Malformed pubkeys are skipped (`from_stored`
+/// returns `None`); Session/expired Seconds rows are kept here and filtered
+/// downstream by `PermissionManager::restore_persisted`, so this stays a
+/// pure function of the stored bytes.
+fn map_stored_to_pregrants(
+    stored: &[keep_core::relay::StoredBunkerPermission],
+) -> Vec<keep_nip46::PreGrantedApp> {
+    stored
+        .iter()
+        .filter_map(keep_nip46::PreGrantedApp::from_stored)
+        .collect()
 }
 
 /// Read the persisted global auto-approve kinds (`keep nip46 auto-approve`).
