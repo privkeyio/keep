@@ -253,7 +253,7 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     let s = addr.segments();
     let o = addr.octets();
     let tail_v4 = || Ipv4Addr::new(o[12], o[13], o[14], o[15]);
-    // IPv4-compatible (::x.x.x.x) — deprecated but still exploitable
+    // IPv4-compatible (::x.x.x.x): deprecated but still exploitable
     if s[..6] == [0, 0, 0, 0, 0, 0] {
         return Some(tail_v4());
     }
@@ -261,11 +261,11 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         return Some(tail_v4());
     }
-    // 6to4 (2002::/16) — IPv4 embedded in bits 16-47
+    // 6to4 (2002::/16): IPv4 embedded in bits 16-47
     if s[0] == 0x2002 {
         return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
     }
-    // Teredo (2001:0000::/32) — IPv4 XOR'd in last 32 bits
+    // Teredo (2001:0000::/32): IPv4 XOR'd in last 32 bits
     if s[0] == 0x2001 && s[1] == 0x0000 {
         return Some(Ipv4Addr::new(
             o[12] ^ 0xff,
@@ -352,7 +352,7 @@ mod tests {
         assert!(validate_relay_url("wss://relay.example.com").is_ok());
         assert!(validate_relay_url("wss://relay.example.com:443/").is_ok());
         assert!(validate_relay_url("wss://relay.example.com:8080").is_ok());
-        assert!(validate_relay_url("wss://nos.lol/").is_ok());
+        assert!(validate_relay_url("wss://bucket.coracle.social/").is_ok());
     }
 
     #[test]
@@ -414,10 +414,10 @@ mod tests {
         assert!(validate_relay_url("wss://[fd00::1]/").is_err());
         assert!(validate_relay_url("wss://[fe80::1]/").is_err());
         assert!(validate_relay_url("wss://[ff02::1]/").is_err());
-        // IPv4-compatible (::x.x.x.x) — exercises to_embedded_v4 deprecated-compat path
+        // IPv4-compatible (::x.x.x.x), exercises to_embedded_v4 deprecated-compat path
         assert!(validate_relay_url("wss://[::7f00:1]/").is_err()); // ::127.0.0.1
         assert!(validate_relay_url("wss://[::a00:1]/").is_err()); // ::10.0.0.1
-                                                                  // NAT64 Well-Known Prefix 64:ff9b::/96 — exercises to_embedded_v4 NAT64 path
+                                                                  // NAT64 Well-Known Prefix 64:ff9b::/96, exercises to_embedded_v4 NAT64 path
         assert!(validate_relay_url("wss://[64:ff9b::7f00:1]/").is_err()); // embeds 127.0.0.1
         assert!(validate_relay_url("wss://[64:ff9b::a00:1]/").is_err()); // embeds 10.0.0.1
     }

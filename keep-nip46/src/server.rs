@@ -701,7 +701,7 @@ mod tests {
     use super::*;
 
     // An explicitly-configured `expected_secret` must surface as the bunker
-    // secret, which `bunker_url()` embeds — otherwise clients get a secret-less
+    // secret, which `bunker_url()` embeds; otherwise clients get a secret-less
     // URL and reject the connect.
     #[test]
     fn expected_secret_surfaces_in_bunker_secret() {

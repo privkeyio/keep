@@ -192,7 +192,7 @@ impl SignerHandler {
     fn check_kill_switch(&self) -> Result<()> {
         if self.kill_switch.load(Ordering::Acquire) {
             Err(KeepError::PermissionDenied(
-                "kill switch active — all signing blocked".into(),
+                "kill switch active: all signing blocked".into(),
             ))
         } else {
             Ok(())

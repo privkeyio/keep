@@ -102,7 +102,7 @@ impl KfpNode {
     /// A share imported from a transport export carries only its own verifying
     /// share (the export does not include the other members' shares), so
     /// `self.share.pubkey_package()` alone is missing the co-signers' verifying
-    /// shares that `frost::aggregate` needs to validate their signature shares —
+    /// shares that `frost::aggregate` needs to validate their signature shares,
     /// without them aggregation fails with "Unknown identifier". Fill the gaps
     /// from the verifying share each peer announced (authenticated via
     /// proof-of-share on discovery), reconstructing the dealer's full package.
@@ -783,7 +783,7 @@ impl KfpNode {
             // this session has produced and sent our share (e.g. a peer's
             // commitment arriving after the pre-exchanged set already drove us
             // into round 2). Treat the repeat as a no-op rather than failing the
-            // whole request on the consumed nonce — aggregation is still driven
+            // whole request on the consumed nonce; aggregation is still driven
             // by the inbound signature-share handler.
             let nonces = match session.take_our_nonces() {
                 Some(n) => n,
@@ -968,7 +968,7 @@ impl KfpNode {
         // fresh interactive round. We deliberately do NOT retry this request in
         // place: our single-use nonce was already spent on a share bound to the
         // stale commitment, the session id is fixed by the message, and the
-        // replay guard would reject re-signing it — retrying would risk nonce
+        // replay guard would reject re-signing it; retrying would risk nonce
         // reuse. The signing session is torn down on failure (see below), so the
         // next attempt starts clean.
         if let Err(FrostNetError::Session(ref e)) = result {

@@ -39,7 +39,7 @@ Keys live only in enclave memory. KMS decrypts only if PCRs match.
 - AWS account with EC2, KMS, IAM permissions
 - AWS CLI configured
 - Docker installed
-- Nitro SDK binaries — see [keep-enclave/build/README.md](../keep-enclave/build/README.md)
+- Nitro SDK binaries, see [keep-enclave/build/README.md](../keep-enclave/build/README.md)
 
 ## Deployment Options
 
@@ -234,18 +234,18 @@ qemu-system-x86_64 -M nitro-enclave,vsock=parent -kernel keep-enclave.eif -m 512
 | `Enclave boot failed` | Increase `--memory` |
 | `No enclave support` | Use Nitro-capable instance |
 | `Resource busy` | `nitro-cli terminate-enclave --all` |
-| `AccessDeniedException` | PCR mismatch—rebuild, update KMS policy |
+| `AccessDeniedException` | PCR mismatch: rebuild, update KMS policy |
 | Vsock failed | Check `nitro-cli describe-enclaves`, verify CID |
 
 Debug mode KMS: set PCR0 to 96 zeros in policy.
 
 ## Security Notes
 
-- PCRs change on rebuild—update KMS policy each time
-- Debug mode sets PCR0=0, bypasses attestation—never in prod
+- PCRs change on rebuild; update KMS policy each time
+- Debug mode sets PCR0=0; bypasses attestation; never in prod
 - Keys lost on restart unless persisted via KMS envelope encryption
-- Host can't decrypt—KMS policy restricts to enclave with matching PCRs
-- No network in enclave—host proxies KMS
+- Host can't decrypt; KMS policy restricts to enclave with matching PCRs
+- No network in enclave; host proxies KMS
 
 ## Checklist
 

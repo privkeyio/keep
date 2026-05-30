@@ -165,7 +165,7 @@ fn test_message_reordering_shares_before_commitments_complete() {
 
     // Reordered relay delivery: participant 2's signature share arrives before
     // its commitment. It must be buffered (not rejected) so the round can still
-    // complete once the commitment shows up — aggregation is gated separately on
+    // complete once the commitment shows up; aggregation is gated separately on
     // every participant having both a commitment and a share.
     let fake_share = frost_secp256k1_tr::round2::SignatureShare::deserialize(&[0u8; 32]).unwrap();
     session

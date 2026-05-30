@@ -2751,7 +2751,7 @@ impl KeepMobile {
         desc: DescriptorContext,
         state: StateContext,
     ) {
-        // FIXME: connection_status is hardcoded — KfpNodeEvent doesn't
+        // FIXME: connection_status is hardcoded; KfpNodeEvent doesn't
         // emit connect/disconnect events yet, so we can't track real state.
         let connection_status = ConnectionStatus::Connected;
         state.push(&connection_status).await;

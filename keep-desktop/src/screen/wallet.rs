@@ -1828,13 +1828,10 @@ impl State {
                         None => "unknown".into(),
                     };
 
-                    let header =
-                        row![
-                            text(format!("PSBT signature request — session {sid_short}"))
-                                .size(theme::size::SMALL)
-                                .color(theme::color::TEXT_MUTED),
-                        ]
-                        .align_y(Alignment::Center);
+                    let header = row![text(format!("PSBT signature request, session {sid_short}"))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),]
+                    .align_y(Alignment::Center);
 
                     let details = column![
                         text(format!("From: {initiator_short}"))
@@ -1864,7 +1861,7 @@ impl State {
                     .spacing(theme::space::XS);
                     // Show every output's FULL address (or fail-closed marker
                     // for un-decodable scripts). Left-truncation here is a
-                    // homograph footgun — the prefix of a benign-looking
+                    // homograph footgun: the prefix of a benign-looking
                     // address can be identical to a malicious one.
                     let mut all_outputs_decoded = !snap.outputs.is_empty();
                     for (addr, sats) in &snap.outputs {
@@ -1922,7 +1919,7 @@ impl State {
                 None => container(
                     column![
                         text(format!(
-                            "Malformed PSBT from {initiator_short} — Reject only."
+                            "Malformed PSBT from {initiator_short}; reject only."
                         ))
                         .size(theme::size::SMALL)
                         .color(theme::color::ERROR),

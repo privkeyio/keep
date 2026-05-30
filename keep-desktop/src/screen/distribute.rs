@@ -152,7 +152,7 @@ impl State {
             "Finish".to_string()
         } else if enough_exported {
             format!(
-                "Finish ({} of {} exported — remaining shares will be lost)",
+                "Finish ({} of {} exported, remaining shares will be lost)",
                 exported_count, self.total
             )
         } else {

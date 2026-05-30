@@ -275,7 +275,7 @@ impl NetworkSession {
     }
 
     /// Every participant has provided both a commitment and a signature share,
-    /// so the commitment set and the share set match exactly — the precondition
+    /// so the commitment set and the share set match exactly, the precondition
     /// for `frost::aggregate`. Gating on this (rather than a bare share count)
     /// makes the coordinator tolerant of reordered relay delivery: a share that
     /// arrives before its commitment is held until the commitment shows up,
@@ -821,7 +821,7 @@ mod tests {
 
     // Relays reorder events: a participant's signature share can arrive before
     // its commitment. The session must buffer both and aggregate only once
-    // every participant has both — never aggregate a share whose commitment is
+    // every participant has both; never aggregate a share whose commitment is
     // missing (which used to produce `Aggregation failed: Unknown identifier`).
     #[test]
     fn test_aggregation_tolerates_reordered_share_before_commitment() {
