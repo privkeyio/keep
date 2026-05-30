@@ -187,15 +187,28 @@ pub fn cmd_audit_retention(
 
     keep.audit_set_retention(policy);
 
+    let has_policy_args = max_entries.is_some() || max_days.is_some();
+
     if apply {
+        if !has_policy_args {
+            return Err(keep_core::error::KeepError::InvalidInput(
+                "audit retention --apply needs at least one of --max-entries or --max-days; pass a policy bound and try again".into(),
+            ));
+        }
         let removed = keep.audit_apply_retention()?;
         if removed > 0 {
             out.success(&format!("Removed {removed} old audit entries"));
         } else {
             out.info("No entries needed to be removed");
         }
+    } else if has_policy_args {
+        out.warn(
+            "Retention policy parsed but NOT applied. This command is a one-shot prune control: it does NOT persist policy. Re-run with --apply to actually delete entries, or omit the flags to see this message.",
+        );
     } else {
-        out.info("Retention policy set (use --apply to remove old entries)");
+        return Err(keep_core::error::KeepError::InvalidInput(
+            "audit retention is a one-shot prune control; it does NOT persist a policy across runs. Pass --max-entries and/or --max-days plus --apply to delete entries now.".into(),
+        ));
     }
 
     Ok(())

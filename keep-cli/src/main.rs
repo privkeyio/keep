@@ -38,7 +38,16 @@ fn next_request_id() -> String {
 
 fn init_logging() {
     let use_json = std::env::var("KEEP_LOG_JSON").is_ok();
-    let filter = EnvFilter::from_default_env();
+    // Downgrade `nostr-relay-pool` from default error level to warn. That
+    // crate logs `Impossible to handle relay message: subscription not found`
+    // at ERROR during normal FROST coordination (we frequently close and
+    // re-open ephemeral subscriptions). The error is recoverable; the noise
+    // is misleading. Operators can re-enable via RUST_LOG=nostr_relay_pool=error.
+    let filter = EnvFilter::from_default_env().add_directive(
+        "nostr_relay_pool=warn"
+            .parse()
+            .expect("static directive is valid"),
+    );
 
     if use_json {
         tracing_subscriber::fmt()

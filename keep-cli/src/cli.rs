@@ -490,6 +490,11 @@ pub(crate) enum FrostNetworkCommands {
         )]
         participants: Option<u16>,
     },
+    /// (NOT IMPLEMENTED) Build and FROST-sign a Nostr event end-to-end.
+    /// Today this returns a NotImplemented error; use `keep frost network sign`
+    /// for raw messages, or the NIP-46 bunker (`keep serve --headless`) for
+    /// full Nostr events.
+    #[command(hide = true)]
     SignEvent {
         #[arg(short, long)]
         group: String,
