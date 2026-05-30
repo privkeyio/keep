@@ -130,10 +130,7 @@ fn run(out: &Output) -> Result<()> {
         Commands::Config { command } => dispatch_config(out, &cfg, command),
         Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
         Commands::Backup { output } => commands::vault::cmd_backup(out, &path, output.as_deref()),
-        Commands::Restore { file, target } => {
-            let target = target.as_deref().unwrap_or(&path);
-            commands::vault::cmd_restore(out, &file, target)
-        }
+        Commands::Restore { file, target } => commands::vault::cmd_restore(out, &file, &target),
     }
 }
 
@@ -206,6 +203,9 @@ fn dispatch_frost(
             format,
         } => commands::frost::cmd_frost_export(out, path, share, &group, format),
         FrostCommands::Import => commands::frost::cmd_frost_import(out, path),
+        FrostCommands::DeleteShare { group, share } => {
+            commands::frost::cmd_frost_delete_share(out, path, &group, share)
+        }
         FrostCommands::Sign {
             message,
             group,
@@ -372,7 +372,7 @@ fn dispatch_frost_hardware(
             commands::frost_hardware::cmd_frost_hardware_ping(out, &device)
         }
         FrostHardwareCommands::List { device } => {
-            commands::frost_hardware::cmd_frost_hardware_list(out, &device)
+            commands::frost_hardware::cmd_frost_hardware_list(out, device.as_deref())
         }
         FrostHardwareCommands::Import {
             device,

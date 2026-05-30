@@ -675,3 +675,49 @@ fn cmd_frost_sign_interactive(
 
     Ok(())
 }
+
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+pub fn cmd_frost_delete_share(
+    out: &Output,
+    path: &Path,
+    group_id: &str,
+    identifier: u16,
+) -> Result<()> {
+    debug!(group = group_id, identifier, "deleting FROST share");
+
+    let group_pubkey = if group_id.starts_with("npub1") {
+        keep_core::keys::npub_to_bytes(group_id)?
+    } else {
+        let bytes = hex::decode(group_id)
+            .map_err(|e| KeepError::InvalidInput(format!("expected npub or 32-byte hex: {e}")))?;
+        bytes
+            .try_into()
+            .map_err(|_| KeepError::InvalidInput("group pubkey must be 32 bytes".into()))?
+    };
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    if !get_confirm(&format!(
+        "Delete FROST share {identifier} for group {}? This cannot be undone.",
+        keep_core::keys::bytes_to_npub(&group_pubkey)
+    ))? {
+        out.info("Cancelled.");
+        return Ok(());
+    }
+
+    let spinner = out.spinner("Deleting share...");
+    keep.frost_delete_share(&group_pubkey, identifier)?;
+    spinner.finish();
+
+    out.newline();
+    out.success(&format!(
+        "Deleted FROST share {identifier} for group {}",
+        keep_core::keys::bytes_to_npub(&group_pubkey)
+    ));
+    Ok(())
+}
