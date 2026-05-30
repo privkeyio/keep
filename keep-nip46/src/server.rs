@@ -61,7 +61,7 @@ pub struct PreGrantedApp {
 impl PreGrantedApp {
     /// Build a runtime `PreGrantedApp` from a persisted
     /// `keep_core::relay::StoredBunkerPermission`. Returns `None` and logs at
-    /// debug-level when the stored row is malformed (bad hex pubkey) so one
+    /// warn-level when the stored row is malformed (bad hex pubkey) so one
     /// bad row never takes the bunker down. Session / expired Seconds rows
     /// are kept here and skipped later by `PermissionManager::restore_persisted`,
     /// so the mapping stays a pure function of the stored bytes.
@@ -69,20 +69,20 @@ impl PreGrantedApp {
         let pk_bytes = match hex::decode(&stored.pubkey_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => {
-                tracing::debug!(
+                tracing::warn!(
                     pubkey_hex = %stored.pubkey_hex,
                     "PreGrantedApp::from_stored: skipping malformed pubkey hex"
                 );
                 return None;
             }
         };
-        let pubkey = PublicKey::from_slice(&pk_bytes).ok().or_else(|| {
-            tracing::debug!(
+        let Ok(pubkey) = PublicKey::from_slice(&pk_bytes) else {
+            tracing::warn!(
                 pubkey_hex = %stored.pubkey_hex,
                 "PreGrantedApp::from_stored: skipping invalid pubkey"
             );
-            None
-        })?;
+            return None;
+        };
         let permissions = Permission::from_bits_truncate(stored.permissions);
         let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = stored
             .auto_approve_kinds
