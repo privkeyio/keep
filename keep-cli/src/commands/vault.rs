@@ -646,8 +646,7 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
 
     if is_hidden_vault(path) {
         return Err(KeepError::NotImplemented(
-            "password rotation not supported for hidden vaults - use the outer vault instead"
-                .into(),
+            "password rotation is not yet supported for hidden vaults. (Rotating the OUTER password does not change the HIDDEN volume's password.) Workaround: unlock the hidden volume, `frost export` and `export` each key/share to a passphrase-encrypted file, init a fresh hidden vault with the new password, and re-import.".into(),
         ));
     }
 
@@ -688,8 +687,7 @@ pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
 
     if is_hidden_vault(path) {
         return Err(KeepError::NotImplemented(
-            "data key rotation not supported for hidden vaults - use the outer vault instead"
-                .into(),
+            "data key rotation is not yet supported for hidden vaults. (The OUTER data key is independent; rotating it does not re-encrypt the HIDDEN volume.) Workaround: export each secret out of the hidden volume, init a fresh hidden vault, and re-import.".into(),
         ));
     }
 
