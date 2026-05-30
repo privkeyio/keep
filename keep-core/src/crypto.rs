@@ -647,7 +647,7 @@ pub mod nip44 {
 /// threshold ECDH, where the shared secret is computed via distributed
 /// key operations rather than from a single private key.
 pub mod nip04 {
-    use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
     use base64::Engine;
 
     use super::{entropy, CryptoError, Result};
@@ -662,7 +662,7 @@ pub mod nip04 {
         let iv: [u8; 16] = entropy::random_bytes();
 
         let cipher = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
-        let ciphertext = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let ciphertext = cipher.encrypt_padded_vec::<Pkcs7>(plaintext);
 
         let b64 = base64::engine::general_purpose::STANDARD;
         Ok(format!("{}?iv={}", b64.encode(&ciphertext), b64.encode(iv)))
@@ -690,7 +690,7 @@ pub mod nip04 {
 
         let cipher = Aes256CbcDec::new(shared_secret.into(), &iv.into());
         cipher
-            .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
+            .decrypt_padded_vec::<Pkcs7>(&ciphertext)
             .map_err(|_| CryptoError::decryption("AES decryption failed").into())
     }
 }
