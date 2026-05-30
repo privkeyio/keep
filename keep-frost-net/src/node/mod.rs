@@ -236,49 +236,44 @@ where
             .iter()
             .find(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
             .map(|d| d.version);
-        let mut successors = descriptors.iter().filter(|d| {
+        let is_successor = |d: &&keep_core::wallet::WalletDescriptor| {
             &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash)
-        });
-        let Some(first) = successors.next() else {
-            return SuccessorLookup::Tip;
         };
-        // If multiple descriptors back-point to the same OLD hash, prefer the one
-        // at version session+1; only fail closed when the lineage is genuinely
-        // ambiguous (no single n+1 successor).
-        if successors.next().is_some() {
-            let matches: Vec<&keep_core::wallet::WalletDescriptor> = descriptors
-                .iter()
-                .filter(|d| {
-                    &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash)
-                })
-                .collect();
-            let next_version = session_version.map(|v| v.saturating_add(1));
-            let chosen: Vec<&keep_core::wallet::WalletDescriptor> = match next_version {
-                Some(nv) => matches
-                    .iter()
-                    .copied()
-                    .filter(|d| d.version == nv)
-                    .collect(),
-                None => Vec::new(),
-            };
-            if chosen.len() == 1 {
-                let d = chosen[0];
-                return SuccessorLookup::Found {
-                    external_descriptor: d.external_descriptor.clone(),
-                    network: d.network.clone(),
+        let matches: Vec<&keep_core::wallet::WalletDescriptor> =
+            descriptors.iter().filter(is_successor).collect();
+        match matches.as_slice() {
+            [] => SuccessorLookup::Tip,
+            [only] => SuccessorLookup::Found {
+                external_descriptor: only.external_descriptor.clone(),
+                network: only.network.clone(),
+            },
+            _ => {
+                // If multiple descriptors back-point to the same OLD hash, prefer
+                // the one at version session+1; only fail closed when the lineage
+                // is genuinely ambiguous (no single n+1 successor).
+                let next_version = session_version.map(|v| v.saturating_add(1));
+                let chosen: Vec<&keep_core::wallet::WalletDescriptor> = match next_version {
+                    Some(nv) => matches
+                        .iter()
+                        .copied()
+                        .filter(|d| d.version == nv)
+                        .collect(),
+                    None => Vec::new(),
                 };
+                if let [only] = chosen.as_slice() {
+                    return SuccessorLookup::Found {
+                        external_descriptor: only.external_descriptor.clone(),
+                        network: only.network.clone(),
+                    };
+                }
+                tracing::warn!(
+                    group = %hex::encode(group),
+                    descriptor_hash = %hex::encode(hash),
+                    successor_count = matches.len(),
+                    "multiple descriptors back-point to the session hash with no single version+1 successor; failing closed (ambiguous lineage)",
+                );
+                SuccessorLookup::Ambiguous
             }
-            tracing::warn!(
-                group = %hex::encode(group),
-                descriptor_hash = %hex::encode(hash),
-                successor_count = matches.len(),
-                "multiple descriptors back-point to the session hash with no single version+1 successor; failing closed (ambiguous lineage)",
-            );
-            return SuccessorLookup::Ambiguous;
-        }
-        SuccessorLookup::Found {
-            external_descriptor: first.external_descriptor.clone(),
-            network: first.network.clone(),
         }
     }
 }
