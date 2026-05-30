@@ -1844,6 +1844,7 @@ async fn approve_psbt_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_wallet_approve_psbt(
     out: &Output,
     path: &Path,
@@ -1852,8 +1853,18 @@ pub fn cmd_wallet_approve_psbt(
     signer_bunker: &[String],
     share_index: Option<u16>,
     relay: &str,
+    timeout_secs: u32,
 ) -> Result<()> {
-    debug!(group, session_hex, relay, "wallet approve-psbt");
+    debug!(
+        group,
+        session_hex, relay, timeout_secs, "wallet approve-psbt"
+    );
+
+    if timeout_secs == 0 || timeout_secs > 600 {
+        return Err(KeepError::InvalidInput(
+            "--timeout must be between 1 and 600 seconds".into(),
+        ));
+    }
 
     if signer_bunker.is_empty() {
         return Err(KeepError::InvalidInput(
@@ -1939,11 +1950,11 @@ pub fn cmd_wallet_approve_psbt(
             }
         });
 
-        const PROPOSAL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+        let proposal_wait_timeout: Duration = Duration::from_secs(timeout_secs as u64);
         const POST_APPROVAL_DRAIN: Duration = Duration::from_secs(2);
         let target_sid = session_id;
         let spinner = out.spinner("Waiting for proposal...");
-        let deadline = tokio::time::Instant::now() + PROPOSAL_WAIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + proposal_wait_timeout;
         let mut approved = false;
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline - tokio::time::Instant::now();
@@ -2003,9 +2014,9 @@ pub fn cmd_wallet_approve_psbt(
         if !approved {
             node_handle.abort();
             return Err(KeepError::Frost(format!(
-                "did not receive PsbtSignatureNeeded for session {} within {}s",
+                "did not receive PsbtSignatureNeeded for session {} within {}s. Common causes: (a) the initiator's `wallet spend` is not running or not connected to this relay; (b) the session id is mistyped; (c) the relay is dropping kind 21130 events. Re-run with --timeout to wait longer or verify the session id with the initiator.",
                 hex::encode(&target_sid[..8]),
-                PROPOSAL_WAIT_TIMEOUT.as_secs()
+                proposal_wait_timeout.as_secs()
             )));
         }
         tokio::time::sleep(POST_APPROVAL_DRAIN).await;

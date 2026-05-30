@@ -721,3 +721,60 @@ pub fn cmd_frost_delete_share(
     ));
     Ok(())
 }
+
+/// Verify a BIP-340 schnorr signature against a FROST group pubkey.
+pub fn cmd_frost_verify(out: &Output, message_hex: &str, group: &str, sig_hex: &str) -> Result<()> {
+    use frost_secp256k1_tr as frost;
+
+    let message = hex::decode(message_hex)
+        .map_err(|e| KeepError::InvalidInput(format!("invalid message hex: {e}")))?;
+
+    let group_pubkey = if group.starts_with("npub1") {
+        keep_core::keys::npub_to_bytes(group)?
+    } else {
+        let bytes = hex::decode(group)
+            .map_err(|e| KeepError::InvalidInput(format!("expected npub or 32-byte hex: {e}")))?;
+        bytes
+            .try_into()
+            .map_err(|_| KeepError::InvalidInput("group pubkey must be 32 bytes".into()))?
+    };
+
+    let sig_bytes = hex::decode(sig_hex)
+        .map_err(|e| KeepError::InvalidInput(format!("invalid signature hex: {e}")))?;
+    if sig_bytes.len() != 64 {
+        return Err(KeepError::InvalidInput(format!(
+            "signature must be 64 bytes, got {}",
+            sig_bytes.len()
+        )));
+    }
+
+    // Reconstruct VerifyingKey from the 32-byte group pubkey using the same
+    // representation frost-secp256k1-tr produces (BIP-340 x-only).
+    let mut serialized_vk = Vec::with_capacity(33);
+    serialized_vk.push(0x02); // compressed prefix, x-only -> even y
+    serialized_vk.extend_from_slice(&group_pubkey);
+    let vk = frost::VerifyingKey::deserialize(&serialized_vk)
+        .map_err(|e| KeepError::Frost(format!("Invalid group pubkey: {e}")))?;
+
+    let signature = frost::Signature::deserialize(&sig_bytes)
+        .map_err(|e| KeepError::Frost(format!("Invalid signature encoding: {e}")))?;
+
+    out.newline();
+    out.header("FROST Signature Verification");
+    out.field("Group", &keep_core::keys::bytes_to_npub(&group_pubkey));
+    out.field("Message", &format!("{} bytes", message.len()));
+    out.newline();
+
+    match vk.verify(&message, &signature) {
+        Ok(()) => {
+            out.success("Signature is VALID for this group pubkey and message");
+            Ok(())
+        }
+        Err(e) => {
+            out.error(&format!(
+                "Signature is INVALID: {e}. The signature does not bind this message to this group pubkey."
+            ));
+            std::process::exit(1);
+        }
+    }
+}

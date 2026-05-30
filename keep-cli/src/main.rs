@@ -210,6 +210,11 @@ fn dispatch_frost(
         FrostCommands::DeleteShare { group, share } => {
             commands::frost::cmd_frost_delete_share(out, path, &group, share)
         }
+        FrostCommands::Verify {
+            message,
+            group,
+            signature,
+        } => commands::frost::cmd_frost_verify(out, &message, &group, &signature),
         FrostCommands::Sign {
             message,
             group,
@@ -539,6 +544,7 @@ fn dispatch_wallet(
             signer_bunker,
             share,
             relay,
+            timeout,
         } => {
             let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
             commands::wallet::cmd_wallet_approve_psbt(
@@ -549,6 +555,7 @@ fn dispatch_wallet(
                 &signer_bunker,
                 share,
                 relay,
+                timeout,
             )
         }
     }
