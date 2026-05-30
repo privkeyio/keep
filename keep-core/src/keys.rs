@@ -234,14 +234,24 @@ impl KeyRecord {
 ///
 /// Returns [`KeepError::InvalidNpub`] if the string is not a valid npub.
 pub fn npub_to_bytes(npub: &str) -> Result<[u8; 32]> {
-    let (hrp, data) = bech32::decode(npub).map_err(|_| KeepError::InvalidNpub)?;
+    let (hrp, data) = bech32::decode(npub).map_err(|e| {
+        KeepError::InvalidNpub(format!(
+            "not valid bech32 ({e}); expected an npub of the form 'npub1...' (63 chars)"
+        ))
+    })?;
 
     if hrp.as_str() != "npub" {
-        return Err(KeepError::InvalidNpub);
+        return Err(KeepError::InvalidNpub(format!(
+            "wrong prefix '{}' (expected 'npub'). Did you paste an nsec or another bech32 entity?",
+            hrp.as_str()
+        )));
     }
 
     if data.len() != 32 {
-        return Err(KeepError::InvalidNpub);
+        return Err(KeepError::InvalidNpub(format!(
+            "decoded payload is {} bytes (expected 32). The npub is bech32-valid but wrong length.",
+            data.len()
+        )));
     }
 
     let mut pubkey = [0u8; 32];

@@ -490,8 +490,8 @@ pub enum KeepError {
     InvalidMnemonic(String),
     #[error("Invalid nsec format")]
     InvalidNsec,
-    #[error("Invalid npub format")]
-    InvalidNpub,
+    #[error("Invalid npub: {0}")]
+    InvalidNpub(String),
     #[error("Keyring full (max {0} keys)")]
     KeyringFull(usize),
     #[error("Keep is locked")]

@@ -270,7 +270,7 @@ pub(crate) enum WalletCommands {
         share: Option<u16>,
         #[arg(
             long,
-            help = "Recovery tier, e.g. '2of3@6mo' (threshold-of-keys@timelock). Repeat for multiple tiers.",
+            help = "Recovery tier, e.g. '2of3@6mo' (threshold-of-keys@timelock). Timelock units: mo/month/months or y/year/years; case-insensitive. Repeat for multiple tiers.",
             required = true
         )]
         recovery: Vec<String>,

@@ -202,6 +202,34 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
         &format!("{} sats", analysis.total_output_sats),
     );
     out.field("Fee", &format!("{} sats", analysis.fee_sats));
+
+    // Loud abnormal-fee warning. A bogus PSBT with garbage witness_utxo values
+    // produces a giant fee that the user might miss; surface it explicitly.
+    if analysis.total_input_sats > 0 {
+        let ratio = analysis.fee_sats as f64 / analysis.total_input_sats as f64;
+        let pct = ratio * 100.0;
+        if ratio >= 0.5 {
+            out.warn(&format!(
+                "ABNORMAL FEE: {:.1}% of total input ({} sats fee / {} sats input). Possible fee-burn attack or malformed PSBT; REVIEW CAREFULLY before signing.",
+                pct, analysis.fee_sats, analysis.total_input_sats,
+            ));
+        } else if ratio >= 0.1 {
+            out.warn(&format!(
+                "HIGH FEE: {:.1}% of total input ({} sats fee / {} sats input). Review before signing.",
+                pct, analysis.fee_sats, analysis.total_input_sats,
+            ));
+        } else if ratio >= 0.01 {
+            out.warn(&format!(
+                "Elevated fee: {:.2}% of total input ({} sats fee).",
+                pct, analysis.fee_sats,
+            ));
+        }
+    } else if analysis.fee_sats > 100_000 {
+        out.warn(&format!(
+            "Large fee {} sats with no input amount data; cannot compute fee ratio.",
+            analysis.fee_sats,
+        ));
+    }
     out.newline();
 
     out.info("Outputs:");

@@ -66,7 +66,7 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::NotFound(_) => "Vault not found".into(),
         KeepError::InvalidInput(msg) => format!("Invalid input: {msg}"),
         KeepError::InvalidNsec => "Invalid secret key format".into(),
-        KeepError::InvalidNpub => "Invalid public key format".into(),
+        KeepError::InvalidNpub(detail) => format!("Invalid public key: {detail}"),
         KeepError::KeyAlreadyExists(_) => "A key with this name already exists".into(),
         KeepError::KeyNotFound(_) => "Key not found".into(),
         KeepError::KeyringFull(_) => "Keyring is full".into(),

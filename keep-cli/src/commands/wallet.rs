@@ -631,7 +631,63 @@ pub fn cmd_wallet_delete(out: &Output, path: &Path, group_hex: &str) -> Result<(
 }
 
 const BLOCKS_PER_MONTH: u32 = 144 * 30;
+const BLOCKS_PER_YEAR: u32 = BLOCKS_PER_MONTH * 12;
 const MAX_CSV_BLOCKS: u32 = 0xFFFF;
+
+/// Parse a timelock expression and return the count in **months** (the unit
+/// the FROST descriptor protocol uses, see `keep_frost_net::PolicyTier`).
+///
+/// Accepts `Nmo`, `Nmonth`, `Nmonths`, `Ny`, `Nyear`, `Nyears` (case-insensitive).
+/// Sub-month units (days, weeks) are deliberately not accepted because the
+/// stored protocol unit is months and we want to refuse, not round silently.
+fn parse_timelock_to_months(spec: &str) -> Result<u32> {
+    let normalized = spec.trim().to_ascii_lowercase();
+    let (n_str, multiplier) = if let Some(n) = normalized
+        .strip_suffix("months")
+        .or_else(|| normalized.strip_suffix("month"))
+        .or_else(|| normalized.strip_suffix("mo"))
+    {
+        (n, 1u32)
+    } else if let Some(n) = normalized
+        .strip_suffix("years")
+        .or_else(|| normalized.strip_suffix("year"))
+        .or_else(|| normalized.strip_suffix('y'))
+    {
+        (n, 12u32)
+    } else {
+        return Err(KeepError::InvalidInput(
+            "Invalid timelock, use e.g. '6mo', '6months', '1y', '1year' (case-insensitive). Sub-month units are not supported by the descriptor protocol.".into(),
+        ));
+    };
+    let n: u32 = n_str
+        .trim()
+        .parse()
+        .map_err(|_| KeepError::InvalidInput(format!("Invalid timelock count: '{n_str}'")))?;
+    if n == 0 {
+        return Err(KeepError::InvalidInput(
+            "Timelock must be at least 1 month".into(),
+        ));
+    }
+    let months = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| KeepError::InvalidInput(format!("Timelock '{spec}' overflows")))?;
+    let blocks = months.checked_mul(BLOCKS_PER_MONTH).ok_or_else(|| {
+        KeepError::InvalidInput(format!("Timelock '{spec}' overflows block count"))
+    })?;
+    if blocks > MAX_CSV_BLOCKS {
+        return Err(KeepError::InvalidInput(format!(
+            "Timelock '{spec}' ({blocks} blocks) exceeds Bitcoin CSV maximum ({MAX_CSV_BLOCKS} blocks, ~{} months)",
+            MAX_CSV_BLOCKS / BLOCKS_PER_MONTH
+        )));
+    }
+    Ok(months)
+}
+
+#[allow(dead_code)]
+const _: () = {
+    // Compile-time sanity check.
+    assert!(BLOCKS_PER_YEAR == BLOCKS_PER_MONTH * 12);
+};
 
 fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::PolicyTier> {
     let parts: Vec<&str> = spec.split('@').collect();
@@ -746,30 +802,7 @@ fn parse_recovery_tier(spec: &str, total_shares: u16) -> Result<keep_frost_net::
         )));
     }
 
-    let timelock_months: u32 = timelock_part
-        .trim_end_matches("mo")
-        .parse()
-        .map_err(|_| KeepError::InvalidInput("Invalid timelock, use e.g. '6mo'".into()))?;
-
-    if timelock_months == 0 {
-        return Err(KeepError::InvalidInput(
-            "Timelock must be at least 1 month".into(),
-        ));
-    }
-
-    let timelock_blocks = timelock_months
-        .checked_mul(BLOCKS_PER_MONTH)
-        .ok_or_else(|| {
-            KeepError::InvalidInput(format!(
-                "Timelock {timelock_months} months overflows block count"
-            ))
-        })?;
-    if timelock_blocks > MAX_CSV_BLOCKS {
-        return Err(KeepError::InvalidInput(format!(
-            "Timelock {timelock_months} months ({timelock_blocks} blocks) exceeds Bitcoin CSV maximum ({MAX_CSV_BLOCKS} blocks, ~{} months)",
-            MAX_CSV_BLOCKS / BLOCKS_PER_MONTH
-        )));
-    }
+    let timelock_months = parse_timelock_to_months(timelock_part)?;
 
     let key_slots: Vec<keep_frost_net::KeySlot> = explicit_slots.unwrap_or_else(|| {
         (1..=key_count)
