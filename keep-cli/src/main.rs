@@ -96,8 +96,12 @@ fn run(out: &Output) -> Result<()> {
 
     match cli.command {
         Commands::Init { size } => commands::vault::cmd_init(out, &path, hidden, size),
-        Commands::Generate { name } => commands::vault::cmd_generate(out, &path, &name, hidden),
-        Commands::Import { name } => commands::vault::cmd_import(out, &path, &name, hidden),
+        Commands::Generate { name, force } => {
+            commands::vault::cmd_generate(out, &path, &name, hidden, force)
+        }
+        Commands::Import { name, force } => {
+            commands::vault::cmd_import(out, &path, &name, hidden, force)
+        }
         Commands::List => commands::vault::cmd_list(out, &path, hidden),
         Commands::Export { name } => commands::vault::cmd_export(out, &path, &name, hidden),
         Commands::Delete { name } => commands::vault::cmd_delete(out, &path, &name, hidden),

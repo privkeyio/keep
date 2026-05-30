@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use secrecy::ExposeSecret;
 
 use keep_core::audit::{AuditEventType, RetentionPolicy};
-use keep_core::error::Result;
+use keep_core::error::{KeepError, Result};
 use keep_core::Keep;
 
 use crate::commands::get_password;
@@ -137,16 +137,35 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     let password = get_password("Password")?;
     keep.unlock(password.expose_secret())?;
 
-    let valid = keep.audit_verify_chain()?;
+    let valid = keep.audit_verify_chain().map_err(map_verify_error)?;
 
     if valid {
         out.success("Audit log integrity verified - hash chain is valid");
     } else {
-        out.error("Audit log integrity check FAILED - hash chain is broken");
+        out.error(
+            "Audit log integrity check FAILED: hash chain is broken. The audit log was modified after writing. Do NOT trust this vault for anything authoritative until you investigate.",
+        );
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// Rewrap low-level audit-decode errors with a clear tamper-vs-corruption
+/// category instead of leaking parser details that mislead operators.
+fn map_verify_error(e: KeepError) -> KeepError {
+    let detail = e.to_string();
+    if detail.contains("Decryption failed") {
+        KeepError::InvalidInput(format!(
+            "Audit log integrity check FAILED: an entry could not be decrypted with the vault data key. This indicates tampering (entry rewritten or truncated mid-entry) or file corruption, NOT a wrong password. Details: {detail}"
+        ))
+    } else if detail.contains("audit line") || detail.contains("Invalid file format") {
+        KeepError::InvalidInput(format!(
+            "Audit log integrity check FAILED: an entry could not be parsed. This indicates tampering or file corruption. Details: {detail}"
+        ))
+    } else {
+        e
+    }
 }
 
 pub fn cmd_audit_retention(
