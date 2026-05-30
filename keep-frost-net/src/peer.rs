@@ -116,7 +116,7 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             our_share_index,
-            offline_threshold: Duration::from_secs(60),
+            offline_threshold: Duration::from_secs(40),
         }
     }
 

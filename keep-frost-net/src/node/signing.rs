@@ -17,6 +17,28 @@ use crate::session::derive_session_id;
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
 
+/// Error from a single signing round. `attempted` lists the non-self peers the
+/// round selected, so a timed-out round can exclude them and fail over.
+struct SigningRoundError {
+    error: FrostNetError,
+    attempted: Vec<u16>,
+}
+
+impl SigningRoundError {
+    fn fatal(error: FrostNetError) -> Self {
+        Self {
+            error,
+            attempted: Vec::new(),
+        }
+    }
+}
+
+impl From<FrostNetError> for SigningRoundError {
+    fn from(error: FrostNetError) -> Self {
+        Self::fatal(error)
+    }
+}
+
 /// Restores peer commitments reserved from the [`NoncePool`] back into the pool
 /// if a signing request aborts before the reservation is committed to a live
 /// session. Disarm once the commitments are recorded so successful flows do not
@@ -960,32 +982,70 @@ impl KfpNode {
         message: Vec<u8>,
         message_type: &str,
     ) -> Result<[u8; 64]> {
-        let result = self.signing_round(message, message_type).await;
+        // On a round timeout the selected co-signer is treated as unresponsive
+        // and excluded, then we re-select from the remaining online peers and
+        // retry. This fails over to another live co-signer in seconds instead of
+        // surfacing the timeout to the caller. The session id is rederived per
+        // attempt from the (changed) participant set, so each retry is a fresh
+        // session with a fresh nonce.
+        let mut excluded: Vec<u16> = Vec::new();
+        loop {
+            let result = self
+                .signing_round(message.clone(), message_type, &excluded)
+                .await;
 
-        // If a peer reported a stale pre-exchanged nonce (it rotated/restarted, so
-        // a pooled commitment we referenced no longer maps to a live secret), drop
-        // the suspect pooled commitments so the *next* request falls back to a
-        // fresh interactive round. We deliberately do NOT retry this request in
-        // place: our single-use nonce was already spent on a share bound to the
-        // stale commitment, the session id is fixed by the message, and the
-        // replay guard would reject re-signing it; retrying would risk nonce
-        // reuse. The signing session is torn down on failure (see below), so the
-        // next attempt starts clean.
-        if let Err(FrostNetError::Session(ref e)) = result {
-            if e.contains("stale_nonce") || e.contains("incomplete_pre_exchange") {
-                self.nonce_pool.clear_all_peers();
-                warn!(
-                    "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
-                );
+            // If a peer reported a stale pre-exchanged nonce (it rotated/restarted, so
+            // a pooled commitment we referenced no longer maps to a live secret), drop
+            // the suspect pooled commitments so the *next* request falls back to a
+            // fresh interactive round. We deliberately do NOT retry this request in
+            // place: our single-use nonce was already spent on a share bound to the
+            // stale commitment, the session id is fixed by the message, and the
+            // replay guard would reject re-signing it; retrying would risk nonce
+            // reuse. The signing session is torn down on failure (see below), so the
+            // next attempt starts clean.
+            if let Err(SigningRoundError {
+                error: FrostNetError::Session(ref e),
+                ..
+            }) = result
+            {
+                if e.contains("stale_nonce") || e.contains("incomplete_pre_exchange") {
+                    self.nonce_pool.clear_all_peers();
+                    warn!(
+                        "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
+                    );
+                }
+            }
+
+            match result {
+                Ok(sig) => return Ok(sig),
+                Err(SigningRoundError {
+                    error: FrostNetError::Timeout(_),
+                    attempted,
+                }) if !attempted.is_empty() => {
+                    warn!(
+                        excluded = ?attempted,
+                        "signing round timed out; excluding unresponsive peers and retrying"
+                    );
+                    excluded.extend(attempted);
+                }
+                Err(e) => return Err(e.error),
             }
         }
-        result
     }
 
-    async fn signing_round(&self, message: Vec<u8>, message_type: &str) -> Result<[u8; 64]> {
+    async fn signing_round(
+        &self,
+        message: Vec<u8>,
+        message_type: &str,
+        exclude: &[u16],
+    ) -> std::result::Result<[u8; 64], SigningRoundError> {
         let threshold = self.share.metadata.threshold;
 
-        let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
+        let (participants, participant_peers) = self
+            .select_eligible_peers(threshold as usize, exclude)
+            .map_err(SigningRoundError::fatal)?;
+
+        let attempted: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
 
         let session_id = derive_session_id(&message, &participants, threshold);
 
@@ -1004,15 +1064,17 @@ impl KfpNode {
             SigningOperation::SignRequestInitiated,
         );
 
-        let key_package = self.share.key_package()?;
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| SigningRoundError::fatal(e.into()))?;
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
         // Try to use pre-exchanged commitments for the selected peers. If every
         // peer has a pooled commitment, reserve them (single-use; removed from
         // the pool) so the interactive commitment round can be skipped.
-        let peer_indices: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
-        let reserved = self.nonce_pool.reserve_for(&peer_indices);
+        let reserved = self.nonce_pool.reserve_for(&attempted);
         // If any step below fails after reservation, the reserved commitments
         // must go back into the pool so they are not leaked permanently.
         let mut reservation_guard = ReservationGuard::new(&self.nonce_pool, reserved.clone());
@@ -1128,7 +1190,7 @@ impl KfpNode {
         .await;
         if let Err(e) = send_result {
             self.sessions.write().complete_session(&session_id);
-            return Err(e);
+            return Err(e.into());
         }
 
         let mut rx = self.event_tx.subscribe();
@@ -1147,11 +1209,11 @@ impl KfpNode {
         if all_committed {
             if let Err(e) = self.generate_and_send_share(&session_id).await {
                 self.sessions.write().complete_session(&session_id);
-                return Err(e);
+                return Err(e.into());
             }
         }
 
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(15);
 
         let result = tokio::time::timeout(timeout, async {
             loop {
@@ -1188,11 +1250,14 @@ impl KfpNode {
             Ok(Ok(signature)) => Ok(signature),
             Ok(Err(e)) => {
                 self.sessions.write().complete_session(&session_id);
-                Err(e)
+                Err(e.into())
             }
             Err(_) => {
                 self.sessions.write().complete_session(&session_id);
-                Err(FrostNetError::Timeout("Signing request timed out".into()))
+                Err(SigningRoundError {
+                    error: FrostNetError::Timeout("Signing request timed out".into()),
+                    attempted,
+                })
             }
         }
     }

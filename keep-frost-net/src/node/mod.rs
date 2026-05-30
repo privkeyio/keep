@@ -1111,12 +1111,14 @@ impl KfpNode {
     pub(crate) fn select_eligible_peers(
         &self,
         threshold: usize,
+        exclude: &[u16],
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         let selected_peers: Vec<Peer> = {
             let peers = self.peers.read();
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
+                .filter(|p| !exclude.contains(&p.share_index))
                 .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
                 .collect();
 
