@@ -3,6 +3,7 @@
 
 #![allow(unused_assignments)]
 
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
