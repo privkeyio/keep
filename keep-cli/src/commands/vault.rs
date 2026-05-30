@@ -16,8 +16,8 @@ use keep_core::Keep;
 use crate::output::Output;
 
 use super::{
-    get_confirm, get_hidden_password, get_nsec, get_password, get_password_with_confirm,
-    is_hidden_vault,
+    get_confirm, get_hidden_password, get_new_password_with_confirm, get_nsec, get_password,
+    get_password_with_confirm, is_hidden_vault,
 };
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
@@ -611,11 +611,18 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
 
     let mut keep = Keep::open(path)?;
     let old_password = get_password("Enter current password")?;
-    let new_password = get_password_with_confirm("Enter new password", "Confirm new password")?;
+    let new_password =
+        get_new_password_with_confirm("Enter new password", "Confirm new password")?;
 
     if new_password.expose_secret().len() < 8 {
         return Err(KeepError::InvalidInput(
             "password must be at least 8 characters".into(),
+        ));
+    }
+
+    if old_password.expose_secret() == new_password.expose_secret() {
+        return Err(KeepError::InvalidInput(
+            "new password is identical to current password; set KEEP_NEW_PASSWORD to a different value or run interactively".into(),
         ));
     }
 
@@ -647,6 +654,10 @@ pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
 
     if !get_confirm("Rotate data encryption key? This will re-encrypt all stored keys and shares.")?
     {
@@ -779,6 +790,12 @@ fn cmd_delete_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()> {
     debug!("creating backup");
+
+    if is_hidden_vault(path) {
+        return Err(KeepError::NotImplemented(
+            "backup of vaults initialized with --hidden is not yet supported".into(),
+        ));
+    }
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
