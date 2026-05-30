@@ -162,6 +162,7 @@ impl MinisignSignature {
             .and_then(|l| l.strip_prefix("untrusted comment: "))
             .ok_or_else(|| KeepError::InvalidInput("missing untrusted comment line".into()))?
             .to_string();
+        validate_comment("untrusted", &untrusted_comment)?;
 
         let sig_blob_b64 = lines
             .next()
@@ -187,6 +188,7 @@ impl MinisignSignature {
             .and_then(|l| l.strip_prefix("trusted comment: "))
             .ok_or_else(|| KeepError::InvalidInput("missing trusted comment line".into()))?
             .to_string();
+        validate_comment("trusted", &trusted_comment)?;
 
         let global_b64 = lines
             .next()

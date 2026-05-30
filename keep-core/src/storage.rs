@@ -1123,7 +1123,7 @@ const SHARE_FORMAT_V1: u8 = 1;
 
 /// Serialize a `StoredShare` with the explicit version prefix.
 pub(crate) fn serialize_stored_share(share: &StoredShare) -> Result<Vec<u8>> {
-    let body = bincode::serialize(share)?;
+    let body = bincode_options().serialize(share)?;
     let mut out = Vec::with_capacity(SHARE_FORMAT_MAGIC.len() + 1 + body.len());
     out.extend_from_slice(SHARE_FORMAT_MAGIC);
     out.push(SHARE_FORMAT_V1);

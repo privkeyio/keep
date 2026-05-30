@@ -496,12 +496,19 @@ impl Keep {
         self.storage.list_shares()
     }
 
-    fn find_stored_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<StoredShare> {
+    fn find_stored_share(
+        &self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+        ciphersuite: Option<crate::frost::Ciphersuite>,
+    ) -> Result<StoredShare> {
         let shares = self.storage.list_shares()?;
         shares
             .into_iter()
             .find(|s| {
-                s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.metadata.identifier == identifier
+                    && ciphersuite.is_none_or(|cs| s.ciphersuite == cs)
             })
             .ok_or_else(|| KeepError::KeyNotFound(format!("No share {identifier} for group")))
     }
@@ -517,7 +524,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
+        let mut stored = self.find_stored_share(group_pubkey, identifier, None)?;
         let data_key = self.get_data_key()?;
         let share = stored.decrypt(&data_key)?;
 
@@ -667,7 +674,7 @@ impl Keep {
                 "share name must not exceed 64 characters".into(),
             ));
         }
-        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
+        let mut stored = self.find_stored_share(group_pubkey, identifier, None)?;
         stored.metadata.name = name.to_string();
         self.storage.store_share(&stored)?;
         Ok(())
@@ -1001,7 +1008,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let stored = self.find_stored_share(group_pubkey, identifier)?;
+        let stored = self.find_stored_share(group_pubkey, identifier, None)?;
         let data_key = self.get_data_key()?;
         stored.decrypt(&data_key)
     }
@@ -1097,7 +1104,7 @@ impl Keep {
         }
 
         let group_pubkey = *shares[0].group_pubkey();
-        let participants: Vec<u16> = (1..=total_shares).collect();
+        let participants: Vec<u16> = shares.iter().map(|s| s.metadata.identifier).collect();
         self.audit_event(AuditEventType::FrostGenerate, |e| {
             e.with_group(&group_pubkey)
                 .with_threshold(threshold)
@@ -1122,39 +1129,19 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let data_key = self.get_data_key()?;
-        let shares = self.storage.list_shares()?;
-        let our_shares: Vec<_> = shares
-            .iter()
-            .filter(|s| {
-                s.metadata.group_pubkey == *group_pubkey
-                    && s.ciphersuite == crate::frost::Ciphersuite::Ed25519
-            })
-            .collect();
-
-        if our_shares.is_empty() {
-            return Err(KeepError::KeyNotFound("No Ed25519 shares for group".into()));
-        }
-
-        let threshold = our_shares[0].metadata.threshold;
-        if our_shares.len() < threshold as usize {
-            self.audit_event(AuditEventType::FrostSignFailed, |e| {
-                e.with_group(group_pubkey)
-                    .with_message_hash(message)
-                    .with_success(false)
-                    .with_reason("Insufficient shares")
-            });
-            return Err(KeepError::Frost(format!(
-                "Need {} shares to sign, only {} available",
-                threshold,
-                our_shares.len()
-            )));
-        }
-
-        let mut decrypted_shares = Vec::new();
-        for stored in our_shares.iter().take(threshold as usize) {
-            decrypted_shares.push(stored.decrypt(&data_key)?);
-        }
+        let decrypted_shares = match self.frost_ed25519_decrypt_threshold_shares(group_pubkey) {
+            Ok(shares) => shares,
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                        .with_reason("Insufficient shares")
+                });
+                return Err(e);
+            }
+        };
+        let threshold = decrypted_shares[0].metadata.threshold;
 
         match crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, message) {
             Ok(sig) => {
@@ -1174,6 +1161,45 @@ impl Keep {
                 Err(e)
             }
         }
+    }
+
+    /// Decrypt the threshold set of local Ed25519 shares for a group.
+    ///
+    /// Returns exactly `threshold` decrypted shares or a `KeyNotFound`/`Frost`
+    /// error. Does not emit audit events; callers own audit semantics.
+    #[cfg(feature = "ed25519")]
+    fn frost_ed25519_decrypt_threshold_shares(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Vec<SharePackage>> {
+        let data_key = self.get_data_key()?;
+        let shares = self.storage.list_shares()?;
+        let our_shares: Vec<_> = shares
+            .iter()
+            .filter(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Ed25519
+            })
+            .collect();
+
+        if our_shares.is_empty() {
+            return Err(KeepError::KeyNotFound("No Ed25519 shares for group".into()));
+        }
+
+        let threshold = our_shares[0].metadata.threshold;
+        if our_shares.len() < threshold as usize {
+            return Err(KeepError::Frost(format!(
+                "Need {} shares to sign, only {} available",
+                threshold,
+                our_shares.len()
+            )));
+        }
+
+        let mut decrypted_shares = Vec::with_capacity(threshold as usize);
+        for stored in our_shares.iter().take(threshold as usize) {
+            decrypted_shares.push(stored.decrypt(&data_key)?);
+        }
+        Ok(decrypted_shares)
     }
 
     /// Verify a detached Ed25519 signature against a group public key.
@@ -1203,14 +1229,57 @@ impl Keep {
     ) -> Result<crate::frost::ed25519::minisign::MinisignSignature> {
         use crate::frost::ed25519::minisign;
 
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
         minisign::validate_comment("untrusted", &untrusted_comment)?;
         minisign::validate_comment("trusted", &trusted_comment)?;
 
-        let prehash = minisign::prehash(message);
-        let signature = self.frost_sign_ed25519(group_pubkey, &prehash)?;
+        let decrypted_shares = match self.frost_ed25519_decrypt_threshold_shares(group_pubkey) {
+            Ok(shares) => shares,
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                        .with_reason("Insufficient shares")
+                });
+                return Err(e);
+            }
+        };
+        let threshold = decrypted_shares[0].metadata.threshold;
 
-        let global_bytes = minisign::global_signed_bytes(&signature, &trusted_comment);
-        let global_signature = self.frost_sign_ed25519(group_pubkey, &global_bytes)?;
+        // Two independent threshold sessions over the same decrypted share set:
+        // fresh nonces per session keep each signature secure.
+        let prehash = minisign::prehash(message);
+        let sign_both = (|| {
+            let signature =
+                crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, &prehash)?;
+            let global_bytes = minisign::global_signed_bytes(&signature, &trusted_comment);
+            let global_signature =
+                crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, &global_bytes)?;
+            Ok::<_, KeepError>((signature, global_signature))
+        })();
+
+        let (signature, global_signature) = match sign_both {
+            Ok(pair) => {
+                self.audit_event(AuditEventType::FrostSign, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_threshold(threshold)
+                });
+                pair
+            }
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                });
+                return Err(e);
+            }
+        };
 
         Ok(minisign::MinisignSignature {
             sig_alg: minisign::ALG_PREHASHED,

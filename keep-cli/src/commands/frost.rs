@@ -33,6 +33,23 @@ fn read_input_file(file: &Path) -> Result<Vec<u8>> {
         .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
 }
 
+const MAX_TEXT_BYTES: u64 = 64 * 1024;
+
+fn read_text_file(file: &Path) -> Result<String> {
+    let len = file
+        .metadata()
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?
+        .len();
+    if len > MAX_TEXT_BYTES {
+        return Err(KeepError::InvalidInput(format!(
+            "{} exceeds maximum size of {MAX_TEXT_BYTES} bytes",
+            file.display()
+        )));
+    }
+    std::fs::read_to_string(file)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
+}
+
 fn resolve_group_pubkey(
     shares: &[keep_core::frost::StoredShare],
     group_id: &str,
@@ -903,8 +920,7 @@ pub fn cmd_verify_file(out: &Output, file: &Path, sig: &Path, group: &str) -> Re
 
     let group_pubkey = resolve_verify_pubkey(group)?;
     let message = read_input_file(file)?;
-    let sig_text = std::fs::read_to_string(sig)
-        .map_err(|e| KeepError::InvalidInput(format!("cannot read signature: {e}")))?;
+    let sig_text = read_text_file(sig)?;
 
     let signature = MinisignSignature::parse(&sig_text)?;
 
@@ -932,8 +948,7 @@ fn resolve_verify_pubkey(group: &str) -> Result<[u8; 32]> {
 
     let candidate = Path::new(group);
     if candidate.is_file() {
-        let text = std::fs::read_to_string(candidate)
-            .map_err(|e| KeepError::InvalidInput(format!("cannot read public key: {e}")))?;
+        let text = read_text_file(candidate)?;
         return Ok(MinisignPublicKey::parse(&text)?.public_key);
     }
     parse_group_pubkey(group)

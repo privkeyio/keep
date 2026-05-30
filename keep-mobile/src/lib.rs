@@ -2018,6 +2018,13 @@ impl KeepMobile {
         let mut prepared_health: Vec<KeyHealthStatusInfo> = Vec::new();
 
         for bs in &decrypted.shares {
+            if bs.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
+                tracing::warn!(
+                    name = %bs.name,
+                    "skipping non-secp256k1 share during restore: unsupported on mobile"
+                );
+                continue;
+            }
             let mut key_package_bytes = Zeroizing::new(decode_hex(&bs.key_package, "key_package")?);
             let pubkey_package_bytes = decode_hex(&bs.pubkey_package, "pubkey_package")?;
             let group_pubkey_bytes = decode_hex(&bs.group_pubkey, "group_pubkey")?;
