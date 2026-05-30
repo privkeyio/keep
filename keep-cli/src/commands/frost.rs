@@ -17,35 +17,30 @@ use crate::ExportFormat;
 use super::{get_confirm, get_password, get_password_with_confirm};
 
 const MAX_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_TEXT_BYTES: u64 = 64 * 1024;
 
-fn read_input_file(file: &Path) -> Result<Vec<u8>> {
+fn check_file_size(file: &Path, max_bytes: u64) -> Result<()> {
     let len = file
         .metadata()
         .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?
         .len();
-    if len > MAX_INPUT_BYTES {
+    if len > max_bytes {
         return Err(KeepError::InvalidInput(format!(
-            "{} exceeds maximum input size of {MAX_INPUT_BYTES} bytes",
+            "{} exceeds maximum size of {max_bytes} bytes",
             file.display()
         )));
     }
+    Ok(())
+}
+
+fn read_input_file(file: &Path) -> Result<Vec<u8>> {
+    check_file_size(file, MAX_INPUT_BYTES)?;
     std::fs::read(file)
         .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
 }
 
-const MAX_TEXT_BYTES: u64 = 64 * 1024;
-
 fn read_text_file(file: &Path) -> Result<String> {
-    let len = file
-        .metadata()
-        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?
-        .len();
-    if len > MAX_TEXT_BYTES {
-        return Err(KeepError::InvalidInput(format!(
-            "{} exceeds maximum size of {MAX_TEXT_BYTES} bytes",
-            file.display()
-        )));
-    }
+    check_file_size(file, MAX_TEXT_BYTES)?;
     std::fs::read_to_string(file)
         .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
 }

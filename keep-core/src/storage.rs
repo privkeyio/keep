@@ -1142,14 +1142,7 @@ pub(crate) fn serialize_stored_share(share: &StoredShare) -> Result<Vec<u8>> {
 /// adversarially prefixed legacy blob) still fails closed at the MAC rather
 /// than yielding a wrong key.
 pub(crate) fn deserialize_stored_share(bytes: &[u8]) -> Result<StoredShare> {
-    if let Some(body) =
-        bytes
-            .strip_prefix(SHARE_FORMAT_MAGIC.as_slice())
-            .and_then(|rest| match rest.split_first() {
-                Some((&SHARE_FORMAT_V1, body)) => Some(body),
-                _ => None,
-            })
-    {
+    if let Some([SHARE_FORMAT_V1, body @ ..]) = bytes.strip_prefix(SHARE_FORMAT_MAGIC.as_slice()) {
         return Ok(bincode_options().deserialize::<StoredShare>(body)?);
     }
 

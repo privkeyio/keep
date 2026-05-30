@@ -391,17 +391,16 @@ impl Storage {
         }
 
         for (stored, key_package_bytes) in shares {
-            let new_encrypted = crypto::encrypt_with_aad(
-                key_package_bytes,
-                stored.ciphersuite.aad(),
+            let package = crate::frost::SharePackage::from_bytes(
+                stored.metadata.clone(),
+                key_package_bytes.to_vec(),
+                stored.pubkey_package.clone(),
+            );
+            let new_stored = StoredShare::encrypt_with_ciphersuite(
+                &package,
+                stored.ciphersuite,
                 new_data_key,
             )?;
-            let new_stored = StoredShare {
-                metadata: stored.metadata.clone(),
-                encrypted_key_package: new_encrypted.to_bytes(),
-                pubkey_package: stored.pubkey_package.clone(),
-                ciphersuite: stored.ciphersuite,
-            };
             let serialized = serialize_stored_share(&new_stored)?;
             let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
             let id = share_id(&stored.metadata.group_pubkey, stored.metadata.identifier);

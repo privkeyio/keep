@@ -288,9 +288,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let stored_shares = keep.frost_list_shares()?;
     let mut backup_shares = Vec::with_capacity(stored_shares.len());
     for share in &stored_shares {
-        let encrypted = EncryptedData::from_bytes(&share.encrypted_key_package)?;
-        let decrypted = crypto::decrypt_with_aad(&encrypted, share.ciphersuite.aad(), &data_key)?;
-        let key_package_bytes = decrypted.as_slice()?;
+        let decrypted = share.decrypt(&data_key)?;
         backup_shares.push(BackupShare {
             identifier: share.metadata.identifier,
             threshold: share.metadata.threshold,
@@ -301,7 +299,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             last_used: share.metadata.last_used,
             sign_count: share.metadata.sign_count,
             did_backup: share.metadata.did_backup,
-            key_package: hex::encode(key_package_bytes.as_slice()),
+            key_package: hex::encode(decrypted.key_package_bytes()),
             pubkey_package: hex::encode(&share.pubkey_package),
             ciphersuite: share.ciphersuite,
         });
@@ -478,30 +476,26 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
     for bs in &backup.shares {
         let key_package_bytes = hex::decode(&bs.key_package)
             .map_err(|e| KeepError::Other(format!("hex decode key_package: {e}")))?;
-        let encrypted =
-            crypto::encrypt_with_aad(&key_package_bytes, bs.ciphersuite.aad(), &data_key)?;
 
         let pubkey_package = hex::decode(&bs.pubkey_package)
             .map_err(|e| KeepError::Other(format!("hex decode pubkey_package: {e}")))?;
 
         let group_pubkey = decode_hex_32(&bs.group_pubkey, "group pubkey")?;
 
-        let share = StoredShare {
-            metadata: crate::frost::ShareMetadata {
-                identifier: bs.identifier,
-                threshold: bs.threshold,
-                total_shares: bs.total_shares,
-                group_pubkey,
-                name: bs.name.clone(),
-                created_at: bs.created_at,
-                last_used: bs.last_used,
-                sign_count: bs.sign_count,
-                did_backup: bs.did_backup,
-            },
-            encrypted_key_package: encrypted.to_bytes(),
-            pubkey_package,
-            ciphersuite: bs.ciphersuite,
+        let metadata = crate::frost::ShareMetadata {
+            identifier: bs.identifier,
+            threshold: bs.threshold,
+            total_shares: bs.total_shares,
+            group_pubkey,
+            name: bs.name.clone(),
+            created_at: bs.created_at,
+            last_used: bs.last_used,
+            sign_count: bs.sign_count,
+            did_backup: bs.did_backup,
         };
+        let package =
+            crate::frost::SharePackage::from_bytes(metadata, key_package_bytes, pubkey_package);
+        let share = StoredShare::encrypt_with_ciphersuite(&package, bs.ciphersuite, &data_key)?;
         keep.restore_stored_share(&share)?;
     }
 
