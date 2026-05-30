@@ -194,6 +194,17 @@ pub fn cmd_serve(
     out.field("Signing mode", &signing_mode);
     out.field("Signing identity", &signing_identity);
 
+    // Load any NIP-46 client app grants persisted via `keep nip46 grant`.
+    // These are loaded into the PermissionManager at startup so headless
+    // bunkers don't need to rely on an interactive approval prompt.
+    let pre_grants = load_pre_grants(&keep)?;
+    if !pre_grants.is_empty() {
+        out.field(
+            "Pre-granted apps",
+            &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
+        );
+    }
+
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -201,6 +212,7 @@ pub fn cmd_serve(
     if headless {
         let headless_config = ServerConfig {
             auto_approve: true,
+            pre_grants: pre_grants.clone(),
             ..Default::default()
         };
         rt.block_on(async {
@@ -488,4 +500,51 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
     spawn_tui_server(keyring, relay, bunker_url, npub)
+}
+
+/// Read persisted NIP-46 client app grants from the global RelayConfig and
+/// translate them into the `PreGrantedApp` shape `keep-nip46::ServerConfig`
+/// expects. Grants are populated into the `PermissionManager` at startup so
+/// headless bunkers (where there is no interactive approval prompt) can
+/// accept signing requests from previously authorized clients.
+fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
+    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
+    let mut out = Vec::with_capacity(cfg.bunker_permissions.len());
+    for bp in &cfg.bunker_permissions {
+        let pk_bytes = match hex::decode(&bp.pubkey_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                tracing::warn!(
+                    pubkey_hex = %bp.pubkey_hex,
+                    "skipping malformed bunker_permission pubkey on load"
+                );
+                continue;
+            }
+        };
+        let pubkey = match nostr_sdk::PublicKey::from_slice(&pk_bytes) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!(
+                    pubkey_hex = %bp.pubkey_hex,
+                    error = %e,
+                    "skipping bunker_permission with invalid pubkey on load"
+                );
+                continue;
+            }
+        };
+        let permissions = keep_nip46::Permission::from_bits_truncate(bp.permissions);
+        let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = bp
+            .auto_approve_kinds
+            .iter()
+            .copied()
+            .map(nostr_sdk::Kind::from)
+            .collect();
+        out.push(keep_nip46::PreGrantedApp {
+            pubkey,
+            name: bp.name.clone(),
+            permissions,
+            auto_approve_kinds,
+        });
+    }
+    Ok(out)
 }

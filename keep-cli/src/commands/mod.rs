@@ -9,6 +9,7 @@ pub mod frost;
 pub mod frost_hardware;
 pub mod frost_network;
 pub mod migrate;
+pub mod nip46;
 pub mod serve;
 pub mod vault;
 pub mod wallet;

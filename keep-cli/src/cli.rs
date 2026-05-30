@@ -101,6 +101,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: EnclaveCommands,
     },
+    /// NIP-46 bunker app management: pre-grant, list, and revoke client permissions
+    Nip46 {
+        #[command(subcommand)]
+        command: Nip46Commands,
+    },
     /// Agent integrations (MCP server, etc.)
     Agent {
         #[command(subcommand)]
@@ -178,6 +183,46 @@ pub(crate) enum AgentCommands {
     Mcp {
         #[arg(short, long)]
         key: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Nip46Commands {
+    /// List persisted NIP-46 client app permission grants
+    Apps,
+    /// Pre-grant a NIP-46 client app a set of permissions.
+    ///
+    /// Granted apps are stored in the global RelayConfig and loaded into the
+    /// PermissionManager when `keep serve` starts. This is the headless
+    /// alternative to approving via the desktop's interactive prompt.
+    Grant {
+        #[arg(help = "Client app's nostr pubkey (hex or npub)")]
+        pubkey: String,
+        #[arg(long, default_value = "unnamed", help = "Display name for the app")]
+        name: String,
+        #[arg(
+            long,
+            help = "Comma-separated permission names: get_public_key, sign_event, nip04_encrypt, nip04_decrypt, nip44_encrypt, nip44_decrypt. Pass 'all' to grant everything.",
+            default_value = "get_public_key,sign_event"
+        )]
+        permissions: String,
+        #[arg(
+            long,
+            help = "Comma-separated event kinds that skip per-event approval (e.g. '1,7,22242')",
+            default_value = ""
+        )]
+        auto_approve_kinds: String,
+        #[arg(
+            long,
+            help = "Grant duration: 'session' (until restart), 'forever', or a number of seconds (e.g. '3600').",
+            default_value = "forever"
+        )]
+        duration: String,
+    },
+    /// Revoke a NIP-46 client app's permissions
+    Revoke {
+        #[arg(help = "Client app's nostr pubkey (hex or npub)")]
+        pubkey: String,
     },
 }
 
