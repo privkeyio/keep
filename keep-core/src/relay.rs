@@ -253,7 +253,7 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     let s = addr.segments();
     let o = addr.octets();
     let tail_v4 = || Ipv4Addr::new(o[12], o[13], o[14], o[15]);
-    // IPv4-compatible (::x.x.x.x), deprecated but still exploitable
+    // IPv4-compatible (::x.x.x.x): deprecated but still exploitable
     if s[..6] == [0, 0, 0, 0, 0, 0] {
         return Some(tail_v4());
     }
@@ -261,11 +261,11 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         return Some(tail_v4());
     }
-    // 6to4 (2002::/16), IPv4 embedded in bits 16-47
+    // 6to4 (2002::/16): IPv4 embedded in bits 16-47
     if s[0] == 0x2002 {
         return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
     }
-    // Teredo (2001:0000::/32), IPv4 XOR'd in last 32 bits
+    // Teredo (2001:0000::/32): IPv4 XOR'd in last 32 bits
     if s[0] == 0x2001 && s[1] == 0x0000 {
         return Some(Ipv4Addr::new(
             o[12] ^ 0xff,

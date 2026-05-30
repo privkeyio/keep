@@ -1105,7 +1105,7 @@ impl KfpNode {
         // Scoping subscriptions to these `authors` (a) satisfies strict relays
         // that reject author-less filters (e.g. relay.nsec.app: "please add
         // authors or #p"), and (b) avoids pulling the relay's entire kind:24242
-        // stream, that kind is shared with Blossom and other FROST groups, so
+        // stream; that kind is shared with Blossom and other FROST groups, so
         // an unscoped filter floods the node and crowds out real signing
         // traffic. It also rejects spoofed group events from non-members.
         let authors = group_member_pubkeys(&self.group_pubkey, self.share.metadata.total_shares);

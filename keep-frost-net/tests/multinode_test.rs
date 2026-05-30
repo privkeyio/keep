@@ -1027,7 +1027,7 @@ async fn test_psbt_recovery_spend_end_to_end() {
         .expect("request_psbt_spend");
 
     // Responder side: receive PsbtSignatureNeeded, then perform the same chain
-    // the production approve path runs, compute sighash, sign (in lieu of
+    // the production approve path runs: compute sighash, sign (in lieu of
     // NIP-46), merge, contribute.
     let need = timeout(Duration::from_secs(15), async {
         loop {

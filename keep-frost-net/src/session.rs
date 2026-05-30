@@ -821,7 +821,7 @@ mod tests {
 
     // Relays reorder events: a participant's signature share can arrive before
     // its commitment. The session must buffer both and aggregate only once
-    // every participant has both, never aggregate a share whose commitment is
+    // every participant has both; never aggregate a share whose commitment is
     // missing (which used to produce `Aggregation failed: Unknown identifier`).
     #[test]
     fn test_aggregation_tolerates_reordered_share_before_commitment() {

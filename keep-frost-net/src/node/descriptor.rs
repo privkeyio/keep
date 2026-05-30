@@ -172,7 +172,7 @@ impl KfpNode {
         // new_descriptor_hash) link, even when each instance is individually
         // within the replay window. Checked BEFORE binding validation so a
         // duplicate can short-circuit, but the entry is only INSERTED after
-        // validation succeeds, otherwise an attacker could pre-poison the
+        // validation succeeds; otherwise an attacker could pre-poison the
         // set with forged tuples to suppress a legitimate later message.
         // Bounded prune happens in the main loop.
         {

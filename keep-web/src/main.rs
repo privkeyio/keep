@@ -96,7 +96,7 @@ fn resolve_group(
     if groups.is_empty() {
         return Ok(None);
     }
-    // Honor the operator's persisted selection, the same active-share key that
+    // Honor the operator's persisted selection: the same active-share key that
     // keep-desktop and keep-android use, if it still names a held group.
     if let Some(active_hex) = keep.get_active_share_key() {
         if let Some(g) = groups.iter().find(|g| hex::encode(g) == active_hex) {
@@ -216,11 +216,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else if single_key && keep.keyring().get_primary().is_some() {
         // Explicit opt-in: sign with the vault's primary key alone (no
-        // threshold security, the full key lives on this box).
+        // threshold security: the full key lives on this box).
         tracing::warn!("KEEP_ALLOW_SINGLE_KEY set; single-key bunker (no threshold security)");
         // Transfer ownership of the keyring into the bunker thread; `keep`'s
         // keyring is intentionally left empty afterwards (the bunker is the
-        // only thing that signs in this mode, don't read keep.keyring() below).
+        // only thing that signs in this mode; don't read keep.keyring() below).
         let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
         let bunker_secret = state::load_or_create_bunker_secret(&vault_path)?;
         bunker::spawn_single_key(

@@ -53,7 +53,7 @@ pub async fn ws_ticket(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Returns the bunker connection details. The `url` carries the connection
-/// `?secret=`, which is sensitive, this endpoint is gated behind bearer auth.
+/// `?secret=` which is sensitive; this endpoint is gated behind bearer auth.
 pub async fn bunker(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.bunker.clone())
 }
@@ -382,7 +382,7 @@ pub struct KillswitchRequest {
     pub enabled: bool,
 }
 
-/// Toggles co-signing live, with no restart, the policy hook reads this on
+/// Toggles co-signing live (no restart); the policy hook reads this on
 /// every round.
 pub async fn set_killswitch(
     State(state): State<AppState>,

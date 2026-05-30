@@ -14,18 +14,18 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 
 ## Features
 
-- **Encrypted vault**, Argon2id + XChaCha20-Poly1305, keys zeroized in RAM
-- **Remote signing**, NIP-46 bunker mode for any compatible Nostr client
-- **Threshold signatures**, FROST t-of-n key splitting with distributed key generation (DKG)
-- **Network signing**, Coordinate FROST signing across devices over Nostr relays
-- **Bitcoin**, BIP-86 Taproot addresses, PSBT signing, wallet descriptor coordination
-- **Hardware signers**, Air-gapped FROST shares on [keep-esp32](https://github.com/privkeyio/keep-esp32)
-- **Mobile**, UniFFI library for Android ([keep-android](https://github.com/privkeyio/keep-android)) and iOS
-- **Enclaves**, AWS Nitro Enclave signing with attestation-based KMS
-- **Agent SDK**, Constrained signing sessions for AI agents (Python, TypeScript, MCP)
-- **Hidden volumes**, Plausibly deniable storage, cryptographically undetectable
-- **Desktop app**, Iced GUI with system tray, QR scanning, NIP-49 import/export
-- **Always-on co-signer**, Headless network-FROST co-signer with a web admin UI ([`keep-web`](keep-web)), packaged for StartOS ([keep-startos](https://github.com/privkeyio/keep-startos))
+- **Encrypted vault**: Argon2id + XChaCha20-Poly1305, keys zeroized in RAM
+- **Remote signing**: NIP-46 bunker mode for any compatible Nostr client
+- **Threshold signatures**: FROST t-of-n key splitting with distributed key generation (DKG)
+- **Network signing**: Coordinate FROST signing across devices over Nostr relays
+- **Bitcoin**: BIP-86 Taproot addresses, PSBT signing, wallet descriptor coordination
+- **Hardware signers**: Air-gapped FROST shares on [keep-esp32](https://github.com/privkeyio/keep-esp32)
+- **Mobile**: UniFFI library for Android ([keep-android](https://github.com/privkeyio/keep-android)) and iOS
+- **Enclaves**: AWS Nitro Enclave signing with attestation-based KMS
+- **Agent SDK**: Constrained signing sessions for AI agents (Python, TypeScript, MCP)
+- **Hidden volumes**: Plausibly deniable storage, cryptographically undetectable
+- **Desktop app**: Iced GUI with system tray, QR scanning, NIP-49 import/export
+- **Always-on co-signer**: Headless network-FROST co-signer with a web admin UI ([`keep-web`](keep-web)), packaged for StartOS ([keep-startos](https://github.com/privkeyio/keep-startos))
 
 ## Quick Start
 
