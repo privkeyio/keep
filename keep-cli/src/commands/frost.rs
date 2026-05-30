@@ -81,6 +81,14 @@ pub fn cmd_frost_generate(
         ));
     }
 
+    let pubkey_comment = if pubkey_out.is_some() {
+        let comment = format!("minisign public key for keep FROST group {name}");
+        keep_core::frost::ed25519::minisign::validate_comment("untrusted", &comment)?;
+        Some(comment)
+    } else {
+        None
+    };
+
     out.newline();
     out.warn("WARNING: Trusted dealer mode - for testing/development only.");
     out.warn("The full private key exists on this machine during generation.");
@@ -120,7 +128,7 @@ pub fn cmd_frost_generate(
         if let Some(pubkey_path) = pubkey_out {
             let pk = keep_core::frost::ed25519::minisign::MinisignPublicKey::from_group_pubkey(
                 group_pubkey,
-                format!("minisign public key for keep FROST group {name}"),
+                pubkey_comment.expect("validated when pubkey_out is set"),
             );
             std::fs::write(pubkey_path, pk.encode()?)
                 .map_err(|e| KeepError::InvalidInput(format!("cannot write public key: {e}")))?;
