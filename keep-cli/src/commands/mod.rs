@@ -76,6 +76,22 @@ pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretSt
     Ok(SecretString::from(pw))
 }
 
+pub fn get_new_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretString> {
+    if let Some(pw) = password_from_env("KEEP_NEW_PASSWORD") {
+        return Ok(pw);
+    }
+    let pw = Password::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .with_confirmation(confirm, "Passwords don't match")
+        .interact()
+        .map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read password: {e}"
+            )))
+        })?;
+    Ok(SecretString::from(pw))
+}
+
 pub fn get_confirm(prompt: &str) -> Result<bool> {
     if std::env::var("KEEP_YES").is_ok() {
         return Ok(true);

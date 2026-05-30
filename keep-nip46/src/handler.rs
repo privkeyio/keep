@@ -343,10 +343,14 @@ impl SignerHandler {
             }
         }
 
-        let (requested_perms, auto_kinds) = permissions
+        let (mut requested_perms, auto_kinds) = permissions
             .as_deref()
             .map(parse_permission_string)
             .unwrap_or((self.connect_grant, HashSet::new()));
+
+        if self.auto_approve {
+            requested_perms = Permission::ALL;
+        }
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
@@ -781,6 +785,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auto_approve_grants_all_permissions_on_connect() {
+        // Headless bunker mode (`auto_approve=true`) must grant Permission::ALL
+        // on connect so that sign_event / nip04 / nip44 succeed without an
+        // interactive approval callback. This is the fix for the regression
+        // where headless bunkers rejected every sign_event with "Permission
+        // denied: operation not permitted".
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+
+        let pm = handler.permissions.lock().await;
+        for perm in [
+            Permission::GET_PUBLIC_KEY,
+            Permission::SIGN_EVENT,
+            Permission::NIP04_ENCRYPT,
+            Permission::NIP04_DECRYPT,
+            Permission::NIP44_ENCRYPT,
+            Permission::NIP44_DECRYPT,
+        ] {
+            assert!(
+                pm.has_permission(&app_pubkey, perm),
+                "auto_approve must grant {perm:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_handle_connect_with_pubkey_mismatch() {
         let handler = setup_handler();
         let app_pubkey = Keys::generate().public_key();
@@ -978,12 +1013,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_client_permissions() {
-        let handler = setup_handler();
+        let handler = setup_handler().with_auto_approve(false);
         let app_pubkey = Keys::generate().public_key();
-        handler
-            .handle_connect(app_pubkey, None, None, None)
-            .await
-            .unwrap();
+        let permissions = handler.permissions.clone();
+        let mut pm = permissions.lock().await;
+        pm.connect_with_permissions(
+            app_pubkey,
+            "test".into(),
+            Permission::DEFAULT,
+            HashSet::new(),
+        );
+        drop(pm);
 
         assert!(!handler
             .permissions
