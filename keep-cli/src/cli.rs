@@ -348,6 +348,12 @@ pub(crate) enum WalletCommands {
         share: Option<u16>,
         #[arg(short, long, help = "Nostr relay URL")]
         relay: Option<String>,
+        #[arg(
+            long,
+            help = "Seconds to wait for a matching PsbtSignatureNeeded proposal before giving up. Default 20s; the old 60s was excessive when the initiator simply wasn't online or the session id was a typo. Upper bound is enforced by keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS.",
+            default_value = "20"
+        )]
+        timeout: u32,
     },
 }
 
@@ -396,6 +402,15 @@ pub(crate) enum FrostCommands {
         group: String,
         #[arg(short, long, help = "Share identifier (1-indexed)")]
         share: u16,
+    },
+    /// Verify a BIP-340 Schnorr signature against a FROST group pubkey
+    Verify {
+        #[arg(short, long, help = "Message hex (the bytes that were signed)")]
+        message: String,
+        #[arg(short, long, help = "FROST group npub or hex pubkey")]
+        group: String,
+        #[arg(short, long, help = "64-byte schnorr signature as hex")]
+        signature: String,
     },
     Sign {
         #[arg(short, long)]
