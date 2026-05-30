@@ -28,6 +28,51 @@ bitflags::bitflags! {
     }
 }
 
+impl Permission {
+    /// Canonical (flag, snake_case name) table. Single source of truth shared
+    /// by the CLI parser/formatter, desktop UI, and any other caller.
+    pub const NAMES: &'static [(Permission, &'static str)] = &[
+        (Permission::GET_PUBLIC_KEY, "get_public_key"),
+        (Permission::SIGN_EVENT, "sign_event"),
+        (Permission::NIP04_ENCRYPT, "nip04_encrypt"),
+        (Permission::NIP04_DECRYPT, "nip04_decrypt"),
+        (Permission::NIP44_ENCRYPT, "nip44_encrypt"),
+        (Permission::NIP44_DECRYPT, "nip44_decrypt"),
+    ];
+
+    /// Resolve a single canonical name (snake_case, also accepts no-underscore
+    /// aliases) to its `Permission` flag, or `None` if unknown. `"all"`
+    /// returns `ALL`. Distinct from the bitflags-generated `from_name`, which
+    /// only matches the all-caps constant names (`GET_PUBLIC_KEY`, ...).
+    pub fn from_canonical_name(name: &str) -> Option<Permission> {
+        let lower = name.to_ascii_lowercase();
+        if lower == "all" {
+            return Some(Permission::ALL);
+        }
+        for (flag, canonical) in Self::NAMES {
+            if lower == *canonical || lower == canonical.replace('_', "") {
+                return Some(*flag);
+            }
+        }
+        None
+    }
+
+    /// Render this bitset as a comma-separated string of snake_case names,
+    /// or `"(none)"` if no bits are set.
+    pub fn to_names(self) -> String {
+        let set: Vec<&str> = Self::NAMES
+            .iter()
+            .filter(|(flag, _)| self.contains(*flag))
+            .map(|(_, n)| *n)
+            .collect();
+        if set.is_empty() {
+            "(none)".to_string()
+        } else {
+            set.join(",")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionDuration {
     Session,
@@ -244,6 +289,39 @@ impl PermissionManager {
             }
             app.last_used = Timestamp::now();
         }
+    }
+
+    /// Restore an app from persisted state. Single source of truth for the
+    /// Session-skip / expired-Seconds-skip / capacity-enforced insert path
+    /// shared by `SignerHandler::restore_client` and the `apply_pre_grants`
+    /// startup hook. Returns `true` if the app was inserted, `false` if it
+    /// was skipped (Session, expired, or capacity full).
+    pub fn restore_persisted(
+        &mut self,
+        pubkey: PublicKey,
+        name: String,
+        permissions: Permission,
+        auto_kinds: HashSet<Kind>,
+        duration: PermissionDuration,
+        connected_at: Timestamp,
+    ) -> bool {
+        match duration {
+            PermissionDuration::Session => return false,
+            PermissionDuration::Seconds(_) if duration.is_expired(connected_at) => return false,
+            _ => {}
+        }
+        if !self.ensure_capacity(&pubkey) {
+            let app_id = &pubkey.to_hex()[..8];
+            warn!(app_id, "restore_persisted: capacity full, skipping");
+            return false;
+        }
+        let mut app = AppPermission::new(pubkey, name);
+        app.permissions = permissions & Permission::ALL;
+        app.auto_approve_kinds = auto_kinds;
+        app.duration = duration;
+        app.connected_at = connected_at;
+        self.insert(app);
+        true
     }
 
     pub(crate) fn insert(&mut self, mut app: AppPermission) {

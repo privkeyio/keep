@@ -17,7 +17,7 @@ use crate::bunker::generate_bunker_url;
 use crate::error::Result;
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::handler::SignerHandler;
-use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
+use crate::permissions::{Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
@@ -56,6 +56,56 @@ pub struct PreGrantedApp {
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
     pub duration: PermissionDuration,
     pub connected_at: Timestamp,
+}
+
+impl PreGrantedApp {
+    /// Build a runtime `PreGrantedApp` from a persisted
+    /// `keep_core::relay::StoredBunkerPermission`. Returns `None` and logs at
+    /// warn-level when the stored row is malformed (bad hex pubkey) so one
+    /// bad row never takes the bunker down. Session / expired Seconds rows
+    /// are kept here and skipped later by `PermissionManager::restore_persisted`,
+    /// so the mapping stays a pure function of the stored bytes.
+    pub fn from_stored(stored: &keep_core::relay::StoredBunkerPermission) -> Option<Self> {
+        let pk_bytes = match hex::decode(&stored.pubkey_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                tracing::warn!(
+                    pubkey_hex = %stored.pubkey_hex,
+                    "PreGrantedApp::from_stored: skipping malformed pubkey hex"
+                );
+                return None;
+            }
+        };
+        let Ok(pubkey) = PublicKey::from_slice(&pk_bytes) else {
+            tracing::warn!(
+                pubkey_hex = %stored.pubkey_hex,
+                "PreGrantedApp::from_stored: skipping invalid pubkey"
+            );
+            return None;
+        };
+        let permissions = Permission::from_bits_truncate(stored.permissions);
+        let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = stored
+            .auto_approve_kinds
+            .iter()
+            .copied()
+            .map(nostr_sdk::Kind::from)
+            .collect();
+        let duration = match &stored.duration {
+            keep_core::relay::StoredPermissionDuration::Session => PermissionDuration::Session,
+            keep_core::relay::StoredPermissionDuration::Seconds(s) => {
+                PermissionDuration::Seconds(*s)
+            }
+            keep_core::relay::StoredPermissionDuration::Forever => PermissionDuration::Forever,
+        };
+        Some(Self {
+            pubkey,
+            name: stored.name.clone(),
+            permissions,
+            auto_approve_kinds,
+            duration,
+            connected_at: Timestamp::from_secs(stored.connected_at),
+        })
+    }
 }
 
 impl Default for ServerConfig {
@@ -119,27 +169,14 @@ async fn apply_pre_grants(
     }
     let mut pm = permissions.lock().await;
     for app in pre_grants {
-        // Mirror SignerHandler::restore_client: Session grants die at restart,
-        // expired Seconds grants are dropped, and capacity is enforced so a
-        // large stored config cannot defeat MAX_CONNECTED_APPS.
-        match app.duration {
-            PermissionDuration::Session => continue,
-            PermissionDuration::Seconds(_) if app.duration.is_expired(app.connected_at) => continue,
-            _ => {}
-        }
-        if !pm.ensure_capacity(&app.pubkey) {
-            warn!(
-                app_id = &app.pubkey.to_hex()[..8],
-                "apply_pre_grants: capacity full, skipping"
-            );
-            continue;
-        }
-        let mut perm = AppPermission::new(app.pubkey, app.name.clone());
-        perm.permissions = app.permissions & Permission::ALL;
-        perm.auto_approve_kinds = app.auto_approve_kinds.clone();
-        perm.duration = app.duration;
-        perm.connected_at = app.connected_at;
-        pm.insert(perm);
+        pm.restore_persisted(
+            app.pubkey,
+            app.name.clone(),
+            app.permissions,
+            app.auto_approve_kinds.clone(),
+            app.duration,
+            app.connected_at,
+        );
     }
 }
 
@@ -786,5 +823,93 @@ mod tests {
 
         let secret = bunker_secret.expect("expected_secret should surface as bunker secret");
         assert_eq!(secret.as_str(), "my-secret");
+    }
+
+    fn sample_stored(
+        pubkey_hex: &str,
+        duration: keep_core::relay::StoredPermissionDuration,
+        connected_at: u64,
+    ) -> keep_core::relay::StoredBunkerPermission {
+        keep_core::relay::StoredBunkerPermission {
+            pubkey_hex: pubkey_hex.to_string(),
+            name: "test app".to_string(),
+            permissions: Permission::GET_PUBLIC_KEY.bits() | Permission::SIGN_EVENT.bits(),
+            auto_approve_kinds: vec![1, 7],
+            duration,
+            connected_at,
+        }
+    }
+
+    fn good_pubkey_hex() -> String {
+        nostr_sdk::Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn from_stored_returns_none_on_malformed_pubkey() {
+        let stored = sample_stored(
+            "not-a-pubkey",
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        assert!(PreGrantedApp::from_stored(&stored).is_none());
+
+        let stored_short = sample_stored(
+            "1234",
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        assert!(PreGrantedApp::from_stored(&stored_short).is_none());
+    }
+
+    #[test]
+    fn from_stored_translates_duration_and_kinds() {
+        let pk_hex = good_pubkey_hex();
+        let stored = sample_stored(
+            &pk_hex,
+            keep_core::relay::StoredPermissionDuration::Seconds(3600),
+            42,
+        );
+        let app = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        assert_eq!(app.name, "test app");
+        assert_eq!(app.connected_at.as_secs(), 42);
+        assert!(matches!(app.duration, PermissionDuration::Seconds(3600)));
+        assert!(app.auto_approve_kinds.contains(&nostr_sdk::Kind::Custom(1)));
+        assert!(app.permissions.contains(Permission::SIGN_EVENT));
+    }
+
+    #[tokio::test]
+    async fn apply_pre_grants_skips_session_and_expired() {
+        let pm = Arc::new(Mutex::new(PermissionManager::new()));
+
+        // Forever: kept.
+        let forever_stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        // Session: dropped by restore_persisted.
+        let session_stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Session,
+            0,
+        );
+        // Expired Seconds (connected long ago, very short ttl): dropped.
+        let expired_stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Seconds(1),
+            1,
+        );
+
+        let pre_grants: Vec<PreGrantedApp> = [&forever_stored, &session_stored, &expired_stored]
+            .iter()
+            .filter_map(|s| PreGrantedApp::from_stored(s))
+            .collect();
+
+        apply_pre_grants(&pm, &pre_grants).await;
+        let count = pm.lock().await.list_apps().count();
+        assert_eq!(
+            count, 1,
+            "only the Forever grant should land in the manager"
+        );
     }
 }

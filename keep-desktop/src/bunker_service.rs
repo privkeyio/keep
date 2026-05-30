@@ -708,38 +708,22 @@ impl App {
         handler: &Arc<keep_nip46::SignerHandler>,
         stored: &[StoredBunkerPermission],
     ) {
-        let now = nostr_sdk::Timestamp::now().as_secs();
-        for perm in stored {
-            match &perm.duration {
-                StoredPermissionDuration::Session => continue,
-                StoredPermissionDuration::Seconds(secs) => {
-                    if now > perm.connected_at.saturating_add(*secs) {
-                        continue;
-                    }
-                }
-                StoredPermissionDuration::Forever => {}
-            }
-            let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&perm.pubkey_hex) else {
-                continue;
-            };
-            let kinds: std::collections::HashSet<nostr_sdk::Kind> = perm
-                .auto_approve_kinds
-                .iter()
-                .map(|k| nostr_sdk::Kind::from(*k))
-                .collect();
-            let duration = match &perm.duration {
-                StoredPermissionDuration::Session => keep_nip46::PermissionDuration::Session,
-                StoredPermissionDuration::Seconds(s) => keep_nip46::PermissionDuration::Seconds(*s),
-                StoredPermissionDuration::Forever => keep_nip46::PermissionDuration::Forever,
-            };
+        // Pure mapping (malformed pubkey skip) lives in `PreGrantedApp::from_stored`;
+        // the Session/expired/capacity-skip decision lives in
+        // `PermissionManager::restore_persisted` via `SignerHandler::restore_client`.
+        // Keeping both responsibilities out of this loop is what closes #510.
+        for app in stored
+            .iter()
+            .filter_map(keep_nip46::PreGrantedApp::from_stored)
+        {
             handler
                 .restore_client(
-                    pubkey,
-                    perm.name.clone(),
-                    keep_nip46::Permission::from_bits_truncate(perm.permissions),
-                    kinds,
-                    duration,
-                    nostr_sdk::Timestamp::from(perm.connected_at),
+                    app.pubkey,
+                    app.name,
+                    app.permissions,
+                    app.auto_approve_kinds,
+                    app.duration,
+                    app.connected_at,
                 )
                 .await;
         }

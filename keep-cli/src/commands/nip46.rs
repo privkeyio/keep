@@ -209,32 +209,24 @@ fn parse_pubkey_hex(input: &str) -> Result<String> {
 }
 
 fn parse_permissions(s: &str) -> Result<u32> {
-    use keep_nip46::Permission;
-    let mut bits: u32 = 0;
+    let mut perms = keep_nip46::Permission::empty();
     for token in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        let lower = token.to_ascii_lowercase();
-        let bit = match lower.as_str() {
-            "all" => return Ok(Permission::ALL.bits()),
-            "get_public_key" | "getpublickey" => Permission::GET_PUBLIC_KEY.bits(),
-            "sign_event" | "signevent" => Permission::SIGN_EVENT.bits(),
-            "nip04_encrypt" | "nip04encrypt" => Permission::NIP04_ENCRYPT.bits(),
-            "nip04_decrypt" | "nip04decrypt" => Permission::NIP04_DECRYPT.bits(),
-            "nip44_encrypt" | "nip44encrypt" => Permission::NIP44_ENCRYPT.bits(),
-            "nip44_decrypt" | "nip44decrypt" => Permission::NIP44_DECRYPT.bits(),
-            other => {
-                return Err(KeepError::InvalidInput(format!(
-                    "unknown permission '{other}'; valid: get_public_key, sign_event, nip04_encrypt, nip04_decrypt, nip44_encrypt, nip44_decrypt, all"
-                )));
-            }
-        };
-        bits |= bit;
+        let flag = keep_nip46::Permission::from_canonical_name(token).ok_or_else(|| {
+            let known = keep_nip46::Permission::NAMES
+                .iter()
+                .map(|(_, n)| *n)
+                .collect::<Vec<_>>()
+                .join(", ");
+            KeepError::InvalidInput(format!("unknown permission '{token}'; valid: {known}, all"))
+        })?;
+        perms |= flag;
     }
-    if bits == 0 {
+    if perms.is_empty() {
         return Err(KeepError::InvalidInput(
             "at least one permission must be granted".into(),
         ));
     }
-    Ok(bits)
+    Ok(perms.bits())
 }
 
 fn parse_auto_approve_kinds(s: &str) -> Result<Vec<u16>> {
@@ -268,25 +260,7 @@ fn parse_duration(s: &str) -> Result<StoredPermissionDuration> {
 }
 
 fn format_permissions(bits: u32) -> String {
-    use keep_nip46::Permission;
-    let names: &[(u32, &str)] = &[
-        (Permission::GET_PUBLIC_KEY.bits(), "get_public_key"),
-        (Permission::SIGN_EVENT.bits(), "sign_event"),
-        (Permission::NIP04_ENCRYPT.bits(), "nip04_encrypt"),
-        (Permission::NIP04_DECRYPT.bits(), "nip04_decrypt"),
-        (Permission::NIP44_ENCRYPT.bits(), "nip44_encrypt"),
-        (Permission::NIP44_DECRYPT.bits(), "nip44_decrypt"),
-    ];
-    let set: Vec<&str> = names
-        .iter()
-        .filter(|(b, _)| bits & b != 0)
-        .map(|(_, n)| *n)
-        .collect();
-    if set.is_empty() {
-        "(none)".to_string()
-    } else {
-        set.join(",")
-    }
+    keep_nip46::Permission::from_bits_truncate(bits).to_names()
 }
 
 fn format_duration(d: &StoredPermissionDuration) -> String {
