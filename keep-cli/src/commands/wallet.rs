@@ -1696,17 +1696,27 @@ async fn approve_psbt_session(
         }
     }
 
+    // Resolve the descriptor the session was coordinated against by its
+    // canonical hash, not the current tip. A migration sweep is keyed on the
+    // OLD descriptor hash while the NEW (successor) descriptor is already the
+    // tip, so loading the tip would both reject the sweep here and authorize
+    // the spend under the wrong policy/keys. All spend-side checks below
+    // (policy, xpub, network, input bindings) derive from this descriptor.
+    // Fail closed if no persisted version matches.
     let descriptor = {
         let guard = keep.lock().expect("keep mutex poisoned");
         guard
-            .get_wallet_descriptor(&group_pubkey)?
-            .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?
+            .list_all_wallet_descriptor_versions()?
+            .into_iter()
+            .find(|d| {
+                d.group_pubkey == group_pubkey && d.canonical_hash() == session_descriptor_hash
+            })
+            .ok_or_else(|| {
+                KeepError::Frost(
+                    "no persisted descriptor matches the PSBT session descriptor_hash".into(),
+                )
+            })?
     };
-    if descriptor.canonical_hash() != session_descriptor_hash {
-        return Err(KeepError::Frost(
-            "stored descriptor hash does not match PSBT session descriptor_hash".into(),
-        ));
-    }
     let policy_json = descriptor.policy.clone().ok_or_else(|| {
         KeepError::InvalidInput(
             "persisted descriptor has no WalletPolicy; cannot derive recovery tier metadata".into(),
@@ -1734,6 +1744,16 @@ async fn approve_psbt_session(
     // outputs it actually controls; fail closed before contacting the bunker.
     let sighashes = keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
         .map_err(|e| KeepError::InvalidInput(format!("PSBT binding verification failed: {e}")))?;
+
+    // #414 responder-side destination validation: if the session is keyed on
+    // an OLD descriptor whose successor (NEW descriptor) is persisted in this
+    // vault, the proposal must be an automated migration sweep and the PSBT
+    // must have exactly one output paying the NEW descriptor's address. The
+    // helper fails CLOSED (store unavailable / ambiguous lineage / mismatch)
+    // because the proposer-side re-derivation in
+    // `request_descriptor_migration_sweep` is not a security boundary.
+    node.validate_migration_sweep_destination(&session_descriptor_hash, &psbt.unsigned_tx)
+        .map_err(KeepError::Frost)?;
 
     // Display every destination (address + amount) and require explicit
     // operator confirmation before signing. The input-binding check above only
