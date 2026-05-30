@@ -30,13 +30,19 @@ fn descriptor_lookup_for(
     })
 }
 
-fn parse_group_hex(group_hex: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(group_hex)
-        .map_err(|e| KeepError::InvalidInput(format!("invalid group hex: {e}")))?;
-    let arr: [u8; 32] = bytes
+/// Parse a FROST group identifier as either bech32 npub or 32-byte hex.
+///
+/// CLI help for every wallet `--group` argument advertises "npub or hex"; this
+/// makes both inputs work.
+fn parse_group_hex(group_id: &str) -> Result<[u8; 32]> {
+    if group_id.starts_with("npub1") {
+        return keep_core::keys::npub_to_bytes(group_id);
+    }
+    let bytes = hex::decode(group_id)
+        .map_err(|e| KeepError::InvalidInput(format!("expected npub or 32-byte hex: {e}")))?;
+    bytes
         .try_into()
-        .map_err(|_| KeepError::InvalidInput("group pubkey must be 32 bytes".into()))?;
-    Ok(arr)
+        .map_err(|_| KeepError::InvalidInput("group pubkey must be 32 bytes".into()))
 }
 
 pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
