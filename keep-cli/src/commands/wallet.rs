@@ -1696,17 +1696,27 @@ async fn approve_psbt_session(
         }
     }
 
+    // Resolve the descriptor the session was coordinated against by its
+    // canonical hash, not the current tip. A migration sweep is keyed on the
+    // OLD descriptor hash while the NEW (successor) descriptor is already the
+    // tip, so loading the tip would both reject the sweep here and authorize
+    // the spend under the wrong policy/keys. All spend-side checks below
+    // (policy, xpub, network, input bindings) derive from this descriptor.
+    // Fail closed if no persisted version matches.
     let descriptor = {
         let guard = keep.lock().expect("keep mutex poisoned");
         guard
-            .get_wallet_descriptor(&group_pubkey)?
-            .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?
+            .list_all_wallet_descriptor_versions()?
+            .into_iter()
+            .find(|d| {
+                d.group_pubkey == group_pubkey && d.canonical_hash() == session_descriptor_hash
+            })
+            .ok_or_else(|| {
+                KeepError::Frost(
+                    "no persisted descriptor matches the PSBT session descriptor_hash".into(),
+                )
+            })?
     };
-    if descriptor.canonical_hash() != session_descriptor_hash {
-        return Err(KeepError::Frost(
-            "stored descriptor hash does not match PSBT session descriptor_hash".into(),
-        ));
-    }
     let policy_json = descriptor.policy.clone().ok_or_else(|| {
         KeepError::InvalidInput(
             "persisted descriptor has no WalletPolicy; cannot derive recovery tier metadata".into(),

@@ -610,26 +610,31 @@ impl App {
                     }
                 }
 
+                // SEC: resolve the descriptor the session was coordinated
+                // against by its canonical hash, not the current tip. A
+                // migration sweep is keyed on the OLD descriptor hash while the
+                // NEW (successor) descriptor is already the tip, so loading the
+                // tip would both reject the sweep and authorize the spend under
+                // the wrong policy/keys. All spend-side checks below derive from
+                // this descriptor. Fail closed if no persisted version matches.
                 let group_pubkey = *node.group_pubkey();
                 let descriptor = tokio::task::spawn_blocking(move || {
                     with_keep_blocking(&keep_arc, "Failed to load descriptor", move |keep| {
-                        keep.get_wallet_descriptor(&group_pubkey)
+                        keep.list_all_wallet_descriptor_versions()
                             .map_err(friendly_err)?
-                            .ok_or_else(|| "No wallet descriptor for this group".to_string())
+                            .into_iter()
+                            .find(|d| {
+                                d.group_pubkey == group_pubkey
+                                    && d.canonical_hash() == session_descriptor_hash
+                            })
+                            .ok_or_else(|| {
+                                "no persisted descriptor matches the PSBT session descriptor_hash"
+                                    .to_string()
+                            })
                     })
                 })
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
-
-                // SEC: confirm the locally stored descriptor matches the one
-                // the session was coordinated against. Fail closed on mismatch
-                // to prevent signing under a substituted descriptor.
-                if descriptor.canonical_hash() != session_descriptor_hash {
-                    return Err(
-                        "stored descriptor hash does not match PSBT session descriptor_hash"
-                            .to_string(),
-                    );
-                }
 
                 let policy_value = descriptor
                     .policy
