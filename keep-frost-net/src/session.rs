@@ -210,6 +210,22 @@ impl NetworkSession {
         self.commitments.len() >= self.threshold as usize
     }
 
+    /// Participant indices (excluding `our_index`) that have not submitted a
+    /// commitment. Used by failover to exclude only peers that demonstrably
+    /// failed to respond, leaving responsive peers eligible for the retry.
+    pub fn uncommitted_participants(&self, our_index: u16) -> Vec<u16> {
+        self.participants
+            .iter()
+            .copied()
+            .filter(|&idx| idx != our_index)
+            .filter(|&idx| {
+                Identifier::try_from(idx)
+                    .map(|id| !self.commitments.contains_key(&id))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
     /// Build the FROST signing package from the collected commitments.
     ///
     /// Correctness invariant (load-bearing now that delivery order is relaxed):
@@ -571,7 +587,12 @@ impl SessionManager {
             completed_sessions: HashSet::new(),
             completed_order: VecDeque::new(),
             max_completed_history: 1000,
-            session_timeout: Duration::from_secs(300),
+            // Co-signer sessions are not torn down explicitly when the
+            // initiator abandons a round, so keep this close to the initiator's
+            // round timeout. A consumed single-use nonce held by an abandoned
+            // session is released within ~60s, bounding session-table and nonce
+            // exhaustion under a burst of failovers.
+            session_timeout: Duration::from_secs(60),
             nonce_store: None,
             max_rehydrations: 3,
         }

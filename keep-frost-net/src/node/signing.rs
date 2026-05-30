@@ -17,8 +17,19 @@ use crate::session::derive_session_id;
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
 
-/// Error from a single signing round. `attempted` lists the non-self peers the
-/// round selected, so a timed-out round can exclude them and fail over.
+/// Per-round wait for the aggregated signature. Below the 20s peer announce
+/// interval so a round resolves within one announce cycle, and comfortably
+/// above honest co-signer response time including TEE attestation latency.
+const SIGNING_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on failover retries for a single signing request. Caps the
+/// worst-case wall-clock cost of repeated round timeouts (each up to
+/// `SIGNING_ROUND_TIMEOUT`) under a partition or latency event.
+const MAX_FAILOVER_ATTEMPTS: usize = 3;
+
+/// Error from a single signing round. `attempted` lists the non-self peers that
+/// failed to respond in this round, so a timed-out round can exclude them and
+/// fail over to other live co-signers.
 struct SigningRoundError {
     error: FrostNetError,
     attempted: Vec<u16>,
@@ -979,19 +990,33 @@ impl KfpNode {
 
     pub async fn request_signature(
         &self,
-        message: Vec<u8>,
+        mut message: Vec<u8>,
         message_type: &str,
     ) -> Result<[u8; 64]> {
-        // On a round timeout the selected co-signer is treated as unresponsive
-        // and excluded, then we re-select from the remaining online peers and
-        // retry. This fails over to another live co-signer in seconds instead of
-        // surfacing the timeout to the caller. The session id is rederived per
-        // attempt from the (changed) participant set, so each retry is a fresh
-        // session with a fresh nonce.
+        // On a round timeout the co-signers that failed to commit are treated as
+        // unresponsive and excluded, then we re-select from the remaining online
+        // peers and retry. This fails over to other live co-signers in seconds
+        // instead of surfacing the timeout to the caller. The session id is
+        // rederived per attempt from the (changed) participant set, so each retry
+        // is a fresh session with a fresh nonce.
+        //
+        // The retry count is capped by MAX_FAILOVER_ATTEMPTS so a partition or
+        // latency event cannot stall the caller for round_timeout × eligible
+        // peers; the final attempt surfaces its error to the caller.
+        //
+        // Stable id correlating all failover attempts of one logical request in
+        // the audit log; independent of the per-attempt participant set.
+        let logical_id = derive_session_id(&message, &[], self.share.metadata.threshold);
         let mut excluded: Vec<u16> = Vec::new();
-        loop {
+        for attempt in 0..MAX_FAILOVER_ATTEMPTS {
+            let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
+            let round_message = if last {
+                std::mem::take(&mut message)
+            } else {
+                message.clone()
+            };
             let result = self
-                .signing_round(message.clone(), message_type, &excluded)
+                .signing_round(round_message, message_type, &excluded, logical_id, attempt)
                 .await;
 
             // If a peer reported a stale pre-exchanged nonce (it rotated/restarted, so
@@ -1001,8 +1026,10 @@ impl KfpNode {
             // place: our single-use nonce was already spent on a share bound to the
             // stale commitment, the session id is fixed by the message, and the
             // replay guard would reject re-signing it; retrying would risk nonce
-            // reuse. The signing session is torn down on failure (see below), so the
-            // next attempt starts clean.
+            // reuse. The stale_nonce/incomplete_pre_exchange branch is a fatal
+            // Session error (not a Timeout), so it intentionally bypasses the
+            // failover retry below and returns to the caller. The signing session
+            // is torn down on failure (see below), so the next attempt starts clean.
             if let Err(SigningRoundError {
                 error: FrostNetError::Session(ref e),
                 ..
@@ -1021,9 +1048,10 @@ impl KfpNode {
                 Err(SigningRoundError {
                     error: FrostNetError::Timeout(_),
                     attempted,
-                }) if !attempted.is_empty() => {
+                }) if !attempted.is_empty() && !last => {
                     warn!(
                         excluded = ?attempted,
+                        attempt = attempt,
                         "signing round timed out; excluding unresponsive peers and retrying"
                     );
                     excluded.extend(attempted);
@@ -1031,6 +1059,9 @@ impl KfpNode {
                 Err(e) => return Err(e.error),
             }
         }
+        Err(FrostNetError::Timeout(
+            "Signing request timed out after failover".into(),
+        ))
     }
 
     async fn signing_round(
@@ -1038,6 +1069,8 @@ impl KfpNode {
         message: Vec<u8>,
         message_type: &str,
         exclude: &[u16],
+        logical_id: [u8; 32],
+        attempt: usize,
     ) -> std::result::Result<[u8; 64], SigningRoundError> {
         let threshold = self.share.metadata.threshold;
 
@@ -1050,8 +1083,10 @@ impl KfpNode {
         let session_id = derive_session_id(&message, &participants, threshold);
 
         info!(
+            logical_id = %hex::encode(logical_id),
             session_id = %hex::encode(session_id),
             participants = ?participants,
+            attempt = attempt,
             "Initiating signing request"
         );
 
@@ -1213,9 +1248,7 @@ impl KfpNode {
             }
         }
 
-        let timeout = Duration::from_secs(15);
-
-        let result = tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(SIGNING_ROUND_TIMEOUT, async {
             loop {
                 match rx.recv().await {
                     Ok(KfpNodeEvent::SignatureComplete {
@@ -1253,10 +1286,21 @@ impl KfpNode {
                 Err(e.into())
             }
             Err(_) => {
+                // Exclude only peers that never committed; responsive peers stay
+                // eligible for the failover retry so we don't drain the eligible
+                // set or waste healthy peers' single-use nonces. If the session is
+                // already gone, fall back to excluding the whole attempted set.
+                let unresponsive = {
+                    let sessions = self.sessions.read();
+                    sessions
+                        .get_session(&session_id)
+                        .map(|s| s.uncommitted_participants(self.share.metadata.identifier))
+                        .unwrap_or_else(|| attempted.clone())
+                };
                 self.sessions.write().complete_session(&session_id);
                 Err(SigningRoundError {
                     error: FrostNetError::Timeout("Signing request timed out".into()),
-                    attempted,
+                    attempted: unresponsive,
                 })
             }
         }

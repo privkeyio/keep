@@ -116,6 +116,9 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             our_share_index,
+            // Two missed 20s announce cycles before a peer is considered
+            // offline, so peers don't flap offline on a single missed announce
+            // mid-failover yet stale peers leave the eligible set promptly.
             offline_threshold: Duration::from_secs(40),
         }
     }
