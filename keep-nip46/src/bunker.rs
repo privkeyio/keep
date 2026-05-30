@@ -198,11 +198,11 @@ mod tests {
         let keys = Keys::generate();
         let url = generate_bunker_url(
             &keys.public_key(),
-            &["wss://nos.lol".to_string()],
+            &["wss://bucket.coracle.social".to_string()],
             Some("abcdef0123456789"),
         );
         // Clients that do a literal `relay=wss://` check must find it.
-        assert!(url.contains("relay=wss://nos.lol"));
+        assert!(url.contains("relay=wss://bucket.coracle.social"));
         assert!(!url.contains("relay=wss%3A"));
     }
 

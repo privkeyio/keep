@@ -39,7 +39,7 @@ pub(crate) struct Nip46Request {
 pub(crate) struct Nip46Response {
     pub id: String,
     // Omit when absent so a success is `{"result":"ack"}` and an error is
-    // `{"error":".."}` — never both. Clients that test for the presence of the
+    // `{"error":".."}`, never both. Clients that test for the presence of the
     // `error` key (not just a non-null value) otherwise read a null `error` on
     // a successful response as a rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -189,7 +189,7 @@ mod tests {
 vault_path = "~/.keep"
 argon2_profile = "high"
 log_level = "debug"
-relays = ["wss://relay.damus.io", "wss://nos.lol"]
+relays = ["wss://relay.damus.io", "wss://bucket.coracle.social"]
 timeout = 60
 "#;
         let config = Config::parse(content).unwrap();

@@ -13,7 +13,7 @@ services:
       - path: keep.env
         required: false
     restart: unless-stopped
-    command: ["serve", "--relay", "wss://nos.lol"]
+    command: ["serve", "--relay", "wss://bucket.coracle.social"]
 
 volumes:
   keep-data:

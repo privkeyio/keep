@@ -6,7 +6,7 @@ Builds `keep-enclave.eif` (enclave image) and `pcrs.json` (hashes for KMS policy
 
 ```bash
 docker build -f keep-enclave/build/Dockerfile.local -t keep-enclave:local .
-docker run --rm keep-enclave:local  # Will fail on vsock—expected
+docker run --rm keep-enclave:local  # Will fail on vsock, expected
 ```
 
 ## Enclaver (Recommended)

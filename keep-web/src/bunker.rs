@@ -342,7 +342,7 @@ pub fn spawn_network_frost(
 }
 
 /// Spawns the single-key fallback bunker (no FROST group configured). The vault
-/// signs with its primary key directly — convenient, but the full key lives on
+/// signs with its primary key directly, convenient, but the full key lives on
 /// this one box, so it does not provide threshold security.
 pub fn spawn_single_key(
     keyring: Arc<Mutex<Keyring>>,

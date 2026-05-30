@@ -1377,7 +1377,7 @@ fn decode_psbt_outputs(psbt_bytes: &[u8], network_str: &str) -> Vec<(String, u64
 ///
 /// Signers are combined in a deterministic order (sorted by SignerId)
 /// because `Psbt::combine` is order-sensitive for fields that aren't pure
-/// set-union — sorting ensures the aggregated bytes are reproducible across
+/// set-union, sorting ensures the aggregated bytes are reproducible across
 /// peers.
 fn aggregate_partial_psbts(
     proposal_psbt: &[u8],

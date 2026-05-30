@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The signer identity is a `SignerId` (either a FROST share index or an
-//! external xpub fingerprint) — either kind can participate in a recovery
+//! external xpub fingerprint), either kind can participate in a recovery
 //! scriptpath spend, since the recovery key holders may not be in the FROST
 //! group.
 

@@ -71,7 +71,7 @@ Keys are stored encrypted at `~/.keep`.
 Sign from any NIP-46 compatible client without exposing your private key:
 
 ```bash
-keep serve --relay wss://nos.lol
+keep serve --relay wss://bucket.coracle.social
 ```
 
 This displays a bunker URL to paste into your client.
@@ -135,7 +135,7 @@ Coordinate signing across devices over nostr relays:
 
 ```bash
 # Device 2: Start signer node
-keep frost network serve --group npub1... --relay wss://nos.lol
+keep frost network serve --group npub1... --relay wss://bucket.coracle.social
 
 # Device 1: Check online peers
 keep frost network peers --group npub1...
@@ -186,7 +186,7 @@ keep frost hardware import --device /dev/ttyACM0 --group npub1... --share 1
 keep frost hardware export --device /dev/ttyACM0 --group npub1... --output backup.json
 
 # Network sign using hardware
-keep frost network sign --group npub1... --message <hex> --relay wss://nos.lol --hardware /dev/ttyACM0
+keep frost network sign --group npub1... --message <hex> --relay wss://bucket.coracle.social --hardware /dev/ttyACM0
 ```
 
 ### Distributed Key Generation (DKG)
@@ -202,7 +202,7 @@ Generate threshold keys without any single party knowing the full private key. E
 | Compromise risk | Single point of failure | Requires threshold breach |
 | Use case | Testing/development | Production |
 
-The trusted dealer approach (`keep frost generate`) generates the full private key on a single machine. If that machine is compromised during generation, all funds are at risk. Distributed DKG ensures the complete key is never computed—each participant generates their share from independent entropy, so no single device ever holds enough information to reconstruct the key.
+The trusted dealer approach (`keep frost generate`) generates the full private key on a single machine. If that machine is compromised during generation, all funds are at risk. Distributed DKG ensures the complete key is never computed, each participant generates their share from independent entropy, so no single device ever holds enough information to reconstruct the key.
 
 ```bash
 # Participant 1 (on first device)
@@ -211,7 +211,7 @@ keep frost network dkg \
   --threshold 2 \
   --participants 3 \
   --index 1 \
-  --relay wss://nos.lol \
+  --relay wss://bucket.coracle.social \
   --hardware /dev/ttyACM0
 
 # Participant 2 (on second device, run simultaneously)
@@ -220,7 +220,7 @@ keep frost network dkg \
   --threshold 2 \
   --participants 3 \
   --index 2 \
-  --relay wss://nos.lol \
+  --relay wss://bucket.coracle.social \
   --hardware /dev/ttyACM0
 
 # Participant 3 (on third device, run simultaneously)
@@ -229,7 +229,7 @@ keep frost network dkg \
   --threshold 2 \
   --participants 3 \
   --index 3 \
-  --relay wss://nos.lol \
+  --relay wss://bucket.coracle.social \
   --hardware /dev/ttyACM0
 ```
 
@@ -339,7 +339,7 @@ Add to your MCP configuration:
 
 ## AWS Nitro Enclaves
 
-Hardware-isolated signing—keys never leave enclave memory.
+Hardware-isolated signing, keys never leave enclave memory.
 
 ```bash
 # Check enclave status
@@ -374,7 +374,7 @@ See [ENCLAVE.md](ENCLAVE.md) for deployment.
 
 ## Hidden Volumes
 
-Plausibly deniable storage—hidden volume is cryptographically undetectable:
+Plausibly deniable storage, hidden volume is cryptographically undetectable:
 
 ```bash
 # Create vault with hidden volume

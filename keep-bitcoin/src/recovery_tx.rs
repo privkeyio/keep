@@ -294,7 +294,7 @@ impl RecoveryTxBuilder {
         let control_block = self.control_block(tier)?;
         // Defensive check: a CHECKSIGADD witness needs one push per key, so a
         // tier with zero keys cannot be finalized. Fail closed rather than
-        // panic — a malformed RecoveryConfig must not crash the node.
+        // panic, a malformed RecoveryConfig must not crash the node.
         if tier.keys.is_empty() {
             return Err(BitcoinError::Recovery(format!(
                 "tier {tier_index} has no keys; cannot build CHECKSIGADD witness"
@@ -482,7 +482,7 @@ pub fn merge_tap_script_sig(
 /// 2. The PSBT input carries exactly one `tap_scripts` entry. Multiple
 ///    candidate scripts make the leaf-hash ambiguous and are rejected.
 /// 3. The `(control_block, script, leaf_version)` triple committed to the
-///    `witness_utxo`'s taproot output key — i.e. the leaf is provably part
+///    `witness_utxo`'s taproot output key, i.e. the leaf is provably part
 ///    of the taproot tree being spent.
 /// 4. The leaf script contains `local_xonly` as a 32-byte push. This binds
 ///    the responder's signing key to a key actually present in the leaf;
