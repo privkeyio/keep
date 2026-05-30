@@ -396,11 +396,8 @@ impl Storage {
                 key_package_bytes.to_vec(),
                 stored.pubkey_package.clone(),
             );
-            let new_stored = StoredShare::encrypt_with_ciphersuite(
-                &package,
-                stored.ciphersuite,
-                new_data_key,
-            )?;
+            let new_stored =
+                StoredShare::encrypt_with_ciphersuite(&package, stored.ciphersuite, new_data_key)?;
             let serialized = serialize_stored_share(&new_stored)?;
             let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
             let id = share_id(&stored.metadata.group_pubkey, stored.metadata.identifier);
