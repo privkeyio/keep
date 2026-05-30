@@ -17,7 +17,7 @@ use crate::bunker::generate_bunker_url;
 use crate::error::Result;
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::handler::SignerHandler;
-use crate::permissions::{Permission, PermissionManager};
+use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
@@ -34,6 +34,28 @@ pub struct ServerConfig {
     /// (keep-web) sets this to `Permission::ALL` so approving a connection lets
     /// the client sign.
     pub connect_grant: Permission,
+    /// Pre-grants that the PermissionManager is populated with at startup.
+    /// Lets a headless bunker accept signing requests from CLI-managed apps
+    /// (`keep nip46 grant <pubkey> ...`) without an interactive approval prompt.
+    pub pre_grants: Vec<PreGrantedApp>,
+    /// Global event kinds that skip the approval prompt for every client,
+    /// independent of any per-app `auto_approve_kinds`. Set via
+    /// `keep nip46 auto-approve`. Only meaningful for interactive serving;
+    /// in headless mode every request is auto-approved regardless.
+    pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
+}
+
+/// A NIP-46 client app whose permissions are loaded into the
+/// `PermissionManager` when a `Server` starts. Constructed from the persisted
+/// `keep_core::relay::StoredBunkerPermission` in the CLI/web entry points.
+#[derive(Debug, Clone)]
+pub struct PreGrantedApp {
+    pub pubkey: PublicKey,
+    pub name: String,
+    pub permissions: Permission,
+    pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
+    pub duration: PermissionDuration,
+    pub connected_at: Timestamp,
 }
 
 impl Default for ServerConfig {
@@ -46,6 +68,8 @@ impl Default for ServerConfig {
             expected_secret: None,
             kill_switch: None,
             connect_grant: Permission::DEFAULT,
+            pre_grants: Vec::new(),
+            auto_approve_kinds: std::collections::HashSet::from([nostr_sdk::Kind::Reaction]),
         }
     }
 }
@@ -84,6 +108,39 @@ fn require_relay_urls(relay_urls: &[String]) -> Result<()> {
         return Err(NetworkError::relay("at least one relay required".to_string()).into());
     }
     Ok(())
+}
+
+async fn apply_pre_grants(
+    permissions: &Arc<Mutex<PermissionManager>>,
+    pre_grants: &[PreGrantedApp],
+) {
+    if pre_grants.is_empty() {
+        return;
+    }
+    let mut pm = permissions.lock().await;
+    for app in pre_grants {
+        // Mirror SignerHandler::restore_client: Session grants die at restart,
+        // expired Seconds grants are dropped, and capacity is enforced so a
+        // large stored config cannot defeat MAX_CONNECTED_APPS.
+        match app.duration {
+            PermissionDuration::Session => continue,
+            PermissionDuration::Seconds(_) if app.duration.is_expired(app.connected_at) => continue,
+            _ => {}
+        }
+        if !pm.ensure_capacity(&app.pubkey) {
+            warn!(
+                app_id = &app.pubkey.to_hex()[..8],
+                "apply_pre_grants: capacity full, skipping"
+            );
+            continue;
+        }
+        let mut perm = AppPermission::new(app.pubkey, app.name.clone());
+        perm.permissions = app.permissions & Permission::ALL;
+        perm.auto_approve_kinds = app.auto_approve_kinds.clone();
+        perm.duration = app.duration;
+        perm.connected_at = app.connected_at;
+        pm.insert(perm);
+    }
 }
 
 fn finalize_handler(
@@ -239,6 +296,11 @@ impl Server {
         add_relays(&client, relay_urls).await?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        apply_pre_grants(&permissions, &config.pre_grants).await;
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(config.auto_approve_kinds.clone());
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_auto_approve(config.auto_approve)
@@ -337,6 +399,11 @@ impl Server {
 
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        apply_pre_grants(&permissions, &config.pre_grants).await;
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(config.auto_approve_kinds.clone());
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)

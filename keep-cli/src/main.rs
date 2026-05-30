@@ -139,6 +139,7 @@ fn run(out: &Output) -> Result<()> {
         Commands::Frost { command } => dispatch_frost(out, &path, &cfg, command),
         Commands::Bitcoin { command } => dispatch_bitcoin(out, &path, command),
         Commands::Enclave { command } => dispatch_enclave(out, &path, command),
+        Commands::Nip46 { command } => dispatch_nip46(out, &path, command),
         Commands::Agent { command } => dispatch_agent(out, &path, command, hidden),
         Commands::Config { command } => dispatch_config(out, &cfg, command),
         Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
@@ -185,6 +186,31 @@ fn dispatch_agent(
 ) -> Result<()> {
     match command {
         AgentCommands::Mcp { key } => commands::agent::cmd_agent_mcp(out, path, &key, hidden),
+    }
+}
+
+fn dispatch_nip46(out: &Output, path: &std::path::Path, command: Nip46Commands) -> Result<()> {
+    match command {
+        Nip46Commands::Apps => commands::nip46::cmd_nip46_apps(out, path),
+        Nip46Commands::Grant {
+            pubkey,
+            name,
+            permissions,
+            auto_approve_kinds,
+            duration,
+        } => commands::nip46::cmd_nip46_grant(
+            out,
+            path,
+            &pubkey,
+            &name,
+            &permissions,
+            &auto_approve_kinds,
+            &duration,
+        ),
+        Nip46Commands::Revoke { pubkey } => commands::nip46::cmd_nip46_revoke(out, path, &pubkey),
+        Nip46Commands::AutoApprove { kinds } => {
+            commands::nip46::cmd_nip46_auto_approve(out, path, &kinds)
+        }
     }
 }
 

@@ -188,3 +188,37 @@ fn test_vault_preserves_data_after_reopen() {
         assert_eq!(keep.list_keys().unwrap()[0].pubkey, pubkey);
     }
 }
+
+#[test]
+fn test_global_auto_approve_kinds_round_trip() {
+    use keep_core::relay::{RelayConfig, GLOBAL_RELAY_KEY};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test-keep");
+    let keep = create_test_keep(&path);
+
+    let mut cfg = RelayConfig::new_global();
+    // Unsorted with a duplicate; storage normalizes (sort + dedup).
+    cfg.auto_approve_kinds = vec![7, 1, 7];
+    keep.store_relay_config(&cfg).unwrap();
+
+    let loaded = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY).unwrap();
+    assert_eq!(loaded.auto_approve_kinds, vec![1, 7]);
+}
+
+#[test]
+fn test_global_auto_approve_kinds_cap_enforced() {
+    use keep_core::relay::{RelayConfig, GLOBAL_RELAY_KEY};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test-keep");
+    let keep = create_test_keep(&path);
+
+    let mut cfg = RelayConfig::new_global();
+    cfg.auto_approve_kinds = (0u16..65).collect();
+    assert!(keep.store_relay_config(&cfg).is_err());
+
+    // Nothing persisted on rejection.
+    let loaded = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY).unwrap();
+    assert!(loaded.auto_approve_kinds.is_empty());
+}

@@ -194,13 +194,32 @@ pub fn cmd_serve(
     out.field("Signing mode", &signing_mode);
     out.field("Signing identity", &signing_identity);
 
+    // Load any NIP-46 client app grants persisted via `keep nip46 grant`.
+    // These are loaded into the PermissionManager at startup so headless
+    // bunkers don't need to rely on an interactive approval prompt. Only the
+    // headless path wires them into the ServerConfig; the interactive TUI path
+    // relies on per-request approval, so the banner is scoped to headless mode
+    // to avoid misleading the operator.
+    let pre_grants = load_pre_grants(&keep)?;
+    let global_auto_approve = load_global_auto_approve(&keep)?;
+
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
+        if !pre_grants.is_empty() {
+            out.field(
+                "Pre-granted apps",
+                &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
+            );
+        }
+        // In headless mode `auto_approve` is globally true, so a pre-grant's
+        // `auto_approve_kinds` has no additional effect: every signing request
+        // from a granted app is auto-approved regardless of kind.
         let headless_config = ServerConfig {
             auto_approve: true,
+            pre_grants,
             ..Default::default()
         };
         rt.block_on(async {
@@ -279,13 +298,22 @@ pub fn cmd_serve(
                 tx: tui_tx_clone.clone(),
             }));
 
+            // Carry the persisted global auto-approve kinds so the interactive
+            // approval prompt skips them, matching `keep nip46 auto-approve`.
+            // An unset (empty) list leaves the server's default in place.
+            let mut tui_config = ServerConfig::default();
+            if !global_auto_approve.is_empty() {
+                tui_config.auto_approve_kinds = global_auto_approve;
+            }
             let mut server =
                 if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
-                    match Server::new_frost(
-                        frost,
-                        transport_key,
+                    match Server::new_with_config(
+                        Arc::new(Mutex::new(Keyring::new())),
+                        Some(frost),
+                        Some(transport_key),
                         std::slice::from_ref(&relay_clone),
                         callbacks,
+                        tui_config,
                     )
                     .await
                     {
@@ -299,10 +327,13 @@ pub fn cmd_serve(
                         }
                     }
                 } else {
-                    match Server::new(
+                    match Server::new_with_config(
                         keyring_for_tui,
+                        None,
+                        None,
                         std::slice::from_ref(&relay_clone),
                         callbacks,
+                        tui_config,
                     )
                     .await
                     {
@@ -488,4 +519,81 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
     spawn_tui_server(keyring, relay, bunker_url, npub)
+}
+
+/// Read persisted NIP-46 client app grants from the global RelayConfig and
+/// translate them into the `PreGrantedApp` shape `keep-nip46::ServerConfig`
+/// expects. Grants are populated into the `PermissionManager` at startup so
+/// headless bunkers (where there is no interactive approval prompt) can
+/// accept signing requests from previously authorized clients.
+fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
+    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
+    let mut out = Vec::with_capacity(cfg.bunker_permissions.len());
+    for bp in &cfg.bunker_permissions {
+        let pk_bytes = match hex::decode(&bp.pubkey_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                tracing::warn!(
+                    pubkey_hex = %bp.pubkey_hex,
+                    "skipping malformed bunker_permission pubkey on load"
+                );
+                continue;
+            }
+        };
+        let pubkey = match nostr_sdk::PublicKey::from_slice(&pk_bytes) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!(
+                    pubkey_hex = %bp.pubkey_hex,
+                    error = %e,
+                    "skipping bunker_permission with invalid pubkey on load"
+                );
+                continue;
+            }
+        };
+        // Mirror keep-desktop's restore_bunker_permissions: Session grants are
+        // not meant to survive a restart, and already-expired Seconds grants
+        // must not be reactivated. Forever grants always load.
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let duration = match &bp.duration {
+            keep_core::relay::StoredPermissionDuration::Session => continue,
+            keep_core::relay::StoredPermissionDuration::Seconds(secs) => {
+                if now > bp.connected_at.saturating_add(*secs) {
+                    continue;
+                }
+                keep_nip46::PermissionDuration::Seconds(*secs)
+            }
+            keep_core::relay::StoredPermissionDuration::Forever => {
+                keep_nip46::PermissionDuration::Forever
+            }
+        };
+        let permissions = keep_nip46::Permission::from_bits_truncate(bp.permissions);
+        let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = bp
+            .auto_approve_kinds
+            .iter()
+            .copied()
+            .map(nostr_sdk::Kind::from)
+            .collect();
+        out.push(keep_nip46::PreGrantedApp {
+            pubkey,
+            name: bp.name.clone(),
+            permissions,
+            auto_approve_kinds,
+            duration,
+            connected_at: nostr_sdk::Timestamp::from(bp.connected_at),
+        });
+    }
+    Ok(out)
+}
+
+/// Read the persisted global auto-approve kinds (`keep nip46 auto-approve`).
+/// An empty stored list leaves the server's default in place.
+fn load_global_auto_approve(keep: &Keep) -> Result<std::collections::HashSet<nostr_sdk::Kind>> {
+    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
+    Ok(cfg
+        .auto_approve_kinds
+        .iter()
+        .copied()
+        .map(nostr_sdk::Kind::from)
+        .collect())
 }

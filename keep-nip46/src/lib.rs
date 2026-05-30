@@ -33,5 +33,5 @@ pub use handler::SignerHandler;
 pub use local_server::{LocalServer, LocalServerConfig};
 pub use permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 pub use rate_limit::{RateLimitConfig, RateLimiter};
-pub use server::{Server, ServerConfig};
+pub use server::{PreGrantedApp, Server, ServerConfig};
 pub use types::{ApprovalRequest, LogEvent, ServerCallbacks};

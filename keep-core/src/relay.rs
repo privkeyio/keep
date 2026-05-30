@@ -74,6 +74,11 @@ pub struct RelayConfig {
     /// Persisted bunker client permission grants.
     #[serde(default)]
     pub bunker_permissions: Vec<StoredBunkerPermission>,
+    /// Global event kinds auto-approved for every NIP-46 signing request,
+    /// independent of any per-app `auto_approve_kinds`. Set via
+    /// `keep nip46 auto-approve`.
+    #[serde(default)]
+    pub auto_approve_kinds: Vec<u16>,
 }
 
 impl RelayConfig {
@@ -86,6 +91,7 @@ impl RelayConfig {
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
             bunker_permissions: Vec::new(),
+            auto_approve_kinds: Vec::new(),
         }
     }
 
@@ -103,6 +109,7 @@ impl RelayConfig {
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
             bunker_permissions: Vec::new(),
+            auto_approve_kinds: Vec::new(),
         }
     }
 }
