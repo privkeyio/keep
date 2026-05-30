@@ -61,6 +61,8 @@ Minimum Supported Rust Version: **1.89**.
 
 Pure Rust with `#![forbid(unsafe_code)]`. Keys are derived with Argon2id, encrypted with XChaCha20-Poly1305, protected in RAM with Ascon-128a, and locked with mlock(2). FROST uses BIP-340 Schnorr signatures. See [`docs/SECURITY.md`](docs/SECURITY.md) for details.
 
+Keep can threshold-sign software releases with a FROST-Ed25519 group (minisign-compatible), so no single maintainer holds the signing key. See [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
+
 ## License
 
 [MIT](LICENSE)
