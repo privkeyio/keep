@@ -118,9 +118,7 @@ fn enumerate_and_list(out: &Output) -> Result<()> {
                                 }
                             }
                         }
-                        Err(e) => out.info(&format!(
-                            "  Could not list shares on {candidate}: {e}"
-                        )),
+                        Err(e) => out.info(&format!("  Could not list shares on {candidate}: {e}")),
                     }
                 }
                 Err(e) => out.info(&format!("  Not a keep hardware signer: {e}")),
