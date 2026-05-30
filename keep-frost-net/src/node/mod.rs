@@ -54,6 +54,30 @@ impl std::fmt::Display for DescriptorLookupUnavailable {
 
 impl std::error::Error for DescriptorLookupUnavailable {}
 
+/// Outcome of resolving the successor (NEW) descriptor for a session keyed on
+/// an OLD descriptor hash. Used by responders to decide whether an automated
+/// migration sweep destination must be re-derived and validated (#414).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorLookup {
+    /// The session descriptor is the current tip: no descriptor back-points to
+    /// it, so there is nothing to validate and signing may proceed.
+    Tip,
+    /// Exactly one successor descriptor was resolved. Carries its external
+    /// (receive) descriptor and canonical network string so the destination can
+    /// be re-derived against the *successor's own* network.
+    Found {
+        external_descriptor: String,
+        network: String,
+    },
+    /// The descriptor store could not be read (vault locked or poisoned).
+    /// Callers must fail closed rather than skip the destination check.
+    Unavailable,
+    /// More than one descriptor back-points to the session hash. The lineage is
+    /// ambiguous and a destination cannot be derived deterministically; callers
+    /// must fail closed.
+    Ambiguous,
+}
+
 /// Fallback lookup for finalized wallet descriptors that have been persisted
 /// outside of the in-memory `DescriptorSessionManager` (e.g. stored by the
 /// host application). Used when a PSBT coordination message arrives for a
@@ -98,8 +122,8 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         group: &[u8; 32],
     ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable>;
 
-    /// Return the external (receive) descriptor of any persisted descriptor for
-    /// `group` whose `previous_descriptor_hash` equals `hash`, if one exists.
+    /// Resolve the successor (NEW) descriptor for `group` whose
+    /// `previous_descriptor_hash` equals `hash`.
     ///
     /// Used by responders to validate that a PSBT signature request keyed on an
     /// OLD descriptor (i.e. an automated migration sweep) actually pays a
@@ -107,9 +131,14 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     /// proposer can drive any destination through `request_psbt_spend` (see
     /// #414) because the proposer-side re-derivation in
     /// `request_descriptor_migration_sweep` is not a security boundary.
-    fn successor_external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+    ///
+    /// Implementations must fail closed: return [`SuccessorLookup::Unavailable`]
+    /// when the store cannot be read and [`SuccessorLookup::Ambiguous`] when
+    /// more than one descriptor back-points to `hash`. The default impl reports
+    /// `Unavailable` so an unconfigured lookup never silently skips the check.
+    fn successor_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> SuccessorLookup {
         let _ = (group, hash);
-        None
+        SuccessorLookup::Unavailable
     }
 }
 
@@ -190,12 +219,67 @@ where
             .max())
     }
 
-    fn successor_external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
-        let descriptors = (self.fetch)()?;
-        descriptors
+    fn successor_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> SuccessorLookup {
+        let Some(descriptors) = (self.fetch)() else {
+            tracing::warn!(
+                group = %hex::encode(group),
+                descriptor_hash = %hex::encode(hash),
+                "KeepDescriptorLookup could not read persisted descriptors for successor_for (vault locked or unavailable); failing closed",
+            );
+            return SuccessorLookup::Unavailable;
+        };
+        // Resolve the session descriptor's own version from the same snapshot so
+        // the read is a single lock-scope (no TOCTOU vs. the caller's separate
+        // OLD-descriptor fetch) and so an n+1 successor can be selected
+        // deterministically.
+        let session_version = descriptors
             .iter()
-            .find(|d| &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash))
-            .map(|d| d.external_descriptor.clone())
+            .find(|d| &d.group_pubkey == group && &d.canonical_hash() == hash)
+            .map(|d| d.version);
+        let mut successors = descriptors.iter().filter(|d| {
+            &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash)
+        });
+        let Some(first) = successors.next() else {
+            return SuccessorLookup::Tip;
+        };
+        // If multiple descriptors back-point to the same OLD hash, prefer the one
+        // at version session+1; only fail closed when the lineage is genuinely
+        // ambiguous (no single n+1 successor).
+        if successors.next().is_some() {
+            let matches: Vec<&keep_core::wallet::WalletDescriptor> = descriptors
+                .iter()
+                .filter(|d| {
+                    &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash)
+                })
+                .collect();
+            let next_version = session_version.map(|v| v.saturating_add(1));
+            let chosen: Vec<&keep_core::wallet::WalletDescriptor> = match next_version {
+                Some(nv) => matches
+                    .iter()
+                    .copied()
+                    .filter(|d| d.version == nv)
+                    .collect(),
+                None => Vec::new(),
+            };
+            if chosen.len() == 1 {
+                let d = chosen[0];
+                return SuccessorLookup::Found {
+                    external_descriptor: d.external_descriptor.clone(),
+                    network: d.network.clone(),
+                };
+            }
+            tracing::warn!(
+                group = %hex::encode(group),
+                descriptor_hash = %hex::encode(hash),
+                successor_count = matches.len(),
+                "multiple descriptors back-point to the session hash with no single version+1 successor; failing closed (ambiguous lineage)",
+            );
+            return SuccessorLookup::Ambiguous;
+        }
+        SuccessorLookup::Found {
+            external_descriptor: first.external_descriptor.clone(),
+            network: first.network.clone(),
+        }
     }
 }
 
@@ -1822,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn successor_external_for_returns_new_descriptor_keyed_on_old_hash() {
+    fn successor_for_returns_new_descriptor_keyed_on_old_hash() {
         // #414: responders need to re-derive the expected sweep destination
         // from the NEW descriptor whose `previous_descriptor_hash` is the
         // session's OLD descriptor hash. Confirm the lookup walks the
@@ -1837,24 +1921,29 @@ mod tests {
         let rows = vec![old.clone(), new.clone()];
         let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
 
-        assert_eq!(
-            lookup.successor_external_for(&group, &old_hash).as_deref(),
-            Some("tr(new_external)"),
-            "session keyed on OLD hash must surface the NEW descriptor as successor",
-        );
+        match lookup.successor_for(&group, &old_hash) {
+            SuccessorLookup::Found {
+                external_descriptor,
+                ..
+            } => assert_eq!(external_descriptor, "tr(new_external)"),
+            other => panic!("expected Found, got {other:?}"),
+        }
         // The NEW descriptor itself is the tip; there is no successor.
         let new_hash = new.canonical_hash();
-        assert_eq!(lookup.successor_external_for(&group, &new_hash), None);
+        assert_eq!(
+            lookup.successor_for(&group, &new_hash),
+            SuccessorLookup::Tip
+        );
         // Wrong group never matches.
         assert_eq!(
-            lookup.successor_external_for(&[8u8; 32], &old_hash),
-            None,
+            lookup.successor_for(&[8u8; 32], &old_hash),
+            SuccessorLookup::Tip,
             "successor lookup must be scoped to the queried group",
         );
     }
 
     #[test]
-    fn successor_external_for_returns_none_without_chain() {
+    fn successor_for_returns_tip_without_chain() {
         // The current-tip descriptor has no successor; responders signing
         // against the tip should NOT be subjected to the migration check.
         let group = [11u8; 32];
@@ -1862,6 +1951,68 @@ mod tests {
         let tip_hash = tip.canonical_hash();
         let rows = vec![tip.clone()];
         let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
-        assert_eq!(lookup.successor_external_for(&group, &tip_hash), None);
+        assert_eq!(
+            lookup.successor_for(&group, &tip_hash),
+            SuccessorLookup::Tip
+        );
+    }
+
+    #[test]
+    fn successor_for_fails_closed_when_store_unavailable() {
+        // A locked/poisoned vault must surface Unavailable so the responder
+        // fails closed instead of silently skipping the destination check.
+        let group = [12u8; 32];
+        let hash = [3u8; 32];
+        let lookup = KeepDescriptorLookup::new(move || None);
+        assert_eq!(
+            lookup.successor_for(&group, &hash),
+            SuccessorLookup::Unavailable
+        );
+    }
+
+    #[test]
+    fn successor_for_picks_version_plus_one_when_multiple_back_point() {
+        // Two descriptors back-point to the same OLD hash. The deterministic
+        // session+1 successor is selected rather than relying on Vec order.
+        let group = [13u8; 32];
+        let old = descriptor_version(group, "tr(old)", 1);
+        let old_hash = old.canonical_hash();
+
+        let mut next = descriptor_version(group, "tr(next)", 2);
+        next.previous_descriptor_hash = Some(old_hash);
+        let mut stray = descriptor_version(group, "tr(stray)", 3);
+        stray.previous_descriptor_hash = Some(old_hash);
+
+        // stray listed first to prove order independence.
+        let rows = vec![old.clone(), stray.clone(), next.clone()];
+        let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
+        match lookup.successor_for(&group, &old_hash) {
+            SuccessorLookup::Found {
+                external_descriptor,
+                ..
+            } => assert_eq!(external_descriptor, "tr(next)"),
+            other => panic!("expected Found(next), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successor_for_ambiguous_when_no_single_version_plus_one() {
+        // Two successors at the same version with no version+1 match is a
+        // genuinely ambiguous lineage; fail closed.
+        let group = [14u8; 32];
+        let old = descriptor_version(group, "tr(old)", 1);
+        let old_hash = old.canonical_hash();
+
+        let mut a = descriptor_version(group, "tr(a)", 5);
+        a.previous_descriptor_hash = Some(old_hash);
+        let mut b = descriptor_version(group, "tr(b)", 6);
+        b.previous_descriptor_hash = Some(old_hash);
+
+        let rows = vec![old.clone(), a.clone(), b.clone()];
+        let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
+        assert_eq!(
+            lookup.successor_for(&group, &old_hash),
+            SuccessorLookup::Ambiguous
+        );
     }
 }

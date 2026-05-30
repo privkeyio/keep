@@ -99,21 +99,73 @@ impl KfpNode {
         Some((initiator, *session.descriptor_hash(), session.tier_index()))
     }
 
-    /// Return the external descriptor of any persisted descriptor that lists
-    /// `descriptor_hash` as its `previous_descriptor_hash` for this node's
-    /// group, or `None` if no such successor exists (i.e. the session's
-    /// descriptor is the current tip and there's no automated-sweep
-    /// re-derivation to perform).
+    /// Responder-side destination guard for automated migration sweeps (#414).
     ///
-    /// Used by responders to validate that a signature request keyed on an
-    /// OLD descriptor actually pays the persisted NEW-descriptor address. Per
-    /// #414, the proposer-side re-derivation in
-    /// `request_descriptor_migration_sweep` is not a security boundary; the
-    /// responder must independently re-derive and refuse to sign on mismatch.
-    pub fn descriptor_successor_external(&self, descriptor_hash: &[u8; 32]) -> Option<String> {
-        self.descriptor_lookup
-            .as_deref()
-            .and_then(|l| l.successor_external_for(&self.group_pubkey, descriptor_hash))
+    /// If the PSBT session is keyed on an OLD descriptor whose successor (NEW
+    /// descriptor) is persisted in this vault, the proposal is an automated
+    /// migration sweep and `tx` must have exactly one output paying the NEW
+    /// descriptor's address. The expected address is re-derived independently
+    /// against the *successor's own* network, because the proposer-side
+    /// re-derivation in `request_descriptor_migration_sweep` is not a security
+    /// boundary. On desktop this is the only destination defense (no human
+    /// confirmation on the sign path).
+    ///
+    /// Fails CLOSED: returns `Err` when a successor should exist but cannot be
+    /// resolved (descriptor store unavailable, ambiguous lineage, or
+    /// re-derivation failure). Returns `Ok(())` only when the session descriptor
+    /// is the current tip (no successor) or when the single output matches the
+    /// re-derived successor address. Mirrors the proposer-side precondition that
+    /// the NEW descriptor be persisted before any spend keyed on an OLD hash is
+    /// signable.
+    pub fn validate_migration_sweep_destination(
+        &self,
+        session_descriptor_hash: &[u8; 32],
+        tx: &bitcoin::Transaction,
+    ) -> std::result::Result<(), String> {
+        let lookup = self.descriptor_lookup.as_deref().ok_or_else(|| {
+            "REFUSED: no descriptor lookup configured; cannot confirm migration sweep destination"
+                .to_string()
+        })?;
+        let (external_descriptor, network_str) = match lookup
+            .successor_for(&self.group_pubkey, session_descriptor_hash)
+        {
+            super::SuccessorLookup::Tip => return Ok(()),
+            super::SuccessorLookup::Found {
+                external_descriptor,
+                network,
+            } => (external_descriptor, network),
+            super::SuccessorLookup::Unavailable => {
+                return Err("REFUSED: descriptor store unavailable; cannot re-derive the migration sweep destination. Unlock the vault and retry.".to_string());
+            }
+            super::SuccessorLookup::Ambiguous => {
+                return Err("REFUSED: ambiguous descriptor lineage; multiple successors back-point to the session descriptor and no single version+1 successor resolves. Refusing to sign.".to_string());
+            }
+        };
+        // Re-derive against the successor's OWN network, not the OLD
+        // descriptor's, so a (mis)matched network can never silently produce the
+        // wrong expected script.
+        let network = bitcoin::Network::from_str(&network_str).map_err(|e| {
+            format!("REFUSED: successor descriptor has invalid network {network_str}: {e}")
+        })?;
+        let expected_addr = keep_bitcoin::descriptor_address(&external_descriptor, network)
+            .map_err(|e| {
+                format!(
+                    "REFUSED: could not derive expected sweep destination from persisted successor descriptor: {e}"
+                )
+            })?;
+        let expected_script = expected_addr.script_pubkey();
+        if tx.output.len() != 1 {
+            return Err(format!(
+                "REFUSED: session is keyed on an OLD descriptor whose successor (NEW descriptor) is persisted, so this is treated as an automated migration sweep; expected exactly 1 output paying the NEW descriptor address, got {} outputs. Refusing to sign.",
+                tx.output.len()
+            ));
+        }
+        if tx.output[0].script_pubkey != expected_script {
+            return Err(format!(
+                "REFUSED: PSBT output does not pay the persisted NEW descriptor address. Expected {expected_addr}; proposer-supplied script differs. This would route funds away from the group-controlled address; refusing to sign."
+            ));
+        }
+        Ok(())
     }
 
     /// Return the lowercase xpub fingerprints listed as expected external
