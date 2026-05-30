@@ -915,6 +915,38 @@ impl KeepMobile {
         Ok(())
     }
 
+    // Load-modify-store without locking; acceptable in single-user mobile context
+    pub fn rename_share(&self, group_pubkey: String, name: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Share name must not be empty".into(),
+            });
+        }
+        Self::validate_share_name(name)?;
+
+        let data = self.storage.load_share_by_key(group_pubkey.clone())?;
+        let mut stored: StoredShareData = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        let mut metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json)
+                .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        metadata.name = name.to_string();
+
+        stored.metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        let serialized = serde_json::to_vec(&stored)
+            .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+
+        self.storage
+            .store_share_by_key(group_pubkey, serialized, (&metadata).into())?;
+        Ok(())
+    }
+
     // Caller is responsible for re-authentication before calling this method
     pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<String>, KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
@@ -3149,8 +3181,22 @@ impl KeepMobile {
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        let metadata: keep_core::frost::ShareMetadata = serde_json::from_str(&stored.metadata_json)
-            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+        let mut metadata: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json)
+                .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        if let Some(display_name) = self
+            .storage
+            .get_share_metadata()
+            .filter(|m| {
+                m.group_pubkey == metadata.group_pubkey && m.identifier == metadata.identifier
+            })
+            .map(|m| m.name)
+        {
+            if display_name != metadata.name {
+                metadata.name = display_name;
+            }
+        }
 
         let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(
             &stored.key_package_bytes,
