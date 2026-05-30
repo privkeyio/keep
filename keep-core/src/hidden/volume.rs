@@ -184,8 +184,27 @@ impl HiddenStorage {
             };
 
         fs::create_dir_all(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
         let vault_path = path.join("keep.vault");
-        let mut file = File::create(&vault_path)?;
+        let mut file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&vault_path)?
+            }
+            #[cfg(not(unix))]
+            {
+                File::create(&vault_path)?
+            }
+        };
 
         file.write_all(&outer_header.to_bytes())?;
 
@@ -203,6 +222,11 @@ impl HiddenStorage {
 
         let db_path = path.join("keep.db");
         let db = Database::create(&db_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600));
+        }
 
         let wtxn = db.begin_write()?;
         let _ = wtxn.open_table(KEYS_TABLE)?;

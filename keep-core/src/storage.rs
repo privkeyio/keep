@@ -223,11 +223,43 @@ fn create_storage_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a vault data file with 0o600 perms on Unix. Defense-in-depth: even
+/// if the containing 0o700 directory is ever loosened (umask, restore-from-tar,
+/// rsync to a less-strict filesystem), the file itself stays owner-readable.
+fn write_vault_file_secure(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, data)?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    fs::write(path, data)?;
+    Ok(())
+}
+
+/// Apply 0o600 perms to an existing file (best-effort). Used to bring
+/// pre-existing redb-created files in line with the rest of the vault.
+#[cfg(unix)]
+fn chmod_secure(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
 impl Storage {
     /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
         create_storage_dir(path)?;
-        let backend = RedbBackend::create(&path.join("keep.db"))?;
+        let db_path = path.join("keep.db");
+        let backend = RedbBackend::create(&db_path)?;
+        #[cfg(unix)]
+        let _ = chmod_secure(&db_path);
         Self::create_inner(path, password, params, Box::new(backend))
     }
 
@@ -262,7 +294,7 @@ impl Storage {
             .encrypted_data_key
             .copy_from_slice(&encrypted.ciphertext);
 
-        fs::write(path.join("keep.hdr"), header.to_bytes())?;
+        write_vault_file_secure(&path.join("keep.hdr"), &header.to_bytes())?;
 
         backend.create_table(KEYS_TABLE)?;
         backend.create_table(SHARES_TABLE)?;

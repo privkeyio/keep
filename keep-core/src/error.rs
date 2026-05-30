@@ -478,7 +478,7 @@ impl NetworkError {
 pub enum KeepError {
     #[error("Invalid password")]
     InvalidPassword,
-    #[error("Rate limited: try again in {0} seconds")]
+    #[error("Rate limited after repeated unlock failures; try again in {0}s. Exponential backoff is active (1s, 2s, 4s, ..., capped at 300s).")]
     RateLimited(u64),
     #[error("Decryption failed - wrong password or corrupted data")]
     DecryptionFailed,
