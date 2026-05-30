@@ -486,6 +486,7 @@ pub mod nip44 {
     use chacha20::cipher::StreamCipher;
     use chacha20::{KeyIvInit, XChaCha20};
     use hkdf::Hkdf;
+    use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -580,7 +581,7 @@ pub mod nip44 {
         );
         cipher.apply_keystream(&mut ciphertext);
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(hmac_key.as_ref())
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(hmac_key.as_ref())
             .map_err(|_| CryptoError::encryption("Failed to create HMAC"))?;
         mac.update(&nonce);
         mac.update(&ciphertext);
@@ -621,7 +622,7 @@ pub mod nip44 {
         let conversation_key = derive_conversation_key(shared_secret)?;
         let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(hmac_key.as_ref())
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(hmac_key.as_ref())
             .map_err(|_| CryptoError::decryption("Failed to create HMAC"))?;
         mac.update(&nonce);
         mac.update(ciphertext);
