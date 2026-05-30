@@ -331,6 +331,11 @@ pub(crate) enum FrostCommands {
         threshold: u16,
         #[arg(short, long, default_value = "3")]
         shares: u16,
+        #[arg(
+            long,
+            help = "Retain the original single-key Nostr key after splitting (default: delete it so threshold security is actually in effect)"
+        )]
+        keep_original: bool,
     },
     List,
     Export {

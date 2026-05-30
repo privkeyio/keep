@@ -197,7 +197,8 @@ fn dispatch_frost(
             key,
             threshold,
             shares,
-        } => commands::frost::cmd_frost_split(out, path, &key, threshold, shares),
+            keep_original,
+        } => commands::frost::cmd_frost_split(out, path, &key, threshold, shares, keep_original),
         FrostCommands::List => commands::frost::cmd_frost_list(out, path),
         FrostCommands::Export {
             share,

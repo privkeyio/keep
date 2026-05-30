@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 
 use keep_core::error::{KeepError, Result};
 use keep_core::keyring::Keyring;
+use keep_core::keys::bytes_to_npub;
 use keep_core::Keep;
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
 use keep_nip46::{FrostSigner, NetworkFrostSigner, Server, ServerConfig};
@@ -147,6 +148,22 @@ pub fn cmd_serve(
     }
 
     let shares = keep.frost_list_shares()?;
+    let distinct_groups: std::collections::BTreeSet<[u8; 32]> =
+        shares.iter().map(|s| s.metadata.group_pubkey).collect();
+
+    if distinct_groups.len() > 1 {
+        let mut listing = String::new();
+        for g in &distinct_groups {
+            listing.push_str("\n  ");
+            listing.push_str(&bytes_to_npub(g));
+        }
+        return Err(KeepError::InvalidInput(format!(
+            "vault holds shares for {} distinct FROST groups; pass --frost-group <npub> to choose one:{}",
+            distinct_groups.len(),
+            listing
+        )));
+    }
+
     let frost_signer = if !shares.is_empty() {
         let first_group = &shares[0].metadata.group_pubkey;
         let group_shares: Vec<_> = shares
@@ -161,7 +178,8 @@ pub fn cmd_serve(
             let group_pubkey = *first_group;
             match FrostSigner::new(group_pubkey, group_shares, data_key) {
                 Ok(signer) => {
-                    out.info(&format!("Using FROST signing ({threshold}-of-{total})"));
+                    out.field("Signing mode", &format!("FROST {threshold}-of-{total}"));
+                    out.field("Signing identity", &bytes_to_npub(&group_pubkey));
                     Some(signer)
                 }
                 Err(_) => None,
@@ -170,6 +188,13 @@ pub fn cmd_serve(
             None
         }
     } else {
+        let primary_npub = keep
+            .keyring()
+            .get_primary()
+            .map(|slot| bytes_to_npub(&slot.pubkey))
+            .unwrap_or_else(|| "(no keys)".to_string());
+        out.field("Signing mode", "Single-key");
+        out.field("Signing identity", &primary_npub);
         None
     };
 

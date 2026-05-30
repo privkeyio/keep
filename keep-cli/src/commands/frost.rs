@@ -95,10 +95,11 @@ pub fn cmd_frost_split(
     key_name: &str,
     threshold: u16,
     total_shares: u16,
+    keep_original: bool,
 ) -> Result<()> {
     debug!(
         key_name,
-        threshold, total_shares, "splitting key into FROST shares"
+        threshold, total_shares, keep_original, "splitting key into FROST shares"
     );
 
     let mut keep = Keep::open(path)?;
@@ -118,8 +119,14 @@ pub fn cmd_frost_split(
         ));
     }
 
-    let group_pubkey = shares[0].group_pubkey();
-    let npub = bytes_to_npub(group_pubkey);
+    let group_pubkey = *shares[0].group_pubkey();
+    let npub = bytes_to_npub(&group_pubkey);
+
+    if !keep_original {
+        let spinner = out.spinner("Deleting original single-key Nostr key...");
+        keep.delete_key(&group_pubkey)?;
+        spinner.finish();
+    }
 
     out.newline();
     out.success("Split key into FROST shares!");
@@ -135,6 +142,13 @@ pub fn cmd_frost_split(
     }
 
     out.newline();
+    if keep_original {
+        out.warn(
+            "Original single-key Nostr key was RETAINED (--keep-original): threshold security is NOT in effect until you delete it manually.",
+        );
+    } else {
+        out.info("Original single-key Nostr key deleted; threshold security is now in effect.");
+    }
     out.warn("BACKUP: Export shares to different locations for recovery!");
 
     Ok(())
