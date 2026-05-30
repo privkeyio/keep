@@ -97,6 +97,20 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         &self,
         group: &[u8; 32],
     ) -> std::result::Result<Option<u32>, DescriptorLookupUnavailable>;
+
+    /// Return the external (receive) descriptor of any persisted descriptor for
+    /// `group` whose `previous_descriptor_hash` equals `hash`, if one exists.
+    ///
+    /// Used by responders to validate that a PSBT signature request keyed on an
+    /// OLD descriptor (i.e. an automated migration sweep) actually pays a
+    /// NEW-descriptor-controlled address. Without this check, an authorized
+    /// proposer can drive any destination through `request_psbt_spend` (see
+    /// #414) because the proposer-side re-derivation in
+    /// `request_descriptor_migration_sweep` is not a security boundary.
+    fn successor_external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        let _ = (group, hash);
+        None
+    }
 }
 
 /// Shared `PersistedDescriptorLookup` adapter over a `Keep` accessor closure.
@@ -174,6 +188,14 @@ where
             .filter(|d| &d.group_pubkey == group)
             .map(|d| d.version)
             .max())
+    }
+
+    fn successor_external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
+        let descriptors = (self.fetch)()?;
+        descriptors
+            .iter()
+            .find(|d| &d.group_pubkey == group && d.previous_descriptor_hash.as_ref() == Some(hash))
+            .map(|d| d.external_descriptor.clone())
     }
 }
 
@@ -1797,5 +1819,49 @@ mod tests {
         assert_eq!(lookup.latest_version_for(&group), Ok(Some(2)));
         assert!(lookup.find_by_hash(&group, &old_hash));
         assert!(lookup.find_by_hash(&group, &new_hash));
+    }
+
+    #[test]
+    fn successor_external_for_returns_new_descriptor_keyed_on_old_hash() {
+        // #414: responders need to re-derive the expected sweep destination
+        // from the NEW descriptor whose `previous_descriptor_hash` is the
+        // session's OLD descriptor hash. Confirm the lookup walks the
+        // back-pointer chain correctly.
+        let group = [7u8; 32];
+        let old = descriptor_version(group, "tr(old_external)", 1);
+        let old_hash = old.canonical_hash();
+
+        let mut new = descriptor_version(group, "tr(new_external)", 2);
+        new.previous_descriptor_hash = Some(old_hash);
+
+        let rows = vec![old.clone(), new.clone()];
+        let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
+
+        assert_eq!(
+            lookup.successor_external_for(&group, &old_hash).as_deref(),
+            Some("tr(new_external)"),
+            "session keyed on OLD hash must surface the NEW descriptor as successor",
+        );
+        // The NEW descriptor itself is the tip; there is no successor.
+        let new_hash = new.canonical_hash();
+        assert_eq!(lookup.successor_external_for(&group, &new_hash), None);
+        // Wrong group never matches.
+        assert_eq!(
+            lookup.successor_external_for(&[8u8; 32], &old_hash),
+            None,
+            "successor lookup must be scoped to the queried group",
+        );
+    }
+
+    #[test]
+    fn successor_external_for_returns_none_without_chain() {
+        // The current-tip descriptor has no successor; responders signing
+        // against the tip should NOT be subjected to the migration check.
+        let group = [11u8; 32];
+        let tip = descriptor_version(group, "tr(tip)", 1);
+        let tip_hash = tip.canonical_hash();
+        let rows = vec![tip.clone()];
+        let lookup = KeepDescriptorLookup::new(move || Some(rows.clone()));
+        assert_eq!(lookup.successor_external_for(&group, &tip_hash), None);
     }
 }

@@ -99,6 +99,23 @@ impl KfpNode {
         Some((initiator, *session.descriptor_hash(), session.tier_index()))
     }
 
+    /// Return the external descriptor of any persisted descriptor that lists
+    /// `descriptor_hash` as its `previous_descriptor_hash` for this node's
+    /// group, or `None` if no such successor exists (i.e. the session's
+    /// descriptor is the current tip and there's no automated-sweep
+    /// re-derivation to perform).
+    ///
+    /// Used by responders to validate that a signature request keyed on an
+    /// OLD descriptor actually pays the persisted NEW-descriptor address. Per
+    /// #414, the proposer-side re-derivation in
+    /// `request_descriptor_migration_sweep` is not a security boundary; the
+    /// responder must independently re-derive and refuse to sign on mismatch.
+    pub fn descriptor_successor_external(&self, descriptor_hash: &[u8; 32]) -> Option<String> {
+        self.descriptor_lookup
+            .as_deref()
+            .and_then(|l| l.successor_external_for(&self.group_pubkey, descriptor_hash))
+    }
+
     /// Return the lowercase xpub fingerprints listed as expected external
     /// signers for the given PSBT session. Returns `None` if the session is
     /// unknown. Share-based signers are not included.

@@ -1735,6 +1735,34 @@ async fn approve_psbt_session(
     let sighashes = keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
         .map_err(|e| KeepError::InvalidInput(format!("PSBT binding verification failed: {e}")))?;
 
+    // #414 responder-side destination validation: if the session is keyed on
+    // an OLD descriptor whose successor (NEW descriptor) is persisted in this
+    // vault, the proposal must be an automated migration sweep and the PSBT
+    // must have exactly one output that pays the NEW descriptor's address.
+    // Without this check an authorized proposer can hand us a PSBT routing
+    // funds to an attacker because the proposer-side re-derivation in
+    // `request_descriptor_migration_sweep` is not a security boundary.
+    if let Some(successor_external) = node.descriptor_successor_external(&session_descriptor_hash) {
+        let expected_addr = keep_bitcoin::descriptor_address(&successor_external, network)
+            .map_err(|e| {
+                KeepError::Frost(format!(
+                    "could not derive expected sweep destination from persisted successor descriptor: {e}"
+                ))
+            })?;
+        let expected_script = expected_addr.script_pubkey();
+        if psbt.unsigned_tx.output.len() != 1 {
+            return Err(KeepError::Frost(format!(
+                "REFUSED: session is keyed on an OLD descriptor whose successor (NEW descriptor) is persisted, so this is treated as an automated migration sweep; expected exactly 1 output paying the NEW descriptor address, got {} outputs. Refusing to sign.",
+                psbt.unsigned_tx.output.len()
+            )));
+        }
+        if psbt.unsigned_tx.output[0].script_pubkey != expected_script {
+            return Err(KeepError::Frost(format!(
+                "REFUSED: PSBT output does not pay the persisted NEW descriptor address. Expected {expected_addr}; proposer-supplied script differs. This would route funds away from the group-controlled address; refusing to sign."
+            )));
+        }
+    }
+
     // Display every destination (address + amount) and require explicit
     // operator confirmation before signing. The input-binding check above only
     // proves we control the spent UTXOs; it says nothing about where the funds

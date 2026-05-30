@@ -666,6 +666,40 @@ impl App {
                     keep_bitcoin::verify_all_script_spend_input_bindings(&psbt, &xonly_bytes)
                         .map_err(|e| format!("PSBT binding verification failed: {e}"))?;
 
+                // #414 responder-side destination validation: if this session
+                // is keyed on an OLD descriptor whose successor (NEW
+                // descriptor) is persisted in this vault, the proposal must be
+                // an automated migration sweep and the PSBT must have exactly
+                // one output that pays the NEW descriptor's address. Without
+                // this check an authorized proposer can route funds to an
+                // attacker since the proposer-side re-derivation in
+                // `request_descriptor_migration_sweep` is not a security
+                // boundary. Desktop has no human approval step on the sign
+                // path, so this check is the only line of defense here.
+                if let Some(successor_external) =
+                    node.descriptor_successor_external(&session_descriptor_hash)
+                {
+                    let expected_addr =
+                        keep_bitcoin::descriptor_address(&successor_external, network)
+                            .map_err(|e| {
+                                format!(
+                                    "could not derive expected sweep destination from persisted successor descriptor: {e}"
+                                )
+                            })?;
+                    let expected_script = expected_addr.script_pubkey();
+                    if psbt.unsigned_tx.output.len() != 1 {
+                        return Err(format!(
+                            "REFUSED: session is keyed on an OLD descriptor whose successor (NEW descriptor) is persisted; expected exactly 1 output paying the NEW descriptor address, got {} outputs.",
+                            psbt.unsigned_tx.output.len()
+                        ));
+                    }
+                    if psbt.unsigned_tx.output[0].script_pubkey != expected_script {
+                        return Err(format!(
+                            "REFUSED: PSBT output does not pay the persisted NEW descriptor address. Expected {expected_addr}; proposer-supplied script differs."
+                        ));
+                    }
+                }
+
                 let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
                     .await
                     .map_err(|e| format!("NIP-46 connect: {e}"))?;
