@@ -144,6 +144,24 @@ fn run(out: &Output) -> Result<()> {
         Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
         Commands::Backup { output } => commands::vault::cmd_backup(out, &path, output.as_deref()),
         Commands::Restore { file, target } => commands::vault::cmd_restore(out, &file, &target),
+        Commands::Sign {
+            file,
+            group,
+            output,
+            comment,
+            trusted_comment,
+        } => commands::frost::cmd_sign_file(
+            out,
+            &path,
+            &file,
+            &group,
+            output.as_deref(),
+            comment,
+            trusted_comment,
+        ),
+        Commands::Verify { file, sig, group } => {
+            commands::frost::cmd_verify_file(out, &file, &sig, &group)
+        }
     }
 }
 
@@ -202,7 +220,17 @@ fn dispatch_frost(
             threshold,
             shares,
             name,
-        } => commands::frost::cmd_frost_generate(out, path, threshold, shares, &name),
+            ed25519,
+            pubkey_out,
+        } => commands::frost::cmd_frost_generate(
+            out,
+            path,
+            threshold,
+            shares,
+            &name,
+            ed25519,
+            pubkey_out.as_deref(),
+        ),
         FrostCommands::Split {
             key,
             threshold,

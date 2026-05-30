@@ -10,7 +10,7 @@ name = "keep"
 path = "src/main.rs"
 
 [dependencies]
-keep-core = { path = "../keep-core" }
+keep-core = { path = "../keep-core", features = ["ed25519"] }
 keep-bitcoin = { path = "../keep-bitcoin" }
 keep-enclave-host = { path = "../keep-enclave/host" }
 keep-agent = { path = "../keep-agent", features = ["mcp"] }

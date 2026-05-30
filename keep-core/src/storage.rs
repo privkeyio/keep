@@ -545,7 +545,7 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = bincode::serialize(share)?;
+        let serialized = serialize_stored_share(share)?;
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
 
@@ -562,7 +562,7 @@ impl Storage {
 
         let mut entries_data: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(shares.len());
         for share in shares {
-            let serialized = bincode::serialize(share)?;
+            let serialized = serialize_stored_share(share)?;
             let encrypted = crypto::encrypt(&serialized, data_key)?;
             let id = share_id(&share.metadata.group_pubkey, share.metadata.identifier);
             entries_data.push((id.to_vec(), encrypted.to_bytes()));
@@ -589,7 +589,7 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
-            shares.push(bincode_options().deserialize(&decrypted_bytes)?);
+            shares.push(deserialize_stored_share(&decrypted_bytes)?);
         }
 
         Ok(shares)
@@ -1110,6 +1110,58 @@ fn parse_versioned_descriptor_key(
     Some(descriptor_key_version(key))
 }
 
+/// Self-describing version prefix on the persisted `StoredShare` blob.
+///
+/// bincode is not self-describing, so a `#[serde(default)]` field appended to
+/// `StoredShare` cannot be filled in from an older blob that lacks it. Rather
+/// than guess the layout by trying multiple deserializations, new writes carry
+/// an explicit `magic || version` prefix that unambiguously identifies the
+/// layout. Blobs without the prefix are pre-versioning data (v0), which is
+/// always secp256k1.
+const SHARE_FORMAT_MAGIC: &[u8; 4] = b"KSH1";
+const SHARE_FORMAT_V1: u8 = 1;
+
+/// Serialize a `StoredShare` with the explicit version prefix.
+pub(crate) fn serialize_stored_share(share: &StoredShare) -> Result<Vec<u8>> {
+    let body = bincode_options().serialize(share)?;
+    let mut out = Vec::with_capacity(SHARE_FORMAT_MAGIC.len() + 1 + body.len());
+    out.extend_from_slice(SHARE_FORMAT_MAGIC);
+    out.push(SHARE_FORMAT_V1);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Deserialize a `StoredShare`, dispatching on the explicit version prefix.
+///
+/// A blob carrying the `KSH1` magic is parsed strictly as the current
+/// `StoredShare` layout (ciphersuite tag included). A blob without the magic is
+/// pre-versioning data: it is parsed as the legacy three-field layout and the
+/// tag defaults to `Secp256k1Tr`. This is parse-don't-guess: the prefix names
+/// the layout instead of inferring it from a failed deserialization. The
+/// ciphersuite tag stays bound in the AEAD AAD, so a misclassification (e.g. an
+/// adversarially prefixed legacy blob) still fails closed at the MAC rather
+/// than yielding a wrong key.
+pub(crate) fn deserialize_stored_share(bytes: &[u8]) -> Result<StoredShare> {
+    if let Some([SHARE_FORMAT_V1, body @ ..]) = bytes.strip_prefix(SHARE_FORMAT_MAGIC.as_slice()) {
+        return Ok(bincode_options().deserialize::<StoredShare>(body)?);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LegacyStoredShare {
+        metadata: crate::frost::ShareMetadata,
+        encrypted_key_package: Vec<u8>,
+        pubkey_package: Vec<u8>,
+    }
+
+    let legacy: LegacyStoredShare = bincode_options().deserialize(bytes)?;
+    Ok(StoredShare {
+        metadata: legacy.metadata,
+        encrypted_key_package: legacy.encrypted_key_package,
+        pubkey_package: legacy.pubkey_package,
+        ciphersuite: crate::frost::Ciphersuite::Secp256k1Tr,
+    })
+}
+
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
     let mut data = [0u8; 34];
     data[..32].copy_from_slice(group_pubkey);
@@ -1127,6 +1179,122 @@ impl Drop for Storage {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_legacy_stored_share_blob_loads_as_secp256k1() {
+        use bincode::Options;
+
+        #[derive(serde::Serialize)]
+        struct LegacyStoredShare {
+            metadata: crate::frost::ShareMetadata,
+            encrypted_key_package: Vec<u8>,
+            pubkey_package: Vec<u8>,
+        }
+
+        let legacy = LegacyStoredShare {
+            metadata: crate::frost::ShareMetadata::new(1, 2, 3, [3u8; 32], "old".into()),
+            encrypted_key_package: vec![1u8; 64],
+            pubkey_package: vec![2u8; 33],
+        };
+
+        let opts = || {
+            bincode::options()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+        };
+
+        // A blob written by the old default-options path and the configured path.
+        for blob in [
+            bincode::serialize(&legacy).unwrap(),
+            opts().serialize(&legacy).unwrap(),
+        ] {
+            let loaded = deserialize_stored_share(&blob).unwrap();
+            assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Secp256k1Tr);
+            assert_eq!(loaded.metadata.identifier, 1);
+            assert_eq!(loaded.encrypted_key_package, vec![1u8; 64]);
+            assert_eq!(loaded.pubkey_package, vec![2u8; 33]);
+        }
+    }
+
+    #[test]
+    fn test_new_stored_share_blob_roundtrips() {
+        let share = StoredShare {
+            metadata: crate::frost::ShareMetadata::new(2, 2, 3, [4u8; 32], "new".into()),
+            encrypted_key_package: vec![7u8; 50],
+            pubkey_package: vec![8u8; 33],
+            ciphersuite: crate::frost::Ciphersuite::Ed25519,
+        };
+
+        let blob = serialize_stored_share(&share).unwrap();
+        assert!(blob.starts_with(SHARE_FORMAT_MAGIC));
+        assert_eq!(blob[SHARE_FORMAT_MAGIC.len()], SHARE_FORMAT_V1);
+
+        let loaded = deserialize_stored_share(&blob).unwrap();
+        assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Ed25519);
+        assert_eq!(loaded.metadata.identifier, 2);
+        assert_eq!(loaded.encrypted_key_package, vec![7u8; 50]);
+    }
+
+    #[test]
+    fn test_versioned_blob_does_not_parse_as_legacy() {
+        // A v1-prefixed Ed25519 blob must never be silently read through the
+        // legacy (always-secp256k1) path. The magic dispatches it strictly to
+        // the current layout, preserving its real ciphersuite tag.
+        let share = StoredShare {
+            metadata: crate::frost::ShareMetadata::new(5, 2, 3, [6u8; 32], "v1".into()),
+            encrypted_key_package: vec![1u8; 40],
+            pubkey_package: vec![2u8; 32],
+            ciphersuite: crate::frost::Ciphersuite::Ed25519,
+        };
+        let blob = serialize_stored_share(&share).unwrap();
+        let loaded = deserialize_stored_share(&blob).unwrap();
+        assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Ed25519);
+    }
+
+    #[test]
+    fn test_legacy_blob_cannot_be_misread_as_ed25519() {
+        // A legacy (unprefixed) blob is always loaded as secp256k1; there is no
+        // input shape that makes the legacy path yield a different ciphersuite.
+        use bincode::Options;
+
+        #[derive(serde::Serialize)]
+        struct LegacyStoredShare {
+            metadata: crate::frost::ShareMetadata,
+            encrypted_key_package: Vec<u8>,
+            pubkey_package: Vec<u8>,
+        }
+
+        let legacy = LegacyStoredShare {
+            metadata: crate::frost::ShareMetadata::new(9, 2, 3, [1u8; 32], "legacy".into()),
+            encrypted_key_package: vec![3u8; 48],
+            pubkey_package: vec![4u8; 33],
+        };
+        let blob = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .serialize(&legacy)
+            .unwrap();
+
+        let loaded = deserialize_stored_share(&blob).unwrap();
+        assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Secp256k1Tr);
+    }
+
+    #[test]
+    fn test_stored_share_envelope_byte_identity_preserved() {
+        // The version prefix lives on the plaintext StoredShare serialization,
+        // independent of the AEAD envelope. A secp256k1 share's encrypted_key_package
+        // (empty AAD) is byte-identical to what plain crypto::encrypt produces.
+        let key = crypto::SecretKey::generate().unwrap();
+        let pkg = crate::frost::SharePackage::from_bytes(
+            crate::frost::ShareMetadata::new(1, 2, 3, [7u8; 32], "x".into()),
+            vec![1, 2, 3, 4],
+            vec![9, 9, 9],
+        );
+        let stored = StoredShare::encrypt(&pkg, &key).unwrap();
+        let restored = stored.decrypt(&key).unwrap();
+        assert_eq!(restored.key_package_bytes(), pkg.key_package_bytes());
+        assert_eq!(stored.ciphersuite, crate::frost::Ciphersuite::Secp256k1Tr);
+    }
 
     #[test]
     fn test_storage_create_and_unlock() {

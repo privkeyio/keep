@@ -435,6 +435,21 @@ impl EncryptedData {
 
 /// Encrypt plaintext using XChaCha20-Poly1305.
 pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
+    encrypt_with_aad(plaintext, &[], key)
+}
+
+/// Decrypt ciphertext using XChaCha20-Poly1305.
+pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
+    decrypt_with_aad(encrypted, &[], key)
+}
+
+/// Encrypt plaintext using XChaCha20-Poly1305 with additional authenticated data.
+///
+/// The `aad` is authenticated but not encrypted; decryption fails unless the
+/// same `aad` is supplied. Passing an empty slice is byte-identical to [`encrypt`].
+pub fn encrypt_with_aad(plaintext: &[u8], aad: &[u8], key: &SecretKey) -> Result<EncryptedData> {
+    use chacha20poly1305::aead::Payload;
+
     let decrypted = key.decrypt()?;
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted));
 
@@ -442,20 +457,40 @@ pub fn encrypt(plaintext: &[u8], key: &SecretKey) -> Result<EncryptedData> {
     let nonce_ga = GenericArray::from_slice(&nonce);
 
     let ciphertext = cipher
-        .encrypt(nonce_ga, plaintext)
+        .encrypt(
+            nonce_ga,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| KeepError::Encryption("Encryption failed".into()))?;
 
     Ok(EncryptedData { ciphertext, nonce })
 }
 
-/// Decrypt ciphertext using XChaCha20-Poly1305.
-pub fn decrypt(encrypted: &EncryptedData, key: &SecretKey) -> Result<SecretVec> {
+/// Decrypt ciphertext using XChaCha20-Poly1305 with additional authenticated data.
+///
+/// Passing an empty `aad` slice is byte-identical to [`decrypt`].
+pub fn decrypt_with_aad(
+    encrypted: &EncryptedData,
+    aad: &[u8],
+    key: &SecretKey,
+) -> Result<SecretVec> {
+    use chacha20poly1305::aead::Payload;
+
     let decrypted_key = key.decrypt()?;
     let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted_key));
     let nonce = GenericArray::from_slice(&encrypted.nonce);
 
     let plaintext = cipher
-        .decrypt(nonce, encrypted.ciphertext.as_ref())
+        .decrypt(
+            nonce,
+            Payload {
+                msg: encrypted.ciphertext.as_ref(),
+                aad,
+            },
+        )
         .map_err(|_| KeepError::DecryptionFailed)?;
 
     SecretVec::new(plaintext)

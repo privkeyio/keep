@@ -496,12 +496,19 @@ impl Keep {
         self.storage.list_shares()
     }
 
-    fn find_stored_share(&self, group_pubkey: &[u8; 32], identifier: u16) -> Result<StoredShare> {
+    fn find_stored_share(
+        &self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+        ciphersuite: Option<crate::frost::Ciphersuite>,
+    ) -> Result<StoredShare> {
         let shares = self.storage.list_shares()?;
         shares
             .into_iter()
             .find(|s| {
-                s.metadata.group_pubkey == *group_pubkey && s.metadata.identifier == identifier
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.metadata.identifier == identifier
+                    && ciphersuite.is_none_or(|cs| s.ciphersuite == cs)
             })
             .ok_or_else(|| KeepError::KeyNotFound(format!("No share {identifier} for group")))
     }
@@ -517,7 +524,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
+        let mut stored = self.find_stored_share(group_pubkey, identifier, None)?;
         let data_key = self.get_data_key()?;
         let share = stored.decrypt(&data_key)?;
 
@@ -526,7 +533,8 @@ impl Keep {
                 .with_participants(vec![identifier])
         });
 
-        let export = ShareExport::from_share(&share, passphrase)?;
+        let export =
+            ShareExport::from_share_with_ciphersuite(&share, stored.ciphersuite, passphrase)?;
 
         // Exporting is the backup action: record it so the UI/clients can stop
         // nagging "not backed up". Best-effort; a storage error here must not
@@ -563,7 +571,7 @@ impl Keep {
 
         let share = export.to_share(passphrase, name)?;
         let data_key = self.get_data_key()?;
-        let stored = StoredShare::encrypt(&share, &data_key)?;
+        let stored = StoredShare::encrypt_with_ciphersuite(&share, export.ciphersuite, &data_key)?;
         self.storage.store_share(&stored)?;
 
         let group = hex::decode(&export.group_pubkey)
@@ -588,7 +596,10 @@ impl Keep {
         let all_shares = self.storage.list_shares()?;
         let group_shares: Vec<_> = all_shares
             .into_iter()
-            .filter(|s| s.metadata.group_pubkey == *group_pubkey)
+            .filter(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Secp256k1Tr
+            })
             .collect();
 
         if group_shares.is_empty() {
@@ -663,7 +674,7 @@ impl Keep {
                 "share name must not exceed 64 characters".into(),
             ));
         }
-        let mut stored = self.find_stored_share(group_pubkey, identifier)?;
+        let mut stored = self.find_stored_share(group_pubkey, identifier, None)?;
         stored.metadata.name = name.to_string();
         self.storage.store_share(&stored)?;
         Ok(())
@@ -978,7 +989,10 @@ impl Keep {
         let shares = self.storage.list_shares()?;
         let stored = shares
             .iter()
-            .find(|s| s.metadata.group_pubkey == *group_pubkey)
+            .find(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Secp256k1Tr
+            })
             .ok_or_else(|| KeepError::KeyNotFound("No shares for group".into()))?;
 
         stored.decrypt(&data_key)
@@ -994,7 +1008,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let stored = self.find_stored_share(group_pubkey, identifier)?;
+        let stored = self.find_stored_share(group_pubkey, identifier, None)?;
         let data_key = self.get_data_key()?;
         stored.decrypt(&data_key)
     }
@@ -1009,7 +1023,10 @@ impl Keep {
         let shares = self.storage.list_shares()?;
         let our_shares: Vec<_> = shares
             .iter()
-            .filter(|s| s.metadata.group_pubkey == *group_pubkey)
+            .filter(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Secp256k1Tr
+            })
             .collect();
 
         if our_shares.is_empty() {
@@ -1055,6 +1072,257 @@ impl Keep {
                 Err(e)
             }
         }
+    }
+
+    /// Generate a FROST-Ed25519 threshold key and store its shares.
+    ///
+    /// Shares are tagged with [`Ciphersuite::Ed25519`], which is bound into the
+    /// at-rest AEAD AAD so they cannot be confused with secp256k1 shares.
+    #[cfg(feature = "ed25519")]
+    pub fn frost_generate_ed25519(
+        &mut self,
+        threshold: u16,
+        total_shares: u16,
+        name: &str,
+    ) -> Result<Vec<SharePackage>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let config = ThresholdConfig::new(threshold, total_shares)?;
+        let dealer = crate::frost::ed25519::TrustedDealer::new(config);
+        let (shares, _) = dealer.generate(name)?;
+
+        let data_key = self.get_data_key()?;
+        for share in &shares {
+            let stored = StoredShare::encrypt_with_ciphersuite(
+                share,
+                crate::frost::Ciphersuite::Ed25519,
+                &data_key,
+            )?;
+            self.storage.store_share(&stored)?;
+        }
+
+        let group_pubkey = *shares[0].group_pubkey();
+        let participants: Vec<u16> = shares.iter().map(|s| s.metadata.identifier).collect();
+        self.audit_event(AuditEventType::FrostGenerate, |e| {
+            e.with_group(&group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(participants)
+        });
+
+        Ok(shares)
+    }
+
+    /// Sign a message with a threshold of local FROST-Ed25519 shares.
+    ///
+    /// Returns a detached 64-byte Ed25519 signature over the raw message
+    /// (RFC 8032), verifiable by [`Keep::frost_verify_ed25519`] and by any
+    /// standard Ed25519 verifier against the group public key.
+    #[cfg(feature = "ed25519")]
+    pub fn frost_sign_ed25519(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        message: &[u8],
+    ) -> Result<[u8; 64]> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        let decrypted_shares = match self.frost_ed25519_decrypt_threshold_shares(group_pubkey) {
+            Ok(shares) => shares,
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                        .with_reason("Insufficient shares")
+                });
+                return Err(e);
+            }
+        };
+        let threshold = decrypted_shares[0].metadata.threshold;
+
+        match crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, message) {
+            Ok(sig) => {
+                self.audit_event(AuditEventType::FrostSign, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_threshold(threshold)
+                });
+                Ok(sig)
+            }
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Decrypt the threshold set of local Ed25519 shares for a group.
+    ///
+    /// Returns exactly `threshold` decrypted shares or a `KeyNotFound`/`Frost`
+    /// error. Does not emit audit events; callers own audit semantics.
+    #[cfg(feature = "ed25519")]
+    fn frost_ed25519_decrypt_threshold_shares(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Vec<SharePackage>> {
+        let data_key = self.get_data_key()?;
+        let shares = self.storage.list_shares()?;
+        let our_shares: Vec<_> = shares
+            .iter()
+            .filter(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Ed25519
+            })
+            .collect();
+
+        if our_shares.is_empty() {
+            return Err(KeepError::KeyNotFound("No Ed25519 shares for group".into()));
+        }
+
+        let threshold = our_shares[0].metadata.threshold;
+        if our_shares.len() < threshold as usize {
+            return Err(KeepError::Frost(format!(
+                "Need {} shares to sign, only {} available",
+                threshold,
+                our_shares.len()
+            )));
+        }
+
+        let mut decrypted_shares = Vec::with_capacity(threshold as usize);
+        for stored in our_shares.iter().take(threshold as usize) {
+            decrypted_shares.push(stored.decrypt(&data_key)?);
+        }
+        Ok(decrypted_shares)
+    }
+
+    /// Verify a detached Ed25519 signature against a group public key.
+    #[cfg(feature = "ed25519")]
+    pub fn frost_verify_ed25519(
+        group_pubkey: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<()> {
+        crate::frost::ed25519::verify(group_pubkey, message, signature)
+    }
+
+    /// Sign `message` and produce a minisign-compatible detached signature.
+    ///
+    /// Runs two FROST-Ed25519 threshold signing sessions: one over the
+    /// BLAKE2b-512 prehash of the message (the `"ED"` file signature) and one
+    /// over `file_signature || trusted_comment` (the global signature). The
+    /// result verifies with the standard `minisign -V` tool against the
+    /// exported group public key.
+    #[cfg(feature = "ed25519")]
+    pub fn frost_sign_ed25519_minisign(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        message: &[u8],
+        untrusted_comment: String,
+        trusted_comment: String,
+    ) -> Result<crate::frost::ed25519::minisign::MinisignSignature> {
+        use crate::frost::ed25519::minisign;
+
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+
+        minisign::validate_comment("untrusted", &untrusted_comment)?;
+        minisign::validate_comment("trusted", &trusted_comment)?;
+
+        let decrypted_shares = match self.frost_ed25519_decrypt_threshold_shares(group_pubkey) {
+            Ok(shares) => shares,
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                        .with_reason("Insufficient shares")
+                });
+                return Err(e);
+            }
+        };
+        let threshold = decrypted_shares[0].metadata.threshold;
+
+        // Two independent threshold sessions over the same decrypted share set:
+        // fresh nonces per session keep each signature secure.
+        let prehash = minisign::prehash(message);
+        let sign_both = (|| {
+            let signature =
+                crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, &prehash)?;
+            let global_bytes = minisign::global_signed_bytes(&signature, &trusted_comment);
+            let global_signature =
+                crate::frost::ed25519::sign_with_local_shares(&decrypted_shares, &global_bytes)?;
+            Ok::<_, KeepError>((signature, global_signature))
+        })();
+
+        let (signature, global_signature) = match sign_both {
+            Ok(pair) => {
+                self.audit_event(AuditEventType::FrostSign, |e| {
+                    e.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_threshold(threshold)
+                });
+                pair
+            }
+            Err(e) => {
+                self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                    ev.with_group(group_pubkey)
+                        .with_message_hash(message)
+                        .with_success(false)
+                });
+                return Err(e);
+            }
+        };
+
+        Ok(minisign::MinisignSignature {
+            sig_alg: minisign::ALG_PREHASHED,
+            key_id: minisign::key_id(group_pubkey),
+            signature,
+            global_signature,
+            untrusted_comment,
+            trusted_comment,
+        })
+    }
+
+    /// Verify a minisign-compatible detached signature against a group public
+    /// key, checking both the file signature and the global signature using
+    /// minisign's semantics (key-id match, prehash for `"ED"`, RFC 8032 strict
+    /// cofactorless verification via frost-ed25519).
+    #[cfg(feature = "ed25519")]
+    pub fn frost_verify_ed25519_minisign(
+        group_pubkey: &[u8; 32],
+        message: &[u8],
+        sig: &crate::frost::ed25519::minisign::MinisignSignature,
+    ) -> Result<()> {
+        use crate::frost::ed25519::minisign;
+
+        if sig.key_id != minisign::key_id(group_pubkey) {
+            return Err(KeepError::InvalidInput(
+                "signature key id does not match group public key".into(),
+            ));
+        }
+
+        let signed_message = match sig.sig_alg {
+            minisign::ALG_PREHASHED => minisign::prehash(message).to_vec(),
+            minisign::ALG_LEGACY => message.to_vec(),
+            _ => {
+                return Err(KeepError::InvalidInput(
+                    "unknown signature algorithm".into(),
+                ))
+            }
+        };
+
+        crate::frost::ed25519::verify(group_pubkey, &signed_message, &sig.signature)?;
+
+        let global_bytes = minisign::global_signed_bytes(&sig.signature, &sig.trusted_comment);
+        crate::frost::ed25519::verify(group_pubkey, &global_bytes, &sig.global_signature)
     }
 
     fn load_keys_to_keyring(&mut self) -> Result<()> {
@@ -1375,6 +1643,201 @@ mod tests {
         let message = b"sign with split key";
         let signature = keep.frost_sign(&frost_pubkey, message).unwrap();
         assert_eq!(signature.len(), 64);
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn test_frost_ed25519_generate_sign_verify() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let shares = keep.frost_generate_ed25519(2, 3, "release").unwrap();
+        assert_eq!(shares.len(), 3);
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let message = b"release artifact v1.0";
+        let signature = keep.frost_sign_ed25519(&group_pubkey, message).unwrap();
+        assert_eq!(signature.len(), 64);
+
+        Keep::frost_verify_ed25519(&group_pubkey, message, &signature).unwrap();
+        assert!(Keep::frost_verify_ed25519(&group_pubkey, b"tampered", &signature).is_err());
+
+        // Shares persisted across reopen carry the Ed25519 ciphersuite tag and
+        // still sign after the versioned-blob round-trip through storage.
+        drop(keep);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        let sig2 = keep.frost_sign_ed25519(&group_pubkey, message).unwrap();
+        Keep::frost_verify_ed25519(&group_pubkey, message, &sig2).unwrap();
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn test_frost_ed25519_export_import_sign() {
+        let src_dir = tempdir().unwrap();
+        let src_path = src_dir.path().join("keep");
+        let mut src = test_keep(&src_path);
+
+        let shares = src.frost_generate_ed25519(2, 3, "release").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let exports: Vec<_> = shares
+            .iter()
+            .take(2)
+            .map(|s| {
+                let export = src
+                    .frost_export_share(&group_pubkey, s.metadata.identifier, "transfer-pass")
+                    .unwrap();
+                assert_eq!(export.ciphersuite, crate::frost::Ciphersuite::Ed25519);
+                export
+            })
+            .collect();
+
+        let dst_dir = tempdir().unwrap();
+        let dst_path = dst_dir.path().join("keep");
+        let mut dst = test_keep(&dst_path);
+
+        for (i, export) in exports.iter().enumerate() {
+            dst.frost_import_share(export, "transfer-pass", &format!("imported-{i}"))
+                .unwrap();
+        }
+
+        let message = b"exported then imported";
+        let sig = dst.frost_sign_ed25519(&group_pubkey, message).unwrap();
+        Keep::frost_verify_ed25519(&group_pubkey, message, &sig).unwrap();
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn test_frost_ed25519_data_key_rotation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let shares = keep.frost_generate_ed25519(2, 3, "release").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+
+        // Rotation re-encrypts the inner key package under the ciphersuite AAD
+        // and verifies it; an Ed25519 vault must rotate without failing.
+        keep.rotate_data_key("testpass").unwrap();
+
+        let message = b"after rotation";
+        let sig = keep.frost_sign_ed25519(&group_pubkey, message).unwrap();
+        Keep::frost_verify_ed25519(&group_pubkey, message, &sig).unwrap();
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn test_frost_ed25519_minisign_round_trip() {
+        use crate::frost::ed25519::minisign::MinisignSignature;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let shares = keep.frost_generate_ed25519(2, 3, "release").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let message = b"release artifact v2.0";
+        let sig = keep
+            .frost_sign_ed25519_minisign(
+                &group_pubkey,
+                message,
+                "untrusted".into(),
+                "trusted:abc".into(),
+            )
+            .unwrap();
+
+        // Full struct verifies (file + global signatures).
+        Keep::frost_verify_ed25519_minisign(&group_pubkey, message, &sig).unwrap();
+
+        // Survives encode/parse round-trip.
+        let encoded = sig.encode().unwrap();
+        let parsed = MinisignSignature::parse(&encoded).unwrap();
+        Keep::frost_verify_ed25519_minisign(&group_pubkey, message, &parsed).unwrap();
+
+        // Tampered message rejected.
+        assert!(Keep::frost_verify_ed25519_minisign(&group_pubkey, b"tampered", &parsed).is_err());
+
+        // Tampered trusted comment breaks the global signature.
+        let mut bad = MinisignSignature::parse(&encoded).unwrap();
+        bad.trusted_comment = "trusted:evil".into();
+        assert!(Keep::frost_verify_ed25519_minisign(&group_pubkey, message, &bad).is_err());
+
+        // Wrong group public key fails the key-id check.
+        let wrong = [0u8; 32];
+        assert!(Keep::frost_verify_ed25519_minisign(&wrong, message, &parsed).is_err());
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn test_frost_ed25519_minisign_external_binary() {
+        use crate::frost::ed25519::minisign::MinisignPublicKey;
+        use std::process::Command;
+
+        // Prefer the C minisign binary; fall back to rsign2 (rsign), which is
+        // byte-format compatible with minisign. Skip if neither is installed.
+        let verifier = if Command::new("minisign").arg("-v").output().is_ok() {
+            "minisign"
+        } else if Command::new("rsign").arg("--help").output().is_ok() {
+            "rsign"
+        } else {
+            eprintln!("no minisign/rsign binary installed; skipping external cross-check");
+            return;
+        };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let shares = keep.frost_generate_ed25519(2, 3, "release").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let data_path = dir.path().join("artifact.bin");
+        std::fs::write(&data_path, b"external minisign cross-check payload").unwrap();
+        let message = std::fs::read(&data_path).unwrap();
+
+        let sig = keep
+            .frost_sign_ed25519_minisign(
+                &group_pubkey,
+                &message,
+                "keep test".into(),
+                "timestamp:0\tfile:artifact.bin".into(),
+            )
+            .unwrap();
+        let sig_path = dir.path().join("artifact.bin.minisig");
+        std::fs::write(&sig_path, sig.encode().unwrap()).unwrap();
+
+        let pk = MinisignPublicKey::from_group_pubkey(&group_pubkey, "keep test".into());
+        let pk_path = dir.path().join("keep.pub");
+        std::fs::write(&pk_path, pk.encode().unwrap()).unwrap();
+
+        let output = match verifier {
+            "minisign" => Command::new("minisign")
+                .arg("-V")
+                .arg("-p")
+                .arg(&pk_path)
+                .arg("-m")
+                .arg(&data_path)
+                .output()
+                .expect("run minisign -V"),
+            _ => Command::new("rsign")
+                .arg("verify")
+                .arg("-p")
+                .arg(&pk_path)
+                .arg("-x")
+                .arg(&sig_path)
+                .arg(&data_path)
+                .output()
+                .expect("run rsign verify"),
+        };
+        assert!(
+            output.status.success(),
+            "external verify ({verifier}) failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]

@@ -16,6 +16,35 @@ use crate::ExportFormat;
 
 use super::{get_confirm, get_password, get_password_with_confirm};
 
+const MAX_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_TEXT_BYTES: u64 = 64 * 1024;
+
+fn check_file_size(file: &Path, max_bytes: u64) -> Result<()> {
+    let len = file
+        .metadata()
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))?
+        .len();
+    if len > max_bytes {
+        return Err(KeepError::InvalidInput(format!(
+            "{} exceeds maximum size of {max_bytes} bytes",
+            file.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_input_file(file: &Path) -> Result<Vec<u8>> {
+    check_file_size(file, MAX_INPUT_BYTES)?;
+    std::fs::read(file)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
+}
+
+fn read_text_file(file: &Path) -> Result<String> {
+    check_file_size(file, MAX_TEXT_BYTES)?;
+    std::fs::read_to_string(file)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot read {}: {e}", file.display())))
+}
+
 fn resolve_group_pubkey(
     shares: &[keep_core::frost::StoredShare],
     group_id: &str,
@@ -38,8 +67,27 @@ pub fn cmd_frost_generate(
     threshold: u16,
     total_shares: u16,
     name: &str,
+    ed25519: bool,
+    pubkey_out: Option<&Path>,
 ) -> Result<()> {
-    debug!(threshold, total_shares, name, "generating FROST key");
+    debug!(
+        threshold,
+        total_shares, name, ed25519, "generating FROST key"
+    );
+
+    if pubkey_out.is_some() && !ed25519 {
+        return Err(KeepError::InvalidInput(
+            "--pubkey-out is only supported with --ed25519 mode".into(),
+        ));
+    }
+
+    let pubkey_comment = if pubkey_out.is_some() {
+        let comment = format!("minisign public key for keep FROST group {name}");
+        keep_core::frost::ed25519::minisign::validate_comment("untrusted", &comment)?;
+        Some(comment)
+    } else {
+        None
+    };
 
     out.newline();
     out.warn("WARNING: Trusted dealer mode - for testing/development only.");
@@ -56,7 +104,11 @@ pub fn cmd_frost_generate(
     spinner.finish();
 
     let spinner = out.spinner("Generating FROST key shares...");
-    let shares = keep.frost_generate(threshold, total_shares, name)?;
+    let shares = if ed25519 {
+        keep.frost_generate_ed25519(threshold, total_shares, name)?
+    } else {
+        keep.frost_generate(threshold, total_shares, name)?
+    };
     spinner.finish();
 
     if shares.is_empty() {
@@ -66,12 +118,25 @@ pub fn cmd_frost_generate(
     }
 
     let group_pubkey = shares[0].group_pubkey();
-    let npub = bytes_to_npub(group_pubkey);
 
     out.newline();
     out.success("Generated FROST key group!");
     out.field("Name", name);
-    out.key_field("Pubkey", &npub);
+    if ed25519 {
+        out.field("Ciphersuite", "Ed25519");
+        out.key_field("Group pubkey", &hex::encode(group_pubkey));
+        if let Some(pubkey_path) = pubkey_out {
+            let pk = keep_core::frost::ed25519::minisign::MinisignPublicKey::from_group_pubkey(
+                group_pubkey,
+                pubkey_comment.expect("validated when pubkey_out is set"),
+            );
+            std::fs::write(pubkey_path, pk.encode()?)
+                .map_err(|e| KeepError::InvalidInput(format!("cannot write public key: {e}")))?;
+            out.field("Minisign pubkey", &pubkey_path.display().to_string());
+        }
+    } else {
+        out.key_field("Pubkey", &bytes_to_npub(group_pubkey));
+    }
     out.field("Threshold", &format!("{threshold}-of-{total_shares}"));
     out.newline();
 
@@ -773,4 +838,127 @@ pub fn cmd_frost_verify(out: &Output, message_hex: &str, group: &str, sig_hex: &
             )),
         )),
     }
+}
+
+/// Parse a FROST-Ed25519 group public key from an npub or 64-char hex string.
+fn parse_group_pubkey(group: &str) -> Result<[u8; 32]> {
+    if group.starts_with("npub1") {
+        return keep_core::keys::npub_to_bytes(group);
+    }
+    let bytes = hex::decode(group)
+        .map_err(|_| KeepError::InvalidInput("invalid group pubkey hex".into()))?;
+    if bytes.len() != 32 {
+        return Err(KeepError::InvalidInput(
+            "group pubkey must be 32 bytes".into(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+pub fn cmd_sign_file(
+    out: &Output,
+    path: &Path,
+    file: &Path,
+    group: &str,
+    output: Option<&Path>,
+    comment: Option<String>,
+    trusted_comment: Option<String>,
+) -> Result<()> {
+    debug!(file = %file.display(), group, "signing file with FROST-Ed25519");
+
+    let group_pubkey = parse_group_pubkey(group)?;
+    let message = read_input_file(file)?;
+
+    let file_name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let untrusted_comment = comment.unwrap_or_else(|| "signature from keep".to_string());
+    let trusted_comment = trusted_comment.unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("timestamp:{ts}\tfile:{file_name}")
+    });
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let spinner = out.spinner("Signing file...");
+    let signature = keep.frost_sign_ed25519_minisign(
+        &group_pubkey,
+        &message,
+        untrusted_comment,
+        trusted_comment,
+    )?;
+    spinner.finish();
+
+    let sig_path = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| with_sig_extension(file));
+    std::fs::write(&sig_path, signature.encode()?)
+        .map_err(|e| KeepError::InvalidInput(format!("cannot write signature: {e}")))?;
+
+    out.newline();
+    out.success("File signed!");
+    out.field("File", &file.display().to_string());
+    out.field("Signature", &sig_path.display().to_string());
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(out))]
+pub fn cmd_verify_file(out: &Output, file: &Path, sig: &Path, group: &str) -> Result<()> {
+    use keep_core::frost::ed25519::minisign::MinisignSignature;
+
+    debug!(file = %file.display(), sig = %sig.display(), group, "verifying file signature");
+
+    let group_pubkey = resolve_verify_pubkey(group)?;
+    let message = read_input_file(file)?;
+    let sig_text = read_text_file(sig)?;
+
+    let signature = MinisignSignature::parse(&sig_text)?;
+
+    match Keep::frost_verify_ed25519_minisign(&group_pubkey, &message, &signature) {
+        Ok(()) => {
+            out.newline();
+            out.success("Signature is valid.");
+            if !signature.trusted_comment.is_empty() {
+                out.field("Trusted comment", &signature.trusted_comment);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            out.newline();
+            out.error("Signature is INVALID.");
+            Err(e)
+        }
+    }
+}
+
+/// Resolve a verification public key from an npub, a 64-char hex string, or a
+/// path to a minisign public-key file.
+fn resolve_verify_pubkey(group: &str) -> Result<[u8; 32]> {
+    use keep_core::frost::ed25519::minisign::MinisignPublicKey;
+
+    let candidate = Path::new(group);
+    if candidate.is_file() {
+        let text = read_text_file(candidate)?;
+        return Ok(MinisignPublicKey::parse(&text)?.public_key);
+    }
+    parse_group_pubkey(group)
+}
+
+fn with_sig_extension(file: &Path) -> std::path::PathBuf {
+    let mut name = file.as_os_str().to_os_string();
+    name.push(".minisig");
+    std::path::PathBuf::from(name)
 }

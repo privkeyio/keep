@@ -20,7 +20,8 @@ use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::relay::RelayConfig;
 use crate::storage::{
-    bincode_options, descriptor_storage_key, share_id, validate_new_password, Header, Storage,
+    bincode_options, descriptor_storage_key, deserialize_stored_share, serialize_stored_share,
+    share_id, validate_new_password, Header, Storage,
 };
 use crate::wallet::WalletDescriptor;
 
@@ -363,7 +364,8 @@ impl Storage {
             .iter()
             .map(|stored| {
                 let encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
-                let key_package_bytes = crypto::decrypt(&encrypted, data_key)?;
+                let key_package_bytes =
+                    crypto::decrypt_with_aad(&encrypted, stored.ciphersuite.aad(), data_key)?;
                 Ok((stored.clone(), key_package_bytes.as_slice()?))
             })
             .collect()
@@ -389,13 +391,14 @@ impl Storage {
         }
 
         for (stored, key_package_bytes) in shares {
-            let new_encrypted = crypto::encrypt(key_package_bytes, new_data_key)?;
-            let new_stored = StoredShare {
-                metadata: stored.metadata.clone(),
-                encrypted_key_package: new_encrypted.to_bytes(),
-                pubkey_package: stored.pubkey_package.clone(),
-            };
-            let serialized = bincode::serialize(&new_stored)?;
+            let package = crate::frost::SharePackage::from_bytes(
+                stored.metadata.clone(),
+                key_package_bytes.to_vec(),
+                stored.pubkey_package.clone(),
+            );
+            let new_stored =
+                StoredShare::encrypt_with_ciphersuite(&package, stored.ciphersuite, new_data_key)?;
+            let serialized = serialize_stored_share(&new_stored)?;
             let record_encrypted = crypto::encrypt(&serialized, new_data_key)?;
             let id = share_id(&stored.metadata.group_pubkey, stored.metadata.identifier);
             backend.put(SHARES_TABLE, &id, &record_encrypted.to_bytes())?;
@@ -490,9 +493,10 @@ impl Storage {
             let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
             let decrypted = crypto::decrypt(&encrypted, data_key)?;
             let decrypted_bytes = decrypted.as_slice()?;
-            let stored: StoredShare = bincode_options().deserialize(&decrypted_bytes)?;
+            let stored: StoredShare = deserialize_stored_share(&decrypted_bytes)?;
             let inner_encrypted = EncryptedData::from_bytes(&stored.encrypted_key_package)?;
-            let inner_decrypted = crypto::decrypt(&inner_encrypted, data_key)?;
+            let inner_decrypted =
+                crypto::decrypt_with_aad(&inner_encrypted, stored.ciphersuite.aad(), data_key)?;
             let inner_bytes = inner_decrypted.as_slice()?;
             if !bool::from(inner_bytes.ct_eq(original_key_package.as_slice())) {
                 return Err(KeepError::RotationFailed(format!(

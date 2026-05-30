@@ -136,6 +136,36 @@ pub(crate) enum Commands {
         )]
         target: PathBuf,
     },
+    /// Sign a file with a FROST-Ed25519 threshold group (minisign .sig)
+    Sign {
+        #[arg(help = "File to sign")]
+        file: PathBuf,
+        #[arg(short, long, help = "FROST-Ed25519 group npub or hex")]
+        group: String,
+        #[arg(short, long, help = "Output signature path (default: <file>.minisig)")]
+        output: Option<PathBuf>,
+        #[arg(short = 'c', long, help = "Untrusted comment line")]
+        comment: Option<String>,
+        #[arg(
+            short = 't',
+            long,
+            help = "Trusted comment line (bound into the signature)"
+        )]
+        trusted_comment: Option<String>,
+    },
+    /// Verify a minisign detached signature over a file
+    Verify {
+        #[arg(help = "File that was signed")]
+        file: PathBuf,
+        #[arg(help = "Detached signature file (.minisig)")]
+        sig: PathBuf,
+        #[arg(
+            short,
+            long,
+            help = "FROST-Ed25519 group npub/hex, or path to a minisign public key file"
+        )]
+        group: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,6 +402,13 @@ pub(crate) enum FrostCommands {
         shares: u16,
         #[arg(short, long, default_value = "default")]
         name: String,
+        #[arg(long, help = "Generate a FROST-Ed25519 group (for release signing)")]
+        ed25519: bool,
+        #[arg(
+            long,
+            help = "Write the minisign public key for the group to this path (Ed25519 only)"
+        )]
+        pubkey_out: Option<PathBuf>,
     },
     Split {
         #[arg(short, long)]
