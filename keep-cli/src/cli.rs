@@ -350,7 +350,7 @@ pub(crate) enum WalletCommands {
         relay: Option<String>,
         #[arg(
             long,
-            help = "Seconds to wait for a matching PsbtSignatureNeeded proposal before giving up. Default 20s; the old 60s was excessive when the initiator simply wasn't online or the session id was a typo. Max 600.",
+            help = "Seconds to wait for a matching PsbtSignatureNeeded proposal before giving up. Default 20s; the old 60s was excessive when the initiator simply wasn't online or the session id was a typo. Upper bound is enforced by keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS.",
             default_value = "20"
         )]
         timeout: u32,

@@ -748,12 +748,9 @@ pub fn cmd_frost_verify(out: &Output, message_hex: &str, group: &str, sig_hex: &
         )));
     }
 
-    // Reconstruct VerifyingKey from the 32-byte group pubkey using the same
-    // representation frost-secp256k1-tr produces (BIP-340 x-only).
-    let mut serialized_vk = Vec::with_capacity(33);
-    serialized_vk.push(0x02); // compressed prefix, x-only -> even y
-    serialized_vk.extend_from_slice(&group_pubkey);
-    let vk = frost::VerifyingKey::deserialize(&serialized_vk)
+    // frost-secp256k1-tr uses the 32-byte BIP-340 x-only encoding directly,
+    // not a SEC1-compressed 33-byte buffer.
+    let vk = frost::VerifyingKey::deserialize(&group_pubkey)
         .map_err(|e| KeepError::Frost(format!("Invalid group pubkey: {e}")))?;
 
     let signature = frost::Signature::deserialize(&sig_bytes)
@@ -770,11 +767,10 @@ pub fn cmd_frost_verify(out: &Output, message_hex: &str, group: &str, sig_hex: &
             out.success("Signature is VALID for this group pubkey and message");
             Ok(())
         }
-        Err(e) => {
-            out.error(&format!(
+        Err(e) => Err(KeepError::CryptoErr(
+            keep_core::error::CryptoError::invalid_signature(format!(
                 "Signature is INVALID: {e}. The signature does not bind this message to this group pubkey."
-            ));
-            std::process::exit(1);
-        }
+            )),
+        )),
     }
 }

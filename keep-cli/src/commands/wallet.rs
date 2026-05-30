@@ -1844,7 +1844,6 @@ async fn approve_psbt_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_wallet_approve_psbt(
     out: &Output,
     path: &Path,
@@ -1860,10 +1859,11 @@ pub fn cmd_wallet_approve_psbt(
         session_hex, relay, timeout_secs, "wallet approve-psbt"
     );
 
-    if timeout_secs == 0 || timeout_secs > 600 {
-        return Err(KeepError::InvalidInput(
-            "--timeout must be between 1 and 600 seconds".into(),
-        ));
+    let max_timeout = keep_frost_net::DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS;
+    if timeout_secs == 0 || u64::from(timeout_secs) > max_timeout {
+        return Err(KeepError::InvalidInput(format!(
+            "--timeout must be between 1 and {max_timeout} seconds"
+        )));
     }
 
     if signer_bunker.is_empty() {
