@@ -14,8 +14,8 @@
 # Options: error, warn, info, debug, trace
 # log_level = "info"
 
-# Default Nostr relays for FROST operations
-# relays = ["wss://nos.lol"]
+# Default Nostr relay(s) for general use and FROST operations
+# relays = ["wss://bucket.coracle.social"]
 
 # Network operation timeout in seconds
 # timeout = 30

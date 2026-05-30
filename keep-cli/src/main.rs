@@ -601,7 +601,7 @@ fn dispatch_config(out: &Output, cfg: &Config, command: ConfigCommands) -> Resul
             out.field("argon2_profile", &cfg.argon2_profile.to_string());
             out.field("log_level", &cfg.log_level.to_string());
             let relays = if cfg.relays.is_empty() {
-                "(default: wss://nos.lol)".to_string()
+                "(default: wss://bucket.coracle.social)".to_string()
             } else {
                 cfg.relays.join(", ")
             };
