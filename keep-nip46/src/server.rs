@@ -17,7 +17,7 @@ use crate::bunker::generate_bunker_url;
 use crate::error::Result;
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::handler::SignerHandler;
-use crate::permissions::{Permission, PermissionManager};
+use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::RateLimitConfig;
 use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
@@ -49,6 +49,8 @@ pub struct PreGrantedApp {
     pub name: String,
     pub permissions: Permission,
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
+    pub duration: PermissionDuration,
+    pub connected_at: Timestamp,
 }
 
 impl Default for ServerConfig {
@@ -111,10 +113,27 @@ async fn apply_pre_grants(
     }
     let mut pm = permissions.lock().await;
     for app in pre_grants {
-        pm.grant(app.pubkey, app.name.clone(), app.permissions);
-        if !app.auto_approve_kinds.is_empty() {
-            pm.set_auto_approve_kinds_for_app(&app.pubkey, app.auto_approve_kinds.clone());
+        // Mirror SignerHandler::restore_client: Session grants die at restart,
+        // expired Seconds grants are dropped, and capacity is enforced so a
+        // large stored config cannot defeat MAX_CONNECTED_APPS.
+        match app.duration {
+            PermissionDuration::Session => continue,
+            PermissionDuration::Seconds(_) if app.duration.is_expired(app.connected_at) => continue,
+            _ => {}
         }
+        if !pm.ensure_capacity(&app.pubkey) {
+            warn!(
+                app_id = &app.pubkey.to_hex()[..8],
+                "apply_pre_grants: capacity full, skipping"
+            );
+            continue;
+        }
+        let mut perm = AppPermission::new(app.pubkey, app.name.clone());
+        perm.permissions = app.permissions & Permission::ALL;
+        perm.auto_approve_kinds = app.auto_approve_kinds.clone();
+        perm.duration = app.duration;
+        perm.connected_at = app.connected_at;
+        pm.insert(perm);
     }
 }
 

@@ -196,20 +196,26 @@ pub fn cmd_serve(
 
     // Load any NIP-46 client app grants persisted via `keep nip46 grant`.
     // These are loaded into the PermissionManager at startup so headless
-    // bunkers don't need to rely on an interactive approval prompt.
+    // bunkers don't need to rely on an interactive approval prompt. Only the
+    // headless path wires them into the ServerConfig; the interactive TUI path
+    // relies on per-request approval, so the banner is scoped to headless mode
+    // to avoid misleading the operator.
     let pre_grants = load_pre_grants(&keep)?;
-    if !pre_grants.is_empty() {
-        out.field(
-            "Pre-granted apps",
-            &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
-        );
-    }
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     if headless {
+        if !pre_grants.is_empty() {
+            out.field(
+                "Pre-granted apps",
+                &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
+            );
+        }
+        // In headless mode `auto_approve` is globally true, so a pre-grant's
+        // `auto_approve_kinds` has no additional effect: every signing request
+        // from a granted app is auto-approved regardless of kind.
         let headless_config = ServerConfig {
             auto_approve: true,
             pre_grants: pre_grants.clone(),
@@ -532,6 +538,22 @@ fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
                 continue;
             }
         };
+        // Mirror keep-desktop's restore_bunker_permissions: Session grants are
+        // not meant to survive a restart, and already-expired Seconds grants
+        // must not be reactivated. Forever grants always load.
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let duration = match &bp.duration {
+            keep_core::relay::StoredPermissionDuration::Session => continue,
+            keep_core::relay::StoredPermissionDuration::Seconds(secs) => {
+                if now > bp.connected_at.saturating_add(*secs) {
+                    continue;
+                }
+                keep_nip46::PermissionDuration::Seconds(*secs)
+            }
+            keep_core::relay::StoredPermissionDuration::Forever => {
+                keep_nip46::PermissionDuration::Forever
+            }
+        };
         let permissions = keep_nip46::Permission::from_bits_truncate(bp.permissions);
         let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = bp
             .auto_approve_kinds
@@ -544,6 +566,8 @@ fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
             name: bp.name.clone(),
             permissions,
             auto_approve_kinds,
+            duration,
+            connected_at: nostr_sdk::Timestamp::from(bp.connected_at),
         });
     }
     Ok(out)

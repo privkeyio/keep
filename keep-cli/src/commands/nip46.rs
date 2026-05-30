@@ -80,10 +80,13 @@ pub fn cmd_nip46_grant(
     let mut cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
 
     // Upsert: replace existing entry for this pubkey, or append a new one.
+    // A 0 fallback would make a `Seconds(n)` grant expire from the epoch (i.e.
+    // immediately), so propagate a backwards clock rather than persisting a
+    // grant that can never activate.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|e| KeepError::InvalidInput(format!("system clock before unix epoch: {e}")))?;
     let existing = cfg
         .bunker_permissions
         .iter()
@@ -165,17 +168,18 @@ fn parse_pubkey_hex(input: &str) -> Result<String> {
 }
 
 fn parse_permissions(s: &str) -> Result<u32> {
+    use keep_nip46::Permission;
     let mut bits: u32 = 0;
     for token in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
         let lower = token.to_ascii_lowercase();
         let bit = match lower.as_str() {
-            "all" => return Ok(0b00111111),
-            "get_public_key" | "getpublickey" => 0b00000001,
-            "sign_event" | "signevent" => 0b00000010,
-            "nip04_encrypt" | "nip04encrypt" => 0b00000100,
-            "nip04_decrypt" | "nip04decrypt" => 0b00001000,
-            "nip44_encrypt" | "nip44encrypt" => 0b00010000,
-            "nip44_decrypt" | "nip44decrypt" => 0b00100000,
+            "all" => return Ok(Permission::ALL.bits()),
+            "get_public_key" | "getpublickey" => Permission::GET_PUBLIC_KEY.bits(),
+            "sign_event" | "signevent" => Permission::SIGN_EVENT.bits(),
+            "nip04_encrypt" | "nip04encrypt" => Permission::NIP04_ENCRYPT.bits(),
+            "nip04_decrypt" | "nip04decrypt" => Permission::NIP04_DECRYPT.bits(),
+            "nip44_encrypt" | "nip44encrypt" => Permission::NIP44_ENCRYPT.bits(),
+            "nip44_decrypt" | "nip44decrypt" => Permission::NIP44_DECRYPT.bits(),
             other => {
                 return Err(KeepError::InvalidInput(format!(
                     "unknown permission '{other}'; valid: get_public_key, sign_event, nip04_encrypt, nip04_decrypt, nip44_encrypt, nip44_decrypt, all"
@@ -223,15 +227,16 @@ fn parse_duration(s: &str) -> Result<StoredPermissionDuration> {
 }
 
 fn format_permissions(bits: u32) -> String {
-    const NAMES: &[(u32, &str)] = &[
-        (0b00000001, "get_public_key"),
-        (0b00000010, "sign_event"),
-        (0b00000100, "nip04_encrypt"),
-        (0b00001000, "nip04_decrypt"),
-        (0b00010000, "nip44_encrypt"),
-        (0b00100000, "nip44_decrypt"),
+    use keep_nip46::Permission;
+    let names: &[(u32, &str)] = &[
+        (Permission::GET_PUBLIC_KEY.bits(), "get_public_key"),
+        (Permission::SIGN_EVENT.bits(), "sign_event"),
+        (Permission::NIP04_ENCRYPT.bits(), "nip04_encrypt"),
+        (Permission::NIP04_DECRYPT.bits(), "nip04_decrypt"),
+        (Permission::NIP44_ENCRYPT.bits(), "nip44_encrypt"),
+        (Permission::NIP44_DECRYPT.bits(), "nip44_decrypt"),
     ];
-    let set: Vec<&str> = NAMES
+    let set: Vec<&str> = names
         .iter()
         .filter(|(b, _)| bits & b != 0)
         .map(|(_, n)| *n)
