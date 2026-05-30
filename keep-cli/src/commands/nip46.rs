@@ -23,14 +23,26 @@ pub fn cmd_nip46_apps(out: &Output, path: &Path) -> Result<()> {
     keep.unlock(password.expose_secret())?;
 
     let cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
-    if cfg.bunker_permissions.is_empty() {
+
+    out.newline();
+    if !cfg.auto_approve_kinds.is_empty() {
+        out.field(
+            "Global auto-approve kinds",
+            &cfg.auto_approve_kinds
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         out.newline();
+    }
+
+    if cfg.bunker_permissions.is_empty() {
         out.info("No NIP-46 client app grants stored.");
         out.info("Pre-grant a client via: keep nip46 grant <pubkey> --name 'X'");
         return Ok(());
     }
 
-    out.newline();
     out.header(&format!(
         "NIP-46 client app grants ({})",
         cfg.bunker_permissions.len()
@@ -146,6 +158,35 @@ pub fn cmd_nip46_revoke(out: &Output, path: &Path, pubkey: &str) -> Result<()> {
     keep.store_relay_config(&cfg)?;
     out.newline();
     out.success(&format!("Revoked NIP-46 grant for app {pubkey_hex}"));
+    Ok(())
+}
+
+/// Set the global list of event kinds auto-approved for every NIP-46 client.
+pub fn cmd_nip46_auto_approve(out: &Output, path: &Path, kinds: &str) -> Result<()> {
+    let parsed = parse_auto_approve_kinds(kinds)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+    keep.unlock(password.expose_secret())?;
+
+    let mut cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
+    cfg.auto_approve_kinds = parsed.clone();
+    keep.store_relay_config(&cfg)?;
+
+    out.newline();
+    if parsed.is_empty() {
+        out.success("Cleared the global auto-approve kinds list.");
+    } else {
+        out.success("Updated global auto-approve kinds.");
+        out.field(
+            "Kinds",
+            &parsed
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     Ok(())
 }
 

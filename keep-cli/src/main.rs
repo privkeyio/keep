@@ -208,6 +208,9 @@ fn dispatch_nip46(out: &Output, path: &std::path::Path, command: Nip46Commands) 
             &duration,
         ),
         Nip46Commands::Revoke { pubkey } => commands::nip46::cmd_nip46_revoke(out, path, &pubkey),
+        Nip46Commands::AutoApprove { kinds } => {
+            commands::nip46::cmd_nip46_auto_approve(out, path, &kinds)
+        }
     }
 }
 

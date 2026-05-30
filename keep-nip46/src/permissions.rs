@@ -225,7 +225,6 @@ impl PermissionManager {
         self.apps.values()
     }
 
-    #[allow(dead_code)]
     pub fn set_auto_approve_kinds(&mut self, kinds: HashSet<Kind>) {
         self.global_auto_approve = kinds;
     }
@@ -408,5 +407,25 @@ mod tests {
 
         assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
         assert!(pm.needs_approval(&pubkey, Kind::from(30023)));
+    }
+
+    #[test]
+    fn test_set_global_auto_approve_kinds() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "Test".into());
+        pm.grant(pubkey, "Test".into(), Permission::SIGN_EVENT);
+
+        // No per-app auto-kinds, so the app needs approval for TextNote.
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+
+        // A global list skips approval regardless of any per-app config.
+        pm.set_auto_approve_kinds(HashSet::from([Kind::TextNote]));
+        assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
+        assert!(pm.needs_approval(&pubkey, Kind::from(30023)));
+
+        // Replacing the global list with an empty set restores approval.
+        pm.set_auto_approve_kinds(HashSet::new());
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
     }
 }

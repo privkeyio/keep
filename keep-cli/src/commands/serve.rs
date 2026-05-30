@@ -201,6 +201,7 @@ pub fn cmd_serve(
     // relies on per-request approval, so the banner is scoped to headless mode
     // to avoid misleading the operator.
     let pre_grants = load_pre_grants(&keep)?;
+    let global_auto_approve = load_global_auto_approve(&keep)?;
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
@@ -218,7 +219,7 @@ pub fn cmd_serve(
         // from a granted app is auto-approved regardless of kind.
         let headless_config = ServerConfig {
             auto_approve: true,
-            pre_grants: pre_grants.clone(),
+            pre_grants,
             ..Default::default()
         };
         rt.block_on(async {
@@ -297,13 +298,22 @@ pub fn cmd_serve(
                 tx: tui_tx_clone.clone(),
             }));
 
+            // Carry the persisted global auto-approve kinds so the interactive
+            // approval prompt skips them, matching `keep nip46 auto-approve`.
+            // An unset (empty) list leaves the server's default in place.
+            let mut tui_config = ServerConfig::default();
+            if !global_auto_approve.is_empty() {
+                tui_config.auto_approve_kinds = global_auto_approve;
+            }
             let mut server =
                 if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
-                    match Server::new_frost(
-                        frost,
-                        transport_key,
+                    match Server::new_with_config(
+                        Arc::new(Mutex::new(Keyring::new())),
+                        Some(frost),
+                        Some(transport_key),
                         std::slice::from_ref(&relay_clone),
                         callbacks,
+                        tui_config,
                     )
                     .await
                     {
@@ -317,10 +327,13 @@ pub fn cmd_serve(
                         }
                     }
                 } else {
-                    match Server::new(
+                    match Server::new_with_config(
                         keyring_for_tui,
+                        None,
+                        None,
                         std::slice::from_ref(&relay_clone),
                         callbacks,
+                        tui_config,
                     )
                     .await
                     {
@@ -571,4 +584,16 @@ fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
         });
     }
     Ok(out)
+}
+
+/// Read the persisted global auto-approve kinds (`keep nip46 auto-approve`).
+/// An empty stored list leaves the server's default in place.
+fn load_global_auto_approve(keep: &Keep) -> Result<std::collections::HashSet<nostr_sdk::Kind>> {
+    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
+    Ok(cfg
+        .auto_approve_kinds
+        .iter()
+        .copied()
+        .map(nostr_sdk::Kind::from)
+        .collect())
 }

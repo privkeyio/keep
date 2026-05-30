@@ -908,6 +908,19 @@ impl Keep {
                 }
                 perms
             },
+            auto_approve_kinds: {
+                const MAX_GLOBAL_AUTO_KINDS: usize = 64;
+                if config.auto_approve_kinds.len() > MAX_GLOBAL_AUTO_KINDS {
+                    return Err(KeepError::InvalidInput(format!(
+                        "Too many global auto-approve kinds: {} (max {MAX_GLOBAL_AUTO_KINDS})",
+                        config.auto_approve_kinds.len()
+                    )));
+                }
+                let mut kinds = config.auto_approve_kinds.clone();
+                kinds.sort_unstable();
+                kinds.dedup();
+                kinds
+            },
         };
         self.storage.store_relay_config(&normalized_config)
     }

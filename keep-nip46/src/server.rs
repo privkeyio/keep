@@ -38,6 +38,11 @@ pub struct ServerConfig {
     /// Lets a headless bunker accept signing requests from CLI-managed apps
     /// (`keep nip46 grant <pubkey> ...`) without an interactive approval prompt.
     pub pre_grants: Vec<PreGrantedApp>,
+    /// Global event kinds that skip the approval prompt for every client,
+    /// independent of any per-app `auto_approve_kinds`. Set via
+    /// `keep nip46 auto-approve`. Only meaningful for interactive serving;
+    /// in headless mode every request is auto-approved regardless.
+    pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
 }
 
 /// A NIP-46 client app whose permissions are loaded into the
@@ -64,6 +69,7 @@ impl Default for ServerConfig {
             kill_switch: None,
             connect_grant: Permission::DEFAULT,
             pre_grants: Vec::new(),
+            auto_approve_kinds: std::collections::HashSet::from([nostr_sdk::Kind::Reaction]),
         }
     }
 }
@@ -291,6 +297,10 @@ impl Server {
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         apply_pre_grants(&permissions, &config.pre_grants).await;
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(config.auto_approve_kinds.clone());
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_auto_approve(config.auto_approve)
@@ -390,6 +400,10 @@ impl Server {
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         apply_pre_grants(&permissions, &config.pre_grants).await;
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(config.auto_approve_kinds.clone());
         let audit = Arc::new(Mutex::new(AuditLog::new(config.audit_log_capacity)));
         let handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_network_frost_signer(network_signer)

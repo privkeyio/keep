@@ -1935,6 +1935,7 @@ impl KeepMobile {
                     bunker_relays: stored.bunker_relays,
                     peer_policies: stored.peer_policies,
                     bunker_permissions: stored.bunker_permissions,
+                    auto_approve_kinds: Vec::new(),
                 });
             }
         }

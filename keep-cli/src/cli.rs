@@ -224,6 +224,19 @@ pub(crate) enum Nip46Commands {
         #[arg(help = "Client app's nostr pubkey (hex or npub)")]
         pubkey: String,
     },
+    /// Set the global list of event kinds auto-approved for every client.
+    ///
+    /// Independent of a grant's per-app `auto_approve_kinds`. Applies when
+    /// serving with an interactive approval prompt; headless serving
+    /// auto-approves every request regardless. Pass no kinds to clear.
+    AutoApprove {
+        #[arg(
+            long,
+            help = "Comma-separated event kinds to auto-approve (e.g. '1,7'). Empty clears the list.",
+            default_value = ""
+        )]
+        kinds: String,
+    },
 }
 
 #[derive(Subcommand)]
