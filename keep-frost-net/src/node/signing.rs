@@ -102,7 +102,7 @@ impl KfpNode {
     /// A share imported from a transport export carries only its own verifying
     /// share (the export does not include the other members' shares), so
     /// `self.share.pubkey_package()` alone is missing the co-signers' verifying
-    /// shares that `frost::aggregate` needs to validate their signature shares, 
+    /// shares that `frost::aggregate` needs to validate their signature shares,
     /// without them aggregation fails with "Unknown identifier". Fill the gaps
     /// from the verifying share each peer announced (authenticated via
     /// proof-of-share on discovery), reconstructing the dealer's full package.

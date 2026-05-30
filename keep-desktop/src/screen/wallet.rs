@@ -1828,13 +1828,10 @@ impl State {
                         None => "unknown".into(),
                     };
 
-                    let header =
-                        row![
-                            text(format!("PSBT signature request, session {sid_short}"))
-                                .size(theme::size::SMALL)
-                                .color(theme::color::TEXT_MUTED),
-                        ]
-                        .align_y(Alignment::Center);
+                    let header = row![text(format!("PSBT signature request, session {sid_short}"))
+                        .size(theme::size::SMALL)
+                        .color(theme::color::TEXT_MUTED),]
+                    .align_y(Alignment::Center);
 
                     let details = column![
                         text(format!("From: {initiator_short}"))
