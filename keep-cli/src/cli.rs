@@ -172,9 +172,12 @@ pub(crate) enum WalletCommands {
     },
     /// Create a simple descriptor from a FROST group (no recovery tiers)
     Descriptor {
-        #[arg(short, long, help = "FROST group pubkey hex")]
+        #[arg(short, long, help = "FROST group npub or hex")]
         group: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default to prevent silent testnet outputs."
+        )]
         network: String,
         #[arg(
             long,
@@ -234,7 +237,10 @@ pub(crate) enum WalletCommands {
     Propose {
         #[arg(short, long, help = "FROST group npub or hex")]
         group: String,
-        #[arg(long, default_value = "signet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default to prevent silent signet proposals."
+        )]
         network: String,
         #[arg(short, long, help = "Nostr relay URL")]
         relay: Option<String>,
@@ -549,7 +555,10 @@ pub(crate) enum BitcoinCommands {
         key: String,
         #[arg(short, long, default_value = "1")]
         count: u32,
-        #[arg(long, default_value = "testnet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default to prevent silent testnet outputs (fund-loss risk if treated as mainnet)."
+        )]
         network: String,
     },
     Descriptor {
@@ -557,7 +566,10 @@ pub(crate) enum BitcoinCommands {
         key: String,
         #[arg(long, default_value = "0")]
         account: u32,
-        #[arg(long, default_value = "testnet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default."
+        )]
         network: String,
     },
     Sign {
@@ -567,13 +579,19 @@ pub(crate) enum BitcoinCommands {
         psbt: String,
         #[arg(short, long)]
         output: Option<String>,
-        #[arg(long, default_value = "testnet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default."
+        )]
         network: String,
     },
     Analyze {
         #[arg(short, long)]
         psbt: String,
-        #[arg(long, default_value = "testnet")]
+        #[arg(
+            long,
+            help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default."
+        )]
         network: String,
     },
 }
@@ -595,6 +613,8 @@ mod tests {
             "main",
             "--psbt",
             "/tmp/unsigned.psbt",
+            "--network",
+            "mainnet",
         ])
         .expect("parse bitcoin sign args");
 
