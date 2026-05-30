@@ -1013,59 +1013,80 @@ impl KfpNode {
         )
         .map_err(|e| FrostNetError::Session(e.to_string()))?;
 
-        let key_proof_psbt_bytes = match self.build_key_proof(
-            &payload.session_id,
-            our_index,
-            our_xpub.as_deref(),
-            &session_network,
-        ) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let reason = format!("Key proof failed: {e}");
-                self.descriptor_sessions
-                    .write()
-                    .remove_session(&payload.session_id);
-                self.send_descriptor_nack(payload.session_id, &sender, &reason)
-                    .await;
-                let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
-                    session_id: payload.session_id,
-                    error: reason.clone(),
-                });
-                return Err(FrostNetError::Session(reason));
-            }
-        };
+        // #423: only contributing peers need to prove ownership of an xpub and
+        // ACK; peers not selected as contributors (`our_xpub == None`) have no
+        // xpub to prove and the proposer's `expected_acks` already excludes
+        // them (see `cmd_frost_network_propose_descriptor`'s contributor-filtered
+        // expected_acks construction). Without this gate, the excluded peer
+        // tried to build a key-proof, failed with "Missing own xpub
+        // contribution for key proof", sent a NACK, removed its session, and
+        // surfaced a `DescriptorFailed` event — even though the proposer's view
+        // was successful. Now: skip the ACK round entirely when we're not a
+        // contributor and proceed straight to local finalization.
+        let we_are_contributor = our_xpub.is_some();
+        if we_are_contributor {
+            let key_proof_psbt_bytes = match self.build_key_proof(
+                &payload.session_id,
+                our_index,
+                our_xpub.as_deref(),
+                &session_network,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let reason = format!("Key proof failed: {e}");
+                    self.descriptor_sessions
+                        .write()
+                        .remove_session(&payload.session_id);
+                    self.send_descriptor_nack(payload.session_id, &sender, &reason)
+                        .await;
+                    let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
+                        session_id: payload.session_id,
+                        error: reason.clone(),
+                    });
+                    return Err(FrostNetError::Session(reason));
+                }
+            };
 
-        let ack = DescriptorAckPayload::new(
-            payload.session_id,
-            self.group_pubkey,
-            descriptor_hash,
-            key_proof_psbt_bytes,
-        );
-        let msg = KfpMessage::DescriptorAck(ack);
-        let json = msg.to_json()?;
+            let ack = DescriptorAckPayload::new(
+                payload.session_id,
+                self.group_pubkey,
+                descriptor_hash,
+                key_proof_psbt_bytes,
+            );
+            let msg = KfpMessage::DescriptorAck(ack);
+            let json = msg.to_json()?;
 
-        let encrypted = nip44::encrypt(self.keys.secret_key(), &sender, &json, nip44::Version::V2)
-            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+            let encrypted =
+                nip44::encrypt(self.keys.secret_key(), &sender, &json, nip44::Version::V2)
+                    .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
-        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
-            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-            .tag(Tag::public_key(sender))
-            .tag(Tag::custom(
-                TagKind::custom("g"),
-                [hex::encode(self.group_pubkey)],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("s"),
-                [hex::encode(payload.session_id)],
-            ))
-            .tag(Tag::custom(TagKind::custom("t"), ["descriptor_ack"]))
-            .sign_with_keys(&self.keys)
-            .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
+            let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+                .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+                .tag(Tag::public_key(sender))
+                .tag(Tag::custom(
+                    TagKind::custom("g"),
+                    [hex::encode(self.group_pubkey)],
+                ))
+                .tag(Tag::custom(
+                    TagKind::custom("s"),
+                    [hex::encode(payload.session_id)],
+                ))
+                .tag(Tag::custom(TagKind::custom("t"), ["descriptor_ack"]))
+                .sign_with_keys(&self.keys)
+                .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.client
+                .send_event(&event)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        } else {
+            let _ = descriptor_hash; // silence unused-variable warning when no ACK is sent
+            debug!(
+                session_id = %hex::encode(payload.session_id),
+                our_index,
+                "not a contributor for this tier; skipping key-proof and ACK"
+            );
+        }
 
         {
             let mut sessions = self.descriptor_sessions.write();
