@@ -38,11 +38,21 @@ pub(crate) enum Commands {
     Generate {
         #[arg(short, long, default_value = "default")]
         name: String,
+        #[arg(
+            long,
+            help = "Allow generating a second key under an existing name. Default refuses so name-based operations stay unambiguous."
+        )]
+        force: bool,
     },
     /// Import an existing Nostr nsec into the vault
     Import {
         #[arg(short, long, default_value = "imported")]
         name: String,
+        #[arg(
+            long,
+            help = "Allow importing under an existing name. Default refuses so name-based operations stay unambiguous."
+        )]
+        force: bool,
     },
     /// List keys stored in the vault
     List,

@@ -116,15 +116,21 @@ pub fn cmd_init(out: &Output, path: &Path, hidden: bool, size_mb: u64) -> Result
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
-pub fn cmd_generate(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
+pub fn cmd_generate(
+    out: &Output,
+    path: &Path,
+    name: &str,
+    hidden: bool,
+    force: bool,
+) -> Result<()> {
     if hidden {
-        return cmd_generate_hidden(out, path, name);
+        return cmd_generate_hidden(out, path, name, force);
     }
     if is_hidden_vault(path) {
-        return cmd_generate_outer(out, path, name);
+        return cmd_generate_outer(out, path, name, force);
     }
 
-    debug!(name, "generating key");
+    debug!(name, force, "generating key");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -132,6 +138,12 @@ pub fn cmd_generate(out: &Output, path: &Path, name: &str, hidden: bool) -> Resu
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
     spinner.finish();
+
+    if !force && keep.keyring().get_by_name(name).is_some() {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let spinner = out.spinner("Generating key...");
     let pubkey = keep.generate_key(name)?;
@@ -148,12 +160,12 @@ pub fn cmd_generate(out: &Output, path: &Path, name: &str, hidden: bool) -> Resu
     Ok(())
 }
 
-fn cmd_generate_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
+fn cmd_generate_outer(out: &Output, path: &Path, name: &str, force: bool) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
-    debug!(name, "generating key in outer volume");
+    debug!(name, force, "generating key in outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
     let password = get_password("Enter password")?;
@@ -161,6 +173,12 @@ fn cmd_generate_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
+
+    if !force && storage.list_keys()?.iter().any(|k| k.name == name) {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let spinner = out.spinner("Generating key...");
     let keypair = NostrKeypair::generate()?;
@@ -187,12 +205,12 @@ fn cmd_generate_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
+fn cmd_generate_hidden(out: &Output, path: &Path, name: &str, force: bool) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
-    debug!(name, "generating key in hidden volume");
+    debug!(name, force, "generating key in hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
     let password = get_hidden_password("Enter HIDDEN password")?;
@@ -200,6 +218,12 @@ fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
+
+    if !force && storage.list_keys()?.iter().any(|k| k.name == name) {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists in hidden volume; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let spinner = out.spinner("Generating key...");
     let keypair = NostrKeypair::generate()?;
@@ -227,15 +251,15 @@ fn cmd_generate_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
-pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
+pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool, force: bool) -> Result<()> {
     if hidden {
-        return cmd_import_hidden(out, path, name);
+        return cmd_import_hidden(out, path, name, force);
     }
     if is_hidden_vault(path) {
-        return cmd_import_outer(out, path, name);
+        return cmd_import_outer(out, path, name, force);
     }
 
-    debug!(name, "importing key");
+    debug!(name, force, "importing key");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -243,6 +267,12 @@ pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
     spinner.finish();
+
+    if !force && keep.keyring().get_by_name(name).is_some() {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let nsec = get_nsec("Enter nsec")?;
 
@@ -261,12 +291,12 @@ pub fn cmd_import(out: &Output, path: &Path, name: &str, hidden: bool) -> Result
     Ok(())
 }
 
-fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
+fn cmd_import_outer(out: &Output, path: &Path, name: &str, force: bool) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
-    debug!(name, "importing key to outer volume");
+    debug!(name, force, "importing key to outer volume");
 
     let mut storage = HiddenStorage::open(path)?;
     let password = get_password("Enter password")?;
@@ -274,6 +304,12 @@ fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     let spinner = out.spinner("Unlocking vault...");
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
+
+    if !force && storage.list_keys()?.iter().any(|k| k.name == name) {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let nsec = get_nsec("Enter nsec")?;
 
@@ -302,12 +338,12 @@ fn cmd_import_outer(out: &Output, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
+fn cmd_import_hidden(out: &Output, path: &Path, name: &str, force: bool) -> Result<()> {
     use keep_core::crypto;
     use keep_core::hidden::HiddenStorage;
     use keep_core::keys::{KeyRecord, KeyType, NostrKeypair};
 
-    debug!(name, "importing key to hidden volume");
+    debug!(name, force, "importing key to hidden volume");
 
     let mut storage = HiddenStorage::open(path)?;
     let password = get_hidden_password("Enter HIDDEN password")?;
@@ -315,6 +351,12 @@ fn cmd_import_hidden(out: &Output, path: &Path, name: &str) -> Result<()> {
     let spinner = out.spinner("Unlocking hidden volume...");
     storage.unlock_hidden(password.expose_secret())?;
     spinner.finish();
+
+    if !force && storage.list_keys()?.iter().any(|k| k.name == name) {
+        return Err(KeepError::InvalidInput(format!(
+            "key with name '{name}' already exists in hidden volume; pick a different --name or pass --force to allow duplicates"
+        )));
+    }
 
     let nsec = get_nsec("Enter nsec")?;
 
@@ -854,6 +896,31 @@ pub fn cmd_backup(out: &Output, path: &Path, output: Option<&Path>) -> Result<()
     Ok(())
 }
 
+/// Rewrap parse-stage errors from `restore_backup` with a user-level headline.
+///
+/// The underlying parser surfaces low-level details like "backup argon2
+/// iterations out of range" when the file is just garbage. That reads like a
+/// keep bug; lead with the actual diagnosis and keep the technical detail as
+/// a "Details:" hint.
+fn map_restore_error(e: KeepError) -> KeepError {
+    let detail = e.to_string();
+    let is_parse_stage = detail.contains("backup file too small")
+        || detail.contains("backup file too large")
+        || detail.contains("invalid backup file magic")
+        || detail.contains("unsupported backup version")
+        || detail.contains("unsupported backup flags")
+        || detail.contains("backup header truncated")
+        || detail.contains("backup argon2")
+        || detail.contains("backup deserialization failed");
+    if is_parse_stage {
+        KeepError::InvalidInput(format!(
+            "backup file appears corrupted or is not a valid keep backup (details: {detail})"
+        ))
+    } else {
+        e
+    }
+}
+
 #[tracing::instrument(skip(out), fields(file = %file.display(), target = %target.display()))]
 pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     debug!("restoring backup");
@@ -889,7 +956,8 @@ pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
         backup_passphrase.expose_secret(),
         target,
         vault_password.expose_secret(),
-    )?;
+    )
+    .map_err(map_restore_error)?;
     spinner.finish();
 
     out.newline();
