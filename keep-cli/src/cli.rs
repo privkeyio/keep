@@ -176,6 +176,11 @@ pub(crate) enum WalletCommands {
         group: String,
         #[arg(long, default_value = "testnet")]
         network: String,
+        #[arg(
+            long,
+            help = "Allow a single-chain descriptor where external (receive) and internal (change) collapse to the same address. Required because simple FROST-key descriptors have no BIP-32 derivation; addresses will be reused. Prefer `wallet propose` with a recovery tier for proper external/internal split."
+        )]
+        allow_address_reuse: bool,
     },
     /// Delete a stored wallet descriptor
     Delete {

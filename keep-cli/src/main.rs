@@ -445,9 +445,17 @@ fn dispatch_wallet(
         WalletCommands::Export { group, format } => {
             commands::wallet::cmd_wallet_export(out, path, &group, &format)
         }
-        WalletCommands::Descriptor { group, network } => {
-            commands::wallet::cmd_wallet_descriptor(out, path, &group, &network)
-        }
+        WalletCommands::Descriptor {
+            group,
+            network,
+            allow_address_reuse,
+        } => commands::wallet::cmd_wallet_descriptor(
+            out,
+            path,
+            &group,
+            &network,
+            allow_address_reuse,
+        ),
         WalletCommands::Delete { group } => commands::wallet::cmd_wallet_delete(out, path, &group),
         WalletCommands::AnnounceKeys {
             group,

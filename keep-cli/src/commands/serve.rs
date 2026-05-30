@@ -164,7 +164,7 @@ pub fn cmd_serve(
         )));
     }
 
-    let frost_signer = if !shares.is_empty() {
+    let (frost_signer, signing_mode, signing_identity) = if !shares.is_empty() {
         let first_group = &shares[0].metadata.group_pubkey;
         let group_shares: Vec<_> = shares
             .iter()
@@ -173,30 +173,26 @@ pub fn cmd_serve(
             .collect();
         let threshold = group_shares[0].metadata.threshold as usize;
         let total = group_shares.len();
-        if total >= threshold {
+        let group_pubkey = *first_group;
+        let group_npub = bytes_to_npub(&group_pubkey);
+        let mode = format!("FROST {threshold}-of-{total}");
+        let signer = if total >= threshold {
             let data_key = keep.data_key()?;
-            let group_pubkey = *first_group;
-            match FrostSigner::new(group_pubkey, group_shares, data_key) {
-                Ok(signer) => {
-                    out.field("Signing mode", &format!("FROST {threshold}-of-{total}"));
-                    out.field("Signing identity", &bytes_to_npub(&group_pubkey));
-                    Some(signer)
-                }
-                Err(_) => None,
-            }
+            FrostSigner::new(group_pubkey, group_shares, data_key).ok()
         } else {
             None
-        }
+        };
+        (signer, mode, group_npub)
     } else {
         let primary_npub = keep
             .keyring()
             .get_primary()
             .map(|slot| bytes_to_npub(&slot.pubkey))
             .unwrap_or_else(|| "(no keys)".to_string());
-        out.field("Signing mode", "Single-key");
-        out.field("Signing identity", &primary_npub);
-        None
+        (None, "Single-key".to_string(), primary_npub)
     };
+    out.field("Signing mode", &signing_mode);
+    out.field("Signing identity", &signing_identity);
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =

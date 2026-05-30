@@ -169,6 +169,7 @@ pub fn cmd_wallet_descriptor(
     path: &Path,
     group_hex: &str,
     network: &str,
+    allow_address_reuse: bool,
 ) -> Result<()> {
     let group_pubkey = parse_group_hex(group_hex)?;
     let net = crate::commands::bitcoin::parse_network(network)?;
@@ -179,6 +180,12 @@ pub fn cmd_wallet_descriptor(
     let internal = export
         .internal_descriptor()
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
+
+    if internal == export.descriptor && !allow_address_reuse {
+        return Err(KeepError::InvalidInput(
+            "simple FROST-key descriptor has identical external (receive) and internal (change) outputs; the wallet would reuse the same address for every receive and every change output. Pass --allow-address-reuse to accept this for single-address use cases, or use `keep wallet propose` with a recovery tier for a wallet with proper external/internal split.".into(),
+        ));
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -218,6 +225,12 @@ pub fn cmd_wallet_descriptor(
     out.field("External (receive)", &export.descriptor);
     out.newline();
     out.field("Internal (change)", &internal);
+    if internal == export.descriptor {
+        out.newline();
+        out.warn(
+            "Single-chain descriptor: every receive and every change output lands on the same address. Address reuse weakens on-chain privacy.",
+        );
+    }
 
     Ok(())
 }
