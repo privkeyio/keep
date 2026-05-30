@@ -553,7 +553,7 @@ pub(crate) enum BitcoinCommands {
     Sign {
         #[arg(short, long)]
         key: String,
-        #[arg(short, long)]
+        #[arg(long)]
         psbt: String,
         #[arg(short, long)]
         output: Option<String>,
@@ -566,6 +566,53 @@ pub(crate) enum BitcoinCommands {
         #[arg(long, default_value = "testnet")]
         network: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn bitcoin_sign_short_p_is_global_path_not_psbt() {
+        let cli = Cli::try_parse_from([
+            "keep",
+            "-p",
+            "/tmp/vault",
+            "bitcoin",
+            "sign",
+            "--key",
+            "main",
+            "--psbt",
+            "/tmp/unsigned.psbt",
+        ])
+        .expect("parse bitcoin sign args");
+
+        assert_eq!(cli.path, Some(PathBuf::from("/tmp/vault")));
+
+        let Commands::Bitcoin { command } = cli.command else {
+            panic!("expected bitcoin command");
+        };
+        let BitcoinCommands::Sign { psbt, .. } = command else {
+            panic!("expected bitcoin sign command");
+        };
+        assert_eq!(psbt, "/tmp/unsigned.psbt");
+    }
+
+    #[test]
+    fn bitcoin_sign_help_does_not_show_short_psbt_flag() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("bitcoin")
+            .expect("bitcoin subcommand")
+            .find_subcommand_mut("sign")
+            .expect("sign subcommand")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("--psbt <PSBT>"));
+        assert!(!help.contains("-p, --psbt"));
+    }
 }
 
 #[derive(Subcommand)]
