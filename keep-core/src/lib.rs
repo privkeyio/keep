@@ -401,6 +401,20 @@ impl Keep {
         &self.keyring
     }
 
+    /// Decrypted audit log entries for this vault, in chronological order.
+    /// Returns an empty vec if the audit log file does not exist yet.
+    ///
+    /// # Errors
+    /// Returns [`KeepError::Locked`] if the vault is not unlocked.
+    pub fn read_audit_entries(&self) -> Result<Vec<AuditEntry>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let data_key = self.get_data_key()?;
+        let audit = AuditLog::open(self.storage.path(), &data_key)?;
+        audit.read_all(&data_key)
+    }
+
     /// Mutable access to the keyring.
     pub fn keyring_mut(&mut self) -> &mut Keyring {
         &mut self.keyring

@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::audit::{AuditEntry, AuditLog};
 use crate::crypto::{self, Argon2Params, EncryptedData, NONCE_SIZE, SALT_SIZE};
 use crate::entropy;
 use crate::error::{KeepError, Result};
@@ -48,6 +49,12 @@ struct VaultBackup {
     relay_configs: Vec<RelayConfig>,
     health_statuses: Vec<KeyHealthStatus>,
     config: BackupConfig,
+    /// Decrypted audit entries from the source vault. Re-encrypted under
+    /// the restored vault's new data key on restore; the hash chain is
+    /// re-derived from a fresh root, so individual entry hashes will
+    /// differ from the source but the timeline of events is preserved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    audit_entries: Vec<AuditEntry>,
 }
 
 /// A key entry in a backup file.
@@ -157,6 +164,8 @@ pub struct DecryptedBackup {
     pub health_statuses: Vec<KeyHealthStatus>,
     /// Backup configuration (kill switch, proxy).
     pub config: BackupConfig,
+    /// Decrypted audit entries from the source vault.
+    pub audit_entries: Vec<AuditEntry>,
     /// ISO-8601 timestamp when the backup was created.
     pub created_at: String,
 }
@@ -188,6 +197,7 @@ fn string_to_key_type(s: &str) -> Result<KeyType> {
 }
 
 /// Create an encrypted backup from pre-gathered data.
+#[allow(clippy::too_many_arguments)]
 pub fn create_backup_from_data(
     keys: Vec<BackupKey>,
     shares: Vec<BackupShare>,
@@ -195,6 +205,7 @@ pub fn create_backup_from_data(
     relay_configs: Vec<RelayConfig>,
     health_statuses: Vec<KeyHealthStatus>,
     config: BackupConfig,
+    audit_entries: Vec<AuditEntry>,
     passphrase: &str,
 ) -> Result<Vec<u8>> {
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
@@ -212,6 +223,7 @@ pub fn create_backup_from_data(
         relay_configs,
         health_statuses,
         config,
+        audit_entries,
     };
 
     let mut json_bytes = serde_json::to_vec(&backup)
@@ -292,6 +304,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let health_statuses = keep.list_health_statuses()?;
     let kill_switch = keep.get_kill_switch()?;
     let proxy = keep.get_proxy_config()?;
+    let audit_entries = keep.read_audit_entries()?;
 
     create_backup_from_data(
         backup_keys,
@@ -303,6 +316,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             kill_switch,
             proxy: if proxy.enabled { Some(proxy) } else { None },
         },
+        audit_entries,
         passphrase,
     )
 }
@@ -413,6 +427,7 @@ pub fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<DecryptedBackup> 
         relay_configs: vault.relay_configs,
         health_statuses: vault.health_statuses,
         config: vault.config,
+        audit_entries: vault.audit_entries,
         created_at: vault.created_at,
     })
 }
@@ -495,6 +510,14 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
     keep.set_kill_switch(backup.config.kill_switch)?;
     if let Some(proxy) = &backup.config.proxy {
         keep.set_proxy_config(proxy)?;
+    }
+
+    if !backup.audit_entries.is_empty() {
+        let data_key = keep.data_key()?;
+        let mut audit = AuditLog::open(path, &data_key)?;
+        for entry in &backup.audit_entries {
+            audit.log(entry.clone(), &data_key)?;
+        }
     }
 
     drop(keep);
@@ -617,5 +640,56 @@ mod tests {
         let result = verify_backup(&data, "any-pass");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    #[test]
+    fn test_audit_log_preserved_across_backup_restore() {
+        // Backup must ship decrypted audit entries; restore must re-encrypt
+        // them under the new vault's data key and emit a hash chain that
+        // verifies cleanly. Without this, `audit list` / `audit verify` on a
+        // restored vault sees zero history (the silent regression from #447).
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let mut keep = create_test_keep(&src_path);
+        // `Keep::create_with_params` returns unlocked but with audit = None.
+        // Call unlock so subsequent operations write audit entries (matches
+        // the CLI flow which does Keep::open + unlock).
+        keep.unlock("test-password-123").unwrap();
+        keep.generate_key("k1").unwrap();
+        keep.generate_key("k2").unwrap();
+
+        let source_entries = keep.read_audit_entries().unwrap();
+        let source_count = source_entries.len();
+        assert!(source_count >= 2, "source audit must have entries");
+
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+
+        let dst_path = dir.path().join("dst");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+        let restored_entries = restored.read_audit_entries().unwrap();
+
+        // Restored vault must contain at least every source entry, in source
+        // order, before any post-restore entries the unlock above appended.
+        assert!(
+            restored_entries.len() >= source_count,
+            "restored audit must include all source entries (have {}, want >= {})",
+            restored_entries.len(),
+            source_count
+        );
+        for (i, src) in source_entries.iter().enumerate() {
+            let dst = &restored_entries[i];
+            assert_eq!(dst.event_type, src.event_type, "entry {i} event_type");
+            assert_eq!(dst.pubkey, src.pubkey, "entry {i} pubkey");
+            assert_eq!(dst.timestamp, src.timestamp, "entry {i} timestamp");
+        }
     }
 }
