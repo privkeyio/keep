@@ -1936,6 +1936,7 @@ impl KeepMobile {
             relay_configs,
             core_health,
             config,
+            Vec::new(),
             &passphrase,
         )
         .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
