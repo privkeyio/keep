@@ -15,7 +15,7 @@
 # log_level = "info"
 
 # Default Nostr relays for FROST operations
-# relays = ["wss://bucket.coracle.social/"]
+# relays = ["wss://bucket.coracle.social"]
 
 # Network operation timeout in seconds
 # timeout = 30

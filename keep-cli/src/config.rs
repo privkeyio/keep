@@ -160,7 +160,7 @@ impl Config {
         self.relays
             .first()
             .map(|s| s.as_str())
-            .unwrap_or("wss://bucket.coracle.social/")
+            .unwrap_or("wss://bucket.coracle.social")
     }
 
     pub fn timeout_secs(&self) -> u64 {
