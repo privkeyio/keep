@@ -14,11 +14,28 @@ use crate::output::Output;
 
 use super::get_password;
 
+/// Gate the mock-enclave path behind a loud, deliberate env var so it cannot
+/// be invoked accidentally in scripts that meant to talk to a real Nitro
+/// Enclave. The mock produces fake attestations and signatures that pass
+/// the local CLI smoke test, but a downstream caller that scrapes the output
+/// has no way to tell the difference from a real signature.
+fn check_local_gate() -> Result<()> {
+    if std::env::var("KEEP_ENCLAVE_MOCK").as_deref() == Ok("1") {
+        Ok(())
+    } else {
+        Err(KeepError::InvalidInput(
+            "--local uses an in-process MOCK enclave that produces fake attestations and signatures (NOT cryptographically verifiable). Set KEEP_ENCLAVE_MOCK=1 to confirm you intend to run the mock path; never set this in production."
+                .into(),
+        ))
+    }
+}
+
 pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
     out.newline();
     out.header("Enclave Status");
 
     if local {
+        check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
         let mut nonce = [0u8; 32];
@@ -77,6 +94,7 @@ pub fn cmd_enclave_verify(
     out.header("Enclave Attestation Verification");
 
     if local {
+        check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
         let mut nonce = [0u8; 32];
@@ -158,6 +176,7 @@ pub fn cmd_enclave_generate_key(out: &Output, name: &str, cid: u32, local: bool)
     out.header("Generate Key in Enclave");
 
     if local {
+        check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
 
@@ -240,6 +259,7 @@ pub fn cmd_enclave_sign(
         hex::decode(message).map_err(|_| KeepError::InvalidInput("invalid message hex".into()))?;
 
     if local {
+        check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
 
@@ -349,6 +369,7 @@ pub fn cmd_enclave_import_key(
     };
 
     if local {
+        check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
 
