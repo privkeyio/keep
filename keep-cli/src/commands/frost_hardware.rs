@@ -81,6 +81,14 @@ fn list_one(out: &Output, device: &str) -> Result<()> {
 }
 
 fn enumerate_and_list(out: &Output) -> Result<()> {
+    use std::time::Duration;
+
+    // Short per-probe timeout so a stuck or non-keep serial device fails fast
+    // rather than blocking the entire scan ~30s. The default constructor's 30s
+    // timeout is still used by `cmd_frost_hardware_list` (single-device path)
+    // and by other hardware commands.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
     out.newline();
     out.header("Hardware Signer Devices");
     out.newline();
@@ -94,20 +102,25 @@ fn enumerate_and_list(out: &Output) -> Result<()> {
     let mut found = 0usize;
     for candidate in &candidates {
         out.field("Probing", candidate);
-        match HardwareSigner::new(candidate) {
+        match HardwareSigner::with_timeout(candidate, PROBE_TIMEOUT) {
             Ok(mut signer) => match signer.ping() {
                 Ok(version) => {
                     found += 1;
                     out.field("  Version", &version);
-                    if let Ok(shares) = signer.list_shares() {
-                        if shares.is_empty() {
-                            out.info("  No shares stored");
-                        } else {
-                            out.info(&format!("  {} share(s):", shares.len()));
-                            for share in shares {
-                                out.field("    Group", &share);
+                    match signer.list_shares() {
+                        Ok(shares) => {
+                            if shares.is_empty() {
+                                out.info("  No shares stored");
+                            } else {
+                                out.info(&format!("  {} share(s):", shares.len()));
+                                for share in shares {
+                                    out.field("    Group", &share);
+                                }
                             }
                         }
+                        Err(e) => out.info(&format!(
+                            "  Could not list shares on {candidate}: {e}"
+                        )),
                     }
                 }
                 Err(e) => out.info(&format!("  Not a keep hardware signer: {e}")),
