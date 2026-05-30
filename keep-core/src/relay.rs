@@ -154,16 +154,22 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
         return Err("URL too long".into());
     }
 
+    // `ws://` is normally rejected in release builds. It can be opted into via
+    // the `allow-ws` Cargo feature (for tests) or the `KEEP_ALLOW_WS=1` runtime
+    // env (for local development against `nak serve`). Both knobs are intended
+    // for non-production use; production deployments should always speak wss://.
+    let ws_allowed_at_runtime =
+        cfg!(feature = "allow-ws") || std::env::var("KEEP_ALLOW_WS").as_deref() == Ok("1");
     let rest = url
         .strip_prefix("wss://")
         .or_else(|| {
-            if cfg!(feature = "allow-ws") {
+            if ws_allowed_at_runtime {
                 url.strip_prefix("ws://")
             } else {
                 None
             }
         })
-        .ok_or("Must use wss:// protocol")?;
+        .ok_or("Must use wss:// protocol (set KEEP_ALLOW_WS=1 for local-only ws:// testing)")?;
 
     if rest.is_empty() {
         return Err("Missing host".into());
