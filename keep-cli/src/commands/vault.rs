@@ -611,8 +611,7 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
 
     let mut keep = Keep::open(path)?;
     let old_password = get_password("Enter current password")?;
-    let new_password =
-        get_new_password_with_confirm("Enter new password", "Confirm new password")?;
+    let new_password = get_new_password_with_confirm("Enter new password", "Confirm new password")?;
 
     if new_password.expose_secret().len() < 8 {
         return Err(KeepError::InvalidInput(
