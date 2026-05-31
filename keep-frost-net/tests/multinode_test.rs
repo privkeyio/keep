@@ -390,6 +390,195 @@ async fn test_full_signing_flow() {
     }
 }
 
+/// Regression for the ping/pong self-deadlock: `handle_ping`/`handle_pong`
+/// previously held a `peers.read()` guard across a `peers.write()` in the same
+/// task, which deadlocks the non-reentrant lock once ping traffic flows. Calling
+/// `health_check` (which pings every peer) while the node loop is running, then
+/// signing, must both complete rather than hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore] // Needs running nodes on a MockRelay - run with: cargo test -- --ignored
+async fn test_health_check_then_sign_no_deadlock() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-health").unwrap();
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()]).await.unwrap();
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()]).await.unwrap();
+    let mut node3 = KfpNode::new(share3, vec![relay]).await.unwrap();
+
+    let mut rx3 = node3.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node3 = Arc::new(node3);
+    let node3_for_run = Arc::clone(&node3);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = node3_for_run.run().await;
+    });
+
+    let mut peers_discovered = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
+    }
+
+    // The deadlock manifested here: before the fix this never returned.
+    let health = timeout(
+        Duration::from_secs(15),
+        node3.health_check(Duration::from_secs(2)),
+    )
+    .await;
+
+    // Signing after the ping round-trip must also still complete.
+    let sign_result = timeout(Duration::from_secs(60), async {
+        node3
+            .request_signature(b"health-then-sign".to_vec(), "raw")
+            .await
+    })
+    .await;
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+
+    let health = health
+        .expect("health_check deadlocked (did not return within 15s)")
+        .expect("health_check returned an error");
+    assert_eq!(
+        health.responsive.len(),
+        2,
+        "both co-signers should answer the liveness ping"
+    );
+    match sign_result {
+        Ok(Ok(signature)) => assert_eq!(signature.len(), 64),
+        Ok(Err(e)) => panic!("Signing after health check failed: {e:?}"),
+        Err(_) => panic!("Signing after health check timed out"),
+    }
+}
+
+/// Issue #412 acceptance: a co-signer taken offline mid-session must fail over
+/// to the surviving co-signer within a few seconds, not tens of seconds. The
+/// pre-round liveness ping excludes the freshly-dropped peer (still "online" by
+/// its recent announce) before committing, so signing goes straight to the live
+/// peer. The 12s bound is comfortably above the ~3s ping budget + one round, but
+/// below the ~15s a single doomed round would cost without the pre-ping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore] // Needs running nodes on a MockRelay - run with: cargo test -- --ignored
+async fn test_failover_when_cosigner_dropped_mid_session() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-failover").unwrap();
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()]).await.unwrap();
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()]).await.unwrap();
+    let mut node3 = KfpNode::new(share3, vec![relay]).await.unwrap();
+
+    let mut rx3 = node3.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node3 = Arc::new(node3);
+    let node3_for_run = Arc::clone(&node3);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = node3_for_run.run().await;
+    });
+
+    let mut peers_discovered = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
+    }
+
+    // Warm up with one all-online signature first. This mirrors the issue #412
+    // scenario (repeated signing after approvals) and ensures the relay
+    // connections/ping path are warm so the liveness pong is prompt.
+    let warmup = timeout(Duration::from_secs(60), async {
+        node3.request_signature(b"warmup".to_vec(), "raw").await
+    })
+    .await;
+    if !matches!(warmup, Ok(Ok(_))) {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Warm-up signing failed: {warmup:?}");
+    }
+
+    // Take co-signer node2 offline. It stays "online" in node3's peer table for
+    // up to offline_threshold, so without the pre-ping node3 may still select it
+    // and burn a full round timeout. node1 remains live.
+    graceful_shutdown(shutdown2, node2_handle).await;
+
+    let started = std::time::Instant::now();
+    let sign_result = timeout(Duration::from_secs(30), async {
+        node3.request_signature(b"failover".to_vec(), "raw").await
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+
+    match sign_result {
+        Ok(Ok(signature)) => assert_eq!(signature.len(), 64),
+        Ok(Err(e)) => panic!("Failover signing failed: {e:?}"),
+        Err(_) => panic!("Failover signing timed out after 30s"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(12),
+        "failover took {elapsed:?}, expected a few seconds (pre-ping should exclude the dead co-signer up front)"
+    );
+}
+
 /// Regression: a share imported from a transport export carries only its own
 /// verifying share, so its `pubkey_package` is missing the co-signers' shares
 /// that `frost::aggregate` needs. The initiator must reconstruct the full

@@ -27,6 +27,12 @@ pub(crate) const SIGNING_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
 /// `SIGNING_ROUND_TIMEOUT`) under a partition or latency event.
 pub(crate) const MAX_FAILOVER_ATTEMPTS: usize = 3;
 
+/// Wait for the pre-round liveness ping. A co-signer that dropped since its last
+/// announce is excluded after at most this long, instead of burning a full
+/// `SIGNING_ROUND_TIMEOUT` round. The ping returns as soon as every co-signer
+/// pongs, so the all-online path is bounded by one round-trip, not this value.
+const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Error from a single signing round. `attempted` lists the non-self peers that
 /// failed to respond in this round, so a timed-out round can exclude them and
 /// fail over to other live co-signers.
@@ -999,6 +1005,58 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Pings every eligible co-signer before the first round and returns the
+    /// ones that fail to pong, so a peer that dropped since its last announce is
+    /// excluded up front instead of being selected and burning a full round
+    /// timeout before failover kicks in (the slow case in issue #412). The ping
+    /// resolves as soon as all co-signers answer, so the all-online happy path
+    /// only pays one round-trip. It is skipped entirely when the group has no
+    /// spare co-signers (single-peer / exactly-threshold), and its result is
+    /// ignored if too few peers answer to still reach threshold, since then the
+    /// normal round and failover should decide rather than a flaky ping.
+    async fn prune_unresponsive_cosigners(&self) -> Vec<u16> {
+        let needed = (self.share.metadata.threshold as usize).saturating_sub(1);
+        let snapshot: Vec<(u16, PublicKey, std::time::Instant)> = {
+            let peers = self.peers.read();
+            peers
+                .get_signing_peers()
+                .into_iter()
+                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .map(|p| (p.share_index, p.pubkey, p.last_seen))
+                .collect()
+        };
+        if snapshot.len() <= needed {
+            return Vec::new();
+        }
+
+        let responsive = match self
+            .ping_peers_snapshot(&snapshot, LIVENESS_PING_TIMEOUT, Some(snapshot.len()))
+            .await
+        {
+            Ok(responsive) => responsive,
+            Err(e) => {
+                warn!(error = %e, "liveness ping failed; proceeding without pre-exclusion");
+                return Vec::new();
+            }
+        };
+        if responsive.len() < needed {
+            return Vec::new();
+        }
+
+        let unresponsive: Vec<u16> = snapshot
+            .iter()
+            .map(|(idx, _, _)| *idx)
+            .filter(|idx| !responsive.contains(idx))
+            .collect();
+        if !unresponsive.is_empty() {
+            warn!(
+                excluded = ?unresponsive,
+                "excluding co-signers that failed the pre-round liveness ping"
+            );
+        }
+        unresponsive
+    }
+
     pub async fn request_signature(
         &self,
         mut message: Vec<u8>,
@@ -1022,7 +1080,11 @@ impl KfpNode {
         // real per-participant session id for that). Two requests for the same
         // message intentionally share this id; do not treat it as unique.
         let logical_id = derive_session_id(&message, &[], self.share.metadata.threshold);
-        let mut excluded: Vec<u16> = Vec::new();
+        // Drop co-signers that are already unreachable before committing, so the
+        // first round goes straight to live peers instead of timing out on a
+        // dead one. Peers that drop mid-round are still caught by the failover
+        // exclusion below.
+        let mut excluded: Vec<u16> = self.prune_unresponsive_cosigners().await;
         for attempt in 0..MAX_FAILOVER_ATTEMPTS {
             let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
             let round_message = if last {

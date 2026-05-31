@@ -6,7 +6,7 @@ mod psbt;
 mod signing;
 
 pub use psbt::PsbtSessionSnapshot;
-pub(crate) use signing::{MAX_FAILOVER_ATTEMPTS, SIGNING_ROUND_TIMEOUT};
+pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -364,6 +364,8 @@ pub struct HealthCheckResult {
 pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+/// How often the early-exit liveness ping re-checks for pongs while waiting.
+const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub enum KfpNodeEvent {
@@ -1682,17 +1684,13 @@ impl KfpNode {
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-        if let Some(peer) = self.peers.read().get_peer_by_pubkey(&from) {
-            self.peers.write().update_last_seen(peer.share_index);
-        }
+        self.peers.write().touch_by_pubkey(&from);
 
         Ok(())
     }
 
     async fn handle_pong(&self, from: PublicKey, _payload: PongPayload) -> Result<()> {
-        if let Some(peer) = self.peers.read().get_peer_by_pubkey(&from) {
-            self.peers.write().update_last_seen(peer.share_index);
-        }
+        self.peers.write().touch_by_pubkey(&from);
         Ok(())
     }
 
@@ -1711,7 +1709,9 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
-        let responsive = self.ping_peers_snapshot(&peers_snapshot, timeout).await?;
+        let responsive = self
+            .ping_peers_snapshot(&peers_snapshot, timeout, None)
+            .await?;
         let unresponsive: Vec<u16> = peers_snapshot
             .iter()
             .map(|(idx, _, _)| *idx)
@@ -1741,13 +1741,15 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
-        self.ping_peers_snapshot(&peers_snapshot, timeout).await
+        self.ping_peers_snapshot(&peers_snapshot, timeout, None)
+            .await
     }
 
     async fn ping_peers_snapshot(
         &self,
         peers_snapshot: &[(u16, PublicKey, std::time::Instant)],
         timeout: Duration,
+        early_exit_at: Option<usize>,
     ) -> Result<Vec<u16>> {
         if peers_snapshot.is_empty() {
             return Ok(Vec::new());
@@ -1776,20 +1778,36 @@ impl KfpNode {
             }
         }
 
-        tokio::time::sleep(timeout).await;
+        let responsive = |snapshot: &[(u16, PublicKey, std::time::Instant)]| -> Vec<u16> {
+            let peers = self.peers.read();
+            snapshot
+                .iter()
+                .filter_map(|(share_index, _, initial_last_seen)| {
+                    peers
+                        .get_peer(*share_index)
+                        .filter(|p| p.last_seen > *initial_last_seen)
+                        .map(|_| *share_index)
+                })
+                .collect()
+        };
 
-        let responsive: Vec<u16> = peers_snapshot
-            .iter()
-            .filter_map(|(share_index, _, initial_last_seen)| {
-                self.peers
-                    .read()
-                    .get_peer(*share_index)
-                    .filter(|p| p.last_seen > *initial_last_seen)
-                    .map(|_| *share_index)
-            })
-            .collect();
+        // Without an early-exit target, classify every peer after the full
+        // timeout (health check). With one, poll and return as soon as that many
+        // peers have ponged so the all-online path resolves in roughly one
+        // round-trip instead of waiting out the whole timeout.
+        let Some(target) = early_exit_at else {
+            tokio::time::sleep(timeout).await;
+            return Ok(responsive(peers_snapshot));
+        };
 
-        Ok(responsive)
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let current = responsive(peers_snapshot);
+            if current.len() >= target || std::time::Instant::now() >= deadline {
+                return Ok(current);
+            }
+            tokio::time::sleep(LIVENESS_PING_POLL_INTERVAL).await;
+        }
     }
 }
 
