@@ -27,7 +27,7 @@ hmac = "0.13"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.10"
 frost-secp256k1-tr = "2.2.0"
-frost-ed25519 = { version = "2.2.0", optional = true }
+frost-ed25519 = { version = "3.0.0", optional = true }
 
 bip39 = { workspace = true }
 bitcoin = { workspace = true }
