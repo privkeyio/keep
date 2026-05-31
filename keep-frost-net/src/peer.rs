@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::AnnouncedXpub;
 
+/// How often a node re-announces itself to peers. The offline threshold and the
+/// node's announce loop are both derived from this so they stay in lockstep.
+pub(crate) const PEER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(20);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
     Online,
@@ -33,6 +37,11 @@ pub struct Peer {
     pub capabilities: Vec<String>,
     pub name: Option<String>,
     pub last_seen: Instant,
+    /// Last time a Pong was received from this peer in reply to our Ping.
+    /// Tracked separately from `last_seen` (which any announce also bumps) so
+    /// the pre-round liveness check classifies a peer as responsive only when it
+    /// actually answered a ping, not merely re-announced.
+    pub last_pong: Option<Instant>,
     pub status: PeerStatus,
     pub protocol_version: u8,
     pub attestation_status: AttestationStatus,
@@ -48,6 +57,7 @@ impl Peer {
             capabilities: vec!["sign".into()],
             name: None,
             last_seen: Instant::now(),
+            last_pong: None,
             status: PeerStatus::Online,
             protocol_version: crate::KFP_VERSION,
             attestation_status: AttestationStatus::NotProvided,
@@ -116,7 +126,11 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             our_share_index,
-            offline_threshold: Duration::from_secs(60),
+            // Tolerate exactly one missed announce so a freshly-dropped peer
+            // stops being selected quickly instead of lingering for a full
+            // minute (issue #412). A peer that drops mid-round is still caught
+            // by the signing-round timeout and failover exclusion.
+            offline_threshold: PEER_ANNOUNCE_INTERVAL.saturating_mul(2),
         }
     }
 
@@ -134,10 +148,14 @@ impl PeerManager {
             // PeerAnnounce carries no recovery xpubs; preserve any previously
             // announced (and replay-validated) xpubs across re-announcements so
             // a duplicate PeerAnnounce does not wipe stored recovery xpubs.
-            if peer.recovery_xpubs.is_empty() {
-                if let Some(existing) = self.peers.get(&peer.share_index) {
+            if let Some(existing) = self.peers.get(&peer.share_index) {
+                if peer.recovery_xpubs.is_empty() {
                     peer.recovery_xpubs = existing.recovery_xpubs.clone();
                 }
+                // Preserve pong history across re-announcements so a later
+                // announce does not wipe the liveness signal the pre-round check
+                // relies on.
+                peer.last_pong = existing.last_pong;
             }
             self.peers.insert(peer.share_index, peer);
         }
@@ -146,6 +164,26 @@ impl PeerManager {
     pub fn update_last_seen(&mut self, share_index: u16) {
         if let Some(peer) = self.peers.get_mut(&share_index) {
             peer.touch();
+        }
+    }
+
+    /// Mark the peer with this pubkey as just-seen. Resolving by pubkey under a
+    /// single write lock avoids a read-then-write on `peers` from the same task,
+    /// which would self-deadlock the (non-reentrant) lock.
+    pub fn touch_by_pubkey(&mut self, pubkey: &PublicKey) {
+        if let Some(peer) = self.peers.values_mut().find(|p| &p.pubkey == pubkey) {
+            peer.touch();
+        }
+    }
+
+    /// Record receipt of a Pong from this peer in reply to our Ping. Bumps
+    /// `last_seen` like any other contact and additionally stamps `last_pong`,
+    /// which the pre-round liveness check uses to distinguish an actual ping
+    /// reply from a periodic announce.
+    pub fn touch_pong_by_pubkey(&mut self, pubkey: &PublicKey) {
+        if let Some(peer) = self.peers.values_mut().find(|p| &p.pubkey == pubkey) {
+            peer.touch();
+            peer.last_pong = Some(Instant::now());
         }
     }
 
@@ -296,5 +334,16 @@ mod tests {
         pm.add_peer(self_peer);
 
         assert_eq!(pm.peer_count(), 0);
+    }
+
+    #[test]
+    fn test_default_offline_threshold_tolerates_one_missed_announce() {
+        // A freshly-dropped peer should leave the eligible set quickly: the
+        // threshold tolerates exactly one missed announce, not several (issue
+        // #412 regressed when this drifted up to a full minute).
+        let pm = PeerManager::new(1);
+        assert_eq!(pm.offline_threshold(), PEER_ANNOUNCE_INTERVAL * 2);
+        assert!(pm.offline_threshold() > PEER_ANNOUNCE_INTERVAL);
+        assert!(pm.offline_threshold() < PEER_ANNOUNCE_INTERVAL * 3);
     }
 }

@@ -17,10 +17,25 @@ use crate::nonce_store::NonceStore;
 use crate::protocol::KFP_VERSION;
 
 pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -> [u8; 32] {
+    derive_session_id_salted(message, participants, threshold, &[])
+}
+
+/// Like [`derive_session_id`] but folds an extra `salt` into the preimage.
+/// Signing failover uses a per-attempt salt so a re-sample over the same
+/// participant set produces a distinct session id (and a distinct fresh nonce)
+/// instead of colliding with the just-completed attempt's id and tripping the
+/// replay guard. The salt is still bound to message+participants+threshold, so
+/// it does not weaken replay protection against genuine external replays.
+pub fn derive_session_id_salted(
+    message: &[u8],
+    participants: &[u16],
+    threshold: u16,
+    salt: &[u8],
+) -> [u8; 32] {
     let mut sorted_participants = participants.to_vec();
     sorted_participants.sort();
 
-    let mut preimage = Vec::with_capacity(64 + message.len() + participants.len() * 2);
+    let mut preimage = Vec::with_capacity(64 + message.len() + participants.len() * 2 + salt.len());
     preimage.extend_from_slice(b"keep-frost-session-v1");
     preimage.push(KFP_VERSION);
     preimage.extend_from_slice(&threshold.to_be_bytes());
@@ -30,6 +45,10 @@ pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -
     }
     preimage.extend_from_slice(&(message.len() as u32).to_be_bytes());
     preimage.extend_from_slice(message);
+    if !salt.is_empty() {
+        preimage.extend_from_slice(&(salt.len() as u32).to_be_bytes());
+        preimage.extend_from_slice(salt);
+    }
 
     keep_core::crypto::blake2b_256(&preimage)
 }
@@ -208,6 +227,44 @@ impl NetworkSession {
 
     pub fn has_all_commitments(&self) -> bool {
         self.commitments.len() >= self.threshold as usize
+    }
+
+    /// Participant indices (excluding `our_index`) for which `has_entry`
+    /// reports no contribution. A participant index that fails `Identifier`
+    /// conversion (only index 0, which is invalid for FROST and is rejected by
+    /// `add_commitment`/`add_signature_share`, so it can't appear in a valid
+    /// session) is treated as missing: it could never have contributed, and
+    /// reporting it to failover just adds it to the excluded set where it
+    /// matches no real peer, so this is harmless rather than a silent error.
+    fn participants_missing<F>(&self, our_index: u16, has_entry: F) -> Vec<u16>
+    where
+        F: Fn(&Identifier) -> bool,
+    {
+        self.participants
+            .iter()
+            .copied()
+            .filter(|&idx| idx != our_index)
+            .filter(|&idx| {
+                Identifier::try_from(idx)
+                    .map(|id| !has_entry(&id))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Participant indices (excluding `our_index`) that have not submitted a
+    /// commitment. Used by failover to exclude only peers that demonstrably
+    /// failed to respond, leaving responsive peers eligible for the retry.
+    pub fn uncommitted_participants(&self, our_index: u16) -> Vec<u16> {
+        self.participants_missing(our_index, |id| self.commitments.contains_key(id))
+    }
+
+    /// Participant indices (excluding `our_index`) that have not submitted a
+    /// signature share. Used by failover when commitments were pre-exchanged
+    /// (so `uncommitted_participants` is empty) but some signers never produced
+    /// a share before the round timed out.
+    pub fn participants_missing_shares(&self, our_index: u16) -> Vec<u16> {
+        self.participants_missing(our_index, |id| self.signature_shares.contains_key(id))
     }
 
     /// Build the FROST signing package from the collected commitments.
@@ -550,8 +607,9 @@ fn validate_session_id(
     message: &[u8],
     participants: &[u16],
     threshold: u16,
+    salt: &[u8],
 ) -> Result<()> {
-    let expected_id = derive_session_id(message, participants, threshold);
+    let expected_id = derive_session_id_salted(message, participants, threshold, salt);
     if session_id != expected_id {
         return Err(FrostNetError::Session(format!(
             "Session ID mismatch: expected {}, got {}",
@@ -571,7 +629,17 @@ impl SessionManager {
             completed_sessions: HashSet::new(),
             completed_order: VecDeque::new(),
             max_completed_history: 1000,
-            session_timeout: Duration::from_secs(300),
+            // A responder creates a fresh session per failover attempt (each
+            // attempt rederives a distinct session id from its participant set),
+            // so a responder session only needs to outlive a single requester
+            // round, not the whole failover window. Bound it to the round
+            // timeout plus margin for clock skew and relay latency. A consumed
+            // single-use nonce held by an abandoned session is then released in
+            // ~SIGNING_ROUND_TIMEOUT rather than ~60s, so a burst of failovers
+            // can't drain responder nonce pools or fill the session table while
+            // requesters abandon rounds after SIGNING_ROUND_TIMEOUT.
+            session_timeout: crate::node::SIGNING_ROUND_TIMEOUT
+                .saturating_add(Duration::from_secs(5)),
             nonce_store: None,
             max_rehydrations: 3,
         }
@@ -599,7 +667,18 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
-        validate_session_id(session_id, &message, &participants, threshold)?;
+        self.create_session_salted(session_id, message, threshold, participants, &[])
+    }
+
+    pub fn create_session_salted(
+        &mut self,
+        session_id: [u8; 32],
+        message: Vec<u8>,
+        threshold: u16,
+        participants: Vec<u16>,
+        salt: &[u8],
+    ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold, salt)?;
 
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
@@ -648,7 +727,18 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
-        validate_session_id(session_id, &message, &participants, threshold)?;
+        self.get_or_create_session_salted(session_id, message, threshold, participants, &[])
+    }
+
+    pub fn get_or_create_session_salted(
+        &mut self,
+        session_id: [u8; 32],
+        message: Vec<u8>,
+        threshold: u16,
+        participants: Vec<u16>,
+        salt: &[u8],
+    ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold, salt)?;
 
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));

@@ -12,10 +12,79 @@ use crate::audit::SigningOperation;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
-use crate::session::derive_session_id;
+use crate::session::{derive_session_id, derive_session_id_salted};
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
+
+/// Per-round wait for the aggregated signature. Below the 20s peer announce
+/// interval so a round resolves within one announce cycle, and comfortably
+/// above honest co-signer response time including TEE attestation latency.
+pub(crate) const SIGNING_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on failover retries for a single signing request. Caps the
+/// worst-case wall-clock cost of repeated round timeouts (each up to
+/// `SIGNING_ROUND_TIMEOUT`) under a partition or latency event.
+pub(crate) const MAX_FAILOVER_ATTEMPTS: usize = 3;
+
+/// Wait for the pre-round liveness ping. A co-signer that dropped since its last
+/// announce is excluded after at most this long, instead of burning a full
+/// `SIGNING_ROUND_TIMEOUT` round. The ping returns as soon as every co-signer
+/// pongs, so the all-online path is bounded by one round-trip, not this value.
+const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Error from a single signing round. `attempted` lists the non-self peers that
+/// failed to respond in this round, so a timed-out round can exclude them and
+/// fail over to other live co-signers.
+struct SigningRoundError {
+    error: FrostNetError,
+    attempted: Vec<u16>,
+}
+
+impl SigningRoundError {
+    fn fatal(error: FrostNetError) -> Self {
+        Self {
+            error,
+            attempted: Vec::new(),
+        }
+    }
+}
+
+impl From<FrostNetError> for SigningRoundError {
+    fn from(error: FrostNetError) -> Self {
+        Self::fatal(error)
+    }
+}
+
+/// A peer-reported failure for the in-flight signing session, carried out of the
+/// round receive loop with the structured error code and offending share index
+/// so the failover logic can decide whether the failure is recoverable in place
+/// or whether the peer should be excluded and the round retried.
+struct PeerRoundFailure {
+    error: String,
+    code: String,
+    offending_index: Option<u16>,
+}
+
+/// Peer-reported error codes that the requester handles in place (clearing the
+/// offending peer's pooled commitments and falling back to an interactive round
+/// on the next request) rather than excluding the peer and failing over. Any
+/// other code is treated like an unresponsive peer so a faulty or malicious
+/// co-signer cannot reliably block signing.
+fn is_recoverable_peer_error(code: &str) -> bool {
+    code == "stale_nonce" || code == "incomplete_pre_exchange"
+}
+
+/// Extract the offending peer's share index from a peer-reported session error,
+/// which the message handler annotates with a trailing "(peer N)". Returns
+/// `None` when the index is absent or unparseable so the caller can fall back
+/// to clearing the whole pool.
+fn parse_offending_peer(msg: &str) -> Option<u16> {
+    let start = msg.rfind("(peer ")? + "(peer ".len();
+    let rest = &msg[start..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
+}
 
 /// Restores peer commitments reserved from the [`NoncePool`] back into the pool
 /// if a signing request aborts before the reservation is committed to a live
@@ -536,11 +605,12 @@ impl KfpNode {
         let commit_result = {
             let mut sessions = self.sessions.write();
 
-            let session = sessions.get_or_create_session(
+            let session = sessions.get_or_create_session_salted(
                 request.session_id,
                 request.message.clone(),
                 self.share.metadata.threshold,
                 request.participants.clone(),
+                &request.session_salt,
             )?;
 
             // All nonce_refs have now been validated above, and a pre-exchange
@@ -955,43 +1025,221 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Pings every eligible co-signer before the first round and returns the
+    /// ones that fail to pong, so a peer that dropped since its last announce is
+    /// excluded up front instead of being selected and burning a full round
+    /// timeout before failover kicks in (the slow case in issue #412). The ping
+    /// resolves as soon as all co-signers answer, so the all-online happy path
+    /// only pays one round-trip. It is skipped entirely when the group has no
+    /// spare co-signers (single-peer / exactly-threshold), and its result is
+    /// ignored if too few peers answer to still reach threshold, since then the
+    /// normal round and failover should decide rather than a flaky ping.
+    async fn prune_unresponsive_cosigners(&self) -> Vec<u16> {
+        let needed = (self.share.metadata.threshold as usize).saturating_sub(1);
+        let snapshot: Vec<(u16, PublicKey, Option<std::time::Instant>)> = {
+            let peers = self.peers.read();
+            peers
+                .get_signing_peers()
+                .into_iter()
+                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .map(|p| (p.share_index, p.pubkey, p.last_pong))
+                .collect()
+        };
+        if snapshot.len() <= needed {
+            return Vec::new();
+        }
+
+        let responsive = match self
+            .ping_peers_snapshot(&snapshot, LIVENESS_PING_TIMEOUT, Some(snapshot.len()))
+            .await
+        {
+            Ok(responsive) => responsive,
+            Err(e) => {
+                warn!(error = %e, "liveness ping failed; proceeding without pre-exclusion");
+                return Vec::new();
+            }
+        };
+        if responsive.len() < needed {
+            return Vec::new();
+        }
+
+        let unresponsive: Vec<u16> = snapshot
+            .iter()
+            .map(|(idx, _, _)| *idx)
+            .filter(|idx| !responsive.contains(idx))
+            .collect();
+        if !unresponsive.is_empty() {
+            warn!(
+                excluded = ?unresponsive,
+                "excluding co-signers that failed the pre-round liveness ping"
+            );
+        }
+        unresponsive
+    }
+
     pub async fn request_signature(
+        &self,
+        mut message: Vec<u8>,
+        message_type: &str,
+    ) -> Result<[u8; 64]> {
+        // On a round timeout the co-signers that failed to commit are treated as
+        // unresponsive and excluded, then we re-select from the remaining online
+        // peers and retry. This fails over to other live co-signers in seconds
+        // instead of surfacing the timeout to the caller. The session id is
+        // rederived per attempt from the (changed) participant set, so each retry
+        // is a fresh session with a fresh nonce.
+        //
+        // The retry count is capped by MAX_FAILOVER_ATTEMPTS so a partition or
+        // latency event cannot stall the caller for round_timeout × eligible
+        // peers; the final attempt surfaces its error to the caller.
+        //
+        // Log-correlation id ONLY, not a cryptographic session id: it ties the
+        // failover attempts of one logical request together in the audit log and
+        // is independent of the per-attempt participant set. It is never used to
+        // gate the replay guard or index the nonce store (each attempt derives a
+        // real per-participant session id for that). Two requests for the same
+        // message intentionally share this id; do not treat it as unique.
+        let logical_id = derive_session_id(&message, &[], self.share.metadata.threshold);
+        // Drop co-signers that are already unreachable before committing, so the
+        // first round goes straight to live peers instead of timing out on a
+        // dead one. Peers that drop mid-round are still caught by the failover
+        // exclusion below.
+        let mut excluded: Vec<u16> = self.prune_unresponsive_cosigners().await;
+        for attempt in 0..MAX_FAILOVER_ATTEMPTS {
+            let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
+            let round_message = if last {
+                std::mem::take(&mut message)
+            } else {
+                message.clone()
+            };
+            let result = self
+                .signing_round(round_message, message_type, &excluded, logical_id, attempt)
+                .await;
+
+            match result {
+                Ok(sig) => return Ok(sig),
+                Err(SigningRoundError {
+                    error: FrostNetError::Timeout(_),
+                    attempted,
+                }) if !last => {
+                    // Fail over on ANY round timeout while retries remain. The
+                    // unresponsive set only decides WHICH peers to drop: when it
+                    // is non-empty exclude those peers, otherwise (e.g. everyone
+                    // committed/responded but aggregation never produced a
+                    // SignatureComplete) retry without excluding anyone so the
+                    // next attempt re-samples a fresh participant set.
+                    if attempted.is_empty() {
+                        warn!(
+                            attempt = attempt,
+                            "signing round timed out with no unresponsive peers; re-sampling and retrying"
+                        );
+                    } else {
+                        warn!(
+                            excluded = ?attempted,
+                            attempt = attempt,
+                            "signing round timed out; excluding unresponsive peers and retrying"
+                        );
+                        excluded.extend(attempted);
+                    }
+                }
+                Err(SigningRoundError {
+                    error: FrostNetError::InsufficientPeers { .. },
+                    ..
+                }) if !excluded.is_empty() => {
+                    // Failover has exhausted the eligible set: each retry after
+                    // the first excludes more peers until fewer than threshold
+                    // remain. Surfacing InsufficientPeers here would mislead the
+                    // caller into thinking the group was undersized, when the
+                    // real cause is co-signers timing out during failover. Break
+                    // to surface the aggregate failover timeout instead.
+                    warn!(
+                        attempt = attempt,
+                        "failover exhausted the eligible peer set; surfacing aggregate timeout"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    // If a peer reported a stale pre-exchanged nonce (it
+                    // rotated/restarted, so a pooled commitment we referenced no
+                    // longer maps to a live secret), drop the suspect pooled
+                    // commitments so the *next* request falls back to a fresh
+                    // interactive round. We deliberately do NOT retry this request
+                    // in place: our single-use nonce was already spent on a share
+                    // bound to the stale commitment, the session id is fixed by the
+                    // message, and the replay guard would reject re-signing it;
+                    // retrying would risk nonce reuse. This is a fatal Session error
+                    // (not a Timeout), so it returns to the caller rather than
+                    // failing over. The signing session is torn down on failure, so
+                    // the next request starts clean.
+                    if let FrostNetError::Session(ref msg) = e.error {
+                        if msg.contains("stale_nonce") || msg.contains("incomplete_pre_exchange") {
+                            // Scope the cleanup to the offending peer when its
+                            // index is identifiable from the error (the handler
+                            // appends "(peer N)"), so other peers keep their
+                            // pooled commitments and don't fall back to slow
+                            // interactive rounds. Only when the peer cannot be
+                            // identified do we clear the whole pool.
+                            match parse_offending_peer(msg) {
+                                Some(idx) => {
+                                    self.nonce_pool.clear_peer(idx);
+                                    warn!(
+                                        peer = idx,
+                                        "peer reported stale pre-exchanged nonce; cleared its pooled commitments"
+                                    );
+                                }
+                                None => {
+                                    self.nonce_pool.clear_all_peers();
+                                    warn!(
+                                        "peer reported stale pre-exchanged nonce (peer unidentified); cleared pool, next round is interactive"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Err(e.error);
+                }
+            }
+        }
+        Err(FrostNetError::Timeout(
+            "Signing request timed out after failover".into(),
+        ))
+    }
+
+    async fn signing_round(
         &self,
         message: Vec<u8>,
         message_type: &str,
-    ) -> Result<[u8; 64]> {
-        let result = self.signing_round(message, message_type).await;
-
-        // If a peer reported a stale pre-exchanged nonce (it rotated/restarted, so
-        // a pooled commitment we referenced no longer maps to a live secret), drop
-        // the suspect pooled commitments so the *next* request falls back to a
-        // fresh interactive round. We deliberately do NOT retry this request in
-        // place: our single-use nonce was already spent on a share bound to the
-        // stale commitment, the session id is fixed by the message, and the
-        // replay guard would reject re-signing it; retrying would risk nonce
-        // reuse. The signing session is torn down on failure (see below), so the
-        // next attempt starts clean.
-        if let Err(FrostNetError::Session(ref e)) = result {
-            if e.contains("stale_nonce") || e.contains("incomplete_pre_exchange") {
-                self.nonce_pool.clear_all_peers();
-                warn!(
-                    "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
-                );
-            }
-        }
-        result
-    }
-
-    async fn signing_round(&self, message: Vec<u8>, message_type: &str) -> Result<[u8; 64]> {
+        exclude: &[u16],
+        logical_id: [u8; 32],
+        attempt: usize,
+    ) -> std::result::Result<[u8; 64], SigningRoundError> {
         let threshold = self.share.metadata.threshold;
 
-        let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
+        let (participants, participant_peers) = self
+            .select_eligible_peers(threshold as usize, exclude)
+            .map_err(SigningRoundError::fatal)?;
 
-        let session_id = derive_session_id(&message, &participants, threshold);
+        let attempted: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
+
+        // Salt the session id with the attempt index so a re-sample over an
+        // unchanged participant set (everyone responded but no signature was
+        // produced) derives a distinct id and fresh nonce instead of colliding
+        // with the just-completed attempt and tripping the replay guard. Attempt
+        // 0 uses an empty salt to keep the common single-attempt id stable and
+        // wire-compatible with peers that predate salted failover.
+        let session_salt: Vec<u8> = if attempt == 0 {
+            Vec::new()
+        } else {
+            (attempt as u64).to_be_bytes().to_vec()
+        };
+        let session_id =
+            derive_session_id_salted(&message, &participants, threshold, &session_salt);
 
         info!(
+            logical_id = %hex::encode(logical_id),
             session_id = %hex::encode(session_id),
             participants = ?participants,
+            attempt = attempt,
             "Initiating signing request"
         );
 
@@ -1004,15 +1252,17 @@ impl KfpNode {
             SigningOperation::SignRequestInitiated,
         );
 
-        let key_package = self.share.key_package()?;
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| SigningRoundError::fatal(e.into()))?;
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
         // Try to use pre-exchanged commitments for the selected peers. If every
         // peer has a pooled commitment, reserve them (single-use; removed from
         // the pool) so the interactive commitment round can be skipped.
-        let peer_indices: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
-        let reserved = self.nonce_pool.reserve_for(&peer_indices);
+        let reserved = self.nonce_pool.reserve_for(&attempted);
         // If any step below fails after reservation, the reserved commitments
         // must go back into the pool so they are not leaked permanently.
         let mut reservation_guard = ReservationGuard::new(&self.nonce_pool, reserved.clone());
@@ -1051,7 +1301,8 @@ impl KfpNode {
             message_type,
             participants.clone(),
         )
-        .with_nonce_refs(nonce_refs);
+        .with_nonce_refs(nonce_refs)
+        .with_session_salt(session_salt.clone());
 
         let session_info = SessionInfo {
             session_id,
@@ -1065,11 +1316,12 @@ impl KfpNode {
 
         {
             let mut sessions = self.sessions.write();
-            let session = sessions.create_session(
+            let session = sessions.create_session_salted(
                 session_id,
                 message,
                 self.share.metadata.threshold,
                 participants.clone(),
+                &session_salt,
             )?;
 
             session.set_our_nonces(nonces);
@@ -1128,7 +1380,7 @@ impl KfpNode {
         .await;
         if let Err(e) = send_result {
             self.sessions.write().complete_session(&session_id);
-            return Err(e);
+            return Err(e.into());
         }
 
         let mut rx = self.event_tx.subscribe();
@@ -1147,13 +1399,11 @@ impl KfpNode {
         if all_committed {
             if let Err(e) = self.generate_and_send_share(&session_id).await {
                 self.sessions.write().complete_session(&session_id);
-                return Err(e);
+                return Err(e.into());
             }
         }
 
-        let timeout = Duration::from_secs(30);
-
-        let result = tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(SIGNING_ROUND_TIMEOUT, async {
             loop {
                 match rx.recv().await {
                     Ok(KfpNodeEvent::SignatureComplete {
@@ -1167,13 +1417,23 @@ impl KfpNode {
                     Ok(KfpNodeEvent::SigningFailed {
                         session_id: sid,
                         error,
+                        code,
+                        offending_index,
                     }) => {
                         if sid == session_id {
-                            return Err(FrostNetError::Session(error));
+                            return Err(PeerRoundFailure {
+                                error,
+                                code,
+                                offending_index,
+                            });
                         }
                     }
                     Err(_) => {
-                        return Err(FrostNetError::Transport("Event channel closed".into()));
+                        return Err(PeerRoundFailure {
+                            error: "Event channel closed".into(),
+                            code: "channel_closed".into(),
+                            offending_index: None,
+                        });
                     }
                     _ => {}
                 }
@@ -1186,13 +1446,73 @@ impl KfpNode {
         // request and our consumed nonce can't be reused.
         match result {
             Ok(Ok(signature)) => Ok(signature),
-            Ok(Err(e)) => {
+            Ok(Err(failure)) => {
                 self.sessions.write().complete_session(&session_id);
-                Err(e)
+                if failure.code == "channel_closed" {
+                    // The event channel closed (node shutting down); not a peer
+                    // fault, so surface it fatally rather than burning failover
+                    // attempts re-subscribing to a dead channel.
+                    Err(SigningRoundError::fatal(FrostNetError::Transport(
+                        failure.error,
+                    )))
+                } else if is_recoverable_peer_error(&failure.code) {
+                    // Recoverable pre-exchange miss: keep the fatal Session error
+                    // so `request_signature` clears the offending peer's pooled
+                    // commitments and the next request falls back to interactive.
+                    Err(SigningRoundError::fatal(FrostNetError::Session(
+                        failure.error,
+                    )))
+                } else {
+                    // A peer actively errored on this session for a
+                    // non-recoverable reason. Treat it like an unresponsive peer:
+                    // exclude it (by share index when known, else the whole
+                    // attempted set) and fail over instead of returning fatally,
+                    // so the offender cannot reliably block signing.
+                    let attempted = match failure.offending_index {
+                        Some(idx) => vec![idx],
+                        None => attempted.clone(),
+                    };
+                    warn!(
+                        code = %failure.code,
+                        offending = ?failure.offending_index,
+                        "peer reported non-recoverable signing error; excluding and failing over"
+                    );
+                    Err(SigningRoundError {
+                        error: FrostNetError::Timeout(failure.error),
+                        attempted,
+                    })
+                }
             }
             Err(_) => {
+                // Exclude only peers that never responded; responsive peers stay
+                // eligible for the failover retry so we don't drain the eligible
+                // set or waste healthy peers' single-use nonces. A peer is
+                // unresponsive if it failed to deliver either its commitment or
+                // its signature share -- the latter matters when commitments were
+                // pre-exchanged, so `uncommitted_participants` would be empty even
+                // though shares never arrived. If the session is already gone,
+                // fall back to excluding the whole attempted set.
+                let unresponsive = {
+                    let sessions = self.sessions.read();
+                    sessions
+                        .get_session(&session_id)
+                        .map(|s| {
+                            let our = self.share.metadata.identifier;
+                            let mut idxs = s.uncommitted_participants(our);
+                            for idx in s.participants_missing_shares(our) {
+                                if !idxs.contains(&idx) {
+                                    idxs.push(idx);
+                                }
+                            }
+                            idxs
+                        })
+                        .unwrap_or_else(|| attempted.clone())
+                };
                 self.sessions.write().complete_session(&session_id);
-                Err(FrostNetError::Timeout("Signing request timed out".into()))
+                Err(SigningRoundError {
+                    error: FrostNetError::Timeout("Signing request timed out".into()),
+                    attempted: unresponsive,
+                })
             }
         }
     }

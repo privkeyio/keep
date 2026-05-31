@@ -233,6 +233,16 @@ impl NoncePool {
         inner.peer_order.clear();
     }
 
+    /// Drop every stored commitment for a single peer. Used when exactly one
+    /// peer reports a stale pre-exchanged nonce, so other peers' pooled
+    /// commitments are preserved and they need not fall back to interactive
+    /// rounds.
+    pub fn clear_peer(&self, share_index: u16) {
+        let mut inner = self.inner.lock();
+        inner.peer.retain(|(idx, _), _| *idx != share_index);
+        inner.peer_order.retain(|(idx, _)| *idx != share_index);
+    }
+
     /// Reserve one available commitment per requested peer for a signing
     /// request, returning the chosen `nonce_id`s. The commitments are *removed*
     /// from the pool so they cannot be reused.

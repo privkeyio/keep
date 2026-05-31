@@ -834,6 +834,13 @@ pub struct SignRequestPayload {
     /// for wire compatibility with peers that predate nonce pre-exchange.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nonce_refs: Vec<NonceRef>,
+    /// Per-attempt salt folded into the session id derivation so a failover
+    /// re-sample over the same participant set yields a distinct session.
+    /// Responders echo it into their own derivation when validating the id.
+    /// Kept `#[serde(default)]` for wire compatibility with peers that predate
+    /// salted failover (an empty salt reproduces the original derivation).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_salt: Vec<u8>,
 }
 
 /// A reference to a single pre-exchanged nonce/commitment pair.
@@ -869,6 +876,7 @@ impl SignRequestPayload {
             created_at: Timestamp::now().as_secs(),
             metadata: None,
             nonce_refs: Vec::new(),
+            session_salt: Vec::new(),
         }
     }
 
@@ -879,6 +887,11 @@ impl SignRequestPayload {
 
     pub fn with_nonce_refs(mut self, nonce_refs: Vec<NonceRef>) -> Self {
         self.nonce_refs = nonce_refs;
+        self
+    }
+
+    pub fn with_session_salt(mut self, salt: Vec<u8>) -> Self {
+        self.session_salt = salt;
         self
     }
 
