@@ -210,20 +210,34 @@ impl NetworkSession {
         self.commitments.len() >= self.threshold as usize
     }
 
-    /// Participant indices (excluding `our_index`) that have not submitted a
-    /// commitment. Used by failover to exclude only peers that demonstrably
-    /// failed to respond, leaving responsive peers eligible for the retry.
-    pub fn uncommitted_participants(&self, our_index: u16) -> Vec<u16> {
+    /// Participant indices (excluding `our_index`) for which `has_entry`
+    /// reports no contribution. A participant index that fails `Identifier`
+    /// conversion (only index 0, which is invalid for FROST and is rejected by
+    /// `add_commitment`/`add_signature_share`, so it can't appear in a valid
+    /// session) is treated as missing: it could never have contributed, and
+    /// reporting it to failover just adds it to the excluded set where it
+    /// matches no real peer, so this is harmless rather than a silent error.
+    fn participants_missing<F>(&self, our_index: u16, has_entry: F) -> Vec<u16>
+    where
+        F: Fn(&Identifier) -> bool,
+    {
         self.participants
             .iter()
             .copied()
             .filter(|&idx| idx != our_index)
             .filter(|&idx| {
                 Identifier::try_from(idx)
-                    .map(|id| !self.commitments.contains_key(&id))
+                    .map(|id| !has_entry(&id))
                     .unwrap_or(true)
             })
             .collect()
+    }
+
+    /// Participant indices (excluding `our_index`) that have not submitted a
+    /// commitment. Used by failover to exclude only peers that demonstrably
+    /// failed to respond, leaving responsive peers eligible for the retry.
+    pub fn uncommitted_participants(&self, our_index: u16) -> Vec<u16> {
+        self.participants_missing(our_index, |id| self.commitments.contains_key(id))
     }
 
     /// Participant indices (excluding `our_index`) that have not submitted a
@@ -231,16 +245,7 @@ impl NetworkSession {
     /// (so `uncommitted_participants` is empty) but some signers never produced
     /// a share before the round timed out.
     pub fn participants_missing_shares(&self, our_index: u16) -> Vec<u16> {
-        self.participants
-            .iter()
-            .copied()
-            .filter(|&idx| idx != our_index)
-            .filter(|&idx| {
-                Identifier::try_from(idx)
-                    .map(|id| !self.signature_shares.contains_key(&id))
-                    .unwrap_or(true)
-            })
-            .collect()
+        self.participants_missing(our_index, |id| self.signature_shares.contains_key(id))
     }
 
     /// Build the FROST signing package from the collected commitments.
@@ -604,12 +609,17 @@ impl SessionManager {
             completed_sessions: HashSet::new(),
             completed_order: VecDeque::new(),
             max_completed_history: 1000,
-            // Co-signer sessions are not torn down explicitly when the
-            // initiator abandons a round, so keep this close to the initiator's
-            // round timeout. A consumed single-use nonce held by an abandoned
-            // session is released within ~60s, bounding session-table and nonce
-            // exhaustion under a burst of failovers.
-            session_timeout: Duration::from_secs(60),
+            // A responder creates a fresh session per failover attempt (each
+            // attempt rederives a distinct session id from its participant set),
+            // so a responder session only needs to outlive a single requester
+            // round, not the whole failover window. Bound it to the round
+            // timeout plus margin for clock skew and relay latency. A consumed
+            // single-use nonce held by an abandoned session is then released in
+            // ~SIGNING_ROUND_TIMEOUT rather than ~60s, so a burst of failovers
+            // can't drain responder nonce pools or fill the session table while
+            // requesters abandon rounds after SIGNING_ROUND_TIMEOUT.
+            session_timeout: crate::node::SIGNING_ROUND_TIMEOUT
+                .saturating_add(Duration::from_secs(5)),
             nonce_store: None,
             max_rehydrations: 3,
         }

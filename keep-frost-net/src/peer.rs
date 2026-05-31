@@ -4,7 +4,12 @@ use nostr_sdk::PublicKey;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::node::{MAX_FAILOVER_ATTEMPTS, SIGNING_ROUND_TIMEOUT};
 use crate::protocol::AnnouncedXpub;
+
+/// How often a node re-announces itself to peers. The offline threshold and the
+/// node's announce loop are both derived from this so they stay in lockstep.
+pub(crate) const PEER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
@@ -116,10 +121,14 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             our_share_index,
-            // Two missed 20s announce cycles before a peer is considered
-            // offline, so peers don't flap offline on a single missed announce
-            // mid-failover yet stale peers leave the eligible set promptly.
-            offline_threshold: Duration::from_secs(40),
+            // Stay comfortably above the worst-case failover duration
+            // (MAX_FAILOVER_ATTEMPTS rounds, each up to SIGNING_ROUND_TIMEOUT)
+            // plus one announce interval of margin, so a healthy peer can't flap
+            // to offline and be dropped from the eligible set mid-failover while
+            // stale peers still leave promptly.
+            offline_threshold: SIGNING_ROUND_TIMEOUT
+                .saturating_mul(MAX_FAILOVER_ATTEMPTS as u32)
+                .saturating_add(PEER_ANNOUNCE_INTERVAL),
         }
     }
 

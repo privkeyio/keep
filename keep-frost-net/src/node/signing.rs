@@ -20,12 +20,12 @@ use crate::nonce_pool::{serialize_commitment, NoncePool};
 /// Per-round wait for the aggregated signature. Below the 20s peer announce
 /// interval so a round resolves within one announce cycle, and comfortably
 /// above honest co-signer response time including TEE attestation latency.
-const SIGNING_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const SIGNING_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Upper bound on failover retries for a single signing request. Caps the
 /// worst-case wall-clock cost of repeated round timeouts (each up to
 /// `SIGNING_ROUND_TIMEOUT`) under a partition or latency event.
-const MAX_FAILOVER_ATTEMPTS: usize = 3;
+pub(crate) const MAX_FAILOVER_ATTEMPTS: usize = 3;
 
 /// Error from a single signing round. `attempted` lists the non-self peers that
 /// failed to respond in this round, so a timed-out round can exclude them and
@@ -48,6 +48,17 @@ impl From<FrostNetError> for SigningRoundError {
     fn from(error: FrostNetError) -> Self {
         Self::fatal(error)
     }
+}
+
+/// Extract the offending peer's share index from a peer-reported session error,
+/// which the message handler annotates with a trailing "(peer N)". Returns
+/// `None` when the index is absent or unparseable so the caller can fall back
+/// to clearing the whole pool.
+fn parse_offending_peer(msg: &str) -> Option<u16> {
+    let start = msg.rfind("(peer ")? + "(peer ".len();
+    let rest = &msg[start..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
 }
 
 /// Restores peer commitments reserved from the [`NoncePool`] back into the pool
@@ -1004,8 +1015,12 @@ impl KfpNode {
         // latency event cannot stall the caller for round_timeout × eligible
         // peers; the final attempt surfaces its error to the caller.
         //
-        // Stable id correlating all failover attempts of one logical request in
-        // the audit log; independent of the per-attempt participant set.
+        // Log-correlation id ONLY, not a cryptographic session id: it ties the
+        // failover attempts of one logical request together in the audit log and
+        // is independent of the per-attempt participant set. It is never used to
+        // gate the replay guard or index the nonce store (each attempt derives a
+        // real per-participant session id for that). Two requests for the same
+        // message intentionally share this id; do not treat it as unique.
         let logical_id = derive_session_id(&message, &[], self.share.metadata.threshold);
         let mut excluded: Vec<u16> = Vec::new();
         for attempt in 0..MAX_FAILOVER_ATTEMPTS {
@@ -1024,13 +1039,42 @@ impl KfpNode {
                 Err(SigningRoundError {
                     error: FrostNetError::Timeout(_),
                     attempted,
-                }) if !attempted.is_empty() && !last => {
+                }) if !last => {
+                    // Fail over on ANY round timeout while retries remain. The
+                    // unresponsive set only decides WHICH peers to drop: when it
+                    // is non-empty exclude those peers, otherwise (e.g. everyone
+                    // committed/responded but aggregation never produced a
+                    // SignatureComplete) retry without excluding anyone so the
+                    // next attempt re-samples a fresh participant set.
+                    if attempted.is_empty() {
+                        warn!(
+                            attempt = attempt,
+                            "signing round timed out with no unresponsive peers; re-sampling and retrying"
+                        );
+                    } else {
+                        warn!(
+                            excluded = ?attempted,
+                            attempt = attempt,
+                            "signing round timed out; excluding unresponsive peers and retrying"
+                        );
+                        excluded.extend(attempted);
+                    }
+                }
+                Err(SigningRoundError {
+                    error: FrostNetError::InsufficientPeers { .. },
+                    ..
+                }) if !excluded.is_empty() => {
+                    // Failover has exhausted the eligible set: each retry after
+                    // the first excludes more peers until fewer than threshold
+                    // remain. Surfacing InsufficientPeers here would mislead the
+                    // caller into thinking the group was undersized, when the
+                    // real cause is co-signers timing out during failover. Break
+                    // to surface the aggregate failover timeout instead.
                     warn!(
-                        excluded = ?attempted,
                         attempt = attempt,
-                        "signing round timed out; excluding unresponsive peers and retrying"
+                        "failover exhausted the eligible peer set; surfacing aggregate timeout"
                     );
-                    excluded.extend(attempted);
+                    break;
                 }
                 Err(e) => {
                     // If a peer reported a stale pre-exchanged nonce (it
@@ -1047,10 +1091,27 @@ impl KfpNode {
                     // the next request starts clean.
                     if let FrostNetError::Session(ref msg) = e.error {
                         if msg.contains("stale_nonce") || msg.contains("incomplete_pre_exchange") {
-                            self.nonce_pool.clear_all_peers();
-                            warn!(
-                                "peer reported stale pre-exchanged nonce; cleared pool, next round is interactive"
-                            );
+                            // Scope the cleanup to the offending peer when its
+                            // index is identifiable from the error (the handler
+                            // appends "(peer N)"), so other peers keep their
+                            // pooled commitments and don't fall back to slow
+                            // interactive rounds. Only when the peer cannot be
+                            // identified do we clear the whole pool.
+                            match parse_offending_peer(msg) {
+                                Some(idx) => {
+                                    self.nonce_pool.clear_peer(idx);
+                                    warn!(
+                                        peer = idx,
+                                        "peer reported stale pre-exchanged nonce; cleared its pooled commitments"
+                                    );
+                                }
+                                None => {
+                                    self.nonce_pool.clear_all_peers();
+                                    warn!(
+                                        "peer reported stale pre-exchanged nonce (peer unidentified); cleared pool, next round is interactive"
+                                    );
+                                }
+                            }
                         }
                     }
                     return Err(e.error);

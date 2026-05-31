@@ -6,6 +6,7 @@ mod psbt;
 mod signing;
 
 pub use psbt::PsbtSessionSnapshot;
+pub(crate) use signing::{MAX_FAILOVER_ATTEMPTS, SIGNING_ROUND_TIMEOUT};
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -1277,11 +1278,16 @@ impl KfpNode {
         // Re-announce often enough that an initiator with a short discovery
         // window reliably catches a periodic announce even if the immediate
         // reciprocal announce (see handle_announce) is missed. Must stay well
-        // under PEER_OFFLINE_THRESHOLD so peers don't flap offline.
-        let mut announce_interval = tokio::time::interval(Duration::from_secs(20));
+        // under the peer offline threshold so peers don't flap offline.
+        let mut announce_interval = tokio::time::interval(crate::peer::PEER_ANNOUNCE_INTERVAL);
         announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(120));
+        // Reap expired sessions on roughly the signing round cadence so an
+        // abandoned co-signer session (and its consumed single-use nonce) is
+        // released promptly instead of lingering until lazy cleanup, which keeps
+        // the session table and nonce pool from filling under a burst of
+        // failovers where requesters abandon rounds after SIGNING_ROUND_TIMEOUT.
+        let mut cleanup_interval = tokio::time::interval(SIGNING_ROUND_TIMEOUT);
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut replenish_interval = tokio::time::interval(Duration::from_secs(30));
@@ -1487,31 +1493,39 @@ impl KfpNode {
                 // referenced pre-exchanged nonce). Surface it so an in-flight
                 // `request_signature` fails fast instead of waiting for timeout.
                 if let Some(session_id) = payload.session_id {
-                    let is_participant = {
+                    // Resolve the offending peer's share index so the requester
+                    // can scope any pool cleanup to just that peer instead of
+                    // wiping every peer's pooled commitments.
+                    let offending_index = {
                         let sessions = self.sessions.read();
                         match sessions.get_session(&session_id) {
                             Some(session) => {
                                 let peers = self.peers.read();
-                                session.participants().iter().any(|&idx| {
+                                session.participants().iter().copied().find(|&idx| {
                                     peers
                                         .get_peer(idx)
                                         .map(|p| p.pubkey == event.pubkey)
                                         .unwrap_or(false)
                                 })
                             }
-                            None => false,
+                            None => None,
                         }
                     };
-                    if is_participant {
+                    if let Some(offending_index) = offending_index {
                         // Future improvement: on `stale_nonce` /
                         // `incomplete_pre_exchange` the requester could retry
                         // this session with a fresh interactive commitment round
                         // instead of failing, since these are recoverable
                         // pre-exchange misses rather than fatal errors. For now
-                        // we fail fast so the caller can decide to retry.
+                        // we fail fast so the caller can decide to retry. The
+                        // peer index is appended so the requester can clear only
+                        // the offending peer's pooled commitments.
                         let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
                             session_id,
-                            error: format!("Peer reported error: {}", payload.code),
+                            error: format!(
+                                "Peer reported error: {} (peer {offending_index})",
+                                payload.code
+                            ),
                         });
                     }
                 }
