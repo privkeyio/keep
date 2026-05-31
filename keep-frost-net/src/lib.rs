@@ -127,7 +127,9 @@ pub use psbt_session::{
 pub use recovery_signers::{
     InMemoryRecoverySignerRegistry, RecoverySignerHandle, RecoverySignerRegistry,
 };
-pub use session::{derive_session_id, NetworkSession, SessionManager, SessionState};
+pub use session::{
+    derive_session_id, derive_session_id_salted, NetworkSession, SessionManager, SessionState,
+};
 
 pub fn install_default_crypto_provider() {
     rustls::crypto::ring::default_provider()

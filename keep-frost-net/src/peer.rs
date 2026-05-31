@@ -37,6 +37,11 @@ pub struct Peer {
     pub capabilities: Vec<String>,
     pub name: Option<String>,
     pub last_seen: Instant,
+    /// Last time a Pong was received from this peer in reply to our Ping.
+    /// Tracked separately from `last_seen` (which any announce also bumps) so
+    /// the pre-round liveness check classifies a peer as responsive only when it
+    /// actually answered a ping, not merely re-announced.
+    pub last_pong: Option<Instant>,
     pub status: PeerStatus,
     pub protocol_version: u8,
     pub attestation_status: AttestationStatus,
@@ -52,6 +57,7 @@ impl Peer {
             capabilities: vec!["sign".into()],
             name: None,
             last_seen: Instant::now(),
+            last_pong: None,
             status: PeerStatus::Online,
             protocol_version: crate::KFP_VERSION,
             attestation_status: AttestationStatus::NotProvided,
@@ -142,10 +148,14 @@ impl PeerManager {
             // PeerAnnounce carries no recovery xpubs; preserve any previously
             // announced (and replay-validated) xpubs across re-announcements so
             // a duplicate PeerAnnounce does not wipe stored recovery xpubs.
-            if peer.recovery_xpubs.is_empty() {
-                if let Some(existing) = self.peers.get(&peer.share_index) {
+            if let Some(existing) = self.peers.get(&peer.share_index) {
+                if peer.recovery_xpubs.is_empty() {
                     peer.recovery_xpubs = existing.recovery_xpubs.clone();
                 }
+                // Preserve pong history across re-announcements so a later
+                // announce does not wipe the liveness signal the pre-round check
+                // relies on.
+                peer.last_pong = existing.last_pong;
             }
             self.peers.insert(peer.share_index, peer);
         }
@@ -163,6 +173,17 @@ impl PeerManager {
     pub fn touch_by_pubkey(&mut self, pubkey: &PublicKey) {
         if let Some(peer) = self.peers.values_mut().find(|p| &p.pubkey == pubkey) {
             peer.touch();
+        }
+    }
+
+    /// Record receipt of a Pong from this peer in reply to our Ping. Bumps
+    /// `last_seen` like any other contact and additionally stamps `last_pong`,
+    /// which the pre-round liveness check uses to distinguish an actual ping
+    /// reply from a periodic announce.
+    pub fn touch_pong_by_pubkey(&mut self, pubkey: &PublicKey) {
+        if let Some(peer) = self.peers.values_mut().find(|p| &p.pubkey == pubkey) {
+            peer.touch();
+            peer.last_pong = Some(Instant::now());
         }
     }
 

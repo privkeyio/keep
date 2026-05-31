@@ -123,7 +123,7 @@ pub fn cmd_frost_network_serve(
                         let sig = hex::encode(signature);
                         tracing::info!(session, signature = sig, "signature complete");
                     }
-                    Ok(keep_frost_net::KfpNodeEvent::SigningFailed { session_id, error }) => {
+                    Ok(keep_frost_net::KfpNodeEvent::SigningFailed { session_id, error, .. }) => {
                         let session = hex::encode(&session_id[..8]);
                         tracing::error!(session, error, "signing failed");
                     }

@@ -12,7 +12,7 @@ use crate::audit::SigningOperation;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
-use crate::session::derive_session_id;
+use crate::session::{derive_session_id, derive_session_id_salted};
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
@@ -54,6 +54,25 @@ impl From<FrostNetError> for SigningRoundError {
     fn from(error: FrostNetError) -> Self {
         Self::fatal(error)
     }
+}
+
+/// A peer-reported failure for the in-flight signing session, carried out of the
+/// round receive loop with the structured error code and offending share index
+/// so the failover logic can decide whether the failure is recoverable in place
+/// or whether the peer should be excluded and the round retried.
+struct PeerRoundFailure {
+    error: String,
+    code: String,
+    offending_index: Option<u16>,
+}
+
+/// Peer-reported error codes that the requester handles in place (clearing the
+/// offending peer's pooled commitments and falling back to an interactive round
+/// on the next request) rather than excluding the peer and failing over. Any
+/// other code is treated like an unresponsive peer so a faulty or malicious
+/// co-signer cannot reliably block signing.
+fn is_recoverable_peer_error(code: &str) -> bool {
+    code == "stale_nonce" || code == "incomplete_pre_exchange"
 }
 
 /// Extract the offending peer's share index from a peer-reported session error,
@@ -586,11 +605,12 @@ impl KfpNode {
         let commit_result = {
             let mut sessions = self.sessions.write();
 
-            let session = sessions.get_or_create_session(
+            let session = sessions.get_or_create_session_salted(
                 request.session_id,
                 request.message.clone(),
                 self.share.metadata.threshold,
                 request.participants.clone(),
+                &request.session_salt,
             )?;
 
             // All nonce_refs have now been validated above, and a pre-exchange
@@ -1016,13 +1036,13 @@ impl KfpNode {
     /// normal round and failover should decide rather than a flaky ping.
     async fn prune_unresponsive_cosigners(&self) -> Vec<u16> {
         let needed = (self.share.metadata.threshold as usize).saturating_sub(1);
-        let snapshot: Vec<(u16, PublicKey, std::time::Instant)> = {
+        let snapshot: Vec<(u16, PublicKey, Option<std::time::Instant>)> = {
             let peers = self.peers.read();
             peers
                 .get_signing_peers()
                 .into_iter()
                 .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
-                .map(|p| (p.share_index, p.pubkey, p.last_seen))
+                .map(|p| (p.share_index, p.pubkey, p.last_pong))
                 .collect()
         };
         if snapshot.len() <= needed {
@@ -1201,7 +1221,19 @@ impl KfpNode {
 
         let attempted: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
 
-        let session_id = derive_session_id(&message, &participants, threshold);
+        // Salt the session id with the attempt index so a re-sample over an
+        // unchanged participant set (everyone responded but no signature was
+        // produced) derives a distinct id and fresh nonce instead of colliding
+        // with the just-completed attempt and tripping the replay guard. Attempt
+        // 0 uses an empty salt to keep the common single-attempt id stable and
+        // wire-compatible with peers that predate salted failover.
+        let session_salt: Vec<u8> = if attempt == 0 {
+            Vec::new()
+        } else {
+            (attempt as u64).to_be_bytes().to_vec()
+        };
+        let session_id =
+            derive_session_id_salted(&message, &participants, threshold, &session_salt);
 
         info!(
             logical_id = %hex::encode(logical_id),
@@ -1269,7 +1301,8 @@ impl KfpNode {
             message_type,
             participants.clone(),
         )
-        .with_nonce_refs(nonce_refs);
+        .with_nonce_refs(nonce_refs)
+        .with_session_salt(session_salt.clone());
 
         let session_info = SessionInfo {
             session_id,
@@ -1283,11 +1316,12 @@ impl KfpNode {
 
         {
             let mut sessions = self.sessions.write();
-            let session = sessions.create_session(
+            let session = sessions.create_session_salted(
                 session_id,
                 message,
                 self.share.metadata.threshold,
                 participants.clone(),
+                &session_salt,
             )?;
 
             session.set_our_nonces(nonces);
@@ -1383,13 +1417,23 @@ impl KfpNode {
                     Ok(KfpNodeEvent::SigningFailed {
                         session_id: sid,
                         error,
+                        code,
+                        offending_index,
                     }) => {
                         if sid == session_id {
-                            return Err(FrostNetError::Session(error));
+                            return Err(PeerRoundFailure {
+                                error,
+                                code,
+                                offending_index,
+                            });
                         }
                     }
                     Err(_) => {
-                        return Err(FrostNetError::Transport("Event channel closed".into()));
+                        return Err(PeerRoundFailure {
+                            error: "Event channel closed".into(),
+                            code: "channel_closed".into(),
+                            offending_index: None,
+                        });
                     }
                     _ => {}
                 }
@@ -1402,9 +1446,42 @@ impl KfpNode {
         // request and our consumed nonce can't be reused.
         match result {
             Ok(Ok(signature)) => Ok(signature),
-            Ok(Err(e)) => {
+            Ok(Err(failure)) => {
                 self.sessions.write().complete_session(&session_id);
-                Err(e.into())
+                if failure.code == "channel_closed" {
+                    // The event channel closed (node shutting down); not a peer
+                    // fault, so surface it fatally rather than burning failover
+                    // attempts re-subscribing to a dead channel.
+                    Err(SigningRoundError::fatal(FrostNetError::Transport(
+                        failure.error,
+                    )))
+                } else if is_recoverable_peer_error(&failure.code) {
+                    // Recoverable pre-exchange miss: keep the fatal Session error
+                    // so `request_signature` clears the offending peer's pooled
+                    // commitments and the next request falls back to interactive.
+                    Err(SigningRoundError::fatal(FrostNetError::Session(
+                        failure.error,
+                    )))
+                } else {
+                    // A peer actively errored on this session for a
+                    // non-recoverable reason. Treat it like an unresponsive peer:
+                    // exclude it (by share index when known, else the whole
+                    // attempted set) and fail over instead of returning fatally,
+                    // so the offender cannot reliably block signing.
+                    let attempted = match failure.offending_index {
+                        Some(idx) => vec![idx],
+                        None => attempted.clone(),
+                    };
+                    warn!(
+                        code = %failure.code,
+                        offending = ?failure.offending_index,
+                        "peer reported non-recoverable signing error; excluding and failing over"
+                    );
+                    Err(SigningRoundError {
+                        error: FrostNetError::Timeout(failure.error),
+                        attempted,
+                    })
+                }
             }
             Err(_) => {
                 // Exclude only peers that never responded; responsive peers stay

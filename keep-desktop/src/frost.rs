@@ -589,7 +589,7 @@ pub(crate) async fn frost_event_listener(
                         }
                         push_frost_event(&frost_events, FrostNodeMsg::SignRequestRemoved(id));
                     }
-                    Ok(KfpNodeEvent::SigningFailed { session_id, ref error }) => {
+                    Ok(KfpNodeEvent::SigningFailed { session_id, ref error, .. }) => {
                         log!(EventLogType::SignFailed, format!("Signing failed: {}", truncate_peer_string(error)));
                         let id = hex::encode(session_id);
                         if let Ok(mut guard) = pending_requests.lock() {

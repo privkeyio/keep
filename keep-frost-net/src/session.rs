@@ -17,10 +17,25 @@ use crate::nonce_store::NonceStore;
 use crate::protocol::KFP_VERSION;
 
 pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -> [u8; 32] {
+    derive_session_id_salted(message, participants, threshold, &[])
+}
+
+/// Like [`derive_session_id`] but folds an extra `salt` into the preimage.
+/// Signing failover uses a per-attempt salt so a re-sample over the same
+/// participant set produces a distinct session id (and a distinct fresh nonce)
+/// instead of colliding with the just-completed attempt's id and tripping the
+/// replay guard. The salt is still bound to message+participants+threshold, so
+/// it does not weaken replay protection against genuine external replays.
+pub fn derive_session_id_salted(
+    message: &[u8],
+    participants: &[u16],
+    threshold: u16,
+    salt: &[u8],
+) -> [u8; 32] {
     let mut sorted_participants = participants.to_vec();
     sorted_participants.sort();
 
-    let mut preimage = Vec::with_capacity(64 + message.len() + participants.len() * 2);
+    let mut preimage = Vec::with_capacity(64 + message.len() + participants.len() * 2 + salt.len());
     preimage.extend_from_slice(b"keep-frost-session-v1");
     preimage.push(KFP_VERSION);
     preimage.extend_from_slice(&threshold.to_be_bytes());
@@ -30,6 +45,10 @@ pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -
     }
     preimage.extend_from_slice(&(message.len() as u32).to_be_bytes());
     preimage.extend_from_slice(message);
+    if !salt.is_empty() {
+        preimage.extend_from_slice(&(salt.len() as u32).to_be_bytes());
+        preimage.extend_from_slice(salt);
+    }
 
     keep_core::crypto::blake2b_256(&preimage)
 }
@@ -588,8 +607,9 @@ fn validate_session_id(
     message: &[u8],
     participants: &[u16],
     threshold: u16,
+    salt: &[u8],
 ) -> Result<()> {
-    let expected_id = derive_session_id(message, participants, threshold);
+    let expected_id = derive_session_id_salted(message, participants, threshold, salt);
     if session_id != expected_id {
         return Err(FrostNetError::Session(format!(
             "Session ID mismatch: expected {}, got {}",
@@ -647,7 +667,18 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
-        validate_session_id(session_id, &message, &participants, threshold)?;
+        self.create_session_salted(session_id, message, threshold, participants, &[])
+    }
+
+    pub fn create_session_salted(
+        &mut self,
+        session_id: [u8; 32],
+        message: Vec<u8>,
+        threshold: u16,
+        participants: Vec<u16>,
+        salt: &[u8],
+    ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold, salt)?;
 
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));
@@ -696,7 +727,18 @@ impl SessionManager {
         threshold: u16,
         participants: Vec<u16>,
     ) -> Result<&mut NetworkSession> {
-        validate_session_id(session_id, &message, &participants, threshold)?;
+        self.get_or_create_session_salted(session_id, message, threshold, participants, &[])
+    }
+
+    pub fn get_or_create_session_salted(
+        &mut self,
+        session_id: [u8; 32],
+        message: Vec<u8>,
+        threshold: u16,
+        participants: Vec<u16>,
+        salt: &[u8],
+    ) -> Result<&mut NetworkSession> {
+        validate_session_id(session_id, &message, &participants, threshold, salt)?;
 
         if self.completed_sessions.contains(&session_id) {
             return Err(FrostNetError::ReplayDetected(hex::encode(session_id)));

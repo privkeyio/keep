@@ -386,6 +386,14 @@ pub enum KfpNodeEvent {
     SigningFailed {
         session_id: [u8; 32],
         error: String,
+        /// Peer-reported error code (e.g. `stale_nonce`), used by the requester
+        /// to decide whether the failure is recoverable in place or whether the
+        /// offending peer should be excluded and the round failed over.
+        code: String,
+        /// Share index of the peer that reported the error, when resolvable.
+        /// Carried structurally so failover can exclude exactly that peer
+        /// without parsing it back out of the human-readable `error` string.
+        offending_index: Option<u16>,
     },
     EcdhComplete {
         session_id: [u8; 32],
@@ -513,10 +521,17 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("signature", &hex::encode(signature))
                 .finish(),
-            Self::SigningFailed { session_id, error } => f
+            Self::SigningFailed {
+                session_id,
+                error,
+                code,
+                offending_index,
+            } => f
                 .debug_struct("SigningFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
+                .field("code", code)
+                .field("offending_index", offending_index)
                 .finish(),
             Self::EcdhFailed { session_id, error } => f
                 .debug_struct("EcdhFailed")
@@ -1513,23 +1528,27 @@ impl KfpNode {
                             None => None,
                         }
                     };
-                    if let Some(offending_index) = offending_index {
-                        // Future improvement: on `stale_nonce` /
-                        // `incomplete_pre_exchange` the requester could retry
-                        // this session with a fresh interactive commitment round
-                        // instead of failing, since these are recoverable
-                        // pre-exchange misses rather than fatal errors. For now
-                        // we fail fast so the caller can decide to retry. The
-                        // peer index is appended so the requester can clear only
-                        // the offending peer's pooled commitments.
-                        let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
-                            session_id,
-                            error: format!(
-                                "Peer reported error: {} (peer {offending_index})",
-                                payload.code
-                            ),
-                        });
-                    }
+                    // Recoverable pre-exchange misses (`stale_nonce` /
+                    // `incomplete_pre_exchange`) keep their fast-fail + pool-clear
+                    // handling in `request_signature`. Any other peer-reported
+                    // error is treated like an unresponsive peer there: the
+                    // offending index is excluded and the round fails over to
+                    // live co-signers instead of returning fatally, so a faulty
+                    // or malicious peer cannot reliably block signing. The index
+                    // is carried structurally; the human-readable string still
+                    // embeds it for logs and external consumers.
+                    let error = match offending_index {
+                        Some(idx) => {
+                            format!("Peer reported error: {} (peer {idx})", payload.code)
+                        }
+                        None => format!("Peer reported error: {}", payload.code),
+                    };
+                    let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
+                        session_id,
+                        error,
+                        code: payload.code.clone(),
+                        offending_index,
+                    });
                 }
             }
         }
@@ -1690,7 +1709,7 @@ impl KfpNode {
     }
 
     async fn handle_pong(&self, from: PublicKey, _payload: PongPayload) -> Result<()> {
-        self.peers.write().touch_by_pubkey(&from);
+        self.peers.write().touch_pong_by_pubkey(&from);
         Ok(())
     }
 
@@ -1701,12 +1720,12 @@ impl KfpNode {
                 timeout.as_secs()
             )));
         }
-        let peers_snapshot: Vec<(u16, PublicKey, std::time::Instant)> = self
+        let peers_snapshot: Vec<(u16, PublicKey, Option<std::time::Instant>)> = self
             .peers
             .read()
             .all_peers()
             .iter()
-            .map(|p| (p.share_index, p.pubkey, p.last_seen))
+            .map(|p| (p.share_index, p.pubkey, p.last_pong))
             .collect();
 
         let responsive = self
@@ -1733,12 +1752,12 @@ impl KfpNode {
     }
 
     pub async fn ping_peers(&self, timeout: Duration) -> Result<Vec<u16>> {
-        let peers_snapshot: Vec<(u16, PublicKey, std::time::Instant)> = self
+        let peers_snapshot: Vec<(u16, PublicKey, Option<std::time::Instant>)> = self
             .peers
             .read()
             .all_peers()
             .iter()
-            .map(|p| (p.share_index, p.pubkey, p.last_seen))
+            .map(|p| (p.share_index, p.pubkey, p.last_pong))
             .collect();
 
         self.ping_peers_snapshot(&peers_snapshot, timeout, None)
@@ -1747,7 +1766,7 @@ impl KfpNode {
 
     async fn ping_peers_snapshot(
         &self,
-        peers_snapshot: &[(u16, PublicKey, std::time::Instant)],
+        peers_snapshot: &[(u16, PublicKey, Option<std::time::Instant>)],
         timeout: Duration,
         early_exit_at: Option<usize>,
     ) -> Result<Vec<u16>> {
@@ -1778,14 +1797,25 @@ impl KfpNode {
             }
         }
 
-        let responsive = |snapshot: &[(u16, PublicKey, std::time::Instant)]| -> Vec<u16> {
+        // A peer counts as responsive only when a *new* Pong arrived after this
+        // snapshot was taken. Comparing `last_pong` against the captured baseline
+        // (rather than generic `last_seen`) prevents a peer that merely
+        // re-announced, without answering our ping, from being classified live,
+        // which is exactly the partial-connectivity case the pre-round ping
+        // targets. A peer with no prior pong (`None` baseline) is responsive once
+        // it has any `last_pong`.
+        let responsive = |snapshot: &[(u16, PublicKey, Option<std::time::Instant>)]| -> Vec<u16> {
             let peers = self.peers.read();
             snapshot
                 .iter()
-                .filter_map(|(share_index, _, initial_last_seen)| {
+                .filter_map(|(share_index, _, baseline_pong)| {
                     peers
                         .get_peer(*share_index)
-                        .filter(|p| p.last_seen > *initial_last_seen)
+                        .filter(|p| match (p.last_pong, baseline_pong) {
+                            (Some(current), Some(baseline)) => current > *baseline,
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        })
                         .map(|_| *share_index)
                 })
                 .collect()
