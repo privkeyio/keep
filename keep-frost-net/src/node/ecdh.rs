@@ -211,7 +211,8 @@ impl KfpNode {
     pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>> {
         let threshold = self.share.metadata.threshold;
 
-        let (participants, participant_peers) = self.select_eligible_peers(threshold as usize)?;
+        let (participants, participant_peers) =
+            self.select_eligible_peers(threshold as usize, &[])?;
 
         let session_id = derive_ecdh_session_id(recipient_pubkey, &participants);
 

@@ -6,6 +6,7 @@ mod psbt;
 mod signing;
 
 pub use psbt::PsbtSessionSnapshot;
+pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -363,6 +364,8 @@ pub struct HealthCheckResult {
 pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+/// How often the early-exit liveness ping re-checks for pongs while waiting.
+const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub enum KfpNodeEvent {
@@ -1111,12 +1114,14 @@ impl KfpNode {
     pub(crate) fn select_eligible_peers(
         &self,
         threshold: usize,
+        exclude: &[u16],
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         let selected_peers: Vec<Peer> = {
             let peers = self.peers.read();
             let eligible_peers: Vec<_> = peers
                 .get_signing_peers()
                 .into_iter()
+                .filter(|p| !exclude.contains(&p.share_index))
                 .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
                 .collect();
 
@@ -1275,11 +1280,16 @@ impl KfpNode {
         // Re-announce often enough that an initiator with a short discovery
         // window reliably catches a periodic announce even if the immediate
         // reciprocal announce (see handle_announce) is missed. Must stay well
-        // under PEER_OFFLINE_THRESHOLD so peers don't flap offline.
-        let mut announce_interval = tokio::time::interval(Duration::from_secs(20));
+        // under the peer offline threshold so peers don't flap offline.
+        let mut announce_interval = tokio::time::interval(crate::peer::PEER_ANNOUNCE_INTERVAL);
         announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(120));
+        // Reap expired sessions on roughly the signing round cadence so an
+        // abandoned co-signer session (and its consumed single-use nonce) is
+        // released promptly instead of lingering until lazy cleanup, which keeps
+        // the session table and nonce pool from filling under a burst of
+        // failovers where requesters abandon rounds after SIGNING_ROUND_TIMEOUT.
+        let mut cleanup_interval = tokio::time::interval(SIGNING_ROUND_TIMEOUT);
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut replenish_interval = tokio::time::interval(Duration::from_secs(30));
@@ -1485,31 +1495,39 @@ impl KfpNode {
                 // referenced pre-exchanged nonce). Surface it so an in-flight
                 // `request_signature` fails fast instead of waiting for timeout.
                 if let Some(session_id) = payload.session_id {
-                    let is_participant = {
+                    // Resolve the offending peer's share index so the requester
+                    // can scope any pool cleanup to just that peer instead of
+                    // wiping every peer's pooled commitments.
+                    let offending_index = {
                         let sessions = self.sessions.read();
                         match sessions.get_session(&session_id) {
                             Some(session) => {
                                 let peers = self.peers.read();
-                                session.participants().iter().any(|&idx| {
+                                session.participants().iter().copied().find(|&idx| {
                                     peers
                                         .get_peer(idx)
                                         .map(|p| p.pubkey == event.pubkey)
                                         .unwrap_or(false)
                                 })
                             }
-                            None => false,
+                            None => None,
                         }
                     };
-                    if is_participant {
+                    if let Some(offending_index) = offending_index {
                         // Future improvement: on `stale_nonce` /
                         // `incomplete_pre_exchange` the requester could retry
                         // this session with a fresh interactive commitment round
                         // instead of failing, since these are recoverable
                         // pre-exchange misses rather than fatal errors. For now
-                        // we fail fast so the caller can decide to retry.
+                        // we fail fast so the caller can decide to retry. The
+                        // peer index is appended so the requester can clear only
+                        // the offending peer's pooled commitments.
                         let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
                             session_id,
-                            error: format!("Peer reported error: {}", payload.code),
+                            error: format!(
+                                "Peer reported error: {} (peer {offending_index})",
+                                payload.code
+                            ),
                         });
                     }
                 }
@@ -1666,17 +1684,13 @@ impl KfpNode {
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-        if let Some(peer) = self.peers.read().get_peer_by_pubkey(&from) {
-            self.peers.write().update_last_seen(peer.share_index);
-        }
+        self.peers.write().touch_by_pubkey(&from);
 
         Ok(())
     }
 
     async fn handle_pong(&self, from: PublicKey, _payload: PongPayload) -> Result<()> {
-        if let Some(peer) = self.peers.read().get_peer_by_pubkey(&from) {
-            self.peers.write().update_last_seen(peer.share_index);
-        }
+        self.peers.write().touch_by_pubkey(&from);
         Ok(())
     }
 
@@ -1695,7 +1709,9 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
-        let responsive = self.ping_peers_snapshot(&peers_snapshot, timeout).await?;
+        let responsive = self
+            .ping_peers_snapshot(&peers_snapshot, timeout, None)
+            .await?;
         let unresponsive: Vec<u16> = peers_snapshot
             .iter()
             .map(|(idx, _, _)| *idx)
@@ -1725,13 +1741,15 @@ impl KfpNode {
             .map(|p| (p.share_index, p.pubkey, p.last_seen))
             .collect();
 
-        self.ping_peers_snapshot(&peers_snapshot, timeout).await
+        self.ping_peers_snapshot(&peers_snapshot, timeout, None)
+            .await
     }
 
     async fn ping_peers_snapshot(
         &self,
         peers_snapshot: &[(u16, PublicKey, std::time::Instant)],
         timeout: Duration,
+        early_exit_at: Option<usize>,
     ) -> Result<Vec<u16>> {
         if peers_snapshot.is_empty() {
             return Ok(Vec::new());
@@ -1760,20 +1778,36 @@ impl KfpNode {
             }
         }
 
-        tokio::time::sleep(timeout).await;
+        let responsive = |snapshot: &[(u16, PublicKey, std::time::Instant)]| -> Vec<u16> {
+            let peers = self.peers.read();
+            snapshot
+                .iter()
+                .filter_map(|(share_index, _, initial_last_seen)| {
+                    peers
+                        .get_peer(*share_index)
+                        .filter(|p| p.last_seen > *initial_last_seen)
+                        .map(|_| *share_index)
+                })
+                .collect()
+        };
 
-        let responsive: Vec<u16> = peers_snapshot
-            .iter()
-            .filter_map(|(share_index, _, initial_last_seen)| {
-                self.peers
-                    .read()
-                    .get_peer(*share_index)
-                    .filter(|p| p.last_seen > *initial_last_seen)
-                    .map(|_| *share_index)
-            })
-            .collect();
+        // Without an early-exit target, classify every peer after the full
+        // timeout (health check). With one, poll and return as soon as that many
+        // peers have ponged so the all-online path resolves in roughly one
+        // round-trip instead of waiting out the whole timeout.
+        let Some(target) = early_exit_at else {
+            tokio::time::sleep(timeout).await;
+            return Ok(responsive(peers_snapshot));
+        };
 
-        Ok(responsive)
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let current = responsive(peers_snapshot);
+            if current.len() >= target || std::time::Instant::now() >= deadline {
+                return Ok(current);
+            }
+            tokio::time::sleep(LIVENESS_PING_POLL_INTERVAL).await;
+        }
     }
 }
 

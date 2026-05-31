@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::AnnouncedXpub;
 
+/// How often a node re-announces itself to peers. The offline threshold and the
+/// node's announce loop are both derived from this so they stay in lockstep.
+pub(crate) const PEER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(20);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
     Online,
@@ -116,7 +120,11 @@ impl PeerManager {
         Self {
             peers: HashMap::new(),
             our_share_index,
-            offline_threshold: Duration::from_secs(60),
+            // Tolerate exactly one missed announce so a freshly-dropped peer
+            // stops being selected quickly instead of lingering for a full
+            // minute (issue #412). A peer that drops mid-round is still caught
+            // by the signing-round timeout and failover exclusion.
+            offline_threshold: PEER_ANNOUNCE_INTERVAL.saturating_mul(2),
         }
     }
 
@@ -145,6 +153,15 @@ impl PeerManager {
 
     pub fn update_last_seen(&mut self, share_index: u16) {
         if let Some(peer) = self.peers.get_mut(&share_index) {
+            peer.touch();
+        }
+    }
+
+    /// Mark the peer with this pubkey as just-seen. Resolving by pubkey under a
+    /// single write lock avoids a read-then-write on `peers` from the same task,
+    /// which would self-deadlock the (non-reentrant) lock.
+    pub fn touch_by_pubkey(&mut self, pubkey: &PublicKey) {
+        if let Some(peer) = self.peers.values_mut().find(|p| &p.pubkey == pubkey) {
             peer.touch();
         }
     }
@@ -296,5 +313,16 @@ mod tests {
         pm.add_peer(self_peer);
 
         assert_eq!(pm.peer_count(), 0);
+    }
+
+    #[test]
+    fn test_default_offline_threshold_tolerates_one_missed_announce() {
+        // A freshly-dropped peer should leave the eligible set quickly: the
+        // threshold tolerates exactly one missed announce, not several (issue
+        // #412 regressed when this drifted up to a full minute).
+        let pm = PeerManager::new(1);
+        assert_eq!(pm.offline_threshold(), PEER_ANNOUNCE_INTERVAL * 2);
+        assert!(pm.offline_threshold() > PEER_ANNOUNCE_INTERVAL);
+        assert!(pm.offline_threshold() < PEER_ANNOUNCE_INTERVAL * 3);
     }
 }
