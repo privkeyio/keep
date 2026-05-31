@@ -43,7 +43,7 @@ use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result, StorageError};
 use crate::keys::KeyRecord;
 use crate::rate_limit;
-use crate::relay::RelayConfig;
+use crate::relay::{self, RelayConfig};
 
 use bincode::Options;
 
@@ -690,7 +690,7 @@ impl HiddenStorage {
         match self.active_volume {
             Some(VolumeType::Outer) => {}
             Some(VolumeType::Hidden) => {
-                return Err(KeepError::Other(
+                return Err(KeepError::NotImplemented(
                     "relay config storage on the hidden volume is not yet implemented".into(),
                 ));
             }
@@ -698,15 +698,16 @@ impl HiddenStorage {
         }
         let (data_key, db) = self.outer_relay_handles()?;
 
-        let serialized = serde_json::to_vec(config)
-            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
-        let encrypted = crypto::encrypt(&serialized, data_key)?;
-        let encrypted_bytes = encrypted.to_bytes();
+        let normalized = config.clone().normalize()?;
+        let encrypted_bytes = relay::encode_relay_config(&normalized, data_key)?;
 
         let wtxn = db.begin_write()?;
         {
             let mut table = wtxn.open_table(RELAY_CONFIGS_TABLE)?;
-            table.insert(config.group_pubkey.as_slice(), encrypted_bytes.as_slice())?;
+            table.insert(
+                normalized.group_pubkey.as_slice(),
+                encrypted_bytes.as_slice(),
+            )?;
         }
         wtxn.commit()?;
         Ok(())
@@ -734,12 +735,7 @@ impl HiddenStorage {
         let Some(entry) = table.get(group_pubkey.as_slice())? else {
             return Ok(None);
         };
-        let encrypted = EncryptedData::from_bytes(entry.value())?;
-        let decrypted = crypto::decrypt(&encrypted, data_key)?;
-        let decrypted_bytes = decrypted.as_slice()?;
-        let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
-            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
-        Ok(Some(config))
+        Ok(Some(relay::decode_relay_config(entry.value(), data_key)?))
     }
 
     /// Load a relay configuration or return a fresh default for `group_pubkey`.

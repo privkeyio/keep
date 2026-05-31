@@ -827,101 +827,7 @@ impl Keep {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
         }
-        let normalize_relays = |urls: &[String], label: &str| -> Result<Vec<String>> {
-            if urls.len() > relay::MAX_RELAYS {
-                return Err(KeepError::InvalidInput(format!(
-                    "Too many {label} relays (max {})",
-                    relay::MAX_RELAYS
-                )));
-            }
-            let normalized = dedup_stable(urls.iter().map(|u| relay::normalize_relay_url(u)));
-            for url in &normalized {
-                relay::validate_relay_url(url).map_err(KeepError::InvalidInput)?;
-            }
-            Ok(normalized)
-        };
-        let normalized_config = RelayConfig {
-            group_pubkey: config.group_pubkey,
-            frost_relays: normalize_relays(&config.frost_relays, "FROST")?,
-            profile_relays: normalize_relays(&config.profile_relays, "profile")?,
-            bunker_relays: normalize_relays(&config.bunker_relays, "bunker")?,
-            peer_policies: {
-                let mut policies = Vec::with_capacity(config.peer_policies.len());
-                for p in &config.peer_policies {
-                    if p.pubkey_hex.len() != 64
-                        || !p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        return Err(KeepError::InvalidInput(format!(
-                            "Invalid peer policy pubkey: {}",
-                            p.pubkey_hex
-                        )));
-                    }
-                    policies.push(relay::PeerPolicyEntry {
-                        pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
-                        allow_send: p.allow_send,
-                        allow_receive: p.allow_receive,
-                    });
-                }
-                policies
-            },
-            bunker_permissions: {
-                const MAX_BUNKER_APPS: usize = 100;
-                const MAX_NAME_LEN: usize = 256;
-                const MAX_AUTO_KINDS: usize = 64;
-                const VALID_PERMISSION_MASK: u32 = 0b00111111;
-                if config.bunker_permissions.len() > MAX_BUNKER_APPS {
-                    return Err(KeepError::InvalidInput(format!(
-                        "Too many bunker permissions: {} (max {MAX_BUNKER_APPS})",
-                        config.bunker_permissions.len()
-                    )));
-                }
-                let mut perms = Vec::with_capacity(config.bunker_permissions.len());
-                for bp in &config.bunker_permissions {
-                    if bp.pubkey_hex.len() != 64
-                        || !bp.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        return Err(KeepError::InvalidInput(format!(
-                            "Invalid bunker permission pubkey: {}",
-                            bp.pubkey_hex
-                        )));
-                    }
-                    if bp.name.len() > MAX_NAME_LEN {
-                        return Err(KeepError::InvalidInput(format!(
-                            "Bunker app name too long: {} (max {MAX_NAME_LEN})",
-                            bp.name.len()
-                        )));
-                    }
-                    if bp.auto_approve_kinds.len() > MAX_AUTO_KINDS {
-                        return Err(KeepError::InvalidInput(format!(
-                            "Too many auto-approve kinds: {} (max {MAX_AUTO_KINDS})",
-                            bp.auto_approve_kinds.len()
-                        )));
-                    }
-                    perms.push(relay::StoredBunkerPermission {
-                        pubkey_hex: bp.pubkey_hex.to_ascii_lowercase(),
-                        name: bp.name.clone(),
-                        permissions: bp.permissions & VALID_PERMISSION_MASK,
-                        auto_approve_kinds: bp.auto_approve_kinds.clone(),
-                        duration: bp.duration.clone(),
-                        connected_at: bp.connected_at,
-                    });
-                }
-                perms
-            },
-            auto_approve_kinds: {
-                const MAX_GLOBAL_AUTO_KINDS: usize = 64;
-                if config.auto_approve_kinds.len() > MAX_GLOBAL_AUTO_KINDS {
-                    return Err(KeepError::InvalidInput(format!(
-                        "Too many global auto-approve kinds: {} (max {MAX_GLOBAL_AUTO_KINDS})",
-                        config.auto_approve_kinds.len()
-                    )));
-                }
-                let mut kinds = config.auto_approve_kinds.clone();
-                kinds.sort_unstable();
-                kinds.dedup();
-                kinds
-            },
-        };
+        let normalized_config = config.clone().normalize()?;
         self.storage.store_relay_config(&normalized_config)
     }
 
@@ -1540,11 +1446,6 @@ pub fn default_keep_path() -> Result<PathBuf> {
             .map(|p| p.join(".keep"))
             .ok_or(KeepError::HomeNotFound),
     }
-}
-
-fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    iter.filter(|s| seen.insert(s.clone())).collect()
 }
 
 #[cfg(test)]
