@@ -411,22 +411,33 @@ fn spawn_tui_server(
     Ok(())
 }
 
-fn run_headless(out: &Output, keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<()> {
+fn run_headless(
+    out: &Output,
+    keyring: Arc<Mutex<Keyring>>,
+    relay: &str,
+    pre_grants: Vec<keep_nip46::PreGrantedApp>,
+    global_auto_approve: std::collections::HashSet<nostr_sdk::Kind>,
+) -> Result<()> {
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    if !pre_grants.is_empty() {
+        out.field(
+            "Pre-granted apps",
+            &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
+        );
+    }
+    let mut config = ServerConfig {
+        auto_approve: true,
+        pre_grants,
+        ..Default::default()
+    };
+    if !global_auto_approve.is_empty() {
+        config.auto_approve_kinds = global_auto_approve;
+    }
     rt.block_on(async {
-        let mut server = Server::new_with_config(
-            keyring,
-            None,
-            None,
-            &[relay.to_string()],
-            None,
-            ServerConfig {
-                auto_approve: true,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let mut server =
+            Server::new_with_config(keyring, None, None, &[relay.to_string()], None, config)
+                .await?;
         info!(relay, bunker_url = %server.bunker_url(), "server started");
         out.field("Bunker URL", &server.bunker_url());
         out.field("Relay", relay);
@@ -481,12 +492,14 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
+    let (pre_grants, global_auto_approve) = hidden_serve_grants(&storage)?;
+
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let keyring = unlock_hidden_keyring(&storage, data_key)?;
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay);
+        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
     }
 
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
@@ -508,17 +521,41 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 
     out.hidden_label();
 
+    // Hidden-volume relay-config storage is not yet implemented, so this
+    // resolves to an empty grant set: the headless bunker falls back to its
+    // built-in `auto_approve` policy. Outer-volume pre-grants are intentionally
+    // not loaded on the hidden path so the relay layer never reflects activity
+    // tied to the outer volume's identity.
+    let (pre_grants, global_auto_approve) = hidden_serve_grants(&storage)?;
+
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let keyring = unlock_hidden_keyring(&storage, data_key)?;
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay);
+        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
     }
 
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
     spawn_tui_server(keyring, relay, bunker_url, npub)
+}
+
+fn hidden_serve_grants(
+    storage: &keep_core::hidden::HiddenStorage,
+) -> Result<(
+    Vec<keep_nip46::PreGrantedApp>,
+    std::collections::HashSet<nostr_sdk::Kind>,
+)> {
+    let cfg = storage.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
+    let pre_grants = map_stored_to_pregrants(&cfg.bunker_permissions);
+    let auto_approve: std::collections::HashSet<nostr_sdk::Kind> = cfg
+        .auto_approve_kinds
+        .iter()
+        .copied()
+        .map(nostr_sdk::Kind::from)
+        .collect();
+    Ok((pre_grants, auto_approve))
 }
 
 /// Read persisted NIP-46 client app grants from the global RelayConfig and
