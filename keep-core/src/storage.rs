@@ -16,7 +16,7 @@ use crate::error::{KeepError, Result, StorageError};
 use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
-use crate::relay::RelayConfig;
+use crate::relay::{self, RelayConfig};
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
@@ -852,12 +852,13 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = serde_json::to_vec(config)
-            .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
-        let encrypted = crypto::encrypt(&serialized, data_key)?;
-        let encrypted_bytes = encrypted.to_bytes();
-
-        backend.put(RELAY_CONFIGS_TABLE, &config.group_pubkey, &encrypted_bytes)?;
+        let normalized = config.clone().normalize()?;
+        let encrypted_bytes = relay::encode_relay_config(&normalized, data_key)?;
+        backend.put(
+            RELAY_CONFIGS_TABLE,
+            &normalized.group_pubkey,
+            &encrypted_bytes,
+        )?;
         Ok(())
     }
 
@@ -871,12 +872,10 @@ impl Storage {
             return Ok(None);
         };
 
-        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
-        let decrypted = crypto::decrypt(&encrypted, data_key)?;
-        let decrypted_bytes = decrypted.as_slice()?;
-        let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
-            .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
-        Ok(Some(config))
+        Ok(Some(relay::decode_relay_config(
+            &encrypted_bytes,
+            data_key,
+        )?))
     }
 
     /// List all stored relay configurations.
@@ -889,12 +888,7 @@ impl Storage {
         let mut configs = Vec::new();
 
         for (_, encrypted_bytes) in entries {
-            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
-            let decrypted = crypto::decrypt(&encrypted, data_key)?;
-            let decrypted_bytes = decrypted.as_slice()?;
-            let config: RelayConfig = serde_json::from_slice(&decrypted_bytes)
-                .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))?;
-            configs.push(config);
+            configs.push(relay::decode_relay_config(&encrypted_bytes, data_key)?);
         }
 
         Ok(configs)

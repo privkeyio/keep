@@ -200,8 +200,9 @@ pub fn cmd_serve(
     // headless path wires them into the ServerConfig; the interactive TUI path
     // relies on per-request approval, so the banner is scoped to headless mode
     // to avoid misleading the operator.
-    let pre_grants = load_pre_grants(&keep)?;
-    let global_auto_approve = load_global_auto_approve(&keep)?;
+    let (pre_grants, global_auto_approve) = serve_grants_from_config(
+        &keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?,
+    );
 
     let keyring = Arc::new(Mutex::new(std::mem::take(keep.keyring_mut())));
     let rt =
@@ -366,6 +367,7 @@ fn spawn_tui_server(
     relay: &str,
     bunker_url: String,
     npub: String,
+    global_auto_approve: std::collections::HashSet<nostr_sdk::Kind>,
 ) -> Result<()> {
     let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
@@ -386,17 +388,32 @@ fn spawn_tui_server(
                 tx: tui_tx_clone.clone(),
             }));
 
-            let mut server =
-                match Server::new(keyring, std::slice::from_ref(&relay_clone), callbacks).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tui_tx_clone.send(TuiEvent::Log(
-                            LogEntry::new("system", "server error", false)
-                                .with_detail(&e.to_string()),
-                        ));
-                        return;
-                    }
-                };
+            // Carry the persisted global auto-approve kinds so the interactive
+            // approval prompt skips them, matching `keep nip46 auto-approve`.
+            // An unset (empty) list leaves the server's default in place.
+            let mut tui_config = ServerConfig::default();
+            if !global_auto_approve.is_empty() {
+                tui_config.auto_approve_kinds = global_auto_approve;
+            }
+
+            let mut server = match Server::new_with_config(
+                keyring,
+                None,
+                None,
+                std::slice::from_ref(&relay_clone),
+                callbacks,
+                tui_config,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(TuiEvent::Log(
+                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
 
             if let Err(e) = server.run().await {
                 let _ = tui_tx_clone.send(TuiEvent::Log(
@@ -411,22 +428,33 @@ fn spawn_tui_server(
     Ok(())
 }
 
-fn run_headless(out: &Output, keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<()> {
+fn run_headless(
+    out: &Output,
+    keyring: Arc<Mutex<Keyring>>,
+    relay: &str,
+    pre_grants: Vec<keep_nip46::PreGrantedApp>,
+    global_auto_approve: std::collections::HashSet<nostr_sdk::Kind>,
+) -> Result<()> {
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    if !pre_grants.is_empty() {
+        out.field(
+            "Pre-granted apps",
+            &format!("{} (from `keep nip46 grant`)", pre_grants.len()),
+        );
+    }
+    let mut config = ServerConfig {
+        auto_approve: true,
+        pre_grants,
+        ..Default::default()
+    };
+    if !global_auto_approve.is_empty() {
+        config.auto_approve_kinds = global_auto_approve;
+    }
     rt.block_on(async {
-        let mut server = Server::new_with_config(
-            keyring,
-            None,
-            None,
-            &[relay.to_string()],
-            None,
-            ServerConfig {
-                auto_approve: true,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let mut server =
+            Server::new_with_config(keyring, None, None, &[relay.to_string()], None, config)
+                .await?;
         info!(relay, bunker_url = %server.bunker_url(), "server started");
         out.field("Bunker URL", &server.bunker_url());
         out.field("Relay", relay);
@@ -481,17 +509,21 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     storage.unlock_outer(password.expose_secret())?;
     spinner.finish();
 
+    let (pre_grants, global_auto_approve) = serve_grants_from_config(
+        &storage.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?,
+    );
+
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let keyring = unlock_hidden_keyring(&storage, data_key)?;
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay);
+        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
     }
 
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI");
-    spawn_tui_server(keyring, relay, bunker_url, npub)
+    spawn_tui_server(keyring, relay, bunker_url, npub, global_auto_approve)
 }
 
 fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
@@ -508,27 +540,48 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
 
     out.hidden_label();
 
+    // Hidden-volume relay-config storage is not yet implemented, so this
+    // resolves to an empty grant set: the headless bunker falls back to its
+    // built-in `auto_approve` policy. Outer-volume pre-grants are intentionally
+    // not loaded on the hidden path so the relay layer never reflects activity
+    // tied to the outer volume's identity.
+    let (pre_grants, global_auto_approve) = serve_grants_from_config(
+        &storage.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?,
+    );
+
     let data_key = storage.data_key().ok_or(KeepError::Locked)?;
     let keyring = unlock_hidden_keyring(&storage, data_key)?;
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay);
+        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
     }
 
     let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
-    spawn_tui_server(keyring, relay, bunker_url, npub)
+    spawn_tui_server(keyring, relay, bunker_url, npub, global_auto_approve)
 }
 
-/// Read persisted NIP-46 client app grants from the global RelayConfig and
-/// translate them into the `PreGrantedApp` shape `keep-nip46::ServerConfig`
-/// expects. Grants are populated into the `PermissionManager` at startup so
-/// headless bunkers (where there is no interactive approval prompt) can
-/// accept signing requests from previously authorized clients.
-fn load_pre_grants(keep: &Keep) -> Result<Vec<keep_nip46::PreGrantedApp>> {
-    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
-    Ok(map_stored_to_pregrants(&cfg.bunker_permissions))
+/// Translate an already-loaded global `RelayConfig` into the runtime serve
+/// grant state: `PreGrantedApp`s populated into the `PermissionManager` so
+/// headless bunkers can accept signing requests from previously authorized
+/// clients, plus the global auto-approve kinds (`keep nip46 auto-approve`).
+/// An empty auto-approve set leaves the server's default in place. Shared by
+/// both standard and hidden-vault serve paths from a single config read.
+fn serve_grants_from_config(
+    cfg: &keep_core::relay::RelayConfig,
+) -> (
+    Vec<keep_nip46::PreGrantedApp>,
+    std::collections::HashSet<nostr_sdk::Kind>,
+) {
+    let pre_grants = map_stored_to_pregrants(&cfg.bunker_permissions);
+    let auto_approve = cfg
+        .auto_approve_kinds
+        .iter()
+        .copied()
+        .map(nostr_sdk::Kind::from)
+        .collect();
+    (pre_grants, auto_approve)
 }
 
 /// Pure mapping persisted permissions → runtime `PreGrantedApp`. Separated
@@ -544,16 +597,4 @@ fn map_stored_to_pregrants(
         .iter()
         .filter_map(keep_nip46::PreGrantedApp::from_stored)
         .collect()
-}
-
-/// Read the persisted global auto-approve kinds (`keep nip46 auto-approve`).
-/// An empty stored list leaves the server's default in place.
-fn load_global_auto_approve(keep: &Keep) -> Result<std::collections::HashSet<nostr_sdk::Kind>> {
-    let cfg = keep.get_relay_config_or_default(&keep_core::relay::GLOBAL_RELAY_KEY)?;
-    Ok(cfg
-        .auto_approve_kinds
-        .iter()
-        .copied()
-        .map(nostr_sdk::Kind::from)
-        .collect())
 }

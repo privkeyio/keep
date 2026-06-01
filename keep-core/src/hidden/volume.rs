@@ -43,6 +43,7 @@ use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result, StorageError};
 use crate::keys::KeyRecord;
 use crate::rate_limit;
+use crate::relay::{self, RelayConfig};
 
 use bincode::Options;
 
@@ -51,6 +52,7 @@ use super::header::{
 };
 
 const KEYS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("keys");
+const RELAY_CONFIGS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("relay_configs");
 
 const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 
@@ -230,6 +232,7 @@ impl HiddenStorage {
 
         let wtxn = db.begin_write()?;
         let _ = wtxn.open_table(KEYS_TABLE)?;
+        let _ = wtxn.open_table(RELAY_CONFIGS_TABLE)?;
         wtxn.commit()?;
 
         Ok(Self {
@@ -677,6 +680,77 @@ impl HiddenStorage {
         self.write_hidden_records(&records, data_key, hidden_header)
     }
 
+    /// Persist a relay configuration on the outer volume.
+    ///
+    /// Only the outer volume is currently supported; hidden-volume relay-config
+    /// storage is a documented follow-up so the headless NIP-46 bunker on the
+    /// outer side can load pre-grants without leaking the existence of a
+    /// hidden volume into the relay layer.
+    pub fn store_relay_config(&self, config: &RelayConfig) -> Result<()> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => {
+                return Err(KeepError::NotImplemented(
+                    "relay config storage on the hidden volume is not yet implemented".into(),
+                ));
+            }
+            None => return Err(KeepError::Locked),
+        }
+        let (data_key, db) = self.outer_relay_handles()?;
+
+        let normalized = config.clone().normalize()?;
+        let encrypted_bytes = relay::encode_relay_config(&normalized, data_key)?;
+
+        let wtxn = db.begin_write()?;
+        {
+            let mut table = wtxn.open_table(RELAY_CONFIGS_TABLE)?;
+            table.insert(
+                normalized.group_pubkey.as_slice(),
+                encrypted_bytes.as_slice(),
+            )?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Load a relay configuration from the outer volume.
+    ///
+    /// Hidden volume callers get `Ok(None)` so a hidden-vault headless bunker
+    /// degrades cleanly to the interactive-approval path until hidden-volume
+    /// relay-config storage is implemented.
+    pub fn get_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<Option<RelayConfig>> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => return Ok(None),
+            None => return Err(KeepError::Locked),
+        }
+        let (data_key, db) = self.outer_relay_handles()?;
+
+        let rtxn = db.begin_read()?;
+        let table = match rtxn.open_table(RELAY_CONFIGS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(entry) = table.get(group_pubkey.as_slice())? else {
+            return Ok(None);
+        };
+        Ok(Some(relay::decode_relay_config(entry.value(), data_key)?))
+    }
+
+    /// Load a relay configuration or return a fresh default for `group_pubkey`.
+    pub fn get_relay_config_or_default(&self, group_pubkey: &[u8; 32]) -> Result<RelayConfig> {
+        Ok(self
+            .get_relay_config(group_pubkey)?
+            .unwrap_or_else(|| RelayConfig::with_defaults(*group_pubkey)))
+    }
+
+    fn outer_relay_handles(&self) -> Result<(&SecretKey, &Database)> {
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let db = self.outer_db.as_ref().ok_or(KeepError::Locked)?;
+        Ok((data_key, db))
+    }
+
     /// The vault directory path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -1109,5 +1183,121 @@ mod tests {
         let _ = storage.unlock("wrong");
         let result = storage.unlock("wrong");
         assert!(matches!(result, Err(KeepError::RateLimited(_))));
+    }
+
+    #[test]
+    fn relay_config_round_trip_outer() {
+        use crate::relay::{
+            RelayConfig, StoredBunkerPermission, StoredPermissionDuration, GLOBAL_RELAY_KEY,
+        };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-relay-cfg-outer");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+
+        // Default until first write.
+        let initial = storage
+            .get_relay_config_or_default(&GLOBAL_RELAY_KEY)
+            .unwrap();
+        assert!(initial.bunker_permissions.is_empty());
+
+        let mut cfg = RelayConfig::with_defaults(GLOBAL_RELAY_KEY);
+        cfg.bunker_permissions.push(StoredBunkerPermission {
+            pubkey_hex: "a".repeat(64),
+            name: "client".to_string(),
+            permissions: 0b1111,
+            auto_approve_kinds: vec![1, 7],
+            duration: StoredPermissionDuration::Forever,
+            connected_at: 100,
+        });
+        cfg.auto_approve_kinds = vec![22242];
+
+        storage.store_relay_config(&cfg).unwrap();
+
+        let loaded = storage
+            .get_relay_config(&GLOBAL_RELAY_KEY)
+            .unwrap()
+            .expect("stored config should round-trip");
+        assert_eq!(loaded.bunker_permissions.len(), 1);
+        assert_eq!(loaded.bunker_permissions[0].name, "client");
+        assert_eq!(loaded.auto_approve_kinds, vec![22242]);
+    }
+
+    #[test]
+    fn relay_config_returns_none_on_hidden_volume() {
+        use crate::relay::GLOBAL_RELAY_KEY;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-relay-cfg-hidden");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_hidden("hidden").unwrap();
+
+        // Hidden-active reads return Ok(None) so headless callers can degrade
+        // cleanly until hidden-volume scope is implemented.
+        let result = storage.get_relay_config(&GLOBAL_RELAY_KEY).unwrap();
+        assert!(result.is_none());
+
+        // Writes from a hidden-active session are explicitly refused so they
+        // never silently land in outer storage and leak hidden-volume activity.
+        let cfg = crate::relay::RelayConfig::with_defaults(GLOBAL_RELAY_KEY);
+        assert!(storage.store_relay_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn relay_config_round_trip_persists_across_open() {
+        use crate::relay::{RelayConfig, GLOBAL_RELAY_KEY};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-relay-cfg-reopen");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_outer("outer").unwrap();
+            let mut cfg = RelayConfig::with_defaults(GLOBAL_RELAY_KEY);
+            cfg.auto_approve_kinds = vec![1, 2, 3];
+            storage.store_relay_config(&cfg).unwrap();
+        }
+        {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_outer("outer").unwrap();
+            let loaded = storage
+                .get_relay_config(&GLOBAL_RELAY_KEY)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.auto_approve_kinds, vec![1, 2, 3]);
+        }
     }
 }

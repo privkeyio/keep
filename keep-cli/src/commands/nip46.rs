@@ -10,19 +10,59 @@ use secrecy::ExposeSecret;
 use tracing::debug;
 
 use keep_core::error::{KeepError, Result};
-use keep_core::relay::{StoredBunkerPermission, StoredPermissionDuration, GLOBAL_RELAY_KEY};
+use keep_core::hidden::HiddenStorage;
+use keep_core::relay::{
+    RelayConfig, StoredBunkerPermission, StoredPermissionDuration, GLOBAL_RELAY_KEY,
+};
 use keep_core::Keep;
 
-use super::get_password;
+use super::{get_password, is_hidden_vault};
 use crate::output::Output;
+
+/// Vault dispatch for NIP-46 grant management. Hidden-init vaults route
+/// through `HiddenStorage`'s outer volume so the same `keep nip46` CLI
+/// surface works regardless of vault layout. Hidden-volume relay-config
+/// storage is a deferred follow-up; until then, `keep nip46 grant` on a
+/// hidden-init vault always targets the outer volume.
+enum NipVault {
+    Keep(Box<Keep>),
+    HiddenOuter(Box<HiddenStorage>),
+}
+
+impl NipVault {
+    fn open_unlock(path: &Path, password: &str) -> Result<Self> {
+        if is_hidden_vault(path) {
+            let mut storage = HiddenStorage::open(path)?;
+            storage.unlock_outer(password)?;
+            Ok(Self::HiddenOuter(Box::new(storage)))
+        } else {
+            let mut keep = Keep::open(path)?;
+            keep.unlock(password)?;
+            Ok(Self::Keep(Box::new(keep)))
+        }
+    }
+
+    fn get_relay_config_or_default(&self, key: &[u8; 32]) -> Result<RelayConfig> {
+        match self {
+            Self::Keep(k) => k.get_relay_config_or_default(key),
+            Self::HiddenOuter(s) => s.get_relay_config_or_default(key),
+        }
+    }
+
+    fn store_relay_config(&self, cfg: &RelayConfig) -> Result<()> {
+        match self {
+            Self::Keep(k) => k.store_relay_config(cfg),
+            Self::HiddenOuter(s) => s.store_relay_config(cfg),
+        }
+    }
+}
 
 /// Display all persisted NIP-46 client grants.
 pub fn cmd_nip46_apps(out: &Output, path: &Path) -> Result<()> {
-    let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = NipVault::open_unlock(path, password.expose_secret())?;
 
-    let cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
+    let cfg = vault.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
 
     out.newline();
     if !cfg.auto_approve_kinds.is_empty() {
@@ -85,11 +125,10 @@ pub fn cmd_nip46_grant(
     let auto_kinds = parse_auto_approve_kinds(auto_approve_kinds)?;
     let parsed_duration = parse_duration(duration)?;
 
-    let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = NipVault::open_unlock(path, password.expose_secret())?;
 
-    let mut cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
+    let mut cfg = vault.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
 
     // Upsert: replace existing entry for this pubkey, or append a new one.
     // A 0 fallback would make a `Seconds(n)` grant expire from the epoch (i.e.
@@ -122,7 +161,7 @@ pub fn cmd_nip46_grant(
         }
     };
 
-    keep.store_relay_config(&cfg)?;
+    vault.store_relay_config(&cfg)?;
 
     out.newline();
     if replaced {
@@ -139,11 +178,10 @@ pub fn cmd_nip46_grant(
 pub fn cmd_nip46_revoke(out: &Output, path: &Path, pubkey: &str) -> Result<()> {
     let pubkey_hex = parse_pubkey_hex(pubkey)?;
 
-    let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = NipVault::open_unlock(path, password.expose_secret())?;
 
-    let mut cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
+    let mut cfg = vault.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
     let before = cfg.bunker_permissions.len();
     cfg.bunker_permissions
         .retain(|p| !p.pubkey_hex.eq_ignore_ascii_case(&pubkey_hex));
@@ -155,7 +193,7 @@ pub fn cmd_nip46_revoke(out: &Output, path: &Path, pubkey: &str) -> Result<()> {
         )));
     }
 
-    keep.store_relay_config(&cfg)?;
+    vault.store_relay_config(&cfg)?;
     out.newline();
     out.success(&format!("Revoked NIP-46 grant for app {pubkey_hex}"));
     Ok(())
@@ -165,13 +203,12 @@ pub fn cmd_nip46_revoke(out: &Output, path: &Path, pubkey: &str) -> Result<()> {
 pub fn cmd_nip46_auto_approve(out: &Output, path: &Path, kinds: &str) -> Result<()> {
     let parsed = parse_auto_approve_kinds(kinds)?;
 
-    let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = NipVault::open_unlock(path, password.expose_secret())?;
 
-    let mut cfg = keep.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
+    let mut cfg = vault.get_relay_config_or_default(&GLOBAL_RELAY_KEY)?;
     cfg.auto_approve_kinds = parsed.clone();
-    keep.store_relay_config(&cfg)?;
+    vault.store_relay_config(&cfg)?;
 
     out.newline();
     if parsed.is_empty() {

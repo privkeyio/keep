@@ -5,11 +5,29 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{self, EncryptedData, SecretKey};
+use crate::error::{KeepError, Result as KeepResult};
+
 /// Sentinel key for global (non-group-specific) relay configuration.
 pub const GLOBAL_RELAY_KEY: [u8; 32] = [0u8; 32];
 
 /// Maximum number of relays per category per share.
 pub const MAX_RELAYS: usize = 10;
+
+/// Maximum size of a decrypted relay-config blob.
+pub const MAX_RELAY_CONFIG_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of persisted bunker app permissions per config.
+pub const MAX_BUNKER_APPS: usize = 100;
+
+/// Maximum length of a stored bunker app name.
+pub const MAX_BUNKER_NAME_LEN: usize = 256;
+
+/// Maximum number of auto-approve kinds per app or globally.
+pub const MAX_AUTO_KINDS: usize = 64;
+
+/// Valid bunker permission bitflags mask (matches `keep_nip46::Permission`).
+pub const VALID_PERMISSION_MASK: u32 = 0b0011_1111;
 
 /// Maximum length of a relay URL.
 pub const MAX_RELAY_URL_LENGTH: usize = 256;
@@ -112,6 +130,130 @@ impl RelayConfig {
             auto_approve_kinds: Vec::new(),
         }
     }
+
+    /// Validate and normalize a relay config before persistence.
+    ///
+    /// Relay URLs are normalized, deduplicated and validated; bunker
+    /// permissions and auto-approve kinds are capped and masked. Used by every
+    /// storage backend so all persisted configs share the same integrity rules.
+    pub fn normalize(self) -> KeepResult<Self> {
+        let normalize_relays = |urls: Vec<String>, label: &str| -> KeepResult<Vec<String>> {
+            if urls.len() > MAX_RELAYS {
+                return Err(KeepError::InvalidInput(format!(
+                    "Too many {label} relays (max {MAX_RELAYS})"
+                )));
+            }
+            let normalized = dedup_stable(urls.iter().map(|u| normalize_relay_url(u)));
+            for url in &normalized {
+                validate_relay_url(url).map_err(KeepError::InvalidInput)?;
+            }
+            Ok(normalized)
+        };
+
+        let mut peer_policies = Vec::with_capacity(self.peer_policies.len());
+        for p in self.peer_policies {
+            if p.pubkey_hex.len() != 64 || !p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(KeepError::InvalidInput(format!(
+                    "Invalid peer policy pubkey: {}",
+                    p.pubkey_hex
+                )));
+            }
+            peer_policies.push(PeerPolicyEntry {
+                pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
+                allow_send: p.allow_send,
+                allow_receive: p.allow_receive,
+            });
+        }
+
+        if self.bunker_permissions.len() > MAX_BUNKER_APPS {
+            return Err(KeepError::InvalidInput(format!(
+                "Too many bunker permissions: {} (max {MAX_BUNKER_APPS})",
+                self.bunker_permissions.len()
+            )));
+        }
+        let mut bunker_permissions = Vec::with_capacity(self.bunker_permissions.len());
+        for bp in self.bunker_permissions {
+            if bp.pubkey_hex.len() != 64 || !bp.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(KeepError::InvalidInput(format!(
+                    "Invalid bunker permission pubkey: {}",
+                    bp.pubkey_hex
+                )));
+            }
+            if bp.name.len() > MAX_BUNKER_NAME_LEN {
+                return Err(KeepError::InvalidInput(format!(
+                    "Bunker app name too long: {} (max {MAX_BUNKER_NAME_LEN})",
+                    bp.name.len()
+                )));
+            }
+            if bp.auto_approve_kinds.len() > MAX_AUTO_KINDS {
+                return Err(KeepError::InvalidInput(format!(
+                    "Too many auto-approve kinds: {} (max {MAX_AUTO_KINDS})",
+                    bp.auto_approve_kinds.len()
+                )));
+            }
+            bunker_permissions.push(StoredBunkerPermission {
+                pubkey_hex: bp.pubkey_hex.to_ascii_lowercase(),
+                name: bp.name,
+                permissions: bp.permissions & VALID_PERMISSION_MASK,
+                auto_approve_kinds: bp.auto_approve_kinds,
+                duration: bp.duration,
+                connected_at: bp.connected_at,
+            });
+        }
+
+        if self.auto_approve_kinds.len() > MAX_AUTO_KINDS {
+            return Err(KeepError::InvalidInput(format!(
+                "Too many global auto-approve kinds: {} (max {MAX_AUTO_KINDS})",
+                self.auto_approve_kinds.len()
+            )));
+        }
+        let mut auto_approve_kinds = self.auto_approve_kinds;
+        auto_approve_kinds.sort_unstable();
+        auto_approve_kinds.dedup();
+
+        Ok(Self {
+            group_pubkey: self.group_pubkey,
+            frost_relays: normalize_relays(self.frost_relays, "FROST")?,
+            profile_relays: normalize_relays(self.profile_relays, "profile")?,
+            bunker_relays: normalize_relays(self.bunker_relays, "bunker")?,
+            peer_policies,
+            bunker_permissions,
+            auto_approve_kinds,
+        })
+    }
+}
+
+fn dedup_stable(iter: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    iter.filter(|s| seen.insert(s.clone())).collect()
+}
+
+/// Serialize and encrypt a relay config for at-rest storage.
+pub fn encode_relay_config(config: &RelayConfig, key: &SecretKey) -> KeepResult<Vec<u8>> {
+    let serialized = serde_json::to_vec(config)
+        .map_err(|e| KeepError::Other(format!("json serialization failed: {e}")))?;
+    if serialized.len() > MAX_RELAY_CONFIG_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "relay config blob too large: {} (max {MAX_RELAY_CONFIG_SIZE})",
+            serialized.len()
+        )));
+    }
+    Ok(crypto::encrypt(&serialized, key)?.to_bytes())
+}
+
+/// Decrypt and deserialize a relay config blob produced by [`encode_relay_config`].
+pub fn decode_relay_config(bytes: &[u8], key: &SecretKey) -> KeepResult<RelayConfig> {
+    let encrypted = EncryptedData::from_bytes(bytes)?;
+    let decrypted = crypto::decrypt(&encrypted, key)?;
+    let decrypted_bytes = decrypted.as_slice()?;
+    if decrypted_bytes.len() > MAX_RELAY_CONFIG_SIZE {
+        return Err(KeepError::InvalidInput(format!(
+            "relay config blob too large: {} (max {MAX_RELAY_CONFIG_SIZE})",
+            decrypted_bytes.len()
+        )));
+    }
+    serde_json::from_slice(&decrypted_bytes)
+        .map_err(|e| KeepError::Other(format!("json deserialization failed: {e}")))
 }
 
 /// Default FROST coordination relays.
