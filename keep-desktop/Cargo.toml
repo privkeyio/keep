@@ -32,7 +32,7 @@ rand = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
 tempfile = "3"
 nokhwa = { version = "0.10", features = ["input-native"] }
-rxing = "0.8"
+rxing = "0.9"
 image = "0.25"
 rfd = "0.17"
 
