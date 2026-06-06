@@ -478,10 +478,26 @@ impl KfpNode {
             threshold: self.share.metadata.threshold,
             participants: request.participants.clone(),
             requester,
+            message_type: request.message_type.clone(),
         };
 
         let hooks = self.hooks.read().clone();
-        hooks.pre_sign(&session_info)?;
+        if let Err(e) = hooks.pre_sign(&session_info) {
+            // Notify the requester so it fails fast instead of hanging until
+            // timeout/failover exhaustion, mirroring the stale-nonce path below.
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                "Sign request refused by pre-sign policy; signaling requester"
+            );
+            self.send_session_error(
+                &from,
+                "policy_violation",
+                &e.to_string(),
+                request.session_id,
+            )
+            .await?;
+            return Ok(());
+        }
 
         // Locate the requester's reference to our own pre-exchanged nonce, if
         // any. The sentinel id ([0u8; 32]) marks the requester's echo-only
@@ -612,6 +628,7 @@ impl KfpNode {
                 request.participants.clone(),
                 &request.session_salt,
             )?;
+            session.set_message_type(request.message_type.clone());
 
             // All nonce_refs have now been validated above, and a pre-exchange
             // request that reaches here covers the full threshold set. The
@@ -1310,6 +1327,7 @@ impl KfpNode {
             threshold: self.share.metadata.threshold,
             participants: participants.clone(),
             requester: self.share.metadata.identifier,
+            message_type: message_type.to_string(),
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
@@ -1323,6 +1341,7 @@ impl KfpNode {
                 participants.clone(),
                 &session_salt,
             )?;
+            session.set_message_type(message_type.to_string());
 
             session.set_our_nonces(nonces);
             session.set_our_commitment(our_commitment);

@@ -93,8 +93,8 @@ pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{
     DescriptorLookupUnavailable, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent,
-    NoOpHooks, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, SessionInfo,
-    SigningHooks, SuccessorLookup,
+    NoOpHooks, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawSignatureHooks,
+    SessionInfo, SigningHooks, SuccessorLookup,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
@@ -117,9 +117,9 @@ pub use protocol::{
     MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH, MAX_NONCE_COMMITMENTS,
     MAX_PARTICIPANTS, MAX_PSBT_ADDRESS_LENGTH, MAX_PSBT_INPUTS, MAX_PSBT_OUTPUTS, MAX_PSBT_SIZE,
     MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
-    MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, PSBT_FINALIZE_PHASE_TIMEOUT_SECS,
-    PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS,
-    VALID_NETWORKS, VALID_XPUB_PREFIXES,
+    MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, MSG_TYPE_NOSTR_EVENT, MSG_TYPE_RAW,
+    PSBT_FINALIZE_PHASE_TIMEOUT_SECS, PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS,
+    PSBT_SIGNING_PHASE_TIMEOUT_SECS, VALID_NETWORKS, VALID_XPUB_PREFIXES,
 };
 pub use psbt_session::{
     derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,

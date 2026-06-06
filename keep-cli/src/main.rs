@@ -310,6 +310,7 @@ fn dispatch_frost_network(
             relay,
             share,
             auto_contribute_descriptor,
+            refuse_raw_sign,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_serve(
@@ -319,6 +320,7 @@ fn dispatch_frost_network(
                 relay,
                 share,
                 auto_contribute_descriptor,
+                refuse_raw_sign,
             )
         }
         FrostNetworkCommands::Peers { group, relay } => {

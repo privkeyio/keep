@@ -545,6 +545,14 @@ pub(crate) enum FrostNetworkCommands {
         share: Option<u16>,
         #[arg(long, help = "Automatically contribute xpub to descriptor proposals")]
         auto_contribute_descriptor: bool,
+        /// Refuse FROST sign requests labeled `message_type="raw"`.
+        ///
+        /// Without this, an authorized requester can have co-signers blind-sign
+        /// any 32-byte digest framed as raw, including a Bitcoin taproot sighash.
+        /// Recommended on groups that also coordinate a wallet descriptor.
+        /// See #524 for the deeper protocol-level fix.
+        #[arg(long)]
+        refuse_raw_sign: bool,
     },
     Peers {
         #[arg(short, long)]

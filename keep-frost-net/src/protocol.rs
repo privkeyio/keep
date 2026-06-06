@@ -22,6 +22,13 @@ pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
 pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
+/// Canonical `message_type` label for a Nostr event id signing request. Shared
+/// across crates so every producer (nip46, mobile, CLI) and every consumer
+/// (signing hooks) agree on one spelling for the same domain.
+pub const MSG_TYPE_NOSTR_EVENT: &str = "nostr-event";
+/// Canonical `message_type` label for an unstructured 32-byte digest. Refused
+/// by [`crate::RefuseRawSignatureHooks`].
+pub const MSG_TYPE_RAW: &str = "raw";
 pub const MAX_RECOVERY_TIERS: usize = 10;
 pub const MAX_KEYS_PER_TIER: usize = 20;
 pub const MIN_XPUB_LENGTH: usize = 111;

@@ -44,8 +44,9 @@ pub fn cmd_frost_network_serve(
     relay: &str,
     share_index: Option<u16>,
     auto_contribute_descriptor: bool,
+    refuse_raw_sign: bool,
 ) -> Result<()> {
-    debug!(group = group_npub, relay, share = ?share_index, "starting FROST network node");
+    debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -85,6 +86,13 @@ pub fn cmd_frost_network_serve(
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         let node =
             node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        if refuse_raw_sign {
+            node.set_hooks(Arc::new(keep_frost_net::RefuseRawSignatureHooks));
+            out.field(
+                "Sign policy",
+                "refuse raw (`message_type=raw` rejected, see #524)",
+            );
+        }
         let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();
@@ -666,7 +674,7 @@ pub fn cmd_frost_network_sign_event(
         share,
         relay,
         event_id.as_bytes().to_vec(),
-        "nostr-event",
+        keep_frost_net::MSG_TYPE_NOSTR_EVENT,
     ))?;
 
     let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {
