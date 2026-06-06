@@ -225,8 +225,15 @@ struct AuditStats {
     frost_gen: u32,
     frost_sign_ok: u32,
     frost_sign_fail: u32,
+    frost_session_start: u32,
+    frost_share_import: u32,
+    frost_share_export: u32,
+    frost_share_delete: u32,
+    frost_share_refresh: u32,
     auth_fail: u32,
+    rate_limit_tripped: u32,
     unlock: u32,
+    lock: u32,
 }
 
 impl AuditStats {
@@ -245,9 +252,15 @@ impl AuditStats {
             AuditEventType::FrostSignFailed | AuditEventType::FrostSessionFailed => {
                 self.frost_sign_fail += 1
             }
+            AuditEventType::FrostSessionStart => self.frost_session_start += 1,
+            AuditEventType::FrostShareImport => self.frost_share_import += 1,
+            AuditEventType::FrostShareExport => self.frost_share_export += 1,
+            AuditEventType::FrostShareDelete => self.frost_share_delete += 1,
+            AuditEventType::FrostShareRefresh => self.frost_share_refresh += 1,
             AuditEventType::AuthFailed => self.auth_fail += 1,
+            AuditEventType::RateLimitTripped => self.rate_limit_tripped += 1,
             AuditEventType::VaultUnlock => self.unlock += 1,
-            _ => {}
+            AuditEventType::VaultLock => self.lock += 1,
         }
     }
 }
@@ -295,12 +308,24 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     out.newline();
     out.info("FROST Operations:");
     out.info(&format!("  Groups created: {}", stats.frost_gen));
+    out.info(&format!(
+        "  Sessions started: {}",
+        stats.frost_session_start
+    ));
     out.info(&format!("  Signatures (success): {}", stats.frost_sign_ok));
     out.info(&format!("  Signatures (failed): {}", stats.frost_sign_fail));
     out.newline();
+    out.info("FROST Share Lifecycle:");
+    out.info(&format!("  Imported: {}", stats.frost_share_import));
+    out.info(&format!("  Exported: {}", stats.frost_share_export));
+    out.info(&format!("  Deleted: {}", stats.frost_share_delete));
+    out.info(&format!("  Refreshed: {}", stats.frost_share_refresh));
+    out.newline();
     out.info("Security:");
     out.info(&format!("  Vault unlocks: {}", stats.unlock));
+    out.info(&format!("  Vault locks: {}", stats.lock));
     out.info(&format!("  Auth failures: {}", stats.auth_fail));
+    out.info(&format!("  Rate limit trips: {}", stats.rate_limit_tripped));
 
     Ok(())
 }
@@ -309,13 +334,13 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
 mod stats_tests {
     use super::*;
 
-    /// Documents the AuditEventType variants `audit stats` currently rolls up
-    /// into counters. Any variant not exercised here is silently dropped by
-    /// the `_ => {}` arm and will not surface in the operator's stats view;
-    /// see #526 for the gap (RateLimitTripped, VaultLock, FrostSessionStart,
-    /// FrostShare*, FrostShareRefresh).
+    /// Every `AuditEventType` variant must roll up into exactly one
+    /// `AuditStats` counter. The match in `AuditStats::record` is now
+    /// exhaustive (no `_ => {}` arm), so a new variant added to
+    /// `AuditEventType` is a compile error here until the author decides
+    /// which bucket it lands in.
     #[test]
-    fn audit_stats_counts_recognised_event_types() {
+    fn audit_stats_covers_every_event_type_variant() {
         let mut stats = AuditStats::default();
         stats.record(AuditEventType::KeyGenerate);
         stats.record(AuditEventType::KeyImport);
@@ -331,8 +356,15 @@ mod stats_tests {
         stats.record(AuditEventType::FrostSessionComplete);
         stats.record(AuditEventType::FrostSignFailed);
         stats.record(AuditEventType::FrostSessionFailed);
+        stats.record(AuditEventType::FrostSessionStart);
+        stats.record(AuditEventType::FrostShareImport);
+        stats.record(AuditEventType::FrostShareExport);
+        stats.record(AuditEventType::FrostShareDelete);
+        stats.record(AuditEventType::FrostShareRefresh);
         stats.record(AuditEventType::AuthFailed);
+        stats.record(AuditEventType::RateLimitTripped);
         stats.record(AuditEventType::VaultUnlock);
+        stats.record(AuditEventType::VaultLock);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -343,17 +375,25 @@ mod stats_tests {
         assert_eq!(stats.frost_gen, 2);
         assert_eq!(stats.frost_sign_ok, 2);
         assert_eq!(stats.frost_sign_fail, 2);
+        assert_eq!(stats.frost_session_start, 1);
+        assert_eq!(stats.frost_share_import, 1);
+        assert_eq!(stats.frost_share_export, 1);
+        assert_eq!(stats.frost_share_delete, 1);
+        assert_eq!(stats.frost_share_refresh, 1);
         assert_eq!(stats.auth_fail, 1);
+        assert_eq!(stats.rate_limit_tripped, 1);
         assert_eq!(stats.unlock, 1);
+        assert_eq!(stats.lock, 1);
     }
 
-    /// Regression guard: AuditEventType variants NOT exercised by
-    /// `AuditStats::record` are silently dropped today. This test pins the
-    /// gap so a future fix that wires them up flips the counters from 0 to
-    /// non-zero and the assertions below need updating.
+    /// Closes the #526 gap surfaced by #441's testing pass: each of the
+    /// previously-dropped variants now lands in a dedicated counter so
+    /// `keep audit stats` actually surfaces lockouts and share-lifecycle
+    /// events to the operator.
     #[test]
-    fn audit_stats_silently_drops_security_relevant_variants() {
+    fn audit_stats_surfaces_previously_dropped_security_variants() {
         let mut stats = AuditStats::default();
+        stats.record(AuditEventType::RateLimitTripped);
         stats.record(AuditEventType::RateLimitTripped);
         stats.record(AuditEventType::VaultLock);
         stats.record(AuditEventType::FrostSessionStart);
@@ -362,18 +402,12 @@ mod stats_tests {
         stats.record(AuditEventType::FrostShareDelete);
         stats.record(AuditEventType::FrostShareRefresh);
 
-        // The current AuditStats has no fields for any of these, so every
-        // counter remains at its default.
-        assert_eq!(stats.key_gen, 0);
-        assert_eq!(stats.key_import, 0);
-        assert_eq!(stats.key_export, 0);
-        assert_eq!(stats.key_delete, 0);
-        assert_eq!(stats.sign_ok, 0);
-        assert_eq!(stats.sign_fail, 0);
-        assert_eq!(stats.frost_gen, 0);
-        assert_eq!(stats.frost_sign_ok, 0);
-        assert_eq!(stats.frost_sign_fail, 0);
-        assert_eq!(stats.auth_fail, 0);
-        assert_eq!(stats.unlock, 0);
+        assert_eq!(stats.rate_limit_tripped, 2);
+        assert_eq!(stats.lock, 1);
+        assert_eq!(stats.frost_session_start, 1);
+        assert_eq!(stats.frost_share_import, 1);
+        assert_eq!(stats.frost_share_export, 1);
+        assert_eq!(stats.frost_share_delete, 1);
+        assert_eq!(stats.frost_share_refresh, 1);
     }
 }
