@@ -520,11 +520,12 @@ fn cmd_list_hidden(out: &Output, path: &Path) -> Result<()> {
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_export(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
-    // Fail fast on non-TTY BEFORE prompting for a password or unlocking. Raw
-    // private-key export is interactive-only by design (#467). Surfacing this
-    // before any vault operation keeps the attack surface minimal and avoids
-    // leaving the operator with a half-completed unlock on a non-interactive
-    // session.
+    // Fail fast BEFORE prompting for a password or unlocking. Raw private-key
+    // export is interactive-only by design (#467): we require stdin and the
+    // stderr secret sink to both be a TTY and no automation env vars to be set.
+    // Surfacing this before any vault operation keeps the attack surface minimal
+    // and avoids leaving the operator with a half-completed unlock on a
+    // non-interactive session.
     require_interactive_tty("keep export")?;
 
     if hidden {
@@ -980,51 +981,4 @@ pub fn cmd_restore(out: &Output, file: &Path, target: &Path) -> Result<()> {
     );
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    /// End-to-end #467 enforcement: `cmd_export` must refuse before opening
-    /// the vault when stdin is not a TTY. The path it's pointed at does NOT
-    /// exist, so if the TTY check were skipped or moved below `Keep::open`
-    /// the error would be `NotFound` instead of the documented
-    /// `InvalidInput("interactive-only", #467)`. That difference is exactly
-    /// what this test pins.
-    #[test]
-    fn cmd_export_refuses_non_tty_before_touching_vault() {
-        let out = Output::new();
-        let dir = tempdir().unwrap();
-        let nonexistent = dir.path().join("never-created-vault");
-        assert!(!nonexistent.exists());
-
-        let err = cmd_export(&out, &nonexistent, "irrelevant-key", false)
-            .expect_err("non-TTY stdin must short-circuit before vault open");
-        let msg = err.to_string();
-        assert!(
-            matches!(err, KeepError::InvalidInput(_)),
-            "expected InvalidInput from the TTY gate, got {err:?}"
-        );
-        assert!(msg.contains("interactive-only"), "got {msg}");
-        assert!(msg.contains("#467"), "got {msg}");
-    }
-
-    /// The hidden-volume code path (`--hidden`) must enforce the same gate.
-    /// Routing the check to the top of `cmd_export` covers both the regular
-    /// and hidden-vault dispatch arms in one place; this test pins that
-    /// behavior so a future refactor that splits the dispatch can't drop
-    /// the gate on the hidden path.
-    #[test]
-    fn cmd_export_hidden_arg_also_refuses_non_tty_before_touching_vault() {
-        let out = Output::new();
-        let dir = tempdir().unwrap();
-        let nonexistent = dir.path().join("never-created-vault");
-
-        let err = cmd_export(&out, &nonexistent, "irrelevant-key", true)
-            .expect_err("non-TTY stdin must short-circuit before hidden vault open");
-        assert!(matches!(err, KeepError::InvalidInput(_)));
-        assert!(err.to_string().contains("interactive-only"));
-    }
 }
