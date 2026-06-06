@@ -167,7 +167,7 @@ impl RedbBackend {
             }
         }
         Err(last_err
-            .map(|e| e.into())
+            .map(|e| map_open_failure(path, e))
             .unwrap_or_else(|| StorageError::database("open failed after retries").into()))
     }
 
@@ -357,6 +357,29 @@ impl RedbBackend {
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }
+}
+
+/// Rewrite the redb `DatabaseAlreadyOpen` failure with a Keep-layer hint that
+/// names the most likely cause (another keep process holding the vault) and
+/// points the operator at how to recover (#422). Without this rewrite, the
+/// operator sees the raw redb message "Database already open. Cannot acquire
+/// lock." with no indication that a running `keep serve` or `keep frost
+/// network serve` daemon is the typical holder, or what to do next.
+///
+/// Non-lock-contention errors fall through to the default `KeepError` mapping
+/// so this helper does not swallow real database failures.
+pub fn map_open_failure(path: &Path, e: redb::DatabaseError) -> KeepError {
+    if matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen) {
+        return KeepError::InvalidInput(format!(
+            "vault at {} is already opened by another process. \
+             A `keep serve` or `keep frost network serve` daemon typically holds the lock; \
+             stop it (or wait for it to exit) and retry. \
+             A separate follow-up will let read-only commands (`list`, `audit list`, etc.) \
+             coexist with a running daemon; see #422 for details.",
+            path.display()
+        ));
+    }
+    e.into()
 }
 
 impl StorageBackend for RedbBackend {
@@ -560,5 +583,38 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = RedbBackend::create(&dir.path().join("test.db")).unwrap();
         assert!(backend.create_table("unknown").is_err());
+    }
+
+    #[test]
+    fn second_open_surfaces_lock_holder_hint() {
+        // The bare redb message ("Database already open. Cannot acquire lock.")
+        // doesn't tell an operator that a running `keep serve` daemon is the
+        // typical holder, or what to do next. #422 (c) is exactly this rewrite:
+        // when a second open fails on the lock, we surface a Keep-layer hint
+        // that names the daemon and points at the issue for the read-only
+        // follow-up.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("locked.db");
+        let _first = RedbBackend::create(&db_path).expect("first open holds the lock");
+
+        let err = match RedbBackend::open(&db_path) {
+            Err(e) => e,
+            Ok(_) => panic!("second open while the first is held must fail"),
+        };
+        let msg = err.to_string();
+        assert!(
+            matches!(err, KeepError::InvalidInput(_)),
+            "expected InvalidInput from map_open_failure, got {err:?}"
+        );
+        assert!(
+            msg.contains("already opened by another process"),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains("keep serve") || msg.contains("frost network serve"),
+            "got {msg}"
+        );
+        assert!(msg.contains("#422"), "got {msg}");
+        assert!(msg.contains(&db_path.display().to_string()), "got {msg}");
     }
 }

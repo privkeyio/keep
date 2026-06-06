@@ -293,7 +293,8 @@ impl HiddenStorage {
         self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
 
         let db_path = self.path.join("keep.db");
-        let db = Database::open(&db_path)?;
+        let db =
+            Database::open(&db_path).map_err(|e| crate::backend::map_open_failure(&db_path, e))?;
 
         self.outer_db = Some(db);
         self.active_volume = Some(VolumeType::Outer);
