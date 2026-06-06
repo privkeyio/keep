@@ -547,10 +547,21 @@ fn dispatch_wallet(
             share,
             recovery,
             timeout,
+            force,
+            replacing_version,
         } => {
             let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
             commands::wallet::cmd_wallet_propose(
-                out, path, &group, &network, relay, share, &recovery, timeout,
+                out,
+                path,
+                &group,
+                &network,
+                relay,
+                share,
+                &recovery,
+                timeout,
+                force,
+                replacing_version,
             )
         }
         WalletCommands::Register {

@@ -226,8 +226,11 @@ pub fn cmd_frost_network_serve(
                             // and only one migration can be in flight per
                             // group at the protocol layer.
                             let guard = keep.lock().expect("keep mutex poisoned");
+                            // Single load reused for both the predecessor-hash
+                            // computation below and the supersession WARN.
+                            let prior = guard.get_wallet_descriptor(&group_pubkey);
                             let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
-                                match guard.get_wallet_descriptor(&group_pubkey) {
+                                match &prior {
                                     Ok(Some(prev)) => {
                                         if prev.version != version - 1 {
                                             tracing::error!(
@@ -270,6 +273,27 @@ pub fn cmd_frost_network_serve(
                                 previous_descriptor_hash,
                                 policy: policy_value,
                             };
+                            // #426 (b): when a finalized descriptor lands on a
+                            // group that already has one, log a single WARN
+                            // naming the from/to versions and hashes so the
+                            // operator can see the supersession in the journal.
+                            // Responders trust the proposer's authority (the
+                            // message is authenticated under the group) so we
+                            // don't block; the gate lives on the proposer side.
+                            if let Ok(Some(prior)) = &prior {
+                                let new_hash = descriptor.canonical_hash();
+                                let prior_hash = prior.canonical_hash();
+                                if prior_hash != new_hash {
+                                    tracing::warn!(
+                                        group = %hex::encode(group_pubkey),
+                                        from_version = prior.version,
+                                        from_hash = %hex::encode(prior_hash),
+                                        to_version = descriptor.version,
+                                        to_hash = %hex::encode(new_hash),
+                                        "replacing finalized wallet descriptor for group (see #426)"
+                                    );
+                                }
+                            }
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
                                     tracing::info!("wallet descriptor stored");
