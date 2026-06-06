@@ -666,7 +666,7 @@ pub fn cmd_frost_network_sign_event(
         share,
         relay,
         event_id.as_bytes().to_vec(),
-        "raw",
+        "nostr-event",
     ))?;
 
     let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {
@@ -683,6 +683,13 @@ pub fn cmd_frost_network_sign_event(
         unsigned.content,
         sig,
     );
+    // Verify the assembled event against the group x-only key before emitting:
+    // if the aggregate signature or the group npub's parity diverges from the
+    // signing key, fail loudly here instead of publishing an event that no
+    // relay or client can verify.
+    signed.verify().map_err(|e| {
+        KeepError::Runtime(format!("assembled event failed signature verification: {e}"))
+    })?;
     let json = serde_json::to_string(&signed)
         .map_err(|e| KeepError::Runtime(format!("serialize signed event: {e}")))?;
 
@@ -894,5 +901,46 @@ mod tests {
         );
         expected.ensure_id();
         assert_eq!(Some(event_id), expected.id);
+    }
+
+    #[test]
+    fn assembled_signed_event_verifies_under_group_key() {
+        // Exercise the part that can actually break: assembling the final
+        // Event from (event_id, group_pubkey, fields..., sig) and emitting it.
+        // Sign the canonical event id with a known key exactly as the FROST
+        // aggregate would, then assert the assembled event verifies under the
+        // group x-only key. Catches field-order/parity mistakes the id-only
+        // test cannot.
+        use nostr_sdk::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        let group_pubkey_bytes = xonly.serialize();
+
+        let kind = 1u16;
+        let content = "hello FROST";
+        let created_at = Timestamp::from_secs(1_700_000_000);
+
+        let (group_pubkey, unsigned, event_id) =
+            build_unsigned_frost_event(&group_pubkey_bytes, kind, content, created_at).unwrap();
+
+        let msg = Message::from_digest(*event_id.as_bytes());
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+
+        let signed = Event::new(
+            event_id,
+            group_pubkey,
+            unsigned.created_at,
+            unsigned.kind,
+            unsigned.tags,
+            unsigned.content,
+            sig,
+        );
+
+        signed
+            .verify()
+            .expect("assembled event must verify under the group key");
     }
 }
