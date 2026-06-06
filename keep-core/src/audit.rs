@@ -71,6 +71,10 @@ pub enum AuditEventType {
     VaultLock = 18,
     /// FROST shares refreshed.
     FrostShareRefresh = 19,
+    /// Rate limiter tripped on a failed unlock attempt. Recorded at unlock
+    /// time on the NEXT successful unlock, since the data key needed to
+    /// encrypt audit entries is not available while the vault is locked.
+    RateLimitTripped = 20,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -96,6 +100,7 @@ impl std::fmt::Display for AuditEventType {
             Self::VaultUnlock => write!(f, "vault_unlock"),
             Self::VaultLock => write!(f, "vault_lock"),
             Self::FrostShareRefresh => write!(f, "frost_share_refresh"),
+            Self::RateLimitTripped => write!(f, "rate_limit_tripped"),
         }
     }
 }

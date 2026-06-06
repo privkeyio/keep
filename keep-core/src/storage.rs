@@ -445,6 +445,14 @@ impl Storage {
         self.backend = None;
     }
 
+    /// Drain rate-limit trip events queued by failed unlock attempts on this
+    /// vault. The caller is expected to be holding an open audit log so the
+    /// trips can be flushed as `RateLimitTripped` entries.
+    pub(crate) fn drain_pending_trips(&self) -> Vec<crate::rate_limit::PendingTrip> {
+        let hmac_key = crate::rate_limit::derive_hmac_key(&self.header.salt);
+        crate::rate_limit::drain_pending_trips(&self.path, &hmac_key)
+    }
+
     /// Returns true if unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.data_key.is_some()
