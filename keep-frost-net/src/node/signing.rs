@@ -478,6 +478,7 @@ impl KfpNode {
             threshold: self.share.metadata.threshold,
             participants: request.participants.clone(),
             requester,
+            message_type: request.message_type.clone(),
         };
 
         let hooks = self.hooks.read().clone();
@@ -1310,6 +1311,7 @@ impl KfpNode {
             threshold: self.share.metadata.threshold,
             participants: participants.clone(),
             requester: self.share.metadata.identifier,
+            message_type: message_type.to_string(),
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;

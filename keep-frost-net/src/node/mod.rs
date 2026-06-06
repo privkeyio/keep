@@ -313,6 +313,12 @@ pub struct SessionInfo {
     pub threshold: u16,
     pub participants: Vec<u16>,
     pub requester: u16,
+    /// Requester-supplied label for the 32 bytes in `message`. Frost-secp256k1
+    /// signs the bytes verbatim, so a "nostr-event" digest is byte-for-byte
+    /// indistinguishable from a Bitcoin taproot key-path sighash. Hooks use
+    /// this to gate (or refuse) requests whose label doesn't match the
+    /// expected domain on this group. See [`RefuseRawSignatureHooks`].
+    pub message_type: String,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -323,6 +329,7 @@ impl From<&NetworkSession> for SessionInfo {
             threshold: session.threshold(),
             participants: session.participants().to_vec(),
             requester: 0,
+            message_type: String::new(),
         }
     }
 }
@@ -349,6 +356,40 @@ pub struct NoOpHooks;
 
 impl SigningHooks for NoOpHooks {
     fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+}
+
+/// Pre-sign policy that refuses requests carrying the `"raw"` message_type
+/// label.
+///
+/// Without this gate, an authorized requester can present any 32-byte digest
+/// framed as `"raw"` and co-signers blind-sign it. A signature over a Nostr
+/// event id is byte-for-byte indistinguishable from a Bitcoin taproot
+/// key-path sighash for the same group key, so a `"raw"` request against a
+/// group that also coordinates a Bitcoin wallet descriptor can be confused
+/// with (or substituted for) a spend authorization. Operators of hybrid
+/// Nostr + Bitcoin groups should install this hook so co-signers reject
+/// anything not labeled with an explicit, recognised domain (e.g.
+/// `"nostr-event"`).
+///
+/// This is the MVP policy seam tracked under #524. A future hardening
+/// iteration will add domain-separated digests on the responder side so
+/// the label cannot be spoofed; until then, refusing `"raw"` outright is
+/// the cheapest correctness-preserving gate.
+pub struct RefuseRawSignatureHooks;
+
+impl SigningHooks for RefuseRawSignatureHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
+        if session.message_type == "raw" {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "co-signer refuses message_type=\"raw\" (group coordinates structured signatures only; see #524). \
+                 session_id={}, requester=share {}",
+                hex::encode(session.session_id),
+                session.requester
+            )));
+        }
         Ok(())
     }
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
@@ -2073,5 +2114,53 @@ mod tests {
             lookup.successor_for(&group, &old_hash),
             SuccessorLookup::Ambiguous
         );
+    }
+
+    fn raw_session() -> SessionInfo {
+        SessionInfo {
+            session_id: [7u8; 32],
+            message: vec![0u8; 32],
+            threshold: 2,
+            participants: vec![1, 2],
+            requester: 1,
+            message_type: "raw".to_string(),
+        }
+    }
+
+    #[test]
+    fn refuse_raw_signature_hooks_rejects_raw_label() {
+        let hooks = RefuseRawSignatureHooks;
+        let session = raw_session();
+        let err = hooks
+            .pre_sign(&session)
+            .expect_err("raw label must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refuses message_type=\"raw\""),
+            "error must explain why: {msg}"
+        );
+        assert!(msg.contains(&hex::encode(session.session_id)));
+    }
+
+    #[test]
+    fn refuse_raw_signature_hooks_accepts_other_labels() {
+        let hooks = RefuseRawSignatureHooks;
+        for label in ["nostr-event", "bitcoin-sighash", "psbt-input-0", ""] {
+            let mut session = raw_session();
+            session.message_type = label.to_string();
+            hooks
+                .pre_sign(&session)
+                .unwrap_or_else(|e| panic!("label {label:?} must be allowed, got {e}"));
+        }
+    }
+
+    #[test]
+    fn noop_hooks_accepts_raw() {
+        // NoOpHooks preserves the original behavior: no domain gating. Pin
+        // this so callers know that switching from NoOpHooks to
+        // RefuseRawSignatureHooks is the only behavioral change.
+        let hooks = NoOpHooks;
+        let session = raw_session();
+        hooks.pre_sign(&session).unwrap();
     }
 }
