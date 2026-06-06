@@ -1346,8 +1346,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            matches!(err, KeepError::InvalidInput(_)),
-            "expected InvalidInput from map_open_failure, got {err:?}"
+            matches!(err, KeepError::Database(_)),
+            "expected Database from map_open_failure, got {err:?}"
         );
         assert!(
             msg.contains("already opened by another process"),
