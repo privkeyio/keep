@@ -498,80 +498,208 @@ pub fn cmd_frost_network_sign(
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
-    rt.block_on(async {
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+    let signature = rt.block_on(frost_network_sign_round(
+        out,
+        share,
+        relay,
+        message.as_bytes().to_vec(),
+        "raw",
+    ))?;
 
-        out.info("Starting FROST coordination node...");
-        let pk = node.pubkey();
-        out.field(
-            "Node pubkey",
-            &pk.to_bech32().unwrap_or_else(|_| format!("{pk}")),
-        );
-        out.newline();
-
-        let node = std::sync::Arc::new(node);
-        let node_clone = node.clone();
-        let _handle = tokio::spawn(async move {
-            let _ = node_clone.run().await;
-        });
-
-        out.info("Discovering peers...");
-        for i in 0..12 {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if node.online_peers() > 0 {
-                break;
-            }
-            if i < 11 {
-                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
-            }
-        }
-
-        if node.online_peers() == 0 {
-            return Err(KeepError::Frost("No peers online after 24s.".into()));
-        }
-
-        out.success(&format!("Found {} online peer(s)", node.online_peers()));
-        out.newline();
-
-        out.info("Waiting for peers to discover us...");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-        let spinner = out.spinner("Requesting signature from network...");
-        let signature = node
-            .request_signature(message.as_bytes().to_vec(), "raw")
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
-        spinner.finish();
-
-        out.newline();
-        out.success("Signature complete!");
-        out.field("Signature", &hex::encode(signature));
-        Ok::<_, KeepError>(())
-    })?;
-
+    out.newline();
+    out.success("Signature complete!");
+    out.field("Signature", &hex::encode(signature));
     Ok(())
 }
 
-#[tracing::instrument(skip(out))]
+/// Construct the unsigned Nostr event whose canonical event id the FROST
+/// group will sign. Authored by the group x-only pubkey so the resulting
+/// signed event verifies under standard BIP-340 against the group key.
+fn build_unsigned_frost_event(
+    group_pubkey_bytes: &[u8; 32],
+    kind: u16,
+    content: &str,
+    created_at: Timestamp,
+) -> Result<(PublicKey, UnsignedEvent, EventId)> {
+    let group_pubkey = PublicKey::from_slice(group_pubkey_bytes).map_err(|e| {
+        KeepError::InvalidInput(format!("group pubkey is not a valid x-only pubkey: {e}"))
+    })?;
+    let mut unsigned = UnsignedEvent::new(
+        group_pubkey,
+        created_at,
+        Kind::Custom(kind),
+        Vec::<Tag>::new(),
+        content.to_string(),
+    );
+    unsigned.ensure_id();
+    let event_id = unsigned
+        .id
+        .ok_or_else(|| KeepError::Runtime("failed to compute event ID".into()))?;
+    Ok((group_pubkey, unsigned, event_id))
+}
+
+/// Shared signing round used by `cmd_frost_network_sign` and
+/// `cmd_frost_network_sign_event`: brings up a `KfpNode`, waits for peers,
+/// requests an aggregated signature, and returns the 64-byte schnorr sig.
+async fn frost_network_sign_round(
+    out: &Output,
+    share: keep_core::frost::SharePackage,
+    relay: &str,
+    message_bytes: Vec<u8>,
+    message_type: &str,
+) -> Result<[u8; 64]> {
+    let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+        .await
+        .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+    out.info("Starting FROST coordination node...");
+    let pk = node.pubkey();
+    out.field(
+        "Node pubkey",
+        &pk.to_bech32().unwrap_or_else(|_| format!("{pk}")),
+    );
+    out.newline();
+
+    let node = std::sync::Arc::new(node);
+    let node_clone = node.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = node_clone.run().await;
+    });
+
+    out.info("Discovering peers...");
+    for i in 0..12 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if node.online_peers() > 0 {
+            break;
+        }
+        if i < 11 {
+            out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+        }
+    }
+
+    if node.online_peers() == 0 {
+        return Err(KeepError::Frost("No peers online after 24s.".into()));
+    }
+
+    out.success(&format!("Found {} online peer(s)", node.online_peers()));
+    out.newline();
+
+    out.info("Waiting for peers to discover us...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let spinner = out.spinner("Requesting signature from network...");
+    let signature = node
+        .request_signature(message_bytes, message_type)
+        .await
+        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    spinner.finish();
+    Ok(signature)
+}
+
+#[tracing::instrument(skip(out, content), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_sign_event(
     out: &Output,
-    _path: &Path,
-    _group_npub: &str,
-    _kind: u16,
-    _content: &str,
-    _relay: &str,
-    _share_index: Option<u16>,
-    _hardware: Option<&str>,
+    path: &Path,
+    group_npub: &str,
+    kind: u16,
+    content: &str,
+    relay: &str,
+    share_index: Option<u16>,
+    hardware: Option<&str>,
 ) -> Result<()> {
+    if hardware.is_some() {
+        // Hardware co-signers only publish their signature share and wait for
+        // a coordinator to aggregate; the final 64-byte schnorr signature is
+        // never observed locally, so we cannot construct the signed event on
+        // this side. Tracked separately so the software flow can ship now.
+        return Err(KeepError::NotImplemented(
+            "hardware FROST network sign-event requires aggregate-receive plumbing on the hardware path; \
+             run the same group with a software participant who can aggregate, or see follow-up issue."
+                .into(),
+        ));
+    }
+
+    debug!(group_npub, kind, relay, "frost network sign-event");
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey_bytes = keep_core::keys::npub_to_bytes(group_npub)?;
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey_bytes, idx)?,
+        None => keep.frost_get_share(&group_pubkey_bytes)?,
+    };
+
+    // Build the unsigned event with the FROST group pubkey as the author so
+    // the computed event id is what the aggregate signature will commit to.
+    let (group_pubkey, unsigned, event_id) =
+        build_unsigned_frost_event(&group_pubkey_bytes, kind, content, Timestamp::now())?;
+
     out.newline();
-    out.error("FROST network event signing not yet implemented");
-    out.info("Use 'keep frost network sign' to sign raw messages instead.");
-    Err(KeepError::NotImplemented(
-        "FROST network event signing".into(),
-    ))
+    out.header("FROST Network Sign Event");
+    out.field("Group", group_npub);
+    out.field(
+        "Share",
+        &format!("{} ({})", share.metadata.identifier, share.metadata.name),
+    );
+    out.field(
+        "Threshold",
+        &format!(
+            "{}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        ),
+    );
+    out.field("Relay", relay);
+    out.field("Kind", &kind.to_string());
+    out.field("Event ID", &event_id.to_hex());
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    let sig_bytes = rt.block_on(frost_network_sign_round(
+        out,
+        share,
+        relay,
+        event_id.as_bytes().to_vec(),
+        "nostr-event",
+    ))?;
+
+    let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {
+        KeepError::Runtime(format!(
+            "aggregate signature was not a valid schnorr signature: {e}"
+        ))
+    })?;
+    let signed = Event::new(
+        event_id,
+        group_pubkey,
+        unsigned.created_at,
+        unsigned.kind,
+        unsigned.tags,
+        unsigned.content,
+        sig,
+    );
+    // Verify the assembled event against the group x-only key before emitting:
+    // if the aggregate signature or the group npub's parity diverges from the
+    // signing key, fail loudly here instead of publishing an event that no
+    // relay or client can verify.
+    signed.verify().map_err(|e| {
+        KeepError::Runtime(format!(
+            "assembled event failed signature verification: {e}"
+        ))
+    })?;
+    let json = serde_json::to_string(&signed)
+        .map_err(|e| KeepError::Runtime(format!("serialize signed event: {e}")))?;
+
+    out.newline();
+    out.success("Signature complete!");
+    out.newline();
+    println!("{json}");
+    Ok(())
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
@@ -744,5 +872,77 @@ fn format_duration_ago(secs: u64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_unsigned_frost_event_matches_canonical_nostr_id() {
+        // The aggregate signature commits to the canonical Nostr event id.
+        // If our derivation drifts from nostr_sdk's serialization, the
+        // produced "signed event" verifies against a hash nobody can
+        // recompute. Pin it against a fixed input and verify the id matches
+        // an independently constructed UnsignedEvent.
+        let group_pubkey_bytes = [0x42u8; 32];
+        let kind = 1u16;
+        let content = "hello FROST";
+        let created_at = Timestamp::from_secs(1_700_000_000);
+
+        let (pubkey, _unsigned, event_id) =
+            build_unsigned_frost_event(&group_pubkey_bytes, kind, content, created_at).unwrap();
+
+        let mut expected = UnsignedEvent::new(
+            pubkey,
+            created_at,
+            Kind::Custom(kind),
+            Vec::<Tag>::new(),
+            content.to_string(),
+        );
+        expected.ensure_id();
+        assert_eq!(Some(event_id), expected.id);
+    }
+
+    #[test]
+    fn assembled_signed_event_verifies_under_group_key() {
+        // Exercise the part that can actually break: assembling the final
+        // Event from (event_id, group_pubkey, fields..., sig) and emitting it.
+        // Sign the canonical event id with a known key exactly as the FROST
+        // aggregate would, then assert the assembled event verifies under the
+        // group x-only key. Catches field-order/parity mistakes the id-only
+        // test cannot.
+        use nostr_sdk::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        let group_pubkey_bytes = xonly.serialize();
+
+        let kind = 1u16;
+        let content = "hello FROST";
+        let created_at = Timestamp::from_secs(1_700_000_000);
+
+        let (group_pubkey, unsigned, event_id) =
+            build_unsigned_frost_event(&group_pubkey_bytes, kind, content, created_at).unwrap();
+
+        let msg = Message::from_digest(*event_id.as_bytes());
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+
+        let signed = Event::new(
+            event_id,
+            group_pubkey,
+            unsigned.created_at,
+            unsigned.kind,
+            unsigned.tags,
+            unsigned.content,
+            sig,
+        );
+
+        signed
+            .verify()
+            .expect("assembled event must verify under the group key");
     }
 }
