@@ -688,7 +688,9 @@ pub fn cmd_frost_network_sign_event(
     // signing key, fail loudly here instead of publishing an event that no
     // relay or client can verify.
     signed.verify().map_err(|e| {
-        KeepError::Runtime(format!("assembled event failed signature verification: {e}"))
+        KeepError::Runtime(format!(
+            "assembled event failed signature verification: {e}"
+        ))
     })?;
     let json = serde_json::to_string(&signed)
         .map_err(|e| KeepError::Runtime(format!("serialize signed event: {e}")))?;
