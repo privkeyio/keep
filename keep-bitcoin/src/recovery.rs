@@ -124,8 +124,13 @@ impl RecoveryConfig {
             )));
         }
 
-        let mut all_keys: HashSet<[u8; 32]> = self.primary.keys.iter().copied().collect();
-
+        // Key reuse across tiers is intentionally allowed (#425). Taproot's
+        // design encodes recovery semantics in the script tree, not in key
+        // independence: the same xpub appearing in `2-of-3 @ 1mo` and
+        // `1-of-3 @ 6mo` serves distinct roles via distinct leaves with
+        // distinct CSV locks. Within-tier duplicates are still rejected
+        // because those would silently collapse a k-of-n threshold to
+        // k-of-(n-1), which is a real correctness bug, not a key-reuse policy.
         for (i, tier) in self.recovery_tiers.iter().enumerate() {
             if tier.keys.is_empty() {
                 return Err(BitcoinError::Recovery(format!(
@@ -155,14 +160,6 @@ impl RecoveryConfig {
                 )));
             }
             check_duplicate_keys(&format!("recovery tier {i}"), &tier.keys)?;
-            for key in &tier.keys {
-                if !all_keys.insert(*key) {
-                    return Err(BitcoinError::Recovery(format!(
-                        "duplicate key across tiers: {}",
-                        hex::encode(key)
-                    )));
-                }
-            }
         }
         for w in self.recovery_tiers.windows(2) {
             if w[1].timelock_months <= w[0].timelock_months {
@@ -851,9 +848,13 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_keys_across_tiers() {
+    fn key_reuse_across_tiers_now_allowed() {
+        // #425: taproot encodes recovery semantics in the script tree, not in
+        // key independence. WDC participants auto-contribute one xpub each, so
+        // multi-tier proposals legitimately reuse the same xpubs across the
+        // primary and recovery tiers. Previously the validator rejected this
+        // with "duplicate key across tiers", blocking any multi-tier WDC flow.
         let pk = test_keypair(1);
-
         let config = RecoveryConfig {
             primary: SpendingTier {
                 keys: vec![pk],
@@ -866,7 +867,71 @@ mod tests {
             }],
             network: Network::Testnet,
         };
-        assert!(config.validate().is_err());
+        config
+            .validate()
+            .expect("identical key across primary + recovery tier must validate");
+    }
+
+    #[test]
+    fn key_reuse_across_multi_tier_recovery_now_allowed() {
+        // The real WDC shape: each share-holder contributes one xpub, and the
+        // same N xpubs appear in both `2-of-3 @ 1mo` and `1-of-3 @ 6mo`.
+        let a = test_keypair(1);
+        let b = test_keypair(2);
+        let c = test_keypair(3);
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![a, b, c],
+                threshold: 3,
+            },
+            recovery_tiers: vec![
+                RecoveryTier {
+                    keys: vec![a, b, c],
+                    threshold: 2,
+                    timelock_months: 1,
+                },
+                RecoveryTier {
+                    keys: vec![a, b, c],
+                    threshold: 1,
+                    timelock_months: 6,
+                },
+            ],
+            network: Network::Testnet,
+        };
+        config
+            .validate()
+            .expect("multi-tier WDC shape with reused xpubs must validate");
+        config
+            .build()
+            .expect("the descriptor must still build under reused xpubs");
+    }
+
+    #[test]
+    fn within_tier_duplicate_still_rejected_in_recovery() {
+        // The within-tier check is the real correctness invariant: duplicate
+        // keys inside one tier silently collapse a k-of-n threshold to
+        // k-of-(n-1). Pinning this so the #425 relaxation doesn't accidentally
+        // weaken it.
+        let pk = test_keypair(1);
+        let pk2 = test_keypair(2);
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk, pk2],
+                threshold: 2,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2, pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        let err = config.validate().expect_err("within-tier dup must fail");
+        assert!(
+            err.to_string().to_lowercase().contains("duplicate"),
+            "got {err}"
+        );
     }
 
     #[test]
