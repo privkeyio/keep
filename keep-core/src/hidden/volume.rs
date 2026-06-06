@@ -293,7 +293,22 @@ impl HiddenStorage {
         self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
 
         let db_path = self.path.join("keep.db");
-        let db = Database::open(&db_path)?;
+        let db = match crate::backend::open_database_with_retry(&db_path) {
+            Ok(db) => db,
+            // Hidden vaults don't auto-upgrade the redb file format here; the
+            // outer-volume schema is owned by `RedbBackend::open`. Surface the
+            // upgrade requirement as a generic database error rather than
+            // silently half-migrating a hidden-init vault.
+            Err(crate::backend::OpenWithRetryError::UpgradeRequired(v)) => {
+                return Err(StorageError::database(format!(
+                    "hidden-vault outer redb requires file format upgrade from v{v}; not yet supported"
+                ))
+                .into());
+            }
+            Err(crate::backend::OpenWithRetryError::Other(e)) => {
+                return Err(crate::backend::map_open_failure(&db_path, e));
+            }
+        };
 
         self.outer_db = Some(db);
         self.active_volume = Some(VolumeType::Outer);
@@ -1299,5 +1314,45 @@ mod tests {
                 .unwrap();
             assert_eq!(loaded.auto_approve_kinds, vec![1, 2, 3]);
         }
+    }
+
+    /// Pin that hidden-vault outer unlock surfaces the #422 lock-holder hint
+    /// when the outer redb is already held (mirrors
+    /// `backend::tests::second_open_surfaces_lock_holder_hint` for the
+    /// HiddenStorage code path, which has its own retry+map_open_failure
+    /// chain).
+    #[test]
+    fn hidden_outer_unlock_surfaces_lock_holder_hint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-locked-hidden");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut first = HiddenStorage::open(&path).unwrap();
+        first.unlock_outer("outer").unwrap();
+
+        let mut second = HiddenStorage::open(&path).unwrap();
+        let err = match second.unlock_outer("outer") {
+            Err(e) => e,
+            Ok(_) => panic!("second outer unlock while first is held must fail"),
+        };
+        let msg = err.to_string();
+        assert!(
+            matches!(err, KeepError::Database(_)),
+            "expected Database from map_open_failure, got {err:?}"
+        );
+        assert!(
+            msg.contains("already opened by another process"),
+            "got {msg}"
+        );
+        assert!(msg.contains("#422"), "got {msg}");
     }
 }
