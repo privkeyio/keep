@@ -203,6 +203,12 @@ pub(crate) fn record_success(path: &Path) {
 }
 
 /// A persisted rate-limit trip event awaiting flush to the audit log.
+///
+/// Records are authenticated with an HMAC key derived from the PUBLIC header
+/// salt, so they are tamper-evident against corruption but NOT forgery by an
+/// attacker with read access to the vault directory. Trip audit events are
+/// therefore best-effort and sit outside the password-keyed audit chain's
+/// cryptographic tamper-evidence boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingTrip {
     pub failed_attempts: u32,
@@ -259,6 +265,7 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
     // flushes (e.g. hidden-volume unlock paths that don't open an audit log).
     if let Ok(meta) = file.metadata() {
         if meta.len() as usize >= TRIP_RECORD_SIZE * MAX_TRIP_RECORDS {
+            tracing::warn!("rate-limit trip log at capacity; dropping trip event");
             return;
         }
     }
@@ -268,16 +275,23 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
         timestamp,
     };
     let mut file = file;
-    let _ = file.write_all(&trip.to_bytes(hmac_key));
+    if file.write_all(&trip.to_bytes(hmac_key)).is_err() {
+        tracing::debug!("failed to write rate-limit trip event");
+    }
     let _ = file.sync_all();
 }
 
-/// Read and remove all pending trip events for `path`. Records with invalid
+/// Read and clear all pending trip events for `path`. Records with invalid
 /// HMAC tags are silently skipped (cannot be attributed to a real trip).
+///
+/// The read and the clear both happen under the exclusive lock so the drain is
+/// atomic: a concurrent unlock cannot double-read, and a trip appended after
+/// this returns is preserved. As with [`PendingTrip`], the HMAC key is derived
+/// from the public salt, so this guards against corruption, not forgery.
 pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<PendingTrip> {
     let trip_path = trip_log_path(path);
 
-    let Ok(mut file) = File::open(&trip_path) else {
+    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&trip_path) else {
         return Vec::new();
     };
 
@@ -297,8 +311,10 @@ pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<Pendi
         }
     }
 
+    // Truncate while still holding the lock so the drain is atomic; the file is
+    // left empty rather than removed (a later record_trip re-appends to it).
+    let _ = file.set_len(0);
     drop(file);
-    let _ = fs::remove_file(&trip_path);
     out
 }
 
@@ -460,7 +476,7 @@ mod tests {
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].failed_attempts, MAX_ATTEMPTS);
 
-        // After draining, the trip file is gone.
+        // After draining, the trip file is empty and drains to nothing.
         assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
     }
 

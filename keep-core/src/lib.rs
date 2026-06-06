@@ -172,10 +172,12 @@ impl Keep {
         // Flush any rate-limit trip events queued by prior failed unlocks
         // before recording this success, so the audit chain reflects the
         // chronological order: lock-out events first, then the successful
-        // unlock that observed and cleared them.
+        // unlock that observed and cleared them. The drain consumes the trip
+        // file before the audit writes, so emission is best-effort: a failed
+        // audit write loses that event at-most-once with no retry.
         let trips = self.storage.drain_pending_trips();
         for trip in trips {
-            let trip_ts = trip.timestamp as i64;
+            let trip_ts = i64::try_from(trip.timestamp).unwrap_or(i64::MAX);
             let reason = format!(
                 "rate limit threshold reached after {} failed attempts",
                 trip.failed_attempts
