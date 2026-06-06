@@ -1041,6 +1041,92 @@ mod tests {
     }
 
     #[test]
+    fn verify_chain_returns_true_when_log_absent() {
+        // A vault that has never recorded an entry has no audit.log on disk.
+        // `verify_chain` must not error or return false in that case, or every
+        // freshly-created vault would look "tampered" to `keep audit verify`.
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert!(log.verify_chain(&key).unwrap());
+        assert!(log.read_all(&key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn verify_chain_detects_ciphertext_tamper() {
+        // The audit log's primary integrity guarantee: a byte flip in a
+        // persisted entry must NOT pass verify_chain. The line-level
+        // ciphertext check is what `keep audit verify` relies on to detect
+        // post-hoc edits of the audit log.
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+
+        for i in 0..3 {
+            let entry =
+                AuditEntry::new(AuditEventType::Sign, log.last_hash()).with_pubkey(&[i as u8; 32]);
+            log.log(entry, &key).unwrap();
+        }
+        assert!(log.verify_chain(&key).unwrap());
+
+        // Flip a byte in the middle of the first persisted entry.
+        let audit_path = dir.path().join("audit.log");
+        let mut content = std::fs::read(&audit_path).unwrap();
+        let first_newline = content.iter().position(|b| *b == b'\n').unwrap();
+        // Pick a base64 alphabet character inside the first line so the byte
+        // remains decode-valid but the underlying ciphertext is altered.
+        let target = first_newline / 2;
+        content[target] = if content[target] == b'A' { b'B' } else { b'A' };
+        std::fs::write(&audit_path, &content).unwrap();
+
+        // The tampered line must NOT verify cleanly. Either Ok(false) for a
+        // hash-chain mismatch, or Err(Corrupted/InvalidFormat) for a failed
+        // decrypt: both are acceptable failure modes that `keep audit verify`
+        // surfaces to the operator as a tamper warning.
+        match log.verify_chain(&key) {
+            Ok(false) => {}
+            Err(_) => {}
+            Ok(true) => panic!("verify_chain accepted a tampered entry as valid"),
+        }
+    }
+
+    #[test]
+    fn apply_retention_by_age_drops_old_entries() {
+        // The age-based retention path is what `keep audit retention --max-days`
+        // exercises; nothing tested it end-to-end before.
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let old_ts = now - 60 * 86400; // 60 days ago.
+        let recent_ts = now - 86400; // 1 day ago.
+
+        let mut old_entry = AuditEntry::new(AuditEventType::Sign, log.last_hash());
+        old_entry.timestamp = old_ts;
+        log.log(old_entry, &key).unwrap();
+
+        let mut recent_entry = AuditEntry::new(AuditEventType::Sign, log.last_hash());
+        recent_entry.timestamp = recent_ts;
+        log.log(recent_entry, &key).unwrap();
+
+        log.set_retention(RetentionPolicy {
+            max_entries: None,
+            max_age_days: Some(30),
+        });
+        let removed = log.apply_retention(&key).unwrap();
+        assert_eq!(removed, 1, "the 60-day-old entry must be pruned");
+
+        let remaining = log.read_all(&key).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].timestamp, recent_ts);
+        assert!(
+            log.verify_chain(&key).unwrap(),
+            "retention rewrite must preserve a valid hash chain"
+        );
+    }
+
+    #[test]
     fn test_signing_audit_hash_chain() {
         let genesis = [0u8; 32];
         let entry1 = SigningAuditEntry::new(

@@ -304,3 +304,76 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    /// Documents the AuditEventType variants `audit stats` currently rolls up
+    /// into counters. Any variant not exercised here is silently dropped by
+    /// the `_ => {}` arm and will not surface in the operator's stats view;
+    /// see #526 for the gap (RateLimitTripped, VaultLock, FrostSessionStart,
+    /// FrostShare*, FrostShareRefresh).
+    #[test]
+    fn audit_stats_counts_recognised_event_types() {
+        let mut stats = AuditStats::default();
+        stats.record(AuditEventType::KeyGenerate);
+        stats.record(AuditEventType::KeyImport);
+        stats.record(AuditEventType::KeyImport);
+        stats.record(AuditEventType::KeyExport);
+        stats.record(AuditEventType::KeyDelete);
+        stats.record(AuditEventType::Sign);
+        stats.record(AuditEventType::Sign);
+        stats.record(AuditEventType::SignFailed);
+        stats.record(AuditEventType::FrostGenerate);
+        stats.record(AuditEventType::FrostSplit);
+        stats.record(AuditEventType::FrostSign);
+        stats.record(AuditEventType::FrostSessionComplete);
+        stats.record(AuditEventType::FrostSignFailed);
+        stats.record(AuditEventType::FrostSessionFailed);
+        stats.record(AuditEventType::AuthFailed);
+        stats.record(AuditEventType::VaultUnlock);
+
+        assert_eq!(stats.key_gen, 1);
+        assert_eq!(stats.key_import, 2);
+        assert_eq!(stats.key_export, 1);
+        assert_eq!(stats.key_delete, 1);
+        assert_eq!(stats.sign_ok, 2);
+        assert_eq!(stats.sign_fail, 1);
+        assert_eq!(stats.frost_gen, 2);
+        assert_eq!(stats.frost_sign_ok, 2);
+        assert_eq!(stats.frost_sign_fail, 2);
+        assert_eq!(stats.auth_fail, 1);
+        assert_eq!(stats.unlock, 1);
+    }
+
+    /// Regression guard: AuditEventType variants NOT exercised by
+    /// `AuditStats::record` are silently dropped today. This test pins the
+    /// gap so a future fix that wires them up flips the counters from 0 to
+    /// non-zero and the assertions below need updating.
+    #[test]
+    fn audit_stats_silently_drops_security_relevant_variants() {
+        let mut stats = AuditStats::default();
+        stats.record(AuditEventType::RateLimitTripped);
+        stats.record(AuditEventType::VaultLock);
+        stats.record(AuditEventType::FrostSessionStart);
+        stats.record(AuditEventType::FrostShareImport);
+        stats.record(AuditEventType::FrostShareExport);
+        stats.record(AuditEventType::FrostShareDelete);
+        stats.record(AuditEventType::FrostShareRefresh);
+
+        // The current AuditStats has no fields for any of these, so every
+        // counter remains at its default.
+        assert_eq!(stats.key_gen, 0);
+        assert_eq!(stats.key_import, 0);
+        assert_eq!(stats.key_export, 0);
+        assert_eq!(stats.key_delete, 0);
+        assert_eq!(stats.sign_ok, 0);
+        assert_eq!(stats.sign_fail, 0);
+        assert_eq!(stats.frost_gen, 0);
+        assert_eq!(stats.frost_sign_ok, 0);
+        assert_eq!(stats.frost_sign_fail, 0);
+        assert_eq!(stats.auth_fail, 0);
+        assert_eq!(stats.unlock, 0);
+    }
+}
