@@ -866,15 +866,19 @@ fn parse_group_id(group: &str) -> Result<[u8; 32]> {
 /// gate only permits replacing an initial (version 1) descriptor: a forced
 /// re-propose over a migrated (version > 1) descriptor would write a v1 row
 /// that the stored higher version shadows, i.e. a silent no-op.
+///
+/// Returns the canonical hash of the descriptor being replaced (`None` when
+/// no descriptor exists yet) so the caller can re-assert it is unchanged
+/// under the same lock that performs the store.
 fn require_replaceable_descriptor(
     keep: &Keep,
     group_display: &str,
     group_pubkey: &[u8; 32],
     force: bool,
     replacing_version: Option<u32>,
-) -> Result<()> {
+) -> Result<Option<[u8; 32]>> {
     let Some(existing) = keep.get_wallet_descriptor(group_pubkey)? else {
-        return Ok(());
+        return Ok(None);
     };
     let existing_hash = existing.canonical_hash();
     if existing.version != INITIAL_DESCRIPTOR_VERSION {
@@ -918,7 +922,7 @@ fn require_replaceable_descriptor(
         replacing_hash = %hex::encode(existing_hash),
         "wallet propose --force confirmed: replacing existing descriptor"
     );
-    Ok(())
+    Ok(Some(existing_hash))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,7 +965,8 @@ pub fn cmd_wallet_propose(
 
     let group_pubkey = parse_group_id(group)?;
 
-    require_replaceable_descriptor(&keep, group, &group_pubkey, force, replacing_version)?;
+    let replacing_hash =
+        require_replaceable_descriptor(&keep, group, &group_pubkey, force, replacing_version)?;
 
     let share = match share_index {
         Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
@@ -1214,9 +1219,28 @@ pub fn cmd_wallet_propose(
             policy: Some(policy_json),
         };
 
-        keep.lock()
-            .map_err(|_| KeepError::Runtime("Keep mutex poisoned".into()))?
-            .store_wallet_descriptor(&descriptor)?;
+        let guard = keep
+            .lock()
+            .map_err(|_| KeepError::Runtime("Keep mutex poisoned".into()))?;
+        // TOCTOU defense-in-depth: the gate validated `--replacing-version`
+        // against storage at session start, but the store happens only after a
+        // full coordination round. Re-assert under the store lock that storage
+        // still holds exactly the descriptor we confirmed replacing (or still
+        // holds none). Single-vault-open already prevents concurrent writers;
+        // this guarantees a confirmed replace can never destroy a descriptor
+        // the operator never saw. See #426.
+        let current_hash = guard
+            .get_wallet_descriptor(&group_pubkey)?
+            .map(|d| d.canonical_hash());
+        if current_hash != replacing_hash {
+            return Err(KeepError::InvalidInput(
+                "the stored wallet descriptor for this group changed since the propose \
+                 began; aborting to avoid overwriting an unconfirmed descriptor. Re-run \
+                 `wallet propose` to re-confirm against the current descriptor (see #426)."
+                    .into(),
+            ));
+        }
+        guard.store_wallet_descriptor(&descriptor)?;
 
         out.newline();
         out.success("Wallet descriptor coordinated and stored!");
@@ -2355,8 +2379,10 @@ mod tests {
         keep.unlock("test-password-1234").unwrap();
         let group = [0x99u8; 32];
 
-        // No descriptor stored: bare proposal must succeed.
-        require_replaceable_descriptor(&keep, "npub1...", &group, false, None).unwrap();
+        // No descriptor stored: bare proposal must succeed with no hash to re-check.
+        let replacing =
+            require_replaceable_descriptor(&keep, "npub1...", &group, false, None).unwrap();
+        assert_eq!(replacing, None);
     }
 
     #[test]
@@ -2399,7 +2425,12 @@ mod tests {
     #[test]
     fn replacing_version_matches_passes() {
         let (group, _dir, keep) = vault_with_descriptor(1);
-        require_replaceable_descriptor(&keep, "npub1...", &group, true, Some(1)).unwrap();
+        let existing = keep.get_wallet_descriptor(&group).unwrap().unwrap();
+        // A confirmed replace returns the hash of the descriptor being replaced
+        // so the caller can re-assert it under the store lock.
+        let replacing =
+            require_replaceable_descriptor(&keep, "npub1...", &group, true, Some(1)).unwrap();
+        assert_eq!(replacing, Some(existing.canonical_hash()));
     }
 
     #[test]
