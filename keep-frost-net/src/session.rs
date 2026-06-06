@@ -66,6 +66,8 @@ pub enum SessionState {
 pub struct CachedSessionState {
     session_id: [u8; 32],
     message: Vec<u8>,
+    #[serde(default)]
+    message_type: String,
     threshold: u16,
     participants: Vec<u16>,
     state: SessionState,
@@ -86,6 +88,7 @@ impl CachedSessionState {
 pub struct NetworkSession {
     session_id: [u8; 32],
     message: Vec<u8>,
+    message_type: String,
     threshold: u16,
     participants: Vec<u16>,
     state: SessionState,
@@ -110,6 +113,7 @@ impl NetworkSession {
         Self {
             session_id,
             message,
+            message_type: String::new(),
             threshold,
             participants,
             state: SessionState::AwaitingCommitments,
@@ -141,6 +145,16 @@ impl NetworkSession {
 
     pub fn message(&self) -> &[u8] {
         &self.message
+    }
+
+    /// Requester-supplied domain label for `message`. Empty when unknown (e.g.
+    /// a session predating the label or rehydrated from older cache state).
+    pub fn message_type(&self) -> &str {
+        &self.message_type
+    }
+
+    pub fn set_message_type(&mut self, message_type: String) {
+        self.message_type = message_type;
     }
 
     pub fn state(&self) -> SessionState {
@@ -471,6 +485,7 @@ impl NetworkSession {
         Ok(CachedSessionState {
             session_id: self.session_id,
             message: self.message.clone(),
+            message_type: self.message_type.clone(),
             threshold: self.threshold,
             participants: self.participants.clone(),
             state: self.state,
@@ -576,6 +591,7 @@ impl NetworkSession {
         Ok(Self {
             session_id: cached.session_id,
             message: cached.message,
+            message_type: cached.message_type,
             threshold: cached.threshold,
             participants: cached.participants,
             state: cached.state,
@@ -1171,7 +1187,8 @@ mod tests {
         let message = b"test".to_vec();
         let participants = vec![1, 2];
         let session_id = derive_session_id(&message, &participants, 2);
-        let session = NetworkSession::new(session_id, message.clone(), 2, participants);
+        let mut session = NetworkSession::new(session_id, message.clone(), 2, participants);
+        session.set_message_type("nostr-event".to_string());
         let cached = session.to_cached_state().unwrap();
 
         let json = serde_json::to_string(&cached).unwrap();
@@ -1181,6 +1198,23 @@ mod tests {
         let rehydrated = NetworkSession::from_cached_state(deserialized).unwrap();
         assert_eq!(*rehydrated.session_id(), session_id);
         assert_eq!(rehydrated.message(), message.as_slice());
+        assert_eq!(rehydrated.message_type(), "nostr-event");
+    }
+
+    #[test]
+    fn test_cached_state_defaults_empty_message_type() {
+        // Cache state predating the message_type field deserializes with an
+        // empty label rather than failing (serde default).
+        let message = b"test".to_vec();
+        let participants = vec![1, 2];
+        let session_id = derive_session_id(&message, &participants, 2);
+        let session = NetworkSession::new(session_id, message, 2, participants);
+        let cached = session.to_cached_state().unwrap();
+
+        let mut value = serde_json::to_value(&cached).unwrap();
+        value.as_object_mut().unwrap().remove("message_type");
+        let legacy: CachedSessionState = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.message_type, "");
     }
 
     #[test]

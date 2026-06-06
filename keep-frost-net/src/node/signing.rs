@@ -489,8 +489,13 @@ impl KfpNode {
                 session_id = %hex::encode(request.session_id),
                 "Sign request refused by pre-sign policy; signaling requester"
             );
-            self.send_session_error(&from, "policy_violation", &e.to_string(), request.session_id)
-                .await?;
+            self.send_session_error(
+                &from,
+                "policy_violation",
+                &e.to_string(),
+                request.session_id,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -623,6 +628,7 @@ impl KfpNode {
                 request.participants.clone(),
                 &request.session_salt,
             )?;
+            session.set_message_type(request.message_type.clone());
 
             // All nonce_refs have now been validated above, and a pre-exchange
             // request that reaches here covers the full threshold set. The
@@ -1335,6 +1341,7 @@ impl KfpNode {
                 participants.clone(),
                 &session_salt,
             )?;
+            session.set_message_type(message_type.to_string());
 
             session.set_our_nonces(nonces);
             session.set_our_commitment(our_commitment);

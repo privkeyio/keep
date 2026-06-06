@@ -315,13 +315,9 @@ pub struct SessionInfo {
     pub requester: u16,
     /// Requester-supplied label for the 32 bytes in `message`. Frost-secp256k1
     /// signs the bytes verbatim, so a "nostr-event" digest is byte-for-byte
-    /// indistinguishable from a Bitcoin taproot key-path sighash. `pre_sign`
-    /// hooks use this to gate (or refuse) requests whose label doesn't match
-    /// the expected domain on this group. See [`RefuseRawSignatureHooks`].
-    ///
-    /// Populated only on the `pre_sign` path. The `From<&NetworkSession>`
-    /// conversion used for `post_sign` leaves it empty because the session does
-    /// not retain the label, so `post_sign` policies must not rely on it.
+    /// indistinguishable from a Bitcoin taproot key-path sighash. Hooks use
+    /// this to gate (or refuse) requests whose label doesn't match the
+    /// expected domain on this group. See [`RefuseRawSignatureHooks`].
     pub message_type: String,
 }
 
@@ -332,11 +328,11 @@ impl From<&NetworkSession> for SessionInfo {
             message: session.message().to_vec(),
             threshold: session.threshold(),
             participants: session.participants().to_vec(),
-            // NetworkSession retains neither the requester index nor the
-            // message_type label, so this post_sign-side conversion cannot
-            // populate them. See the `message_type` doc above.
+            // NetworkSession does not retain the requester index, so this
+            // post_sign-side conversion cannot populate it; message_type is
+            // carried through so post_sign sees the original domain label.
             requester: 0,
-            message_type: String::new(),
+            message_type: session.message_type().to_string(),
         }
     }
 }
