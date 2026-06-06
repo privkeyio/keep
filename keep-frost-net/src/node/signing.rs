@@ -482,7 +482,17 @@ impl KfpNode {
         };
 
         let hooks = self.hooks.read().clone();
-        hooks.pre_sign(&session_info)?;
+        if let Err(e) = hooks.pre_sign(&session_info) {
+            // Notify the requester so it fails fast instead of hanging until
+            // timeout/failover exhaustion, mirroring the stale-nonce path below.
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                "Sign request refused by pre-sign policy; signaling requester"
+            );
+            self.send_session_error(&from, "policy_violation", &e.to_string(), request.session_id)
+                .await?;
+            return Ok(());
+        }
 
         // Locate the requester's reference to our own pre-exchanged nonce, if
         // any. The sentinel id ([0u8; 32]) marks the requester's echo-only

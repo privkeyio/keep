@@ -674,7 +674,7 @@ pub fn cmd_frost_network_sign_event(
         share,
         relay,
         event_id.as_bytes().to_vec(),
-        "nostr-event",
+        keep_frost_net::MSG_TYPE_NOSTR_EVENT,
     ))?;
 
     let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {

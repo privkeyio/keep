@@ -94,7 +94,7 @@ impl NetworkFrostSigner {
 
     pub async fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         self.node
-            .request_signature(message.to_vec(), "nostr_event")
+            .request_signature(message.to_vec(), keep_frost_net::MSG_TYPE_NOSTR_EVENT)
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))
     }

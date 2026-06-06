@@ -521,7 +521,7 @@ impl Nip55Handler {
             async move {
                 let node_guard = node_arc.read().await;
                 let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-                node.request_signature(event_hash.to_vec(), "nostr_event")
+                node.request_signature(event_hash.to_vec(), keep_frost_net::MSG_TYPE_NOSTR_EVENT)
                     .await
                     .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
             },

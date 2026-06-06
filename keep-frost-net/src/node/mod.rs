@@ -315,9 +315,13 @@ pub struct SessionInfo {
     pub requester: u16,
     /// Requester-supplied label for the 32 bytes in `message`. Frost-secp256k1
     /// signs the bytes verbatim, so a "nostr-event" digest is byte-for-byte
-    /// indistinguishable from a Bitcoin taproot key-path sighash. Hooks use
-    /// this to gate (or refuse) requests whose label doesn't match the
-    /// expected domain on this group. See [`RefuseRawSignatureHooks`].
+    /// indistinguishable from a Bitcoin taproot key-path sighash. `pre_sign`
+    /// hooks use this to gate (or refuse) requests whose label doesn't match
+    /// the expected domain on this group. See [`RefuseRawSignatureHooks`].
+    ///
+    /// Populated only on the `pre_sign` path. The `From<&NetworkSession>`
+    /// conversion used for `post_sign` leaves it empty because the session does
+    /// not retain the label, so `post_sign` policies must not rely on it.
     pub message_type: String,
 }
 
@@ -328,6 +332,9 @@ impl From<&NetworkSession> for SessionInfo {
             message: session.message().to_vec(),
             threshold: session.threshold(),
             participants: session.participants().to_vec(),
+            // NetworkSession retains neither the requester index nor the
+            // message_type label, so this post_sign-side conversion cannot
+            // populate them. See the `message_type` doc above.
             requester: 0,
             message_type: String::new(),
         }
@@ -361,28 +368,34 @@ impl SigningHooks for NoOpHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
-/// Pre-sign policy that refuses requests carrying the `"raw"` message_type
-/// label.
+/// Pre-sign policy that refuses requests whose `message_type` label is `"raw"`
+/// (compared case- and whitespace-insensitively).
 ///
-/// Without this gate, an authorized requester can present any 32-byte digest
-/// framed as `"raw"` and co-signers blind-sign it. A signature over a Nostr
-/// event id is byte-for-byte indistinguishable from a Bitcoin taproot
-/// key-path sighash for the same group key, so a `"raw"` request against a
-/// group that also coordinates a Bitcoin wallet descriptor can be confused
-/// with (or substituted for) a spend authorization. Operators of hybrid
-/// Nostr + Bitcoin groups should install this hook so co-signers reject
-/// anything not labeled with an explicit, recognised domain (e.g.
-/// `"nostr-event"`).
+/// The honest signing paths that produce unstructured 32-byte digests, the
+/// built-in `frost-network sign` command and the hardware bridge, label them
+/// `"raw"`. A signature over such a digest is byte-for-byte indistinguishable
+/// from a Bitcoin taproot key-path sighash for the same group key, so on a
+/// group that also coordinates a Bitcoin wallet descriptor a `"raw"` request
+/// can be confused with (or substituted for) a spend authorization. Operators
+/// of hybrid Nostr + Bitcoin groups install this hook so those raw requests
+/// are rejected and only structured, domain-labeled requests proceed.
 ///
-/// This is the MVP policy seam tracked under #524. A future hardening
-/// iteration will add domain-separated digests on the responder side so
-/// the label cannot be spoofed; until then, refusing `"raw"` outright is
-/// the cheapest correctness-preserving gate.
+/// This is a denylist, not an allowlist: it stops the honest raw-signing
+/// paths, but it does NOT stop an adversary. Because `message_type` is
+/// requester-supplied and not bound to the signed bytes, a caller can relabel
+/// a sighash as `"nostr-event"` (or anything else) and bypass the gate. The
+/// real fix, binding the domain into the signed digest on the responder side,
+/// is tracked under #524; until then, refusing `"raw"` outright is the
+/// cheapest correctness-preserving gate against accidental misuse.
 pub struct RefuseRawSignatureHooks;
 
 impl SigningHooks for RefuseRawSignatureHooks {
     fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
-        if session.message_type == "raw" {
+        if session
+            .message_type
+            .trim()
+            .eq_ignore_ascii_case(crate::MSG_TYPE_RAW)
+        {
             return Err(FrostNetError::PolicyViolation(format!(
                 "co-signer refuses message_type=\"raw\" (group coordinates structured signatures only; see #524). \
                  session_id={}, requester=share {}",
@@ -2140,6 +2153,21 @@ mod tests {
             "error must explain why: {msg}"
         );
         assert!(msg.contains(&hex::encode(session.session_id)));
+    }
+
+    #[test]
+    fn refuse_raw_signature_hooks_rejects_raw_label_variants() {
+        // Case- and whitespace-insensitive: the honest raw paths emit lowercase
+        // "raw", but a careless relabel like " RAW\n" must not slip through.
+        let hooks = RefuseRawSignatureHooks;
+        for label in ["RAW", "Raw", " raw", "raw\n", "\traw "] {
+            let mut session = raw_session();
+            session.message_type = label.to_string();
+            assert!(
+                hooks.pre_sign(&session).is_err(),
+                "variant {label:?} must be refused"
+            );
+        }
     }
 
     #[test]
