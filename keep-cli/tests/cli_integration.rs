@@ -81,7 +81,15 @@ impl KeepCmd {
     }
 
     fn run(mut self) -> Output {
-        self.cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Pin stdin to /dev/null so it is deterministically NOT a TTY rather
+        // than inheriting the parent's (a TTY under interactive `cargo test`).
+        // The export gate also refuses on its automation-env branch because
+        // `KeepCmd::new` always sets KEEP_YES, but pinning stdin keeps the gate
+        // independent of the ambient terminal regardless.
+        self.cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = self.cmd.spawn().expect("failed to spawn");
         let start = Instant::now();
         loop {
@@ -120,6 +128,12 @@ fn output_contains(output: &Output, needle: &str) -> bool {
     stdout.contains(needle) || stderr.contains(needle)
 }
 
+fn assert_interactive_refusal(output: &Output) {
+    assert_failure(output);
+    assert!(output_contains(output, "interactive-only"));
+    assert!(output_contains(output, "#467"));
+}
+
 #[test]
 fn test_init_generate_list_export_workflow() {
     let bin = require_binary!();
@@ -143,12 +157,38 @@ fn test_init_generate_list_export_workflow() {
     assert!(output_contains(&output, "testkey"));
     assert!(output_contains(&output, "Nostr"));
 
+    // `export` is interactive-only by design (#467): no TTY in this test
+    // harness means the command must refuse rather than print an nsec.
     let output = KeepCmd::new(&bin)
         .path(&vault)
         .args(["export", "--name", "testkey"])
         .run();
-    assert_success(&output);
-    assert!(output_contains(&output, "nsec1"));
+    assert_interactive_refusal(&output);
+}
+
+/// The #467 gate must fire BEFORE the vault is opened. Pointed at a vault that
+/// was never created, the command must refuse with the interactive-only policy
+/// error rather than a not-found error, proving the gate short-circuits ahead
+/// of `Keep::open`. Both the regular and `--hidden` dispatch arms share the
+/// single gate at the top of `cmd_export`, so both are pinned here.
+#[test]
+fn test_export_refuses_before_touching_vault() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("never-created-vault");
+
+    let output = KeepCmd::new(&bin)
+        .path(&nonexistent)
+        .args(["export", "--name", "irrelevant"])
+        .run();
+    assert_interactive_refusal(&output);
+
+    let output = KeepCmd::new(&bin)
+        .hidden()
+        .path(&nonexistent)
+        .args(["export", "--name", "irrelevant"])
+        .run();
+    assert_interactive_refusal(&output);
 }
 
 #[test]
@@ -202,48 +242,31 @@ fn test_delete_key() {
     assert!(output_contains(&output, "No keys found"));
 }
 
+/// `export` is interactive-only by design (#467), so the original
+/// generate -> export -> import -> list roundtrip via the CLI is no longer
+/// possible non-interactively. This test now covers the import half against
+/// a fixed test nsec (the export half is asserted to REFUSE in
+/// `test_init_generate_list_export_workflow`).
 #[test]
-fn test_import_export_nsec_roundtrip() {
+fn test_import_nsec_into_fresh_vault() {
     let bin = require_binary!();
     let dir = TempDir::new().unwrap();
-    let vault1 = dir.path().join("vault1");
-    let vault2 = dir.path().join("vault2");
+    let vault = dir.path().join("import-vault");
 
-    assert_success(&KeepCmd::new(&bin).path(&vault1).args(["init"]).run());
-    assert_success(
-        &KeepCmd::new(&bin)
-            .path(&vault1)
-            .args(["generate", "--name", "original"])
-            .run(),
-    );
+    // Deterministic test nsec - never used for anything real. Generated once
+    // and pinned so the test is hermetic.
+    const TEST_NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
 
     let output = KeepCmd::new(&bin)
-        .path(&vault1)
-        .args(["export", "--name", "original"])
-        .run();
-    assert_success(&output);
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let nsec = combined
-        .lines()
-        .find(|l| l.trim().starts_with("nsec1"))
-        .expect("no nsec found in output")
-        .trim();
-
-    assert_success(&KeepCmd::new(&bin).path(&vault2).args(["init"]).run());
-
-    let output = KeepCmd::new(&bin)
-        .path(&vault2)
-        .env("KEEP_NSEC", nsec)
+        .path(&vault)
+        .env("KEEP_NSEC", TEST_NSEC)
         .args(["import", "--name", "imported"])
         .run();
     assert_success(&output);
 
-    let output = KeepCmd::new(&bin).path(&vault2).args(["list"]).run();
+    let output = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
     assert_success(&output);
     assert!(output_contains(&output, "imported"));
 }
@@ -379,20 +402,12 @@ fn test_missing_vault_fails() {
     assert_failure(&KeepCmd::new(&bin).path(&nonexistent).args(["list"]).run());
 }
 
-#[test]
-fn test_export_nonexistent_key_fails() {
-    let bin = require_binary!();
-    let dir = TempDir::new().unwrap();
-    let vault = dir.path().join("nokey-vault");
-
-    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
-    assert_failure(
-        &KeepCmd::new(&bin)
-            .path(&vault)
-            .args(["export", "--name", "nonexistent"])
-            .run(),
-    );
-}
+// Note: there is no `test_export_nonexistent_key_fails` here. `export` is now
+// interactive-only (#467) and this harness is always non-interactive
+// (KEEP_YES set, stdin pinned to null), so the gate refuses before the key
+// lookup is ever reached. The nonexistent-key path is unreachable via the CLI
+// non-interactively; the gate behavior itself is covered by
+// `test_export_refuses_before_touching_vault`.
 
 #[test]
 fn test_delete_nonexistent_key_fails() {

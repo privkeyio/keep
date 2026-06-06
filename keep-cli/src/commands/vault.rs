@@ -17,7 +17,7 @@ use crate::output::Output;
 
 use super::{
     get_confirm, get_hidden_password, get_new_password_with_confirm, get_nsec, get_password,
-    get_password_with_confirm, is_hidden_vault,
+    get_password_with_confirm, is_hidden_vault, require_interactive_tty,
 };
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
@@ -520,6 +520,14 @@ fn cmd_list_hidden(out: &Output, path: &Path) -> Result<()> {
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 pub fn cmd_export(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
+    // Fail fast BEFORE prompting for a password or unlocking. Raw private-key
+    // export is interactive-only by design (#467): we require stdin and the
+    // stderr secret sink to both be a TTY and no automation env vars to be set.
+    // Surfacing this before any vault operation keeps the attack surface minimal
+    // and avoids leaving the operator with a half-completed unlock on a
+    // non-interactive session.
+    require_interactive_tty("keep export")?;
+
     if hidden {
         return cmd_export_hidden(out, path, name);
     }

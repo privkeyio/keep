@@ -93,6 +93,56 @@ pub fn get_new_password_with_confirm(prompt: &str, confirm: &str) -> Result<Secr
     Ok(SecretString::from(pw))
 }
 
+/// Refuse to proceed unless the session is genuinely interactive.
+///
+/// `keep export` reveals raw private key material. Per the #467 decision, raw
+/// private-key export is interactive-only by design: the threat model is
+/// "operator accidentally automates" or "malware scripts the export". This is
+/// a deliberate speed bump against accidental automation, not a hard control
+/// against a local attacker who can drive a pty.
+///
+/// "Interactive" requires all three to hold:
+///   - stdin is a TTY, so the operator can answer the prompts;
+///   - stderr is a TTY, because the nsec is written to stderr (`Output` uses
+///     `Term::stderr`), so gating only stdin would let `keep export 2>file`
+///     redirect the secret sink while still passing the check; and
+///   - no automation env vars (`KEEP_YES` / `KEEP_PASSWORD`) are set, since
+///     those silently script past the password prompt and the "Display nsec?"
+///     confirmation and would defeat the operator-in-the-loop intent.
+///
+/// The check fires BEFORE any password prompt or vault unlock so a missing TTY
+/// surfaces immediately on the smallest possible attack surface.
+pub fn require_interactive_tty(operation: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    require_interactive(
+        operation,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+        std::env::var_os("KEEP_YES").is_some() || std::env::var_os("KEEP_PASSWORD").is_some(),
+    )
+}
+
+/// Pure policy behind [`require_interactive_tty`], split out so both the accept
+/// and refuse branches are deterministically testable without depending on the
+/// ambient TTY state of the test harness.
+fn require_interactive(
+    operation: &str,
+    stdin_tty: bool,
+    stderr_tty: bool,
+    automation_env: bool,
+) -> Result<()> {
+    if stdin_tty && stderr_tty && !automation_env {
+        return Ok(());
+    }
+    Err(KeepError::InvalidInput(format!(
+        "{operation} is interactive-only by design: it refuses to run unless stdin and stderr are both a TTY \
+         and no automation env vars (KEEP_YES / KEEP_PASSWORD) are set. Raw private-key export reveals secret \
+         material; running it from a script, a pipe, or with the secret stream redirected defeats the \
+         operator-in-the-loop intent. If you genuinely need to automate this, wrap the command in `expect` / a \
+         pty harness; see #467 for the policy rationale."
+    )))
+}
+
 pub fn get_confirm(prompt: &str) -> Result<bool> {
     if std::env::var("KEEP_YES").is_ok() {
         return Ok(true);
@@ -126,4 +176,55 @@ pub fn get_nsec(prompt: &str) -> Result<SecretString> {
 
 pub fn is_hidden_vault(path: &std::path::Path) -> bool {
     path.join("keep.vault").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_refusal(err: &KeepError, operation: &str) {
+        let msg = err.to_string();
+        assert!(
+            matches!(err, KeepError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            msg.contains(operation),
+            "error must name the operation: {msg}"
+        );
+        assert!(
+            msg.contains("interactive-only") && msg.contains("#467"),
+            "error must explain why and point at the policy issue: {msg}"
+        );
+    }
+
+    /// A genuinely interactive session (TTY in + TTY out, no automation env)
+    /// is the only combination that is allowed through.
+    #[test]
+    fn require_interactive_accepts_full_interactive_session() {
+        require_interactive("keep export", true, true, false)
+            .expect("tty stdin + tty stderr with no automation env must be allowed");
+    }
+
+    #[test]
+    fn require_interactive_refuses_non_tty_stdin() {
+        let err = require_interactive("keep export", false, true, false).unwrap_err();
+        assert_refusal(&err, "keep export");
+    }
+
+    /// The nsec is written to stderr, so redirecting the secret sink
+    /// (`keep export 2>file`) must be refused even when stdin is still a TTY.
+    #[test]
+    fn require_interactive_refuses_non_tty_stderr() {
+        let err = require_interactive("keep export", true, false, false).unwrap_err();
+        assert_refusal(&err, "keep export");
+    }
+
+    /// `KEEP_YES` / `KEEP_PASSWORD` would script past the prompt and confirm,
+    /// so their presence is treated as non-interactive.
+    #[test]
+    fn require_interactive_refuses_automation_env() {
+        let err = require_interactive("keep export", true, true, true).unwrap_err();
+        assert_refusal(&err, "keep export");
+    }
 }
