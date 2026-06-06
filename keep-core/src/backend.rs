@@ -126,49 +126,27 @@ impl RedbBackend {
     /// Retries on Windows to handle delayed file handle release.
     /// Auto-upgrades from older redb file formats.
     pub fn open(path: &Path) -> Result<Self> {
-        const MAX_RETRIES: u32 = 10;
-        const RETRY_DELAY_MS: u64 = 50;
-
-        let mut last_err = None;
-        for _ in 0..MAX_RETRIES {
-            match Database::open(path) {
-                Ok(db) => {
-                    migration::check_compatibility(&db)?;
-                    let result = migration::run_migrations(&db)?;
-                    if result.migrations_run > 0 {
-                        info!(
-                            count = result.migrations_run,
-                            "vault schema migration completed"
-                        );
-                    }
-                    return Ok(Self { db });
-                }
-                Err(redb::DatabaseError::UpgradeRequired(old_version)) => {
-                    warn!(
-                        old_version,
-                        "redb file format upgrade required, migrating automatically"
+        match open_database_with_retry(path) {
+            Ok(db) => {
+                migration::check_compatibility(&db)?;
+                let result = migration::run_migrations(&db)?;
+                if result.migrations_run > 0 {
+                    info!(
+                        count = result.migrations_run,
+                        "vault schema migration completed"
                     );
-                    return Self::upgrade_file_format(path);
                 }
-                Err(e) => {
-                    let is_retryable = matches!(
-                        &e,
-                        redb::DatabaseError::Storage(redb::StorageError::Io(io_err))
-                            if io_err.kind() == std::io::ErrorKind::PermissionDenied
-                    ) || matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen);
-
-                    if is_retryable {
-                        last_err = Some(e);
-                        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
-                        continue;
-                    }
-                    return Err(e.into());
-                }
+                Ok(Self { db })
             }
+            Err(OpenWithRetryError::UpgradeRequired(old_version)) => {
+                warn!(
+                    old_version,
+                    "redb file format upgrade required, migrating automatically"
+                );
+                Self::upgrade_file_format(path)
+            }
+            Err(OpenWithRetryError::Other(e)) => Err(map_open_failure(path, e)),
         }
-        Err(last_err
-            .map(|e| map_open_failure(path, e))
-            .unwrap_or_else(|| StorageError::database("open failed after retries").into()))
     }
 
     /// Upgrade from an older redb file format by copying all data.
@@ -359,6 +337,55 @@ impl RedbBackend {
     }
 }
 
+/// Outcome of [`open_database_with_retry`] when retries are exhausted or a
+/// non-retryable failure is observed. `UpgradeRequired` is split out because
+/// callers route it to a format upgrade path, not to error mapping.
+pub(crate) enum OpenWithRetryError {
+    UpgradeRequired(u8),
+    Other(redb::DatabaseError),
+}
+
+/// Open a redb database with the same bounded retry policy used everywhere in
+/// keep-core: handles transient `DatabaseAlreadyOpen` (Windows handle release,
+/// brief contention windows) and `PermissionDenied` failures. After
+/// `MAX_RETRIES` attempts the most recent error is returned so callers can
+/// surface a Keep-layer message via [`map_open_failure`].
+pub(crate) fn open_database_with_retry(
+    path: &Path,
+) -> std::result::Result<Database, OpenWithRetryError> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY_MS: u64 = 50;
+
+    let mut last_err = None;
+    for _ in 0..MAX_RETRIES {
+        match Database::open(path) {
+            Ok(db) => return Ok(db),
+            Err(redb::DatabaseError::UpgradeRequired(old_version)) => {
+                return Err(OpenWithRetryError::UpgradeRequired(old_version));
+            }
+            Err(e) => {
+                let is_retryable = matches!(
+                    &e,
+                    redb::DatabaseError::Storage(redb::StorageError::Io(io_err))
+                        if io_err.kind() == std::io::ErrorKind::PermissionDenied
+                ) || matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen);
+
+                if is_retryable {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(OpenWithRetryError::Other(e));
+            }
+        }
+    }
+    Err(OpenWithRetryError::Other(last_err.unwrap_or_else(|| {
+        redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::other(
+            "open failed after retries",
+        )))
+    })))
+}
+
 /// Rewrite the redb `DatabaseAlreadyOpen` failure with a Keep-layer hint that
 /// names the most likely cause (another keep process holding the vault) and
 /// points the operator at how to recover (#422). Without this rewrite, the
@@ -368,7 +395,7 @@ impl RedbBackend {
 ///
 /// Non-lock-contention errors fall through to the default `KeepError` mapping
 /// so this helper does not swallow real database failures.
-pub fn map_open_failure(path: &Path, e: redb::DatabaseError) -> KeepError {
+pub(crate) fn map_open_failure(path: &Path, e: redb::DatabaseError) -> KeepError {
     if matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen) {
         return KeepError::InvalidInput(format!(
             "vault at {} is already opened by another process. \
