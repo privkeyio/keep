@@ -270,6 +270,27 @@ pub fn cmd_frost_network_serve(
                                 previous_descriptor_hash,
                                 policy: policy_value,
                             };
+                            // #426 (b): when a finalized descriptor lands on a
+                            // group that already has one, log a single WARN
+                            // naming the from/to versions and hashes so the
+                            // operator can see the supersession in the journal.
+                            // Responders trust the proposer's authority (the
+                            // message is authenticated under the group) so we
+                            // don't block; the gate lives on the proposer side.
+                            if let Ok(Some(prior)) = guard.get_wallet_descriptor(&group_pubkey) {
+                                let new_hash = descriptor.canonical_hash();
+                                let prior_hash = prior.canonical_hash();
+                                if prior_hash != new_hash {
+                                    tracing::warn!(
+                                        group = %hex::encode(group_pubkey),
+                                        from_version = prior.version,
+                                        from_hash = %hex::encode(prior_hash),
+                                        to_version = descriptor.version,
+                                        to_hash = %hex::encode(new_hash),
+                                        "replacing finalized wallet descriptor for group (see #426)"
+                                    );
+                                }
+                            }
                             match guard.store_wallet_descriptor(&descriptor) {
                                 Ok(()) => {
                                     tracing::info!("wallet descriptor stored");

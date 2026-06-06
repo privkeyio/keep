@@ -376,6 +376,18 @@ pub(crate) enum WalletCommands {
         recovery: Vec<String>,
         #[arg(long, help = "Session timeout in seconds (max 86400)")]
         timeout: Option<u64>,
+        /// Required when a finalized descriptor already exists for this
+        /// group. Refuses unless paired with --replacing-version <N>
+        /// matching the stored version. Without this, the propose would
+        /// silently overwrite the stored descriptor and break wallet
+        /// address generation. See #426 for the policy rationale.
+        #[arg(long, requires = "replacing_version")]
+        force: bool,
+        /// The version number of the existing descriptor this propose
+        /// intends to replace. Must match what `wallet show` reports for
+        /// the group. Belt-and-suspenders against muscle-memory --force.
+        #[arg(long)]
+        replacing_version: Option<u32>,
     },
     /// Propose a recovery-tier (scriptpath) spend via WDC PSBT coordination
     Spend {
