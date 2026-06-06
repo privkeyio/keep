@@ -93,6 +93,29 @@ pub fn get_new_password_with_confirm(prompt: &str, confirm: &str) -> Result<Secr
     Ok(SecretString::from(pw))
 }
 
+/// Refuse to proceed when stdin is not a TTY.
+///
+/// `keep export` reveals raw private key material. Per the #467 decision, raw
+/// private-key export is interactive-only by design: the threat model is
+/// exactly "operator accidentally automates" or "malware scripts the export",
+/// and an env-var or `--yes` gate barely raises the bar against either.
+/// Operators who genuinely need scripted export can wrap in `expect`/`pty`;
+/// the speed bump is intentional. The check fires BEFORE any password prompt
+/// or vault unlock so a missing TTY surfaces immediately on the smallest
+/// possible attack surface.
+pub fn require_interactive_tty(operation: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    Err(KeepError::InvalidInput(format!(
+        "{operation} is interactive-only by design: stdin is not a TTY, so this command refuses to run. \
+         Raw private-key export reveals secret material; running it from a script or pipe defeats the operator-in-the-loop \
+         intent. If you genuinely need to automate this, wrap the command in `expect` / a pty harness; see #467 for the \
+         policy rationale."
+    )))
+}
+
 pub fn get_confirm(prompt: &str) -> Result<bool> {
     if std::env::var("KEEP_YES").is_ok() {
         return Ok(true);
@@ -126,4 +149,32 @@ pub fn get_nsec(prompt: &str) -> Result<SecretString> {
 
 pub fn is_hidden_vault(path: &std::path::Path) -> bool {
     path.join("keep.vault").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `require_interactive_tty` must return an `InvalidInput` error whose
+    /// message names the operation and points at #467 when stdin is not a
+    /// TTY. In the test harness stdin is never a TTY, so this is a stable
+    /// negative-path assertion.
+    #[test]
+    fn require_interactive_tty_rejects_non_tty_stdin() {
+        let err = require_interactive_tty("keep export")
+            .expect_err("test harness stdin is not a TTY; require_interactive_tty must refuse");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, KeepError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            msg.contains("keep export"),
+            "error must name the operation: {msg}"
+        );
+        assert!(
+            msg.contains("interactive-only") && msg.contains("#467"),
+            "error must explain why and point at the policy issue: {msg}"
+        );
+    }
 }

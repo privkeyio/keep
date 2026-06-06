@@ -143,12 +143,15 @@ fn test_init_generate_list_export_workflow() {
     assert!(output_contains(&output, "testkey"));
     assert!(output_contains(&output, "Nostr"));
 
+    // `export` is interactive-only by design (#467): no TTY in this test
+    // harness means the command must refuse rather than print an nsec.
     let output = KeepCmd::new(&bin)
         .path(&vault)
         .args(["export", "--name", "testkey"])
         .run();
-    assert_success(&output);
-    assert!(output_contains(&output, "nsec1"));
+    assert_failure(&output);
+    assert!(output_contains(&output, "interactive-only"));
+    assert!(output_contains(&output, "#467"));
 }
 
 #[test]
@@ -202,48 +205,31 @@ fn test_delete_key() {
     assert!(output_contains(&output, "No keys found"));
 }
 
+/// `export` is interactive-only by design (#467), so the original
+/// generate -> export -> import -> list roundtrip via the CLI is no longer
+/// possible non-interactively. This test now covers the import half against
+/// a fixed test nsec (the export half is asserted to REFUSE in
+/// `test_init_generate_list_export_workflow`).
 #[test]
-fn test_import_export_nsec_roundtrip() {
+fn test_import_nsec_into_fresh_vault() {
     let bin = require_binary!();
     let dir = TempDir::new().unwrap();
-    let vault1 = dir.path().join("vault1");
-    let vault2 = dir.path().join("vault2");
+    let vault = dir.path().join("import-vault");
 
-    assert_success(&KeepCmd::new(&bin).path(&vault1).args(["init"]).run());
-    assert_success(
-        &KeepCmd::new(&bin)
-            .path(&vault1)
-            .args(["generate", "--name", "original"])
-            .run(),
-    );
+    // Deterministic test nsec - never used for anything real. Generated once
+    // and pinned so the test is hermetic.
+    const TEST_NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
 
     let output = KeepCmd::new(&bin)
-        .path(&vault1)
-        .args(["export", "--name", "original"])
-        .run();
-    assert_success(&output);
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let nsec = combined
-        .lines()
-        .find(|l| l.trim().starts_with("nsec1"))
-        .expect("no nsec found in output")
-        .trim();
-
-    assert_success(&KeepCmd::new(&bin).path(&vault2).args(["init"]).run());
-
-    let output = KeepCmd::new(&bin)
-        .path(&vault2)
-        .env("KEEP_NSEC", nsec)
+        .path(&vault)
+        .env("KEEP_NSEC", TEST_NSEC)
         .args(["import", "--name", "imported"])
         .run();
     assert_success(&output);
 
-    let output = KeepCmd::new(&bin).path(&vault2).args(["list"]).run();
+    let output = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
     assert_success(&output);
     assert!(output_contains(&output, "imported"));
 }

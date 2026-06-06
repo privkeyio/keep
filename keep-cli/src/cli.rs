@@ -56,7 +56,8 @@ pub(crate) enum Commands {
     },
     /// List keys stored in the vault
     List,
-    /// Print a raw nsec for the named key (prompts for confirmation)
+    /// Print a raw nsec for the named key. Interactive-only by design:
+    /// refuses when stdin is not a TTY (see #467 for policy rationale).
     Export {
         #[arg(short, long)]
         name: String,
