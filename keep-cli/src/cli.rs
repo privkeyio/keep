@@ -600,18 +600,24 @@ pub(crate) enum FrostNetworkCommands {
         )]
         participants: Option<u16>,
     },
+    /// Build a Nostr event with the FROST group pubkey as the author,
+    /// FROST-sign its canonical event id across peers, and emit the signed
+    /// event as JSON.
     SignEvent {
-        #[arg(short, long)]
+        #[arg(short, long, help = "FROST group npub (event author)")]
         group: String,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Nostr event kind")]
         kind: u16,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Event content")]
         content: String,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Coordination relay URL")]
         relay: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Local share index to use")]
         share: Option<u16>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
+        #[arg(
+            long,
+            help = "Hardware signer device path (not yet supported for sign-event, see follow-up)"
+        )]
         hardware: Option<String>,
     },
     GroupCreate {
