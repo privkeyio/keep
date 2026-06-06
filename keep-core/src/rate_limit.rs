@@ -29,6 +29,16 @@ fn rate_limit_path(storage_path: &Path) -> PathBuf {
     }
 }
 
+fn trip_log_path(storage_path: &Path) -> PathBuf {
+    let mut rl = rate_limit_path(storage_path);
+    let new_name = match rl.file_name() {
+        Some(n) => format!("{}.trips", n.to_string_lossy()),
+        None => ".ratelimit.trips".to_string(),
+    };
+    rl.set_file_name(new_name);
+    rl
+}
+
 pub(crate) fn derive_hmac_key(salt: &[u8; 32]) -> [u8; 32] {
     use blake2::digest::consts::U32;
     use blake2::{Blake2b, Digest};
@@ -168,17 +178,128 @@ pub(crate) fn record_failure(path: &Path, hmac_key: &[u8; 32]) {
     }
 
     let mut record = read_record_from_file(&mut file, hmac_key);
+    let prior_attempts = record.failed_attempts;
     record.failed_attempts = record.failed_attempts.saturating_add(1);
     record.last_failure = now_secs();
 
     let _ = file.seek(SeekFrom::Start(0));
     let _ = file.write_all(&record.to_bytes(hmac_key));
     let _ = file.sync_all();
+
+    // Queue a trip event the first time this failure crosses the rate-limit
+    // threshold. Successive failures while already tripped do not enqueue
+    // additional events. The trip log persists across the failed-attempt
+    // cycle and is drained by the next successful unlock when the audit log
+    // is available (the data key required to write encrypted audit entries
+    // is not available at this point in the flow, see #495).
+    if prior_attempts < MAX_ATTEMPTS && record.failed_attempts >= MAX_ATTEMPTS {
+        record_trip(path, hmac_key, record.failed_attempts, record.last_failure);
+    }
 }
 
 pub(crate) fn record_success(path: &Path) {
     let rl_path = rate_limit_path(path);
     let _ = fs::remove_file(rl_path);
+}
+
+/// A persisted rate-limit trip event awaiting flush to the audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingTrip {
+    pub failed_attempts: u32,
+    pub timestamp: u64,
+}
+
+const TRIP_RECORD_SIZE: usize = 20;
+const MAX_TRIP_RECORDS: usize = 256;
+
+impl PendingTrip {
+    fn to_bytes(&self, hmac_key: &[u8; 32]) -> [u8; TRIP_RECORD_SIZE] {
+        let mut data = [0u8; TRIP_RECORD_SIZE];
+        data[0..4].copy_from_slice(&self.failed_attempts.to_le_bytes());
+        data[4..12].copy_from_slice(&self.timestamp.to_le_bytes());
+        let tag = compute_hmac(&data[0..12], hmac_key);
+        data[12..20].copy_from_slice(&tag);
+        data
+    }
+
+    fn from_bytes(data: &[u8], hmac_key: &[u8; 32]) -> Option<Self> {
+        if data.len() != TRIP_RECORD_SIZE {
+            return None;
+        }
+        let tag = compute_hmac(&data[0..12], hmac_key);
+        if !bool::from(data[12..20].ct_eq(&tag)) {
+            return None;
+        }
+        Some(Self {
+            failed_attempts: u32::from_le_bytes(data[0..4].try_into().ok()?),
+            timestamp: u64::from_le_bytes(data[4..12].try_into().ok()?),
+        })
+    }
+}
+
+fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp: u64) {
+    let trip_path = trip_log_path(path);
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let Ok(file) = opts.open(&trip_path) else {
+        return;
+    };
+
+    if FileExt::lock_exclusive(&file).is_err() {
+        return;
+    }
+
+    // Cap the file at MAX_TRIP_RECORDS to bound disk usage when nothing
+    // flushes (e.g. hidden-volume unlock paths that don't open an audit log).
+    if let Ok(meta) = file.metadata() {
+        if meta.len() as usize >= TRIP_RECORD_SIZE * MAX_TRIP_RECORDS {
+            return;
+        }
+    }
+
+    let trip = PendingTrip {
+        failed_attempts,
+        timestamp,
+    };
+    let mut file = file;
+    let _ = file.write_all(&trip.to_bytes(hmac_key));
+    let _ = file.sync_all();
+}
+
+/// Read and remove all pending trip events for `path`. Records with invalid
+/// HMAC tags are silently skipped (cannot be attributed to a real trip).
+pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<PendingTrip> {
+    let trip_path = trip_log_path(path);
+
+    let Ok(mut file) = File::open(&trip_path) else {
+        return Vec::new();
+    };
+
+    if FileExt::lock_exclusive(&file).is_err() {
+        return Vec::new();
+    }
+
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(buf.len() / TRIP_RECORD_SIZE);
+    for chunk in buf.chunks_exact(TRIP_RECORD_SIZE) {
+        if let Some(trip) = PendingTrip::from_bytes(chunk, hmac_key) {
+            out.push(trip);
+        }
+    }
+
+    drop(file);
+    let _ = fs::remove_file(&trip_path);
+    out
 }
 
 #[cfg(test)]
@@ -319,5 +440,110 @@ mod tests {
         let bytes = record.to_bytes(&TEST_KEY);
         let wrong_key = [0xCD; 32];
         assert!(RateLimitRecord::from_bytes(&bytes, &wrong_key).is_none());
+    }
+
+    #[test]
+    fn trip_recorded_exactly_once_on_threshold_crossing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        // Drive the counter up to MAX_ATTEMPTS - 1 with no trip recorded.
+        for _ in 0..(MAX_ATTEMPTS - 1) {
+            record_failure(&path, &TEST_KEY);
+        }
+        assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+
+        // This failure crosses the threshold and must queue exactly one trip.
+        record_failure(&path, &TEST_KEY);
+        let trips = drain_pending_trips(&path, &TEST_KEY);
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].failed_attempts, MAX_ATTEMPTS);
+
+        // After draining, the trip file is gone.
+        assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+    }
+
+    #[test]
+    fn additional_failures_past_threshold_do_not_requeue() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        for _ in 0..=MAX_ATTEMPTS {
+            record_failure(&path, &TEST_KEY);
+        }
+
+        // We expect exactly one trip (the first to cross), regardless of how
+        // many failures piled on after.
+        let trips = drain_pending_trips(&path, &TEST_KEY);
+        assert_eq!(trips.len(), 1);
+    }
+
+    #[test]
+    fn success_does_not_clear_trip_file() {
+        // record_success clears the rate-limit counter so the user can keep
+        // trying, but the trip event must survive to be flushed by the
+        // next unlock that opens an audit log.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        for _ in 0..=MAX_ATTEMPTS {
+            record_failure(&path, &TEST_KEY);
+        }
+        record_success(&path);
+
+        let trips = drain_pending_trips(&path, &TEST_KEY);
+        assert_eq!(trips.len(), 1);
+    }
+
+    #[test]
+    fn drain_skips_tampered_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        for _ in 0..=MAX_ATTEMPTS {
+            record_failure(&path, &TEST_KEY);
+        }
+
+        let trip_path = trip_log_path(&path);
+        let mut bytes = fs::read(&trip_path).unwrap();
+        // Flip a bit in the failed_attempts field; HMAC over the data will
+        // no longer match, so drain must reject this record.
+        bytes[0] ^= 0xFF;
+        fs::write(&trip_path, &bytes).unwrap();
+
+        let trips = drain_pending_trips(&path, &TEST_KEY);
+        assert!(trips.is_empty(), "tampered record must be silently skipped");
+    }
+
+    #[test]
+    fn trip_file_capped_at_max_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        // Synthesize MAX_TRIP_RECORDS valid records by repeatedly tripping
+        // and resetting the counter so each call crosses the threshold.
+        for _ in 0..MAX_TRIP_RECORDS {
+            // Drive up to MAX_ATTEMPTS then reset.
+            for _ in 0..MAX_ATTEMPTS {
+                record_failure(&path, &TEST_KEY);
+            }
+            record_success(&path);
+        }
+        // One more cycle must not push the file past the cap.
+        for _ in 0..MAX_ATTEMPTS {
+            record_failure(&path, &TEST_KEY);
+        }
+
+        let trip_path = trip_log_path(&path);
+        let size = fs::metadata(&trip_path).unwrap().len() as usize;
+        assert!(
+            size <= TRIP_RECORD_SIZE * MAX_TRIP_RECORDS,
+            "trip file size {size} exceeded cap"
+        );
     }
 }

@@ -168,6 +168,24 @@ impl Keep {
         let data_key = self.get_data_key()?;
         self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
         self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &data_key)?);
+
+        // Flush any rate-limit trip events queued by prior failed unlocks
+        // before recording this success, so the audit chain reflects the
+        // chronological order: lock-out events first, then the successful
+        // unlock that observed and cleared them.
+        let trips = self.storage.drain_pending_trips();
+        for trip in trips {
+            let trip_ts = trip.timestamp as i64;
+            let reason = format!(
+                "rate limit threshold reached after {} failed attempts",
+                trip.failed_attempts
+            );
+            self.audit_event(AuditEventType::RateLimitTripped, |mut e| {
+                e.timestamp = trip_ts;
+                e.with_success(false).with_reason(&reason)
+            });
+        }
+
         self.audit_event(AuditEventType::VaultUnlock, |e| e);
         debug!("loading keys to keyring");
         self.load_keys_to_keyring()
@@ -1458,6 +1476,74 @@ mod tests {
         let mut keep = Keep::open(path).unwrap();
         keep.unlock("testpass").unwrap();
         keep
+    }
+
+    #[test]
+    fn rate_limit_trip_emits_audit_entry_on_next_unlock() {
+        // The rate limiter trips after MAX_ATTEMPTS (5) failed unlocks. The
+        // trip event must surface as a `RateLimitTripped` audit entry the
+        // next time the operator successfully unlocks (#495).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+
+        Storage::create(&path, "right-password", crypto::Argon2Params::TESTING).unwrap();
+
+        // Five failed attempts trips the limiter.
+        for _ in 0..5 {
+            let mut keep = Keep::open(&path).unwrap();
+            let _ = keep.unlock("wrong-password");
+        }
+
+        // The sixth attempt would hit the back-off; wait it out by clearing
+        // the active rate-limit counter (the trip event lives in a separate
+        // file that record_success deliberately does NOT touch).
+        crate::rate_limit::record_success(&path);
+
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("right-password").unwrap();
+
+        let entries = keep.audit_read_all().unwrap();
+        let trips: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::RateLimitTripped))
+            .collect();
+        assert_eq!(trips.len(), 1, "expected one trip entry, got {trips:#?}");
+        assert!(!trips[0].success, "trip entry must record success=false");
+        assert!(
+            trips[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("rate limit")),
+            "trip entry must carry a descriptive reason, got {:?}",
+            trips[0].reason
+        );
+
+        // Chronological order: RateLimitTripped precedes the VaultUnlock it
+        // was discovered by, so the audit chain reflects the actual sequence
+        // of lockout then recovery.
+        let trip_idx = entries
+            .iter()
+            .position(|e| matches!(e.event_type, AuditEventType::RateLimitTripped))
+            .unwrap();
+        let unlock_idx = entries
+            .iter()
+            .rposition(|e| matches!(e.event_type, AuditEventType::VaultUnlock))
+            .unwrap();
+        assert!(trip_idx < unlock_idx);
+
+        // Subsequent unlocks don't re-emit the same trip.
+        keep.lock();
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("right-password").unwrap();
+        let entries = keep.audit_read_all().unwrap();
+        let trip_count = entries
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::RateLimitTripped))
+            .count();
+        assert_eq!(
+            trip_count, 1,
+            "trip entry must not duplicate on later unlocks"
+        );
     }
 
     #[test]
