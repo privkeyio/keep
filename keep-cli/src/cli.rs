@@ -386,7 +386,7 @@ pub(crate) enum WalletCommands {
         /// The version number of the existing descriptor this propose
         /// intends to replace. Must match what `wallet show` reports for
         /// the group. Belt-and-suspenders against muscle-memory --force.
-        #[arg(long)]
+        #[arg(long, requires = "force")]
         replacing_version: Option<u32>,
     },
     /// Propose a recovery-tier (scriptpath) spend via WDC PSBT coordination

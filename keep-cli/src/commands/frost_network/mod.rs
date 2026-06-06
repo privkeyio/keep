@@ -226,8 +226,11 @@ pub fn cmd_frost_network_serve(
                             // and only one migration can be in flight per
                             // group at the protocol layer.
                             let guard = keep.lock().expect("keep mutex poisoned");
+                            // Single load reused for both the predecessor-hash
+                            // computation below and the supersession WARN.
+                            let prior = guard.get_wallet_descriptor(&group_pubkey);
                             let previous_descriptor_hash = if version > INITIAL_DESCRIPTOR_VERSION {
-                                match guard.get_wallet_descriptor(&group_pubkey) {
+                                match &prior {
                                     Ok(Some(prev)) => {
                                         if prev.version != version - 1 {
                                             tracing::error!(
@@ -277,7 +280,7 @@ pub fn cmd_frost_network_serve(
                             // Responders trust the proposer's authority (the
                             // message is authenticated under the group) so we
                             // don't block; the gate lives on the proposer side.
-                            if let Ok(Some(prior)) = guard.get_wallet_descriptor(&group_pubkey) {
+                            if let Ok(Some(prior)) = &prior {
                                 let new_hash = descriptor.canonical_hash();
                                 let prior_hash = prior.canonical_hash();
                                 if prior_hash != new_hash {
