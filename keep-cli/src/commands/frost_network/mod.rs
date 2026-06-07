@@ -594,9 +594,12 @@ async fn frost_network_sign_round(
 
     let node = std::sync::Arc::new(node);
     let node_clone = node.clone();
-    let _handle = tokio::spawn(async move {
+    // RAII guard so the background run() task is aborted on every exit path
+    // (Ok return, the `?` from `request_signature`, or a panic), not silently
+    // detached until the surrounding tokio runtime tears down. See #525.
+    let _run_guard = NodeRunGuard(tokio::spawn(async move {
         let _ = node_clone.run().await;
-    });
+    }));
 
     out.info("Discovering peers...");
     for i in 0..12 {
@@ -626,6 +629,18 @@ async fn frost_network_sign_round(
         .map_err(|e| KeepError::Frost(e.to_string()))?;
     spinner.finish();
     Ok(signature)
+}
+
+/// Aborts the background `KfpNode::run()` task on drop so a signing helper's
+/// every exit path (Ok return, `?` error, panic) tears down relay
+/// subscriptions promptly instead of relying on the surrounding tokio
+/// runtime's drop to cancel a detached task at its next await point.
+struct NodeRunGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for NodeRunGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[tracing::instrument(skip(out, content), fields(path = %path.display()))]
@@ -976,5 +991,47 @@ mod tests {
         signed
             .verify()
             .expect("assembled event must verify under the group key");
+    }
+
+    /// `NodeRunGuard` must abort its inner `JoinHandle` on drop so a signing
+    /// helper that returns early via `?` doesn't leak a detached `run()`
+    /// task. Without the guard, the only cleanup signal is the surrounding
+    /// tokio runtime tearing down on shutdown, which arrives much later than
+    /// the operator's view of the command exiting (#525).
+    #[tokio::test]
+    async fn node_run_guard_aborts_on_drop() {
+        // A long-running task simulates `KfpNode::run()`'s relay subscription
+        // loop. Without the guard's Drop impl, this future would keep
+        // running past the helper's exit.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+
+        {
+            let _guard = NodeRunGuard(handle);
+            // Guard goes out of scope here; Drop fires.
+        }
+
+        // The previous handle was consumed, so spawn another task that
+        // observes whether tokio knows the prior was aborted. We re-create
+        // the guarded handle to make a clean assertion: a fresh JoinHandle's
+        // is_finished() should flip to true shortly after we abort.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let abort_handle = handle.abort_handle();
+        let guard = NodeRunGuard(handle);
+        assert!(
+            !abort_handle.is_finished(),
+            "task must still be running before guard drop"
+        );
+        drop(guard);
+
+        // Yield once so the abort signal is observed by the runtime.
+        tokio::task::yield_now().await;
+        assert!(
+            abort_handle.is_finished(),
+            "guard's Drop impl must have aborted the inner JoinHandle"
+        );
     }
 }
