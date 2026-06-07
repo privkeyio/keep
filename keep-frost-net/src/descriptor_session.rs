@@ -1927,22 +1927,35 @@ mod tests {
         assert_eq!(discard_reason(&session, false), Some("invalid network"));
     }
 
-    /// `hash_policy` MUST commit to the policy version. A `>` ↔ `>=` /
-    /// `==` mutation on `version > 0` would silently NOT hash the version
-    /// byte for version=1, causing two different-versioned descriptors to
-    /// hash to the same value and bypass the version monotonic check
-    /// downstream.
+    /// `hash_policy` folds the policy version into the hash only when
+    /// `version > 1`, so v0/v1 records (written before versioning existed)
+    /// stay bit-identical. Two pins matter:
+    ///   * v0 and v1 with identical tiers MUST collide — this is the
+    ///     `> 1` boundary. A `>= 1` or `== 1` mutation would fold the
+    ///     version for v1 and break the collision, which this test catches.
+    ///   * v2 MUST differ from v1 — confirms the version is actually hashed
+    ///     past the boundary (kills the "condition → false" mutation).
     #[test]
     fn derive_policy_hash_depends_on_version() {
-        let mut p1 = test_policy();
-        p1.version = 1;
-        let mut p2 = test_policy();
-        p2.version = 2;
-        let h1 = derive_policy_hash(&p1);
-        let h2 = derive_policy_hash(&p2);
-        assert_ne!(h1, h2, "different versions must yield different hashes");
+        let mut v0 = test_policy();
+        v0.version = 0;
+        let mut v1 = test_policy();
+        v1.version = 1;
+        let mut v2 = test_policy();
+        v2.version = 2;
+
+        let h0 = derive_policy_hash(&v0);
+        let h1 = derive_policy_hash(&v1);
+        let h2 = derive_policy_hash(&v2);
+
+        // `> 1` boundary: v0 and v1 are NOT folded, so identical tiers
+        // collide. A `>= 1`/`== 1` mutant would fold v1 and break this.
+        assert_eq!(h0, h1, "v0 and v1 must hash identically under `> 1`");
+
+        // Past the boundary v2 is folded and must diverge.
+        assert_ne!(h1, h2, "v2 must hash differently from v1");
+
         assert_ne!(h1, [0u8; 32], "hash must not be the all-zero pin");
-        assert_ne!(h1, [1u8; 32]);
     }
 
     /// `derive_policy_hash` MUST also depend on the recovery_tiers shape.
@@ -2125,13 +2138,19 @@ mod tests {
 
     /// The persisted state mapping for `Failed` truncates reasons longer
     /// than 512 bytes to 512 (or the nearest UTF-8 boundary below) + "...".
-    /// The `> with ==` mutation on the length check would only truncate
-    /// reasons of EXACTLY 513 bytes, leaving longer ones intact and
-    /// bloating the persistence record.
+    /// Two mutations are pinned:
+    ///   * `> with ==` on the length check: the 1014-byte reason here is
+    ///     not exactly 512, so an `== 512` mutant would skip truncation and
+    ///     the exact-equality assertion below would fail.
+    ///   * `-=` ↔ `+=` on the char-boundary walk: a 3-byte `€` straddles
+    ///     byte index 512 (it occupies bytes 511..514), so 512 is NOT a
+    ///     char boundary. The real loop walks `end` DOWN to 511, dropping
+    ///     the `€`; a `+=` mutant walks UP to 514, keeping it. Asserting
+    ///     the `€` is absent and the prefix ends at byte 511 kills it.
     #[test]
     fn to_persisted_failed_state_truncates_long_reason() {
         let mut session = test_session();
-        let long = "x".repeat(1_000);
+        let long = format!("{}€{}", "x".repeat(511), "y".repeat(500));
         session.fail(long);
         let persisted = session.to_persisted();
         match persisted.state {
@@ -2140,7 +2159,15 @@ mod tests {
                     r.ends_with("..."),
                     "truncated reason must terminate with '...'"
                 );
-                assert!(r.len() <= 515, "truncated reason must not exceed 515 chars");
+                assert_eq!(
+                    r,
+                    format!("{}...", "x".repeat(511)),
+                    "must truncate DOWN to the char boundary at byte 511"
+                );
+                assert!(
+                    !r.contains('€'),
+                    "`-=` loop must stop before the multibyte char, not after it"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
