@@ -90,7 +90,7 @@ Tracked modules so far (per #417's scope list):
 
 - `keep-frost-net/src/node/signing.rs`
 - `keep-frost-net/src/ecdh.rs` and `keep-frost-net/src/node/ecdh.rs`
-- `keep-core/src/descriptor.rs` and `keep-core/src/descriptor_session*.rs`
+- `keep-core/src/descriptor.rs`
 - `keep-nip46/src/server.rs`
 
 ## Code Review

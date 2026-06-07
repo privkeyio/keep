@@ -1568,12 +1568,15 @@ mod tests {
         assert!(!is_recoverable_peer_error("malformed_request"));
     }
 
-    /// `parse_offending_peer` extracts the share index annotation on
-    /// peer-reported session errors. The handler appends "(peer N)";
-    /// the failover logic uses the parsed index to scope cleanup to
-    /// the offending peer's pooled commitments. A regression here that
-    /// returns `None` for every input would force a full pool wipe
-    /// every time, and a regression that returns a wrong index would
+    /// `parse_offending_peer` extracts the share index from the trailing
+    /// "(peer N)" annotation the handler appends. The parsed index is only
+    /// trustworthy because the handler appends the resolved sender index
+    /// LAST, so `rfind` picks it over any `(peer N)` an attacker embeds in
+    /// the free-form `code` (verified by the "last occurrence wins" case
+    /// below). This test pins the parser, not the trust boundary: scoping
+    /// cleanup safely depends on the suffix being appended at the call site.
+    /// A regression returning `None` for every input would force a full
+    /// pool wipe every time; a regression returning a wrong index would
     /// scope cleanup at the wrong peer.
     #[test]
     fn parse_offending_peer_extracts_index_from_trailing_annotation() {
@@ -1605,10 +1608,11 @@ mod tests {
 
     /// The content hash for the nonce-commitment dedup MUST be order- and
     /// position-independent across the commitment set. Pin the
-    /// equivalence so a future mutation that drops the sort (or swaps
-    /// the secondary key) is caught: it would otherwise let an
-    /// adversary re-broadcast the same set under a reordered payload
-    /// and bypass dedup.
+    /// equivalence so a future mutation that drops the primary sort is
+    /// caught: it would otherwise let an adversary re-broadcast the same
+    /// set under a reordered payload and bypass dedup. The secondary
+    /// (commitment) sort key is exercised separately by
+    /// `nonce_commitment_content_hash_orders_by_commitment_on_tie`.
     #[test]
     fn nonce_commitment_content_hash_is_order_independent() {
         let a = PreExchangedCommitment {
@@ -1643,25 +1647,57 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    /// Concatenation MUST NOT collide distinct partitions. A naive
-    /// implementation that hashed `nonce_id || commitment` without a
-    /// length prefix would let `("AB", "C")` and `("A", "BC")` hash to
-    /// the same digest, opening a dedup-bypass: an attacker rebroadcasts
-    /// the same conceptual set under a different chunking and the
-    /// receiver treats it as new.
+    /// When two entries share a `nonce_id`, the secondary `.then(commitment
+    /// .cmp(..))` sort key decides their order, and the hash MUST still be
+    /// reorder-independent. This is the case the all-distinct-`nonce_id`
+    /// order test cannot reach: dropping or swapping the secondary key lets
+    /// the two orderings serialize differently and the hash diverge, so
+    /// `assert_eq` here kills that mutant.
     #[test]
-    fn nonce_commitment_content_hash_resists_length_extension_collision() {
+    fn nonce_commitment_content_hash_orders_by_commitment_on_tie() {
+        let lo = PreExchangedCommitment {
+            nonce_id: [5u8; 32],
+            commitment: b"aaa".to_vec(),
+        };
+        let hi = PreExchangedCommitment {
+            nonce_id: [5u8; 32],
+            commitment: b"bbb".to_vec(),
+        };
+        let h1 = nonce_commitment_content_hash(3, &[lo.clone(), hi.clone()]);
+        let h2 = nonce_commitment_content_hash(3, &[hi, lo]);
+        assert_eq!(
+            h1, h2,
+            "tied nonce_ids must order by commitment, independent of input order"
+        );
+    }
+
+    /// The per-entry `(len as u32)` length prefix MUST disambiguate where one
+    /// commitment ends and the next begins. Without it the serialization is
+    /// `nonce_id || commitment` per entry, so a two-entry set and a crafted
+    /// single entry whose commitment is `"AB" || nonce_id || "C"` produce an
+    /// identical byte stream and collide, opening a dedup-bypass. Construct
+    /// exactly that ambiguity: the two hashes differ ONLY because of the
+    /// length prefix, so deleting line `:140` makes this `assert_ne` fail and
+    /// kills the mutant (the prior all-distinct fixture could not).
+    #[test]
+    fn nonce_commitment_content_hash_length_prefix_prevents_concatenation_collision() {
+        let nid = [4u8; 32];
         let split_a = PreExchangedCommitment {
-            nonce_id: [4u8; 32],
+            nonce_id: nid,
             commitment: b"AB".to_vec(),
         };
         let split_b = PreExchangedCommitment {
-            nonce_id: [4u8; 32],
+            nonce_id: nid,
             commitment: b"C".to_vec(),
         };
+        // "AB" || nonce_id || "C": equals the split stream once the length
+        // prefix is removed (nonce_id is fixed-width and interleaved).
+        let mut merged = b"AB".to_vec();
+        merged.extend_from_slice(&nid);
+        merged.extend_from_slice(b"C");
         let single = PreExchangedCommitment {
-            nonce_id: [4u8; 32],
-            commitment: b"ABC".to_vec(),
+            nonce_id: nid,
+            commitment: merged,
         };
         let h_split = nonce_commitment_content_hash(0, &[split_a, split_b]);
         let h_single = nonce_commitment_content_hash(0, &[single]);
@@ -1669,5 +1705,31 @@ mod tests {
             h_split, h_single,
             "length-prefixing must prevent concatenation collisions"
         );
+    }
+
+    /// Golden vector pinning the exact serialization end-to-end. One absolute
+    /// digest locks the domain separator, the big-endian `share_index` and
+    /// length encodings, and the entry layout in a single assertion, killing
+    /// the endianness, domain-string, and length-prefix mutants that the
+    /// relative eq/ne tests leave alive. Recompute deliberately if the wire
+    /// format changes (and bump the `-v1` domain).
+    #[test]
+    fn nonce_commitment_content_hash_matches_golden_vector() {
+        let entries = [
+            PreExchangedCommitment {
+                nonce_id: [1u8; 32],
+                commitment: b"abc".to_vec(),
+            },
+            PreExchangedCommitment {
+                nonce_id: [2u8; 32],
+                commitment: b"de".to_vec(),
+            },
+        ];
+        let expected: [u8; 32] = [
+            0xa3, 0x41, 0x2c, 0xec, 0x4f, 0x37, 0x4c, 0xd6, 0xaa, 0x34, 0xad, 0x14, 0x3a, 0x9a,
+            0xd1, 0xeb, 0xb8, 0x96, 0x22, 0x4f, 0xbc, 0xa9, 0x19, 0xfd, 0x0b, 0x45, 0x5f, 0xc6,
+            0x6c, 0x4f, 0x9e, 0x9f,
+        ];
+        assert_eq!(nonce_commitment_content_hash(7, &entries), expected);
     }
 }
