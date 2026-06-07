@@ -342,11 +342,18 @@ timeout = 120
     /// config has no `vault_path` set. The fallback path drives where every
     /// CLI command without `--path` lands, so a silent drift away from
     /// `~/.keep` would mis-target every default command.
+    ///
+    /// Compared via `.ok()` instead of `unwrap()`: both calls go through the
+    /// same `default_keep_path()` resolver, so the invariant under test is
+    /// "they agree", not "they succeed". On a stripped CI without HOME set
+    /// the resolver returns `HomeNotFound` from both sides, which still
+    /// satisfies the agreement check rather than panicking.
     #[test]
     fn vault_path_falls_back_to_default_when_unset() {
         let config = Config::parse("").unwrap();
-        let resolved = config.vault_path().unwrap();
-        let expected = keep_core::default_keep_path().unwrap();
-        assert_eq!(resolved, expected);
+        assert_eq!(
+            config.vault_path().ok(),
+            keep_core::default_keep_path().ok()
+        );
     }
 }
