@@ -696,4 +696,107 @@ mod tests {
             assert_eq!(dst.timestamp, src.timestamp, "entry {i} timestamp");
         }
     }
+
+    /// Pin that backup + restore preserves every stored row type — not just
+    /// keys (already covered by `test_backup_roundtrip`). #437's acceptance
+    /// criterion is "verify in-place migration succeeds without data loss",
+    /// and the migration unit underneath restore is the whole vault. A future
+    /// refactor that drops shares, descriptors, or relay configs from the
+    /// backup envelope would have shipped past the existing tests.
+    #[test]
+    fn backup_roundtrip_preserves_shares_descriptors_and_relay_config() {
+        use crate::relay::{
+            RelayConfig, StoredBunkerPermission, StoredPermissionDuration, GLOBAL_RELAY_KEY,
+        };
+        use crate::wallet::{WalletDescriptor, INITIAL_DESCRIPTOR_VERSION};
+
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let mut keep = create_test_keep(&src_path);
+        keep.unlock("test-password-123").unwrap();
+
+        // Populate every row type the backup envelope ships.
+        let key_pubkey = keep.generate_key("primary").unwrap();
+        let shares = keep.frost_split("primary", 2, 3).unwrap();
+        assert_eq!(shares.len(), 3, "split should produce 3 shares");
+        let group_pubkey = shares[0].metadata.group_pubkey;
+
+        let descriptor = WalletDescriptor {
+            group_pubkey,
+            external_descriptor: format!("tr({})/0/*)", hex::encode(group_pubkey)),
+            internal_descriptor: format!("tr({})/1/*)", hex::encode(group_pubkey)),
+            network: "signet".into(),
+            created_at: 1_700_000_000,
+            device_registrations: Vec::new(),
+            policy_hash: [0x22; 32],
+            version: INITIAL_DESCRIPTOR_VERSION,
+            previous_descriptor_hash: None,
+            policy: None,
+        };
+        keep.store_wallet_descriptor(&descriptor).unwrap();
+
+        let mut relay_cfg = RelayConfig::with_defaults(GLOBAL_RELAY_KEY);
+        relay_cfg.bunker_permissions.push(StoredBunkerPermission {
+            pubkey_hex: "a".repeat(64),
+            name: "test-app".to_string(),
+            permissions: 0b1111,
+            auto_approve_kinds: vec![1, 7],
+            duration: StoredPermissionDuration::Forever,
+            connected_at: 1_700_000_000,
+        });
+        relay_cfg.auto_approve_kinds = vec![22242];
+        keep.store_relay_config(&relay_cfg).unwrap();
+
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+
+        let dst_path = dir.path().join("dst");
+        let info = restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+        assert_eq!(info.key_count, 1);
+        assert_eq!(info.share_count, 3);
+        assert_eq!(info.descriptor_count, 1);
+
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+
+        // Key survived (already covered by test_backup_roundtrip but pin
+        // alongside the new assertions so a failure localizes here).
+        let keys = restored.list_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "primary");
+        assert_eq!(keys[0].pubkey, key_pubkey);
+
+        // All three shares survived with intact metadata.
+        let restored_shares = restored.frost_list_shares().unwrap();
+        assert_eq!(restored_shares.len(), 3);
+        for share in &restored_shares {
+            assert_eq!(share.metadata.group_pubkey, group_pubkey);
+            assert_eq!(share.metadata.threshold, 2);
+            assert_eq!(share.metadata.total_shares, 3);
+        }
+
+        // Descriptor survived with the same canonical hash.
+        let restored_descs = restored.list_wallet_descriptors().unwrap();
+        assert_eq!(restored_descs.len(), 1);
+        assert_eq!(
+            restored_descs[0].canonical_hash(),
+            descriptor.canonical_hash(),
+            "descriptor canonical hash must survive restore"
+        );
+
+        // Relay config + bunker grants survived (without this, every NIP-46
+        // pre-grant would silently vanish on restore).
+        let restored_cfg = restored
+            .get_relay_config(&GLOBAL_RELAY_KEY)
+            .unwrap()
+            .expect("relay config must survive restore");
+        assert_eq!(restored_cfg.bunker_permissions.len(), 1);
+        assert_eq!(restored_cfg.bunker_permissions[0].name, "test-app");
+        assert_eq!(restored_cfg.auto_approve_kinds, vec![22242]);
+    }
 }
