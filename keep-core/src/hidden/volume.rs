@@ -354,11 +354,16 @@ impl HiddenStorage {
     }
 
     /// Open the outer-volume audit log and drain pending trip events. Called
-    /// from `unlock_outer` after the data key is in hand. Errors on the audit
-    /// log are non-fatal to the unlock itself; we log and continue so a
-    /// corrupted audit log can't make the whole vault inaccessible.
+    /// from `unlock_outer` and the `unlock()` dispatcher after the data key is
+    /// in hand. Errors on the audit log are non-fatal to the unlock itself; we
+    /// log and continue so a corrupted audit log can't make the whole vault
+    /// inaccessible. Idempotent: a no-op once the log is already attached.
     fn attach_outer_audit(&mut self, hmac_key: &[u8; 32]) -> Result<()> {
         use crate::audit::{AuditEntry, AuditEventType};
+
+        if self.outer_audit.is_some() {
+            return Ok(());
+        }
 
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
         let mut audit = match crate::audit::AuditLog::open(&self.path, data_key) {
@@ -371,7 +376,7 @@ impl HiddenStorage {
 
         let trips = rate_limit::drain_pending_trips(&self.path, hmac_key);
         for trip in trips {
-            let trip_ts = trip.timestamp as i64;
+            let trip_ts = i64::try_from(trip.timestamp).unwrap_or(i64::MAX);
             let reason = format!(
                 "rate limit threshold reached after {} failed attempts",
                 trip.failed_attempts
@@ -486,6 +491,10 @@ impl HiddenStorage {
             (Ok(()), _) => {
                 self.active_volume = Some(VolumeType::Outer);
                 rate_limit::record_success(&self.path);
+                // #520: the auto-detect path must flush trips and attach the
+                // outer audit log too, otherwise `audit_*` accessors see an
+                // unlocked vault with `outer_audit == None`. Mirror `unlock_outer`.
+                self.attach_outer_audit(&hmac_key)?;
                 Ok(VolumeType::Outer)
             }
             (Err(_), Ok(())) => {
@@ -1561,5 +1570,47 @@ mod tests {
         assert!(storage.audit_read_all().unwrap().is_empty());
         assert!(storage.audit_verify_chain().unwrap());
         assert!(storage.audit_apply_retention().is_err());
+    }
+
+    /// #520 on the auto-detect `unlock()` path: tripping the limiter then
+    /// unlocking via the dispatcher (not `unlock_outer`) must still flush the
+    /// `RateLimitTripped` entry and attach the outer audit log. Pins the fix
+    /// for the dispatcher arm that previously skipped `attach_outer_audit`.
+    #[test]
+    fn hidden_dispatch_unlock_flushes_rate_limit_trips_to_audit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-dispatch-trip-audit");
+
+        HiddenStorage::create(
+            &path,
+            "outer-password",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        for _ in 0..5 {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            let _ = storage.unlock_outer("wrong-password");
+        }
+
+        crate::rate_limit::record_success(&path);
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        assert_eq!(storage.unlock("outer-password").unwrap(), VolumeType::Outer);
+
+        let entries = storage.audit_read_all().unwrap();
+        let trips: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.event_type, crate::audit::AuditEventType::RateLimitTripped))
+            .collect();
+        assert_eq!(
+            trips.len(),
+            1,
+            "dispatcher unlock must flush exactly one trip entry; got {trips:#?}"
+        );
+        assert!(storage.audit_verify_chain().unwrap());
     }
 }
