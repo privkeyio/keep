@@ -840,10 +840,10 @@ mod tests {
         );
     }
 
-    /// `create_session` may reuse an id whose prior session has EXPIRED by
-    /// evicting the stale entry (the `remove` path) instead of reporting
-    /// "already active". A regression that drops the `remove` would wedge the
-    /// id permanently once its first session timed out.
+    /// `create_session` may reuse an id whose prior session has EXPIRED,
+    /// replacing the stale entry instead of reporting "already active". This
+    /// pins the `is_expired()` guard: a regression that treats an expired
+    /// duplicate as still-active would reject the second create.
     #[test]
     fn ecdh_session_manager_create_session_replaces_expired_duplicate() {
         let mut mgr = EcdhSessionManager::new().with_timeout(Duration::from_nanos(1));
