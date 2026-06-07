@@ -371,6 +371,28 @@ impl Default for EcdhSessionManager {
 mod tests {
     use super::*;
 
+    /// Valid SEC1-compressed secp256k1 point reused as the recipient pubkey
+    /// across the ECDH tests.
+    fn test_pubkey() -> [u8; 33] {
+        hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// Deterministic, valid (sub-group-order) signing-share scalar. The `seed`
+    /// only perturbs the high byte so every value stays well below the
+    /// secp256k1 group order while remaining distinct per test.
+    fn test_scalar(seed: u8) -> [u8; 32] {
+        let mut s = [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+            0xf0, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+            0xd0, 0xe0, 0xf0, 0x01,
+        ];
+        s[0] = seed;
+        s
+    }
+
     #[test]
     fn test_derive_ecdh_session_id_deterministic() {
         let recipient = [0x02u8; 33];
@@ -392,16 +414,8 @@ mod tests {
 
     #[test]
     fn test_single_party_ecdh() {
-        let signing_share: [u8; 32] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-            0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-            0xdd, 0xee, 0xff, 0x01,
-        ];
-        let recipient_pk: [u8; 33] =
-            hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
-                .unwrap()
-                .try_into()
-                .unwrap();
+        let signing_share = test_scalar(0x11);
+        let recipient_pk = test_pubkey();
         let partial = compute_partial_ecdh(&signing_share, &recipient_pk).unwrap();
         let result = aggregate_ecdh_shares(&[(1u16, partial)], &[1u16]);
         assert!(
@@ -454,8 +468,11 @@ mod tests {
             id_a, id_c,
             "different participant count must yield distinct id"
         );
+        // id_a and id_d share the same participant count (3) but differ in a
+        // single value — this pins the per-participant value loop, which a
+        // count-only comparison would leave unguarded.
         assert_ne!(
-            id_c, id_d,
+            id_a, id_d,
             "different participant value must yield distinct id"
         );
 
@@ -470,16 +487,8 @@ mod tests {
     /// produce a zero share that aggregates to the curve identity (or fails).
     #[test]
     fn compute_partial_ecdh_returns_nonzero_compressed_point() {
-        let scalar = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-            0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-            0xdd, 0xee, 0xff, 0x01,
-        ];
-        let pk: [u8; 33] =
-            hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
-                .unwrap()
-                .try_into()
-                .unwrap();
+        let scalar = test_scalar(0x11);
+        let pk = test_pubkey();
         let result = compute_partial_ecdh(&scalar, &pk).unwrap();
         assert_ne!(
             result, [0u8; 33],
@@ -498,12 +507,8 @@ mod tests {
     /// scalar/pubkey on the wire.
     #[test]
     fn compute_partial_ecdh_rejects_invalid_inputs() {
-        let valid_pk: [u8; 33] =
-            hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        // 0xff*32 is greater than the secp256k1 group order — an invalid
+        let valid_pk = test_pubkey();
+        // 0xff*32 is greater than the secp256k1 group order, an invalid
         // scalar repr that must surface a Crypto error.
         assert!(compute_partial_ecdh(&[0xffu8; 32], &valid_pk).is_err());
 
@@ -535,6 +540,14 @@ mod tests {
         assert_eq!(c1 + c2, Scalar::ONE);
     }
 
+    /// `lagrange_coefficient` surfaces an error for an out-of-range identifier.
+    /// Index 0 cannot map to a FROST `Identifier`, so the `try_from` guard must
+    /// short-circuit instead of silently producing a bogus coefficient.
+    #[test]
+    fn lagrange_coefficient_rejects_invalid_identifier() {
+        assert!(lagrange_coefficient(0, &[0, 1]).is_err());
+    }
+
     /// `aggregate_ecdh_shares` errors on empty input. A regression to
     /// `Ok([0; 32])` would silently return a fake secret to callers.
     #[test]
@@ -552,13 +565,8 @@ mod tests {
     /// would both fail this end-to-end check.
     #[test]
     fn aggregate_ecdh_shares_matches_direct_ecdh_in_single_party_case() {
-        let scalar: [u8; 32] = [
-            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
-            0xf0, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
-            0xd0, 0xe0, 0xf0, 0x01,
-        ];
-        let pk_hex = "02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de";
-        let pk: [u8; 33] = hex::decode(pk_hex).unwrap().try_into().unwrap();
+        let scalar = test_scalar(0x10);
+        let pk = test_pubkey();
 
         let partial = compute_partial_ecdh(&scalar, &pk).unwrap();
         let result = aggregate_ecdh_shares(&[(1u16, partial)], &[1u16]).unwrap();
@@ -687,16 +695,8 @@ mod tests {
     /// every caller regardless of which session they queried.
     #[test]
     fn ecdh_session_shared_secret_returns_stored_value_only_after_completion() {
-        let scalar: [u8; 32] = [
-            0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe,
-            0x0f, 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc,
-            0xed, 0xfe, 0x0f, 0x11,
-        ];
-        let pk: [u8; 33] =
-            hex::decode("02bc52210b20d3fb89326463a3518674c7edde65794a7765c7f3a9119b20bfc6de")
-                .unwrap()
-                .try_into()
-                .unwrap();
+        let scalar = test_scalar(0x21);
+        let pk = test_pubkey();
         let partial = compute_partial_ecdh(&scalar, &pk).unwrap();
 
         let mut s = EcdhSession::new([0; 32], pk, 1, vec![1]);
@@ -838,5 +838,46 @@ mod tests {
             mgr.get_session(&sid_exp).is_none(),
             "cleanup_expired must drop sessions past their deadline"
         );
+    }
+
+    /// `create_session` may reuse an id whose prior session has EXPIRED by
+    /// evicting the stale entry (the `remove` path) instead of reporting
+    /// "already active". A regression that drops the `remove` would wedge the
+    /// id permanently once its first session timed out.
+    #[test]
+    fn ecdh_session_manager_create_session_replaces_expired_duplicate() {
+        let mut mgr = EcdhSessionManager::new().with_timeout(Duration::from_nanos(1));
+        let sid = [0x44; 32];
+        mgr.create_session(sid, [0x02u8; 33], 2, vec![1, 2])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+
+        // The prior entry is now expired, so a fresh create must succeed by
+        // evicting it; the new participant set proves the entry was replaced.
+        assert!(mgr
+            .create_session(sid, [0x02u8; 33], 2, vec![1, 3])
+            .is_ok());
+        assert_eq!(mgr.get_session(&sid).unwrap().participants(), &[1, 3]);
+    }
+
+    /// `create_session` enforces the `MAX_ACTIVE_SESSIONS` cap once the table
+    /// is full of live sessions. A regression that drops the bound would let an
+    /// adversary exhaust memory by opening unbounded concurrent sessions.
+    #[test]
+    fn ecdh_session_manager_enforces_max_active_sessions() {
+        let mut mgr = EcdhSessionManager::new();
+        for i in 0..EcdhSessionManager::MAX_ACTIVE_SESSIONS {
+            let mut sid = [0u8; 32];
+            sid[0] = i as u8;
+            mgr.create_session(sid, [0x02u8; 33], 2, vec![1, 2])
+                .unwrap();
+        }
+
+        // A new distinct id beyond the cap must be rejected.
+        let mut sid = [0u8; 32];
+        sid[1] = 1;
+        assert!(mgr
+            .create_session(sid, [0x02u8; 33], 2, vec![1, 2])
+            .is_err());
     }
 }
