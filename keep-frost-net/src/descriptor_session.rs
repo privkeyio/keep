@@ -1780,4 +1780,447 @@ mod tests {
             Ok(())
         }
     }
+
+    // === #417 round 3b: targeted unit tests killing the surviving mutations ===
+
+    /// `now_unix` MUST return a value greater than zero — the UNIX epoch is
+    /// 1970. A "return 0" or "return 1" regression would corrupt every
+    /// `to_persisted` round-trip by recording sessions as if they were
+    /// created decades in the past, which `unix_to_instant` then rejects
+    /// as "too far in the past".
+    #[test]
+    fn now_unix_returns_current_epoch_seconds() {
+        let t = now_unix();
+        // Sanity: after Jan 1 2020 (1577836800).
+        assert!(
+            t > 1_577_836_800,
+            "now_unix returned {t}, expected after 2020-01-01"
+        );
+    }
+
+    /// `validate_session_timeout` is the gate for caller-supplied timeouts.
+    /// Both bounds matter: zero is refused, exceeding the max is refused,
+    /// and the upper boundary is INCLUSIVE (the max is allowed). A `>` ↔
+    /// `>=` mutation would either silently allow timeouts past the cap or
+    /// refuse the legal maximum.
+    #[test]
+    fn validate_session_timeout_enforces_bounds() {
+        // Zero refused.
+        assert!(validate_session_timeout(Duration::from_secs(0)).is_err());
+
+        // One second accepted.
+        assert!(validate_session_timeout(Duration::from_secs(1)).is_ok());
+
+        // Exactly at the max boundary — INCLUSIVE.
+        let max = Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS);
+        assert!(
+            validate_session_timeout(max).is_ok(),
+            "max boundary must be inclusive"
+        );
+
+        // One second past the max — refused.
+        let over = Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS + 1);
+        assert!(validate_session_timeout(over).is_err());
+    }
+
+    /// `clamp_session_timeout` maps any out-of-range seconds value to the
+    /// nearest in-range Duration. A `Default::default()` regression would
+    /// return `Duration::ZERO`, defeating the whole point of the clamp.
+    #[test]
+    fn clamp_session_timeout_enforces_floor_and_ceiling() {
+        // Zero clamps UP to 1 second (the floor).
+        assert_eq!(clamp_session_timeout(0), Duration::from_secs(1));
+
+        // Mid-range passes through.
+        assert_eq!(clamp_session_timeout(60), Duration::from_secs(60));
+
+        // Above max clamps DOWN to max.
+        let beyond = DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS + 1_000;
+        assert_eq!(
+            clamp_session_timeout(beyond),
+            Duration::from_secs(DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS)
+        );
+    }
+
+    /// `instant_to_unix` converts a recent `Instant` into a unix
+    /// timestamp anchored at `now`. A "return 0" or "return 1" regression
+    /// would erase the time component entirely, breaking the persisted
+    /// session round-trip.
+    #[test]
+    fn instant_to_unix_anchors_at_now_minus_elapsed() {
+        let now: u64 = 1_700_000_000;
+        let instant = Instant::now();
+        // Elapsed is ~0 right after Instant::now(), so the result must
+        // be very close to `now`.
+        let result = instant_to_unix(now, instant);
+        // Allow 1s of test scheduling slack.
+        assert!(
+            result == now || result == now - 1,
+            "expected {now}±1, got {result}"
+        );
+    }
+
+    /// `unix_to_instant` rejects timestamps in the future (allowing for
+    /// MAX_FUTURE_SKEW_SECS slack). A `>` ↔ `>=` or `==` regression would
+    /// either silently accept future timestamps or refuse exactly-now.
+    #[test]
+    fn unix_to_instant_rejects_far_future_and_accepts_present() {
+        let now = now_unix();
+
+        // Exactly `now` accepted (no skew needed).
+        assert!(unix_to_instant(now, now, "test").is_ok());
+
+        // Within the skew window accepted.
+        assert!(
+            unix_to_instant(now, now + crate::protocol::MAX_FUTURE_SKEW_SECS, "test").is_ok(),
+            "skew-boundary timestamp must be accepted"
+        );
+
+        // Beyond the skew window refused.
+        let far_future = now + crate::protocol::MAX_FUTURE_SKEW_SECS + 1;
+        assert!(unix_to_instant(now, far_future, "test").is_err());
+    }
+
+    /// `discard_reason` reports a static label string. A regression that
+    /// returns `Some("xyzzy")` or `Some("")` would silently inject a stub
+    /// reason that downstream logging keys off, masking the real cause.
+    #[test]
+    fn discard_reason_returns_terminal_or_expired_when_flagged() {
+        let session = test_session();
+        // Terminal flag forces the "terminal or expired" reason.
+        assert_eq!(
+            discard_reason(&session, true),
+            Some("terminal or expired"),
+            "is_terminal must surface the terminal/expired reason"
+        );
+    }
+
+    /// `discard_reason` returns None when the session is healthy AND
+    /// `is_terminal == false`. A "delete !" regression on the network or
+    /// contribution validity check would flip a healthy session into a
+    /// discarded one, silently dropping in-flight coordination.
+    #[test]
+    fn discard_reason_returns_none_for_healthy_non_terminal_session() {
+        let session = test_session();
+        assert_eq!(discard_reason(&session, false), None);
+    }
+
+    /// `discard_reason` triggers on invalid network. The `>` boundary
+    /// on `expected_contributors.len() > MAX_PARTICIPANTS` is similarly
+    /// pinned in the next test, but here we cover the network gate
+    /// (which mutations would flip with `!VALID_NETWORKS.contains` →
+    /// `VALID_NETWORKS.contains`).
+    #[test]
+    fn discard_reason_flags_invalid_network() {
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let session = DescriptorSession::new(
+            [1u8; 32],
+            [2u8; 32],
+            policy,
+            "garbage-network".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        assert_eq!(discard_reason(&session, false), Some("invalid network"));
+    }
+
+    /// `hash_policy` folds the policy version into the hash only when
+    /// `version > 1`, so v0/v1 records (written before versioning existed)
+    /// stay bit-identical. Two pins matter:
+    ///   * v0 and v1 with identical tiers MUST collide — this is the
+    ///     `> 1` boundary. A `>= 1` or `== 1` mutation would fold the
+    ///     version for v1 and break the collision, which this test catches.
+    ///   * v2 MUST differ from v1 — confirms the version is actually hashed
+    ///     past the boundary (kills the "condition → false" mutation).
+    #[test]
+    fn derive_policy_hash_depends_on_version() {
+        let mut v0 = test_policy();
+        v0.version = 0;
+        let mut v1 = test_policy();
+        v1.version = 1;
+        let mut v2 = test_policy();
+        v2.version = 2;
+
+        let h0 = derive_policy_hash(&v0);
+        let h1 = derive_policy_hash(&v1);
+        let h2 = derive_policy_hash(&v2);
+
+        // `> 1` boundary: v0 and v1 are NOT folded, so identical tiers
+        // collide. A `>= 1`/`== 1` mutant would fold v1 and break this.
+        assert_eq!(h0, h1, "v0 and v1 must hash identically under `> 1`");
+
+        // Past the boundary v2 is folded and must diverge.
+        assert_ne!(h1, h2, "v2 must hash differently from v1");
+
+        assert_ne!(h1, [0u8; 32], "hash must not be the all-zero pin");
+    }
+
+    /// `derive_policy_hash` MUST also depend on the recovery_tiers shape.
+    /// Catches `> with == ` mutations on `hash_policy`'s "is there a tier
+    /// to hash?" branches that would short-circuit different policies to
+    /// the same hash.
+    #[test]
+    fn derive_policy_hash_depends_on_tier_shape() {
+        let mut p1 = test_policy();
+        let mut p2 = test_policy();
+        // Same policy version but different timelock.
+        p2.recovery_tiers[0].timelock_months = 12;
+        assert_ne!(derive_policy_hash(&p1), derive_policy_hash(&p2));
+
+        // Same policy version but different threshold.
+        p1.recovery_tiers[0].threshold = 1;
+        let mut p3 = test_policy();
+        assert_ne!(derive_policy_hash(&p1), derive_policy_hash(&p3));
+
+        // Removing all tiers also changes the hash.
+        p3.recovery_tiers.clear();
+        assert_ne!(derive_policy_hash(&p1), derive_policy_hash(&p3));
+    }
+
+    /// `DescriptorSession::session_id` returns the constructor input
+    /// verbatim. A `Box::leak(Box::new([1; 32]))` regression would let
+    /// every caller see a stubbed identity instead of the real session.
+    #[test]
+    fn descriptor_session_id_accessor_returns_construction_input() {
+        let session = test_session();
+        assert_eq!(session.session_id(), &[1u8; 32]);
+        // And a different id is distinguishable.
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let other = DescriptorSession::new(
+            [9u8; 32],
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        assert_eq!(other.session_id(), &[9u8; 32]);
+    }
+
+    /// `is_participant` returns true for share indices in EITHER the
+    /// contributors or the acks set. A `||` ↔ `&&` regression would
+    /// require membership in BOTH (true only for the intersection),
+    /// silently rejecting participants who only appear in one role.
+    #[test]
+    fn is_participant_matches_either_role() {
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2].into();
+        let acks: HashSet<u16> = [2, 3].into();
+        let session = DescriptorSession::new(
+            [0u8; 32],
+            [0u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(60),
+        );
+
+        assert!(session.is_participant(1), "contributor-only");
+        assert!(session.is_participant(2), "intersection");
+        assert!(session.is_participant(3), "ack-only");
+        assert!(!session.is_participant(4));
+
+        // True/false constant return regression: outsiders must NOT
+        // match.
+        assert!(!session.is_participant(99));
+    }
+
+    /// `has_nacked` reflects nack-set membership exactly. A `true`/`false`
+    /// constant-return regression would silently accept or reject every
+    /// nack vote.
+    #[test]
+    fn has_nacked_tracks_individual_indices() {
+        let mut session = test_session();
+        assert!(!session.has_nacked(1));
+        session.add_nack(1);
+        assert!(session.has_nacked(1));
+        assert!(!session.has_nacked(2));
+        session.add_nack(2);
+        assert!(session.has_nacked(2));
+        assert!(session.has_nacked(1));
+    }
+
+    /// `add_nack` MUST persist the nack. A "replace with ()" regression
+    /// would silently drop the nack vote, breaking downstream `has_nacked`
+    /// queries.
+    #[test]
+    fn add_nack_persists_vote_to_set() {
+        let mut session = test_session();
+        session.add_nack(5);
+        // Witness via has_nacked: independent code path, harder to game.
+        assert!(session.has_nacked(5));
+    }
+
+    /// `is_failed` returns true ONLY when in the Failed state. A `false`-
+    /// return regression would silently let failed sessions proceed
+    /// through the coordination; a `true`-return regression would block
+    /// every healthy session.
+    #[test]
+    fn is_failed_reflects_failed_state_only() {
+        let mut session = test_session();
+        assert!(!session.is_failed(), "Proposed is not failed");
+        session.fail("test reason".into());
+        assert!(session.is_failed());
+    }
+
+    /// `fail` MUST be a no-op when the session is already complete or
+    /// already failed. The `&&` ↔ `||` mutation would let a fail() call
+    /// after completion overwrite the Complete state, corrupting the
+    /// final session record.
+    #[test]
+    fn fail_is_noop_when_already_complete_or_failed() {
+        let mut session = test_session();
+        session.state = DescriptorSessionState::Complete;
+        session.fail("late failure".into());
+        assert_eq!(
+            *session.state(),
+            DescriptorSessionState::Complete,
+            "fail() must not overwrite Complete"
+        );
+
+        let mut session = test_session();
+        session.fail("first".into());
+        session.fail("second".into());
+        // First failure reason persists.
+        if let DescriptorSessionState::Failed(reason) = session.state() {
+            assert_eq!(reason, "first", "second fail() must not overwrite first");
+        } else {
+            panic!("expected Failed state");
+        }
+    }
+
+    /// `ack_count` and `expected_ack_count` return concrete sizes; constant-
+    /// return mutations would corrupt the "have we reached threshold?"
+    /// check downstream that drives session completion.
+    #[test]
+    fn ack_counts_reflect_set_sizes() {
+        let mut session = test_session();
+        // expected_ack_count from test_session is 3.
+        assert_eq!(session.expected_ack_count(), 3);
+        assert_eq!(session.ack_count(), 0);
+
+        // Inject acks directly to avoid hash-verification path.
+        session.acks.insert(1);
+        assert_eq!(session.ack_count(), 1);
+        session.acks.insert(2);
+        assert_eq!(session.ack_count(), 2);
+        session.acks.insert(2); // duplicate insert is a no-op for HashSet
+        assert_eq!(
+            session.ack_count(),
+            2,
+            "duplicate insert must not bump count"
+        );
+    }
+
+    /// The persisted state mapping for `Failed` must preserve reasons
+    /// shorter than 512 bytes verbatim. A `-=` ↔ `+=` regression on the
+    /// truncation loop would either truncate excessively or run forever.
+    #[test]
+    fn to_persisted_failed_state_preserves_short_reason() {
+        let mut session = test_session();
+        let short = "a clear, descriptive failure reason";
+        session.fail(short.into());
+        let persisted = session.to_persisted();
+        match persisted.state {
+            PersistedSessionState::Failed(r) => {
+                assert_eq!(r, short, "short reason must survive verbatim");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The persisted state mapping for `Failed` truncates reasons longer
+    /// than 512 bytes to 512 (or the nearest UTF-8 boundary below) + "...".
+    /// Two mutations are pinned:
+    ///   * `> with ==` on the length check: the 1014-byte reason here is
+    ///     not exactly 512, so an `== 512` mutant would skip truncation and
+    ///     the exact-equality assertion below would fail.
+    ///   * `-=` ↔ `+=` on the char-boundary walk: a 3-byte `€` straddles
+    ///     byte index 512 (it occupies bytes 511..514), so 512 is NOT a
+    ///     char boundary. The real loop walks `end` DOWN to 511, dropping
+    ///     the `€`; a `+=` mutant walks UP to 514, keeping it. Asserting
+    ///     the `€` is absent and the prefix ends at byte 511 kills it.
+    #[test]
+    fn to_persisted_failed_state_truncates_long_reason() {
+        let mut session = test_session();
+        let long = format!("{}€{}", "x".repeat(511), "y".repeat(500));
+        session.fail(long);
+        let persisted = session.to_persisted();
+        match persisted.state {
+            PersistedSessionState::Failed(r) => {
+                assert!(
+                    r.ends_with("..."),
+                    "truncated reason must terminate with '...'"
+                );
+                assert_eq!(
+                    r,
+                    format!("{}...", "x".repeat(511)),
+                    "must truncate DOWN to the char boundary at byte 511"
+                );
+                assert!(
+                    !r.contains('€'),
+                    "`-=` loop must stop before the multibyte char, not after it"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// `DescriptorSessionManager::session_count` returns the actual count.
+    /// A "return 0" / "return 1" regression would corrupt the
+    /// MAX_ACTIVE_SESSIONS gate, either rejecting every new session or
+    /// letting them all in.
+    #[test]
+    fn manager_session_count_reports_actual_size() {
+        let mut mgr = DescriptorSessionManager::new();
+        assert_eq!(mgr.session_count(), 0);
+
+        let session = test_session();
+        let sid = *session.session_id();
+        mgr.sessions.insert(sid, session);
+        assert_eq!(mgr.session_count(), 1);
+
+        // Insert a second distinct-id session.
+        let policy = test_policy();
+        let contributors: HashSet<u16> = [1, 2, 3].into();
+        let acks: HashSet<u16> = [1, 2, 3].into();
+        let mut sid2 = [0u8; 32];
+        sid2[0] = 0xAA;
+        let second = DescriptorSession::new(
+            sid2,
+            [2u8; 32],
+            policy,
+            "signet".into(),
+            contributors,
+            acks,
+            Duration::from_secs(600),
+        );
+        mgr.sessions.insert(sid2, second);
+        assert_eq!(mgr.session_count(), 2);
+    }
+
+    /// `iter_sessions` MUST yield every stored session. A "return empty"
+    /// regression would silently hide active sessions from callers that
+    /// audit the manager state.
+    #[test]
+    fn manager_iter_sessions_yields_every_stored_entry() {
+        let mut mgr = DescriptorSessionManager::new();
+        let session = test_session();
+        let sid = *session.session_id();
+        mgr.sessions.insert(sid, session);
+
+        let mut count = 0;
+        for (got_id, _) in mgr.iter_sessions() {
+            assert_eq!(got_id, &sid);
+            count += 1;
+        }
+        assert_eq!(count, 1, "iterator must yield the inserted session");
+    }
 }
