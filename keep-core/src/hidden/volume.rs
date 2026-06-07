@@ -851,6 +851,20 @@ impl HiddenStorage {
         audit.read_all(data_key)
     }
 
+    /// Export the outer-volume audit log as JSON. Hidden-active sessions
+    /// return an empty array rather than the outer log's contents, matching
+    /// the deniability boundary `audit_read_all` enforces.
+    pub fn audit_export(&self) -> Result<String> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => return Ok("[]".to_string()),
+            None => return Err(KeepError::Locked),
+        }
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        audit.export(data_key)
+    }
+
     /// Verify the outer-volume audit log's hash chain. Hidden-active sessions
     /// have no log of their own and return `Ok(true)` (vacuously valid).
     pub fn audit_verify_chain(&self) -> Result<bool> {
@@ -1570,6 +1584,40 @@ mod tests {
         assert!(storage.audit_read_all().unwrap().is_empty());
         assert!(storage.audit_verify_chain().unwrap());
         assert!(storage.audit_apply_retention().is_err());
+        // Export must also surface the same deniability boundary — the outer
+        // log's JSON must not appear under a hidden-active session.
+        assert_eq!(storage.audit_export().unwrap(), "[]");
+    }
+
+    /// `audit_export` on the outer-volume path must serialise the outer log
+    /// as JSON. Pin so `keep audit export` against a hidden-init vault stops
+    /// erroring (the explicit gap left open by PR #538 / closed here).
+    #[test]
+    fn hidden_outer_audit_export_returns_valid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-outer-audit-export");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+
+        let json = storage.audit_export().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("audit_export output must be valid JSON");
+        let arr = parsed.as_array().expect("export root must be a JSON array");
+
+        // Unlock emits at least the VaultUnlock entry; the JSON array must
+        // surface it.
+        assert!(!arr.is_empty(), "expected at least the VaultUnlock entry");
     }
 
     /// #520 on the auto-detect `unlock()` path: tripping the limiter then

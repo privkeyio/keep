@@ -60,9 +60,7 @@ impl AuditVault {
     fn export(&self) -> Result<String> {
         match self {
             Self::Keep(k) => k.audit_export(),
-            Self::HiddenOuter(_) => Err(KeepError::Other(
-                "audit export is not yet wired for hidden-init vaults; see #520 follow-up".into(),
-            )),
+            Self::HiddenOuter(s) => s.audit_export(),
         }
     }
 
