@@ -846,9 +846,21 @@ impl HiddenStorage {
             Some(VolumeType::Hidden) => return Ok(Vec::new()),
             None => return Err(KeepError::Locked),
         }
-        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        let (data_key, audit) = self.outer_audit_handles()?;
         audit.read_all(data_key)
+    }
+
+    /// Export the outer-volume audit log as JSON. Hidden-active sessions
+    /// return an empty array rather than the outer log's contents, matching
+    /// the deniability boundary `audit_read_all` enforces.
+    pub fn audit_export(&self) -> Result<String> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => return Ok("[]".to_string()),
+            None => return Err(KeepError::Locked),
+        }
+        let (data_key, audit) = self.outer_audit_handles()?;
+        audit.export(data_key)
     }
 
     /// Verify the outer-volume audit log's hash chain. Hidden-active sessions
@@ -859,9 +871,24 @@ impl HiddenStorage {
             Some(VolumeType::Hidden) => return Ok(true),
             None => return Err(KeepError::Locked),
         }
-        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        let (data_key, audit) = self.outer_audit_handles()?;
         audit.verify_chain(data_key)
+    }
+
+    /// Resolve the outer data key and audit log for an outer-active session.
+    /// A `None` `outer_audit` despite an unlocked outer volume means
+    /// `attach_outer_audit` failed to open the on-disk audit log earlier and
+    /// logged the underlying error. Surface a descriptive error rather than
+    /// the misleading `Locked` so callers can distinguish "not unlocked yet"
+    /// from "unlocked but audit log unavailable" (see PR #540 review).
+    fn outer_audit_handles(&self) -> Result<(&SecretKey, &crate::audit::AuditLog)> {
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_ref().ok_or_else(|| {
+            KeepError::Other(
+                "outer-volume audit log is unavailable; check earlier logs for the underlying open failure (the unlock succeeded but `attach_outer_audit` did not attach an audit log)".into(),
+            )
+        })?;
+        Ok((data_key, audit))
     }
 
     /// Set the retention policy on the outer-volume audit log. No-op when
@@ -888,7 +915,11 @@ impl HiddenStorage {
             None => return Err(KeepError::Locked),
         }
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_mut().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_mut().ok_or_else(|| {
+            KeepError::Other(
+                "outer-volume audit log is unavailable; check earlier logs for the underlying open failure (the unlock succeeded but `attach_outer_audit` did not attach an audit log)".into(),
+            )
+        })?;
         audit.apply_retention(data_key)
     }
 }
@@ -1570,6 +1601,83 @@ mod tests {
         assert!(storage.audit_read_all().unwrap().is_empty());
         assert!(storage.audit_verify_chain().unwrap());
         assert!(storage.audit_apply_retention().is_err());
+        // Export must also surface the same deniability boundary — the outer
+        // log's JSON must not appear under a hidden-active session.
+        assert_eq!(storage.audit_export().unwrap(), "[]");
+    }
+
+    /// `audit_export` on the outer-volume path must serialise the outer log
+    /// as JSON. Pin so `keep audit export` against a hidden-init vault stops
+    /// erroring (the explicit gap left open by PR #538 / closed here).
+    #[test]
+    fn hidden_outer_audit_export_returns_valid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-outer-audit-export");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+
+        let json = storage.audit_export().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("audit_export output must be valid JSON");
+        let arr = parsed.as_array().expect("export root must be a JSON array");
+
+        // `AuditEventType` derives `Serialize` without a tag attribute, so a
+        // `VaultUnlock` entry serializes as `{"event_type":"VaultUnlock", ...}`.
+        // Pin the actual invariant — unlock emitted at least one such entry —
+        // instead of a loose `!arr.is_empty()` check which would also pass on
+        // a stray `RateLimitTripped` from an earlier session.
+        let has_unlock = arr.iter().any(|entry| {
+            entry
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == "VaultUnlock")
+        });
+        assert!(
+            has_unlock,
+            "expected exported audit to contain a VaultUnlock entry; got {arr:#?}"
+        );
+    }
+
+    /// Deniability boundary must hold even when the outer log is populated.
+    /// Unlocking outer first fills `outer_key`/`outer_audit`; switching to the
+    /// hidden volume must still yield "[]" from `audit_export`. Pins that the
+    /// hidden-active guard, not a `None` outer key, enforces the boundary.
+    #[test]
+    fn hidden_active_audit_export_empty_with_populated_outer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-outer-populated-then-hidden");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+        // Outer export is non-empty here (VaultUnlock entry present).
+        let outer_json = storage.audit_export().unwrap();
+        let outer_parsed: serde_json::Value = serde_json::from_str(&outer_json).unwrap();
+        assert!(!outer_parsed.as_array().unwrap().is_empty());
+
+        storage.unlock_hidden("hidden").unwrap();
+        assert_eq!(storage.active_volume(), Some(VolumeType::Hidden));
+        assert_eq!(storage.audit_export().unwrap(), "[]");
     }
 
     /// #520 on the auto-detect `unlock()` path: tripping the limiter then
