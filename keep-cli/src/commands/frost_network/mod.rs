@@ -378,14 +378,14 @@ pub fn cmd_frost_network_peers(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
-        let node_handle = tokio::spawn({
+        let _run_guard = NodeRunGuard::aborting(tokio::spawn({
             let node = node.clone();
             async move {
                 if let Err(e) = node.run().await {
                     tracing::error!(error = %e, "FROST node error");
                 }
             }
-        });
+        }));
 
         // Peers announce every 20s. A bare 3s sleep was missing most announces.
         // Poll for up to 25s, exit early as soon as we see anyone.
@@ -399,7 +399,6 @@ pub fn cmd_frost_network_peers(
             tokio::time::sleep(PEER_POLL_INTERVAL).await;
         }
         spinner.finish();
-        node_handle.abort();
 
         let status = node.peer_status();
 
@@ -650,6 +649,18 @@ struct NodeRunGuard {
     shutdown: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
+impl NodeRunGuard {
+    /// Aborts `handle` on drop with no cooperative channel. For short-lived
+    /// probes (peer discovery, health check) that just need the `run()` task
+    /// torn down on every exit path, including early `?` returns and panics.
+    fn aborting(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle,
+            shutdown: None,
+        }
+    }
+}
+
 impl Drop for NodeRunGuard {
     fn drop(&mut self) {
         match self.shutdown.take() {
@@ -819,14 +830,14 @@ pub fn cmd_frost_network_health_check(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
-        let node_handle = tokio::spawn({
+        let _run_guard = NodeRunGuard::aborting(tokio::spawn({
             let node = node.clone();
             async move {
                 if let Err(e) = node.run().await {
                     tracing::error!(error = %e, "FROST node error");
                 }
             }
-        });
+        }));
 
         let spinner = out.spinner("Discovering peers...");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -836,7 +847,6 @@ pub fn cmd_frost_network_health_check(
         out.info(&format!("{online} peer(s) discovered"));
 
         if online == 0 {
-            node_handle.abort();
             out.newline();
             out.warn("No peers discovered. Run 'keep frost network serve' on other devices first.");
             return Ok::<_, KeepError>(());
@@ -848,7 +858,6 @@ pub fn cmd_frost_network_health_check(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         spinner.finish();
-        node_handle.abort();
 
         out.newline();
         out.header("Results");
