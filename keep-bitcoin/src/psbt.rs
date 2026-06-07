@@ -247,6 +247,7 @@ pub fn serialize_psbt_base64(psbt: &Psbt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
 
     #[test]
     fn test_psbt_signer_creation() {
@@ -255,5 +256,164 @@ mod tests {
 
         let pubkey = signer.x_only_public_key();
         assert_eq!(pubkey.serialize().len(), 32);
+    }
+
+    // === #417 round 4a: targeted unit tests killing the surviving mutations ===
+
+    /// `parse_psbt(serialize_psbt(p)) == p`. The `serialize_psbt → vec![]`
+    /// and `vec![0]` / `vec![1]` regressions all produce non-PSBT bytes
+    /// that `parse_psbt` rejects, so this roundtrip catches every constant-
+    /// return mutation on `serialize_psbt`. A `serialize_psbt_base64` →
+    /// `"xyzzy"` regression is caught the same way through `parse_psbt_base64`.
+    #[test]
+    fn psbt_serialization_roundtrip() {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+
+        // Binary roundtrip.
+        let bytes = serialize_psbt(&psbt);
+        assert!(!bytes.is_empty(), "serialize_psbt must not return empty");
+        let parsed = parse_psbt(&bytes).expect("must roundtrip through binary");
+        assert_eq!(parsed.unsigned_tx, psbt.unsigned_tx);
+
+        // Base64 roundtrip.
+        let b64 = serialize_psbt_base64(&psbt);
+        assert!(
+            !b64.is_empty(),
+            "serialize_psbt_base64 must not return empty"
+        );
+        let parsed = parse_psbt_base64(&b64).expect("must roundtrip through base64");
+        assert_eq!(parsed.unsigned_tx, psbt.unsigned_tx);
+    }
+
+    /// `should_sign_input` returns true iff any of the three conditions
+    /// match (internal_key, tap_key_origins, or script_pubkey of our
+    /// address). A constant `Ok(true)` regression would make this signer
+    /// sign EVERY input it sees, including ones not actually addressed to
+    /// it. A constant `Ok(false)` would refuse to sign anything.
+    #[test]
+    fn should_sign_input_returns_false_for_unrelated_input() {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        let mut our_secret = [1u8; 32];
+        let signer = PsbtSigner::new(&mut our_secret, Network::Testnet).unwrap();
+
+        // Build a PSBT whose witness_utxo's script_pubkey points to a
+        // DIFFERENT taproot key (we use [2; 32] as the other party's
+        // secret-derived xonly proxy).
+        let mut other_secret = [2u8; 32];
+        let other_signer = PsbtSigner::new(&mut other_secret, Network::Testnet).unwrap();
+        let other_addr = Address::p2tr(
+            &Secp256k1::new(),
+            other_signer.x_only_public_key(),
+            None,
+            Network::Testnet,
+        );
+
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: bitcoin::Amount::from_sat(60_000),
+            script_pubkey: other_addr.script_pubkey(),
+        });
+
+        // Our signer is unrelated to this input; should_sign_input must
+        // return false. A `Ok(true)` regression here would have us
+        // sign an input whose UTXO we don't control.
+        assert!(!signer.should_sign_input(&psbt, 0).unwrap());
+    }
+
+    /// `sign` returns the count of inputs the signer actually signed. A
+    /// `Ok(0)` / `Ok(1)` constant-return regression would silently report
+    /// the wrong success state to the caller, who routes the signed PSBT
+    /// based on this count.
+    #[test]
+    fn sign_returns_zero_when_no_inputs_match_our_key() {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        let mut our_secret = [1u8; 32];
+        let signer = PsbtSigner::new(&mut our_secret, Network::Testnet).unwrap();
+
+        // Same setup as above: a PSBT whose only input is addressed to
+        // someone else. `sign` should iterate and skip every input,
+        // returning 0.
+        let mut other_secret = [2u8; 32];
+        let other_signer = PsbtSigner::new(&mut other_secret, Network::Testnet).unwrap();
+        let other_addr = Address::p2tr(
+            &Secp256k1::new(),
+            other_signer.x_only_public_key(),
+            None,
+            Network::Testnet,
+        );
+
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: bitcoin::Amount::from_sat(60_000),
+            script_pubkey: other_addr.script_pubkey(),
+        });
+
+        let signed = signer.sign(&mut psbt).unwrap();
+        assert_eq!(signed, 0, "sign must report zero when no inputs match");
+        assert!(
+            psbt.inputs[0].tap_key_sig.is_none(),
+            "no signature should be written for an unrelated input"
+        );
     }
 }

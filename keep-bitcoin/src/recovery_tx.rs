@@ -880,4 +880,230 @@ mod tests {
             .count();
         assert_eq!(sig_count, 2);
     }
+
+    // === #417 round 4a: targeted unit tests killing the surviving mutations ===
+    //
+    // The boundary checks below are #414/#502's exact security boundary:
+    // - `fee_sats > MAX_FEE_SATS` (defends against runaway fees)
+    // - `utxo_value <= fee_sats` (insufficient funds)
+    // - `output_value < TAPROOT_DUST_LIMIT_SATS` (dust)
+    //
+    // `>` ↔ `==` / `>=` and `<` ↔ `==` / `<=` mutations on these checks
+    // would let through "exactly at the cap" inputs or skip the gate
+    // entirely on a malicious proposer-supplied amount, exactly the
+    // attack surface #414 describes.
+
+    fn fixture_builder() -> RecoveryTxBuilder {
+        let (_, pk1) = test_keypair_full(1);
+        let (_, pk2) = test_keypair_full(2);
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        let output = config.build().unwrap();
+        RecoveryTxBuilder::new(output)
+    }
+
+    fn fixture_outpoint() -> OutPoint {
+        OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        }
+    }
+
+    fn fixture_dest() -> ScriptBuf {
+        let (_, pk) = test_keypair_full(7);
+        let xonly = XOnlyPublicKey::from_slice(&pk).unwrap();
+        ScriptBuf::new_p2tr(&Secp256k1::new(), xonly, None)
+    }
+
+    /// Fee strictly equal to MAX_FEE_SATS is REJECTED only if `>` is
+    /// strict; a `>=` mutation would refuse exactly-at-cap fees,
+    /// while a `==` mutation would let above-cap fees slip past for
+    /// any non-equality. Both are corrupt; pin the exact boundary.
+    #[test]
+    fn build_recovery_psbt_rejects_fee_above_max_only() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+
+        // Exactly MAX_FEE_SATS is allowed (the `>` check is strict).
+        // Use a large enough utxo to leave output above dust.
+        assert!(
+            builder
+                .build_recovery_psbt(0, utxo, MAX_FEE_SATS + 1_000, &dest, MAX_FEE_SATS)
+                .is_ok(),
+            "fee exactly at the MAX_FEE_SATS cap must be allowed"
+        );
+
+        // One sat above the cap is refused.
+        let err = builder
+            .build_recovery_psbt(0, utxo, MAX_FEE_SATS + 2_000, &dest, MAX_FEE_SATS + 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    /// `utxo_value <= fee_sats` means we have no output value left after
+    /// paying the fee. The `<` ↔ `==` or `<=` mutation would either
+    /// silently accept a zero-output transaction (which is non-standard)
+    /// or refuse the legitimate one-sat-above-fee case.
+    #[test]
+    fn build_recovery_psbt_rejects_when_fee_equals_or_exceeds_utxo_value() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+
+        // fee == utxo_value: output value is zero, refused.
+        let err = builder
+            .build_recovery_psbt(0, utxo, 1_000, &dest, 1_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("insufficient funds"));
+
+        // fee > utxo_value: also refused.
+        let err = builder
+            .build_recovery_psbt(0, utxo, 1_000, &dest, 1_001)
+            .unwrap_err();
+        assert!(err.to_string().contains("insufficient funds"));
+    }
+
+    /// The dust threshold check is strict: an output of EXACTLY
+    /// TAPROOT_DUST_LIMIT_SATS is allowed; one below is refused. A `<` ↔
+    /// `==` or `<=` mutation would either refuse the legal exactly-dust
+    /// boundary (defeating recovery on tight budgets) or accept a
+    /// 1-sat-below-dust output (producing a non-standard tx that
+    /// mempool would reject anyway, but the call still succeeds).
+    #[test]
+    fn build_recovery_psbt_dust_boundary_is_strict() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+
+        // output == dust limit: allowed.
+        let utxo_value = TAPROOT_DUST_LIMIT_SATS + 100;
+        let fee = 100;
+        assert!(
+            builder
+                .build_recovery_psbt(0, utxo, utxo_value, &dest, fee)
+                .is_ok(),
+            "output exactly at dust limit must be allowed"
+        );
+
+        // output == dust limit - 1: refused.
+        let utxo_value = TAPROOT_DUST_LIMIT_SATS + 100;
+        let fee = 101;
+        let err = builder
+            .build_recovery_psbt(0, utxo, utxo_value, &dest, fee)
+            .unwrap_err();
+        assert!(err.to_string().contains("dust threshold"));
+    }
+
+    /// Same three boundary invariants for `build_sweep_psbt`: fee cap,
+    /// insufficient funds, dust. The sweep path has its own surviving
+    /// mutations on each, and an authorized proposer attacks the sweep
+    /// path the same way as the single-input recovery path.
+    #[test]
+    fn build_sweep_psbt_rejects_fee_above_max_only() {
+        let builder = fixture_builder();
+        let dest = fixture_dest();
+        let utxos = vec![SweepUtxo {
+            outpoint: fixture_outpoint(),
+            value_sats: MAX_FEE_SATS + 1_000,
+        }];
+
+        // Exactly at the cap: allowed.
+        assert!(builder
+            .build_sweep_psbt(0, &utxos, &dest, MAX_FEE_SATS)
+            .is_ok());
+
+        // One above: refused.
+        let err = builder
+            .build_sweep_psbt(0, &utxos, &dest, MAX_FEE_SATS + 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    /// `build_sweep_psbt` insufficient-funds boundary: pin `<= fee` is
+    /// rejected and `> fee` accepted (when above dust).
+    #[test]
+    fn build_sweep_psbt_rejects_when_total_inputs_equal_or_below_fee() {
+        let builder = fixture_builder();
+        let dest = fixture_dest();
+
+        // total == fee: refused.
+        let utxos = vec![SweepUtxo {
+            outpoint: fixture_outpoint(),
+            value_sats: 1_000,
+        }];
+        let err = builder
+            .build_sweep_psbt(0, &utxos, &dest, 1_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("insufficient funds"));
+
+        // total > fee but output below dust: surfaces the dust error
+        // (not the insufficient-funds error). Pin both for clarity.
+        let utxos = vec![SweepUtxo {
+            outpoint: fixture_outpoint(),
+            value_sats: 1_000,
+        }];
+        let err = builder
+            .build_sweep_psbt(0, &utxos, &dest, 1_000 - (TAPROOT_DUST_LIMIT_SATS - 1))
+            .unwrap_err();
+        assert!(err.to_string().contains("dust threshold"));
+    }
+
+    /// `verify_script_spend_input_binding` rejects when the witness_utxo
+    /// is missing, when the script_pubkey doesn't match, or when the
+    /// tap_scripts entry doesn't match the expected leaf. Several `delete
+    /// !` mutations would silently accept an attacker-supplied PSBT with
+    /// wrong bindings. Cover the missing-witness_utxo case since it's
+    /// the cheapest to construct without a full PSBT fixture.
+    #[test]
+    fn verify_script_spend_input_binding_refuses_psbt_with_no_witness_utxo() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+        let (_, local_pk) = test_keypair_full(2);
+
+        // Build a valid recovery PSBT, then strip the witness_utxo.
+        let mut psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+        psbt.inputs[0].witness_utxo = None;
+
+        let result = verify_script_spend_input_binding(&psbt, 0, &local_pk);
+        assert!(
+            result.is_err(),
+            "missing witness_utxo must surface a binding error"
+        );
+    }
+
+    /// `script_contains_xonly` is a small but security-critical helper:
+    /// it scans a tap-script's pushdata for a 32-byte x-only key. A
+    /// `true`/`false`-return regression silently accepts any key as
+    /// present (or none); an `==` ↔ `!=` regression would match every
+    /// non-matching key.
+    #[test]
+    fn script_contains_xonly_only_matches_exact_32_byte_pushdata() {
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+
+        // Script containing key_a as a pushdata.
+        let script_a = bitcoin::ScriptBuf::builder()
+            .push_slice(key_a)
+            .into_script();
+        assert!(script_contains_xonly(&script_a, &key_a));
+        assert!(!script_contains_xonly(&script_a, &key_b));
+
+        // Empty script never matches.
+        let empty = bitcoin::ScriptBuf::new();
+        assert!(!script_contains_xonly(&empty, &key_a));
+    }
 }
