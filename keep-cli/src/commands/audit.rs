@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use secrecy::ExposeSecret;
 
-use keep_core::audit::{AuditEventType, RetentionPolicy};
+use keep_core::audit::{AuditEntry, AuditEventType, RetentionPolicy};
 use keep_core::error::{KeepError, Result};
+use keep_core::hidden::HiddenStorage;
 use keep_core::Keep;
 
-use crate::commands::get_password;
+use crate::commands::{get_password, is_hidden_vault};
 use crate::output::Output;
 
 fn resolve_path(path: &Path, hidden: bool) -> PathBuf {
@@ -15,6 +16,68 @@ fn resolve_path(path: &Path, hidden: bool) -> PathBuf {
         path.join("inner")
     } else {
         path.to_path_buf()
+    }
+}
+
+/// Dispatch the audit surface across the two vault layouts. Hidden-init
+/// vaults (`keep.vault` present) route through `HiddenStorage`'s outer
+/// volume so `keep audit list/verify/stats/retention` work consistently
+/// after #520. Regular vaults (`keep.hdr` / the legacy `inner` layout) go
+/// through `Keep` as before.
+enum AuditVault {
+    Keep(Box<Keep>),
+    HiddenOuter(Box<HiddenStorage>),
+}
+
+impl AuditVault {
+    fn open_unlock(path: &Path, hidden_flag: bool, password: &str) -> Result<Self> {
+        let target = resolve_path(path, hidden_flag);
+        if is_hidden_vault(&target) {
+            let mut storage = HiddenStorage::open(&target)?;
+            storage.unlock_outer(password)?;
+            Ok(Self::HiddenOuter(Box::new(storage)))
+        } else {
+            let mut keep = Keep::open(&target)?;
+            keep.unlock(password)?;
+            Ok(Self::Keep(Box::new(keep)))
+        }
+    }
+
+    fn read_all(&self) -> Result<Vec<AuditEntry>> {
+        match self {
+            Self::Keep(k) => k.audit_read_all(),
+            Self::HiddenOuter(s) => s.audit_read_all(),
+        }
+    }
+
+    fn verify_chain(&self) -> Result<bool> {
+        match self {
+            Self::Keep(k) => k.audit_verify_chain(),
+            Self::HiddenOuter(s) => s.audit_verify_chain(),
+        }
+    }
+
+    fn export(&self) -> Result<String> {
+        match self {
+            Self::Keep(k) => k.audit_export(),
+            Self::HiddenOuter(_) => Err(KeepError::Other(
+                "audit export is not yet wired for hidden-init vaults; see #520 follow-up".into(),
+            )),
+        }
+    }
+
+    fn set_retention(&mut self, policy: RetentionPolicy) {
+        match self {
+            Self::Keep(k) => k.audit_set_retention(policy),
+            Self::HiddenOuter(s) => s.audit_set_retention(policy),
+        }
+    }
+
+    fn apply_retention(&mut self) -> Result<usize> {
+        match self {
+            Self::Keep(k) => k.audit_apply_retention(),
+            Self::HiddenOuter(s) => s.audit_apply_retention(),
+        }
     }
 }
 
@@ -26,11 +89,10 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 pub fn cmd_audit_list(out: &Output, path: &Path, limit: Option<usize>, hidden: bool) -> Result<()> {
-    let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
-    let entries = keep.audit_read_all()?;
+    let entries = vault.read_all()?;
     let display_entries: Vec<_> = if let Some(n) = limit {
         entries.iter().rev().take(n).collect()
     } else {
@@ -114,11 +176,10 @@ pub fn cmd_audit_export(
     output_path: Option<&str>,
     hidden: bool,
 ) -> Result<()> {
-    let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
-    let json = keep.audit_export()?;
+    let json = vault.export()?;
 
     match output_path {
         Some(out_path) => {
@@ -133,11 +194,10 @@ pub fn cmd_audit_export(
 }
 
 pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
-    let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
-    let valid = keep.audit_verify_chain().map_err(map_verify_error)?;
+    let valid = vault.verify_chain().map_err(map_verify_error)?;
 
     if valid {
         out.success("Audit log integrity verified - hash chain is valid");
@@ -176,16 +236,15 @@ pub fn cmd_audit_retention(
     apply: bool,
     hidden: bool,
 ) -> Result<()> {
-    let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
-    keep.unlock(password.expose_secret())?;
+    let mut vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
     let policy = RetentionPolicy {
         max_entries,
         max_age_days: max_days,
     };
 
-    keep.audit_set_retention(policy);
+    vault.set_retention(policy);
 
     let has_policy_args = max_entries.is_some() || max_days.is_some();
 
@@ -195,7 +254,7 @@ pub fn cmd_audit_retention(
                 "audit retention --apply needs at least one of --max-entries or --max-days; pass a policy bound and try again".into(),
             ));
         }
-        let removed = keep.audit_apply_retention()?;
+        let removed = vault.apply_retention()?;
         if removed > 0 {
             out.success(&format!("Removed {removed} old audit entries"));
         } else {
@@ -266,11 +325,10 @@ impl AuditStats {
 }
 
 pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
-    let mut keep = Keep::open(&resolve_path(path, hidden))?;
     let password = get_password("Password")?;
-    keep.unlock(password.expose_secret())?;
+    let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
-    let entries = keep.audit_read_all()?;
+    let entries = vault.read_all()?;
 
     if entries.is_empty() {
         out.info("No audit entries found");

@@ -96,6 +96,11 @@ pub struct HiddenStorage {
     hidden_key: Option<SecretKey>,
     active_volume: Option<VolumeType>,
     outer_db: Option<Database>,
+    /// Audit log attached on outer unlock so the `keep audit list/verify/...`
+    /// surface works on hidden-init vaults and `drain_pending_trips` can
+    /// flush rate-limit trip events queued by failed unlocks (#520).
+    /// Outer-volume scope only, paralleling the #507 relay-config decision.
+    outer_audit: Option<crate::audit::AuditLog>,
 }
 
 impl HiddenStorage {
@@ -243,6 +248,7 @@ impl HiddenStorage {
             hidden_key: hidden_data_key,
             active_volume: Some(VolumeType::Outer),
             outer_db: Some(db),
+            outer_audit: None,
         })
     }
 
@@ -267,6 +273,7 @@ impl HiddenStorage {
             hidden_key: None,
             active_volume: None,
             outer_db: None,
+            outer_audit: None,
         })
     }
 
@@ -330,6 +337,11 @@ impl HiddenStorage {
         match self.try_unlock_outer(password) {
             Ok(()) => {
                 rate_limit::record_success(&self.path);
+                // #520: open the audit log under the outer data key and flush
+                // any queued rate-limit trip events. Mirrors `Keep::unlock` so
+                // hidden-init vaults get the same `RateLimitTripped` audit
+                // surfacing that regular vaults do.
+                self.attach_outer_audit(&hmac_key)?;
                 Ok(())
             }
             Err(e) => {
@@ -339,6 +351,48 @@ impl HiddenStorage {
                 Err(e)
             }
         }
+    }
+
+    /// Open the outer-volume audit log and drain pending trip events. Called
+    /// from `unlock_outer` after the data key is in hand. Errors on the audit
+    /// log are non-fatal to the unlock itself; we log and continue so a
+    /// corrupted audit log can't make the whole vault inaccessible.
+    fn attach_outer_audit(&mut self, hmac_key: &[u8; 32]) -> Result<()> {
+        use crate::audit::{AuditEntry, AuditEventType};
+
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let mut audit = match crate::audit::AuditLog::open(&self.path, data_key) {
+            Ok(log) => log,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not open audit log on hidden vault outer unlock; trips will not flush this cycle");
+                return Ok(());
+            }
+        };
+
+        let trips = rate_limit::drain_pending_trips(&self.path, hmac_key);
+        for trip in trips {
+            let trip_ts = trip.timestamp as i64;
+            let reason = format!(
+                "rate limit threshold reached after {} failed attempts",
+                trip.failed_attempts
+            );
+            let mut entry = AuditEntry::new(AuditEventType::RateLimitTripped, audit.last_hash())
+                .with_success(false)
+                .with_reason(&reason);
+            entry.timestamp = trip_ts;
+            if let Err(e) = audit.log(entry, data_key) {
+                tracing::warn!(error = %e, "failed to flush RateLimitTripped audit entry on hidden vault");
+            }
+        }
+
+        // Emit VaultUnlock to mirror `Keep::unlock`.
+        let unlock_entry = AuditEntry::new(AuditEventType::VaultUnlock, audit.last_hash());
+        if let Err(e) = audit.log(unlock_entry, data_key) {
+            tracing::warn!(error = %e, "failed to log VaultUnlock audit entry on hidden vault");
+        }
+
+        self.outer_audit = Some(audit);
+        Ok(())
     }
 
     fn try_unlock_hidden(&mut self, password: &str) -> Result<()> {
@@ -464,6 +518,7 @@ impl HiddenStorage {
         self.hidden_header = None;
         self.active_volume = None;
         self.outer_db = None;
+        self.outer_audit = None;
     }
 
     /// Returns true if any volume is unlocked.
@@ -769,6 +824,63 @@ impl HiddenStorage {
     /// The vault directory path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read every audit entry stored under the outer data key. Hidden-vault
+    /// scope is deliberately limited to the outer volume (#520, paralleling
+    /// the #507 relay-config decision); a hidden-active session has no
+    /// audit log of its own and returns `Ok(vec![])` rather than reading
+    /// the outer log's contents.
+    pub fn audit_read_all(&self) -> Result<Vec<crate::audit::AuditEntry>> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => return Ok(Vec::new()),
+            None => return Err(KeepError::Locked),
+        }
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        audit.read_all(data_key)
+    }
+
+    /// Verify the outer-volume audit log's hash chain. Hidden-active sessions
+    /// have no log of their own and return `Ok(true)` (vacuously valid).
+    pub fn audit_verify_chain(&self) -> Result<bool> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => return Ok(true),
+            None => return Err(KeepError::Locked),
+        }
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        audit.verify_chain(data_key)
+    }
+
+    /// Set the retention policy on the outer-volume audit log. No-op when
+    /// the active volume is hidden.
+    pub fn audit_set_retention(&mut self, policy: crate::audit::RetentionPolicy) {
+        if !matches!(self.active_volume, Some(VolumeType::Outer)) {
+            return;
+        }
+        if let Some(audit) = self.outer_audit.as_mut() {
+            audit.set_retention(policy);
+        }
+    }
+
+    /// Apply the retention policy on the outer-volume audit log. Errors on
+    /// hidden-active sessions since no audit log exists there.
+    pub fn audit_apply_retention(&mut self) -> Result<usize> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => {
+                return Err(KeepError::Other(
+                    "audit retention is not yet supported on the hidden volume".into(),
+                ));
+            }
+            None => return Err(KeepError::Locked),
+        }
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_mut().ok_or(KeepError::Locked)?;
+        audit.apply_retention(data_key)
     }
 }
 
@@ -1354,5 +1466,100 @@ mod tests {
             "got {msg}"
         );
         assert!(msg.contains("#422"), "got {msg}");
+    }
+
+    /// #520 end-to-end on the hidden-vault outer path: trip the rate limiter
+    /// with failed unlocks, then successfully unlock and observe the
+    /// `RateLimitTripped` entry in the outer audit log. Mirrors the
+    /// `rate_limit_trip_emits_audit_entry_on_next_unlock` test that proves
+    /// this works on regular vaults.
+    #[test]
+    fn hidden_outer_unlock_flushes_rate_limit_trips_to_audit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-trip-audit");
+
+        HiddenStorage::create(
+            &path,
+            "outer-password",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        // Five failed attempts trip the limiter.
+        for _ in 0..5 {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            let _ = storage.unlock_outer("wrong-password");
+        }
+
+        // Clear the rate-limit counter so the next attempt isn't gated by the
+        // active back-off. The trip queue lives in a separate file the rate
+        // limiter deliberately does NOT clear on success.
+        crate::rate_limit::record_success(&path);
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer-password").unwrap();
+
+        let entries = storage.audit_read_all().unwrap();
+        let trips: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.event_type, crate::audit::AuditEventType::RateLimitTripped))
+            .collect();
+        assert_eq!(
+            trips.len(),
+            1,
+            "exactly one trip entry must surface after hidden-outer unlock; got {trips:#?}"
+        );
+        assert!(!trips[0].success, "trip entry must record success=false");
+        assert!(
+            trips[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("rate limit")),
+            "trip entry must carry a descriptive reason"
+        );
+
+        let trip_idx = entries
+            .iter()
+            .position(|e| matches!(e.event_type, crate::audit::AuditEventType::RateLimitTripped))
+            .unwrap();
+        let unlock_idx = entries
+            .iter()
+            .rposition(|e| matches!(e.event_type, crate::audit::AuditEventType::VaultUnlock))
+            .unwrap();
+        assert!(
+            trip_idx < unlock_idx,
+            "trip must precede the unlock it was observed by"
+        );
+
+        assert!(storage.audit_verify_chain().unwrap());
+    }
+
+    /// A hidden-active session must NOT surface the outer audit log's
+    /// contents. Pin so a future refactor doesn't accidentally leak outer
+    /// activity through the hidden-active read paths.
+    #[test]
+    fn hidden_active_audit_returns_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-hidden-audit-empty");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_hidden("hidden").unwrap();
+
+        assert!(storage.audit_read_all().unwrap().is_empty());
+        assert!(storage.audit_verify_chain().unwrap());
+        assert!(storage.audit_apply_retention().is_err());
     }
 }
