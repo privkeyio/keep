@@ -261,3 +261,55 @@ pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keep_bitcoin::Network;
+
+    /// `parse_network` is the single chokepoint every `keep bitcoin ...`
+    /// subcommand routes user input through. A regression here mis-targets
+    /// every Bitcoin operation; pin all canonical aliases + case-insensitivity.
+    #[test]
+    fn parse_network_accepts_all_canonical_names_case_insensitive() {
+        for (input, expected) in [
+            ("mainnet", Network::Bitcoin),
+            ("MAINNET", Network::Bitcoin),
+            ("bitcoin", Network::Bitcoin),
+            ("BiTcOiN", Network::Bitcoin),
+            ("testnet", Network::Testnet),
+            ("TESTNET", Network::Testnet),
+            ("signet", Network::Signet),
+            ("regtest", Network::Regtest),
+        ] {
+            let got = parse_network(input)
+                .unwrap_or_else(|e| panic!("parse_network({input:?}) must succeed, got {e}"));
+            assert_eq!(got, expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_network_rejects_unknown_and_empty_inputs() {
+        for input in [
+            "",
+            "main",
+            "Bitcoin Cash",
+            "mainnetwork",
+            " mainnet ",
+            "regt",
+        ] {
+            let err = parse_network(input).expect_err(&format!(
+                "parse_network({input:?}) must reject unknown input"
+            ));
+            assert!(
+                matches!(err, KeepError::InvalidNetwork(_)),
+                "expected InvalidNetwork for {input:?}, got {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("mainnet, testnet, signet, regtest"),
+                "error must list valid options for {input:?}: {err}"
+            );
+        }
+    }
+}
