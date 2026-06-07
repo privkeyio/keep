@@ -67,6 +67,32 @@ cargo test -- --nocapture
 
 New features require tests. Bug fixes should include regression tests.
 
+## Mutation Testing
+
+Run mutation testing per module on security-critical code paths to validate
+that the test suite actually exercises the decision branches that matter
+(#417). Operate per module, not workspace-wide.
+
+```bash
+cargo install --locked cargo-mutants
+cargo mutants -p keep-frost-net --file keep-frost-net/src/node/signing.rs --jobs 4 --timeout-multiplier 2.0
+```
+
+Triage each surviving mutant in one of three ways:
+
+- **Real gap.** Add a test that kills the mutant; land as a PR.
+- **Equivalent mutation** (semantically identical behavior). Annotate with
+  `#[mutants::skip]` and a one-line comment naming the reason.
+- **Untestable timing/IO path.** Annotate `#[mutants::skip]` with a comment
+  explaining why the branch can't be exercised under a unit test.
+
+Tracked modules so far (per #417's scope list):
+
+- `keep-frost-net/src/node/signing.rs`
+- `keep-frost-net/src/ecdh.rs` and `keep-frost-net/src/node/ecdh.rs`
+- `keep-core/src/descriptor.rs`
+- `keep-nip46/src/server.rs`
+
 ## Code Review
 
 All PRs require review before merging. Reviewers check:
