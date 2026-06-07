@@ -846,8 +846,7 @@ impl HiddenStorage {
             Some(VolumeType::Hidden) => return Ok(Vec::new()),
             None => return Err(KeepError::Locked),
         }
-        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        let (data_key, audit) = self.outer_audit_handles()?;
         audit.read_all(data_key)
     }
 
@@ -860,8 +859,7 @@ impl HiddenStorage {
             Some(VolumeType::Hidden) => return Ok("[]".to_string()),
             None => return Err(KeepError::Locked),
         }
-        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        let (data_key, audit) = self.outer_audit_handles()?;
         audit.export(data_key)
     }
 
@@ -873,9 +871,24 @@ impl HiddenStorage {
             Some(VolumeType::Hidden) => return Ok(true),
             None => return Err(KeepError::Locked),
         }
-        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_ref().ok_or(KeepError::Locked)?;
+        let (data_key, audit) = self.outer_audit_handles()?;
         audit.verify_chain(data_key)
+    }
+
+    /// Resolve the outer data key and audit log for an outer-active session.
+    /// A `None` `outer_audit` despite an unlocked outer volume means
+    /// `attach_outer_audit` failed to open the on-disk audit log earlier and
+    /// logged the underlying error. Surface a descriptive error rather than
+    /// the misleading `Locked` so callers can distinguish "not unlocked yet"
+    /// from "unlocked but audit log unavailable" (see PR #540 review).
+    fn outer_audit_handles(&self) -> Result<(&SecretKey, &crate::audit::AuditLog)> {
+        let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_ref().ok_or_else(|| {
+            KeepError::Other(
+                "outer-volume audit log is unavailable; check earlier logs for the underlying open failure (the unlock succeeded but `attach_outer_audit` did not attach an audit log)".into(),
+            )
+        })?;
+        Ok((data_key, audit))
     }
 
     /// Set the retention policy on the outer-volume audit log. No-op when
@@ -902,7 +915,11 @@ impl HiddenStorage {
             None => return Err(KeepError::Locked),
         }
         let data_key = self.outer_key.as_ref().ok_or(KeepError::Locked)?;
-        let audit = self.outer_audit.as_mut().ok_or(KeepError::Locked)?;
+        let audit = self.outer_audit.as_mut().ok_or_else(|| {
+            KeepError::Other(
+                "outer-volume audit log is unavailable; check earlier logs for the underlying open failure (the unlock succeeded but `attach_outer_audit` did not attach an audit log)".into(),
+            )
+        })?;
         audit.apply_retention(data_key)
     }
 }
@@ -1615,9 +1632,21 @@ mod tests {
             serde_json::from_str(&json).expect("audit_export output must be valid JSON");
         let arr = parsed.as_array().expect("export root must be a JSON array");
 
-        // Unlock emits at least the VaultUnlock entry; the JSON array must
-        // surface it.
-        assert!(!arr.is_empty(), "expected at least the VaultUnlock entry");
+        // `AuditEventType` derives `Serialize` without a tag attribute, so a
+        // `VaultUnlock` entry serializes as `{"event_type":"VaultUnlock", ...}`.
+        // Pin the actual invariant — unlock emitted at least one such entry —
+        // instead of a loose `!arr.is_empty()` check which would also pass on
+        // a stray `RateLimitTripped` from an earlier session.
+        let has_unlock = arr.iter().any(|entry| {
+            entry
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == "VaultUnlock")
+        });
+        assert!(
+            has_unlock,
+            "expected exported audit to contain a VaultUnlock entry; got {arr:#?}"
+        );
     }
 
     /// Deniability boundary must hold even when the outer log is populated.
