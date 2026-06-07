@@ -378,14 +378,14 @@ pub fn cmd_frost_network_peers(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
-        let node_handle = tokio::spawn({
+        let _run_guard = NodeRunGuard::aborting(tokio::spawn({
             let node = node.clone();
             async move {
                 if let Err(e) = node.run().await {
                     tracing::error!(error = %e, "FROST node error");
                 }
             }
-        });
+        }));
 
         // Peers announce every 20s. A bare 3s sleep was missing most announces.
         // Poll for up to 25s, exit early as soon as we see anyone.
@@ -399,7 +399,6 @@ pub fn cmd_frost_network_peers(
             tokio::time::sleep(PEER_POLL_INTERVAL).await;
         }
         spinner.finish();
-        node_handle.abort();
 
         let status = node.peer_status();
 
@@ -580,7 +579,7 @@ async fn frost_network_sign_round(
     message_bytes: Vec<u8>,
     message_type: &str,
 ) -> Result<[u8; 64]> {
-    let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
         .await
         .map_err(|e| KeepError::Frost(e.to_string()))?;
 
@@ -592,11 +591,20 @@ async fn frost_network_sign_round(
     );
     out.newline();
 
+    // Take the cooperative shutdown sender before sharing the node behind an
+    // Arc; the guard uses it to ask run() to break at its next loop iteration.
+    let shutdown_tx = node.take_shutdown_handle();
     let node = std::sync::Arc::new(node);
     let node_clone = node.clone();
-    let _handle = tokio::spawn(async move {
-        let _ = node_clone.run().await;
-    });
+    // RAII guard so the background run() task is wound down on every exit path
+    // (Ok return, the `?` from `request_signature`, or a panic), not silently
+    // detached until the surrounding tokio runtime tears down. See #525.
+    let _run_guard = NodeRunGuard {
+        handle: tokio::spawn(async move {
+            let _ = node_clone.run().await;
+        }),
+        shutdown: shutdown_tx,
+    };
 
     out.info("Discovering peers...");
     for i in 0..12 {
@@ -626,6 +634,42 @@ async fn frost_network_sign_round(
         .map_err(|e| KeepError::Frost(e.to_string()))?;
     spinner.finish();
     Ok(signature)
+}
+
+/// Winds down the background `KfpNode::run()` task on drop so a signing
+/// helper's every exit path (Ok return, `?` error, panic) stops the relay
+/// loop instead of leaving a detached task for the surrounding tokio runtime
+/// to cancel much later (#525). Signals the node's cooperative shutdown
+/// channel so an in-flight `handle_event` finishes and the loop breaks at its
+/// next iteration, dropping the task's `Arc<KfpNode>` and its relay
+/// subscriptions. If no shutdown channel was captured, falls back to aborting
+/// the task so it can never leak.
+struct NodeRunGuard {
+    handle: tokio::task::JoinHandle<()>,
+    shutdown: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl NodeRunGuard {
+    /// Aborts `handle` on drop with no cooperative channel. For short-lived
+    /// probes (peer discovery, health check) that just need the `run()` task
+    /// torn down on every exit path, including early `?` returns and panics.
+    fn aborting(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle,
+            shutdown: None,
+        }
+    }
+}
+
+impl Drop for NodeRunGuard {
+    fn drop(&mut self) {
+        match self.shutdown.take() {
+            Some(tx) => {
+                let _ = tx.try_send(());
+            }
+            None => self.handle.abort(),
+        }
+    }
 }
 
 #[tracing::instrument(skip(out, content), fields(path = %path.display()))]
@@ -786,14 +830,14 @@ pub fn cmd_frost_network_health_check(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
 
-        let node_handle = tokio::spawn({
+        let _run_guard = NodeRunGuard::aborting(tokio::spawn({
             let node = node.clone();
             async move {
                 if let Err(e) = node.run().await {
                     tracing::error!(error = %e, "FROST node error");
                 }
             }
-        });
+        }));
 
         let spinner = out.spinner("Discovering peers...");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -803,7 +847,6 @@ pub fn cmd_frost_network_health_check(
         out.info(&format!("{online} peer(s) discovered"));
 
         if online == 0 {
-            node_handle.abort();
             out.newline();
             out.warn("No peers discovered. Run 'keep frost network serve' on other devices first.");
             return Ok::<_, KeepError>(());
@@ -815,7 +858,6 @@ pub fn cmd_frost_network_health_check(
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
         spinner.finish();
-        node_handle.abort();
 
         out.newline();
         out.header("Results");
@@ -976,5 +1018,65 @@ mod tests {
         signed
             .verify()
             .expect("assembled event must verify under the group key");
+    }
+
+    /// Dropping `NodeRunGuard` signals the node's cooperative shutdown channel
+    /// so a signing helper that returns early via `?` lets the background
+    /// `run()` loop break on its own instead of leaking a detached task until
+    /// the surrounding tokio runtime tears down (#525).
+    #[tokio::test]
+    async fn node_run_guard_signals_graceful_shutdown() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        // Stand in for `KfpNode::run()`'s select! loop: runs until it observes
+        // the cooperative shutdown signal, then returns on its own.
+        let run_loop = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+                }
+            }
+        });
+
+        let guard = NodeRunGuard {
+            handle: tokio::spawn(async {}),
+            shutdown: Some(tx),
+        };
+        assert!(
+            !run_loop.is_finished(),
+            "run loop must still be running before guard drop"
+        );
+
+        // Dropping the guard sends `()` on the shutdown channel; the loop
+        // breaks and the task completes deterministically (no abort).
+        drop(guard);
+        run_loop
+            .await
+            .expect("run loop should complete after graceful shutdown signal");
+    }
+
+    /// With no shutdown channel captured, the guard must abort its task on drop
+    /// so it can never leak.
+    #[tokio::test]
+    async fn node_run_guard_aborts_when_no_shutdown_channel() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = handle.abort_handle();
+
+        let guard = NodeRunGuard {
+            handle,
+            shutdown: None,
+        };
+        assert!(
+            !abort_handle.is_finished(),
+            "task must still be running before guard drop"
+        );
+        drop(guard);
+
+        // The guard aborted the task; spin until the runtime observes the
+        // cancellation (terminates as soon as the abort is processed).
+        while !abort_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
     }
 }
