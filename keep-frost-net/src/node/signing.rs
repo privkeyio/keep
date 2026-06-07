@@ -1536,3 +1536,138 @@ impl KfpNode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure helpers in this module. Mutation testing
+    //! (`cargo mutants -p keep-frost-net --file
+    //! keep-frost-net/src/node/signing.rs`) on the failover/dedup logic
+    //! surfaces these as obvious gaps without dedicated coverage; see #417.
+
+    use super::*;
+
+    /// `is_recoverable_peer_error` gates the failover decision: when a
+    /// remote returns one of the two recoverable codes, the requester
+    /// drops the offending peer's pooled commitments and falls back to a
+    /// fresh interactive round on the NEXT request rather than failing
+    /// over and excluding the peer. Mutating the `||`, either `==`, or
+    /// the return-bool flips this entire policy.
+    #[test]
+    fn is_recoverable_peer_error_pins_exact_recoverable_codes() {
+        assert!(is_recoverable_peer_error("stale_nonce"));
+        assert!(is_recoverable_peer_error("incomplete_pre_exchange"));
+        // Anything else MUST fall through to the exclude-and-failover
+        // branch — a true return on these would let a faulty/malicious
+        // peer block signing by repeatedly emitting recoverable-looking
+        // errors that the requester never excludes them for.
+        assert!(!is_recoverable_peer_error(""));
+        assert!(!is_recoverable_peer_error("stale_nonces"));
+        assert!(!is_recoverable_peer_error("STALE_NONCE"));
+        assert!(!is_recoverable_peer_error("incomplete_pre_exchange "));
+        assert!(!is_recoverable_peer_error("rate_limited"));
+        assert!(!is_recoverable_peer_error("malformed_request"));
+    }
+
+    /// `parse_offending_peer` extracts the share index annotation on
+    /// peer-reported session errors. The handler appends "(peer N)";
+    /// the failover logic uses the parsed index to scope cleanup to
+    /// the offending peer's pooled commitments. A regression here that
+    /// returns `None` for every input would force a full pool wipe
+    /// every time, and a regression that returns a wrong index would
+    /// scope cleanup at the wrong peer.
+    #[test]
+    fn parse_offending_peer_extracts_index_from_trailing_annotation() {
+        assert_eq!(parse_offending_peer("error (peer 3)"), Some(3));
+        assert_eq!(parse_offending_peer("error (peer 42)"), Some(42));
+        // Multi-digit and the last occurrence wins (rfind).
+        assert_eq!(
+            parse_offending_peer("error (peer 9) more (peer 7)"),
+            Some(7)
+        );
+        // Whitespace inside the parentheses is trimmed by .trim().
+        assert_eq!(parse_offending_peer("error (peer   5)"), Some(5));
+    }
+
+    #[test]
+    fn parse_offending_peer_returns_none_when_annotation_absent_or_malformed() {
+        // No annotation at all.
+        assert_eq!(parse_offending_peer(""), None);
+        assert_eq!(parse_offending_peer("plain error message"), None);
+        // Missing closing paren.
+        assert_eq!(parse_offending_peer("error (peer 5"), None);
+        // Non-numeric index.
+        assert_eq!(parse_offending_peer("error (peer abc)"), None);
+        // Overflow.
+        assert_eq!(parse_offending_peer("error (peer 99999999)"), None);
+        // Negative index (u16 has no signed parse).
+        assert_eq!(parse_offending_peer("error (peer -1)"), None);
+    }
+
+    /// The content hash for the nonce-commitment dedup MUST be order- and
+    /// position-independent across the commitment set. Pin the
+    /// equivalence so a future mutation that drops the sort (or swaps
+    /// the secondary key) is caught: it would otherwise let an
+    /// adversary re-broadcast the same set under a reordered payload
+    /// and bypass dedup.
+    #[test]
+    fn nonce_commitment_content_hash_is_order_independent() {
+        let a = PreExchangedCommitment {
+            nonce_id: [1u8; 32],
+            commitment: b"alpha".to_vec(),
+        };
+        let b = PreExchangedCommitment {
+            nonce_id: [2u8; 32],
+            commitment: b"beta".to_vec(),
+        };
+        let c = PreExchangedCommitment {
+            nonce_id: [3u8; 32],
+            commitment: b"gamma".to_vec(),
+        };
+
+        let h1 = nonce_commitment_content_hash(7, &[a.clone(), b.clone(), c.clone()]);
+        let h2 = nonce_commitment_content_hash(7, &[c.clone(), a.clone(), b.clone()]);
+        assert_eq!(h1, h2, "reordering must not change the dedup hash");
+    }
+
+    /// Distinct `share_index` MUST produce a distinct hash. Without this
+    /// the dedup would collide commitments contributed by different
+    /// peers, defeating the per-peer rebroadcast filter.
+    #[test]
+    fn nonce_commitment_content_hash_depends_on_share_index() {
+        let item = PreExchangedCommitment {
+            nonce_id: [9u8; 32],
+            commitment: b"x".to_vec(),
+        };
+        let h1 = nonce_commitment_content_hash(1, std::slice::from_ref(&item));
+        let h2 = nonce_commitment_content_hash(2, std::slice::from_ref(&item));
+        assert_ne!(h1, h2);
+    }
+
+    /// Concatenation MUST NOT collide distinct partitions. A naive
+    /// implementation that hashed `nonce_id || commitment` without a
+    /// length prefix would let `("AB", "C")` and `("A", "BC")` hash to
+    /// the same digest, opening a dedup-bypass: an attacker rebroadcasts
+    /// the same conceptual set under a different chunking and the
+    /// receiver treats it as new.
+    #[test]
+    fn nonce_commitment_content_hash_resists_length_extension_collision() {
+        let split_a = PreExchangedCommitment {
+            nonce_id: [4u8; 32],
+            commitment: b"AB".to_vec(),
+        };
+        let split_b = PreExchangedCommitment {
+            nonce_id: [4u8; 32],
+            commitment: b"C".to_vec(),
+        };
+        let single = PreExchangedCommitment {
+            nonce_id: [4u8; 32],
+            commitment: b"ABC".to_vec(),
+        };
+        let h_split = nonce_commitment_content_hash(0, &[split_a, split_b]);
+        let h_single = nonce_commitment_content_hash(0, &[single]);
+        assert_ne!(
+            h_split, h_single,
+            "length-prefixing must prevent concatenation collisions"
+        );
+    }
+}
