@@ -283,4 +283,70 @@ vault_path = "~/custom/keep"
         let path = config.vault_path.unwrap();
         assert!(!path.to_string_lossy().contains('~'));
     }
+
+    /// `keep config init` writes the bundled `config.toml.example` to the
+    /// user's config dir. If that example drifts (typo, removed field, etc.)
+    /// the next `keep config show` would fail to parse it. Pin so a CI
+    /// regression catches the drift instead of an operator who just ran
+    /// `init`.
+    #[test]
+    fn bundled_example_config_template_parses_cleanly() {
+        let example = include_str!("../contrib/config.toml.example");
+        Config::parse(example).expect("bundled config.toml.example must parse");
+    }
+
+    /// The 1MB size cap on `from_file` is a defense against a malformed or
+    /// adversarial config dropping a giant payload that would either OOM the
+    /// process or hide an attack inside a multi-MB TOML. Pin so the cap can't
+    /// drift silently.
+    #[test]
+    fn from_file_rejects_oversize_config() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.toml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Write 1MB + 1 byte. Content shape doesn't matter; the size gate
+        // fires before parsing.
+        let chunk = vec![b' '; 1024 * 1024 + 1];
+        file.write_all(&chunk).unwrap();
+
+        let err = Config::from_file(&path).expect_err("must reject oversize config");
+        assert!(err.to_string().contains("too large"), "got {err}");
+    }
+
+    /// Round-trip a small config through disk to exercise `from_file`'s read
+    /// path. The existing tests cover `parse` over an in-memory string, which
+    /// skips the `metadata`/`read_to_string` boundary where real-world
+    /// failures (missing file, permission errors) live.
+    #[test]
+    fn from_file_round_trip_matches_parse() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let content = r#"
+argon2_profile = "high"
+log_level = "warn"
+timeout = 120
+"#;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+
+        let loaded = Config::from_file(&path).unwrap();
+        let parsed = Config::parse(content).unwrap();
+        assert_eq!(loaded.argon2_profile, parsed.argon2_profile);
+        assert_eq!(loaded.log_level, parsed.log_level);
+        assert_eq!(loaded.timeout, parsed.timeout);
+    }
+
+    /// `vault_path()` falls back to `keep_core::default_keep_path()` when the
+    /// config has no `vault_path` set. The fallback path drives where every
+    /// CLI command without `--path` lands, so a silent drift away from
+    /// `~/.keep` would mis-target every default command.
+    #[test]
+    fn vault_path_falls_back_to_default_when_unset() {
+        let config = Config::parse("").unwrap();
+        let resolved = config.vault_path().unwrap();
+        let expected = keep_core::default_keep_path().unwrap();
+        assert_eq!(resolved, expected);
+    }
 }

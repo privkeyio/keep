@@ -443,4 +443,73 @@ mod tests {
         }
         assert_eq!(count, 1);
     }
+
+    /// End-to-end runner coverage for a v1 vault walking forward to the
+    /// current schema version. Until now only the no-op "already current"
+    /// case was tested at the runner level; this exercises the loop that
+    /// looks up each step's migration, runs it, writes the new version, and
+    /// stops at CURRENT_SCHEMA_VERSION.
+    #[test]
+    fn run_migrations_progresses_from_v1_to_current() {
+        let (_dir, db) = create_test_db();
+        write_schema_version(&db, 1).unwrap();
+        let result = run_migrations(&db).unwrap();
+        assert_eq!(result.from_version, 1);
+        assert_eq!(result.to_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(result.migrations_run, CURRENT_SCHEMA_VERSION - 1);
+        assert_eq!(
+            read_schema_version(&db).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    /// `read_schema_version().unwrap_or(1)` means an uninitialized vault is
+    /// treated as v1. Pin so a future refactor that swaps the fallback (e.g.
+    /// to `CURRENT_SCHEMA_VERSION`) is caught: that would silently mask a
+    /// real "needs migration" state on fresh databases.
+    #[test]
+    fn run_migrations_treats_uninitialized_vault_as_v1() {
+        let (_dir, db) = create_test_db();
+        assert!(read_schema_version(&db).unwrap().is_none());
+        let result = run_migrations(&db).unwrap();
+        assert_eq!(result.from_version, 1);
+        assert_eq!(result.to_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(result.migrations_run, CURRENT_SCHEMA_VERSION - 1);
+    }
+
+    /// Opening a vault written by a NEWER keep build must refuse rather than
+    /// silently downgrade or run forward migrations that don't exist. The
+    /// CLI surfaces this with `keep migrate status` showing the error before
+    /// any data is touched.
+    #[test]
+    fn run_migrations_refuses_future_schema_version() {
+        let (_dir, db) = create_test_db();
+        write_schema_version(&db, CURRENT_SCHEMA_VERSION + 7).unwrap();
+        let err = run_migrations(&db).unwrap_err();
+        assert!(err.to_string().contains("newer version"), "got {err}");
+        assert_eq!(
+            read_schema_version(&db).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION + 7),
+            "the persisted version must not be rewritten on a refusal"
+        );
+    }
+
+    /// `needs_migration()` is what `keep migrate status` displays. Pin the
+    /// transitional case where it must report TRUE on a v1 vault.
+    #[test]
+    fn needs_migration_true_when_below_current() {
+        let (_dir, db) = create_test_db();
+        write_schema_version(&db, 1).unwrap();
+        assert!(needs_migration(&db).unwrap());
+    }
+
+    /// `check_compatibility()` runs on EVERY open via `RedbBackend::open`, so
+    /// the happy path needs an explicit pin: a vault at the current version
+    /// must NOT raise.
+    #[test]
+    fn check_compatibility_passes_at_current_version() {
+        let (_dir, db) = create_test_db();
+        write_schema_version(&db, CURRENT_SCHEMA_VERSION).unwrap();
+        check_compatibility(&db).unwrap();
+    }
 }
