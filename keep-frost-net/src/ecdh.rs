@@ -854,9 +854,7 @@ mod tests {
 
         // The prior entry is now expired, so a fresh create must succeed by
         // evicting it; the new participant set proves the entry was replaced.
-        assert!(mgr
-            .create_session(sid, [0x02u8; 33], 2, vec![1, 3])
-            .is_ok());
+        assert!(mgr.create_session(sid, [0x02u8; 33], 2, vec![1, 3]).is_ok());
         assert_eq!(mgr.get_session(&sid).unwrap().participants(), &[1, 3]);
     }
 
