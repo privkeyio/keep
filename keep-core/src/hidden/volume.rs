@@ -1620,6 +1620,37 @@ mod tests {
         assert!(!arr.is_empty(), "expected at least the VaultUnlock entry");
     }
 
+    /// Deniability boundary must hold even when the outer log is populated.
+    /// Unlocking outer first fills `outer_key`/`outer_audit`; switching to the
+    /// hidden volume must still yield "[]" from `audit_export`. Pins that the
+    /// hidden-active guard, not a `None` outer key, enforces the boundary.
+    #[test]
+    fn hidden_active_audit_export_empty_with_populated_outer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-outer-populated-then-hidden");
+
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+        // Outer export is non-empty here (VaultUnlock entry present).
+        let outer_json = storage.audit_export().unwrap();
+        let outer_parsed: serde_json::Value = serde_json::from_str(&outer_json).unwrap();
+        assert!(!outer_parsed.as_array().unwrap().is_empty());
+
+        storage.unlock_hidden("hidden").unwrap();
+        assert_eq!(storage.active_volume(), Some(VolumeType::Hidden));
+        assert_eq!(storage.audit_export().unwrap(), "[]");
+    }
+
     /// #520 on the auto-detect `unlock()` path: tripping the limiter then
     /// unlocking via the dispatcher (not `unlock_outer`) must still flush the
     /// `RateLimitTripped` entry and attach the outer audit log. Pins the fix

@@ -182,6 +182,25 @@ pub fn cmd_audit_export(
     match output_path {
         Some(out_path) => {
             let canonical = resolve_output_path(out_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&canonical)?;
+                // `.mode()` only applies when the file is newly created; force
+                // 0o600 so re-exporting over a pre-existing, looser-permission
+                // file does not leak the audit history group/world-readable.
+                std::fs::set_permissions(
+                    &canonical,
+                    std::fs::Permissions::from_mode(0o600),
+                )?;
+                std::io::Write::write_all(&mut file, json.as_bytes())?;
+            }
+            #[cfg(not(unix))]
             std::fs::write(&canonical, &json)?;
             out.success(&format!("Audit log exported to {}", canonical.display()));
         }
