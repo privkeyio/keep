@@ -257,7 +257,7 @@ pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
         "signet" => Ok(keep_bitcoin::Network::Signet),
         "regtest" => Ok(keep_bitcoin::Network::Regtest),
         _ => Err(KeepError::InvalidNetwork(format!(
-            "'{s}' (valid: mainnet, testnet, signet, regtest)"
+            "'{s}' (valid: mainnet/bitcoin, testnet, signet, regtest)"
         ))),
     }
 }
@@ -307,8 +307,8 @@ mod tests {
             );
             assert!(
                 err.to_string()
-                    .contains("mainnet, testnet, signet, regtest"),
-                "error must list valid options for {input:?}: {err}"
+                    .contains("mainnet/bitcoin, testnet, signet, regtest"),
+                "error must list every accepted option (including the bitcoin alias) for {input:?}: {err}"
             );
         }
     }
