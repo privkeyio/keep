@@ -1623,3 +1623,118 @@ async fn test_repeated_signing() {
         "repeated signing failures: {failures:#?}"
     );
 }
+
+/// ECDH multi-peer integration test (closes #543's request/share/complete handler gaps).
+///
+/// Drives a 2-of-3 group through `request_ecdh` end-to-end on a MockRelay
+/// with two live nodes: the requester (node1) and one cosigner (node2).
+/// This exercises the full responder pipeline (`handle_ecdh_request` ->
+/// `handle_ecdh_share` -> `handle_ecdh_complete`) and the requester-side
+/// completion path, killing the mutations in `node/ecdh.rs` that the unit
+/// tests in PR #544 couldn't reach.
+///
+/// Marked `#[ignore]` because the inner `request_ecdh` 30s timeout is tight
+/// when this MockRelay-backed test runs concurrently with the rest of the
+/// multinode suite. Run with `cargo test -- --ignored` (same pattern as
+/// the other complex MockRelay tests in this file). The test passes
+/// reliably when invoked alone or with --test-threads=1.
+#[tokio::test]
+#[ignore] // Concurrent-MockRelay timing; run with: cargo test -- --ignored
+async fn test_ecdh_request_completes_with_one_cosigner() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-ecdh").unwrap();
+
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("Failed to create node 1");
+    let mut node2 = KfpNode::new(share2, vec![relay])
+        .await
+        .expect("Failed to create node 2");
+
+    let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
+
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node1_for_run = Arc::clone(&node1);
+    let node2_for_run = Arc::clone(&node2);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1_for_run.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2_for_run.run().await;
+    });
+
+    // Wait for peer discovery: both nodes must see the other before the
+    // request_ecdh call, or `select_eligible_peers` fails with no eligible
+    // cosigner.
+    let mut node1_peers = 0u32;
+    let mut node2_peers = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        loop {
+            tokio::select! {
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => {
+                    node1_peers += 1;
+                }
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => {
+                    node2_peers += 1;
+                }
+            }
+            if node1_peers >= 1 && node2_peers >= 1 {
+                return;
+            }
+        }
+    })
+    .await;
+
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        panic!("Peer discovery timed out: node1={node1_peers}, node2={node2_peers}");
+    }
+
+    // An arbitrary external recipient. ECDH completes regardless of
+    // recipient identity; PR #544 covers crypto correctness, so here we
+    // just need a syntactically valid compressed point.
+    let recipient_secret = bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let recipient_pubkey_full = recipient_secret.public_key(&secp);
+    let recipient_pubkey: [u8; 33] = recipient_pubkey_full.serialize();
+
+    let request_result = timeout(
+        Duration::from_secs(45),
+        node1.request_ecdh(&recipient_pubkey),
+    )
+    .await;
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+
+    let shared_secret = match request_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("request_ecdh failed: {e}"),
+        Err(_) => panic!("request_ecdh timed out: multi-peer ECDH coordination did not complete"),
+    };
+
+    assert_eq!(shared_secret.len(), 32);
+    assert!(
+        shared_secret.iter().any(|b| *b != 0),
+        "shared secret is all-zero: ECDH protocol did not actually run"
+    );
+
+    // Suppress unused-variable warning on rx2 (used for discovery only).
+    drop(rx2);
+}
