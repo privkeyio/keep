@@ -2323,51 +2323,60 @@ mod tests {
         assert_eq!(mgr.session_count(), 3);
     }
 
-    /// `load_persisted_sessions` MUST cap restoration at `MAX_SESSIONS`. A
-    /// `>=` ↔ `<` mutation on the capacity gate would either always trigger
-    /// the break (loading 0 sessions) or never trigger it (overflowing the
-    /// active set). With MAX_SESSIONS = 64, save 65 and assert loaded == 64.
+    /// `load_persisted_sessions` MUST cap restoration at `MAX_SESSIONS` via two
+    /// independent gates: the `store.load_all(MAX_SESSIONS)` read-cap at the
+    /// start of the loader, and the in-loop `self.sessions.len() >= MAX_SESSIONS`
+    /// overflow backstop that stops inserting once the active set is full.
+    /// Pre-filling one in-memory session forces the backstop to fire after the
+    /// read-capped batch tops the active set off at `MAX_SESSIONS`. A `>=` to `<`
+    /// mutation breaks immediately (loaded 0); a `>=` to `>` mutation never breaks
+    /// (loaded MAX_SESSIONS, overflowing the active set). Both are caught.
     #[test]
     fn load_persisted_sessions_caps_at_max_sessions() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.redb");
         let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
 
-        let now = now_unix();
         for i in 0..(MAX_SESSIONS + 1) {
             let mut sid = [0u8; 32];
             sid[0] = (i / 256) as u8;
             sid[1] = (i % 256) as u8;
-            let persisted = PersistedDescriptorSession {
-                session_id: sid,
-                group_pubkey: [2u8; 32],
-                policy: test_policy(),
-                network: "signet".into(),
-                initiator: None,
-                contributions: BTreeMap::new(),
-                expected_contributors: [1u16, 2, 3].into_iter().collect(),
-                descriptor: None,
-                acks: HashSet::new(),
-                nacks: HashSet::new(),
-                expected_acks: [1u16, 2, 3].into_iter().collect(),
-                state: PersistedSessionState::Proposed,
-                created_at_unix: now,
-                contributions_complete_at_unix: None,
-                finalized_at_unix: None,
-                timeout_secs: 600,
-                contribution_timeout_secs: 300,
-                finalize_timeout_secs: 300,
-                ack_phase_timeout_secs: 300,
-            };
+            let persisted = DescriptorSession::new(
+                sid,
+                [2u8; 32],
+                test_policy(),
+                "signet".into(),
+                [1u16, 2, 3].into(),
+                [1u16, 2, 3].into(),
+                Duration::from_secs(600),
+            )
+            .to_persisted();
             store.save(&persisted).unwrap();
         }
 
         let mut mgr = DescriptorSessionManager::new();
         mgr.set_store(store.clone());
+
+        // Seed one in-memory session so the read-capped batch tops the active
+        // set off at MAX_SESSIONS and the in-loop overflow backstop fires.
+        let mut seed_sid = [0u8; 32];
+        seed_sid[0] = 0xff;
+        let seed = DescriptorSession::new(
+            seed_sid,
+            [2u8; 32],
+            test_policy(),
+            "signet".into(),
+            [1u16, 2, 3].into(),
+            [1u16, 2, 3].into(),
+            Duration::from_secs(600),
+        );
+        mgr.sessions.insert(seed_sid, seed);
+
         let loaded = mgr.load_persisted_sessions().unwrap();
         assert_eq!(
-            loaded, MAX_SESSIONS,
-            "loader must cap at MAX_SESSIONS regardless of how many are persisted"
+            loaded,
+            MAX_SESSIONS - 1,
+            "loader must stop inserting once the active set reaches MAX_SESSIONS"
         );
         assert_eq!(mgr.session_count(), MAX_SESSIONS);
     }
