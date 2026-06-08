@@ -912,4 +912,127 @@ mod tests {
             "only the Forever grant should land in the manager"
         );
     }
+
+    // === #417 round 5: targeted unit tests killing the surviving mutations ===
+
+    /// `PreGrantedApp::from_stored` MUST reject pubkey-hex strings whose
+    /// decoded byte length is anything other than 32. A `match guard
+    /// b.len() == 32 with true` mutation would silently accept any
+    /// hex-decoded byte sequence, including arbitrary-length attacker
+    /// payloads. Pin the boundary by also feeding the 31- and 33-byte
+    /// cases: both must produce None.
+    #[test]
+    fn from_stored_rejects_pubkey_byte_lengths_other_than_32() {
+        // 31 bytes = 62 hex chars.
+        let stored_31 = sample_stored(
+            &"ab".repeat(31),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        assert!(
+            PreGrantedApp::from_stored(&stored_31).is_none(),
+            "31-byte decoded pubkey must be rejected"
+        );
+
+        // 33 bytes = 66 hex chars.
+        let stored_33 = sample_stored(
+            &"ab".repeat(33),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        assert!(
+            PreGrantedApp::from_stored(&stored_33).is_none(),
+            "33-byte decoded pubkey must be rejected"
+        );
+
+        // Empty hex (decodes to zero bytes) — also rejected.
+        let stored_0 = sample_stored("", keep_core::relay::StoredPermissionDuration::Forever, 0);
+        assert!(
+            PreGrantedApp::from_stored(&stored_0).is_none(),
+            "empty hex (zero-length pubkey) must be rejected"
+        );
+    }
+
+    /// `require_relay_urls` MUST refuse empty input. An `Ok(())`-return
+    /// regression would let the server start with no relays, silently
+    /// failing every connect attempt without surfacing a config error.
+    #[test]
+    fn require_relay_urls_rejects_empty_and_accepts_one() {
+        assert!(
+            require_relay_urls(&[]).is_err(),
+            "empty relay set must be refused"
+        );
+        assert!(require_relay_urls(&["wss://relay.example.com".into()]).is_ok());
+        // Multiple relays also accepted.
+        assert!(require_relay_urls(&[
+            "wss://relay.example.com".into(),
+            "wss://other.example.com".into(),
+        ])
+        .is_ok());
+    }
+
+    /// `finalize_handler` generates a fresh random bunker secret ONLY when
+    /// BOTH headless (`auto_approve == true`) AND no explicit
+    /// `expected_secret` is configured. A `&&` ↔ `||` mutation would
+    /// generate a secret in either non-headless mode (defeating the
+    /// auth contract) or whenever an explicit secret is set (overwriting
+    /// the operator's configured value).
+    #[test]
+    fn finalize_handler_generates_secret_only_in_auto_approve_and_no_explicit_secret() {
+        // (auto_approve=true, expected_secret=None) → random secret generated.
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let config = ServerConfig {
+            auto_approve: true,
+            expected_secret: None,
+            ..ServerConfig::default()
+        };
+        let (_h, sec) =
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+        let generated = sec.expect("headless without explicit secret must generate one");
+        assert!(
+            !generated.is_empty(),
+            "generated bunker secret must not be empty"
+        );
+
+        // (auto_approve=false, expected_secret=None) → no secret.
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let config = ServerConfig {
+            auto_approve: false,
+            expected_secret: None,
+            ..ServerConfig::default()
+        };
+        let (_h, sec) =
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+        assert!(
+            sec.is_none(),
+            "interactive mode without explicit secret must NOT generate one"
+        );
+
+        // (auto_approve=true, expected_secret=Some(...)) → operator's value,
+        // not a generated one. Already covered by
+        // `expected_secret_surfaces_in_bunker_secret` but pin again here for
+        // the `&&` mutation's specific case: the random-generation branch
+        // must NOT fire when an explicit secret is configured.
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let config = ServerConfig {
+            auto_approve: true,
+            expected_secret: Some("operator-supplied".to_string()),
+            ..ServerConfig::default()
+        };
+        let (_h, sec) =
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+        assert_eq!(
+            sec.expect("explicit secret should surface").as_str(),
+            "operator-supplied"
+        );
+    }
 }
