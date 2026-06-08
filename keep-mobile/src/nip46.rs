@@ -224,6 +224,7 @@ impl BunkerHandler {
 
             let config = ServerConfig {
                 rate_limit: Some(RateLimitConfig::default()),
+                expected_secret: Some(hex::encode(keep_core::crypto::random_bytes::<16>())),
                 ..ServerConfig::default()
             };
 
