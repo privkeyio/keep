@@ -338,7 +338,10 @@ impl KfpNode {
                             return Err(FrostNetError::Session(error));
                         }
                     }
-                    Err(_) => {
+                    // `Lagged` is recoverable: the receiver stays live, so
+                    // keep waiting rather than aborting a valid coordination.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err(FrostNetError::Transport("Event channel closed".into()));
                     }
                     _ => {}
@@ -347,9 +350,16 @@ impl KfpNode {
         })
         .await;
 
-        match result {
+        let result = match result {
             Ok(r) => r,
             Err(_) => Err(FrostNetError::Timeout("ECDH request timed out".into())),
+        };
+        // Tear down the session on any non-success exit so it doesn't linger in
+        // active_sessions until cleanup_expired reaps it (matches the
+        // single-party error path above and signing.rs).
+        if result.is_err() {
+            self.ecdh_sessions.write().complete_session(&session_id);
         }
+        result
     }
 }
