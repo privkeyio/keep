@@ -2223,4 +2223,224 @@ mod tests {
         }
         assert_eq!(count, 1, "iterator must yield the inserted session");
     }
+
+    // === #549: integration tests for persistence + load/migration paths ===
+
+    use crate::descriptor_session_store::FileDescriptorSessionStore;
+    use tempfile::tempdir;
+
+    /// `persist_session` MUST actually write to the underlying store. A
+    /// "replace with `()`" regression would silently no-op the save, and a
+    /// process restart would lose the session forever.
+    #[test]
+    fn persist_session_writes_to_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+
+        let mut mgr = DescriptorSessionManager::new();
+        mgr.set_store(store.clone());
+        let session = test_session();
+        let sid = *session.session_id();
+        mgr.sessions.insert(sid, session);
+        mgr.persist_session(&sid);
+
+        // Witness via the store directly — independent of any
+        // load_persisted_sessions path the persist regression couldn't
+        // mask.
+        let loaded = store
+            .load(&sid)
+            .expect("store read must succeed")
+            .expect("persisted session must be present in the store");
+        assert_eq!(loaded.session_id, sid);
+        assert_eq!(loaded.network, "signet");
+    }
+
+    /// `delete_persisted_session` MUST actually remove from the underlying
+    /// store. A "replace with `()`" regression would silently no-op the
+    /// delete, leaking storage on every completed session.
+    #[test]
+    fn delete_persisted_session_removes_from_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+
+        let mut mgr = DescriptorSessionManager::new();
+        mgr.set_store(store.clone());
+        let session = test_session();
+        let sid = *session.session_id();
+        mgr.sessions.insert(sid, session);
+        mgr.persist_session(&sid);
+        assert!(
+            store.load(&sid).unwrap().is_some(),
+            "precondition: persisted"
+        );
+
+        mgr.delete_persisted_session(&sid);
+        assert!(
+            store.load(&sid).unwrap().is_none(),
+            "delete_persisted_session must remove the entry from disk"
+        );
+    }
+
+    /// `load_persisted_sessions` MUST report the exact count of restored
+    /// sessions. A `+=` ↔ `-=` / `*=` mutation on the counter would corrupt
+    /// the returned value, breaking process-startup health checks that
+    /// log session restoration progress.
+    #[test]
+    fn load_persisted_sessions_returns_exact_loaded_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+
+        // Pre-populate the store with 3 healthy proposed sessions.
+        for i in 1..=3u8 {
+            let mut sid = [0u8; 32];
+            sid[0] = i;
+            let policy = test_policy();
+            let contributors: HashSet<u16> = [1, 2, 3].into();
+            let acks: HashSet<u16> = [1, 2, 3].into();
+            let session = DescriptorSession::new(
+                sid,
+                [2u8; 32],
+                policy,
+                "signet".into(),
+                contributors,
+                acks,
+                Duration::from_secs(600),
+            );
+            let persisted = session.to_persisted();
+            store.save(&persisted).unwrap();
+        }
+
+        let mut mgr = DescriptorSessionManager::new();
+        mgr.set_store(store.clone());
+        let loaded = mgr.load_persisted_sessions().unwrap();
+        assert_eq!(
+            loaded, 3,
+            "load_persisted_sessions must return the exact count of restored sessions, not a corrupted value"
+        );
+        assert_eq!(mgr.session_count(), 3);
+    }
+
+    /// `load_persisted_sessions` MUST cap restoration at `MAX_SESSIONS`. A
+    /// `>=` ↔ `<` mutation on the capacity gate would either always trigger
+    /// the break (loading 0 sessions) or never trigger it (overflowing the
+    /// active set). With MAX_SESSIONS = 64, save 65 and assert loaded == 64.
+    #[test]
+    fn load_persisted_sessions_caps_at_max_sessions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+
+        let now = now_unix();
+        for i in 0..(MAX_SESSIONS + 1) {
+            let mut sid = [0u8; 32];
+            sid[0] = (i / 256) as u8;
+            sid[1] = (i % 256) as u8;
+            let persisted = PersistedDescriptorSession {
+                session_id: sid,
+                group_pubkey: [2u8; 32],
+                policy: test_policy(),
+                network: "signet".into(),
+                initiator: None,
+                contributions: BTreeMap::new(),
+                expected_contributors: [1u16, 2, 3].into_iter().collect(),
+                descriptor: None,
+                acks: HashSet::new(),
+                nacks: HashSet::new(),
+                expected_acks: [1u16, 2, 3].into_iter().collect(),
+                state: PersistedSessionState::Proposed,
+                created_at_unix: now,
+                contributions_complete_at_unix: None,
+                finalized_at_unix: None,
+                timeout_secs: 600,
+                contribution_timeout_secs: 300,
+                finalize_timeout_secs: 300,
+                ack_phase_timeout_secs: 300,
+            };
+            store.save(&persisted).unwrap();
+        }
+
+        let mut mgr = DescriptorSessionManager::new();
+        mgr.set_store(store.clone());
+        let loaded = mgr.load_persisted_sessions().unwrap();
+        assert_eq!(
+            loaded, MAX_SESSIONS,
+            "loader must cap at MAX_SESSIONS regardless of how many are persisted"
+        );
+        assert_eq!(mgr.session_count(), MAX_SESSIONS);
+    }
+
+    /// `load_verified_wallet_policy` MUST reject a policy whose recomputed
+    /// hash does not match the stored expectation. The `!=` ↔ `==` mutation
+    /// inverts the gate: it would accept policies that fail the hash check
+    /// and reject the legitimate ones. Test both branches.
+    #[test]
+    fn load_verified_wallet_policy_rejects_hash_mismatch_and_accepts_match() {
+        let policy = test_policy();
+        let policy_json = serde_json::to_value(&policy).unwrap();
+        let real_hash = derive_policy_hash(&policy);
+
+        // Correct hash: accepted.
+        let loaded = load_verified_wallet_policy(&policy_json, &real_hash)
+            .expect("matching hash must be accepted");
+        assert_eq!(loaded.version, policy.version);
+
+        // Wrong hash: rejected with a "does not match" message.
+        let wrong_hash = [0u8; 32];
+        let err = load_verified_wallet_policy(&policy_json, &wrong_hash)
+            .expect_err("mismatched hash must be rejected");
+        assert!(
+            err.contains("does not match"),
+            "rejection message must explain the hash mismatch: {err}"
+        );
+    }
+
+    /// Round-trip integration: persist a Proposed session, drop the
+    /// manager, recreate against the same store path, load. The session
+    /// must come back with its state intact. Catches end-to-end regressions
+    /// across the persist/serialize/deserialize/restore chain that no
+    /// single in-memory test can catch.
+    #[test]
+    fn proposed_session_survives_manager_restart_via_file_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+
+        let sid = [0xAA; 32];
+        // Round 1: create + persist.
+        {
+            let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+            let mut mgr = DescriptorSessionManager::new();
+            mgr.set_store(store);
+            let policy = test_policy();
+            let contributors: HashSet<u16> = [1, 2, 3].into();
+            let acks: HashSet<u16> = [1, 2, 3].into();
+            let session = DescriptorSession::new(
+                sid,
+                [2u8; 32],
+                policy,
+                "signet".into(),
+                contributors,
+                acks,
+                Duration::from_secs(3600),
+            );
+            mgr.sessions.insert(sid, session);
+            mgr.persist_session(&sid);
+        }
+
+        // Round 2: fresh manager + same store path.
+        {
+            let store = Arc::new(FileDescriptorSessionStore::new(&path).unwrap());
+            let mut mgr = DescriptorSessionManager::new();
+            mgr.set_store(store);
+            let loaded = mgr.load_persisted_sessions().unwrap();
+            assert_eq!(loaded, 1, "the persisted session must round-trip");
+            assert!(mgr.get_session(&sid).is_some());
+            assert_eq!(
+                *mgr.get_session(&sid).unwrap().state(),
+                DescriptorSessionState::Proposed
+            );
+        }
+    }
 }

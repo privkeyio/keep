@@ -273,4 +273,70 @@ mod tests {
 
         assert_eq!(store.load_all(100).unwrap().len(), 1);
     }
+
+    // === #549: integration test for the corrupt-entry cleanup path ===
+
+    /// `load_all` MUST remove corrupt entries from the store so they don't
+    /// accumulate over restarts. The `delete !` mutation on the
+    /// `!corrupt_keys.is_empty()` gate would invert it: with the mutation,
+    /// cleanup only fires when there are NO corrupt keys, which is a no-op,
+    /// and any real corruption would persist forever. Pin both:
+    /// (1) the corrupt entry is dropped from load_all's return value, and
+    /// (2) a second load_all after the first does NOT yield the corrupt
+    /// entry — confirming it was actually removed from the store.
+    #[test]
+    fn load_all_removes_corrupt_entries_from_the_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+
+        // Inject a corrupt entry directly via redb so it bypasses the
+        // serde-validating `save`.
+        {
+            let _store = FileDescriptorSessionStore::new(&path).unwrap();
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(TABLE).unwrap();
+            let corrupt_key: [u8; 32] = [0xDD; 32];
+            table
+                .insert(
+                    corrupt_key.as_slice(),
+                    b"not-a-valid-json-payload".as_slice(),
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        drop(db);
+
+        // Inject a legitimate entry alongside it.
+        let store = FileDescriptorSessionStore::new(&path).unwrap();
+        store.save(&test_persisted_session([0x11; 32])).unwrap();
+
+        // load_all drops the corrupt entry from its return value.
+        let first = store.load_all(100).unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "load_all must filter out corrupt entries; got {} items",
+            first.len()
+        );
+        assert_eq!(first[0].session_id, [0x11; 32]);
+
+        // A subsequent load_all must ALSO yield only the legitimate
+        // entry — the corrupt one was removed from the store, not just
+        // filtered from this one call.
+        let second = store.load_all(100).unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "the corrupt entry must have been removed from the store"
+        );
+
+        // And direct `load` on the corrupt key returns None now.
+        assert!(
+            store.load(&[0xDD; 32]).unwrap().is_none(),
+            "corrupt entry must be physically removed"
+        );
+    }
 }
