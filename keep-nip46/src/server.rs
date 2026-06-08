@@ -916,11 +916,12 @@ mod tests {
     // === #417 round 5: targeted unit tests killing the surviving mutations ===
 
     /// `PreGrantedApp::from_stored` MUST reject pubkey-hex strings whose
-    /// decoded byte length is anything other than 32. A `match guard
-    /// b.len() == 32 with true` mutation would silently accept any
-    /// hex-decoded byte sequence, including arbitrary-length attacker
-    /// payloads. Pin the boundary by also feeding the 31- and 33-byte
-    /// cases: both must produce None.
+    /// decoded byte length is anything other than 32. Pin that boundary
+    /// with the 0-, 31-, and 33-byte cases: all must produce None.
+    /// Note the `b.len() == 32` match guard is backstopped by
+    /// `PublicKey::from_slice`, which itself rejects any non-32-byte slice,
+    /// so mutating the guard alone is an equivalent mutation (the result
+    /// stays None). This test pins the contract, not that specific guard.
     #[test]
     fn from_stored_rejects_pubkey_byte_lengths_other_than_32() {
         // 31 bytes = 62 hex chars.
