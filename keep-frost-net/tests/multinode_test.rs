@@ -1633,13 +1633,7 @@ async fn test_repeated_signing() {
 /// completion path, killing the mutations in `node/ecdh.rs` that the unit
 /// tests in PR #544 couldn't reach.
 ///
-/// Marked `#[ignore]` because the inner `request_ecdh` 30s timeout is tight
-/// when this MockRelay-backed test runs concurrently with the rest of the
-/// multinode suite. Run with `cargo test -- --ignored` (same pattern as
-/// the other complex MockRelay tests in this file). The test passes
-/// reliably when invoked alone or with --test-threads=1.
 #[tokio::test]
-#[ignore] // Concurrent-MockRelay timing; run with: cargo test -- --ignored
 async fn test_ecdh_request_completes_with_one_cosigner() {
     use std::sync::Arc;
 

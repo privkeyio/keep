@@ -258,6 +258,14 @@ impl KfpNode {
             our_partial.to_vec(),
         );
 
+        // Subscribe BEFORE sending: a fast cosigner can respond, our run loop
+        // can call `handle_ecdh_share`, and the resulting `EcdhComplete` can
+        // fire on `event_tx` between the send loop and our `subscribe()`.
+        // `tokio::sync::broadcast` does not replay past messages to late
+        // subscribers, so a missed completion stalls the request until the
+        // 30s coordination timeout — exactly the flake in #561.
+        let mut rx = self.event_tx.subscribe();
+
         for (share_index, pubkey) in participant_peers {
             let event = KfpEventBuilder::ecdh_request(&self.keys, &pubkey, request.clone())?;
             self.client
@@ -275,10 +283,7 @@ impl KfpNode {
             debug!(share_index, "Sent ECDH request and share");
         }
 
-        let mut rx = self.event_tx.subscribe();
-
         // For single-participant (threshold=1), our own partial is the only one needed.
-        // Subscribe first so we don't miss the EcdhComplete we send to ourselves.
         let single_party_secret = {
             let mut ecdh_sessions = self.ecdh_sessions.write();
             match ecdh_sessions.get_session_mut(&session_id) {
@@ -333,7 +338,10 @@ impl KfpNode {
                             return Err(FrostNetError::Session(error));
                         }
                     }
-                    Err(_) => {
+                    // `Lagged` is recoverable: the receiver stays live, so
+                    // keep waiting rather than aborting a valid coordination.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err(FrostNetError::Transport("Event channel closed".into()));
                     }
                     _ => {}
@@ -342,9 +350,16 @@ impl KfpNode {
         })
         .await;
 
-        match result {
+        let result = match result {
             Ok(r) => r,
             Err(_) => Err(FrostNetError::Timeout("ECDH request timed out".into())),
+        };
+        // Tear down the session on any non-success exit so it doesn't linger in
+        // active_sessions until cleanup_expired reaps it (matches the
+        // single-party error path above and signing.rs).
+        if result.is_err() {
+            self.ecdh_sessions.write().complete_session(&session_id);
         }
+        result
     }
 }
