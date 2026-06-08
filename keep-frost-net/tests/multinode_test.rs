@@ -1711,8 +1711,7 @@ async fn test_ecdh_request_completes_with_one_cosigner() {
     // just need a syntactically valid compressed point.
     let recipient_secret = bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let recipient_pubkey_full = recipient_secret.public_key(&secp);
-    let recipient_pubkey: [u8; 33] = recipient_pubkey_full.serialize();
+    let recipient_pubkey: [u8; 33] = recipient_secret.public_key(&secp).serialize();
 
     let request_result = timeout(
         Duration::from_secs(45),
