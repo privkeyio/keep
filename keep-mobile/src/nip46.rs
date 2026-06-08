@@ -61,6 +61,10 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
     fn request_approval(&self, request: BunkerApprovalRequest) -> bool;
+    /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
+    /// `name` are untrusted, remote-derived values: render them as inert text,
+    /// never as markup.
+    fn on_connect(&self, pubkey: String, name: String);
 }
 
 struct CallbackBridge {
@@ -86,6 +90,11 @@ impl ServerCallbacks for CallbackBridge {
             event_content: request.event_content,
             requested_permissions: request.requested_permissions,
         })
+    }
+
+    fn on_connect(&self, pubkey: &str, name: &str) {
+        self.callbacks
+            .on_connect(pubkey.to_string(), name.to_string());
     }
 }
 
@@ -224,6 +233,7 @@ impl BunkerHandler {
 
             let config = ServerConfig {
                 rate_limit: Some(RateLimitConfig::default()),
+                expected_secret: Some(hex::encode(keep_core::crypto::random_bytes::<16>())),
                 ..ServerConfig::default()
             };
 
