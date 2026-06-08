@@ -1737,8 +1737,8 @@ async fn test_ecdh_request_completes_with_one_cosigner() {
     let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
     let group_point = bitcoin::secp256k1::PublicKey::from_slice(vk_bytes.as_slice())
         .expect("group verifying key is a valid compressed point");
-    let recipient_scalar =
-        bitcoin::secp256k1::Scalar::from_be_bytes([7u8; 32]).expect("recipient secret is a valid scalar");
+    let recipient_scalar = bitcoin::secp256k1::Scalar::from_be_bytes([7u8; 32])
+        .expect("recipient secret is a valid scalar");
     let shared_point = group_point
         .mul_tweak(&secp, &recipient_scalar)
         .expect("ECDH point multiplication");
