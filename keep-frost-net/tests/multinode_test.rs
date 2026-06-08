@@ -1648,7 +1648,7 @@ async fn test_ecdh_request_completes_with_one_cosigner() {
 
     let config = ThresholdConfig::two_of_three();
     let dealer = TrustedDealer::new(config);
-    let (mut shares, _pubkey_pkg) = dealer.generate("test-ecdh").unwrap();
+    let (mut shares, pubkey_pkg) = dealer.generate("test-ecdh").unwrap();
 
     let share1 = shares.remove(0);
     let share2 = shares.remove(0);
@@ -1729,12 +1729,26 @@ async fn test_ecdh_request_completes_with_one_cosigner() {
         Err(_) => panic!("request_ecdh timed out: multi-peer ECDH coordination did not complete"),
     };
 
-    assert_eq!(shared_secret.len(), 32);
-    assert!(
-        shared_secret.iter().any(|b| *b != 0),
-        "shared secret is all-zero: ECDH protocol did not actually run"
-    );
+    // Independent recipient-side oracle. The cosigners aggregate to the
+    // x-coordinate of `recipient_pubkey * group_secret`; by ECDH symmetry that
+    // equals the x-coordinate of `group_pubkey * recipient_secret`, which the
+    // x-coordinate makes invariant to taproot's even-Y parity. Deriving it from
+    // the dealer's group pubkey and the known recipient secret never touches the
+    // request_ecdh path, so this is a genuine oracle rather than a circular check.
+    let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+    let group_point = bitcoin::secp256k1::PublicKey::from_slice(vk_bytes.as_slice())
+        .expect("group verifying key is a valid compressed point");
+    let recipient_scalar =
+        bitcoin::secp256k1::Scalar::from_be_bytes([7u8; 32]).expect("recipient secret is a valid scalar");
+    let shared_point = group_point
+        .mul_tweak(&secp, &recipient_scalar)
+        .expect("ECDH point multiplication");
+    let mut expected = [0u8; 32];
+    expected.copy_from_slice(&shared_point.serialize()[1..33]);
 
-    // Suppress unused-variable warning on rx2 (used for discovery only).
-    drop(rx2);
+    assert_eq!(
+        shared_secret.as_slice(),
+        expected.as_slice(),
+        "ECDH shared secret must match the independently computed recipient-side value"
+    );
 }
