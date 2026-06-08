@@ -61,6 +61,9 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
     fn request_approval(&self, request: BunkerApprovalRequest) -> bool;
+    /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
+    /// `name` are untrusted, remote-derived values: render them as inert text,
+    /// never as markup.
     fn on_connect(&self, pubkey: String, name: String);
 }
 
