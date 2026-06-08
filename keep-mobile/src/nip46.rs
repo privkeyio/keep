@@ -90,7 +90,8 @@ impl ServerCallbacks for CallbackBridge {
     }
 
     fn on_connect(&self, pubkey: &str, name: &str) {
-        self.callbacks.on_connect(pubkey.to_string(), name.to_string());
+        self.callbacks
+            .on_connect(pubkey.to_string(), name.to_string());
     }
 }
 
