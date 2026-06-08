@@ -1820,4 +1820,249 @@ mod snapshot_decode_tests {
         let outs = super::decode_psbt_outputs(&[0u8, 1, 2], "regtest");
         assert!(outs.is_empty());
     }
+
+    // === #417 round 4b: targeted unit tests killing the surviving mutations ===
+
+    /// `signer_id_sort_key` is what `aggregate_partial_psbts` uses to make
+    /// the combine order deterministic across peers — without that, the
+    /// aggregated PSBT bytes would diverge across peers and the consensus
+    /// hash would break. Pin every dimension:
+    ///
+    /// 1. `Share` MUST sort before `Fingerprint` (variant tag 0 vs 1).
+    /// 2. Within `Share`, indices sort ascending.
+    /// 3. Within `Fingerprint`, fingerprints sort lexicographically.
+    ///
+    /// 6 mutations on the tuple's three components are killed by pinning
+    /// these orderings.
+    #[test]
+    fn signer_id_sort_key_orders_share_before_fingerprint() {
+        use super::signer_id_sort_key;
+        use crate::psbt_session::SignerId;
+
+        // Share(0) < Fingerprint("a") — variant tag dominates.
+        assert!(
+            signer_id_sort_key(&SignerId::Share(0))
+                < signer_id_sort_key(&SignerId::Fingerprint("a".into()))
+        );
+        // Even Share(u16::MAX) < Fingerprint("") — variant tag still
+        // dominates regardless of inner values.
+        assert!(
+            signer_id_sort_key(&SignerId::Share(u16::MAX))
+                < signer_id_sort_key(&SignerId::Fingerprint(String::new()))
+        );
+    }
+
+    #[test]
+    fn signer_id_sort_key_orders_shares_by_ascending_index() {
+        use super::signer_id_sort_key;
+        use crate::psbt_session::SignerId;
+
+        assert!(signer_id_sort_key(&SignerId::Share(1)) < signer_id_sort_key(&SignerId::Share(2)));
+        assert!(signer_id_sort_key(&SignerId::Share(0)) < signer_id_sort_key(&SignerId::Share(1)));
+        assert!(signer_id_sort_key(&SignerId::Share(2)) < signer_id_sort_key(&SignerId::Share(10)));
+        // Same index hashes to equal keys.
+        assert_eq!(
+            signer_id_sort_key(&SignerId::Share(5)),
+            signer_id_sort_key(&SignerId::Share(5))
+        );
+    }
+
+    #[test]
+    fn signer_id_sort_key_orders_fingerprints_lexicographically() {
+        use super::signer_id_sort_key;
+        use crate::psbt_session::SignerId;
+
+        assert!(
+            signer_id_sort_key(&SignerId::Fingerprint("aaaa".into()))
+                < signer_id_sort_key(&SignerId::Fingerprint("bbbb".into()))
+        );
+        // Empty string sorts before any non-empty string.
+        assert!(
+            signer_id_sort_key(&SignerId::Fingerprint(String::new()))
+                < signer_id_sort_key(&SignerId::Fingerprint("abc".into()))
+        );
+        // `signer_id_sort_key` returns `(u8, u16, String)`, so a
+        // constant-return mutation (`Default::default()` → `(0, 0, "")`)
+        // would collapse all fingerprints onto one key; pinning two
+        // distinct fingerprints' distinctness catches it.
+        assert_ne!(
+            signer_id_sort_key(&SignerId::Fingerprint("alpha".into())),
+            signer_id_sort_key(&SignerId::Fingerprint("beta".into()))
+        );
+    }
+
+    /// `aggregate_partial_psbts` with an empty partials map and threshold=0
+    /// is a no-op that returns the proposal PSBT verbatim. A `vec![0]` /
+    /// `vec![1]` constant-return regression would emit bytes that fail to
+    /// re-decode as a PSBT downstream.
+    #[test]
+    fn aggregate_partial_psbts_returns_proposal_bytes_when_no_partials_and_threshold_zero() {
+        // Build a proposal PSBT with no inputs so the threshold-check loop
+        // doesn't run.
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, Psbt, ScriptBuf, Transaction, TxOut};
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let proposal = Psbt::from_unsigned_tx(tx).unwrap().serialize();
+
+        let result =
+            super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 0)
+                .expect("empty partials + threshold 0 must succeed");
+
+        // The constant-return regressions vec![0] / vec![1] would emit
+        // tiny garbage bytes; the real result is a complete PSBT
+        // serialisation that decodes back to the proposal.
+        assert!(
+            result.len() > 5,
+            "result must be a real PSBT, got {} bytes",
+            result.len()
+        );
+        let parsed = Psbt::deserialize(&result).expect("result must decode as a PSBT");
+        assert_eq!(parsed.unsigned_tx.output.len(), 1);
+        assert_eq!(parsed.unsigned_tx.output[0].value.to_sat(), 50_000);
+    }
+
+    /// `aggregate_partial_psbts` must error when an input carries a
+    /// `witness_utxo` (so prevout collection succeeds) but no `tap_scripts`
+    /// entry: with no leaf there is no way to determine which signatures
+    /// count toward the threshold. Execution stops at the "no tap_scripts
+    /// entry" guard before the threshold loop runs, so this test pins that
+    /// guard only; a mutation dropping it would let an undecidable-leaf
+    /// PSBT through. The threshold comparison itself is pinned separately by
+    /// `aggregate_partial_psbts_rejects_input_below_threshold`.
+    #[test]
+    fn aggregate_partial_psbts_fails_when_input_has_no_tap_scripts_entry() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{
+            Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let prev_txid: bitcoin::Txid =
+            "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        // witness_utxo present so the prevouts-collection loop succeeds
+        // and execution reaches the no-tap_scripts guard.
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let proposal = psbt.serialize();
+
+        let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
+            .expect_err("no tap_scripts entry must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no tap_scripts entry"),
+            "expected the no-tap_scripts-entry error, got {msg}"
+        );
+    }
+
+    /// Pins the threshold comparison `matching < required_threshold` in
+    /// `aggregate_partial_psbts`. The input carries one valid `tap_scripts`
+    /// entry (built via `TaprootBuilder`) so execution reaches the
+    /// threshold check rather than the earlier leaf guard, but zero
+    /// `tap_script_sigs`, leaving `matching == 0`. With threshold 1 the
+    /// original code errors; the `< → >` mutation evaluates `0 > 1 == false`
+    /// and would instead return `Ok`, so `expect_err` kills it.
+    #[test]
+    fn aggregate_partial_psbts_rejects_input_below_threshold() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::opcodes::all::OP_CHECKSIG;
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+        use bitcoin::transaction::Version;
+        use bitcoin::{
+            Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use std::collections::BTreeMap;
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        // Single-leaf taproot tree: `<key> OP_CHECKSIG`.
+        let leaf_script = ScriptBuf::builder()
+            .push_x_only_key(&xonly)
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+        let internal_kp = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let (internal, _) = internal_kp.x_only_public_key();
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf_script.clone())
+            .unwrap()
+            .finalize(&secp, internal)
+            .unwrap();
+        let control_block = spend_info
+            .control_block(&(leaf_script.clone(), LeafVersion::TapScript))
+            .unwrap();
+        let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+
+        let prev_txid: bitcoin::Txid =
+            "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: spk,
+        });
+        let mut tap_scripts = BTreeMap::new();
+        tap_scripts.insert(control_block, (leaf_script, LeafVersion::TapScript));
+        psbt.inputs[0].tap_scripts = tap_scripts;
+        let proposal = psbt.serialize();
+
+        // No tap_script_sigs => matching == 0, below threshold 1 => error.
+        let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
+            .expect_err("zero matching sigs below threshold 1 must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("below threshold"),
+            "expected a below-threshold error, got {msg}"
+        );
+    }
 }
