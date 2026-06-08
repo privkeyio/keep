@@ -1059,12 +1059,10 @@ mod tests {
         assert!(err.to_string().contains("dust threshold"));
     }
 
-    /// `verify_script_spend_input_binding` rejects when the witness_utxo
-    /// is missing, when the script_pubkey doesn't match, or when the
-    /// tap_scripts entry doesn't match the expected leaf. Several `delete
-    /// !` mutations would silently accept an attacker-supplied PSBT with
-    /// wrong bindings. Cover the missing-witness_utxo case since it's
-    /// the cheapest to construct without a full PSBT fixture.
+    /// Pins only the `MissingWitnessUtxo` early return: a PSBT with the
+    /// witness_utxo stripped is rejected before any of the three binding
+    /// checks run. The checks themselves are pinned by the dedicated
+    /// success and negative tests below.
     #[test]
     fn verify_script_spend_input_binding_refuses_psbt_with_no_witness_utxo() {
         let builder = fixture_builder();
@@ -1083,6 +1081,100 @@ mod tests {
             result.is_err(),
             "missing witness_utxo must surface a binding error"
         );
+    }
+
+    /// Success path: a PSBT built by the real builder passes all three
+    /// security checks (P2TR witness_utxo, control block commits to the
+    /// output key, leaf script references the local x-only key) and
+    /// returns the verified sighash bundle. This drives every `!`-negated
+    /// guard through its accept branch, so a `delete !` mutation on any of
+    /// them flips this success into a failure.
+    #[test]
+    fn verify_script_spend_input_binding_accepts_valid_psbt() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+        let (_, local_pk) = test_keypair_full(2);
+
+        let psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+
+        let bundle = verify_script_spend_input_binding(&psbt, 0, &local_pk).unwrap();
+        assert_eq!(bundle.input_index, 0);
+    }
+
+    /// Trips the P2TR check: a witness_utxo whose script_pubkey is not a
+    /// 34-byte P2TR output is rejected. A `delete !` on the `!is_p2tr()`
+    /// guard would accept a non-P2TR output.
+    #[test]
+    fn verify_script_spend_input_binding_rejects_non_p2tr_witness_utxo() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+        let (_, local_pk) = test_keypair_full(2);
+
+        let mut psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+
+        let err = verify_script_spend_input_binding(&psbt, 0, &local_pk).unwrap_err();
+        assert!(err.to_string().contains("not a P2TR output"));
+    }
+
+    /// Trips the taproot-commitment check: a valid P2TR witness_utxo whose
+    /// output key differs from the one the tap_scripts control block
+    /// commits to is rejected. A `delete !` on
+    /// `!verify_taproot_commitment(...)` would accept a leaf that isn't
+    /// part of the spent output's taproot tree.
+    #[test]
+    fn verify_script_spend_input_binding_rejects_uncommitted_control_block() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+        let (_, local_pk) = test_keypair_full(2);
+
+        let mut psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+        // Swap in a valid but unrelated P2TR output key; the control
+        // block no longer commits to it.
+        let (_, other_pk) = test_keypair_full(9);
+        let other_xonly = XOnlyPublicKey::from_slice(&other_pk).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2tr(&Secp256k1::new(), other_xonly, None),
+        });
+
+        let err = verify_script_spend_input_binding(&psbt, 0, &local_pk).unwrap_err();
+        assert!(err.to_string().contains("does not commit"));
+    }
+
+    /// Trips the leaf-key check: even with a valid P2TR witness_utxo and a
+    /// committing control block, a local x-only key absent from the leaf
+    /// script is rejected. A `delete !` on `!script_contains_xonly(...)`
+    /// would let a malicious proposer bind the responder to an unrelated
+    /// leaf.
+    #[test]
+    fn verify_script_spend_input_binding_rejects_local_key_absent_from_leaf() {
+        let builder = fixture_builder();
+        let utxo = fixture_outpoint();
+        let dest = fixture_dest();
+        // Key 9 participates in no tier built by fixture_builder.
+        let (_, absent_pk) = test_keypair_full(9);
+
+        let psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+
+        let err = verify_script_spend_input_binding(&psbt, 0, &absent_pk).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not reference the local responder"));
     }
 
     /// `script_contains_xonly` is a small but security-critical helper:
