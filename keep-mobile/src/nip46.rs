@@ -61,6 +61,7 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
     fn request_approval(&self, request: BunkerApprovalRequest) -> bool;
+    fn on_connect(&self, pubkey: String, name: String);
 }
 
 struct CallbackBridge {
@@ -86,6 +87,10 @@ impl ServerCallbacks for CallbackBridge {
             event_content: request.event_content,
             requested_permissions: request.requested_permissions,
         })
+    }
+
+    fn on_connect(&self, pubkey: &str, name: &str) {
+        self.callbacks.on_connect(pubkey.to_string(), name.to_string());
     }
 }
 
