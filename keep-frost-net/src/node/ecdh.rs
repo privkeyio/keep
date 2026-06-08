@@ -258,6 +258,14 @@ impl KfpNode {
             our_partial.to_vec(),
         );
 
+        // Subscribe BEFORE sending: a fast cosigner can respond, our run loop
+        // can call `handle_ecdh_share`, and the resulting `EcdhComplete` can
+        // fire on `event_tx` between the send loop and our `subscribe()`.
+        // `tokio::sync::broadcast` does not replay past messages to late
+        // subscribers, so a missed completion stalls the request until the
+        // 30s coordination timeout — exactly the flake in #561.
+        let mut rx = self.event_tx.subscribe();
+
         for (share_index, pubkey) in participant_peers {
             let event = KfpEventBuilder::ecdh_request(&self.keys, &pubkey, request.clone())?;
             self.client
@@ -275,10 +283,7 @@ impl KfpNode {
             debug!(share_index, "Sent ECDH request and share");
         }
 
-        let mut rx = self.event_tx.subscribe();
-
         // For single-participant (threshold=1), our own partial is the only one needed.
-        // Subscribe first so we don't miss the EcdhComplete we send to ourselves.
         let single_party_secret = {
             let mut ecdh_sessions = self.ecdh_sessions.write();
             match ecdh_sessions.get_session_mut(&session_id) {
