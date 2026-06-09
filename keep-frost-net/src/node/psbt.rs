@@ -2154,4 +2154,99 @@ mod snapshot_decode_tests {
              SECURITY VIOLATION otherwise (proposer-supplied tampered tx accepted)"
         );
     }
+
+    /// `aggregate_partial_psbts` binds the `non_witness_utxo` to the input's
+    /// `previous_output.txid` before reading its value/script as the
+    /// prevout. The `!= → ==` mutation on the `compute_txid() != txid` gate
+    /// inverts that check; an
+    /// attacker-supplied unrelated transaction whose vout-N output carries
+    /// an altered value/script would change the sighash recomputed below
+    /// without changing the signed commitment.
+    ///
+    /// Pin: a tampered `non_witness_utxo` whose computed txid differs from
+    /// `previous_output.txid` MUST surface a "txid does not match" error.
+    #[test]
+    fn aggregate_partial_psbts_rejects_non_witness_utxo_with_mismatched_txid() {
+        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (xonly, _parity) = keypair.x_only_public_key();
+        let leaf_script = ScriptBuf::builder()
+            .push_slice(xonly.serialize())
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+            .into_script();
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf_script.clone())
+            .unwrap()
+            .finalize(&secp, xonly)
+            .unwrap();
+
+        // Build a real previous tx whose vout 0 carries 60_000.
+        let real_prev = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(60_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(spend_info.output_key()),
+            }],
+        };
+        let real_prev_txid = real_prev.compute_txid();
+
+        // Tamper with the prev's output value so its txid changes.
+        let mut tampered_prev = real_prev.clone();
+        tampered_prev.output[0].value = Amount::from_sat(999_999_999);
+        let tampered_txid = tampered_prev.compute_txid();
+        assert_ne!(
+            tampered_txid, real_prev_txid,
+            "control: changing the prev output value must change the txid"
+        );
+
+        // The proposal claims to spend from `real_prev_txid:0` but carries
+        // the tampered tx as non_witness_utxo (no witness_utxo).
+        let our_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: real_prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(our_tx).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(tampered_prev);
+
+        let control_block = spend_info
+            .control_block(&(leaf_script.clone(), LeafVersion::TapScript))
+            .unwrap();
+        let mut tap_scripts = std::collections::BTreeMap::new();
+        tap_scripts.insert(control_block, (leaf_script, LeafVersion::TapScript));
+        psbt.inputs[0].tap_scripts = tap_scripts;
+
+        let proposal = psbt.serialize();
+        let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
+            .expect_err("mismatched non_witness_utxo txid MUST be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("txid does not match"),
+            "expected `txid does not match` error, got {msg}"
+        );
+    }
 }
