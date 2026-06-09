@@ -566,23 +566,10 @@ fn test_frost_sign_rejects_malformed_message_hex() {
     let vault = dir.path().join("bad-hex-vault");
 
     assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
-    assert_success(
-        &KeepCmd::new(&bin)
-            .path(&vault)
-            .args([
-                "frost",
-                "generate",
-                "--threshold",
-                "2",
-                "--shares",
-                "3",
-                "--name",
-                "badhex",
-            ])
-            .run(),
-    );
 
-    // Odd-length / non-hex input — must be refused cleanly.
+    // `--message` hex is decoded before the vault is opened or any group is
+    // resolved, so no frost share setup is needed: odd-length / non-hex input
+    // must be refused cleanly regardless of group state.
     let output = KeepCmd::new(&bin)
         .path(&vault)
         .args([
@@ -626,6 +613,12 @@ fn test_frost_sign_rejects_unknown_group() {
         ])
         .run();
     assert_failure(&output);
+    assert!(
+        output_contains(&output, "No group found"),
+        "unknown group must surface a clean 'not found' error, got:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // === #433: WDC CLI pre-vault validation coverage ===
