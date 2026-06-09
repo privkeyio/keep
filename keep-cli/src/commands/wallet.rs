@@ -2466,8 +2466,8 @@ mod tests {
 
     #[test]
     fn test_parse_recovery_tier_rejects_non_numeric_threshold() {
-        let err = parse_recovery_tier("xof3@1mo", 3)
-            .expect_err("non-numeric threshold must be refused");
+        let err =
+            parse_recovery_tier("xof3@1mo", 3).expect_err("non-numeric threshold must be refused");
         assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
     }
 
