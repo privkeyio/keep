@@ -79,6 +79,7 @@ testing = ["keep-core/testing"]
 warden = ["dep:reqwest", "dep:uuid"]
 
 [dev-dependencies]
+bitcoin = { workspace = true }
 tempfile = "3.27"
 sha2 = "0.10"
 hex = "0.4"

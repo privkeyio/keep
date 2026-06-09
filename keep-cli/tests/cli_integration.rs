@@ -461,6 +461,166 @@ fn test_help_flag() {
     assert!(output_contains(&output, "Sovereign key management"));
 }
 
+// === #440: `frost sign` non-interactive coverage ===
+//
+// The existing `test_frost_generate_list_sign` only checks the signature is
+// 64 hex bytes. These tests:
+//
+// 1. Pin that the produced signature actually VERIFIES against the group
+//    pubkey under BIP-340. The existing test would still pass if a regression
+//    emitted any garbage 64-byte hex value; this one wouldn't.
+// 2. Pin that a malformed message hex is refused with a clean error rather
+//    than panicking or silently signing nonsense bytes.
+// 3. Pin that an unknown group identifier surfaces a clean "not found"
+//    rather than an obscure failure downstream.
+
+/// Extract a 64-byte hex signature line from `frost sign` stdout.
+fn extract_signature_hex(output: &Output) -> [u8; 64] {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sig_hex = stdout
+        .lines()
+        .find(|l| l.len() == 128 && l.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or_else(|| {
+            panic!(
+                "no 128-char hex line in stdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let bytes = hex::decode(sig_hex).expect("decode signature hex");
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&bytes);
+    sig
+}
+
+#[test]
+fn test_frost_sign_signature_verifies_against_group_pubkey() {
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+    use keep_core::Keep;
+
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("verify-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    let gen_output = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "generate",
+            "--threshold",
+            "2",
+            "--shares",
+            "3",
+            "--name",
+            "verifygroup",
+        ])
+        .run();
+    assert_success(&gen_output);
+
+    // Read the actual group pubkey out of the vault. The CLI `frost list`
+    // truncates the npub for display, so we can't parse it back; in-process
+    // access via `keep_core::Keep` is exact.
+    let group_pubkey: [u8; 32] = {
+        let mut keep = Keep::open(&vault).unwrap();
+        keep.unlock(TEST_PASSWORD).unwrap();
+        let shares = keep.frost_list_shares().unwrap();
+        let share = shares
+            .iter()
+            .find(|s| s.metadata.name == "verifygroup")
+            .expect("verifygroup share must exist after generate");
+        share.metadata.group_pubkey
+    };
+
+    let message_digest: [u8; 32] = sha2::Sha256::digest(b"verifiable signing payload").into();
+    let msg_hex = hex::encode(message_digest);
+
+    let sign_output = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "sign",
+            "--message",
+            &msg_hex,
+            "--group",
+            "verifygroup",
+        ])
+        .run();
+    assert_success(&sign_output);
+
+    let sig_bytes = extract_signature_hex(&sign_output);
+    let signature = schnorr::Signature::from_slice(&sig_bytes).expect("valid schnorr signature");
+    let msg = Message::from_digest(message_digest);
+    let xonly =
+        XOnlyPublicKey::from_slice(&group_pubkey).expect("group pubkey is a valid x-only point");
+    let secp = Secp256k1::verification_only();
+    secp.verify_schnorr(&signature, &msg, &xonly).expect(
+        "`frost sign` output MUST verify against the group pubkey \
+         via BIP-340 schnorr",
+    );
+}
+
+#[test]
+fn test_frost_sign_rejects_malformed_message_hex() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("bad-hex-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    // `--message` hex is decoded before the vault is opened or any group is
+    // resolved, so no frost share setup is needed: odd-length / non-hex input
+    // must be refused cleanly regardless of group state.
+    let output = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "sign",
+            "--message",
+            "ZZZ-not-hex",
+            "--group",
+            "badhex",
+        ])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "invalid message hex"),
+        "malformed hex must surface a clean error, got:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_frost_sign_rejects_unknown_group() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("no-group-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    // No frost share generated; the lookup must fail cleanly rather than
+    // panic or sign with a random share.
+    let msg_hex = hex::encode(sha2::Sha256::digest(b"x"));
+    let output = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "sign",
+            "--message",
+            &msg_hex,
+            "--group",
+            "nosuchgroup",
+        ])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "No group found"),
+        "unknown group must surface a clean 'not found' error, got:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // === #433: WDC CLI pre-vault validation coverage ===
 //
 // `wallet propose` validates `--timeout` and `--network` BEFORE opening the

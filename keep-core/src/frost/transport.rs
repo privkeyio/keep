@@ -549,4 +549,57 @@ mod tests {
         let json = msg.to_json().unwrap();
         assert!(json.contains("round2_share"));
     }
+
+    // === #440: FrostMessage rejection coverage for interactive sign ===
+
+    /// `FrostMessage::from_json` is the parse boundary the interactive
+    /// signer pastes into. Malformed input MUST surface a clean error
+    /// rather than panic. Pin three classes: complete garbage, valid JSON
+    /// with wrong shape, and an empty string.
+    #[test]
+    fn test_frost_message_from_json_rejects_malformed_input() {
+        assert!(FrostMessage::from_json("not-json").is_err());
+        assert!(FrostMessage::from_json("").is_err());
+        // Valid JSON but missing required fields:
+        assert!(FrostMessage::from_json(r#"{"foo": "bar"}"#).is_err());
+    }
+
+    /// The interactive signer compares the parsed `session_id` hex against
+    /// its own session digest to defend against cross-session reuse. The
+    /// `session_id_bytes()` accessor MUST refuse hex that doesn't decode
+    /// to exactly 32 bytes, otherwise the gate could be bypassed by a
+    /// short prefix that happens to match.
+    #[test]
+    fn test_frost_message_session_id_bytes_rejects_wrong_length_hex() {
+        let session_id = [7u8; 32];
+        let payload = vec![1, 2, 3];
+        let mut msg = FrostMessage::commitment(&session_id, 1, &payload);
+
+        // 31-byte hex (62 chars): refused.
+        msg.session_id = "aa".repeat(31);
+        assert!(
+            msg.session_id_bytes().is_err(),
+            "31-byte session_id hex must be refused"
+        );
+
+        // 33-byte hex (66 chars): refused.
+        msg.session_id = "bb".repeat(33);
+        assert!(
+            msg.session_id_bytes().is_err(),
+            "33-byte session_id hex must be refused"
+        );
+
+        // Non-hex characters: refused.
+        msg.session_id = "z".repeat(64);
+        assert!(
+            msg.session_id_bytes().is_err(),
+            "non-hex session_id must be refused"
+        );
+
+        // Exactly 32 bytes (64 hex chars) of valid hex: accepted, and
+        // round-trips to the same bytes.
+        msg.session_id = "cc".repeat(32);
+        let bytes = msg.session_id_bytes().expect("32-byte hex must parse");
+        assert_eq!(bytes, [0xCCu8; 32]);
+    }
 }
