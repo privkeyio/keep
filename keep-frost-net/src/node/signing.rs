@@ -1368,6 +1368,14 @@ impl KfpNode {
             our_commit_bytes.clone(),
         );
 
+        // Subscribe BEFORE sending: a fast cosigner can respond, our run loop
+        // can process its share, and the resulting `SignatureComplete` can
+        // fire on `event_tx` between the send loop and our `subscribe()`.
+        // `tokio::sync::broadcast` does not replay past messages to late
+        // subscribers, so a missed completion stalls the request until the
+        // coordination timeout. Same race shape as #561 (ECDH) fixed in #562.
+        let mut rx = self.event_tx.subscribe();
+
         // Reservations are already consumed and committed to the live session,
         // so on a send failure tear the session down (matching the timeout and
         // share-generation paths below) rather than leaving it active until it
@@ -1402,12 +1410,10 @@ impl KfpNode {
             return Err(e.into());
         }
 
-        let mut rx = self.event_tx.subscribe();
-
         // All commitments may already be present: for single-participant
         // (threshold=1), or when peer commitments were pre-exchanged and
-        // reserved above. Must subscribe before generating share so we don't
-        // miss SignatureComplete.
+        // reserved above. We already subscribed above (before the send loop),
+        // so generating the share here can't miss SignatureComplete.
         let all_committed = {
             let sessions = self.sessions.read();
             sessions
@@ -1447,7 +1453,11 @@ impl KfpNode {
                             });
                         }
                     }
-                    Err(_) => {
+                    // `Lagged` is recoverable: the receiver stays live, so keep
+                    // waiting rather than aborting a valid signing round. Mirrors
+                    // the ECDH recv loop (#562).
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err(PeerRoundFailure {
                             error: "Event channel closed".into(),
                             code: "channel_closed".into(),

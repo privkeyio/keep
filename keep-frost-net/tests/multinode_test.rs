@@ -53,7 +53,6 @@ async fn test_node_creation_and_announcement() {
 }
 
 #[tokio::test]
-#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
 async fn test_peer_discovery_with_running_nodes() {
     let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
     let relay = mock_relay.url().await.to_string();
@@ -298,7 +297,6 @@ async fn test_session_management() {
 }
 
 #[tokio::test]
-#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
 async fn test_full_signing_flow() {
     use std::sync::Arc;
 
@@ -396,7 +394,6 @@ async fn test_full_signing_flow() {
 /// `health_check` (which pings every peer) while the node loop is running, then
 /// signing, must both complete rather than hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // Needs running nodes on a MockRelay - run with: cargo test -- --ignored
 async fn test_health_check_then_sign_no_deadlock() {
     use std::sync::Arc;
 
@@ -488,7 +485,6 @@ async fn test_health_check_then_sign_no_deadlock() {
 /// peer. The 12s bound is comfortably above the ~3s ping budget + one round, but
 /// below the ~15s a single doomed round would cost without the pre-ping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // Needs running nodes on a MockRelay - run with: cargo test -- --ignored
 async fn test_failover_when_cosigner_dropped_mid_session() {
     use std::sync::Arc;
 
@@ -585,12 +581,10 @@ async fn test_failover_when_cosigner_dropped_mid_session() {
 /// package from peers' announced verifying shares; before that fix this signing
 /// round failed on the initiator with "Aggregation failed: Unknown identifier".
 ///
-/// Ignored by default: like the other full signing-flow tests it spins up three
-/// nodes on a shared in-process MockRelay and is timing-sensitive under parallel
-/// suite load (the extra Argon2 export/import here makes it the most sensitive).
-/// Run explicitly with `--ignored`.
+/// Like the other full signing-flow tests it spins up three nodes on a shared
+/// in-process MockRelay and is timing-sensitive under parallel suite load (the
+/// extra Argon2 export/import here makes it the most sensitive).
 #[tokio::test]
-#[ignore]
 async fn test_imported_share_can_initiate_signing() {
     use keep_core::frost::ShareExport;
     use std::sync::Arc;
@@ -1408,7 +1402,6 @@ async fn test_request_descriptor_fails_with_no_peers() {
 }
 
 #[tokio::test]
-#[ignore] // Flaky in CI due to network timing - run with: cargo test -- --ignored
 async fn test_signing_flow_with_nonce_pre_exchange() {
     use std::sync::Arc;
 
@@ -1552,7 +1545,6 @@ async fn test_signing_flow_with_nonce_pre_exchange() {
 // identifier): a persistent initiator must complete many signs in a row as the
 // pre-exchanged nonce pool churns.
 #[tokio::test]
-#[ignore]
 async fn test_repeated_signing() {
     use std::sync::Arc;
 

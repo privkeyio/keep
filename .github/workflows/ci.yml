@@ -104,7 +104,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-      - run: cargo install cargo-fuzz
+      - run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz nsec parsing
         run: cargo +nightly fuzz run fuzz_nsec -- -max_total_time=30
         working-directory: fuzz
