@@ -581,10 +581,9 @@ async fn test_failover_when_cosigner_dropped_mid_session() {
 /// package from peers' announced verifying shares; before that fix this signing
 /// round failed on the initiator with "Aggregation failed: Unknown identifier".
 ///
-/// Ignored by default: like the other full signing-flow tests it spins up three
-/// nodes on a shared in-process MockRelay and is timing-sensitive under parallel
-/// suite load (the extra Argon2 export/import here makes it the most sensitive).
-/// Run explicitly with `--ignored`.
+/// Like the other full signing-flow tests it spins up three nodes on a shared
+/// in-process MockRelay and is timing-sensitive under parallel suite load (the
+/// extra Argon2 export/import here makes it the most sensitive).
 #[tokio::test]
 async fn test_imported_share_can_initiate_signing() {
     use keep_core::frost::ShareExport;

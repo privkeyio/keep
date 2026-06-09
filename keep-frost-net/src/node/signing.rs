@@ -1412,8 +1412,8 @@ impl KfpNode {
 
         // All commitments may already be present: for single-participant
         // (threshold=1), or when peer commitments were pre-exchanged and
-        // reserved above. Must subscribe before generating share so we don't
-        // miss SignatureComplete.
+        // reserved above. We already subscribed above (before the send loop),
+        // so generating the share here can't miss SignatureComplete.
         let all_committed = {
             let sessions = self.sessions.read();
             sessions
@@ -1453,7 +1453,11 @@ impl KfpNode {
                             });
                         }
                     }
-                    Err(_) => {
+                    // `Lagged` is recoverable: the receiver stays live, so keep
+                    // waiting rather than aborting a valid signing round. Mirrors
+                    // the ECDH recv loop (#562).
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err(PeerRoundFailure {
                             error: "Event channel closed".into(),
                             code: "channel_closed".into(),
