@@ -598,12 +598,10 @@ async fn bunker_with_connected_client() -> ConnectedBunker {
     )
     .await
     .expect("connect must respond");
-    assert!(
-        connect_resp
-            .get("error")
-            .map(|v| v.is_null())
-            .unwrap_or(true),
-        "connect must succeed: {connect_resp}"
+    assert_eq!(
+        connect_resp.get("result").and_then(|v| v.as_str()),
+        Some("ack"),
+        "connect must succeed with ack, got: {connect_resp}"
     );
 
     ConnectedBunker {
@@ -700,9 +698,16 @@ async fn test_dispatch_nip44_encrypt_decrypt_roundtrip() {
         .and_then(|v| v.as_str())
         .expect("nip44_encrypt result must be a ciphertext string")
         .to_string();
-    assert!(
-        !ciphertext.is_empty() && ciphertext != plaintext,
-        "ciphertext MUST be non-empty and differ from plaintext"
+    assert!(!ciphertext.is_empty(), "nip44 ciphertext MUST be non-empty");
+    // Independently decrypt with the third party's key against the signer
+    // pubkey. This proves the bunker encrypted to the REQUESTED recipient,
+    // not to a fixed or its own key: a bunker-internal symmetric round-trip
+    // alone can't catch a peer-pubkey-binding regression.
+    let independent = nip44::decrypt(third_party.secret_key(), &cb.signer_pubkey, &ciphertext)
+        .expect("nip44 ciphertext must decrypt for the requested peer");
+    assert_eq!(
+        independent, plaintext,
+        "nip44 ciphertext MUST be addressed to the requested peer pubkey"
     );
 
     let dec = send_and_await(
@@ -744,9 +749,14 @@ async fn test_dispatch_nip04_encrypt_decrypt_roundtrip() {
         .and_then(|v| v.as_str())
         .expect("nip04_encrypt result must be a ciphertext string")
         .to_string();
-    assert!(
-        !ciphertext.is_empty() && ciphertext != plaintext,
-        "ciphertext MUST be non-empty and differ from plaintext"
+    assert!(!ciphertext.is_empty(), "nip04 ciphertext MUST be non-empty");
+    // Independently decrypt with the third party's key against the signer
+    // pubkey to prove the bunker encrypted to the REQUESTED recipient.
+    let independent = nip04::decrypt(third_party.secret_key(), &cb.signer_pubkey, &ciphertext)
+        .expect("nip04 ciphertext must decrypt for the requested peer");
+    assert_eq!(
+        independent, plaintext,
+        "nip04 ciphertext MUST be addressed to the requested peer pubkey"
     );
 
     let dec = send_and_await(
