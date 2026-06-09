@@ -460,3 +460,104 @@ fn test_help_flag() {
     assert_success(&output);
     assert!(output_contains(&output, "Sovereign key management"));
 }
+
+// === #433: WDC CLI pre-vault validation coverage ===
+//
+// `wallet propose` validates `--timeout` and `--network` BEFORE opening the
+// vault, so these tests don't need a real frost share to pin the gates.
+// They use a temp path that does NOT have a vault, plus any-string args for
+// the other required parameters: the validation fires before any of those
+// are dereferenced.
+//
+// Each input is one of the boundary cases documented in #418's smoke notes;
+// pinning them here makes a future regression on the rejection error
+// surface fail in CI instead of in the next round of manual testing.
+
+fn propose_cmd(bin: &Path, path: &Path) -> KeepCmd {
+    KeepCmd::new(bin).path(path).args([
+        "wallet",
+        "propose",
+        "--group",
+        // any-string: validation fires before group_pubkey decoding.
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "--relay",
+        "wss://relay.example.com",
+        "--recovery",
+        "2of3@6mo",
+    ])
+}
+
+#[test]
+fn test_wallet_propose_rejects_zero_timeout() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("vault");
+
+    let output = propose_cmd(&bin, &vault)
+        .args(["--network", "signet", "--timeout", "0"])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "timeout must be between"),
+        "expected timeout boundary error, got: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_wallet_propose_rejects_oversize_timeout() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("vault");
+
+    let output = propose_cmd(&bin, &vault)
+        .args(["--network", "signet", "--timeout", "86401"])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "timeout must be between"),
+        "expected timeout boundary error"
+    );
+}
+
+#[test]
+fn test_wallet_propose_rejects_unknown_network() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("vault");
+
+    let output = propose_cmd(&bin, &vault)
+        .args(["--network", "fakenet"])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "Invalid network"),
+        "expected unknown-network rejection, got: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_wallet_propose_accepts_every_canonical_network() {
+    // Mirror of `parse_network`'s positive cases (#428) so the wallet-propose
+    // surface gates them the same way as the bitcoin subcommands. We expect
+    // the network check to PASS and the command to fail later on vault open,
+    // proving the early `Invalid network` gate let the input through.
+    let bin = require_binary!();
+
+    for network in ["bitcoin", "testnet", "signet", "regtest"] {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+
+        let output = propose_cmd(&bin, &vault).args(["--network", network]).run();
+        assert_failure(&output); // vault doesn't exist
+                                 // The failure MUST NOT be on the network check; it must surface from
+                                 // a later step (vault open / missing file).
+        assert!(
+            !output_contains(&output, "Invalid network"),
+            "network {network:?} must pass the early validation gate"
+        );
+    }
+}

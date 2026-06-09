@@ -2448,4 +2448,52 @@ mod tests {
         assert!(msg.contains("version 3"), "got {msg}");
         assert!(msg.contains("#426"), "got {msg}");
     }
+
+    // === #433: recovery-spec parser rejection coverage ===
+    //
+    // Pin the specific malformed inputs the WDC CLI smoke (#418) tested
+    // manually so any future parser regression surfaces in CI rather than
+    // in the next round of manual smoke. Each input exercises a distinct
+    // rejection branch:
+    //
+    // - `xof3@1mo`           — non-numeric threshold
+    // - `3of2@1mo`           — threshold > N
+    // - `0of3@1mo`           — threshold zero
+    // - `2of3@0mo`           — zero-month timelock
+    // - `2of3`               — no `@<timelock>` separator
+    //
+    // All five MUST produce a clean error, not a panic or silent accept.
+
+    #[test]
+    fn test_parse_recovery_tier_rejects_non_numeric_threshold() {
+        let err = parse_recovery_tier("xof3@1mo", 3)
+            .expect_err("non-numeric threshold must be refused");
+        assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_parse_recovery_tier_rejects_threshold_greater_than_n() {
+        let err = parse_recovery_tier("3of2@1mo", 5).expect_err("threshold > N must be refused");
+        assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_parse_recovery_tier_rejects_zero_threshold() {
+        let err = parse_recovery_tier("0of3@1mo", 5).expect_err("threshold of 0 must be refused");
+        assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_parse_recovery_tier_rejects_zero_month_timelock() {
+        let err =
+            parse_recovery_tier("2of3@0mo", 5).expect_err("zero-month timelock must be refused");
+        assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_parse_recovery_tier_rejects_missing_timelock_separator() {
+        let err = parse_recovery_tier("2of3", 5)
+            .expect_err("recovery-tier spec without `@<timelock>` must be refused");
+        assert!(matches!(err, KeepError::InvalidInput(_)), "got {err:?}");
+    }
 }
