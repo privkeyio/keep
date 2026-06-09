@@ -505,3 +505,266 @@ async fn test_bunker_e2e_returned_event_signature_verifies() {
     server_handle.abort();
     client.disconnect().await;
 }
+
+// === #553: NIP-46 dispatch_request match-arm coverage ===
+//
+// Each of these tests drives one NIP-46 method through `dispatch_request`
+// over the relay, killing the match-arm-deletion mutation for that
+// method. The existing #435 e2e covers `connect` + `sign_event` only.
+
+/// Holds everything an NIP-46 method test needs after the connect handshake.
+/// `_mock_relay` MUST stay alive for the entire test — dropping it shuts
+/// down the relay and any in-flight method calls hang on the 10s timeout.
+struct ConnectedBunker {
+    client: Client,
+    client_keys: Keys,
+    server_pubkey: PublicKey,
+    signer_pubkey: PublicKey,
+    server_handle: tokio::task::JoinHandle<()>,
+    notifications: tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+    _mock_relay: MockRelay,
+}
+
+async fn bunker_with_connected_client() -> ConnectedBunker {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let relay_url = mock_relay.url().await.to_string();
+
+    let (keyring, signer_pubkey) = setup_keyring();
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        None,
+        std::slice::from_ref(&relay_url),
+        None,
+        ServerConfig {
+            auto_approve: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("server creation");
+
+    let bunker_url = server.bunker_url();
+    let bunker_secret = extract_bunker_secret(&bunker_url).expect("bunker secret");
+    let server_pubkey = server.pubkey();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let client_keys = Keys::generate();
+    let client = Client::new(client_keys.clone());
+    client.add_relay(relay_url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .author(server_pubkey)
+                .pubkey(client_keys.public_key()),
+            None,
+        )
+        .await
+        .expect("subscribe to bunker responses");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut notifications = client.notifications();
+
+    let connect_req = serde_json::json!({
+        "id": "req-connect",
+        "method": "connect",
+        "params": [signer_pubkey.to_hex(), bunker_secret],
+    });
+    client
+        .send_event(&build_nip46_request(
+            &client_keys,
+            &server_pubkey,
+            &serde_json::to_string(&connect_req).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let connect_resp = await_nip46_response(
+        &mut notifications,
+        &client_keys,
+        &server_pubkey,
+        "req-connect",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect must respond");
+    assert!(
+        connect_resp
+            .get("error")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "connect must succeed: {connect_resp}"
+    );
+
+    ConnectedBunker {
+        client,
+        client_keys,
+        server_pubkey,
+        signer_pubkey,
+        server_handle,
+        notifications,
+        _mock_relay: mock_relay,
+    }
+}
+
+async fn send_and_await(
+    cb: &mut ConnectedBunker,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let req = serde_json::json!({ "id": id, "method": method, "params": params });
+    cb.client
+        .send_event(&build_nip46_request(
+            &cb.client_keys,
+            &cb.server_pubkey,
+            &serde_json::to_string(&req).unwrap(),
+        ))
+        .await
+        .unwrap();
+    await_nip46_response(
+        &mut cb.notifications,
+        &cb.client_keys,
+        &cb.server_pubkey,
+        id,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap_or_else(|| panic!("{method} must respond"))
+}
+
+#[tokio::test]
+async fn test_dispatch_get_public_key_returns_signer_pubkey() {
+    let mut cb = bunker_with_connected_client().await;
+
+    let resp = send_and_await(&mut cb, "req-gpk", "get_public_key", serde_json::json!([])).await;
+    let result = resp
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("get_public_key result must be a string");
+
+    assert_eq!(
+        result,
+        cb.signer_pubkey.to_hex(),
+        "get_public_key MUST return the bunker's signer pubkey verbatim"
+    );
+
+    cb.server_handle.abort();
+    cb.client.disconnect().await;
+}
+
+#[tokio::test]
+async fn test_dispatch_ping_returns_pong() {
+    let mut cb = bunker_with_connected_client().await;
+
+    let resp = send_and_await(&mut cb, "req-ping", "ping", serde_json::json!([])).await;
+    let result = resp
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("ping result must be a string");
+    assert_eq!(
+        result, "pong",
+        "ping MUST return the literal string \"pong\""
+    );
+
+    cb.server_handle.abort();
+    cb.client.disconnect().await;
+}
+
+#[tokio::test]
+async fn test_dispatch_nip44_encrypt_decrypt_roundtrip() {
+    let mut cb = bunker_with_connected_client().await;
+
+    let third_party = Keys::generate();
+    let plaintext = "secret message for #553 nip44 coverage";
+
+    let enc = send_and_await(
+        &mut cb,
+        "req-nip44-enc",
+        "nip44_encrypt",
+        serde_json::json!([third_party.public_key().to_hex(), plaintext]),
+    )
+    .await;
+    let ciphertext = enc
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("nip44_encrypt result must be a ciphertext string")
+        .to_string();
+    assert!(
+        !ciphertext.is_empty() && ciphertext != plaintext,
+        "ciphertext MUST be non-empty and differ from plaintext"
+    );
+
+    let dec = send_and_await(
+        &mut cb,
+        "req-nip44-dec",
+        "nip44_decrypt",
+        serde_json::json!([third_party.public_key().to_hex(), ciphertext]),
+    )
+    .await;
+    let decrypted = dec
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("nip44_decrypt result must be a plaintext string");
+    assert_eq!(
+        decrypted, plaintext,
+        "nip44 decrypt MUST round-trip to the original plaintext"
+    );
+
+    cb.server_handle.abort();
+    cb.client.disconnect().await;
+}
+
+#[tokio::test]
+async fn test_dispatch_nip04_encrypt_decrypt_roundtrip() {
+    let mut cb = bunker_with_connected_client().await;
+
+    let third_party = Keys::generate();
+    let plaintext = "legacy nip04 coverage for #553";
+
+    let enc = send_and_await(
+        &mut cb,
+        "req-nip04-enc",
+        "nip04_encrypt",
+        serde_json::json!([third_party.public_key().to_hex(), plaintext]),
+    )
+    .await;
+    let ciphertext = enc
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("nip04_encrypt result must be a ciphertext string")
+        .to_string();
+    assert!(
+        !ciphertext.is_empty() && ciphertext != plaintext,
+        "ciphertext MUST be non-empty and differ from plaintext"
+    );
+
+    let dec = send_and_await(
+        &mut cb,
+        "req-nip04-dec",
+        "nip04_decrypt",
+        serde_json::json!([third_party.public_key().to_hex(), ciphertext]),
+    )
+    .await;
+    let decrypted = dec
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("nip04_decrypt result must be a plaintext string");
+    assert_eq!(
+        decrypted, plaintext,
+        "nip04 decrypt MUST round-trip to the original plaintext"
+    );
+
+    cb.server_handle.abort();
+    cb.client.disconnect().await;
+}
