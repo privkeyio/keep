@@ -653,6 +653,17 @@ pub(crate) struct StoredBunkerConfig {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) authorized_clients: Vec<String>,
+    /// Hex-encoded 32-byte transport secret key. The bunker:// pubkey is derived
+    /// from this key, so persisting it keeps the bunker URL stable across service
+    /// restarts. Stored in the same SQLCipher-backed SecureStorage as the FROST
+    /// share material. `Option` + `serde(default)` keeps pre-existing configs
+    /// (written before this field existed) deserializable.
+    #[serde(default)]
+    pub(crate) transport_secret: Option<String>,
+    /// Connect secret embedded in the bunker:// URL. Persisted alongside the
+    /// transport key so saved client sessions keep authenticating after a restart.
+    #[serde(default)]
+    pub(crate) connect_secret: Option<String>,
 }
 
 pub(crate) fn load_bunker_config(

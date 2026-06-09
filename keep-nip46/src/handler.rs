@@ -742,6 +742,7 @@ mod tests {
     use super::*;
     use crate::audit::AuditLog;
     use crate::permissions::PermissionManager;
+    use crate::NIP98_HTTP_AUTH;
     use keep_core::keyring::Keyring;
     use keep_core::keys::{KeyType, NostrKeypair};
 
@@ -764,6 +765,132 @@ mod tests {
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
         SignerHandler::new(keyring, permissions, audit, None).with_auto_approve(true)
+    }
+
+    /// Records every `request_approval` invocation (by method) so a test can
+    /// assert which operations triggered an interactive prompt. Approves all.
+    struct RecordingCallbacks {
+        methods: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::types::ServerCallbacks for RecordingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> bool {
+            self.methods.lock().unwrap().push(request.method);
+            true
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    }
+
+    // Reproduces the readstr / nostr-tools failure: a client that connects
+    // WITHOUT requesting permissions only receives the least-privilege
+    // `connect_grant` default (get_public_key), so signing a kind-27235
+    // (NIP-98) event is denied — the client logs in but its signed requests
+    // all fail. The mobile/web bunkers must override `connect_grant`.
+    #[tokio::test]
+    async fn default_connect_grant_denies_sign_event() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RecordingCallbacks {
+            methods: std::sync::Mutex::new(Vec::new()),
+        });
+        // Default connect_grant == Permission::DEFAULT (get_public_key only).
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb));
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let unsigned = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, vec![], "");
+        let result = handler.handle_sign_event(app, unsigned).await;
+        assert!(
+            result.is_err(),
+            "default connect_grant must not permit sign_event"
+        );
+    }
+
+    // The fix: with `connect_grant` including SIGN_EVENT and kind 27235 in the
+    // global auto-approve set, a client that connected without requesting
+    // permissions can sign a NIP-98 event immediately, and NO per-request
+    // approval prompt fires (only the connection itself is gated).
+    #[tokio::test]
+    async fn http_auth_signed_without_per_request_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RecordingCallbacks {
+            methods: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let tags = vec![
+            Tag::parse(["u", "https://readstr.example/api/feed"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ];
+        let unsigned = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        let signed = handler
+            .handle_sign_event(app, unsigned)
+            .await
+            .expect("kind 27235 must auto-sign for an authorized client");
+        assert_eq!(signed.kind, NIP98_HTTP_AUTH);
+
+        let methods = cb.methods.lock().unwrap().clone();
+        assert!(
+            !methods.iter().any(|m| m == "sign_event"),
+            "kind 27235 must not trigger a per-request approval prompt, saw: {methods:?}"
+        );
+    }
+
+    // Requirement 3: the signer must sign the event EXACTLY as received —
+    // created_at is not rewritten and tags (including the NIP-98 `payload`
+    // tag) are preserved verbatim and in order.
+    #[tokio::test]
+    async fn sign_event_preserves_created_at_and_tags() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None).with_auto_approve(true);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let created_at = Timestamp::from(1_700_000_000);
+        let tags = vec![
+            Tag::parse(["u", "https://readstr.example/api/feed"]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+            Tag::parse([
+                "payload",
+                "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3",
+            ])
+            .unwrap(),
+        ];
+        let unsigned = UnsignedEvent::new(signer_pk, created_at, NIP98_HTTP_AUTH, tags.clone(), "");
+        let signed = handler.handle_sign_event(app, unsigned).await.unwrap();
+
+        assert_eq!(
+            signed.created_at, created_at,
+            "created_at must not be rewritten"
+        );
+        assert!(signed.verify().is_ok(), "signed event must verify");
+        assert_eq!(
+            signed.tags.to_vec(),
+            tags,
+            "tags must be preserved verbatim and in order"
+        );
     }
 
     #[tokio::test]

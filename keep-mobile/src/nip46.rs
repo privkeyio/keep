@@ -4,7 +4,8 @@
 use crate::network::validate_relay_url;
 use crate::{KeepMobile, KeepMobileError};
 use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
-use keep_nip46::{NetworkFrostSigner, RateLimitConfig, Server, ServerConfig};
+use keep_nip46::{NetworkFrostSigner, Permission, RateLimitConfig, Server, ServerConfig};
+use nostr_sdk::Kind;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -176,6 +177,70 @@ impl BunkerHandler {
     }
 }
 
+/// NIP-46 event kinds the bunker signs without a per-request approval prompt,
+/// once the connection itself is authorized. Kind 27235 (NIP-98 HTTP auth) is
+/// required by web clients such as nostr-tools' `BunkerSigner`, which sign a
+/// fresh auth event for *every* API call and time out (~60s) if the signer
+/// prompts per request. Kind 7 (reactions) matches the engine default.
+fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
+    std::collections::HashSet::from([Kind::Reaction, keep_nip46::NIP98_HTTP_AUTH])
+}
+
+fn decode_transport_secret(hex_str: &str) -> Option<[u8; 32]> {
+    hex::decode(hex_str).ok()?.try_into().ok()
+}
+
+/// Loads the persisted bunker transport key + connect secret, generating and
+/// persisting fresh values on first start (or when absent/corrupt). The
+/// bunker:// pubkey is derived from the transport key and the URL embeds the
+/// connect secret, so reusing the persisted values keeps the bunker URL stable
+/// across service restarts — saved client sessions (readstr and the like) keep
+/// receiving responses after a reboot or off/on toggle. The secrets live in the
+/// same SQLCipher-backed SecureStorage as the FROST share material.
+fn load_or_create_bunker_keys(
+    storage: &Arc<dyn crate::SecureStorage>,
+) -> Result<([u8; 32], String), KeepMobileError> {
+    let mut stored =
+        crate::persistence::load_bunker_config(storage, crate::BUNKER_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+
+    let mut dirty = false;
+
+    let transport_secret = match stored
+        .transport_secret
+        .as_deref()
+        .and_then(decode_transport_secret)
+    {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = keep_core::crypto::random_bytes::<32>();
+            stored.transport_secret = Some(hex::encode(bytes));
+            dirty = true;
+            bytes
+        }
+    };
+
+    let connect_secret = match stored.connect_secret.take() {
+        Some(secret) if !secret.is_empty() => secret,
+        _ => {
+            let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+            stored.connect_secret = Some(secret.clone());
+            dirty = true;
+            secret
+        }
+    };
+
+    if dirty {
+        crate::persistence::persist_bunker_config(
+            storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            &stored,
+        )?;
+    }
+
+    Ok((transport_secret, connect_secret))
+}
+
 impl BunkerHandler {
     fn do_start_bunker(
         &self,
@@ -229,11 +294,19 @@ impl BunkerHandler {
             let network_signer =
                 NetworkFrostSigner::with_shared_node(group_pubkey_bytes, Arc::clone(node));
 
-            let transport_secret = keep_core::crypto::random_bytes::<32>();
+            let (transport_secret, connect_secret) =
+                load_or_create_bunker_keys(&self.mobile.storage)?;
 
             let config = ServerConfig {
                 rate_limit: Some(RateLimitConfig::default()),
-                expected_secret: Some(hex::encode(keep_core::crypto::random_bytes::<16>())),
+                expected_secret: Some(connect_secret),
+                // Approving the bunker connection (the secret in the bunker URL
+                // is the grant) must let the client sign, mirroring the
+                // always-on bunker in keep-web. Without this the client only
+                // gets get_public_key and every sign_event is denied — the
+                // client logs in but its signed-request calls all fail.
+                connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+                auto_approve_kinds: bunker_auto_approve_kinds(),
                 ..ServerConfig::default()
             };
 
@@ -285,5 +358,209 @@ async fn run_server(
             server.stop().await;
             status.store(STATUS_STOPPED, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{load_bunker_config, persist_bunker_config, StoredBunkerConfig};
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use crate::KeepMobileError;
+    use crate::BUNKER_CONFIG_STORAGE_KEY;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemStorage {
+        data: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl SecureStorage for MemStorage {
+        fn store_share(
+            &self,
+            _data: Vec<u8>,
+            _metadata: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            unimplemented!()
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            unimplemented!()
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            unimplemented!()
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _metadata: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            Vec::new()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            None
+        }
+        fn set_active_share_key(&self, _key: Option<String>) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+    }
+
+    // (a) Configs serialized before the transport_secret/connect_secret fields
+    // existed must still deserialize, leaving the new fields as None.
+    #[test]
+    fn old_bunker_config_deserializes() {
+        let legacy = br#"{"enabled":true,"authorized_clients":["abc"]}"#;
+        let config: StoredBunkerConfig = serde_json::from_slice(legacy).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.authorized_clients, vec!["abc".to_string()]);
+        assert!(config.transport_secret.is_none());
+        assert!(config.connect_secret.is_none());
+    }
+
+    // (c) A fresh storage generates and persists new transport key + secret.
+    #[test]
+    fn fresh_storage_generates_and_persists() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+
+        assert!(load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .is_none());
+
+        let (transport, secret) = load_or_create_bunker_keys(&storage).unwrap();
+        assert!(!secret.is_empty());
+
+        let stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("config persisted on first start");
+        assert_eq!(
+            stored
+                .transport_secret
+                .as_deref()
+                .and_then(decode_transport_secret),
+            Some(transport)
+        );
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+    }
+
+    // (b) Starting the bunker twice against the same storage reuses the same
+    // transport key + connect secret, so the derived bunker:// URI is stable.
+    #[test]
+    fn restart_reuses_persisted_keys() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+
+        let (transport1, secret1) = load_or_create_bunker_keys(&storage).unwrap();
+        let (transport2, secret2) = load_or_create_bunker_keys(&storage).unwrap();
+
+        assert_eq!(transport1, transport2);
+        assert_eq!(secret1, secret2);
+    }
+
+    // Corrupt (invalid-hex transport) or empty (blank connect secret) persisted
+    // values must be treated as absent: regenerated to valid material, persisted,
+    // and stable across the next load — the junk is never propagated.
+    #[test]
+    fn corrupt_or_empty_keys_regenerate_and_persist() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+
+        let stored = StoredBunkerConfig {
+            transport_secret: Some("zzz".into()),
+            connect_secret: Some(String::new()),
+            ..StoredBunkerConfig::default()
+        };
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+
+        let (transport, secret) = load_or_create_bunker_keys(&storage).unwrap();
+        assert!(!secret.is_empty());
+        assert_ne!(secret, "");
+        assert_eq!(transport.len(), 32);
+
+        let reloaded = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("regenerated config persisted");
+        assert_eq!(
+            reloaded
+                .transport_secret
+                .as_deref()
+                .and_then(decode_transport_secret),
+            Some(transport)
+        );
+        assert_eq!(reloaded.connect_secret.as_deref(), Some(secret.as_str()));
+
+        let (transport2, secret2) = load_or_create_bunker_keys(&storage).unwrap();
+        assert_eq!(transport, transport2);
+        assert_eq!(secret, secret2);
+    }
+
+    // Drive the real `KeepMobile::save_bunker_config`: persisted transport key +
+    // connect secret survive an unrelated config save (disable + add a client).
+    #[test]
+    fn save_bunker_config_preserves_secrets() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+
+        let (transport, secret) = load_or_create_bunker_keys(&storage).unwrap();
+
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: false,
+                authorized_clients: vec!["c".into()],
+            })
+            .unwrap();
+
+        let reloaded = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("config persisted");
+        assert!(!reloaded.enabled);
+        assert_eq!(reloaded.authorized_clients, vec!["c".to_string()]);
+        assert_eq!(
+            reloaded
+                .transport_secret
+                .as_deref()
+                .and_then(decode_transport_secret),
+            Some(transport)
+        );
+        assert_eq!(reloaded.connect_secret.as_deref(), Some(secret.as_str()));
+    }
+
+    // Saving unrelated config (e.g. toggling enabled) must not rotate the keys.
+    #[test]
+    fn rewriting_config_preserves_keys() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+
+        let (transport1, secret1) = load_or_create_bunker_keys(&storage).unwrap();
+
+        let mut stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .unwrap();
+        stored.enabled = false;
+        stored.authorized_clients.push("client".into());
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+
+        let (transport2, secret2) = load_or_create_bunker_keys(&storage).unwrap();
+        assert_eq!(transport1, transport2);
+        assert_eq!(secret1, secret2);
     }
 }

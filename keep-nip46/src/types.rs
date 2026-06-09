@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT
 use nostr_sdk::prelude::*;
 
+/// NIP-98 HTTP Auth event kind (27235). Web clients such as nostr-tools'
+/// `BunkerSigner` sign a fresh auth event for every API call, so the bunkers
+/// auto-approve this kind to avoid a per-request prompt that would time out.
+pub const NIP98_HTTP_AUTH: Kind = Kind::Custom(27235);
+
 #[derive(Debug, Clone)]
 pub struct LogEvent {
     pub app: String,

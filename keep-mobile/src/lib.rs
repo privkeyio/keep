@@ -1756,9 +1756,16 @@ impl KeepMobile {
     }
 
     pub fn save_bunker_config(&self, config: BunkerConfigInfo) -> Result<(), KeepMobileError> {
+        // Preserve the persisted transport key + connect secret so toggling the
+        // bunker off/on (or any other config save) does not rotate the bunker://
+        // URL out from under already-paired clients.
+        let existing = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
         let stored = persistence::StoredBunkerConfig {
             enabled: config.enabled,
             authorized_clients: config.authorized_clients,
+            transport_secret: existing.transport_secret,
+            connect_secret: existing.connect_secret,
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
