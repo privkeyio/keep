@@ -2065,4 +2065,93 @@ mod snapshot_decode_tests {
             "expected a below-threshold error, got {msg}"
         );
     }
+
+    /// `decode_psbt_for_snapshot` binds the `non_witness_utxo` to the input's
+    /// `previous_output.txid` before trusting its value: a mismatched tx
+    /// MUST yield `fee = None`. The `!= → ==` mutation on the txid check
+    /// would silently accept an attacker-supplied unrelated transaction
+    /// whose vout-N output carries an altered value, producing a wrong fee
+    /// in the snapshot. Pin both branches: matching txid → `Some(fee)`,
+    /// mismatched txid → `None`.
+    #[test]
+    fn decode_psbt_for_snapshot_rejects_non_witness_utxo_with_mismatched_txid() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[1u8; 32]).unwrap();
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+        let tap_script = ScriptBuf::new_p2tr(&secp, x_only_pubkey, None);
+
+        // Build a "previous tx" we claim our input spends from.
+        let real_prev = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(60_000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+        let real_prev_txid = real_prev.compute_txid();
+
+        // The new tx's input claims to spend from `real_prev_txid:0`.
+        let our_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: real_prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: tap_script.clone(),
+            }],
+        };
+
+        // Case A: matching txid -> fee = Some(10_000).
+        let mut psbt = Psbt::from_unsigned_tx(our_tx.clone()).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(real_prev.clone());
+        let bytes = psbt.serialize();
+        let (_hash, _outputs, fee) =
+            decode_psbt_for_snapshot(&bytes).expect("matching txid must decode");
+        assert_eq!(
+            fee,
+            Some(10_000),
+            "matching non_witness_utxo txid must yield the correct fee"
+        );
+
+        // Case B: tamper with the non_witness_utxo so its computed txid no
+        // longer matches `previous_output.txid`. With the `!= → ==`
+        // mutation, the value `999_999_999` would be accepted and fee
+        // would be `Some(999_949_999)`. Original code returns None.
+        let mut tampered_prev = real_prev.clone();
+        tampered_prev.output[0].value = Amount::from_sat(999_999_999);
+        let tampered_txid = tampered_prev.compute_txid();
+        assert_ne!(
+            tampered_txid, real_prev_txid,
+            "control: changing the output value must change the txid"
+        );
+
+        let mut psbt = Psbt::from_unsigned_tx(our_tx).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(tampered_prev);
+        let bytes = psbt.serialize();
+        let (_hash, _outputs, fee) =
+            decode_psbt_for_snapshot(&bytes).expect("psbt itself is well-formed");
+        assert_eq!(
+            fee, None,
+            "mismatched non_witness_utxo txid MUST yield fee = None; \
+             SECURITY VIOLATION otherwise (proposer-supplied tampered tx accepted)"
+        );
+    }
 }
