@@ -229,4 +229,87 @@ mod tests {
         let sig = sign_with_local_shares(&refreshed, message).unwrap();
         assert_eq!(sig.len(), 64);
     }
+
+    /// **The security property #438 names**: an attacker who compromises a
+    /// pre-refresh share MUST NOT be able to combine it with post-refresh
+    /// shares to produce a valid signature. Otherwise proactive secret
+    /// sharing is defeated — the refresh would be cosmetic, not protective.
+    ///
+    /// We model the attack: keep one old share, drop the rest, accept the
+    /// refreshed shares as legitimate, then attempt to sign a quorum from
+    /// the union. The protocol either fails outright or produces a
+    /// signature that does NOT verify against the group pubkey.
+    #[test]
+    fn test_mixed_old_and_new_shares_cannot_produce_valid_signature() {
+        use bitcoin::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+
+        let config = ThresholdConfig::two_of_three();
+        let dealer = TrustedDealer::new(config);
+        let (mut old_shares, _) = dealer.generate("test-mixed").unwrap();
+        let group_pubkey = *old_shares[0].group_pubkey();
+
+        let (mut new_shares, _) = refresh_shares(&old_shares).unwrap();
+
+        // BIP-340 schnorr signs a 32-byte message digest, and
+        // `sign_with_local_shares` passes the bytes verbatim to FROST's
+        // SigningPackage. Use a 32-byte digest as the message so the
+        // signer and verifier agree on what was signed.
+        let message_digest: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(b"attack: mix pre-refresh and post-refresh shares").into()
+        };
+        let message = message_digest.as_slice();
+
+        let secp = Secp256k1::verification_only();
+        let xonly = XOnlyPublicKey::from_slice(&group_pubkey)
+            .expect("group pubkey is a valid x-only point");
+        let msg = Message::from_digest(message_digest);
+
+        // Control FIRST: 2 NEW shares MUST produce a valid signature
+        // against the group pubkey. Proves the refresh is healthy so
+        // the mixed-failure below is genuinely the security property,
+        // not a setup bug. Drain the first two new shares to avoid
+        // SharePackage's no-Clone constraint.
+        let new_share_a = new_shares.remove(0);
+        let new_share_b = new_shares.remove(0);
+        let new_quorum = [new_share_a, new_share_b];
+        let good_sig = sign_with_local_shares(&new_quorum, message)
+            .expect("two fresh shares must produce a valid signature");
+        let bip340 = bitcoin::secp256k1::schnorr::Signature::from_slice(&good_sig)
+            .expect("64-byte schnorr signature");
+        secp.verify_schnorr(&bip340, &msg, &xonly)
+            .expect("control: two-of-three new shares MUST verify against the group pubkey");
+
+        // Now the attack: pull one OLD share and pair it with one
+        // surviving NEW share. Models a partially-compromised group
+        // where the attacker still holds one old share post-refresh.
+        let old_share_1 = old_shares.remove(0);
+        let surviving_new_share = new_shares.remove(0); // was original index 2
+        let mixed = [old_share_1, surviving_new_share];
+
+        // The protocol either errors out OR produces a signature that
+        // fails verification. Either outcome upholds the security
+        // property; pin both.
+        match sign_with_local_shares(&mixed, message) {
+            Ok(sig) => {
+                let bip340 = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig)
+                    .expect("64-byte schnorr signature");
+                let verified = secp.verify_schnorr(&bip340, &msg, &xonly).is_ok();
+                assert!(
+                    !verified,
+                    "SECURITY VIOLATION: mixed old+new shares produced a signature \
+                     that verifies against the group pubkey. Refresh did not actually \
+                     rotate the shares."
+                );
+            }
+            Err(_) => {
+                // This is the EXPECTED path in normal operation: FROST's
+                // `aggregate` verifies the signature internally and rejects
+                // the cross-epoch mix before it ever returns bytes. The Ok
+                // arm above is the regression tripwire for a cosmetic refresh,
+                // so do not collapse this match to `unwrap_err()` even though
+                // the Ok branch looks unreachable today.
+            }
+        }
+    }
 }

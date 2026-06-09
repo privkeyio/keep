@@ -656,4 +656,219 @@ mod tests {
             assert_eq!(keys[0].name, "dek-test");
         }
     }
+
+    // === #438: security-critical rotation property coverage ===
+
+    /// Create an empty vault under a fresh temp dir and return the temp dir
+    /// (the caller must keep it alive) together with its path. Every #438
+    /// rejection test starts from the same empty vault; the password stays an
+    /// explicit argument so each test still shows what it unlocks with.
+    fn create_empty_vault(password: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let _ = Storage::create(&path, password, Argon2Params::TESTING).unwrap();
+        (dir, path)
+    }
+
+    /// `rotate_password` MUST reject a wrong old password without touching
+    /// the header. A regression that accepts any input here would let
+    /// anyone with file access change the password.
+    #[test]
+    fn test_rotate_password_rejects_wrong_old_password() {
+        let (_dir, path) = create_empty_vault("correctpass");
+
+        let mut storage = Storage::open(&path).unwrap();
+        let err = storage
+            .rotate_password("WRONG_OLD_PASSWORD", "newpass1")
+            .expect_err("wrong old password must be rejected");
+        // Wrong old password fails at the unlock step inside rotate_password.
+        // Pin the variant so a regression that rejects for an unrelated reason
+        // (IO, lock contention, a future pre-unlock validation) doesn't pass
+        // this test while the auth gate silently degrades.
+        assert!(
+            matches!(err, KeepError::DecryptionFailed),
+            "expected DecryptionFailed, got {err:?}"
+        );
+
+        // The original password must still unlock the vault unchanged.
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .unlock("correctpass")
+            .expect("original password must still work after failed rotation");
+    }
+
+    /// `rotate_password` MUST reject a new password that fails
+    /// `validate_new_password` (too short). Without this, a rotation
+    /// would silently weaken the vault to an empty-or-tiny password
+    /// despite the create-time gate.
+    #[test]
+    fn test_rotate_password_rejects_short_new_password() {
+        let (_dir, path) = create_empty_vault("validpass1");
+
+        let mut storage = Storage::open(&path).unwrap();
+        let err = storage
+            .rotate_password("validpass1", "")
+            .expect_err("empty new password must be refused");
+        assert!(
+            matches!(err, KeepError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        let mut storage = Storage::open(&path).unwrap();
+        let err = storage
+            .rotate_password("validpass1", "a")
+            .expect_err("too-short new password must be refused");
+        assert!(
+            matches!(err, KeepError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // Original password still works.
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("validpass1").unwrap();
+    }
+
+    /// `rotate_password` re-wraps the same data encryption key under the new
+    /// password; it does not change the DEK or re-encrypt stored keys. This
+    /// test confirms the DEK survives that re-wrap intact, so a stored secret
+    /// still decrypts to the exact pre-rotation bytes under the new password.
+    /// A regression that corrupted or replaced the DEK during the re-wrap
+    /// would surface here as a decrypt failure or byte mismatch.
+    #[test]
+    fn test_rotate_password_preserves_decrypted_secret_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-decrypt-after-pw");
+        let original_secret: Vec<u8> = (0u8..32).collect();
+        let pubkey: [u8; 32] = [0xAA; 32];
+
+        {
+            let storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+            let encrypted = crypto::encrypt(&original_secret, storage.data_key().unwrap()).unwrap();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "decrypt-survives".into(),
+                encrypted.to_bytes(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_password("oldpass1", "newpass1").unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("newpass1").unwrap();
+        let data_key = storage.data_key().expect("unlocked has data_key");
+        let keys = storage.list_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        let record = &keys[0];
+        let encrypted =
+            crypto::EncryptedData::from_bytes(&record.encrypted_secret).expect("decode encrypted");
+        let decrypted = crypto::decrypt(&encrypted, data_key).expect("decrypt after rotation");
+        let plaintext = decrypted.as_slice().expect("secret bytes");
+        assert_eq!(
+            plaintext.as_slice(),
+            original_secret.as_slice(),
+            "decrypted secret bytes MUST match the pre-rotation value"
+        );
+    }
+
+    /// `rotate_data_key` MUST reject a wrong password. Without the gate,
+    /// an attacker with file access could re-encrypt all stored secrets
+    /// to a new key without ever proving they hold the password.
+    #[test]
+    fn test_rotate_data_key_rejects_wrong_password() {
+        let (_dir, path) = create_empty_vault("correctpass");
+
+        let mut storage = Storage::open(&path).unwrap();
+        let err = storage
+            .rotate_data_key("WRONG_PASSWORD")
+            .expect_err("wrong password to rotate_data_key must be refused");
+        assert!(
+            matches!(err, KeepError::DecryptionFailed),
+            "expected DecryptionFailed, got {err:?}"
+        );
+
+        // Original password still unlocks.
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .unlock("correctpass")
+            .expect("original password must still work after failed dek rotation");
+    }
+
+    /// `rotate_data_key` generates a fresh data encryption key and re-encrypts
+    /// every stored secret under it. Verify three properties: the decrypted
+    /// bytes round-trip unchanged, the on-disk ciphertext changes, and the OLD
+    /// data key can no longer decrypt the new ciphertext. That last check is
+    /// the proactive-security property, and unlike the ciphertext-changed
+    /// check it cannot be satisfied by a fresh nonce alone, so it actually
+    /// proves the key rotated rather than merely being re-encrypted in place.
+    #[test]
+    fn test_rotate_data_key_preserves_decrypted_secret_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-decrypt-after-dek");
+        let original_secret: Vec<u8> = (10u8..42).collect();
+        let pubkey: [u8; 32] = [0xCC; 32];
+
+        let pre_ciphertext;
+        let old_data_key;
+        {
+            let storage = Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+            // Capture the pre-rotation data key so we can later prove it no
+            // longer decrypts the rotated ciphertext.
+            old_data_key = storage.data_key().unwrap().clone();
+            let encrypted = crypto::encrypt(&original_secret, storage.data_key().unwrap()).unwrap();
+            pre_ciphertext = encrypted.to_bytes();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "dek-decrypt-survives".into(),
+                pre_ciphertext.clone(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key("password").unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("password").unwrap();
+        let data_key = storage.data_key().expect("unlocked has data_key");
+        let keys = storage.list_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        let record = &keys[0];
+
+        // Ciphertext on disk MUST differ from pre-rotation. (Necessary but not
+        // sufficient: a fresh nonce alone would change it, hence the old-key
+        // check below.)
+        assert_ne!(
+            record.encrypted_secret, pre_ciphertext,
+            "ciphertext must change after data-key rotation"
+        );
+
+        let encrypted =
+            crypto::EncryptedData::from_bytes(&record.encrypted_secret).expect("decode encrypted");
+
+        // The data key MUST have actually rotated: the OLD key can no longer
+        // decrypt the post-rotation ciphertext (AEAD tag check fails under the
+        // wrong key). This is the real proactive-security property.
+        assert!(
+            crypto::decrypt(&encrypted, &old_data_key).is_err(),
+            "SECURITY VIOLATION: old data key still decrypts post-rotation \
+             ciphertext; the data key was not actually rotated"
+        );
+
+        // The new key decrypts to the identical plaintext.
+        let decrypted = crypto::decrypt(&encrypted, data_key).expect("decrypt after rotation");
+        let plaintext = decrypted.as_slice().expect("secret bytes");
+        assert_eq!(
+            plaintext.as_slice(),
+            original_secret.as_slice(),
+            "decrypted secret bytes MUST match the pre-rotation value"
+        );
+    }
 }
