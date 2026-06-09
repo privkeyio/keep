@@ -442,9 +442,10 @@ async fn test_bunker_e2e_returned_event_signature_verifies() {
     );
 
     // 2. sign_event request, kind 1 text note.
+    let request_content = "round-trip signature verification (#435)";
     let unsigned = serde_json::json!({
         "kind": 1,
-        "content": "round-trip signature verification (#435)",
+        "content": request_content,
         "tags": [],
         "created_at": Timestamp::now().as_secs(),
     });
@@ -492,7 +493,7 @@ async fn test_bunker_e2e_returned_event_signature_verifies() {
         "returned event MUST be signed under the bunker's signer pubkey"
     );
     assert_eq!(
-        signed_event.content, "round-trip signature verification (#435)",
+        signed_event.content, request_content,
         "returned event MUST carry the requested content"
     );
     assert_eq!(
