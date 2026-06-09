@@ -285,3 +285,238 @@ async fn test_bunker_permission_scoping() {
         "sign_event should be denied when only get_public_key requested"
     );
 }
+
+// === #435: validate the signature on the returned event ===
+//
+// The existing `test_bunker_e2e_connect_and_sign` sends a `sign_event`
+// request over the relay but never waits for the response nor validates
+// the returned signed event. That's #435's headline gap: until a NIP-46
+// round-trip is verified end-to-end, "keep is a Nostr signer" is only
+// asserted at the bunker URL boundary.
+//
+// This test drives the full handshake (connect, sign_event), waits for
+// the sign_event response, decrypts it, parses the signed event, and
+// verifies its signature against the bunker's signer pubkey via BIP-340
+// schnorr. A regression that emits an unsigned event, signs with the
+// wrong key, or corrupts the response payload fails this test.
+
+/// Build a NIP-46 request event addressed to `server_pubkey`, encrypted
+/// under `client_keys` with NIP-44 v2.
+fn build_nip46_request(client_keys: &Keys, server_pubkey: &PublicKey, request_json: &str) -> Event {
+    let encrypted = nip44::encrypt(
+        client_keys.secret_key(),
+        server_pubkey,
+        request_json,
+        nip44::Version::V2,
+    )
+    .expect("nip44 encrypt");
+    EventBuilder::new(Kind::NostrConnect, &encrypted)
+        .tag(Tag::public_key(*server_pubkey))
+        .sign_with_keys(client_keys)
+        .expect("sign nip46 request")
+}
+
+/// Wait up to `timeout` for a NIP-46 response from `server_pubkey` whose
+/// JSON id matches `expected_id`. Caller must subscribe to NIP-46 events
+/// addressed to the client BEFORE calling, to avoid a publish-before-
+/// subscribe race.
+async fn await_nip46_response(
+    client: &Client,
+    client_keys: &Keys,
+    server_pubkey: &PublicKey,
+    expected_id: &str,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut notifications = client.notifications();
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let event = match tokio::time::timeout(remaining, notifications.recv()).await {
+            Ok(Ok(RelayPoolNotification::Event { event, .. })) => event,
+            _ => continue,
+        };
+        if event.kind != Kind::NostrConnect || event.pubkey != *server_pubkey {
+            continue;
+        }
+        let decrypted = match nip44::decrypt(
+            client_keys.secret_key(),
+            server_pubkey,
+            event.content.as_str(),
+        ) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&decrypted) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if json.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
+            continue;
+        }
+        return Some(json);
+    }
+}
+
+#[tokio::test]
+async fn test_bunker_e2e_returned_event_signature_verifies() {
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let relay_url = mock_relay.url().await.to_string();
+
+    let (keyring, signer_pubkey) = setup_keyring();
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        None,
+        std::slice::from_ref(&relay_url),
+        None,
+        ServerConfig {
+            auto_approve: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("server creation");
+
+    let bunker_url = server.bunker_url();
+    let bunker_secret = extract_bunker_secret(&bunker_url).expect("bunker secret");
+    let server_pubkey = server.pubkey();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let client_keys = Keys::generate();
+    let client = Client::new(client_keys.clone());
+    client.add_relay(relay_url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Subscribe BEFORE any request so no response can beat the filter.
+    client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .author(server_pubkey)
+                .pubkey(client_keys.public_key()),
+            None,
+        )
+        .await
+        .expect("subscribe to bunker responses");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 1. connect handshake, wait for ack before signing.
+    let connect_req = serde_json::json!({
+        "id": "req-connect",
+        "method": "connect",
+        "params": [signer_pubkey.to_hex(), bunker_secret],
+    });
+    client
+        .send_event(&build_nip46_request(
+            &client_keys,
+            &server_pubkey,
+            &serde_json::to_string(&connect_req).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let connect_resp = await_nip46_response(
+        &client,
+        &client_keys,
+        &server_pubkey,
+        "req-connect",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect must respond before sign_event");
+    assert!(
+        connect_resp
+            .get("error")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "connect must succeed, got: {connect_resp}"
+    );
+
+    // 2. sign_event request, kind 1 text note.
+    let unsigned = serde_json::json!({
+        "kind": 1,
+        "content": "round-trip signature verification (#435)",
+        "tags": [],
+        "created_at": Timestamp::now().as_secs(),
+    });
+    let sign_req = serde_json::json!({
+        "id": "req-sign",
+        "method": "sign_event",
+        "params": [serde_json::to_string(&unsigned).unwrap()],
+    });
+    client
+        .send_event(&build_nip46_request(
+            &client_keys,
+            &server_pubkey,
+            &serde_json::to_string(&sign_req).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let response = await_nip46_response(
+        &client,
+        &client_keys,
+        &server_pubkey,
+        "req-sign",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("sign_event must respond");
+
+    // NIP-46 response shape: { id, result, error }. `result` is the
+    // JSON-stringified signed event.
+    let result_str = response
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("sign_event response must include `result`");
+    let signed_event: serde_json::Value =
+        serde_json::from_str(result_str).expect("`result` is JSON-stringified signed event");
+
+    let sig_hex = signed_event["sig"]
+        .as_str()
+        .expect("signed event must have `sig`");
+    let id_hex = signed_event["id"]
+        .as_str()
+        .expect("signed event must have `id`");
+    let pubkey_hex = signed_event["pubkey"]
+        .as_str()
+        .expect("signed event must have `pubkey`");
+
+    assert_eq!(
+        pubkey_hex,
+        signer_pubkey.to_hex(),
+        "returned event MUST be signed under the bunker's signer pubkey"
+    );
+
+    let sig_bytes: [u8; 64] = hex::decode(sig_hex)
+        .expect("sig is hex")
+        .try_into()
+        .expect("64-byte sig");
+    let id_bytes: [u8; 32] = hex::decode(id_hex)
+        .expect("id is hex")
+        .try_into()
+        .expect("32-byte id");
+    let pubkey_bytes: [u8; 32] = hex::decode(pubkey_hex)
+        .expect("pubkey is hex")
+        .try_into()
+        .expect("32-byte pubkey");
+
+    let secp = Secp256k1::verification_only();
+    let sig = schnorr::Signature::from_slice(&sig_bytes).expect("valid schnorr signature");
+    let xonly = XOnlyPublicKey::from_slice(&pubkey_bytes).expect("valid x-only pubkey");
+    let msg = Message::from_digest(id_bytes);
+    secp.verify_schnorr(&sig, &msg, &xonly)
+        .expect("returned NIP-46 signed event MUST verify under BIP-340");
+
+    server_handle.abort();
+    client.disconnect().await;
+}

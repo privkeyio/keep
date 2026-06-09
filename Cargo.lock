@@ -4585,6 +4585,7 @@ dependencies = [
 name = "keep-nip46"
 version = "0.4.7"
 dependencies = [
+ "bitcoin",
  "bitflags 2.13.0",
  "chrono",
  "hex",
