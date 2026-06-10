@@ -178,23 +178,31 @@ impl BunkerHandler {
     }
 }
 
-/// NIP-46 event kinds the bunker signs without a per-request approval prompt,
-/// once the connection itself is authorized. Kind 27235 (NIP-98 HTTP auth) is
-/// required by web clients such as nostr-tools' `BunkerSigner`, which sign a
-/// fresh auth event for *every* API call and time out (~60s) if the signer
-/// prompts per request. Kind 7 (reactions) matches the engine default.
+/// Global event kinds the bunker signs without a per-request prompt for any
+/// client. Kept to the safe engine default (kind 7 reactions) only. NIP-98 is
+/// NOT global; see `bunker_connect_auto_approve_kinds`.
+fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
+    std::collections::HashSet::from([Kind::Reaction])
+}
+
+/// Event kinds auto-approved per-app for each client that completes the connect
+/// handshake, scoped to that client's pubkey instead of granted globally. Kind
+/// 27235 (NIP-98 HTTP auth) is required by web clients such as nostr-tools'
+/// `BunkerSigner`, which sign a fresh auth event for *every* API call and time
+/// out (~60s) if the signer prompts per request.
 ///
 /// TRUST MODEL: auto-approving kind 27235 makes the bunker URL + connect secret
 /// an HTTP-auth bearer credential. Any client that completes the connect
 /// handshake can silently mint NIP-98 auth tokens for *any* URL and method with
 /// no per-request prompt, exactly like handing out an HTTP `Authorization`
-/// header. Amber behaves the same way. Unlike Amber, this is currently GLOBAL:
-/// one shared connect secret and one global `auto_approve_kinds` set, not
-/// per-app scoped, so every connected client shares the same blanket grant.
-/// Per-app scoping is tracked as follow-up work; treat the bunker URL as a
-/// secret of equivalent power to the signing key for HTTP-auth purposes.
-fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
-    std::collections::HashSet::from([Kind::Reaction, keep_nip46::NIP98_HTTP_AUTH])
+/// header. Amber behaves the same way. The grant is now scoped to each
+/// connected app's pubkey (revocable and auditable per app) rather than a
+/// blanket global rule, but the connect secret is still shared across clients,
+/// so treat the bunker URL as a secret of equivalent power to the signing key
+/// for HTTP-auth purposes. A per-app/URL-method allowlist is tracked as
+/// follow-up work.
+fn bunker_connect_auto_approve_kinds() -> std::collections::HashSet<Kind> {
+    std::collections::HashSet::from([keep_nip46::NIP98_HTTP_AUTH])
 }
 
 /// Decodes a persisted transport secret, returning `None` when the stored value
@@ -349,14 +357,17 @@ impl BunkerHandler {
                 // gets get_public_key and every sign_event is denied — the
                 // client logs in but its signed-request calls all fail.
                 //
-                // TRUST MODEL: this connect grant plus the global
-                // auto_approve_kinds (see `bunker_auto_approve_kinds`) means a
-                // single shared connect secret authorizes signing and silent
-                // NIP-98 (kind 27235) token minting for every connected client.
-                // The connect secret is a bearer credential, not yet per-app
-                // scoped; per-app grants are tracked as follow-up work.
+                // TRUST MODEL: this connect grant plus the per-app
+                // connect_auto_approve_kinds (see
+                // `bunker_connect_auto_approve_kinds`) means a single shared
+                // connect secret authorizes signing and silent NIP-98 (kind
+                // 27235) token minting for every connected client. NIP-98 is
+                // granted per connected app pubkey (revocable/auditable), not
+                // globally. The connect secret is still a shared bearer
+                // credential; a per-app/URL-method allowlist is follow-up work.
                 connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                 auto_approve_kinds: bunker_auto_approve_kinds(),
+                connect_auto_approve_kinds: bunker_connect_auto_approve_kinds(),
                 ..ServerConfig::default()
             };
 

@@ -104,6 +104,12 @@ pub struct SignerHandler {
     /// act of approving the connection is the grant. Defaults to the
     /// least-privilege `Permission::DEFAULT`.
     connect_grant: Permission,
+    /// Event kinds auto-approved per-app for every client that completes the
+    /// connect handshake, granted to that specific app pubkey (revocable,
+    /// auditable) rather than via the blanket `global_auto_approve` set. The
+    /// mobile bunker uses this to auto-approve NIP-98 (kind 27235) for connected
+    /// web clients without making it a global rule for unconnected apps.
+    connect_auto_approve_kinds: HashSet<Kind>,
     relay_urls: Vec<String>,
     kill_switch: Arc<AtomicBool>,
     /// The transport (bunker URL) pubkey clients connect to. For a remote
@@ -134,6 +140,7 @@ impl SignerHandler {
             expected_secret: None,
             auto_approve: false,
             connect_grant: Permission::DEFAULT,
+            connect_auto_approve_kinds: HashSet::new(),
             relay_urls: Vec::new(),
             kill_switch: Arc::new(AtomicBool::new(false)),
             transport_pubkey: None,
@@ -152,6 +159,11 @@ impl SignerHandler {
 
     pub fn with_connect_grant(mut self, grant: Permission) -> Self {
         self.connect_grant = grant;
+        self
+    }
+
+    pub fn with_connect_auto_approve_kinds(mut self, kinds: HashSet<Kind>) -> Self {
+        self.connect_auto_approve_kinds = kinds;
         self
     }
 
@@ -343,10 +355,11 @@ impl SignerHandler {
             }
         }
 
-        let (mut requested_perms, auto_kinds) = permissions
+        let (mut requested_perms, mut auto_kinds) = permissions
             .as_deref()
             .map(parse_permission_string)
             .unwrap_or((self.connect_grant, HashSet::new()));
+        auto_kinds.extend(self.connect_auto_approve_kinds.iter().copied());
 
         if self.auto_approve {
             requested_perms = Permission::ALL;
@@ -626,9 +639,10 @@ impl SignerHandler {
     ) -> Result<()> {
         self.check_rate_limit(&app_pubkey).await?;
 
-        let (requested_perms, auto_kinds) = permissions_str
+        let (requested_perms, mut auto_kinds) = permissions_str
             .map(parse_permission_string)
             .unwrap_or((self.connect_grant, HashSet::new()));
+        auto_kinds.extend(self.connect_auto_approve_kinds.iter().copied());
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
@@ -847,6 +861,38 @@ mod tests {
         assert!(
             !methods.iter().any(|m| m == "sign_event"),
             "kind 27235 must not trigger a per-request approval prompt, saw: {methods:?}"
+        );
+    }
+
+    // App-scoped grant: `connect_auto_approve_kinds` auto-approves kind 27235
+    // only for clients that completed the connect handshake (scoped to their
+    // pubkey), and does NOT leak to apps that never connected — unlike the
+    // global `auto_approve_kinds` set.
+    #[tokio::test]
+    async fn connect_auto_approve_kinds_are_per_app_not_global() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, Arc::clone(&permissions), audit, None)
+            .with_expected_secret("connect-secret".into())
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT)
+            .with_connect_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
+
+        let connected = Keys::generate().public_key();
+        handler
+            .handle_connect(connected, None, Some("connect-secret".into()), None)
+            .await
+            .unwrap();
+
+        let never_connected = Keys::generate().public_key();
+        let pm = permissions.lock().await;
+        assert!(
+            !pm.needs_approval(&connected, NIP98_HTTP_AUTH),
+            "connected app must have NIP-98 auto-approved per-app"
+        );
+        assert!(
+            pm.needs_approval(&never_connected, NIP98_HTTP_AUTH),
+            "NIP-98 must NOT be globally auto-approved for unconnected apps"
         );
     }
 
