@@ -43,6 +43,12 @@ pub struct ServerConfig {
     /// `keep nip46 auto-approve`. Only meaningful for interactive serving;
     /// in headless mode every request is auto-approved regardless.
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
+    /// Event kinds auto-approved per-app for each client that completes the
+    /// connect handshake, scoped to that app's pubkey instead of the global
+    /// `auto_approve_kinds`. The mobile bunker grants NIP-98 (kind 27235) this
+    /// way so connected web clients sign without per-request prompts while
+    /// unconnected apps get no blanket grant.
+    pub connect_auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
 }
 
 /// A NIP-46 client app whose permissions are loaded into the
@@ -120,6 +126,7 @@ impl Default for ServerConfig {
             connect_grant: Permission::DEFAULT,
             pre_grants: Vec::new(),
             auto_approve_kinds: std::collections::HashSet::from([nostr_sdk::Kind::Reaction]),
+            connect_auto_approve_kinds: std::collections::HashSet::new(),
         }
     }
 }
@@ -342,6 +349,7 @@ impl Server {
         let mut handler = SignerHandler::new(keyring, permissions, audit, callbacks.clone())
             .with_auto_approve(config.auto_approve)
             .with_connect_grant(config.connect_grant)
+            .with_connect_auto_approve_kinds(config.connect_auto_approve_kinds.clone())
             .with_transport_pubkey(keys.public_key());
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
@@ -446,6 +454,7 @@ impl Server {
             .with_network_frost_signer(network_signer)
             .with_auto_approve(config.auto_approve)
             .with_connect_grant(config.connect_grant)
+            .with_connect_auto_approve_kinds(config.connect_auto_approve_kinds.clone())
             .with_transport_pubkey(keys.public_key());
         let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
 
