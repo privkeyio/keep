@@ -323,6 +323,7 @@ impl DescriptorSession {
     /// require; used by integration tests that need a `Complete` session as
     /// a precondition for downstream PSBT or sweep flows.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn test_completed(
         session_id: [u8; 32],
         group_pubkey: [u8; 32],
@@ -723,6 +724,7 @@ impl DescriptorSessionManager {
     /// PSBT/sweep coordination flows without re-running descriptor proposal,
     /// contribution, finalization, and ACK rounds.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn test_insert_session(&mut self, session: DescriptorSession) {
         let sid = *session.session_id();
         self.sessions.insert(sid, session);

@@ -1008,6 +1008,7 @@ impl KfpNode {
     /// without running the full descriptor proposal/contribute/finalize/ACK
     /// flow.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn test_inject_descriptor_session(
         &self,
         session: crate::descriptor_session::DescriptorSession,

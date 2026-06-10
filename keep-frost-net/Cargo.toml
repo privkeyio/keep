@@ -51,3 +51,7 @@ nostr-relay-builder = "0.44"
 chrono = "0.4"
 proptest = "1.11"
 keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal"] }
+
+[[test]]
+name = "multinode_test"
+required-features = ["testing"]

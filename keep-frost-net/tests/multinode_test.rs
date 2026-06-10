@@ -1835,7 +1835,7 @@ async fn test_psbt_migration_sweep_end_to_end() {
     use bitcoin::psbt::Psbt;
     use bitcoin::secp256k1::{Keypair, Secp256k1};
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-    use bitcoin::taproot::{LeafVersion, Signature as TaprootSignature, TapLeafHash};
+    use bitcoin::taproot::{LeafVersion, TapLeafHash};
     use bitcoin::{Amount, Network, OutPoint, TxOut, XOnlyPublicKey};
     use keep_bitcoin::recovery::{
         RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier,
@@ -2213,6 +2213,17 @@ async fn test_psbt_migration_sweep_end_to_end() {
             "input {idx}: recomputed sighash must match the proposer's"
         );
 
+        // Cross-check the responder's real proposal sighash (derived from the
+        // protocol's proposal PSBT) against the locally rebuilt one.
+        assert_eq!(
+            sighashes[idx].input_index, sh.input_index,
+            "input {idx}: proposal/rebuild input index must align"
+        );
+        assert_eq!(
+            sighashes[idx].sighash, sh.sighash,
+            "input {idx}: responder's real proposal sighash must match the rebuilt one"
+        );
+
         // Sign with the responder's key and verify under BIP-340.
         let v_msg = bitcoin::secp256k1::Message::from_digest(sh.sighash);
         let v_sig = secp.sign_schnorr_with_aux_rand(&v_msg, &responder_kp, &aux);
@@ -2233,15 +2244,6 @@ async fn test_psbt_migration_sweep_end_to_end() {
         total_in - fee_sats,
         "sweep output value = sum(inputs) - fee"
     );
-
-    let _ = TaprootSignature {
-        signature: secp.sign_schnorr_with_aux_rand(
-            &bitcoin::secp256k1::Message::from_digest([0u8; 32]),
-            &responder_kp,
-            &aux,
-        ),
-        sighash_type: TapSighashType::Default,
-    };
 
     graceful_shutdown(shutdown1, node1_handle).await;
     graceful_shutdown(shutdown2, node2_handle).await;
