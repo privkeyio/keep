@@ -4,8 +4,11 @@ TypeScript SDK for Keep - secure signing for AI agents.
 
 ## Installation
 
+Not yet published to npm. Build from a clone of the
+[keep](https://github.com/privkeyio/keep) repo:
+
 ```bash
-npm install @keep/agent
+cd keep-agent-ts && npm install && npm run build
 ```
 
 ## Quick Start
