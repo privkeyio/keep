@@ -1,0 +1,20 @@
+[book]
+title = "Keep Documentation"
+authors = ["PrivKey LLC"]
+description = "Self-custodial key management for Nostr and Bitcoin"
+src = "docs"
+language = "en"
+
+[output.html]
+site-url = "/"
+git-repository-url = "https://github.com/privkeyio/keep"
+edit-url-template = "https://github.com/privkeyio/keep/edit/main/docs/{path}"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

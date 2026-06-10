@@ -25,7 +25,7 @@
 Requires Rust 1.89+ (MSRV). System dependencies (for the hardware-signer serial support)
 vary by platform: Linux needs `pkg-config` and `libudev` (`build-essential`/`libudev-dev`),
 macOS needs the Xcode Command Line Tools, and Windows needs nothing extra. See
-[`BUILD.md`](../BUILD.md) for the full list.
+[`BUILD.md`](https://github.com/privkeyio/keep/blob/main/BUILD.md) for the full list.
 
 **Install the CLI directly:**
 
@@ -557,7 +557,7 @@ KEEP_PASSWORD="hidden" keep --hidden list
 
 > `KEEP_PATH` is **not** used by the CLI; it configures the vault path for the `keep-web`
 > co-signer only. For the CLI, use `KEEP_HOME` or `--path`. See
-> [`keep-web/README.md`](../keep-web/README.md) for the co-signer's variables.
+> [`keep-web/README.md`](https://github.com/privkeyio/keep/blob/main/keep-web/README.md) for the co-signer's variables.
 
 ---
 
