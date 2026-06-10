@@ -314,12 +314,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "debugless-unwrap"
-version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f400d0750c0c069e8493f2256cb4da6f604b6d2eeb69a0ca8863acde352f8400"
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -429,13 +423,12 @@ checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
 
 [[package]]
 name = "frost-core"
-version = "2.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2619366c227233c0f817ae01156bd21b8cf74d2bd96cbe0889f4c2e266724e44"
+checksum = "81ef2787af391c7e8bedc037a3b9ea03dde803fbd93e778e6bb369547800e5cd"
 dependencies = [
  "byteorder",
  "const-crc32-nostd",
- "debugless-unwrap",
  "derive-getters",
  "document-features",
  "hex",
@@ -447,13 +440,14 @@ dependencies = [
  "thiserror 2.0.17",
  "visibility",
  "zeroize",
+ "zeroize_derive",
 ]
 
 [[package]]
 name = "frost-rerandomized"
-version = "2.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5eb1ea58c0250b7ce834337f7b19e0417686d14ffc7f626137dea9149762d4"
+checksum = "8f4c5cedd2426728adef2c0b1720f57676354c473836d1ccc50d0f0d1c91942b"
 dependencies = [
  "derive-getters",
  "document-features",
@@ -464,9 +458,9 @@ dependencies = [
 
 [[package]]
 name = "frost-secp256k1-tr"
-version = "2.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff8a25b14bfd5d25deba5edce61ec99c3afb752a1d26630a196bba4cb1c4ca5e"
+checksum = "c6fca4ca9f057cf22066f3eb5bbda59d2af51f429f2aac5982a11a8a841c0993"
 dependencies = [
  "document-features",
  "frost-core",
@@ -628,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "keep-enclave-bin"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "aws-nitro-enclaves-nsm-api",

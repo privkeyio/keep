@@ -19,7 +19,7 @@ hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["alloc", "aes"] }
 signature = "2.2"
 
-frost-secp256k1-tr = { version = "2.2", default-features = false, features = ["serialization"] }
+frost-secp256k1-tr = { version = "3.0", default-features = false, features = ["serialization"] }
 
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 

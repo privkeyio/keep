@@ -205,6 +205,7 @@ impl KfpNode {
         Ok(frost_secp256k1_tr::keys::PublicKeyPackage::new(
             verifying_shares,
             *base.verifying_key(),
+            Some(self.share.metadata.threshold),
         ))
     }
 
