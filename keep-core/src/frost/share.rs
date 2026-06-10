@@ -321,4 +321,57 @@ mod tests {
 
         assert!(opts().deserialize::<StoredShare>(&blob).is_err());
     }
+
+    // Golden bytes from a real 2-of-3 secp256k1-tr group, captured in the pre-3.0
+    // on-disk layout (PublicKeyPackage serialized without the `min_signers` field
+    // that frost-core 3.0 appended). Hardcoded, not regenerated, so a future frost
+    // bump that changes the wire format fails this test instead of silently
+    // locking existing users out of shares written by the 2.2-era release.
+    const GOLDEN_GROUP_PUBKEY: &str =
+        "e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a88";
+    const GOLDEN_PUBKEY_PACKAGE_LEGACY: &str = "00230f8ab3030000000000000000000000000000000000000000000000000000000000000001036800734597e8251af183d2ebe63d4e40e13aadb1fbc6a42b9355bf0e8687b9b9000000000000000000000000000000000000000000000000000000000000000203528367b7e2165da412e85b4dd5dc59f289ecbb2051d2e9f76ff3524b7ce10eab000000000000000000000000000000000000000000000000000000000000000303d408b25a61c86d4cd2c5d56a0e8d697ed81149852971469975dd36d64c5c215b03e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a88";
+    const GOLDEN_KEY_PACKAGE_1: &str = "00230f8ab30000000000000000000000000000000000000000000000000000000000000001fb905abafb56780848f1404d19e7389ca53f838a52cd3d959ba015cbf1f30952036800734597e8251af183d2ebe63d4e40e13aadb1fbc6a42b9355bf0e8687b9b903e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a8802";
+    const GOLDEN_KEY_PACKAGE_2: &str = "00230f8ab300000000000000000000000000000000000000000000000000000000000000020b9bd02ae54309f2459d2399a429b6675874a8a822566ec198cb218c2ddc8c2603528367b7e2165da412e85b4dd5dc59f289ecbb2051d2e9f76ff3524b7ce10eab03e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a8802";
+
+    #[test]
+    fn test_legacy_format_share_deserializes_and_signs() {
+        use crate::frost::sign_with_local_shares;
+        use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+
+        let group_pubkey: [u8; 32] = hex::decode(GOLDEN_GROUP_PUBKEY)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let pubkey_bytes = hex::decode(GOLDEN_PUBKEY_PACKAGE_LEGACY).unwrap();
+
+        let build = |id: u16, kp_hex: &str| {
+            let metadata = ShareMetadata::new(id, 2, 3, group_pubkey, "golden".into());
+            SharePackage::from_bytes(metadata, hex::decode(kp_hex).unwrap(), pubkey_bytes.clone())
+        };
+        let shares = [
+            build(1, GOLDEN_KEY_PACKAGE_1),
+            build(2, GOLDEN_KEY_PACKAGE_2),
+        ];
+
+        // The legacy buffer decodes via frost-core's pre-3.0 compatibility path
+        // and reports min_signers = None.
+        assert!(shares[0].pubkey_package().unwrap().min_signers().is_none());
+        assert!(shares[0].key_package().is_ok());
+
+        // A real BIP-340 signature from the legacy shares still verifies against
+        // the group key, so an upgraded user can still spend.
+        let digest: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(b"legacy share must still sign under frost 3.0").into()
+        };
+        let sig = sign_with_local_shares(&shares, &digest).unwrap();
+        let secp = Secp256k1::verification_only();
+        let xonly = XOnlyPublicKey::from_slice(&group_pubkey).unwrap();
+        secp.verify_schnorr(
+            &schnorr::Signature::from_slice(&sig).unwrap(),
+            &Message::from_digest(digest),
+            &xonly,
+        )
+        .expect("legacy-format share must produce a valid signature under frost 3.0");
+    }
 }

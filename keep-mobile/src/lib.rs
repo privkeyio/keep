@@ -2648,6 +2648,7 @@ impl KeepMobile {
 
         let mut verifying_shares = std::collections::BTreeMap::new();
         verifying_shares.insert(identifier, verifying_share);
+        // Some(1): 1-of-1 nsec import, matching the KeyPackage min_signers above.
         let pubkey_package =
             frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk, Some(1));
 

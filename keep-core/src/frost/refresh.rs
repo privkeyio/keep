@@ -140,6 +140,47 @@ mod tests {
     use super::*;
     use crate::frost::{sign_with_local_shares, ThresholdConfig, TrustedDealer};
 
+    /// A pre-3.0 stored pubkey package decodes with `min_signers = None`, so
+    /// refreshing a share loaded from disk must hit the `Some(threshold)`
+    /// rebuild path before `compute_refreshing_shares`. Freshly
+    /// dealt 3.0 packages already carry `Some`, so re-serialize each pubkey
+    /// without `min_signers` to reproduce the legacy on-disk layout.
+    #[test]
+    fn test_refresh_with_legacy_pubkey_package() {
+        use crate::frost::share::SharePackage;
+
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("legacy").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+
+        let legacy: Vec<SharePackage> = shares
+            .iter()
+            .map(|s| {
+                let pk = s.pubkey_package().unwrap();
+                let old_pubkey =
+                    PublicKeyPackage::new(pk.verifying_shares().clone(), *pk.verifying_key(), None)
+                        .serialize()
+                        .unwrap();
+                SharePackage::from_bytes(
+                    s.metadata.clone(),
+                    s.key_package_bytes().to_vec(),
+                    old_pubkey,
+                )
+            })
+            .collect();
+
+        assert!(legacy[0].pubkey_package().unwrap().min_signers().is_none());
+
+        let (refreshed, _) = refresh_shares(&legacy).unwrap();
+        assert_eq!(refreshed.len(), 3);
+        for share in &refreshed {
+            assert_eq!(*share.group_pubkey(), group_pubkey);
+        }
+
+        let sig = sign_with_local_shares(&refreshed, b"refresh after legacy load").unwrap();
+        assert_eq!(sig.len(), 64);
+    }
+
     #[test]
     fn test_refresh_shares_preserves_group_key() {
         let config = ThresholdConfig::two_of_three();
