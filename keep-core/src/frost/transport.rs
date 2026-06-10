@@ -211,8 +211,11 @@ fn import_ed25519_share(
 
     let mut verifying_shares = BTreeMap::new();
     verifying_shares.insert(*key_package.identifier(), *key_package.verifying_share());
-    let pubkey_package =
-        frost::keys::PublicKeyPackage::new(verifying_shares, *key_package.verifying_key());
+    let pubkey_package = frost::keys::PublicKeyPackage::new(
+        verifying_shares,
+        *key_package.verifying_key(),
+        Some(*key_package.min_signers()),
+    );
 
     let key_package_bytes = key_package
         .serialize()
@@ -250,7 +253,11 @@ fn derive_pubkey_package(
     let mut verifying_shares = BTreeMap::new();
     verifying_shares.insert(*key_package.identifier(), *verifying_share);
 
-    Ok(PublicKeyPackage::new(verifying_shares, *verifying_key))
+    Ok(PublicKeyPackage::new(
+        verifying_shares,
+        *verifying_key,
+        Some(*key_package.min_signers()),
+    ))
 }
 
 /// A FROST protocol message for network transport.

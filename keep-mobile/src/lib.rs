@@ -2648,7 +2648,8 @@ impl KeepMobile {
 
         let mut verifying_shares = std::collections::BTreeMap::new();
         verifying_shares.insert(identifier, verifying_share);
-        let pubkey_package = frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk);
+        let pubkey_package =
+            frost_secp256k1_tr::keys::PublicKeyPackage::new(verifying_shares, vk, Some(1));
 
         Ok((key_package, pubkey_package, vk_bytes))
     }

@@ -398,7 +398,7 @@ pub mod nip49 {
     }
 
     fn derive_key(password: &str, salt: &[u8; 16], log_n: u8) -> Result<Zeroizing<[u8; 32]>> {
-        let params = scrypt::Params::new(log_n, 8, 1, 32)
+        let params = scrypt::Params::new(log_n, 8, 1)
             .map_err(|e| CryptoError::kdf(format!("scrypt params: {e}")))?;
 
         let mut key = Zeroizing::new([0u8; 32]);

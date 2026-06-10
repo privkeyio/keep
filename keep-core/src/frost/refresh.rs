@@ -74,6 +74,11 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
     }
 
     let pubkey_pkg = shares[0].pubkey_package()?;
+    let pubkey_pkg = PublicKeyPackage::new(
+        pubkey_pkg.verifying_shares().clone(),
+        *pubkey_pkg.verifying_key(),
+        Some(threshold),
+    );
 
     let mut key_packages: Vec<KeyPackage> = shares
         .iter()
@@ -83,14 +88,8 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
     let identifiers: Vec<Identifier> = key_packages.iter().map(|kp| *kp.identifier()).collect();
 
     let (refreshing_shares, new_pubkey_pkg) =
-        compute_refreshing_shares::<frost::Secp256K1Sha256TR, _>(
-            pubkey_pkg,
-            total,
-            threshold,
-            &identifiers,
-            &mut OsRng,
-        )
-        .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;
+        compute_refreshing_shares(pubkey_pkg, &identifiers, &mut OsRng)
+            .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;
 
     if refreshing_shares.len() != identifiers.len() {
         return Err(KeepError::Frost(format!(
@@ -111,9 +110,8 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             KeepError::Frost(format!("No refreshing share for identifier {id:?}"))
         })?;
 
-        let new_kp =
-            refresh_share::<frost::Secp256K1Sha256TR>(refreshing_share.clone(), current_kp)
-                .map_err(|e| KeepError::Frost(format!("Refresh share failed: {e}")))?;
+        let new_kp = refresh_share(refreshing_share.clone(), current_kp)
+            .map_err(|e| KeepError::Frost(format!("Refresh share failed: {e}")))?;
 
         if new_kp.identifier() != &id {
             return Err(KeepError::Frost(

@@ -112,7 +112,11 @@ pub fn sign_with_local_shares(shares: &[SharePackage], message: &[u8]) -> Result
         .values()
         .next()
         .ok_or_else(|| KeepError::Frost("No key packages".into()))?;
-    let pubkey_pkg = PublicKeyPackage::new(verifying_shares, *first_kp.verifying_key());
+    let pubkey_pkg = PublicKeyPackage::new(
+        verifying_shares,
+        *first_kp.verifying_key(),
+        Some(*first_kp.min_signers()),
+    );
 
     let signature = frost::aggregate(&signing_package, &signature_shares, &pubkey_pkg)
         .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))?;

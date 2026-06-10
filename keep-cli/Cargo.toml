@@ -38,7 +38,7 @@ urlencoding = "2.1"
 url = "2.5"
 base64 = "0.22"
 
-frost-secp256k1-tr = "2.2.0"
+frost-secp256k1-tr = "3.0.0"
 sha2 = "0.10.9"
 rand = "0.10"
 
