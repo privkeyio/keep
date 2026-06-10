@@ -6,11 +6,10 @@ src = "docs"
 language = "en"
 
 [output.html]
-site-url = "/"
 git-repository-url = "https://github.com/privkeyio/keep"
 edit-url-template = "https://github.com/privkeyio/keep/edit/main/docs/{path}"
-default-theme = "navy"
-preferred-dark-theme = "navy"
+# Theme (default-theme, site-url) is enforced by the docs.privkey.io aggregator
+# at build time; see github.com/privkeyio/docs.
 
 [output.html.fold]
 enable = true
