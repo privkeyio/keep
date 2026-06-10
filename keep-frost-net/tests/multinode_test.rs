@@ -2224,11 +2224,24 @@ async fn test_psbt_migration_sweep_end_to_end() {
             "input {idx}: responder's real proposal sighash must match the rebuilt one"
         );
 
-        // Sign with the responder's key and verify under BIP-340.
+        // Verify the responder's actual contributed signature, not a re-signed
+        // copy. Pulls the schnorr sig the responder merged into the proposal
+        // PSBT before contributing; re-signing here would tautologically pass
+        // regardless of whether the PSBT coordination produced a valid sig.
         let v_msg = bitcoin::secp256k1::Message::from_digest(sh.sighash);
-        let v_sig = secp.sign_schnorr_with_aux_rand(&v_msg, &responder_kp, &aux);
-        secp.verify_schnorr(&v_sig, &v_msg, &responder_xonly)
-            .expect("sweep input signature MUST verify under BIP-340");
+        let contributed_sig = responder_psbt.inputs[sh.input_index]
+            .tap_script_sigs
+            .get(&(responder_xonly, sh.leaf_hash))
+            .unwrap_or_else(|| {
+                panic!(
+                    "input {idx}: PSBT is missing the responder's tap_script_sig \
+                     for (xonly={responder_xonly:?}, leaf={:?}); \
+                     PSBT merging or storage regression",
+                    sh.leaf_hash
+                )
+            });
+        secp.verify_schnorr(&contributed_sig.signature, &v_msg, &responder_xonly)
+            .expect("responder's contributed sweep signature MUST verify under BIP-340");
     }
 
     // The proposer-side build produced exactly the right output shape: one

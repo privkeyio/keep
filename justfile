@@ -52,7 +52,7 @@ clean:
 
 test:
     cargo test --workspace --lib --bins
-    cargo test -p keep-core --test integration_tests
+    cargo test -p keep-core --features testing --test integration_tests
     cargo test -p keep-frost-net --features testing --test multinode_test
     cargo test -p keep-enclave-host --test integration_tests
 
