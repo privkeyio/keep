@@ -1002,6 +1002,21 @@ impl KfpNode {
         self.share.metadata.identifier
     }
 
+    /// Test-only: inject a fully-formed descriptor session directly into the
+    /// node's session manager. Used by integration tests that need a
+    /// `Complete` migration session as a precondition for sweep coordination,
+    /// without running the full descriptor proposal/contribute/finalize/ACK
+    /// flow.
+    #[doc(hidden)]
+    pub fn test_inject_descriptor_session(
+        &self,
+        session: crate::descriptor_session::DescriptorSession,
+    ) {
+        self.descriptor_sessions
+            .write()
+            .test_insert_session(session);
+    }
+
     pub fn set_replay_window(&mut self, secs: u64) {
         self.replay_window_secs = secs;
     }
