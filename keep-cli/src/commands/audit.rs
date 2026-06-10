@@ -453,6 +453,10 @@ mod stats_tests {
         stats.record(AuditEventType::RateLimitTripped);
         stats.record(AuditEventType::VaultUnlock);
         stats.record(AuditEventType::VaultLock);
+        stats.record(AuditEventType::PasswordRotate);
+        stats.record(AuditEventType::PasswordRotateFailed);
+        stats.record(AuditEventType::DataKeyRotate);
+        stats.record(AuditEventType::DataKeyRotateFailed);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -472,6 +476,10 @@ mod stats_tests {
         assert_eq!(stats.rate_limit_tripped, 1);
         assert_eq!(stats.unlock, 1);
         assert_eq!(stats.lock, 1);
+        assert_eq!(stats.password_rotate_ok, 1);
+        assert_eq!(stats.password_rotate_fail, 1);
+        assert_eq!(stats.data_key_rotate_ok, 1);
+        assert_eq!(stats.data_key_rotate_fail, 1);
     }
 
     /// Closes the #526 gap surfaced by #441's testing pass: each of the
