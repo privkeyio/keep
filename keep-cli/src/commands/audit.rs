@@ -307,6 +307,10 @@ struct AuditStats {
     rate_limit_tripped: u32,
     unlock: u32,
     lock: u32,
+    password_rotate_ok: u32,
+    password_rotate_fail: u32,
+    data_key_rotate_ok: u32,
+    data_key_rotate_fail: u32,
 }
 
 impl AuditStats {
@@ -334,6 +338,10 @@ impl AuditStats {
             AuditEventType::RateLimitTripped => self.rate_limit_tripped += 1,
             AuditEventType::VaultUnlock => self.unlock += 1,
             AuditEventType::VaultLock => self.lock += 1,
+            AuditEventType::PasswordRotate => self.password_rotate_ok += 1,
+            AuditEventType::PasswordRotateFailed => self.password_rotate_fail += 1,
+            AuditEventType::DataKeyRotate => self.data_key_rotate_ok += 1,
+            AuditEventType::DataKeyRotateFailed => self.data_key_rotate_fail += 1,
         }
     }
 }
@@ -398,6 +406,14 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     out.info(&format!("  Vault locks: {}", stats.lock));
     out.info(&format!("  Auth failures: {}", stats.auth_fail));
     out.info(&format!("  Rate limit trips: {}", stats.rate_limit_tripped));
+    out.info(&format!(
+        "  Password rotations: {} ok / {} failed",
+        stats.password_rotate_ok, stats.password_rotate_fail
+    ));
+    out.info(&format!(
+        "  Data-key rotations: {} ok / {} failed",
+        stats.data_key_rotate_ok, stats.data_key_rotate_fail
+    ));
 
     Ok(())
 }
@@ -437,6 +453,10 @@ mod stats_tests {
         stats.record(AuditEventType::RateLimitTripped);
         stats.record(AuditEventType::VaultUnlock);
         stats.record(AuditEventType::VaultLock);
+        stats.record(AuditEventType::PasswordRotate);
+        stats.record(AuditEventType::PasswordRotateFailed);
+        stats.record(AuditEventType::DataKeyRotate);
+        stats.record(AuditEventType::DataKeyRotateFailed);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -456,6 +476,10 @@ mod stats_tests {
         assert_eq!(stats.rate_limit_tripped, 1);
         assert_eq!(stats.unlock, 1);
         assert_eq!(stats.lock, 1);
+        assert_eq!(stats.password_rotate_ok, 1);
+        assert_eq!(stats.password_rotate_fail, 1);
+        assert_eq!(stats.data_key_rotate_ok, 1);
+        assert_eq!(stats.data_key_rotate_fail, 1);
     }
 
     /// Closes the #526 gap surfaced by #441's testing pass: each of the

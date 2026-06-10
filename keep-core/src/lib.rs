@@ -1292,18 +1292,42 @@ impl Keep {
     /// Re-encrypts the data encryption key with a new password-derived key.
     /// The data encryption key itself is unchanged, so stored secrets remain intact.
     pub fn rotate_password(&mut self, old_password: &str, new_password: &str) -> Result<()> {
-        self.storage.rotate_password(old_password, new_password)?;
-        self.keyring.clear();
-        self.load_keys_to_keyring()?;
-        Ok(())
+        match self.storage.rotate_password(old_password, new_password) {
+            Ok(()) => {
+                self.keyring.clear();
+                self.load_keys_to_keyring()?;
+                // Audit AFTER reloading the keyring so the entry binds to the
+                // post-rotation state. Logged through `audit_event`, which
+                // silently no-ops when the vault has no accessible data key.
+                self.audit_event(AuditEventType::PasswordRotate, |e| e);
+                Ok(())
+            }
+            Err(e) => {
+                // Failed attempts are observable only when the vault was
+                // unlocked before the call (audit log needs the data key).
+                let reason = e.to_string();
+                self.audit_event(AuditEventType::PasswordRotateFailed, |entry| {
+                    entry.with_success(false).with_reason(&reason)
+                });
+                Err(e)
+            }
+        }
     }
 
     /// Rotate the data encryption key.
     ///
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
+        // A locked vault has no data key, so the failure entry cannot be
+        // encrypted/recorded here; `audit_event` no-ops in that case.
         let old_data_key = self.get_data_key()?;
-        self.storage.rotate_data_key(password)?;
+        if let Err(e) = self.storage.rotate_data_key(password) {
+            let reason = e.to_string();
+            self.audit_event(AuditEventType::DataKeyRotateFailed, |entry| {
+                entry.with_success(false).with_reason(&reason)
+            });
+            return Err(e);
+        }
         let new_data_key = self.get_data_key()?;
 
         if let Some(ref mut audit) = self.audit {
@@ -1315,6 +1339,9 @@ impl Keep {
 
         self.keyring.clear();
         self.load_keys_to_keyring()?;
+        // Log AFTER re-encryption: ensures the audit log is now encrypted
+        // under the new data key and the entry sits at the head of the chain.
+        self.audit_event(AuditEventType::DataKeyRotate, |e| e);
         Ok(())
     }
 
@@ -1933,6 +1960,126 @@ mod tests {
             let slot = keep.keyring().get(&pubkey).unwrap();
             assert_eq!(slot.name, "dektest");
         }
+    }
+
+    // === #566: audit-log entries for rotation security operations ===
+
+    /// `Keep::rotate_password` MUST emit a `PasswordRotate` audit entry on
+    /// success. Without this, security-sensitive password rotations leave no
+    /// observable trace for the operator or for post-incident review.
+    #[test]
+    fn rotate_password_emits_success_audit_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        {
+            let mut keep = test_keep(&path);
+            keep.generate_key("audited").unwrap();
+            keep.rotate_password("testpass", "newpass1").unwrap();
+            let entries = keep.audit_read_all().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::PasswordRotate),
+                "PasswordRotate entry missing from audit log: {:?}",
+                entries.iter().map(|e| e.event_type).collect::<Vec<_>>()
+            );
+        }
+        // Re-open with the NEW password to confirm the audit log survived the
+        // header rotation and still chain-verifies.
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("newpass1").unwrap();
+        keep.audit_verify_chain().unwrap();
+        let entries = keep.audit_read_all().unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.event_type == AuditEventType::PasswordRotate));
+    }
+
+    /// `Keep::rotate_password` MUST emit a `PasswordRotateFailed` audit entry
+    /// when the call is rejected, so failed attacker attempts are observable.
+    /// Failed attempts on an already-locked vault cannot be recorded (data
+    /// key unavailable); this test exercises the unlocked path and uses an
+    /// invalid new password as the failure trigger because Storage's
+    /// `rotate_password` short-circuits the wrong-old-password check when
+    /// the vault is already unlocked (which is the path that admits audit
+    /// writes), while `validate_new_password` is enforced unconditionally.
+    #[test]
+    fn rotate_password_emits_failure_audit_entry_when_unlocked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.generate_key("audited").unwrap();
+
+        let pre = keep.audit_read_all().unwrap().len();
+
+        // Empty new password: validate_new_password rejects.
+        assert!(keep.rotate_password("testpass", "").is_err());
+        let after_empty = keep.audit_read_all().unwrap();
+        assert!(
+            after_empty.len() > pre,
+            "audit log should grow on empty-new-password rejection"
+        );
+        let failure = after_empty
+            .iter()
+            .find(|e| e.event_type == AuditEventType::PasswordRotateFailed)
+            .expect("PasswordRotateFailed entry missing after empty-new-password rejection");
+        assert!(
+            !failure.success,
+            "PasswordRotateFailed entry must be marked success=false"
+        );
+        assert!(
+            failure.reason.is_some(),
+            "PasswordRotateFailed entry must record a failure reason"
+        );
+
+        // Too-short new password: same rejection.
+        let pre2 = keep.audit_read_all().unwrap().len();
+        assert!(keep.rotate_password("testpass", "a").is_err());
+        let entries = keep.audit_read_all().unwrap();
+        assert!(
+            entries.len() > pre2,
+            "audit log should grow on too-short-new-password rejection"
+        );
+        // The original password still unlocks: failure paths don't corrupt
+        // the header. Drop the first handle before reopening so the vault
+        // file lock is released.
+        drop(keep);
+        let mut reopened = Keep::open(&path).unwrap();
+        reopened.unlock("testpass").unwrap();
+    }
+
+    /// `Keep::rotate_data_key` MUST emit a `DataKeyRotate` audit entry on
+    /// success. The entry's payload is encrypted under the NEW data key (the
+    /// log gets re-encrypted as part of rotation); this test confirms the
+    /// entry is readable after rotation and the chain still verifies.
+    #[test]
+    fn rotate_data_key_emits_success_audit_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        {
+            let mut keep = test_keep(&path);
+            keep.generate_key("dek-audit").unwrap();
+            keep.rotate_data_key("testpass").unwrap();
+            let entries = keep.audit_read_all().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::DataKeyRotate),
+                "DataKeyRotate entry missing from audit log: {:?}",
+                entries.iter().map(|e| e.event_type).collect::<Vec<_>>()
+            );
+            // The audit log was re-encrypted under the new data key during
+            // rotation; the chain over both pre- and post-rotation entries
+            // must remain valid.
+            keep.audit_verify_chain().unwrap();
+        }
+        // Confirm persistence: re-open and the entry is still there.
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        let entries = keep.audit_read_all().unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.event_type == AuditEventType::DataKeyRotate));
     }
 
     #[test]
