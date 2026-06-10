@@ -35,17 +35,48 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 
 ## Quick Start
 
+Install the CLI (Rust 1.89+):
+
 ```bash
+cargo install --git https://github.com/privkeyio/keep keep-cli
+```
+
+Building needs `pkg-config` and `libudev` (Linux); see [`BUILD.md`](BUILD.md) for the full
+per-platform dependency list.
+
+Or build from a clone:
+
+```bash
+git clone https://github.com/privkeyio/keep
+cd keep
 cargo install --path keep-cli
 ```
 
+Then:
+
 ```bash
-keep init                     # Create encrypted vault
+keep init                     # Create encrypted vault (prompts for a password)
 keep generate --name main     # Generate a new Nostr key
 keep serve --relay wss://bucket.coracle.social  # Start remote signer
 ```
 
-Keys are stored encrypted at `~/.keep`. See [`docs/USAGE.md`](docs/USAGE.md) for full CLI reference, FROST setup, Bitcoin commands, and more.
+Keys are stored encrypted at `~/.keep` (override with `KEEP_HOME` or `--path`). Set
+`KEEP_PASSWORD` to skip the interactive unlock prompt in scripts. Back up your vault with
+`keep backup`; see [`docs/USAGE.md`](docs/USAGE.md) for the full CLI reference, FROST
+setup, Bitcoin commands, and more.
+
+## Documentation
+
+| Doc | Covers |
+|-----|--------|
+| [`docs/USAGE.md`](docs/USAGE.md) | CLI reference, FROST, Bitcoin, agents, hidden volumes, troubleshooting |
+| [`keep-web/README.md`](keep-web/README.md) | Self-hosting the headless co-signer (config, auth, API) |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | Cryptography and threat model |
+| [`docs/ENCLAVE.md`](docs/ENCLAVE.md) | AWS Nitro Enclave deployment |
+| [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md) | Threshold-signed releases |
+| [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) | Reproducible builds |
+| [`BUILD.md`](BUILD.md) | Building from source, system dependencies |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributing guidelines |
 
 ## Development
 
