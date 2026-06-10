@@ -39,7 +39,7 @@ Keys live only in enclave memory. KMS decrypts only if PCRs match.
 - AWS account with EC2, KMS, IAM permissions
 - AWS CLI configured
 - Docker installed
-- Nitro SDK binaries, see [keep-enclave/build/README.md](../keep-enclave/build/README.md)
+- Nitro SDK binaries, see [keep-enclave/build/README.md](https://github.com/privkeyio/keep/blob/main/keep-enclave/build/README.md)
 
 ## Deployment Options
 
@@ -153,7 +153,7 @@ exit  # Re-login to apply groups
 
 ## Build Enclave
 
-See [keep-enclave/build/README.md](../keep-enclave/build/README.md). Produces `keep-enclave.eif` and `pcrs.json`.
+See [keep-enclave/build/README.md](https://github.com/privkeyio/keep/blob/main/keep-enclave/build/README.md). Produces `keep-enclave.eif` and `pcrs.json`.
 
 PCRs (Platform Configuration Registers) are hashes of the enclave code. They change on rebuild. KMS uses them to restrict decryption to your exact code.
 
