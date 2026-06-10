@@ -317,6 +317,35 @@ impl DescriptorSession {
         &self.contributions
     }
 
+    /// Test-only: construct a session directly in `Complete` state with the
+    /// supplied finalized descriptor. Skips the normal Proposed → contribute
+    /// → Finalized → ACK protocol that the production coordination paths
+    /// require; used by integration tests that need a `Complete` session as
+    /// a precondition for downstream PSBT or sweep flows.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_completed(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        policy: WalletPolicy,
+        network: String,
+        descriptor: FinalizedDescriptor,
+    ) -> Self {
+        let mut s = Self::new(
+            session_id,
+            group_pubkey,
+            policy,
+            network,
+            HashSet::new(),
+            HashSet::new(),
+            Duration::from_secs(DESCRIPTOR_SESSION_TIMEOUT_SECS),
+        );
+        s.descriptor = Some(descriptor);
+        s.state = DescriptorSessionState::Complete;
+        s.finalized_at = Some(Instant::now());
+        s
+    }
+
     pub fn set_finalized(&mut self, descriptor: FinalizedDescriptor) -> Result<()> {
         if self.state != DescriptorSessionState::Proposed {
             return Err(FrostNetError::Session(
@@ -687,6 +716,18 @@ impl DescriptorSessionManager {
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Test-only: inject a fully-formed `DescriptorSession` directly into
+    /// the manager, bypassing the coordination protocol. Used by integration
+    /// tests that need a `Complete` session as a precondition for downstream
+    /// PSBT/sweep coordination flows without re-running descriptor proposal,
+    /// contribution, finalization, and ACK rounds.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_insert_session(&mut self, session: DescriptorSession) {
+        let sid = *session.session_id();
+        self.sessions.insert(sid, session);
     }
 
     pub fn create_session(
