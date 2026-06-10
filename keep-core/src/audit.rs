@@ -75,6 +75,18 @@ pub enum AuditEventType {
     /// time on the NEXT successful unlock, since the data key needed to
     /// encrypt audit entries is not available while the vault is locked.
     RateLimitTripped = 20,
+    /// Vault password rotated successfully.
+    PasswordRotate = 21,
+    /// Vault password rotation attempted but rejected (wrong old password,
+    /// invalid new password, or mid-rotation failure). Recorded only when
+    /// the vault was unlocked at attempt time; failed attempts on a locked
+    /// vault cannot be persisted because the audit log needs the data key.
+    PasswordRotateFailed = 22,
+    /// Data encryption key rotated successfully.
+    DataKeyRotate = 23,
+    /// Data-key rotation attempted but rejected (wrong password or mid-
+    /// rotation failure). Same locked-vault caveat as `PasswordRotateFailed`.
+    DataKeyRotateFailed = 24,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -101,6 +113,10 @@ impl std::fmt::Display for AuditEventType {
             Self::VaultLock => write!(f, "vault_lock"),
             Self::FrostShareRefresh => write!(f, "frost_share_refresh"),
             Self::RateLimitTripped => write!(f, "rate_limit_tripped"),
+            Self::PasswordRotate => write!(f, "password_rotate"),
+            Self::PasswordRotateFailed => write!(f, "password_rotate_failed"),
+            Self::DataKeyRotate => write!(f, "data_key_rotate"),
+            Self::DataKeyRotateFailed => write!(f, "data_key_rotate_failed"),
         }
     }
 }
