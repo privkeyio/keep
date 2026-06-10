@@ -411,8 +411,11 @@ Secure signing for AI agents with constrained sessions.
 
 ### Python
 
+Not yet published to PyPI. Install from a repo clone (the build backend is
+[maturin](https://www.maturin.rs/)):
+
 ```bash
-pip install keep-agent
+pip install ./keep-agent-py
 ```
 
 ```python
@@ -453,8 +456,10 @@ tools = create_keep_tools(session)
 
 ### TypeScript
 
+Not yet published to npm. Build from a repo clone:
+
 ```bash
-npm install @keep/agent
+cd keep-agent-ts && npm install && npm run build
 ```
 
 ```typescript

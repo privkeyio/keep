@@ -4,8 +4,11 @@ Python SDK for Keep - secure signing for AI agents.
 
 ## Installation
 
+Not yet published to PyPI. Install from a clone of the [keep](https://github.com/privkeyio/keep)
+repo (built with [maturin](https://www.maturin.rs/)):
+
 ```bash
-pip install keep-agent
+pip install ./keep-agent-py
 ```
 
 ## Quick Start
