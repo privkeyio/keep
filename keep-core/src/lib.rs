@@ -1305,7 +1305,10 @@ impl Keep {
             Err(e) => {
                 // Failed attempts are observable only when the vault was
                 // unlocked before the call (audit log needs the data key).
-                self.audit_event(AuditEventType::PasswordRotateFailed, |e| e);
+                let reason = e.to_string();
+                self.audit_event(AuditEventType::PasswordRotateFailed, |entry| {
+                    entry.with_success(false).with_reason(&reason)
+                });
                 Err(e)
             }
         }
@@ -1315,15 +1318,14 @@ impl Keep {
     ///
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
-        let old_data_key = match self.get_data_key() {
-            Ok(k) => k,
-            Err(e) => {
-                self.audit_event(AuditEventType::DataKeyRotateFailed, |e| e);
-                return Err(e);
-            }
-        };
+        // A locked vault has no data key, so the failure entry cannot be
+        // encrypted/recorded here; `audit_event` no-ops in that case.
+        let old_data_key = self.get_data_key()?;
         if let Err(e) = self.storage.rotate_data_key(password) {
-            self.audit_event(AuditEventType::DataKeyRotateFailed, |e| e);
+            let reason = e.to_string();
+            self.audit_event(AuditEventType::DataKeyRotateFailed, |entry| {
+                entry.with_success(false).with_reason(&reason)
+            });
             return Err(e);
         }
         let new_data_key = self.get_data_key()?;
@@ -2017,11 +2019,17 @@ mod tests {
             after_empty.len() > pre,
             "audit log should grow on empty-new-password rejection"
         );
+        let failure = after_empty
+            .iter()
+            .find(|e| e.event_type == AuditEventType::PasswordRotateFailed)
+            .expect("PasswordRotateFailed entry missing after empty-new-password rejection");
         assert!(
-            after_empty
-                .iter()
-                .any(|e| e.event_type == AuditEventType::PasswordRotateFailed),
-            "PasswordRotateFailed entry missing after empty-new-password rejection"
+            !failure.success,
+            "PasswordRotateFailed entry must be marked success=false"
+        );
+        assert!(
+            failure.reason.is_some(),
+            "PasswordRotateFailed entry must record a failure reason"
         );
 
         // Too-short new password: same rejection.
