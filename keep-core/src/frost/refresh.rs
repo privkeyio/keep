@@ -349,8 +349,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("distinct identifiers")
-                && msg.contains(&dup_identifier.to_string()),
+            msg.contains("distinct identifiers") && msg.contains(&dup_identifier.to_string()),
             "expected duplicate rejection naming the identifier, got {msg}"
         );
         assert!(
