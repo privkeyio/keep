@@ -679,15 +679,28 @@ pub fn cmd_rotate_password(out: &Output, path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let spinner = out.spinner("Rotating password...");
-    keep.rotate_password(old_password.expose_secret(), new_password.expose_secret())?;
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(old_password.expose_secret())?;
     spinner.finish();
 
-    info!("password rotated");
-    out.newline();
-    out.success("Password rotated successfully!");
-
-    Ok(())
+    let spinner = out.spinner("Rotating password...");
+    let result = keep.rotate_password(old_password.expose_secret(), new_password.expose_secret());
+    spinner.finish();
+    match result {
+        Ok(()) => {
+            info!("password rotated");
+            out.newline();
+            out.success("Password rotated successfully!");
+            Ok(())
+        }
+        Err(KeepError::AuditWriteFailed(e)) => {
+            warn!("password rotated but audit entry failed: {e}");
+            out.newline();
+            out.warn("Password WAS rotated: unlock with the NEW password from now on. The audit entry could not be written.");
+            Err(KeepError::AuditWriteFailed(e))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
@@ -702,25 +715,34 @@ pub fn cmd_rotate_data_key(out: &Output, path: &Path) -> Result<()> {
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
-    let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(password.expose_secret())?;
-    spinner.finish();
-
     if !get_confirm("Rotate data encryption key? This will re-encrypt all stored keys and shares.")?
     {
         out.info("Cancelled.");
         return Ok(());
     }
 
-    let spinner = out.spinner("Rotating data key and re-encrypting all secrets...");
-    keep.rotate_data_key(password.expose_secret())?;
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    info!("data key rotated");
-    out.newline();
-    out.success("Data key rotated successfully!");
-
-    Ok(())
+    let spinner = out.spinner("Rotating data key and re-encrypting all secrets...");
+    let result = keep.rotate_data_key(password.expose_secret());
+    spinner.finish();
+    match result {
+        Ok(()) => {
+            info!("data key rotated");
+            out.newline();
+            out.success("Data key rotated successfully!");
+            Ok(())
+        }
+        Err(KeepError::AuditWriteFailed(e)) => {
+            warn!("data key rotated but audit entry failed: {e}");
+            out.newline();
+            out.warn("Data key WAS rotated and all secrets re-encrypted. The audit entry could not be written.");
+            Err(KeepError::AuditWriteFailed(e))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]

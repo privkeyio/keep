@@ -504,6 +504,13 @@ pub enum KeepError {
     InvalidNetwork(String),
     #[error("Rotation failed: {0}")]
     RotationFailed(String),
+    /// Audit-log write failed for a security-critical event. Distinct from
+    /// best-effort audit failures (those are only warn-logged): operations
+    /// that return this variant performed their side effect (e.g. password /
+    /// data-key rotation) but the audit entry could not be persisted, so the
+    /// operation is observable only via this error.
+    #[error("Audit write failed: {0}")]
+    AuditWriteFailed(String),
     #[error("Encryption error: {0}")]
     Encryption(String),
     #[error("Database error: {0}")]
