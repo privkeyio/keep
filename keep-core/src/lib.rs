@@ -627,14 +627,16 @@ impl Keep {
         }
 
         let threshold = group_shares[0].metadata.threshold;
+        let total = group_shares[0].metadata.total_shares;
 
         let share_count: u16 = group_shares
             .len()
             .try_into()
             .map_err(|_| KeepError::Frost("Too many shares".into()))?;
-        if share_count < threshold {
+        if share_count != total {
             return Err(KeepError::Frost(format!(
-                "Need at least {threshold} shares to refresh, only {share_count} available locally"
+                "refresh requires the full set of {total} shares; only {share_count} available. \
+                 A partial refresh would orphan the absent shares (#586)."
             )));
         }
 
