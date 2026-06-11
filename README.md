@@ -94,6 +94,10 @@ Pure Rust with `#![forbid(unsafe_code)]`. Keys are derived with Argon2id, encryp
 
 Keep can threshold-sign software releases with a FROST-Ed25519 group (minisign-compatible), so no single maintainer holds the signing key. See [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
 
+## Status
+
+Keep is pre-1.0 and under active development. Public APIs and on-disk formats may change between releases, so pin a version if you build on it. The cryptography has had internal review but no independent third-party audit yet. Use at your own risk, and don't secure more than you can afford to lose.
+
 ## License
 
 [MIT](LICENSE)
