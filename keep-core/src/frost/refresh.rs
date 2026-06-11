@@ -72,6 +72,19 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             "Need at least {threshold} shares to refresh, only {share_count} available"
         )));
     }
+    // #586: FROST 3.0's `compute_refreshing_shares` only refreshes the
+    // identifiers passed in, so a subset call (>= threshold but < total)
+    // silently orphans every absent share. The refreshed shares still
+    // advertise the full `total_shares` in metadata, so a holder of an
+    // absent share would believe they are still part of the group when
+    // they have actually been excluded. Refuse partial refresh outright;
+    // callers must collect the full set or use a different protocol.
+    if share_count != total {
+        return Err(KeepError::Frost(format!(
+            "refresh_shares requires the full set of {total} shares; got {share_count}. \
+             A partial refresh would silently orphan the absent shares (#586)."
+        )));
+    }
 
     let pubkey_pkg = shares[0].pubkey_package()?;
     let pubkey_pkg = PublicKeyPackage::new(
@@ -250,6 +263,44 @@ mod tests {
     fn test_refresh_empty_shares_fails() {
         let result = refresh_shares(&[]);
         assert!(result.is_err());
+    }
+
+    /// #586: a subset call (>= threshold but < total) MUST be refused.
+    /// FROST 3.0's `compute_refreshing_shares` silently drops every absent
+    /// identifier, and the refreshed shares still claim the full
+    /// `total_shares` in metadata, so a holder of an absent share would
+    /// believe they are still part of an N-of-M group after they have been
+    /// orphaned. Pin both: 2 of 3 (above threshold, below total) refused,
+    /// and the error message names the gap.
+    #[test]
+    fn test_refresh_with_subset_below_total_is_refused() {
+        let config = ThresholdConfig::two_of_three();
+        let dealer = TrustedDealer::new(config);
+        let (mut shares, _) = dealer.generate("test-subset").unwrap();
+
+        // Drop the third share, leaving 2 of 3 (meets threshold = 2).
+        shares.pop();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].metadata.threshold, 2);
+        assert_eq!(shares[0].metadata.total_shares, 3);
+
+        let err = match refresh_shares(&shares) {
+            Ok(_) => panic!("subset refresh must be refused"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires the full set") && msg.contains("3 shares"),
+            "expected subset-refresh rejection naming the total, got {msg}"
+        );
+        assert!(
+            msg.contains("got 2"),
+            "expected the rejection to name the observed share count, got {msg}"
+        );
+        assert!(
+            msg.contains("#586"),
+            "rejection should reference the issue for future readers, got {msg}"
+        );
     }
 
     #[test]
