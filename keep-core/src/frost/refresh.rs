@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
 use frost::keys::{KeyPackage, PublicKeyPackage};
@@ -84,6 +84,20 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             "refresh_shares requires the full set of {total} shares; got {share_count}. \
              A partial refresh would silently orphan the absent shares (#586)."
         )));
+    }
+    // #586: a full-cardinality call with a duplicated identifier (e.g. [A, A, B]
+    // for a 3-member group) passes the count guard yet still orphans the absent
+    // member, because `refreshing_by_id` collapses the duplicate. Require every
+    // supplied share to carry a distinct identifier.
+    let mut seen = BTreeSet::new();
+    for share in shares {
+        if !seen.insert(share.metadata.identifier) {
+            return Err(KeepError::Frost(format!(
+                "refresh_shares requires distinct identifiers; identifier {} appears more than \
+                 once. A partial refresh would silently orphan the absent shares (#586).",
+                share.metadata.identifier
+            )));
+        }
     }
 
     let pubkey_pkg = shares[0].pubkey_package()?;
@@ -296,6 +310,48 @@ mod tests {
         assert!(
             msg.contains("got 2"),
             "expected the rejection to name the observed share count, got {msg}"
+        );
+        assert!(
+            msg.contains("#586"),
+            "rejection should reference the issue for future readers, got {msg}"
+        );
+    }
+
+    /// #586: a full-cardinality call with a DUPLICATED identifier (e.g.
+    /// [A, A, B] for a 3-member group) passes the count guard but still
+    /// orphans the genuinely-absent member, because `refreshing_by_id`
+    /// collapses the duplicate. Reject it before any rotation happens, and
+    /// name the offending identifier.
+    #[test]
+    fn test_refresh_with_duplicate_identifier_is_refused() {
+        use crate::frost::share::SharePackage;
+
+        let config = ThresholdConfig::two_of_three();
+        let dealer = TrustedDealer::new(config);
+        let (mut shares, _) = dealer.generate("test-dup").unwrap();
+
+        let dup_identifier = shares[0].metadata.identifier;
+        let duplicate = SharePackage::from_bytes(
+            shares[0].metadata.clone(),
+            shares[0].key_package_bytes().to_vec(),
+            shares[0].pubkey_package_bytes().to_vec(),
+        );
+
+        // Drop the third member and replace it with a copy of the first, so
+        // there are still 3 shares but only 2 distinct identifiers.
+        shares.pop();
+        shares.push(duplicate);
+        assert_eq!(shares.len(), 3);
+
+        let err = match refresh_shares(&shares) {
+            Ok(_) => panic!("duplicate-identifier refresh must be refused"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distinct identifiers")
+                && msg.contains(&dup_identifier.to_string()),
+            "expected duplicate rejection naming the identifier, got {msg}"
         );
         assert!(
             msg.contains("#586"),

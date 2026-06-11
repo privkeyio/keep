@@ -394,9 +394,10 @@ pub fn cmd_frost_refresh(out: &Output, path: &Path, group_id: &str) -> Result<()
         .len()
         .try_into()
         .map_err(|_| KeepError::Frost("Too many shares".into()))?;
-    if share_count < threshold {
+    if share_count != total {
         return Err(KeepError::Frost(format!(
-            "Need at least {threshold} shares to refresh, only {share_count} available locally"
+            "refresh requires the full set of {total} shares; only {share_count} available locally. \
+             A partial refresh would silently orphan the absent shares (#586)."
         )));
     }
 
