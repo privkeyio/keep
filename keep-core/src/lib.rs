@@ -1356,12 +1356,15 @@ impl Keep {
         if let Some(ref mut signing_audit) = self.signing_audit {
             signing_audit.reencrypt(&old_data_key, &new_data_key)?;
         }
-        self.keyring.clear();
-        self.load_keys_to_keyring()?;
 
-        // Both chains are now under `new_data_key`, so this success entry is
-        // consistent with the on-disk chain (#580 fails closed).
-        self.audit_event_required(AuditEventType::DataKeyRotate, |e| e)
+        // Both chains are now under `new_data_key`, so record the success entry
+        // before reloading the keyring (#580 fails closed). The rotation has
+        // already committed; the keyring is in-memory and rebuilt on the next
+        // unlock, so a reload failure must not leave the rotation unrecorded.
+        self.audit_event_required(AuditEventType::DataKeyRotate, |e| e)?;
+
+        self.keyring.clear();
+        self.load_keys_to_keyring()
     }
 
     /// Returns the data encryption key used to encrypt stored secrets.
