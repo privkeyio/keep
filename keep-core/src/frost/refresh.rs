@@ -7,7 +7,7 @@ use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::rand_core::OsRng;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{KeepError, Result};
 
@@ -107,10 +107,12 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         Some(threshold),
     );
 
-    let mut key_packages: Vec<KeyPackage> = shares
-        .iter()
-        .map(|s| s.key_package())
-        .collect::<Result<_>>()?;
+    let key_packages = Zeroizing::new(
+        shares
+            .iter()
+            .map(|s| s.key_package())
+            .collect::<Result<Vec<KeyPackage>>>()?,
+    );
 
     let identifiers: Vec<Identifier> = key_packages.iter().map(|kp| *kp.identifier()).collect();
 
@@ -131,7 +133,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
 
     let mut new_packages = Vec::with_capacity(shares.len());
 
-    for (share, current_kp) in shares.iter().zip(&key_packages) {
+    for (share, current_kp) in shares.iter().zip(key_packages.iter()) {
         let id = *current_kp.identifier();
         let refreshing_share = refreshing_by_id.get(&id).ok_or_else(|| {
             KeepError::Frost(format!("No refreshing share for identifier {id:?}"))
@@ -149,8 +151,6 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
-
-    key_packages.iter_mut().for_each(|kp| kp.zeroize());
 
     let new_group_pubkey = *new_packages[0].group_pubkey();
     if new_group_pubkey != group_pubkey {
