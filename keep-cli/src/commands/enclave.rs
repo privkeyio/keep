@@ -89,6 +89,7 @@ pub fn cmd_enclave_verify(
     pcr1: Option<&str>,
     pcr2: Option<&str>,
     local: bool,
+    insecure_no_pcrs: bool,
 ) -> Result<()> {
     out.newline();
     out.header("Enclave Attestation Verification");
@@ -133,16 +134,33 @@ pub fn cmd_enclave_verify(
         })?;
         spinner.finish();
 
-        let expected_pcrs = if let (Some(p0), Some(p1), Some(p2)) = (pcr0, pcr1, pcr2) {
-            Some(
-                keep_enclave_host::ExpectedPcrs::from_hex(p0, p1, p2)
-                    .map_err(|e| KeepError::InvalidInput(format!("invalid PCR hex: {e}")))?,
-            )
-        } else {
-            None
+        // #577: PCR matching is the only thing that binds an AWS-signed
+        // attestation to a specific reproducible-build enclave image. Fail
+        // closed when PCRs are absent unless the operator explicitly opted
+        // in to the insecure path via `--insecure-no-pcrs`.
+        let verifier = match (pcr0, pcr1, pcr2) {
+            (Some(p0), Some(p1), Some(p2)) => {
+                let pcrs = keep_enclave_host::ExpectedPcrs::from_hex(p0, p1, p2)
+                    .map_err(|e| KeepError::InvalidInput(format!("invalid PCR hex: {e}")))?;
+                keep_enclave_host::AttestationVerifier::new(pcrs)
+            }
+            _ if insecure_no_pcrs => {
+                out.warn(
+                    "INSECURE: --insecure-no-pcrs set; the attestation will be cert-chain and \
+                     nonce verified but NOT bound to a specific enclave image. Any AWS-signed \
+                     enclave document will pass. Do not use in production.",
+                );
+                keep_enclave_host::AttestationVerifier::insecure_without_pcrs()
+            }
+            _ => {
+                return Err(KeepError::InvalidInput(
+                    "expected PCRs are required (--pcr0 --pcr1 --pcr2). Without them, the \
+                     attestation cannot be bound to a known enclave image (#577). To skip PCR \
+                     matching for dev/testing, pass --insecure-no-pcrs explicitly."
+                        .into(),
+                ));
+            }
         };
-
-        let verifier = keep_enclave_host::AttestationVerifier::new(expected_pcrs);
 
         let spinner = out.spinner("Verifying attestation...");
         match verifier.verify(&attestation_doc, &nonce) {

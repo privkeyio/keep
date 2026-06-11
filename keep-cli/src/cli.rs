@@ -846,6 +846,12 @@ pub(crate) enum EnclaveCommands {
         pcr2: Option<String>,
         #[arg(long, help = "Use mock enclave for local testing")]
         local: bool,
+        #[arg(
+            long,
+            help = "INSECURE: skip PCR matching (cert-chain + nonce still verified). \
+                    Dev/testing only; does NOT bind the attestation to a known image (#577)."
+        )]
+        insecure_no_pcrs: bool,
     },
     GenerateKey {
         #[arg(short, long)]

@@ -54,7 +54,7 @@ pub fn verify_peer_attestation(
     use keep_enclave_host::{AttestationVerifier, ExpectedPcrs as HostPcrs};
 
     let host_pcrs = HostPcrs::new(expected_pcrs.pcr0, expected_pcrs.pcr1, expected_pcrs.pcr2);
-    let verifier = AttestationVerifier::new(Some(host_pcrs));
+    let verifier = AttestationVerifier::new(host_pcrs);
     let nonce = derive_attestation_nonce(group_pubkey);
 
     let verified = verifier

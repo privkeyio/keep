@@ -73,10 +73,33 @@ fn parse_pem_cert(pem: &str) -> Certificate {
 }
 
 impl AttestationVerifier {
-    pub fn new(expected_pcrs: Option<ExpectedPcrs>) -> Self {
+    /// Construct a production attestation verifier that enforces PCR matching
+    /// against `expected_pcrs`. The cert-chain, nonce-replay, and signature
+    /// checks all run regardless, but a verifier that never matches PCRs
+    /// silently discards the reproducible-build guarantee (#577): a caller
+    /// gets a valid AWS-signed attestation that is not bound to any known
+    /// enclave image. Production callers MUST pin PCRs here; dev or test
+    /// code that genuinely needs to skip PCR matching must opt in via
+    /// `insecure_without_pcrs` so the unsafe path can never be reached by
+    /// accident.
+    pub fn new(expected_pcrs: ExpectedPcrs) -> Self {
         let root_cert = parse_pem_cert(AWS_NITRO_ROOT_CERT_PEM);
         Self {
-            expected_pcrs,
+            expected_pcrs: Some(expected_pcrs),
+            root_cert,
+        }
+    }
+
+    /// **INSECURE — for dev/test only.** Construct a verifier that runs the
+    /// cert-chain, nonce-replay, and signature checks but does NOT match
+    /// PCRs against a pinned image. Skipping PCR matching means the
+    /// attestation is not bound to any known enclave image; an AWS-signed
+    /// document from a *different* enclave still verifies. Never call this
+    /// from production paths.
+    pub fn insecure_without_pcrs() -> Self {
+        let root_cert = parse_pem_cert(AWS_NITRO_ROOT_CERT_PEM);
+        Self {
+            expected_pcrs: None,
             root_cert,
         }
     }
@@ -378,5 +401,36 @@ mod tests {
         assert_eq!(pcrs.pcr0[0], 0x00);
         assert_eq!(pcrs.pcr1[0], 0x11);
         assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    /// #577: `AttestationVerifier::new` MUST require pinned PCRs by
+    /// construction. The signature `new(ExpectedPcrs)` (no `Option`) is the
+    /// fail-closed contract; any future regression that re-introduces
+    /// `Option<ExpectedPcrs>` would let production callers silently skip PCR
+    /// matching and break the reproducible-build binding.
+    #[test]
+    fn production_verifier_requires_pcrs_by_construction() {
+        let pcrs = ExpectedPcrs::from_hex(&"0".repeat(96), &"1".repeat(96), &"2".repeat(96))
+            .expect("ExpectedPcrs hex");
+        let verifier = AttestationVerifier::new(pcrs);
+        assert!(
+            verifier.expected_pcrs.is_some(),
+            "production constructor MUST persist the pinned PCRs"
+        );
+    }
+
+    /// `AttestationVerifier::insecure_without_pcrs` is the explicit opt-in
+    /// path for dev/test code that genuinely needs to skip PCR matching.
+    /// Calling it MUST yield `expected_pcrs: None` so the existing
+    /// `verify()` branch (line ~117) skips PCR matching. The name is the
+    /// gate; this test pins both the constructor and the documented
+    /// behavior so the unsafe path can never be reached by accident.
+    #[test]
+    fn insecure_constructor_yields_verifier_without_pcrs() {
+        let verifier = AttestationVerifier::insecure_without_pcrs();
+        assert!(
+            verifier.expected_pcrs.is_none(),
+            "insecure_without_pcrs MUST construct a verifier with no pinned PCRs"
+        );
     }
 }
