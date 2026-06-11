@@ -131,6 +131,14 @@ impl Storage {
 
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let data_key_bytes = data_key.decrypt()?;
+
+        // #581: verify `old_password` against the current header EVEN when the
+        // vault is already unlocked. Without this check, anyone with access to
+        // an unlocked Keep can re-wrap the data key under a new password
+        // without knowing the prior credential, and the PasswordRotate audit
+        // entry (#566) would attest a rotation that never proved knowledge of
+        // `old_password`.
+        self.verify_header_decryption(&self.header, old_password, &*data_key_bytes)?;
         let old_header = self.header.clone();
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
@@ -224,6 +232,13 @@ impl Storage {
 
         let old_data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?.clone();
         let old_header = self.header.clone();
+
+        // #581: verify `password` against the current header even when the
+        // vault is already unlocked; same threat model as `rotate_password`.
+        {
+            let data_key_bytes = old_data_key.decrypt()?;
+            self.verify_header_decryption(&self.header, password, &*data_key_bytes)?;
+        }
         let header_path = self.path.join("keep.hdr");
         let backup_path = self.path.join("keep.hdr.backup");
         let db_path = self.path.join("keep.db");
