@@ -1323,39 +1323,45 @@ impl Keep {
     ///
     /// Generates a new data encryption key and re-encrypts all stored keys and shares.
     ///
-    /// Closes #579 (post-storage-rotation failures audit DataKeyRotateFailed)
-    /// and #580 (success path uses `audit_event_required`).
+    /// Closes #579 (a failure before the storage commit audits
+    /// DataKeyRotateFailed) and #580 (success path uses `audit_event_required`).
     pub fn rotate_data_key(&mut self, password: &str) -> Result<()> {
         // A locked vault has no data key, so the failure entry cannot be
         // encrypted/recorded here; `audit_event` no-ops in that case.
-        let result = self.rotate_data_key_inner(password);
-        match &result {
-            Ok(()) => self.audit_event_required(AuditEventType::DataKeyRotate, |e| e),
-            Err(e) => {
-                let reason = e.to_string();
-                self.audit_event(AuditEventType::DataKeyRotateFailed, |entry| {
-                    entry.with_success(false).with_reason(&reason)
-                });
-                result
-            }
-        }
-    }
-
-    fn rotate_data_key_inner(&mut self, password: &str) -> Result<()> {
         let old_data_key = self.get_data_key()?;
-        self.storage.rotate_data_key(password)?;
-        let new_data_key = self.get_data_key()?;
 
+        // Pre-commit phase. `storage.rotate_data_key` rolls back internally on
+        // failure, so the on-disk data key is unchanged and the audit chains
+        // still match `old_data_key` == the current data key. The failure entry
+        // therefore encrypts under the key matching the on-disk chain (#579).
+        if let Err(e) = self.storage.rotate_data_key(password) {
+            let reason = e.to_string();
+            self.audit_event(AuditEventType::DataKeyRotateFailed, |entry| {
+                entry.with_success(false).with_reason(&reason)
+            });
+            return Err(e);
+        }
+
+        // Post-commit phase. Storage has durably committed the new data key, so
+        // the rotation has already succeeded on disk; the audit chains are still
+        // under `old_data_key` until re-encrypted below. A failure here must NOT
+        // emit a DataKeyRotateFailed entry: it would be encrypted under the new
+        // key and appended to a chain still under the old key (corrupting it,
+        // since `reencrypt` is atomic and leaves the file under the old key on
+        // failure), and it would misreport a rotation that already committed.
+        let new_data_key = self.get_data_key()?;
         if let Some(ref mut audit) = self.audit {
             audit.reencrypt(&old_data_key, &new_data_key)?;
         }
         if let Some(ref mut signing_audit) = self.signing_audit {
             signing_audit.reencrypt(&old_data_key, &new_data_key)?;
         }
-
         self.keyring.clear();
         self.load_keys_to_keyring()?;
-        Ok(())
+
+        // Both chains are now under `new_data_key`, so this success entry is
+        // consistent with the on-disk chain (#580 fails closed).
+        self.audit_event_required(AuditEventType::DataKeyRotate, |e| e)
     }
 
     /// Returns the data encryption key used to encrypt stored secrets.
