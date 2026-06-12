@@ -147,8 +147,7 @@ impl AppPermission {
     pub fn has_unexpired_timed_grant(&self, kind: Kind) -> bool {
         self.timed_kind_grants
             .get(&kind)
-            .map(|expiry| now_unix_secs() < *expiry)
-            .unwrap_or(false)
+            .is_some_and(|expiry| now_unix_secs() < *expiry)
     }
 
     fn prune_expired_kind_grants(&mut self) {
