@@ -3,7 +3,7 @@
 
 use crate::nip55::Nip55RequestType;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HIGH_FREQUENCY_THRESHOLD: u32 = 10;
@@ -224,62 +224,146 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+const HOURLY_KEY_PREFIX: &str = "hourly_";
+const DAILY_KEY_PREFIX: &str = "daily_";
+const COOLED_OFF_KEY_PREFIX: &str = "cooled_off_";
+const COOLED_OFF_ELAPSED_KEY_PREFIX: &str = "cooled_off_elapsed_";
+
 struct UsageWindow {
     count: u32,
-    window_start_ms: u64,
+    /// Window start on the monotonic clock (Android `elapsedRealtime`).
+    start_elapsed: u64,
 }
 
+/// Persistence backend for the per-package velocity counters and cooling-off
+/// state, so they survive a keep restart (a reboot, OS-kill, or upgrade). A
+/// simple string key/value store; the Android side backs it with the encrypted
+/// `nip55_auto_signing` prefs.
+#[uniffi::export(with_foreign)]
+pub trait SigningRateLimiterStorage: Send + Sync {
+    fn load(&self, key: String) -> Option<String>;
+    fn save(&self, key: String, value: String);
+    fn remove(&self, key: String);
+    fn clear(&self);
+}
+
+/// Per-package velocity limiter for opt-in auto-signing. Hourly and daily
+/// counters and the cooling-off state are persisted via [`SigningRateLimiterStorage`]
+/// so they cannot be reset by restarting keep; the short unusual-activity window
+/// is kept in memory. Windows are tracked on the monotonic clock and persisted
+/// with a wall-clock anchor, so they survive a reboot (which resets the monotonic
+/// clock) without trusting a manipulable wall clock for liveness.
 #[derive(uniffi::Object)]
 pub struct SigningRateLimiter {
-    state: Mutex<RateLimiterState>,
-}
-
-impl Default for SigningRateLimiter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Default)]
-struct RateLimiterState {
-    hourly: HashMap<String, UsageWindow>,
-    daily: HashMap<String, UsageWindow>,
-    recent: HashMap<String, UsageWindow>,
-    cooled_off_until: HashMap<String, u64>,
+    storage: Arc<dyn SigningRateLimiterStorage>,
+    recent: Mutex<HashMap<String, UsageWindow>>,
 }
 
 #[uniffi::export]
 impl SigningRateLimiter {
     #[uniffi::constructor]
-    pub fn new() -> Self {
+    pub fn new(storage: Arc<dyn SigningRateLimiterStorage>) -> Self {
         Self {
-            state: Mutex::new(RateLimiterState::default()),
+            storage,
+            recent: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn check_and_record(&self, package_name: String) -> AutoSignDecision {
-        let now = now_ms();
-        self.check_and_record_at(package_name, now)
+    /// Record one auto-sign attempt for `package_name` and decide whether it is
+    /// allowed. `now_elapsed_ms` is the monotonic clock; `now_wall_ms` is wall
+    /// time. Exceeding any limit starts a 15-minute cooling-off.
+    pub fn check_and_record(
+        &self,
+        package_name: String,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> AutoSignDecision {
+        if self.is_cooled_off(&package_name, now_elapsed_ms, now_wall_ms) {
+            return AutoSignDecision::CoolingOff {
+                until_ms: self.cooled_off_until(&package_name, now_elapsed_ms, now_wall_ms),
+            };
+        }
+
+        let hourly = self.bump_window(
+            HOURLY_KEY_PREFIX,
+            &package_name,
+            HOUR_MS,
+            now_elapsed_ms,
+            now_wall_ms,
+        );
+        if hourly > HOURLY_LIMIT {
+            self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
+            return AutoSignDecision::HourlyLimitExceeded;
+        }
+
+        let daily = self.bump_window(
+            DAILY_KEY_PREFIX,
+            &package_name,
+            DAY_MS,
+            now_elapsed_ms,
+            now_wall_ms,
+        );
+        if daily > DAILY_LIMIT {
+            self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
+            return AutoSignDecision::DailyLimitExceeded;
+        }
+
+        let recent = self.bump_recent(&package_name, now_elapsed_ms);
+        if recent > UNUSUAL_ACTIVITY_THRESHOLD {
+            self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
+            return AutoSignDecision::UnusualActivity;
+        }
+
+        AutoSignDecision::Allowed {
+            hourly_count: hourly,
+            daily_count: daily,
+            recent_count: recent,
+            hourly_limit: HOURLY_LIMIT,
+            daily_limit: DAILY_LIMIT,
+        }
     }
 
     pub fn clear_cooling_off(&self, package_name: String) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.cooled_off_until.remove(&package_name);
+        self.storage
+            .remove(format!("{COOLED_OFF_KEY_PREFIX}{package_name}"));
+        self.storage
+            .remove(format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"));
     }
 
     pub fn clear_all(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.hourly.clear();
-        state.daily.clear();
-        state.recent.clear();
-        state.cooled_off_until.clear();
+        self.storage.clear();
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
-    pub fn get_usage_stats(&self, package_name: String) -> UsageStats {
-        let now = now_ms();
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let hourly_count = get_usage_count(&state.hourly, &package_name, now, HOUR_MS);
-        let daily_count = get_usage_count(&state.daily, &package_name, now, DAY_MS);
+    pub fn get_usage_stats(
+        &self,
+        package_name: String,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> UsageStats {
+        let hourly_count = self
+            .read_window(
+                HOURLY_KEY_PREFIX,
+                &package_name,
+                HOUR_MS,
+                now_elapsed_ms,
+                now_wall_ms,
+            )
+            .map(|w| w.count)
+            .unwrap_or(0);
+        let daily_count = self
+            .read_window(
+                DAILY_KEY_PREFIX,
+                &package_name,
+                DAY_MS,
+                now_elapsed_ms,
+                now_wall_ms,
+            )
+            .map(|w| w.count)
+            .unwrap_or(0);
         UsageStats {
             hourly_count,
             daily_count,
@@ -290,67 +374,179 @@ impl SigningRateLimiter {
 }
 
 impl SigningRateLimiter {
-    fn check_and_record_at(&self, package_name: String, now_ms: u64) -> AutoSignDecision {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-
-        evict_if_needed(&mut state.hourly, now_ms, HOUR_MS);
-        evict_if_needed(&mut state.daily, now_ms, DAY_MS);
-        evict_if_needed(&mut state.recent, now_ms, UNUSUAL_ACTIVITY_WINDOW_MS);
-        state
-            .cooled_off_until
-            .retain(|_, &mut until| now_ms < until);
-
-        if let Some(&until) = state.cooled_off_until.get(&package_name) {
-            return AutoSignDecision::CoolingOff { until_ms: until };
-        }
-
-        let hourly = get_usage_count(&state.hourly, &package_name, now_ms, HOUR_MS);
-        let daily = get_usage_count(&state.daily, &package_name, now_ms, DAY_MS);
-        let recent = get_usage_count(
-            &state.recent,
-            &package_name,
-            now_ms,
-            UNUSUAL_ACTIVITY_WINDOW_MS,
-        );
-
-        if hourly >= HOURLY_LIMIT {
-            state
-                .cooled_off_until
-                .insert(package_name, now_ms + COOLING_OFF_PERIOD_MS);
-            return AutoSignDecision::HourlyLimitExceeded;
-        }
-
-        if daily >= DAILY_LIMIT {
-            state
-                .cooled_off_until
-                .insert(package_name, now_ms + COOLING_OFF_PERIOD_MS);
-            return AutoSignDecision::DailyLimitExceeded;
-        }
-
-        if recent >= UNUSUAL_ACTIVITY_THRESHOLD {
-            state
-                .cooled_off_until
-                .insert(package_name.clone(), now_ms + COOLING_OFF_PERIOD_MS);
-            return AutoSignDecision::UnusualActivity;
-        }
-
-        let hourly = increment_usage(&mut state.hourly, &package_name, now_ms, HOUR_MS);
-        let daily = increment_usage(&mut state.daily, &package_name, now_ms, DAY_MS);
-        let recent = increment_usage(
-            &mut state.recent,
-            &package_name,
-            now_ms,
-            UNUSUAL_ACTIVITY_WINDOW_MS,
-        );
-
-        AutoSignDecision::Allowed {
-            hourly_count: hourly,
-            daily_count: daily,
-            recent_count: recent,
-            hourly_limit: HOURLY_LIMIT,
-            daily_limit: DAILY_LIMIT,
-        }
+    /// Load an unexpired persisted window, reconstructing the monotonic start
+    /// across a reboot from the wall-clock anchor. Returns `None` when absent,
+    /// unparseable, or expired.
+    fn read_window(
+        &self,
+        prefix: &str,
+        package_name: &str,
+        window_ms: u64,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> Option<UsageWindow> {
+        let raw = self.storage.load(format!("{prefix}{package_name}"))?;
+        let window = parse_window(&raw, now_elapsed_ms, now_wall_ms)?;
+        let active = now_elapsed_ms
+            .checked_sub(window.start_elapsed)
+            .is_some_and(|elapsed| elapsed < window_ms);
+        active.then_some(window)
     }
+
+    /// Increment (or start) a persisted window and return the new count.
+    fn bump_window(
+        &self,
+        prefix: &str,
+        package_name: &str,
+        window_ms: u64,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> u32 {
+        let window =
+            match self.read_window(prefix, package_name, window_ms, now_elapsed_ms, now_wall_ms) {
+                Some(mut w) => {
+                    w.count = w.count.saturating_add(1);
+                    w
+                }
+                None => UsageWindow {
+                    count: 1,
+                    start_elapsed: now_elapsed_ms,
+                },
+            };
+        self.storage.save(
+            format!("{prefix}{package_name}"),
+            serialize_window(&window, now_wall_ms),
+        );
+        window.count
+    }
+
+    /// Increment the in-memory unusual-activity window (60s); not persisted.
+    fn bump_recent(&self, package_name: &str, now_elapsed_ms: u64) -> u32 {
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        recent.retain(|_, w| {
+            now_elapsed_ms
+                .checked_sub(w.start_elapsed)
+                .is_some_and(|e| e < UNUSUAL_ACTIVITY_WINDOW_MS)
+        });
+        let entry = recent
+            .entry(package_name.to_string())
+            .or_insert(UsageWindow {
+                count: 0,
+                start_elapsed: now_elapsed_ms,
+            });
+        let active = now_elapsed_ms
+            .checked_sub(entry.start_elapsed)
+            .is_some_and(|e| e < UNUSUAL_ACTIVITY_WINDOW_MS);
+        if active {
+            entry.count = entry.count.saturating_add(1);
+        } else {
+            entry.count = 1;
+            entry.start_elapsed = now_elapsed_ms;
+        }
+        let count = entry.count;
+        if recent.len() > MAX_TRACKED_PACKAGES {
+            if let Some(oldest) = recent
+                .iter()
+                .filter(|(k, _)| k.as_str() != package_name)
+                .min_by_key(|(_, w)| w.start_elapsed)
+                .map(|(k, _)| k.clone())
+            {
+                recent.remove(&oldest);
+            }
+        }
+        count
+    }
+
+    /// True while either the monotonic or wall cooling-off deadline is in the
+    /// future (belt-and-suspenders across a reboot or wall-clock change).
+    fn is_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> bool {
+        if let Some(until) =
+            self.load_u64(&format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"))
+        {
+            if until > 0
+                && now_elapsed_ms < until
+                && until - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
+            {
+                return true;
+            }
+        }
+        if let Some(until) = self.load_u64(&format!("{COOLED_OFF_KEY_PREFIX}{package_name}")) {
+            if until > 0 && now_wall_ms < until {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The cooling-off deadline as a wall-clock timestamp (the soonest valid of
+    /// the wall and reconstructed-monotonic deadlines), or 0 if not cooled off.
+    fn cooled_off_until(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> u64 {
+        let until_wall = self.load_u64(&format!("{COOLED_OFF_KEY_PREFIX}{package_name}"));
+        let until_elapsed =
+            self.load_u64(&format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"));
+
+        let wall_valid = until_wall.is_some_and(|u| u > 0 && now_wall_ms < u);
+        let elapsed_valid = until_elapsed.is_some_and(|u| {
+            u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
+        });
+
+        if !wall_valid && !elapsed_valid {
+            return 0;
+        }
+        let wall_expiry = if wall_valid {
+            until_wall.unwrap()
+        } else {
+            u64::MAX
+        };
+        let elapsed_expiry = if elapsed_valid {
+            now_wall_ms + (until_elapsed.unwrap() - now_elapsed_ms)
+        } else {
+            u64::MAX
+        };
+        wall_expiry.min(elapsed_expiry)
+    }
+
+    fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) {
+        self.storage.save(
+            format!("{COOLED_OFF_KEY_PREFIX}{package_name}"),
+            (now_wall_ms + COOLING_OFF_PERIOD_MS).to_string(),
+        );
+        self.storage.save(
+            format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"),
+            (now_elapsed_ms + COOLING_OFF_PERIOD_MS).to_string(),
+        );
+    }
+
+    fn load_u64(&self, key: &str) -> Option<u64> {
+        self.storage.load(key.to_string())?.parse::<u64>().ok()
+    }
+}
+
+/// Parse a persisted `count:start_elapsed:persist_wall` window. When the stored
+/// monotonic start is in the future relative to `now_elapsed_ms` (a reboot reset
+/// the monotonic clock), reconstruct the start from the wall-clock anchor.
+/// Mirrors keep-android `AutoSigningSafeguards.loadPersistedUsage`.
+fn parse_window(raw: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> Option<UsageWindow> {
+    let mut parts = raw.split(':');
+    let count = parts.next()?.parse::<u32>().ok()?.min(DAILY_LIMIT + 1);
+    let start_elapsed = parts.next()?.parse::<u64>().ok()?;
+    if start_elapsed <= now_elapsed_ms {
+        return Some(UsageWindow {
+            count,
+            start_elapsed,
+        });
+    }
+    let persist_wall = parts.next()?.parse::<u64>().ok()?;
+    let elapsed_since = now_wall_ms.checked_sub(persist_wall)?;
+    let reconstructed = now_elapsed_ms.checked_sub(elapsed_since)?;
+    (reconstructed > 0).then_some(UsageWindow {
+        count,
+        start_elapsed: reconstructed,
+    })
+}
+
+fn serialize_window(window: &UsageWindow, now_wall_ms: u64) -> String {
+    format!("{}:{}:{}", window.count, window.start_elapsed, now_wall_ms)
 }
 
 #[uniffi::export]
@@ -388,59 +584,6 @@ pub fn evaluate_sign_policy(
     match rate_check {
         AutoSignDecision::Allowed { .. } => SignPolicyEvaluation::AutoApprove,
         _ => SignPolicyEvaluation::FallToUi,
-    }
-}
-
-fn is_window_active(window: &UsageWindow, now_ms: u64, window_ms: u64) -> bool {
-    window.window_start_ms <= now_ms && now_ms - window.window_start_ms < window_ms
-}
-
-fn increment_usage(
-    map: &mut HashMap<String, UsageWindow>,
-    package_name: &str,
-    now_ms: u64,
-    window_ms: u64,
-) -> u32 {
-    let entry = map.entry(package_name.to_string()).or_insert(UsageWindow {
-        count: 0,
-        window_start_ms: now_ms,
-    });
-
-    if is_window_active(entry, now_ms, window_ms) {
-        entry.count += 1;
-    } else {
-        entry.count = 1;
-        entry.window_start_ms = now_ms;
-    }
-
-    entry.count
-}
-
-fn get_usage_count(
-    map: &HashMap<String, UsageWindow>,
-    package_name: &str,
-    now_ms: u64,
-    window_ms: u64,
-) -> u32 {
-    match map.get(package_name) {
-        Some(w) if is_window_active(w, now_ms, window_ms) => w.count,
-        _ => 0,
-    }
-}
-
-fn evict_if_needed(map: &mut HashMap<String, UsageWindow>, now_ms: u64, window_ms: u64) {
-    map.retain(|_, w| is_window_active(w, now_ms, window_ms));
-
-    while map.len() > MAX_TRACKED_PACKAGES {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, w)| w.window_start_ms)
-            .map(|(k, _)| k.clone())
-        {
-            map.remove(&oldest_key);
-        } else {
-            break;
-        }
     }
 }
 
@@ -562,18 +705,42 @@ mod tests {
             .contains(&SigningRiskFactor::SensitiveOperation));
     }
 
+    struct MockStorage {
+        map: Mutex<HashMap<String, String>>,
+    }
+    impl MockStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                map: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+    impl SigningRateLimiterStorage for MockStorage {
+        fn load(&self, key: String) -> Option<String> {
+            self.map.lock().unwrap().get(&key).cloned()
+        }
+        fn save(&self, key: String, value: String) {
+            self.map.lock().unwrap().insert(key, value);
+        }
+        fn remove(&self, key: String) {
+            self.map.lock().unwrap().remove(&key);
+        }
+        fn clear(&self) {
+            self.map.lock().unwrap().clear();
+        }
+    }
+
     #[test]
     fn test_rate_limiter_allowed() {
-        let limiter = SigningRateLimiter::new();
-        let result = limiter.check_and_record_at("com.test".to_string(), 1000);
+        let limiter = SigningRateLimiter::new(MockStorage::new());
+        let result = limiter.check_and_record("com.test".to_string(), 1000, 1000);
         assert!(matches!(result, AutoSignDecision::Allowed { .. }));
     }
 
     #[test]
     fn test_rate_limiter_allowed_includes_limits() {
-        let limiter = SigningRateLimiter::new();
-        let result = limiter.check_and_record_at("com.test".to_string(), 1000);
-        match result {
+        let limiter = SigningRateLimiter::new(MockStorage::new());
+        match limiter.check_and_record("com.test".to_string(), 1000, 1000) {
             AutoSignDecision::Allowed {
                 hourly_limit,
                 daily_limit,
@@ -588,12 +755,12 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_hourly_limit() {
-        let limiter = SigningRateLimiter::new();
+        let limiter = SigningRateLimiter::new(MockStorage::new());
         let base = 1_000_000u64;
         let gap = 1201u64;
         for i in 0..HOURLY_LIMIT {
             let ts = base + (i as u64) * gap;
-            let result = limiter.check_and_record_at("com.test".to_string(), ts);
+            let result = limiter.check_and_record("com.test".to_string(), ts, ts);
             assert!(
                 matches!(result, AutoSignDecision::Allowed { .. }),
                 "Expected Allowed at iteration {i}, got {:?}",
@@ -601,38 +768,59 @@ mod tests {
             );
         }
         let ts = base + (HOURLY_LIMIT as u64) * gap;
-        let result = limiter.check_and_record_at("com.test".to_string(), ts);
+        let result = limiter.check_and_record("com.test".to_string(), ts, ts);
         assert!(matches!(result, AutoSignDecision::HourlyLimitExceeded));
-    }
-
-    #[test]
-    fn test_rate_limiter_denied_does_not_increment() {
-        let limiter = SigningRateLimiter::new();
-        let base = 1_000_000u64;
-        let gap = 1201u64;
-        for i in 0..HOURLY_LIMIT {
-            limiter.check_and_record_at("com.test".to_string(), base + (i as u64) * gap);
-        }
-        let ts_exceed = base + (HOURLY_LIMIT as u64) * gap;
-        let result = limiter.check_and_record_at("com.test".to_string(), ts_exceed);
-        assert!(matches!(result, AutoSignDecision::HourlyLimitExceeded));
-
-        let state = limiter.state.lock().unwrap();
-        let hourly = state.hourly.get("com.test").unwrap();
-        assert_eq!(hourly.count, HOURLY_LIMIT);
     }
 
     #[test]
     fn test_rate_limiter_cooling_off() {
-        let limiter = SigningRateLimiter::new();
+        let limiter = SigningRateLimiter::new(MockStorage::new());
         let base = 1_000_000u64;
         let gap = 1201u64;
         for i in 0..=HOURLY_LIMIT {
-            limiter.check_and_record_at("com.test".to_string(), base + (i as u64) * gap);
+            let ts = base + (i as u64) * gap;
+            limiter.check_and_record("com.test".to_string(), ts, ts);
         }
         let ts = base + ((HOURLY_LIMIT + 1) as u64) * gap;
-        let result = limiter.check_and_record_at("com.test".to_string(), ts);
+        let result = limiter.check_and_record("com.test".to_string(), ts, ts);
         assert!(matches!(result, AutoSignDecision::CoolingOff { .. }));
+    }
+
+    #[test]
+    fn test_rate_limiter_persists_across_instances() {
+        // Counters live in storage, so a fresh limiter (a keep restart) keeps
+        // them -- an app cannot reset its velocity by restarting keep.
+        let storage = MockStorage::new();
+        let l1 = SigningRateLimiter::new(storage.clone());
+        for i in 0..50u64 {
+            let ts = 1_000_000 + i * 1201;
+            l1.check_and_record("com.test".to_string(), ts, ts);
+        }
+        let l2 = SigningRateLimiter::new(storage.clone());
+        let now = 1_000_000 + 50 * 1201;
+        assert_eq!(
+            l2.get_usage_stats("com.test".to_string(), now, now)
+                .hourly_count,
+            50
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_reboot_reconstructs_window() {
+        // After a reboot the monotonic clock resets; the wall anchor keeps the
+        // window alive (when the device has been up at least as long as the wall
+        // gap), so the counter is not silently reset.
+        let storage = MockStorage::new();
+        let l1 = SigningRateLimiter::new(storage.clone());
+        l1.check_and_record("com.test".to_string(), 1_000_000, 1_700_000_000_000);
+        // Reboot: elapsed reset to 200_000 (200s uptime), wall advanced 60s.
+        let l2 = SigningRateLimiter::new(storage.clone());
+        assert_eq!(
+            l2.get_usage_stats("com.test".to_string(), 200_000, 1_700_000_060_000)
+                .hourly_count,
+            1,
+            "window survived reboot via wall anchor"
+        );
     }
 
     #[test]
@@ -680,22 +868,5 @@ mod tests {
         let ctx = test_ctx(Nip55RequestType::Nip44Encrypt, None);
         let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
-    }
-
-    #[test]
-    fn test_eviction_removes_expired() {
-        let mut map = HashMap::new();
-        for i in 0..10u32 {
-            map.insert(
-                format!("pkg-{i}"),
-                UsageWindow {
-                    count: 1,
-                    window_start_ms: 1000,
-                },
-            );
-        }
-        let now = 1000 + HOUR_MS + 1;
-        evict_if_needed(&mut map, now, HOUR_MS);
-        assert_eq!(map.len(), 0);
     }
 }
