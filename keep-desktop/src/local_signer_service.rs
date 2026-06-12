@@ -48,7 +48,10 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         });
     }
 
-    fn request_approval(&self, request: keep_nip46::types::ApprovalRequest) -> bool {
+    fn request_approval(
+        &self,
+        request: keep_nip46::types::ApprovalRequest,
+    ) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let display = PendingApprovalDisplay {
             app_name: request.app_name,
@@ -64,7 +67,7 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
             })
             .is_err()
         {
-            return false;
+            return false.into();
         }
         let tx = self.tx.clone();
         tokio::task::block_in_place(|| match response_rx.recv_timeout(BUNKER_APPROVAL_TIMEOUT) {
@@ -74,6 +77,7 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
                 false
             }
         })
+        .into()
     }
 
     fn on_connect(&self, client_id: &str, name: &str) {

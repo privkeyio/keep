@@ -3,7 +3,9 @@
 
 use crate::network::validate_relay_url;
 use crate::{KeepMobile, KeepMobileError};
-use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
+use keep_nip46::types::{
+    ApprovalRequest, ApprovalResult, LogEvent, RememberDuration, ServerCallbacks,
+};
 use keep_nip46::{NetworkFrostSigner, Permission, RateLimitConfig, Server, ServerConfig};
 use nostr_sdk::Kind;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -41,6 +43,56 @@ pub struct BunkerApprovalRequest {
     pub requested_permissions: Option<String>,
 }
 
+/// How long an approval persists. Mirrors keep-android's
+/// `nip55/PermissionEntities.kt::PermissionDuration` and Amber's `RememberType`
+/// so the same enum maps cleanly to the existing `Nip46ApprovalScreen` picker.
+/// `JustThisTime` is the one-shot default (no grant persisted); `Forever`
+/// permanently auto-approves the (app, kind) pair; the timed variants persist
+/// a per-(app, kind) grant with the matching expiry.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BunkerRememberDuration {
+    JustThisTime,
+    OneMinute,
+    FiveMinutes,
+    TenMinutes,
+    OneHour,
+    OneDay,
+    Forever,
+}
+
+impl From<BunkerRememberDuration> for RememberDuration {
+    fn from(d: BunkerRememberDuration) -> Self {
+        match d {
+            BunkerRememberDuration::JustThisTime => RememberDuration::JustThisTime,
+            BunkerRememberDuration::OneMinute => RememberDuration::OneMinute,
+            BunkerRememberDuration::FiveMinutes => RememberDuration::FiveMinutes,
+            BunkerRememberDuration::TenMinutes => RememberDuration::TenMinutes,
+            BunkerRememberDuration::OneHour => RememberDuration::OneHour,
+            BunkerRememberDuration::OneDay => RememberDuration::OneDay,
+            BunkerRememberDuration::Forever => RememberDuration::Forever,
+        }
+    }
+}
+
+/// Result of an approval prompt as returned by the native UI. `approved=false`
+/// always means reject and `remember` is ignored. `approved=true` plus a non-
+/// `JustThisTime` duration persists a per-(app, kind) grant in the bunker so
+/// subsequent requests within the window auto-approve without re-prompting.
+#[derive(uniffi::Record, Clone, Copy, Debug)]
+pub struct BunkerApprovalResult {
+    pub approved: bool,
+    pub remember: BunkerRememberDuration,
+}
+
+impl From<BunkerApprovalResult> for ApprovalResult {
+    fn from(r: BunkerApprovalResult) -> Self {
+        ApprovalResult {
+            approved: r.approved,
+            remember: r.remember.into(),
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct ParsedBunkerUrl {
     pub pubkey: String,
@@ -62,7 +114,7 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
 #[uniffi::export(with_foreign)]
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
-    fn request_approval(&self, request: BunkerApprovalRequest) -> bool;
+    fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
     /// never as markup.
@@ -83,15 +135,17 @@ impl ServerCallbacks for CallbackBridge {
         });
     }
 
-    fn request_approval(&self, request: ApprovalRequest) -> bool {
-        self.callbacks.request_approval(BunkerApprovalRequest {
-            app_pubkey: request.app_pubkey.to_hex(),
-            app_name: request.app_name,
-            method: request.method,
-            event_kind: request.event_kind.map(|k| k.as_u16() as u32),
-            event_content: request.event_content,
-            requested_permissions: request.requested_permissions,
-        })
+    fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        self.callbacks
+            .request_approval(BunkerApprovalRequest {
+                app_pubkey: request.app_pubkey.to_hex(),
+                app_name: request.app_name,
+                method: request.method,
+                event_kind: request.event_kind.map(|k| k.as_u16() as u32),
+                event_content: request.event_content,
+                requested_permissions: request.requested_permissions,
+            })
+            .into()
     }
 
     fn on_connect(&self, pubkey: &str, name: &str) {
@@ -186,23 +240,23 @@ fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
 }
 
 /// Event kinds auto-approved per-app for each client that completes the connect
-/// handshake, scoped to that client's pubkey instead of granted globally. Kind
-/// 27235 (NIP-98 HTTP auth) is required by web clients such as nostr-tools'
-/// `BunkerSigner`, which sign a fresh auth event for *every* API call and time
-/// out (~60s) if the signer prompts per request.
+/// handshake, scoped to that client's pubkey instead of granted globally.
 ///
-/// TRUST MODEL: auto-approving kind 27235 makes the bunker URL + connect secret
-/// an HTTP-auth bearer credential. Any client that completes the connect
-/// handshake can silently mint NIP-98 auth tokens for *any* URL and method with
-/// no per-request prompt, exactly like handing out an HTTP `Authorization`
-/// header. Amber behaves the same way. The grant is now scoped to each
-/// connected app's pubkey (revocable and auditable per app) rather than a
-/// blanket global rule, but the connect secret is still shared across clients,
-/// so treat the bunker URL as a secret of equivalent power to the signing key
-/// for HTTP-auth purposes. A per-app/URL-method allowlist is tracked as
-/// follow-up work.
+/// **Empty by default as of #575.** Previously this returned `{NIP98_HTTP_AUTH}`
+/// so web clients such as nostr-tools' `BunkerSigner` (which signs a fresh NIP-98
+/// event per HTTP call) would not be blocked by a 60s-per-request prompt. That
+/// silent grant turned the bunker URL + connect secret into an HTTP-auth bearer
+/// credential: anyone holding it could mint NIP-98 tokens authenticating as the
+/// user to any URL/method with no prompt. Per-app scoping does not bound that
+/// threat as long as the connect secret is reusable.
+///
+/// NIP-98 sign requests now fall through to the existing per-request approval
+/// callback. The next step (mobile UI, tracked as a follow-up under #575) is to
+/// extend the approval response with a remember-duration so the user can opt in
+/// to "remember for 1 hour / 1 day / always" after seeing the first request,
+/// matching Amber's UX without the silent-grant trade-off.
 fn bunker_connect_auto_approve_kinds() -> std::collections::HashSet<Kind> {
-    std::collections::HashSet::from([keep_nip46::NIP98_HTTP_AUTH])
+    std::collections::HashSet::new()
 }
 
 /// Decodes a persisted transport secret, returning `None` when the stored value

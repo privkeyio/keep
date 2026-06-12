@@ -98,7 +98,15 @@ pub struct AppPermission {
     pub pubkey: PublicKey,
     pub name: String,
     pub permissions: Permission,
+    /// Per-app, per-kind grants that never expire. Set via the
+    /// `connect_auto_approve_kinds` startup config OR by the user picking
+    /// "Forever" on the per-request prompt (#575).
     pub auto_approve_kinds: HashSet<Kind>,
+    /// Per-app, per-kind grants with an explicit expiry (unix epoch seconds).
+    /// Set by the user picking a timed remember-duration on the per-request
+    /// prompt (#575). Skipped on read once `now() >= expiry`.
+    #[serde(default)]
+    pub timed_kind_grants: HashMap<Kind, u64>,
     pub connected_at: Timestamp,
     pub last_used: Timestamp,
     pub request_count: u64,
@@ -117,12 +125,36 @@ impl AppPermission {
             name,
             permissions: Permission::DEFAULT,
             auto_approve_kinds: HashSet::from([Kind::Reaction]),
+            timed_kind_grants: HashMap::new(),
             connected_at: Timestamp::now(),
             last_used: Timestamp::now(),
             request_count: 0,
             duration: PermissionDuration::Forever,
         }
     }
+
+    /// Returns true if a timed grant exists for `kind` AND the grant has not
+    /// expired. Expired entries are skipped here and garbage-collected by the
+    /// next mutation through `prune_expired_kind_grants`.
+    pub fn has_unexpired_timed_grant(&self, kind: Kind) -> bool {
+        self.timed_kind_grants
+            .get(&kind)
+            .map(|expiry| now_unix_secs() < *expiry)
+            .unwrap_or(false)
+    }
+
+    fn prune_expired_kind_grants(&mut self) {
+        let now = now_unix_secs();
+        self.timed_kind_grants.retain(|_, expiry| now < *expiry);
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct PermissionManager {
@@ -244,15 +276,61 @@ impl PermissionManager {
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
         if let Some(app) = self.apps.get(pubkey) {
-            if !app.duration.is_expired(app.connected_at) && app.auto_approve_kinds.contains(&kind)
-            {
-                return false;
+            if !app.duration.is_expired(app.connected_at) {
+                if app.auto_approve_kinds.contains(&kind) {
+                    return false;
+                }
+                if app.has_unexpired_timed_grant(kind) {
+                    return false;
+                }
             }
         }
         if self.global_auto_approve.contains(&kind) {
             return false;
         }
         true
+    }
+
+    /// Persist a forever-grant for `kind` on the connected app at `pubkey`.
+    /// No-op when the app is unknown. Used by the per-request approval prompt
+    /// (#575) when the user picks `RememberDuration::Forever`.
+    pub fn grant_kind_forever(&mut self, pubkey: &PublicKey, kind: Kind) {
+        if let Some(app) = self.apps.get_mut(pubkey) {
+            app.auto_approve_kinds.insert(kind);
+            // A Forever grant supersedes any timed grant for the same kind.
+            app.timed_kind_grants.remove(&kind);
+            app.last_used = Timestamp::now();
+        }
+    }
+
+    /// Persist a timed grant for `kind` on the connected app at `pubkey` that
+    /// expires `secs` seconds from now. No-op when the app is unknown or when
+    /// `secs == 0`. Used by the per-request approval prompt (#575) when the
+    /// user picks a `RememberDuration::OneMinute / FiveMinutes / TenMinutes /
+    /// OneHour / OneDay` value.
+    pub fn grant_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) {
+        if secs == 0 {
+            return;
+        }
+        if let Some(app) = self.apps.get_mut(pubkey) {
+            app.prune_expired_kind_grants();
+            // A Forever grant already covers this kind; don't downgrade it.
+            if app.auto_approve_kinds.contains(&kind) {
+                return;
+            }
+            let expiry = now_unix_secs().saturating_add(secs);
+            // Take the LATER of any existing expiry and the new one so a user
+            // re-approving with a shorter window does not shrink an existing
+            // longer window unintentionally.
+            let final_expiry = app
+                .timed_kind_grants
+                .get(&kind)
+                .copied()
+                .map(|existing| existing.max(expiry))
+                .unwrap_or(expiry);
+            app.timed_kind_grants.insert(kind, final_expiry);
+            app.last_used = Timestamp::now();
+        }
     }
 
     pub fn record_usage(&mut self, pubkey: &PublicKey) {
@@ -504,6 +582,85 @@ mod tests {
 
         // Replacing the global list with an empty set restores approval.
         pm.set_auto_approve_kinds(HashSet::new());
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+    }
+
+    #[test]
+    fn timed_grant_skips_approval_until_pruned() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        // No grant yet: approval required.
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+
+        // A non-zero timed grant is honored.
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
+        assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
+
+        // Force the grant to expire and verify needs_approval returns true
+        // again once the expired entry is pruned.
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.timed_kind_grants.insert(Kind::TextNote, 1);
+        }
+        assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+    }
+
+    #[test]
+    fn forever_grant_is_not_downgraded_by_timed_grant() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        pm.grant_kind_forever(&pubkey, Kind::TextNote);
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
+
+        let app = pm.get_app(&pubkey).unwrap();
+        assert!(app.auto_approve_kinds.contains(&Kind::TextNote));
+        assert!(!app.timed_kind_grants.contains_key(&Kind::TextNote));
+    }
+
+    #[test]
+    fn forever_grant_removes_pre_existing_timed_grant() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
+        pm.grant_kind_forever(&pubkey, Kind::TextNote);
+
+        let app = pm.get_app(&pubkey).unwrap();
+        assert!(app.auto_approve_kinds.contains(&Kind::TextNote));
+        assert!(!app.timed_kind_grants.contains_key(&Kind::TextNote));
+    }
+
+    #[test]
+    fn timed_grant_keeps_longer_existing_window() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 24 * 60 * 60);
+        let before = pm.get_app(&pubkey).unwrap().timed_kind_grants[&Kind::TextNote];
+
+        // Re-approve with a shorter window: the longer existing expiry stands.
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
+        let after = pm.get_app(&pubkey).unwrap().timed_kind_grants[&Kind::TextNote];
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn grant_kind_for_zero_seconds_is_noop() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 0);
+        assert!(!pm
+            .get_app(&pubkey)
+            .unwrap()
+            .timed_kind_grants
+            .contains_key(&Kind::TextNote));
         assert!(pm.needs_approval(&pubkey, Kind::TextNote));
     }
 }

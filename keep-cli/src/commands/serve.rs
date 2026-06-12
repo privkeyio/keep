@@ -38,7 +38,7 @@ impl ServerCallbacks for TuiCallbacks {
         ));
     }
 
-    fn request_approval(&self, request: ApprovalRequest) -> bool {
+    fn request_approval(&self, request: ApprovalRequest) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let tui_req = TuiApprovalRequest {
             id: 0,
@@ -50,9 +50,14 @@ impl ServerCallbacks for TuiCallbacks {
         };
 
         if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
-            return false;
+            return false.into();
         }
+        // The TUI does not (yet) capture a remember-duration, so a positive
+        // response is one-shot. The new persistent-grant semantics (#575)
+        // only apply to bunkers whose callback returns a non-`JustThisTime`
+        // `RememberDuration` (today: keep-mobile).
         tokio::task::block_in_place(|| response_rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false))
+            .into()
     }
 }
 

@@ -19,7 +19,7 @@ use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
-use crate::types::{ApprovalRequest, ServerCallbacks};
+use crate::types::{ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks};
 
 fn prepare_frost_event(
     pubkey: PublicKey,
@@ -326,7 +326,11 @@ impl SignerHandler {
                 return Err(KeepError::PermissionDenied("invalid secret".into()));
             }
         } else if !self.auto_approve {
-            let approved = self
+            // Connect-time approval ignores the remember-duration today: the
+            // app-level lifetime is configured separately via the bunker's
+            // existing connect path. Per-kind remember semantics apply at
+            // `sign_event` (where #575 surfaced the silent NIP-98 grant).
+            let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
                     app_name: name.clone(),
@@ -336,7 +340,7 @@ impl SignerHandler {
                     requested_permissions: permissions.clone(),
                 })
                 .await;
-            if !approved {
+            if !result.approved {
                 return Err(KeepError::UserRejected);
             }
         }
@@ -417,7 +421,7 @@ impl SignerHandler {
             .needs_approval(&app_pubkey, kind);
 
         if needs_approval {
-            let approved = self
+            let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
                     app_name: self.get_app_name(&app_pubkey).await,
@@ -428,13 +432,35 @@ impl SignerHandler {
                 })
                 .await;
 
-            if !approved {
+            if !result.approved {
                 self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
                         .with_success(false),
                 );
                 return Err(KeepError::UserRejected);
+            }
+
+            // #575: when the user approves with a remember-duration, persist
+            // a per-app, per-kind grant so subsequent requests within the
+            // window skip the prompt. `JustThisTime` is the one-shot default
+            // and does not persist; the next request prompts again.
+            match result.remember {
+                RememberDuration::JustThisTime => {}
+                RememberDuration::Forever => {
+                    self.permissions
+                        .lock()
+                        .await
+                        .grant_kind_forever(&app_pubkey, kind);
+                }
+                timed => {
+                    if let Some(secs) = timed.as_seconds() {
+                        self.permissions
+                            .lock()
+                            .await
+                            .grant_kind_for(&app_pubkey, kind, secs);
+                    }
+                }
             }
         }
 
@@ -509,7 +535,7 @@ impl SignerHandler {
             event_content: None,
             requested_permissions: None,
         };
-        if self.request_approval(request).await {
+        if self.request_approval(request).await.approved {
             Ok(())
         } else {
             self.audit
@@ -738,16 +764,16 @@ impl SignerHandler {
             .unwrap_or_else(|| pubkey.to_hex()[..8].to_string())
     }
 
-    async fn request_approval(&self, request: ApprovalRequest) -> bool {
+    async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
         if self.auto_approve {
             warn!(method = %request.method, "auto-approving in headless mode");
-            return true;
+            return ApprovalResult::approved_once();
         }
         warn!(method = %request.method, "denying request: no approval callbacks configured");
-        false
+        ApprovalResult::rejected()
     }
 }
 
@@ -788,9 +814,9 @@ mod tests {
     }
     impl crate::types::ServerCallbacks for RecordingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
-        fn request_approval(&self, request: ApprovalRequest) -> bool {
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
             self.methods.lock().unwrap().push(request.method);
-            true
+            ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str) {}
     }

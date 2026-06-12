@@ -73,7 +73,10 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         });
     }
 
-    fn request_approval(&self, request: keep_nip46::types::ApprovalRequest) -> bool {
+    fn request_approval(
+        &self,
+        request: keep_nip46::types::ApprovalRequest,
+    ) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let display = PendingApprovalDisplay {
             app_pubkey: request.app_pubkey.to_hex(),
@@ -91,13 +94,14 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
             })
             .is_err()
         {
-            return false;
+            return false.into();
         }
         tokio::task::block_in_place(|| {
             response_rx
                 .recv_timeout(BUNKER_APPROVAL_TIMEOUT)
                 .unwrap_or(false)
         })
+        .into()
     }
 
     fn on_connect(&self, pubkey: &str, _name: &str) {

@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use keep_core::keyring::Keyring;
 use keep_core::keys::{KeyType, NostrKeypair};
-use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
+use keep_nip46::types::{ApprovalRequest, ApprovalResult, LogEvent, ServerCallbacks};
 use keep_nip46::{Server, ServerConfig};
 
 /// Test-only `ServerCallbacks` that approves every request. Used by tests
@@ -17,8 +17,8 @@ use keep_nip46::{Server, ServerConfig};
 struct AlwaysApprove;
 impl ServerCallbacks for AlwaysApprove {
     fn on_log(&self, _event: LogEvent) {}
-    fn request_approval(&self, _request: ApprovalRequest) -> bool {
-        true
+    fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+        ApprovalResult::approved_once()
     }
 }
 
