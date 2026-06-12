@@ -149,6 +149,7 @@ pub fn cmd_nip46_grant(
         auto_approve_kinds: auto_kinds,
         duration: parsed_duration,
         connected_at: now,
+        timed_kind_grants: Vec::new(),
     };
     let replaced = match existing {
         Some(idx) => {

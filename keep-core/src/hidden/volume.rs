@@ -1388,6 +1388,7 @@ mod tests {
             auto_approve_kinds: vec![1, 7],
             duration: StoredPermissionDuration::Forever,
             connected_at: 100,
+            timed_kind_grants: Vec::new(),
         });
         cfg.auto_approve_kinds = vec![22242];
 

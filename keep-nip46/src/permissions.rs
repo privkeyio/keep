@@ -392,6 +392,7 @@ impl PermissionManager {
         auto_kinds: HashSet<Kind>,
         duration: PermissionDuration,
         connected_at: Timestamp,
+        timed_kind_grants: HashMap<Kind, u64>,
     ) -> bool {
         match duration {
             PermissionDuration::Session => return false,
@@ -408,6 +409,13 @@ impl PermissionManager {
         app.auto_approve_kinds = auto_kinds;
         app.duration = duration;
         app.connected_at = connected_at;
+        // Drop grants that expired while the bunker was down; a clock error
+        // reads as u64::MAX so every grant prunes (fail-closed).
+        let now = now_unix_secs();
+        app.timed_kind_grants = timed_kind_grants
+            .into_iter()
+            .filter(|(_, expiry)| now < *expiry)
+            .collect();
         self.insert(app);
         true
     }
@@ -659,6 +667,37 @@ mod tests {
         pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
         let after = pm.get_app(&pubkey).unwrap().timed_kind_grants[&Kind::TextNote];
         assert!(after < before);
+    }
+
+    #[test]
+    fn restore_persisted_keeps_future_grant_prunes_expired() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let now = now_unix_secs();
+        let expired_kind = Kind::Custom(30023);
+        let mut grants = HashMap::new();
+        grants.insert(Kind::TextNote, now + 3600);
+        grants.insert(expired_kind, 1);
+
+        let restored = pm.restore_persisted(
+            pubkey,
+            "App".into(),
+            Permission::SIGN_EVENT,
+            HashSet::new(),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            grants,
+        );
+        assert!(restored);
+
+        // Future-dated grant survives the restart; the expired one is pruned.
+        assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
+        assert!(pm.needs_approval(&pubkey, expired_kind));
+        assert!(!pm
+            .get_app(&pubkey)
+            .unwrap()
+            .timed_kind_grants
+            .contains_key(&expired_kind));
     }
 
     #[test]

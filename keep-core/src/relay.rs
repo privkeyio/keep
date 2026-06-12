@@ -46,6 +46,16 @@ pub enum StoredPermissionDuration {
     Forever,
 }
 
+/// A single timed per-kind auto-approve grant persisted for a bunker client.
+/// Survives restart; pruned on restore once `expires_at` has passed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredTimedKindGrant {
+    /// Event kind this grant auto-approves.
+    pub kind: u16,
+    /// Unix timestamp (seconds) when the grant expires.
+    pub expires_at: u64,
+}
+
 /// Persisted permission state for a connected bunker (NIP-46) client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredBunkerPermission {
@@ -61,6 +71,10 @@ pub struct StoredBunkerPermission {
     pub duration: StoredPermissionDuration,
     /// Unix timestamp when the client first connected.
     pub connected_at: u64,
+    /// Per-kind timed auto-approve grants that survive restart. Expired entries
+    /// are pruned when the bunker restores this client.
+    #[serde(default)]
+    pub timed_kind_grants: Vec<StoredTimedKindGrant>,
 }
 
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
@@ -191,6 +205,12 @@ impl RelayConfig {
                     bp.auto_approve_kinds.len()
                 )));
             }
+            if bp.timed_kind_grants.len() > MAX_AUTO_KINDS {
+                return Err(KeepError::InvalidInput(format!(
+                    "Too many timed kind grants: {} (max {MAX_AUTO_KINDS})",
+                    bp.timed_kind_grants.len()
+                )));
+            }
             bunker_permissions.push(StoredBunkerPermission {
                 pubkey_hex: bp.pubkey_hex.to_ascii_lowercase(),
                 name: bp.name,
@@ -198,6 +218,7 @@ impl RelayConfig {
                 auto_approve_kinds: bp.auto_approve_kinds,
                 duration: bp.duration,
                 connected_at: bp.connected_at,
+                timed_kind_grants: bp.timed_kind_grants,
             });
         }
 

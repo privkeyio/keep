@@ -18,6 +18,7 @@ pub struct ConnectedClient {
     pub duration: String,
     pub duration_seconds: Option<u64>,
     pub connected_at: u64,
+    pub timed_kind_grants: Vec<(u16, u64)>,
 }
 
 const PERM_FLAGS: &[(&str, u32)] = &[

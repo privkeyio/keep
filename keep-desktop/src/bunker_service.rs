@@ -8,7 +8,7 @@ use iced::Task;
 use keep_core::relay::{normalize_relay_url, validate_relay_url};
 use zeroize::Zeroizing;
 
-use keep_core::relay::{StoredBunkerPermission, StoredPermissionDuration};
+use keep_core::relay::{StoredBunkerPermission, StoredPermissionDuration, StoredTimedKindGrant};
 
 use crate::app::{
     lock_keep, save_settings, App, ToastKind, BUNKER_APPROVAL_TIMEOUT, MAX_BUNKER_LOG_ENTRIES,
@@ -703,6 +703,11 @@ impl App {
                         .unwrap_or(StoredPermissionDuration::Session),
                 },
                 connected_at: c.connected_at,
+                timed_kind_grants: c
+                    .timed_kind_grants
+                    .iter()
+                    .map(|&(kind, expires_at)| StoredTimedKindGrant { kind, expires_at })
+                    .collect(),
             })
             .collect();
         self.update_relay_config(|config| config.bunker_permissions = stored);
@@ -728,6 +733,7 @@ impl App {
                     app.auto_approve_kinds,
                     app.duration,
                     app.connected_at,
+                    app.timed_kind_grants,
                 )
                 .await;
         }
@@ -775,6 +781,11 @@ impl App {
                             duration: duration_str,
                             duration_seconds,
                             connected_at: app.connected_at.as_secs(),
+                            timed_kind_grants: app
+                                .timed_kind_grants
+                                .iter()
+                                .map(|(k, &expiry)| (k.as_u16(), expiry))
+                                .collect(),
                         }
                     })
                     .collect()

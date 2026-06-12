@@ -62,6 +62,7 @@ pub struct PreGrantedApp {
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
     pub duration: PermissionDuration,
     pub connected_at: Timestamp,
+    pub timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64>,
 }
 
 impl PreGrantedApp {
@@ -96,6 +97,11 @@ impl PreGrantedApp {
             .copied()
             .map(nostr_sdk::Kind::from)
             .collect();
+        let timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64> = stored
+            .timed_kind_grants
+            .iter()
+            .map(|g| (nostr_sdk::Kind::from(g.kind), g.expires_at))
+            .collect();
         let duration = match &stored.duration {
             keep_core::relay::StoredPermissionDuration::Session => PermissionDuration::Session,
             keep_core::relay::StoredPermissionDuration::Seconds(s) => {
@@ -110,6 +116,7 @@ impl PreGrantedApp {
             auto_approve_kinds,
             duration,
             connected_at: Timestamp::from_secs(stored.connected_at),
+            timed_kind_grants,
         })
     }
 }
@@ -183,6 +190,7 @@ async fn apply_pre_grants(
             app.auto_approve_kinds.clone(),
             app.duration,
             app.connected_at,
+            app.timed_kind_grants.clone(),
         );
     }
 }
@@ -846,6 +854,7 @@ mod tests {
             auto_approve_kinds: vec![1, 7],
             duration,
             connected_at,
+            timed_kind_grants: Vec::new(),
         }
     }
 
@@ -884,6 +893,24 @@ mod tests {
         assert!(matches!(app.duration, PermissionDuration::Seconds(3600)));
         assert!(app.auto_approve_kinds.contains(&nostr_sdk::Kind::Custom(1)));
         assert!(app.permissions.contains(Permission::SIGN_EVENT));
+    }
+
+    #[test]
+    fn from_stored_maps_timed_kind_grants() {
+        let mut stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            42,
+        );
+        stored.timed_kind_grants = vec![keep_core::relay::StoredTimedKindGrant {
+            kind: 1,
+            expires_at: 1_900_000_000,
+        }];
+        let app = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        assert_eq!(
+            app.timed_kind_grants.get(&nostr_sdk::Kind::Custom(1)),
+            Some(&1_900_000_000)
+        );
     }
 
     #[tokio::test]

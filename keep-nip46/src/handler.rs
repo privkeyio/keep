@@ -475,11 +475,11 @@ impl SignerHandler {
                 }
                 timed => {
                     if let Some(secs) = timed.as_seconds() {
-                        let granted = self
-                            .permissions
-                            .lock()
-                            .await
-                            .grant_kind_for(&app_pubkey, kind, secs);
+                        let granted =
+                            self.permissions
+                                .lock()
+                                .await
+                                .grant_kind_for(&app_pubkey, kind, secs);
                         if granted {
                             self.audit.lock().await.log(
                                 AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
@@ -723,6 +723,7 @@ impl SignerHandler {
         auto_kinds: HashSet<Kind>,
         duration: PermissionDuration,
         connected_at: Timestamp,
+        timed_kind_grants: HashMap<Kind, u64>,
     ) {
         let mut pm = self.permissions.lock().await;
         pm.restore_persisted(
@@ -732,6 +733,7 @@ impl SignerHandler {
             auto_kinds,
             duration,
             connected_at,
+            timed_kind_grants,
         );
     }
 
