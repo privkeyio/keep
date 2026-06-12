@@ -471,6 +471,7 @@ impl SignerHandler {
                                 .with_event_kind(kind)
                                 .with_reason("grant kind forever"),
                         );
+                        self.persist_permissions().await;
                     }
                 }
                 timed => {
@@ -486,6 +487,7 @@ impl SignerHandler {
                                     .with_event_kind(kind)
                                     .with_reason(format!("grant kind for {secs}s")),
                             );
+                            self.persist_permissions().await;
                         }
                     }
                 }
@@ -746,6 +748,7 @@ impl SignerHandler {
             AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
                 .with_reason(format!("permissions={permissions:?}")),
         );
+        self.persist_permissions().await;
     }
 
     pub async fn update_client_duration(&self, pubkey: &PublicKey, duration: PermissionDuration) {
@@ -756,6 +759,7 @@ impl SignerHandler {
             AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
                 .with_reason(format!("duration={duration:?}")),
         );
+        self.persist_permissions().await;
     }
 
     pub async fn update_client_auto_kinds(&self, pubkey: &PublicKey, kinds: HashSet<Kind>) {
@@ -766,6 +770,7 @@ impl SignerHandler {
             AuditEntry::new(AuditAction::PermissionChanged, *pubkey)
                 .with_reason("auto_approve_kinds updated"),
         );
+        self.persist_permissions().await;
     }
 
     pub async fn list_clients(&self) -> Vec<AppPermission> {
@@ -774,13 +779,32 @@ impl SignerHandler {
     }
 
     pub async fn revoke_client(&self, pubkey: &PublicKey) {
-        let mut pm = self.permissions.lock().await;
-        pm.revoke(pubkey);
+        self.permissions.lock().await.revoke(pubkey);
+        self.persist_permissions().await;
     }
 
     pub async fn revoke_all_clients(&self) {
-        let mut pm = self.permissions.lock().await;
-        pm.revoke_all();
+        self.permissions.lock().await.revoke_all();
+        self.persist_permissions().await;
+    }
+
+    /// Snapshot the current grants and hand them to the consumer's persistence
+    /// callback. No-op when no callbacks are configured (e.g. headless CLI use).
+    /// Called after every grant write or revoke so the durable store always
+    /// mirrors the in-memory engine state, keeping the engine the single source
+    /// of truth for NIP-46 remember-grants.
+    async fn persist_permissions(&self) {
+        let Some(ref callbacks) = self.callbacks else {
+            return;
+        };
+        // Hold the permissions lock across both the snapshot and the durable
+        // write so concurrent grant/revoke persists commit in the same order
+        // they were snapshotted. Dropping the lock before the callback lets two
+        // persists race (snapshot in one order, write in the reverse) and
+        // durably resurrect a revoked client on the next restart.
+        let pm = self.permissions.lock().await;
+        let snapshot = pm.stored_snapshot();
+        callbacks.persist_permissions(snapshot);
     }
 
     pub async fn revoke_session_apps(&self) {
@@ -1560,6 +1584,77 @@ mod tests {
         assert!(
             !granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH),
             "NIP-98 must not be persisted as a timed grant"
+        );
+    }
+
+    /// Captures every `persist_permissions` snapshot so a test can assert the
+    /// durable store mirrors the engine after a remember-grant and after a revoke.
+    struct PersistCapturingCallbacks {
+        snapshots: std::sync::Mutex<Vec<Vec<keep_core::relay::StoredBunkerPermission>>>,
+    }
+    impl crate::types::ServerCallbacks for PersistCapturingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+            ApprovalResult {
+                approved: true,
+                remember: RememberDuration::Forever,
+            }
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+        fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
+            self.snapshots.lock().unwrap().push(grants);
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_grant_and_revoke_persist_engine_snapshot() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(PersistCapturingCallbacks {
+            snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        // A remembered (Forever) sign grant must fire persist with the granted
+        // kind captured in the durable snapshot.
+        let unsigned = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
+        handler.handle_sign_event(app, unsigned).await.unwrap();
+
+        let app_hex = app.to_hex();
+        let after_grant = cb
+            .snapshots
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a remember-grant must persist a snapshot");
+        let row = after_grant
+            .iter()
+            .find(|p| p.pubkey_hex == app_hex)
+            .expect("granted app must be in the persisted snapshot");
+        assert!(
+            row.auto_approve_kinds.contains(&Kind::TextNote.as_u16()),
+            "remembered kind must be captured in the persisted snapshot"
+        );
+
+        // Revoking the client must fire persist with the app absent.
+        handler.revoke_client(&app).await;
+        let after_revoke = cb
+            .snapshots
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("revoke must persist a snapshot");
+        assert!(
+            !after_revoke.iter().any(|p| p.pubkey_hex == app_hex),
+            "revoked app must be removed from the persisted snapshot"
         );
     }
 }

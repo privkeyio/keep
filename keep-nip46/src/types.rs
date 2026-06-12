@@ -97,6 +97,13 @@ pub trait ServerCallbacks: Send + Sync + 'static {
     fn on_log(&self, event: LogEvent);
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
     fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    /// Called after the in-memory permission grants change (a remember-grant is
+    /// written or a client is revoked), passing a full snapshot of the current
+    /// grants so the consumer can persist them durably. Default no-op: keep-web
+    /// and the CLI manage persistence out-of-band; the mobile bunker overrides
+    /// this to write the snapshot to its relay-config storage so remembered
+    /// grants survive a service restart.
+    fn persist_permissions(&self, _grants: Vec<keep_core::relay::StoredBunkerPermission>) {}
 }
 
 #[derive(Debug, serde::Deserialize)]
