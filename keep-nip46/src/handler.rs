@@ -19,7 +19,9 @@ use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
-use crate::types::{ApprovalRequest, ServerCallbacks};
+use crate::types::{
+    ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
+};
 
 fn prepare_frost_event(
     pubkey: PublicKey,
@@ -326,7 +328,11 @@ impl SignerHandler {
                 return Err(KeepError::PermissionDenied("invalid secret".into()));
             }
         } else if !self.auto_approve {
-            let approved = self
+            // Connect-time approval ignores the remember-duration today: the
+            // app-level lifetime is configured separately via the bunker's
+            // existing connect path. Per-kind remember semantics apply at
+            // `sign_event` (where #575 surfaced the silent NIP-98 grant).
+            let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
                     app_name: name.clone(),
@@ -336,7 +342,7 @@ impl SignerHandler {
                     requested_permissions: permissions.clone(),
                 })
                 .await;
-            if !approved {
+            if !result.approved {
                 return Err(KeepError::UserRejected);
             }
         }
@@ -417,7 +423,7 @@ impl SignerHandler {
             .needs_approval(&app_pubkey, kind);
 
         if needs_approval {
-            let approved = self
+            let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
                     app_name: self.get_app_name(&app_pubkey).await,
@@ -428,13 +434,61 @@ impl SignerHandler {
                 })
                 .await;
 
-            if !approved {
+            if !result.approved {
                 self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
                         .with_success(false),
                 );
                 return Err(KeepError::UserRejected);
+            }
+
+            // #575: when the user approves with a remember-duration, persist
+            // a per-app, per-kind grant so subsequent requests within the
+            // window skip the prompt. `JustThisTime` is the one-shot default
+            // and does not persist; the next request prompts again.
+            //
+            // NIP-98 (kind 27235) is never remembered: its security-relevant
+            // url/method live in tags the prompt does not surface, so a
+            // per-(app,kind) grant would auto-approve any url/method after one
+            // tap (bearer-credential threat). Force per-request approval.
+            let remember = if kind == NIP98_HTTP_AUTH {
+                RememberDuration::JustThisTime
+            } else {
+                result.remember
+            };
+            match remember {
+                RememberDuration::JustThisTime => {}
+                RememberDuration::Forever => {
+                    let granted = self
+                        .permissions
+                        .lock()
+                        .await
+                        .grant_kind_forever(&app_pubkey, kind);
+                    if granted {
+                        self.audit.lock().await.log(
+                            AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
+                                .with_event_kind(kind)
+                                .with_reason("grant kind forever"),
+                        );
+                    }
+                }
+                timed => {
+                    if let Some(secs) = timed.as_seconds() {
+                        let granted =
+                            self.permissions
+                                .lock()
+                                .await
+                                .grant_kind_for(&app_pubkey, kind, secs);
+                        if granted {
+                            self.audit.lock().await.log(
+                                AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
+                                    .with_event_kind(kind)
+                                    .with_reason(format!("grant kind for {secs}s")),
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -509,7 +563,7 @@ impl SignerHandler {
             event_content: None,
             requested_permissions: None,
         };
-        if self.request_approval(request).await {
+        if self.request_approval(request).await.approved {
             Ok(())
         } else {
             self.audit
@@ -661,6 +715,7 @@ impl SignerHandler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn restore_client(
         &self,
         pubkey: PublicKey,
@@ -669,6 +724,7 @@ impl SignerHandler {
         auto_kinds: HashSet<Kind>,
         duration: PermissionDuration,
         connected_at: Timestamp,
+        timed_kind_grants: HashMap<Kind, u64>,
     ) {
         let mut pm = self.permissions.lock().await;
         pm.restore_persisted(
@@ -678,6 +734,7 @@ impl SignerHandler {
             auto_kinds,
             duration,
             connected_at,
+            timed_kind_grants,
         );
     }
 
@@ -738,16 +795,16 @@ impl SignerHandler {
             .unwrap_or_else(|| pubkey.to_hex()[..8].to_string())
     }
 
-    async fn request_approval(&self, request: ApprovalRequest) -> bool {
+    async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
         if self.auto_approve {
             warn!(method = %request.method, "auto-approving in headless mode");
-            return true;
+            return ApprovalResult::approved_once();
         }
         warn!(method = %request.method, "denying request: no approval callbacks configured");
-        false
+        ApprovalResult::rejected()
     }
 }
 
@@ -788,9 +845,9 @@ mod tests {
     }
     impl crate::types::ServerCallbacks for RecordingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
-        fn request_approval(&self, request: ApprovalRequest) -> bool {
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
             self.methods.lock().unwrap().push(request.method);
-            true
+            ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str) {}
     }
@@ -823,12 +880,12 @@ mod tests {
         );
     }
 
-    // The fix: with `connect_grant` including SIGN_EVENT and kind 27235 in the
-    // global auto-approve set, a client that connected without requesting
-    // permissions can sign a NIP-98 event immediately, and NO per-request
-    // approval prompt fires (only the connection itself is gated).
+    // #575: even with `connect_grant` including SIGN_EVENT and kind 27235 in
+    // the global auto-approve set, a NIP-98 sign request MUST still fire the
+    // per-request approval prompt. The sign succeeds only because the prompt is
+    // approved; it must never be silently auto-signed.
     #[tokio::test]
-    async fn http_auth_signed_without_per_request_prompt() {
+    async fn http_auth_always_triggers_per_request_prompt() {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         permissions
@@ -854,22 +911,21 @@ mod tests {
         let signed = handler
             .handle_sign_event(app, unsigned)
             .await
-            .expect("kind 27235 must auto-sign for an authorized client");
+            .expect("kind 27235 signs once the prompt is approved");
         assert_eq!(signed.kind, NIP98_HTTP_AUTH);
 
         let methods = cb.methods.lock().unwrap().clone();
         assert!(
-            !methods.iter().any(|m| m == "sign_event"),
-            "kind 27235 must not trigger a per-request approval prompt, saw: {methods:?}"
+            methods.iter().any(|m| m == "sign_event"),
+            "kind 27235 MUST trigger a per-request approval prompt, saw: {methods:?}"
         );
     }
 
-    // App-scoped grant: `connect_auto_approve_kinds` auto-approves kind 27235
-    // only for clients that completed the connect handshake (scoped to their
-    // pubkey), and does NOT leak to apps that never connected — unlike the
-    // global `auto_approve_kinds` set.
+    // #575: NIP-98 (kind 27235) is never auto-approved, not even per-app via
+    // `connect_auto_approve_kinds`. The 27235 grant is stripped on connect, so
+    // both the connected app and an unconnected one still need approval.
     #[tokio::test]
-    async fn connect_auto_approve_kinds_are_per_app_not_global() {
+    async fn connect_auto_approve_kinds_never_cover_nip98() {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
@@ -887,12 +943,19 @@ mod tests {
         let never_connected = Keys::generate().public_key();
         let pm = permissions.lock().await;
         assert!(
-            !pm.needs_approval(&connected, NIP98_HTTP_AUTH),
-            "connected app must have NIP-98 auto-approved per-app"
+            pm.needs_approval(&connected, NIP98_HTTP_AUTH),
+            "NIP-98 must always prompt even for a connected app"
         );
         assert!(
             pm.needs_approval(&never_connected, NIP98_HTTP_AUTH),
-            "NIP-98 must NOT be globally auto-approved for unconnected apps"
+            "NIP-98 must always prompt for unconnected apps"
+        );
+        assert!(
+            !pm.get_app(&connected)
+                .unwrap()
+                .auto_approve_kinds
+                .contains(&NIP98_HTTP_AUTH),
+            "NIP-98 must be stripped from the per-app auto-approve set on connect"
         );
     }
 
@@ -1395,5 +1458,108 @@ mod tests {
 
         handler.revoke_all_clients().await;
         assert_eq!(handler.list_clients().await.len(), 0);
+    }
+
+    /// Approves every request with a fixed `remember` value and counts how many
+    /// `sign_event` prompts fired, so a test can assert whether a remembered
+    /// grant skipped the prompt on the next request.
+    struct RememberingCallbacks {
+        remember: RememberDuration,
+        sign_event_prompts: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::types::ServerCallbacks for RememberingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            if request.method == "sign_event" {
+                self.sign_event_prompts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            ApprovalResult {
+                approved: true,
+                remember: self.remember,
+            }
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    }
+
+    #[tokio::test]
+    async fn remembered_grant_skips_next_same_kind_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RememberingCallbacks {
+            remember: RememberDuration::Forever,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let first = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "one");
+        handler.handle_sign_event(app, first).await.unwrap();
+
+        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "two");
+        handler.handle_sign_event(app, second).await.unwrap();
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a Forever grant must skip the prompt on the next same-kind request"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip98_is_never_remembered_even_when_approved_forever() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RememberingCallbacks {
+            remember: RememberDuration::Forever,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler =
+            SignerHandler::new(keyring, Arc::clone(&permissions), audit, Some(cb.clone()))
+                .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let tags = vec![
+            Tag::parse(["u", "https://a.example/api"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ];
+        let first = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            tags.clone(),
+            "",
+        );
+        handler.handle_sign_event(app, first).await.unwrap();
+
+        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        handler.handle_sign_event(app, second).await.unwrap();
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "NIP-98 must prompt on every request even after approve=Forever"
+        );
+        let pm = permissions.lock().await;
+        let granted = pm.get_app(&app).unwrap();
+        assert!(
+            !granted.auto_approve_kinds.contains(&NIP98_HTTP_AUTH),
+            "NIP-98 must not be persisted as an auto-approve kind"
+        );
+        assert!(
+            !granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH),
+            "NIP-98 must not be persisted as a timed grant"
+        );
     }
 }

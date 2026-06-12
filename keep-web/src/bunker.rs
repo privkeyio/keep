@@ -63,7 +63,7 @@ impl ServerCallbacks for WebCallbacks {
         });
     }
 
-    fn request_approval(&self, request: ApprovalRequest) -> bool {
+    fn request_approval(&self, request: ApprovalRequest) -> keep_nip46::types::ApprovalResult {
         // Co-signing is off (kill switch): refuse signing without bothering the
         // operator with a prompt that would only fail at the FROST layer.
         if request.method == "sign_event"
@@ -78,7 +78,7 @@ impl ServerCallbacks for WebCallbacks {
                 success: false,
                 detail: Some("enable co-signing to approve requests".into()),
             });
-            return false;
+            return false.into();
         }
         let id = random_approval_id();
         let (tx, rx) = channel();
@@ -101,7 +101,7 @@ impl ServerCallbacks for WebCallbacks {
         if let Ok(mut map) = self.approvals.lock() {
             map.remove(&id);
         }
-        decision
+        decision.into()
     }
 }
 

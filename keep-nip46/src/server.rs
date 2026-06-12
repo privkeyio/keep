@@ -62,6 +62,7 @@ pub struct PreGrantedApp {
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
     pub duration: PermissionDuration,
     pub connected_at: Timestamp,
+    pub timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64>,
 }
 
 impl PreGrantedApp {
@@ -96,6 +97,11 @@ impl PreGrantedApp {
             .copied()
             .map(nostr_sdk::Kind::from)
             .collect();
+        let timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64> = stored
+            .timed_kind_grants
+            .iter()
+            .map(|g| (nostr_sdk::Kind::from(g.kind), g.expires_at))
+            .collect();
         let duration = match &stored.duration {
             keep_core::relay::StoredPermissionDuration::Session => PermissionDuration::Session,
             keep_core::relay::StoredPermissionDuration::Seconds(s) => {
@@ -110,6 +116,7 @@ impl PreGrantedApp {
             auto_approve_kinds,
             duration,
             connected_at: Timestamp::from_secs(stored.connected_at),
+            timed_kind_grants,
         })
     }
 }
@@ -183,6 +190,7 @@ async fn apply_pre_grants(
             app.auto_approve_kinds.clone(),
             app.duration,
             app.connected_at,
+            app.timed_kind_grants.clone(),
         );
     }
 }
@@ -846,6 +854,7 @@ mod tests {
             auto_approve_kinds: vec![1, 7],
             duration,
             connected_at,
+            timed_kind_grants: Vec::new(),
         }
     }
 
@@ -886,6 +895,24 @@ mod tests {
         assert!(app.permissions.contains(Permission::SIGN_EVENT));
     }
 
+    #[test]
+    fn from_stored_maps_timed_kind_grants() {
+        let mut stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            42,
+        );
+        stored.timed_kind_grants = vec![keep_core::relay::StoredTimedKindGrant {
+            kind: 1,
+            expires_at: 1_900_000_000,
+        }];
+        let app = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        assert_eq!(
+            app.timed_kind_grants.get(&nostr_sdk::Kind::Custom(1)),
+            Some(&1_900_000_000)
+        );
+    }
+
     #[tokio::test]
     async fn apply_pre_grants_skips_session_and_expired() {
         let pm = Arc::new(Mutex::new(PermissionManager::new()));
@@ -920,6 +947,45 @@ mod tests {
             count, 1,
             "only the Forever grant should land in the manager"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_pre_grants_round_trips_timed_grant_but_drops_nip98() {
+        use crate::NIP98_HTTP_AUTH;
+
+        let pm = Arc::new(Mutex::new(PermissionManager::new()));
+        let pk_hex = good_pubkey_hex();
+        let mut stored = sample_stored(
+            &pk_hex,
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        // A persisted (legacy/hostile) config carrying both a NIP-98 grant and a
+        // benign TextNote grant in every channel.
+        stored.auto_approve_kinds = vec![NIP98_HTTP_AUTH.as_u16(), 1];
+        stored.timed_kind_grants = vec![
+            keep_core::relay::StoredTimedKindGrant {
+                kind: NIP98_HTTP_AUTH.as_u16(),
+                expires_at: 1_900_000_000,
+            },
+            keep_core::relay::StoredTimedKindGrant {
+                kind: 1,
+                expires_at: 1_900_000_000,
+            },
+        ];
+
+        let pre = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        apply_pre_grants(&pm, &[pre]).await;
+
+        let pubkey = nostr_sdk::PublicKey::from_hex(&pk_hex).unwrap();
+        let guard = pm.lock().await;
+        // Benign grant survives the persistence round trip.
+        assert!(!guard.needs_approval(&pubkey, nostr_sdk::Kind::TextNote));
+        // NIP-98 is dropped and always prompts.
+        assert!(guard.needs_approval(&pubkey, NIP98_HTTP_AUTH));
+        let app = guard.get_app(&pubkey).unwrap();
+        assert!(!app.auto_approve_kinds.contains(&NIP98_HTTP_AUTH));
+        assert!(!app.timed_kind_grants.contains_key(&NIP98_HTTP_AUTH));
     }
 
     // === #417 round 5: targeted unit tests killing the surviving mutations ===

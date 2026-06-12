@@ -25,9 +25,77 @@ pub struct ApprovalRequest {
     pub requested_permissions: Option<String>,
 }
 
+/// How long an approval extends beyond the current request, captured from the
+/// per-request prompt UI. Mirrors keep-android's
+/// `nip55/PermissionEntities.kt::PermissionDuration` and Amber's
+/// `SettingsScreen.kt::RememberType` 1:1 so the same UX maps cleanly across
+/// signers. `JustThisTime` is the one-shot default: the request is approved
+/// but no grant is persisted, so the next request prompts again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RememberDuration {
+    JustThisTime,
+    OneMinute,
+    FiveMinutes,
+    TenMinutes,
+    OneHour,
+    OneDay,
+    Forever,
+}
+
+impl RememberDuration {
+    /// Duration in seconds for timed variants, `None` for `JustThisTime` and
+    /// `Forever` (which have no expiry semantics).
+    pub fn as_seconds(&self) -> Option<u64> {
+        match self {
+            Self::JustThisTime | Self::Forever => None,
+            Self::OneMinute => Some(60),
+            Self::FiveMinutes => Some(5 * 60),
+            Self::TenMinutes => Some(10 * 60),
+            Self::OneHour => Some(60 * 60),
+            Self::OneDay => Some(24 * 60 * 60),
+        }
+    }
+}
+
+/// Result of a per-request approval prompt. `approved == false` always means
+/// reject (with `remember = JustThisTime`). `approved == true` plus a non-
+/// `JustThisTime` duration persists a per-app, per-kind grant so subsequent
+/// requests within the window auto-approve without re-prompting.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalResult {
+    pub approved: bool,
+    pub remember: RememberDuration,
+}
+
+impl ApprovalResult {
+    pub fn approved_once() -> Self {
+        Self {
+            approved: true,
+            remember: RememberDuration::JustThisTime,
+        }
+    }
+
+    pub fn rejected() -> Self {
+        Self {
+            approved: false,
+            remember: RememberDuration::JustThisTime,
+        }
+    }
+}
+
+impl From<bool> for ApprovalResult {
+    fn from(b: bool) -> Self {
+        if b {
+            Self::approved_once()
+        } else {
+            Self::rejected()
+        }
+    }
+}
+
 pub trait ServerCallbacks: Send + Sync + 'static {
     fn on_log(&self, event: LogEvent);
-    fn request_approval(&self, request: ApprovalRequest) -> bool;
+    fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
     fn on_connect(&self, _pubkey: &str, _name: &str) {}
 }
 
@@ -78,4 +146,20 @@ pub(crate) struct PartialEvent {
     #[serde(default)]
     pub tags: Vec<Vec<String>>,
     pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_duration_as_seconds_mapping() {
+        assert_eq!(RememberDuration::JustThisTime.as_seconds(), None);
+        assert_eq!(RememberDuration::Forever.as_seconds(), None);
+        assert_eq!(RememberDuration::OneMinute.as_seconds(), Some(60));
+        assert_eq!(RememberDuration::FiveMinutes.as_seconds(), Some(5 * 60));
+        assert_eq!(RememberDuration::TenMinutes.as_seconds(), Some(10 * 60));
+        assert_eq!(RememberDuration::OneHour.as_seconds(), Some(60 * 60));
+        assert_eq!(RememberDuration::OneDay.as_seconds(), Some(24 * 60 * 60));
+    }
 }
