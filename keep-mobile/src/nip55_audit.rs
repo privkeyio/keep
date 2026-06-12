@@ -79,6 +79,14 @@ pub fn nip55_audit_entry_hash(
     was_automatic: bool,
     hmac_key: Vec<u8>,
 ) -> String {
+    // Fail closed on a missing key, matching keep-android `calculateEntryHash`
+    // (`?: throw IllegalStateException("HMAC key not initialized ...")`). Without
+    // this an empty key silently yields a key-independent, forgeable MAC.
+    assert!(
+        !hmac_key.is_empty(),
+        "HMAC key not initialized - cannot compute audit entry hash"
+    );
+    let hmac_key = zeroize::Zeroizing::new(hmac_key);
     audit_entry_hash_inner(
         previous_hash.as_deref(),
         &caller,
@@ -87,7 +95,7 @@ pub fn nip55_audit_entry_hash(
         &decision,
         timestamp,
         was_automatic,
-        &hmac_key,
+        hmac_key.as_slice(),
     )
 }
 
@@ -123,6 +131,13 @@ pub fn nip55_verify_audit_chain(
     hmac_key: Vec<u8>,
 ) -> Nip55ChainStatus {
     use std::collections::HashSet;
+
+    // Fail closed on a missing key, matching keep-android `verifyAuditChain`.
+    assert!(
+        !hmac_key.is_empty(),
+        "HMAC key not initialized - cannot verify audit chain"
+    );
+    let hmac_key = zeroize::Zeroizing::new(hmac_key);
 
     let known_hashes: HashSet<&str> = entries
         .iter()
@@ -168,7 +183,7 @@ pub fn nip55_verify_audit_chain(
             &entry.decision,
             entry.timestamp,
             entry.was_automatic,
-            &hmac_key,
+            hmac_key.as_slice(),
         );
         if !ct_eq(&calculated, &entry.entry_hash) {
             return Nip55ChainStatus::Tampered { entry_id: entry.id };
@@ -319,6 +334,28 @@ mod tests {
                 legacy_entries_skipped: 1
             }
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "HMAC key not initialized")]
+    fn empty_key_rejected_on_hash() {
+        nip55_audit_entry_hash(
+            None,
+            "com.app".into(),
+            "SIGN_EVENT".into(),
+            Some(1),
+            "allow".into(),
+            100,
+            false,
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "HMAC key not initialized")]
+    fn empty_key_rejected_on_verify() {
+        let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
+        nip55_verify_audit_chain(vec![e1], Vec::new());
     }
 
     #[test]
