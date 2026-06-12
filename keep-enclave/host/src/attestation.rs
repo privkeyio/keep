@@ -26,8 +26,16 @@ impl ExpectedPcrs {
                 .try_into()
                 .map_err(|_| EnclaveError::Attestation("PCR must be 48 bytes".into()))
         };
+        let pcr0 = parse(pcr0)?;
+        if pcr0.iter().all(|&b| b == 0) {
+            return Err(EnclaveError::Attestation(
+                "PCR0 is all zeros, which indicates a debug-mode enclave; refusing to pin it. \
+                 Use --insecure-no-pcrs if you genuinely intend to verify a debug enclave."
+                    .into(),
+            ));
+        }
         Ok(Self {
-            pcr0: parse(pcr0)?,
+            pcr0,
             pcr1: parse(pcr1)?,
             pcr2: parse(pcr2)?,
         })
@@ -83,9 +91,13 @@ impl AttestationVerifier {
     /// `insecure_without_pcrs` so the unsafe path can never be reached by
     /// accident.
     pub fn new(expected_pcrs: ExpectedPcrs) -> Self {
+        Self::with_pcrs(Some(expected_pcrs))
+    }
+
+    fn with_pcrs(expected_pcrs: Option<ExpectedPcrs>) -> Self {
         let root_cert = parse_pem_cert(AWS_NITRO_ROOT_CERT_PEM);
         Self {
-            expected_pcrs: Some(expected_pcrs),
+            expected_pcrs,
             root_cert,
         }
     }
@@ -96,12 +108,9 @@ impl AttestationVerifier {
     /// attestation is not bound to any known enclave image; an AWS-signed
     /// document from a *different* enclave still verifies. Never call this
     /// from production paths.
+    #[doc(hidden)]
     pub fn insecure_without_pcrs() -> Self {
-        let root_cert = parse_pem_cert(AWS_NITRO_ROOT_CERT_PEM);
-        Self {
-            expected_pcrs: None,
-            root_cert,
-        }
+        Self::with_pcrs(None)
     }
 
     pub fn verify(&self, attestation_doc: &[u8], nonce: &[u8; 32]) -> Result<VerifiedAttestation> {
@@ -393,14 +402,21 @@ mod tests {
 
     #[test]
     fn test_expected_pcrs_from_hex() {
-        let pcr0 = "0".repeat(96);
+        let pcr0 = "9".repeat(96);
         let pcr1 = "1".repeat(96);
         let pcr2 = "2".repeat(96);
 
         let pcrs = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).unwrap();
-        assert_eq!(pcrs.pcr0[0], 0x00);
+        assert_eq!(pcrs.pcr0[0], 0x99);
         assert_eq!(pcrs.pcr1[0], 0x11);
         assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    #[test]
+    fn from_hex_rejects_all_zero_pcr0() {
+        let err = ExpectedPcrs::from_hex(&"0".repeat(96), &"1".repeat(96), &"2".repeat(96))
+            .expect_err("all-zero PCR0 must be rejected");
+        assert!(matches!(err, EnclaveError::Attestation(_)));
     }
 
     /// #577: `AttestationVerifier::new` MUST require pinned PCRs by
@@ -410,7 +426,7 @@ mod tests {
     /// matching and break the reproducible-build binding.
     #[test]
     fn production_verifier_requires_pcrs_by_construction() {
-        let pcrs = ExpectedPcrs::from_hex(&"0".repeat(96), &"1".repeat(96), &"2".repeat(96))
+        let pcrs = ExpectedPcrs::from_hex(&"9".repeat(96), &"1".repeat(96), &"2".repeat(96))
             .expect("ExpectedPcrs hex");
         let verifier = AttestationVerifier::new(pcrs);
         assert!(
