@@ -107,32 +107,42 @@ pub fn nip55_effective_grant_duration(
     duration
 }
 
-/// True when a stored permission has expired. Prefers the monotonic
-/// (`created_at_elapsed` + `duration_ms`) clock and falls back to wall-clock
-/// when the monotonic stamp is absent; a backwards wall-clock jump relative to
-/// `created_at` reads as expired (fail-closed against clock manipulation).
-/// Mirrors `PermissionEntities.kt::isTimestampExpired`.
-fn is_expired(perm: &Nip55StoredPermission, now_elapsed_ms: i64, now_wall_ms: i64) -> bool {
-    if perm.expires_at.is_none() && perm.duration_ms.is_none() {
+/// True when a `(created_at, duration)` lifetime has expired. Prefers the
+/// monotonic (`created_at_elapsed` + `duration_ms`) clock and falls back to
+/// wall-clock when the monotonic stamp is absent; a backwards wall-clock jump
+/// relative to `created_at` reads as expired (fail-closed against clock
+/// manipulation). The single source of truth for NIP-55 expiry, shared by
+/// permission rows and per-app settings. Mirrors
+/// `PermissionEntities.kt::isTimestampExpired`.
+#[uniffi::export]
+pub fn nip55_timestamp_expired(
+    expires_at: Option<i64>,
+    created_at: i64,
+    created_at_elapsed: i64,
+    duration_ms: Option<i64>,
+    now_elapsed_ms: i64,
+    now_wall_ms: i64,
+) -> bool {
+    if expires_at.is_none() && duration_ms.is_none() {
         return false;
     }
-    if let Some(duration_ms) = perm.duration_ms {
-        if perm.created_at_elapsed > 0 {
-            if now_elapsed_ms < perm.created_at_elapsed {
+    if let Some(duration_ms) = duration_ms {
+        if created_at_elapsed > 0 {
+            if now_elapsed_ms < created_at_elapsed {
                 return true;
             }
-            if now_elapsed_ms - perm.created_at_elapsed >= duration_ms {
+            if now_elapsed_ms - created_at_elapsed >= duration_ms {
                 return true;
             }
         } else {
-            let wall_expiry = perm.created_at.saturating_add(duration_ms);
+            let wall_expiry = created_at.saturating_add(duration_ms);
             if now_wall_ms >= wall_expiry {
                 return true;
             }
         }
     }
-    if let Some(expires_at) = perm.expires_at {
-        let clock_manipulated = now_wall_ms < perm.created_at;
+    if let Some(expires_at) = expires_at {
+        let clock_manipulated = now_wall_ms < created_at;
         if clock_manipulated || expires_at <= now_wall_ms {
             return true;
         }
@@ -140,16 +150,15 @@ fn is_expired(perm: &Nip55StoredPermission, now_elapsed_ms: i64, now_wall_ms: i6
     false
 }
 
-/// True when a stored permission has expired given the current clocks. FFI
-/// wrapper over the shared expiry rule (reused for both permission rows and
-/// per-app settings on the Android side).
-#[uniffi::export]
-pub fn nip55_permission_expired(
-    permission: Nip55StoredPermission,
-    now_elapsed_ms: i64,
-    now_wall_ms: i64,
-) -> bool {
-    is_expired(&permission, now_elapsed_ms, now_wall_ms)
+fn is_expired(perm: &Nip55StoredPermission, now_elapsed_ms: i64, now_wall_ms: i64) -> bool {
+    nip55_timestamp_expired(
+        perm.expires_at,
+        perm.created_at,
+        perm.created_at_elapsed,
+        perm.duration_ms,
+        now_elapsed_ms,
+        now_wall_ms,
+    )
 }
 
 /// Resolve the standing decision for a request. `exact` is the row keyed by the
@@ -333,6 +342,15 @@ mod tests {
             nip55_resolve_decision(None, None, Some(PLAIN_KIND), 0, 0),
             None
         );
+    }
+
+    #[test]
+    fn raw_timestamp_export_matches_monotonic_window() {
+        // 1h grant, monotonic stamp present.
+        assert!(!nip55_timestamp_expired(None, 0, 1_000, Some(HOUR_MS), 1_000 + HOUR_MS - 1, 0));
+        assert!(nip55_timestamp_expired(None, 0, 1_000, Some(HOUR_MS), 1_000 + HOUR_MS, 0));
+        // No lifetime fields -> never expires.
+        assert!(!nip55_timestamp_expired(None, 0, 0, None, i64::MAX, i64::MAX));
     }
 
     #[test]
