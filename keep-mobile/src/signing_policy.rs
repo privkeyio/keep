@@ -229,6 +229,13 @@ const DAILY_KEY_PREFIX: &str = "daily_";
 const COOLED_OFF_KEY_PREFIX: &str = "cooled_off_";
 const COOLED_OFF_ELAPSED_KEY_PREFIX: &str = "cooled_off_elapsed_";
 
+/// Build a storage key. The `:` separator cannot appear in an Android package
+/// name (segments are `[a-zA-Z0-9_]`), so prefixes never collide with each other
+/// regardless of the package name.
+fn key(prefix: &str, package_name: &str) -> String {
+    format!("{prefix}:{package_name}")
+}
+
 struct UsageWindow {
     count: u32,
     /// Window start on the monotonic clock (Android `elapsedRealtime`).
@@ -257,6 +264,10 @@ pub trait SigningRateLimiterStorage: Send + Sync {
 pub struct SigningRateLimiter {
     storage: Arc<dyn SigningRateLimiterStorage>,
     recent: Mutex<HashMap<String, UsageWindow>>,
+    /// Serializes the storage read-modify-write critical sections so concurrent
+    /// calls for the same package cannot lose an increment. Always acquired
+    /// before `recent` to keep a consistent lock order.
+    guard: Mutex<()>,
 }
 
 #[uniffi::export]
@@ -266,6 +277,7 @@ impl SigningRateLimiter {
         Self {
             storage,
             recent: Mutex::new(HashMap::new()),
+            guard: Mutex::new(()),
         }
     }
 
@@ -278,32 +290,38 @@ impl SigningRateLimiter {
         now_elapsed_ms: u64,
         now_wall_ms: u64,
     ) -> AutoSignDecision {
-        if self.is_cooled_off(&package_name, now_elapsed_ms, now_wall_ms) {
+        let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cooled = self.cooled_off_state(&package_name, now_elapsed_ms, now_wall_ms);
+        if cooled.active() {
             return AutoSignDecision::CoolingOff {
-                until_ms: self.cooled_off_until(&package_name, now_elapsed_ms, now_wall_ms),
+                until_ms: cooled.until_wall_ms(now_elapsed_ms, now_wall_ms),
             };
         }
 
-        let hourly = self.bump_window(
+        // Compute would-be counts first; a denied request must not increment the
+        // persisted counter, so the windows are only saved once every limit
+        // passes.
+        let hourly = self.next_window(
             HOURLY_KEY_PREFIX,
             &package_name,
             HOUR_MS,
             now_elapsed_ms,
             now_wall_ms,
         );
-        if hourly > HOURLY_LIMIT {
+        if hourly.count > HOURLY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
             return AutoSignDecision::HourlyLimitExceeded;
         }
 
-        let daily = self.bump_window(
+        let daily = self.next_window(
             DAILY_KEY_PREFIX,
             &package_name,
             DAY_MS,
             now_elapsed_ms,
             now_wall_ms,
         );
-        if daily > DAILY_LIMIT {
+        if daily.count > DAILY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
             return AutoSignDecision::DailyLimitExceeded;
         }
@@ -314,9 +332,12 @@ impl SigningRateLimiter {
             return AutoSignDecision::UnusualActivity;
         }
 
+        self.save_window(HOURLY_KEY_PREFIX, &package_name, &hourly, now_wall_ms);
+        self.save_window(DAILY_KEY_PREFIX, &package_name, &daily, now_wall_ms);
+
         AutoSignDecision::Allowed {
-            hourly_count: hourly,
-            daily_count: daily,
+            hourly_count: hourly.count,
+            daily_count: daily.count,
             recent_count: recent,
             hourly_limit: HOURLY_LIMIT,
             daily_limit: DAILY_LIMIT,
@@ -324,13 +345,18 @@ impl SigningRateLimiter {
     }
 
     pub fn clear_cooling_off(&self, package_name: String) {
+        let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        self.storage.remove(key(COOLED_OFF_KEY_PREFIX, &package_name));
         self.storage
-            .remove(format!("{COOLED_OFF_KEY_PREFIX}{package_name}"));
-        self.storage
-            .remove(format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"));
+            .remove(key(COOLED_OFF_ELAPSED_KEY_PREFIX, &package_name));
+        // Also drop the velocity counters; leaving an over-limit counter in
+        // place would immediately re-trip cooling-off on the next request.
+        self.storage.remove(key(HOURLY_KEY_PREFIX, &package_name));
+        self.storage.remove(key(DAILY_KEY_PREFIX, &package_name));
     }
 
     pub fn clear_all(&self) {
+        let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         self.storage.clear();
         self.recent
             .lock()
@@ -344,6 +370,7 @@ impl SigningRateLimiter {
         now_elapsed_ms: u64,
         now_wall_ms: u64,
     ) -> UsageStats {
+        let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let hourly_count = self
             .read_window(
                 HOURLY_KEY_PREFIX,
@@ -385,7 +412,7 @@ impl SigningRateLimiter {
         now_elapsed_ms: u64,
         now_wall_ms: u64,
     ) -> Option<UsageWindow> {
-        let raw = self.storage.load(format!("{prefix}{package_name}"))?;
+        let raw = self.storage.load(key(prefix, package_name))?;
         let window = parse_window(&raw, now_elapsed_ms, now_wall_ms)?;
         let active = now_elapsed_ms
             .checked_sub(window.start_elapsed)
@@ -393,31 +420,32 @@ impl SigningRateLimiter {
         active.then_some(window)
     }
 
-    /// Increment (or start) a persisted window and return the new count.
-    fn bump_window(
+    /// Compute the window the next increment would produce, without persisting
+    /// it. The caller saves it via [`save_window`] only if the request is
+    /// allowed, so a denied request never bumps the stored counter.
+    fn next_window(
         &self,
         prefix: &str,
         package_name: &str,
         window_ms: u64,
         now_elapsed_ms: u64,
         now_wall_ms: u64,
-    ) -> u32 {
-        let window =
-            match self.read_window(prefix, package_name, window_ms, now_elapsed_ms, now_wall_ms) {
-                Some(mut w) => {
-                    w.count = w.count.saturating_add(1);
-                    w
-                }
-                None => UsageWindow {
-                    count: 1,
-                    start_elapsed: now_elapsed_ms,
-                },
-            };
-        self.storage.save(
-            format!("{prefix}{package_name}"),
-            serialize_window(&window, now_wall_ms),
-        );
-        window.count
+    ) -> UsageWindow {
+        match self.read_window(prefix, package_name, window_ms, now_elapsed_ms, now_wall_ms) {
+            Some(mut w) => {
+                w.count = w.count.saturating_add(1);
+                w
+            }
+            None => UsageWindow {
+                count: 1,
+                start_elapsed: now_elapsed_ms,
+            },
+        }
+    }
+
+    fn save_window(&self, prefix: &str, package_name: &str, window: &UsageWindow, now_wall_ms: u64) {
+        self.storage
+            .save(key(prefix, package_name), serialize_window(window, now_wall_ms));
     }
 
     /// Increment the in-memory unusual-activity window (60s); not persisted.
@@ -457,68 +485,69 @@ impl SigningRateLimiter {
         count
     }
 
-    /// True while either the monotonic or wall cooling-off deadline is in the
-    /// future (belt-and-suspenders across a reboot or wall-clock change).
-    fn is_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> bool {
-        if let Some(until) =
-            self.load_u64(&format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"))
-        {
-            if until > 0
-                && now_elapsed_ms < until
-                && until - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
-            {
-                return true;
-            }
+    /// Load and validate both cooling-off deadlines in a single pass, so a
+    /// cooling-off decision touches each storage key only once instead of
+    /// re-loading (and re-decrypting) them for separate predicates.
+    fn cooled_off_state(
+        &self,
+        package_name: &str,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> CooledOffState {
+        let wall_until = self
+            .load_u64(&key(COOLED_OFF_KEY_PREFIX, package_name))
+            .filter(|&u| u > 0 && now_wall_ms < u);
+        let elapsed_until = self
+            .load_u64(&key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name))
+            .filter(|&u| u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS);
+        CooledOffState {
+            wall_until,
+            elapsed_until,
         }
-        if let Some(until) = self.load_u64(&format!("{COOLED_OFF_KEY_PREFIX}{package_name}")) {
-            if until > 0 && now_wall_ms < until {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// The cooling-off deadline as a wall-clock timestamp (the soonest valid of
-    /// the wall and reconstructed-monotonic deadlines), or 0 if not cooled off.
-    fn cooled_off_until(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> u64 {
-        let until_wall = self.load_u64(&format!("{COOLED_OFF_KEY_PREFIX}{package_name}"));
-        let until_elapsed =
-            self.load_u64(&format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"));
-
-        let wall_valid = until_wall.is_some_and(|u| u > 0 && now_wall_ms < u);
-        let elapsed_valid = until_elapsed.is_some_and(|u| {
-            u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
-        });
-
-        if !wall_valid && !elapsed_valid {
-            return 0;
-        }
-        let wall_expiry = if wall_valid {
-            until_wall.unwrap()
-        } else {
-            u64::MAX
-        };
-        let elapsed_expiry = if elapsed_valid {
-            now_wall_ms + (until_elapsed.unwrap() - now_elapsed_ms)
-        } else {
-            u64::MAX
-        };
-        wall_expiry.min(elapsed_expiry)
     }
 
     fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) {
         self.storage.save(
-            format!("{COOLED_OFF_KEY_PREFIX}{package_name}"),
+            key(COOLED_OFF_KEY_PREFIX, package_name),
             (now_wall_ms + COOLING_OFF_PERIOD_MS).to_string(),
         );
         self.storage.save(
-            format!("{COOLED_OFF_ELAPSED_KEY_PREFIX}{package_name}"),
+            key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name),
             (now_elapsed_ms + COOLING_OFF_PERIOD_MS).to_string(),
         );
     }
 
     fn load_u64(&self, key: &str) -> Option<u64> {
         self.storage.load(key.to_string())?.parse::<u64>().ok()
+    }
+}
+
+/// The validated cooling-off deadlines for a package: the wall and the
+/// reconstructed-monotonic deadlines, each present only when still in the future
+/// (belt-and-suspenders across a reboot or a wall-clock change).
+struct CooledOffState {
+    wall_until: Option<u64>,
+    elapsed_until: Option<u64>,
+}
+
+impl CooledOffState {
+    /// True while either deadline is still in the future.
+    fn active(&self) -> bool {
+        self.wall_until.is_some() || self.elapsed_until.is_some()
+    }
+
+    /// The cooling-off deadline as a wall-clock timestamp (the soonest valid of
+    /// the wall and reconstructed-monotonic deadlines), or 0 if not cooled off.
+    fn until_wall_ms(&self, now_elapsed_ms: u64, now_wall_ms: u64) -> u64 {
+        if !self.active() {
+            return 0;
+        }
+        let wall_expiry = self.wall_until.unwrap_or(u64::MAX);
+        let elapsed_expiry = self
+            .elapsed_until
+            .map(|u| now_wall_ms + (u - now_elapsed_ms))
+            .unwrap_or(u64::MAX);
+        wall_expiry.min(elapsed_expiry)
     }
 }
 
@@ -537,11 +566,18 @@ fn parse_window(raw: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> Option<Usag
         });
     }
     let persist_wall = parts.next()?.parse::<u64>().ok()?;
-    let elapsed_since = now_wall_ms.checked_sub(persist_wall)?;
-    let reconstructed = now_elapsed_ms.checked_sub(elapsed_since)?;
-    (reconstructed > 0).then_some(UsageWindow {
+    // When the wall delta is unusable (the wall clock moved backward, or jumped
+    // forward past the device's uptime) or reconstructs to 0, do NOT drop the
+    // window -- that would let an app reset its velocity by restarting keep.
+    // Clamp it to still-active (just-started) while preserving the count.
+    let start_elapsed = now_wall_ms
+        .checked_sub(persist_wall)
+        .and_then(|elapsed_since| now_elapsed_ms.checked_sub(elapsed_since))
+        .filter(|&reconstructed| reconstructed > 0)
+        .unwrap_or(now_elapsed_ms);
+    Some(UsageWindow {
         count,
-        start_elapsed: reconstructed,
+        start_elapsed,
     })
 }
 
@@ -770,6 +806,28 @@ mod tests {
         let ts = base + (HOURLY_LIMIT as u64) * gap;
         let result = limiter.check_and_record("com.test".to_string(), ts, ts);
         assert!(matches!(result, AutoSignDecision::HourlyLimitExceeded));
+    }
+
+    #[test]
+    fn test_rate_limiter_denied_does_not_increment() {
+        let storage = MockStorage::new();
+        let limiter = SigningRateLimiter::new(storage.clone());
+        let base = 1_000_000u64;
+        let gap = 1201u64;
+        for i in 0..HOURLY_LIMIT {
+            let ts = base + (i as u64) * gap;
+            limiter.check_and_record("com.test".to_string(), ts, ts);
+        }
+        let ts = base + (HOURLY_LIMIT as u64) * gap;
+        let result = limiter.check_and_record("com.test".to_string(), ts, ts);
+        assert!(matches!(result, AutoSignDecision::HourlyLimitExceeded));
+        // The denied request must not bump the persisted counter past the limit.
+        assert_eq!(
+            limiter
+                .get_usage_stats("com.test".to_string(), ts, ts)
+                .hourly_count,
+            HOURLY_LIMIT
+        );
     }
 
     #[test]
