@@ -223,7 +223,8 @@ mod tests {
         ts: i64,
         auto: bool,
     ) -> Nip55AuditEntry {
-        let hash = audit_entry_hash_inner(prev, caller, "SIGN_EVENT", kind, decision, ts, auto, KEY);
+        let hash =
+            audit_entry_hash_inner(prev, caller, "SIGN_EVENT", kind, decision, ts, auto, KEY);
         Nip55AuditEntry {
             id,
             timestamp: ts,
@@ -275,7 +276,15 @@ mod tests {
     #[test]
     fn valid_chain_verifies() {
         let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
-        let e2 = entry(2, Some(&e1.entry_hash), "com.app", Some(1), "allow", 200, true);
+        let e2 = entry(
+            2,
+            Some(&e1.entry_hash),
+            "com.app",
+            Some(1),
+            "allow",
+            200,
+            true,
+        );
         assert_eq!(
             nip55_verify_audit_chain(vec![e1, e2], KEY.to_vec()),
             Nip55ChainStatus::Valid
@@ -293,7 +302,15 @@ mod tests {
     #[test]
     fn tampered_entry_detected() {
         let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
-        let mut e2 = entry(2, Some(&e1.entry_hash), "com.app", Some(1), "allow", 200, true);
+        let mut e2 = entry(
+            2,
+            Some(&e1.entry_hash),
+            "com.app",
+            Some(1),
+            "allow",
+            200,
+            true,
+        );
         // Flip a field but keep the (now-stale) hash -> recompute mismatches.
         e2.decision = "deny".to_string();
         assert_eq!(
@@ -327,7 +344,15 @@ mod tests {
             entry_hash: String::new(),
         };
         let e2 = entry(2, None, "com.app", Some(1), "allow", 200, false);
-        let e3 = entry(3, Some(&e2.entry_hash), "com.app", Some(1), "allow", 300, false);
+        let e3 = entry(
+            3,
+            Some(&e2.entry_hash),
+            "com.app",
+            Some(1),
+            "allow",
+            300,
+            false,
+        );
         assert_eq!(
             nip55_verify_audit_chain(vec![legacy, e2, e3], KEY.to_vec()),
             Nip55ChainStatus::PartiallyVerified {
@@ -362,7 +387,15 @@ mod tests {
     fn truncated_head_detected() {
         // First non-empty entry references a prev hash not present in the set.
         let e2 = entry(2, Some("00ff00ff"), "com.app", Some(1), "allow", 200, false);
-        let e3 = entry(3, Some(&e2.entry_hash), "com.app", Some(1), "allow", 300, false);
+        let e3 = entry(
+            3,
+            Some(&e2.entry_hash),
+            "com.app",
+            Some(1),
+            "allow",
+            300,
+            false,
+        );
         assert_eq!(
             nip55_verify_audit_chain(vec![e2, e3], KEY.to_vec()),
             Nip55ChainStatus::Truncated { entry_id: 2 }
