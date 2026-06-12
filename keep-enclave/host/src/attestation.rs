@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExpectedPcrs {
     pub pcr0: [u8; 48],
     pub pcr1: [u8; 48],

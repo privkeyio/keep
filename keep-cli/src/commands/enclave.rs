@@ -183,7 +183,6 @@ pub fn cmd_enclave_verify(
             }
             Err(e) => {
                 spinner.finish();
-                out.error(&format!("Verification failed: {e}"));
                 return Err(KeepError::Runtime(format!(
                     "attestation verification failed: {e}"
                 )));
@@ -193,7 +192,7 @@ pub fn cmd_enclave_verify(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (pcr0, pcr1, pcr2);
+        let _ = (pcr0, pcr1, pcr2, insecure_no_pcrs);
         out.warn("Enclave operations only available on Linux with Nitro");
     }
 

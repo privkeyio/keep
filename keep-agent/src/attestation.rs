@@ -25,8 +25,16 @@ impl ExpectedPcrs {
                 .try_into()
                 .map_err(|_| AgentError::Attestation("PCR must be 48 bytes".into()))
         };
+        let pcr0 = parse(pcr0)?;
+        if pcr0.iter().all(|&b| b == 0) {
+            return Err(AgentError::Attestation(
+                "PCR0 is all zeros, which indicates a debug-mode enclave; refusing to pin it. \
+                 Use the insecure no-PCR path if you genuinely intend to verify a debug enclave."
+                    .into(),
+            ));
+        }
         Ok(Self {
-            pcr0: parse(pcr0)?,
+            pcr0,
             pcr1: parse(pcr1)?,
             pcr2: parse(pcr2)?,
         })
@@ -289,13 +297,21 @@ mod tests {
 
     #[test]
     fn test_expected_pcrs_from_hex() {
-        let pcr0 = "0".repeat(96);
+        let pcr0 = "9".repeat(96);
         let pcr1 = "1".repeat(96);
         let pcr2 = "2".repeat(96);
         let pcrs = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).unwrap();
-        assert_eq!(pcrs.pcr0[0], 0x00);
+        assert_eq!(pcrs.pcr0[0], 0x99);
         assert_eq!(pcrs.pcr1[0], 0x11);
         assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    #[test]
+    fn test_expected_pcrs_from_hex_rejects_all_zero_pcr0() {
+        let pcr0 = "0".repeat(96);
+        let pcr1 = "1".repeat(96);
+        let pcr2 = "2".repeat(96);
+        assert!(ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).is_err());
     }
 
     #[test]
