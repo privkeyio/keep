@@ -297,44 +297,50 @@ impl PermissionManager {
 
     /// Persist a forever-grant for `kind` on the connected app at `pubkey`.
     /// No-op when the app is unknown. Used by the per-request approval prompt
-    /// (#575) when the user picks `RememberDuration::Forever`.
-    pub fn grant_kind_forever(&mut self, pubkey: &PublicKey, kind: Kind) {
+    /// (#575) when the user picks `RememberDuration::Forever`. Returns whether a
+    /// grant was actually written, so callers only audit real state changes.
+    pub fn grant_kind_forever(&mut self, pubkey: &PublicKey, kind: Kind) -> bool {
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.auto_approve_kinds.insert(kind);
             // A Forever grant supersedes any timed grant for the same kind.
             app.timed_kind_grants.remove(&kind);
             app.last_used = Timestamp::now();
+            return true;
         }
+        false
     }
 
     /// Persist a timed grant for `kind` on the connected app at `pubkey` that
     /// expires `secs` seconds from now. No-op when the app is unknown or when
     /// `secs == 0`. Used by the per-request approval prompt (#575) when the
     /// user picks a `RememberDuration::OneMinute / FiveMinutes / TenMinutes /
-    /// OneHour / OneDay` value.
-    pub fn grant_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) {
+    /// OneHour / OneDay` value. Returns whether a grant was actually written, so
+    /// callers only audit real state changes.
+    pub fn grant_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) -> bool {
         if secs == 0 {
-            return;
+            return false;
         }
         let now = now_unix_secs();
         // Clock error reads as u64::MAX (fail-closed for expiry checks); refuse
         // to write a grant we could not bound, otherwise it would read as
         // eternal once the clock recovers.
         if now == u64::MAX {
-            return;
+            return false;
         }
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.prune_expired_kind_grants();
             // A Forever grant already covers this kind; don't downgrade it.
             if app.auto_approve_kinds.contains(&kind) {
-                return;
+                return false;
             }
             // An explicit re-approval sets the new expiry, even if shorter, so
             // a user can deliberately shrink an over-granted window.
             let expiry = now.saturating_add(secs);
             app.timed_kind_grants.insert(kind, expiry);
             app.last_used = Timestamp::now();
+            return true;
         }
+        false
     }
 
     pub fn record_usage(&mut self, pubkey: &PublicKey) {

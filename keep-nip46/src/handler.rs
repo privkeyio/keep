@@ -460,27 +460,33 @@ impl SignerHandler {
             match remember {
                 RememberDuration::JustThisTime => {}
                 RememberDuration::Forever => {
-                    self.permissions
+                    let granted = self
+                        .permissions
                         .lock()
                         .await
                         .grant_kind_forever(&app_pubkey, kind);
-                    self.audit.lock().await.log(
-                        AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
-                            .with_event_kind(kind)
-                            .with_reason("grant kind forever"),
-                    );
-                }
-                timed => {
-                    if let Some(secs) = timed.as_seconds() {
-                        self.permissions
-                            .lock()
-                            .await
-                            .grant_kind_for(&app_pubkey, kind, secs);
+                    if granted {
                         self.audit.lock().await.log(
                             AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
                                 .with_event_kind(kind)
-                                .with_reason(format!("grant kind for {secs}s")),
+                                .with_reason("grant kind forever"),
                         );
+                    }
+                }
+                timed => {
+                    if let Some(secs) = timed.as_seconds() {
+                        let granted = self
+                            .permissions
+                            .lock()
+                            .await
+                            .grant_kind_for(&app_pubkey, kind, secs);
+                        if granted {
+                            self.audit.lock().await.log(
+                                AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
+                                    .with_event_kind(kind)
+                                    .with_reason(format!("grant kind for {secs}s")),
+                            );
+                        }
                     }
                 }
             }
