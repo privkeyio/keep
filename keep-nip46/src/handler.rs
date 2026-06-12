@@ -471,6 +471,7 @@ impl SignerHandler {
                                 .with_event_kind(kind)
                                 .with_reason("grant kind forever"),
                         );
+                        self.persist_permissions().await;
                     }
                 }
                 timed => {
@@ -486,6 +487,7 @@ impl SignerHandler {
                                     .with_event_kind(kind)
                                     .with_reason(format!("grant kind for {secs}s")),
                             );
+                            self.persist_permissions().await;
                         }
                     }
                 }
@@ -774,13 +776,26 @@ impl SignerHandler {
     }
 
     pub async fn revoke_client(&self, pubkey: &PublicKey) {
-        let mut pm = self.permissions.lock().await;
-        pm.revoke(pubkey);
+        self.permissions.lock().await.revoke(pubkey);
+        self.persist_permissions().await;
     }
 
     pub async fn revoke_all_clients(&self) {
-        let mut pm = self.permissions.lock().await;
-        pm.revoke_all();
+        self.permissions.lock().await.revoke_all();
+        self.persist_permissions().await;
+    }
+
+    /// Snapshot the current grants and hand them to the consumer's persistence
+    /// callback. No-op when no callbacks are configured (e.g. headless CLI use).
+    /// Called after every grant write or revoke so the durable store always
+    /// mirrors the in-memory engine state, keeping the engine the single source
+    /// of truth for NIP-46 remember-grants.
+    async fn persist_permissions(&self) {
+        let Some(ref callbacks) = self.callbacks else {
+            return;
+        };
+        let snapshot = self.permissions.lock().await.stored_snapshot();
+        callbacks.persist_permissions(snapshot);
     }
 
     pub async fn revoke_session_apps(&self) {

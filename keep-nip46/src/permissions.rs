@@ -396,6 +396,41 @@ impl PermissionManager {
         self.apps.values()
     }
 
+    /// Serialize the current grants into the persisted `StoredBunkerPermission`
+    /// form, the inverse of `restore_persisted`. Session apps are skipped (they
+    /// are never persisted and `restore_persisted` would drop them anyway); each
+    /// app's forever and timed per-kind grants are captured so a consumer can
+    /// write a durable snapshot and reload it via `apply_pre_grants` on restart.
+    pub fn stored_snapshot(&self) -> Vec<keep_core::relay::StoredBunkerPermission> {
+        use keep_core::relay::{
+            StoredBunkerPermission, StoredPermissionDuration, StoredTimedKindGrant,
+        };
+        self.apps
+            .values()
+            .filter(|app| !matches!(app.duration, PermissionDuration::Session))
+            .map(|app| StoredBunkerPermission {
+                pubkey_hex: app.pubkey.to_hex(),
+                name: app.name.clone(),
+                permissions: app.permissions.bits(),
+                auto_approve_kinds: app.auto_approve_kinds.iter().map(|k| k.as_u16()).collect(),
+                duration: match app.duration {
+                    PermissionDuration::Session => StoredPermissionDuration::Session,
+                    PermissionDuration::Seconds(s) => StoredPermissionDuration::Seconds(s),
+                    PermissionDuration::Forever => StoredPermissionDuration::Forever,
+                },
+                connected_at: app.connected_at.as_secs(),
+                timed_kind_grants: app
+                    .timed_kind_grants
+                    .iter()
+                    .map(|(k, expiry)| StoredTimedKindGrant {
+                        kind: k.as_u16(),
+                        expires_at: *expiry,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn set_auto_approve_kinds(&mut self, kinds: HashSet<Kind>) {
         self.global_auto_approve = kinds;
     }
@@ -834,6 +869,65 @@ mod tests {
         assert!(
             restored.needs_approval(&pubkey, NIP98_HTTP_AUTH),
             "NIP-98 must not survive the round trip"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_round_trips_through_restore() {
+        // The mobile bunker persists grants by serializing `stored_snapshot()`
+        // and reloads them via `restore_persisted` on the next start. Prove that
+        // a forever grant and a timed grant survive that exact round trip.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+        assert!(pm.grant_kind_forever(&pubkey, Kind::TextNote));
+        assert!(pm.grant_kind_for(&pubkey, Kind::Custom(30023), 3600));
+
+        let snapshot = pm.stored_snapshot();
+        assert_eq!(snapshot.len(), 1, "one connected app is serialized");
+        let stored = &snapshot[0];
+        assert_eq!(stored.pubkey_hex, pubkey.to_hex());
+        assert!(stored.auto_approve_kinds.contains(&Kind::TextNote.as_u16()));
+        assert!(stored
+            .timed_kind_grants
+            .iter()
+            .any(|g| g.kind == Kind::Custom(30023).as_u16()));
+
+        let auto: HashSet<Kind> = stored.auto_approve_kinds.iter().copied().map(Kind::from).collect();
+        let timed: HashMap<Kind, u64> = stored
+            .timed_kind_grants
+            .iter()
+            .map(|g| (Kind::from(g.kind), g.expires_at))
+            .collect();
+        let duration = match &stored.duration {
+            keep_core::relay::StoredPermissionDuration::Session => PermissionDuration::Session,
+            keep_core::relay::StoredPermissionDuration::Seconds(s) => {
+                PermissionDuration::Seconds(*s)
+            }
+            keep_core::relay::StoredPermissionDuration::Forever => PermissionDuration::Forever,
+        };
+        let mut restored = PermissionManager::new();
+        restored.restore_persisted(
+            pubkey,
+            stored.name.clone(),
+            Permission::from_bits_truncate(stored.permissions),
+            auto,
+            duration,
+            Timestamp::from_secs(stored.connected_at),
+            timed,
+        );
+
+        assert!(
+            !restored.needs_approval(&pubkey, Kind::TextNote),
+            "forever grant survives the snapshot/restore round trip"
+        );
+        assert!(
+            !restored.needs_approval(&pubkey, Kind::Custom(30023)),
+            "timed grant survives the snapshot/restore round trip"
+        );
+        assert!(
+            restored.needs_approval(&pubkey, Kind::Metadata),
+            "an ungranted kind still prompts after restore"
         );
     }
 

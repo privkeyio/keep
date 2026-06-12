@@ -7,7 +7,8 @@ use keep_nip46::types::{
     ApprovalRequest, ApprovalResult, LogEvent, RememberDuration, ServerCallbacks,
 };
 use keep_nip46::{
-    NetworkFrostSigner, Permission, RateLimitConfig, Server, ServerConfig, SignerHandler,
+    NetworkFrostSigner, Permission, PreGrantedApp, RateLimitConfig, Server, ServerConfig,
+    SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -125,6 +126,7 @@ pub trait BunkerCallbacks: Send + Sync {
 
 struct CallbackBridge {
     callbacks: Arc<dyn BunkerCallbacks>,
+    mobile: Arc<KeepMobile>,
 }
 
 impl ServerCallbacks for CallbackBridge {
@@ -153,6 +155,12 @@ impl ServerCallbacks for CallbackBridge {
     fn on_connect(&self, pubkey: &str, name: &str) {
         self.callbacks
             .on_connect(pubkey.to_string(), name.to_string());
+    }
+
+    fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
+        if let Err(e) = self.mobile.persist_bunker_permissions(grants) {
+            tracing::warn!("failed to persist bunker permissions: {e}");
+        }
     }
 }
 
@@ -444,9 +452,21 @@ impl BunkerHandler {
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
 
+            // Restore persisted per-(app, kind) remember-grants so they survive a
+            // bunker restart. The engine is the single source of truth for these
+            // grants; they are durably mirrored to the relay config on every
+            // grant/revoke via the `persist_permissions` callback below.
+            let pre_grants: Vec<PreGrantedApp> = self
+                .mobile
+                .load_bunker_permissions()
+                .iter()
+                .filter_map(PreGrantedApp::from_stored)
+                .collect();
+
             let config = ServerConfig {
                 rate_limit: Some(RateLimitConfig::default()),
                 expected_secret: Some(connect_secret.as_str().to_owned()),
+                pre_grants,
                 // Approving the bunker connection (the secret in the bunker URL
                 // is the grant) must let the client sign, mirroring the
                 // always-on bunker in keep-web. Without this the client only
@@ -471,7 +491,10 @@ impl BunkerHandler {
                 network_signer,
                 *transport_secret,
                 &relays,
-                Some(Arc::new(CallbackBridge { callbacks }) as Arc<dyn ServerCallbacks>),
+                Some(Arc::new(CallbackBridge {
+                    callbacks,
+                    mobile: Arc::clone(&self.mobile),
+                }) as Arc<dyn ServerCallbacks>),
                 config,
                 proxy,
             )
