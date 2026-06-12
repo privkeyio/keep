@@ -30,8 +30,16 @@ impl ExpectedPcrs {
                 .try_into()
                 .map_err(|_| FrostNetError::Attestation("PCR must be 48 bytes".into()))
         };
+        let pcr0 = parse(pcr0)?;
+        if pcr0.iter().all(|&b| b == 0) {
+            return Err(FrostNetError::Attestation(
+                "PCR0 is all zeros, which indicates a debug-mode enclave; refusing to pin it. \
+                 Use the explicit insecure path if you genuinely intend a debug enclave."
+                    .into(),
+            ));
+        }
         Ok(Self {
-            pcr0: parse(pcr0)?,
+            pcr0,
             pcr1: parse(pcr1)?,
             pcr2: parse(pcr2)?,
         })
@@ -54,7 +62,7 @@ pub fn verify_peer_attestation(
     use keep_enclave_host::{AttestationVerifier, ExpectedPcrs as HostPcrs};
 
     let host_pcrs = HostPcrs::new(expected_pcrs.pcr0, expected_pcrs.pcr1, expected_pcrs.pcr2);
-    let verifier = AttestationVerifier::new(Some(host_pcrs));
+    let verifier = AttestationVerifier::new(host_pcrs);
     let nonce = derive_attestation_nonce(group_pubkey);
 
     let verified = verifier
@@ -153,13 +161,19 @@ mod tests {
 
     #[test]
     fn test_expected_pcrs_from_hex() {
-        let pcr0 = "0".repeat(96);
+        let pcr0 = "9".repeat(96);
         let pcr1 = "1".repeat(96);
         let pcr2 = "2".repeat(96);
         let pcrs = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).unwrap();
-        assert_eq!(pcrs.pcr0[0], 0x00);
+        assert_eq!(pcrs.pcr0[0], 0x99);
         assert_eq!(pcrs.pcr1[0], 0x11);
         assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    #[test]
+    fn test_expected_pcrs_from_hex_rejects_all_zero_pcr0() {
+        let result = ExpectedPcrs::from_hex(&"0".repeat(96), &"1".repeat(96), &"2".repeat(96));
+        assert!(result.is_err());
     }
 
     #[test]

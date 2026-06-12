@@ -648,6 +648,7 @@ fn dispatch_enclave(out: &Output, path: &std::path::Path, command: EnclaveComman
             pcr1,
             pcr2,
             local,
+            insecure_no_pcrs,
         } => commands::enclave::cmd_enclave_verify(
             out,
             cid,
@@ -655,6 +656,7 @@ fn dispatch_enclave(out: &Output, path: &std::path::Path, command: EnclaveComman
             pcr1.as_deref(),
             pcr2.as_deref(),
             local,
+            insecure_no_pcrs,
         ),
         EnclaveCommands::GenerateKey { name, cid, local } => {
             commands::enclave::cmd_enclave_generate_key(out, &name, cid, local)
