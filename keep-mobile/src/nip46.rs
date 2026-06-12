@@ -453,14 +453,14 @@ impl BunkerHandler {
                 // gets get_public_key and every sign_event is denied — the
                 // client logs in but its signed-request calls all fail.
                 //
-                // TRUST MODEL: this connect grant plus the per-app
-                // connect_auto_approve_kinds (see
-                // `bunker_connect_auto_approve_kinds`) means a single shared
-                // connect secret authorizes signing and silent NIP-98 (kind
-                // 27235) token minting for every connected client. NIP-98 is
-                // granted per connected app pubkey (revocable/auditable), not
-                // globally. The connect secret is still a shared bearer
-                // credential; a per-app/URL-method allowlist is follow-up work.
+                // TRUST MODEL: this connect grant authorizes signing, but
+                // NIP-98 (kind 27235) is NEVER auto-approved. Per #575 it always
+                // falls through to the per-request approval prompt and is never
+                // remembered (see `bunker_connect_auto_approve_kinds`, now
+                // empty), so a shared connect secret cannot silently mint NIP-98
+                // HTTP-auth tokens. The connect secret is still a shared bearer
+                // credential for non-NIP-98 signing; a per-app/URL-method
+                // allowlist is follow-up work.
                 connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                 auto_approve_kinds: bunker_auto_approve_kinds(),
                 connect_auto_approve_kinds: bunker_connect_auto_approve_kinds(),

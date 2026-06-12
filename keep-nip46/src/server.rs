@@ -949,6 +949,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn apply_pre_grants_round_trips_timed_grant_but_drops_nip98() {
+        use crate::NIP98_HTTP_AUTH;
+
+        let pm = Arc::new(Mutex::new(PermissionManager::new()));
+        let pk_hex = good_pubkey_hex();
+        let mut stored = sample_stored(
+            &pk_hex,
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        // A persisted (legacy/hostile) config carrying both a NIP-98 grant and a
+        // benign TextNote grant in every channel.
+        stored.auto_approve_kinds = vec![NIP98_HTTP_AUTH.as_u16(), 1];
+        stored.timed_kind_grants = vec![
+            keep_core::relay::StoredTimedKindGrant {
+                kind: NIP98_HTTP_AUTH.as_u16(),
+                expires_at: 1_900_000_000,
+            },
+            keep_core::relay::StoredTimedKindGrant {
+                kind: 1,
+                expires_at: 1_900_000_000,
+            },
+        ];
+
+        let pre = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        apply_pre_grants(&pm, &[pre]).await;
+
+        let pubkey = nostr_sdk::PublicKey::from_hex(&pk_hex).unwrap();
+        let guard = pm.lock().await;
+        // Benign grant survives the persistence round trip.
+        assert!(!guard.needs_approval(&pubkey, nostr_sdk::Kind::TextNote));
+        // NIP-98 is dropped and always prompts.
+        assert!(guard.needs_approval(&pubkey, NIP98_HTTP_AUTH));
+        let app = guard.get_app(&pubkey).unwrap();
+        assert!(!app.auto_approve_kinds.contains(&NIP98_HTTP_AUTH));
+        assert!(!app.timed_kind_grants.contains_key(&NIP98_HTTP_AUTH));
+    }
+
     // === #417 round 5: targeted unit tests killing the surviving mutations ===
 
     /// `PreGrantedApp::from_stored` MUST reject pubkey-hex strings whose

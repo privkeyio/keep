@@ -879,12 +879,12 @@ mod tests {
         );
     }
 
-    // The fix: with `connect_grant` including SIGN_EVENT and kind 27235 in the
-    // global auto-approve set, a client that connected without requesting
-    // permissions can sign a NIP-98 event immediately, and NO per-request
-    // approval prompt fires (only the connection itself is gated).
+    // #575: even with `connect_grant` including SIGN_EVENT and kind 27235 in
+    // the global auto-approve set, a NIP-98 sign request MUST still fire the
+    // per-request approval prompt. The sign succeeds only because the prompt is
+    // approved; it must never be silently auto-signed.
     #[tokio::test]
-    async fn http_auth_signed_without_per_request_prompt() {
+    async fn http_auth_always_triggers_per_request_prompt() {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         permissions
@@ -910,22 +910,21 @@ mod tests {
         let signed = handler
             .handle_sign_event(app, unsigned)
             .await
-            .expect("kind 27235 must auto-sign for an authorized client");
+            .expect("kind 27235 signs once the prompt is approved");
         assert_eq!(signed.kind, NIP98_HTTP_AUTH);
 
         let methods = cb.methods.lock().unwrap().clone();
         assert!(
-            !methods.iter().any(|m| m == "sign_event"),
-            "kind 27235 must not trigger a per-request approval prompt, saw: {methods:?}"
+            methods.iter().any(|m| m == "sign_event"),
+            "kind 27235 MUST trigger a per-request approval prompt, saw: {methods:?}"
         );
     }
 
-    // App-scoped grant: `connect_auto_approve_kinds` auto-approves kind 27235
-    // only for clients that completed the connect handshake (scoped to their
-    // pubkey), and does NOT leak to apps that never connected — unlike the
-    // global `auto_approve_kinds` set.
+    // #575: NIP-98 (kind 27235) is never auto-approved, not even per-app via
+    // `connect_auto_approve_kinds`. The 27235 grant is stripped on connect, so
+    // both the connected app and an unconnected one still need approval.
     #[tokio::test]
-    async fn connect_auto_approve_kinds_are_per_app_not_global() {
+    async fn connect_auto_approve_kinds_never_cover_nip98() {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
@@ -943,12 +942,19 @@ mod tests {
         let never_connected = Keys::generate().public_key();
         let pm = permissions.lock().await;
         assert!(
-            !pm.needs_approval(&connected, NIP98_HTTP_AUTH),
-            "connected app must have NIP-98 auto-approved per-app"
+            pm.needs_approval(&connected, NIP98_HTTP_AUTH),
+            "NIP-98 must always prompt even for a connected app"
         );
         assert!(
             pm.needs_approval(&never_connected, NIP98_HTTP_AUTH),
-            "NIP-98 must NOT be globally auto-approved for unconnected apps"
+            "NIP-98 must always prompt for unconnected apps"
+        );
+        assert!(
+            !pm.get_app(&connected)
+                .unwrap()
+                .auto_approve_kinds
+                .contains(&NIP98_HTTP_AUTH),
+            "NIP-98 must be stripped from the per-app auto-approve set on connect"
         );
     }
 

@@ -3,9 +3,12 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use keep_core::relay::MAX_AUTO_KINDS;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::types::NIP98_HTTP_AUTH;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -104,9 +107,12 @@ pub struct AppPermission {
     pub auto_approve_kinds: HashSet<Kind>,
     /// Per-app, per-kind grants with an explicit expiry (unix epoch seconds).
     /// Set by the user picking a timed remember-duration on the per-request
-    /// prompt (#575). Skipped on read once `now() >= expiry`. Intentionally
-    /// process-lifetime only: `#[serde(skip)]` because the restore path does
-    /// not carry timed grants, so they must not appear to survive a restart.
+    /// prompt (#575). Skipped on read once `now() >= expiry`. `#[serde(skip)]`
+    /// on direct `AppPermission` serialization, but the grants ARE persisted
+    /// and restored out-of-band via the `StoredBunkerPermission` path: on save
+    /// they are written to `StoredTimedKindGrant`, and `restore_persisted`
+    /// reloads them, pruning any entry that expired while the bunker was down
+    /// and excluding NIP-98 (kind 27235), which is never remembered.
     #[serde(skip)]
     pub timed_kind_grants: HashMap<Kind, u64>,
     pub connected_at: Timestamp,
@@ -239,6 +245,9 @@ impl PermissionManager {
             Entry::Vacant(entry) => {
                 let mut app = AppPermission::new(pubkey, name);
                 app.permissions = requested & Permission::ALL;
+                // #575: NIP-98 (kind 27235) is never auto-approved.
+                let mut auto_kinds = auto_kinds;
+                auto_kinds.remove(&NIP98_HTTP_AUTH);
                 if !auto_kinds.is_empty() {
                     app.auto_approve_kinds.extend(auto_kinds);
                 }
@@ -279,6 +288,13 @@ impl PermissionManager {
     }
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
+        // #575: NIP-98 (kind 27235) must ALWAYS prompt per-request and can
+        // never be auto-approved by any per-app, global, or timed grant. This
+        // is the authoritative chokepoint: even a 27235 entry that slipped into
+        // a grant set or a persisted/upgraded config cannot bypass the prompt.
+        if kind == NIP98_HTTP_AUTH {
+            return true;
+        }
         if let Some(app) = self.apps.get(pubkey) {
             if !app.duration.is_expired(app.connected_at) {
                 if app.auto_approve_kinds.contains(&kind) {
@@ -300,7 +316,18 @@ impl PermissionManager {
     /// (#575) when the user picks `RememberDuration::Forever`. Returns whether a
     /// grant was actually written, so callers only audit real state changes.
     pub fn grant_kind_forever(&mut self, pubkey: &PublicKey, kind: Kind) -> bool {
+        // #575: NIP-98 (kind 27235) is never remembered.
+        if kind == NIP98_HTTP_AUTH {
+            return false;
+        }
         if let Some(app) = self.apps.get_mut(pubkey) {
+            // Enforce the persisted-config cap (MAX_AUTO_KINDS) in memory so an
+            // app cannot exceed what `RelayConfig` validation will later accept.
+            if !app.auto_approve_kinds.contains(&kind)
+                && app.auto_approve_kinds.len() >= MAX_AUTO_KINDS
+            {
+                return false;
+            }
             app.auto_approve_kinds.insert(kind);
             // A Forever grant supersedes any timed grant for the same kind.
             app.timed_kind_grants.remove(&kind);
@@ -320,6 +347,10 @@ impl PermissionManager {
         if secs == 0 {
             return false;
         }
+        // #575: NIP-98 (kind 27235) is never remembered.
+        if kind == NIP98_HTTP_AUTH {
+            return false;
+        }
         let now = now_unix_secs();
         // Clock error reads as u64::MAX (fail-closed for expiry checks); refuse
         // to write a grant we could not bound, otherwise it would read as
@@ -331,6 +362,14 @@ impl PermissionManager {
             app.prune_expired_kind_grants();
             // A Forever grant already covers this kind; don't downgrade it.
             if app.auto_approve_kinds.contains(&kind) {
+                return false;
+            }
+            // Enforce the persisted-config cap (MAX_AUTO_KINDS) in memory. A
+            // re-approval of an already-granted kind is allowed (it replaces the
+            // existing window) and does not count against the cap.
+            if !app.timed_kind_grants.contains_key(&kind)
+                && app.timed_kind_grants.len() >= MAX_AUTO_KINDS
+            {
                 return false;
             }
             // An explicit re-approval sets the new expiry, even if shorter, so
@@ -406,15 +445,20 @@ impl PermissionManager {
         }
         let mut app = AppPermission::new(pubkey, name);
         app.permissions = permissions & Permission::ALL;
+        // #575: drop any persisted NIP-98 (kind 27235) grant; it must never be
+        // remembered, even if an older/upgraded config carried it.
+        let mut auto_kinds = auto_kinds;
+        auto_kinds.remove(&NIP98_HTTP_AUTH);
         app.auto_approve_kinds = auto_kinds;
         app.duration = duration;
         app.connected_at = connected_at;
-        // Drop grants that expired while the bunker was down; a clock error
-        // reads as u64::MAX so every grant prunes (fail-closed).
+        // Drop grants that expired while the bunker was down (a clock error
+        // reads as u64::MAX so every grant prunes, fail-closed) and any NIP-98
+        // grant that should never have been persisted.
         let now = now_unix_secs();
         app.timed_kind_grants = timed_kind_grants
             .into_iter()
-            .filter(|(_, expiry)| now < *expiry)
+            .filter(|(kind, expiry)| *kind != NIP98_HTTP_AUTH && now < *expiry)
             .collect();
         self.insert(app);
         true
@@ -426,7 +470,9 @@ impl PermissionManager {
         self.apps.insert(key, app);
     }
 
-    pub fn set_auto_approve_kinds_for_app(&mut self, pubkey: &PublicKey, kinds: HashSet<Kind>) {
+    pub fn set_auto_approve_kinds_for_app(&mut self, pubkey: &PublicKey, mut kinds: HashSet<Kind>) {
+        // #575: NIP-98 (kind 27235) is never auto-approved.
+        kinds.remove(&NIP98_HTTP_AUTH);
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.auto_approve_kinds = kinds;
             app.last_used = Timestamp::now();
@@ -698,6 +744,140 @@ mod tests {
             .unwrap()
             .timed_kind_grants
             .contains_key(&expired_kind));
+    }
+
+    #[test]
+    fn nip98_always_needs_approval_despite_every_grant() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        // Force NIP-98 into every auto-approve channel directly, bypassing the
+        // write-path guards, to prove the read-path chokepoint is authoritative.
+        pm.set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.auto_approve_kinds.insert(NIP98_HTTP_AUTH);
+            app.timed_kind_grants
+                .insert(NIP98_HTTP_AUTH, now_unix_secs() + 3600);
+        }
+
+        assert!(
+            pm.needs_approval(&pubkey, NIP98_HTTP_AUTH),
+            "NIP-98 must always need approval even when present in per-app, \
+             global, and unexpired timed grant sets"
+        );
+    }
+
+    #[test]
+    fn restore_persisted_strips_nip98_grants() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let now = now_unix_secs();
+
+        let mut grants = HashMap::new();
+        grants.insert(NIP98_HTTP_AUTH, now + 3600);
+        grants.insert(Kind::TextNote, now + 3600);
+
+        let restored = pm.restore_persisted(
+            pubkey,
+            "App".into(),
+            Permission::SIGN_EVENT,
+            HashSet::from([NIP98_HTTP_AUTH, Kind::Reaction]),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            grants,
+        );
+        assert!(restored);
+
+        let app = pm.get_app(&pubkey).unwrap();
+        assert!(!app.auto_approve_kinds.contains(&NIP98_HTTP_AUTH));
+        assert!(!app.timed_kind_grants.contains_key(&NIP98_HTTP_AUTH));
+        // Non-NIP-98 grants survive the restore.
+        assert!(app.auto_approve_kinds.contains(&Kind::Reaction));
+        assert!(app.timed_kind_grants.contains_key(&Kind::TextNote));
+        assert!(pm.needs_approval(&pubkey, NIP98_HTTP_AUTH));
+    }
+
+    #[test]
+    fn timed_grant_round_trips_but_nip98_does_not() {
+        // Create a non-NIP-98 timed grant, capture it as the persistence layer
+        // would, restore it, and confirm it survives; a 27235 grant captured the
+        // same way must not survive the restore.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        pm.grant_kind_for(&pubkey, Kind::TextNote, 3600);
+        // grant_kind_for refuses NIP-98, so inject it directly to model a
+        // hostile/legacy persisted row.
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.timed_kind_grants
+                .insert(NIP98_HTTP_AUTH, now_unix_secs() + 3600);
+        }
+        let persisted = pm.get_app(&pubkey).unwrap().timed_kind_grants.clone();
+
+        let mut restored = PermissionManager::new();
+        restored.restore_persisted(
+            pubkey,
+            "App".into(),
+            Permission::SIGN_EVENT,
+            HashSet::new(),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            persisted,
+        );
+
+        assert!(
+            !restored.needs_approval(&pubkey, Kind::TextNote),
+            "non-NIP-98 timed grant must survive the round trip"
+        );
+        assert!(
+            restored.needs_approval(&pubkey, NIP98_HTTP_AUTH),
+            "NIP-98 must not survive the round trip"
+        );
+    }
+
+    #[test]
+    fn grant_kind_forever_enforces_max_auto_kinds_cap() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        // Fill auto_approve_kinds up to the cap with distinct custom kinds.
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.auto_approve_kinds.clear();
+            for k in 0..MAX_AUTO_KINDS as u16 {
+                app.auto_approve_kinds.insert(Kind::Custom(k));
+            }
+        }
+        assert_eq!(
+            pm.get_app(&pubkey).unwrap().auto_approve_kinds.len(),
+            MAX_AUTO_KINDS
+        );
+
+        // A new kind is refused once at the cap.
+        assert!(!pm.grant_kind_forever(&pubkey, Kind::Custom(60000)));
+        // Re-granting an already-present kind still succeeds.
+        assert!(pm.grant_kind_forever(&pubkey, Kind::Custom(0)));
+    }
+
+    #[test]
+    fn grant_kind_for_enforces_max_auto_kinds_cap() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        let now = now_unix_secs();
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            for k in 0..MAX_AUTO_KINDS as u16 {
+                app.timed_kind_grants.insert(Kind::Custom(k), now + 3600);
+            }
+        }
+
+        // A new kind is refused once at the cap.
+        assert!(!pm.grant_kind_for(&pubkey, Kind::Custom(60000), 3600));
+        // Re-granting an already-present kind replaces its window, still ok.
+        assert!(pm.grant_kind_for(&pubkey, Kind::Custom(0), 60));
     }
 
     #[test]
