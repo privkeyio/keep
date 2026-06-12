@@ -9,6 +9,7 @@ mod error;
 mod network;
 mod nip46;
 mod nip55;
+mod nip55_audit;
 mod nip55_policy;
 mod persistence;
 mod policy;

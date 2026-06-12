@@ -507,6 +507,24 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     output
 }
 
+/// HMAC-SHA256 of `data` keyed by `key`. Keyed so the output is a MAC (forgeable
+/// only with the key), used for tamper-evident hash chains such as the NIP-55
+/// signing-audit log. Accepts a key of any length (HMAC pads/hashes as needed).
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::digest::KeyInit;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&result);
+    output
+}
+
 /// Generate cryptographically secure random bytes.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     entropy::random_bytes()
@@ -734,6 +752,17 @@ pub mod nip04 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hmac_sha256_rfc4231_case1() {
+        // RFC 4231 test case 1: 20-byte 0x0b key, "Hi There".
+        let key = [0x0bu8; 20];
+        let mac = hmac_sha256(&key, b"Hi There");
+        assert_eq!(
+            hex::encode(mac),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
 
     #[test]
     fn test_key_derivation() {
