@@ -1719,6 +1719,13 @@ impl KeepMobile {
             validate_hex_pubkey(pk)?;
         }
         let key = relay_config_key(group_pubkey.as_deref());
+        // Serialize against save_relay_config / persist_bunker_permissions, which
+        // do a read-modify-write on this same key; without the lock a concurrent
+        // persist could resurrect the record after the delete.
+        let _guard = self
+            .relay_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.storage
             .delete_share_by_key(key)
             .map_err(|e| KeepMobileError::StorageError {
@@ -2420,13 +2427,24 @@ impl KeepMobile {
     /// Load the persisted NIP-46 bunker permission grants from the global relay
     /// config, returning them ready to seed `ServerConfig::pre_grants` so
     /// remembered grants survive a bunker restart.
-    pub(crate) fn load_bunker_permissions(
-        &self,
-    ) -> Vec<keep_core::relay::StoredBunkerPermission> {
+    pub(crate) fn load_bunker_permissions(&self) -> Vec<keep_core::relay::StoredBunkerPermission> {
         let key = relay_config_key(None);
         match persistence::load_relay_config(&self.storage, &key) {
             Ok(Some(c)) => c.bunker_permissions,
-            _ => Vec::new(),
+            Ok(None) => Vec::new(),
+            // A real load error (decrypt/deserialize failure, corruption, or
+            // tampering) is NOT the same as "no config yet". Seeding empty
+            // grants is fail-safe (more prompting), but the next grant's persist
+            // would then overwrite the durable store and erase the remembered
+            // grants for good, so surface the error loudly rather than swallow it.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to load persisted bunker permissions; starting with \
+                     none (a subsequent grant will overwrite the durable store)"
+                );
+                Vec::new()
+            }
         }
     }
 

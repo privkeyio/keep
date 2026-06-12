@@ -405,6 +405,7 @@ impl PermissionManager {
         use keep_core::relay::{
             StoredBunkerPermission, StoredPermissionDuration, StoredTimedKindGrant,
         };
+        let now = now_unix_secs();
         self.apps
             .values()
             .filter(|app| !matches!(app.duration, PermissionDuration::Session))
@@ -422,6 +423,7 @@ impl PermissionManager {
                 timed_kind_grants: app
                     .timed_kind_grants
                     .iter()
+                    .filter(|(_, expiry)| now < **expiry)
                     .map(|(k, expiry)| StoredTimedKindGrant {
                         kind: k.as_u16(),
                         expires_at: *expiry,
@@ -893,7 +895,12 @@ mod tests {
             .iter()
             .any(|g| g.kind == Kind::Custom(30023).as_u16()));
 
-        let auto: HashSet<Kind> = stored.auto_approve_kinds.iter().copied().map(Kind::from).collect();
+        let auto: HashSet<Kind> = stored
+            .auto_approve_kinds
+            .iter()
+            .copied()
+            .map(Kind::from)
+            .collect();
         let timed: HashMap<Kind, u64> = stored
             .timed_kind_grants
             .iter()
