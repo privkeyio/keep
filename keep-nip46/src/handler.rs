@@ -715,6 +715,7 @@ impl SignerHandler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn restore_client(
         &self,
         pubkey: PublicKey,

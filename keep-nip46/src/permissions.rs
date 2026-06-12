@@ -422,6 +422,7 @@ impl PermissionManager {
     /// shared by `SignerHandler::restore_client` and the `apply_pre_grants`
     /// startup hook. Returns `true` if the app was inserted, `false` if it
     /// was skipped (Session, expired, or capacity full).
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_persisted(
         &mut self,
         pubkey: PublicKey,
