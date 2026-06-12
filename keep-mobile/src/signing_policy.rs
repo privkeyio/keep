@@ -346,7 +346,8 @@ impl SigningRateLimiter {
 
     pub fn clear_cooling_off(&self, package_name: String) {
         let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
-        self.storage.remove(key(COOLED_OFF_KEY_PREFIX, &package_name));
+        self.storage
+            .remove(key(COOLED_OFF_KEY_PREFIX, &package_name));
         self.storage
             .remove(key(COOLED_OFF_ELAPSED_KEY_PREFIX, &package_name));
         // Also drop the velocity counters; leaving an over-limit counter in
@@ -443,9 +444,17 @@ impl SigningRateLimiter {
         }
     }
 
-    fn save_window(&self, prefix: &str, package_name: &str, window: &UsageWindow, now_wall_ms: u64) {
-        self.storage
-            .save(key(prefix, package_name), serialize_window(window, now_wall_ms));
+    fn save_window(
+        &self,
+        prefix: &str,
+        package_name: &str,
+        window: &UsageWindow,
+        now_wall_ms: u64,
+    ) {
+        self.storage.save(
+            key(prefix, package_name),
+            serialize_window(window, now_wall_ms),
+        );
     }
 
     /// Increment the in-memory unusual-activity window (60s); not persisted.
@@ -499,7 +508,9 @@ impl SigningRateLimiter {
             .filter(|&u| u > 0 && now_wall_ms < u);
         let elapsed_until = self
             .load_u64(&key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name))
-            .filter(|&u| u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS);
+            .filter(|&u| {
+                u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
+            });
         CooledOffState {
             wall_until,
             elapsed_until,
