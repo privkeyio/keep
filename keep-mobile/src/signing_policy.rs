@@ -604,10 +604,9 @@ pub fn evaluate_sign_policy(
         return SignPolicyEvaluation::FallToUi;
     }
 
-    let recent_count = if let AutoSignDecision::Allowed { recent_count, .. } = &rate_check {
-        *recent_count
-    } else {
-        0
+    let recent_count = match &rate_check {
+        AutoSignDecision::Allowed { recent_count, .. } => *recent_count,
+        _ => 0,
     };
 
     let current_hour = ((now_ms() / 1000 % 86400) / 3600) as u32;
