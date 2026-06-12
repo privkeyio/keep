@@ -19,7 +19,9 @@ use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
-use crate::types::{ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks};
+use crate::types::{
+    ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
+};
 
 fn prepare_frost_event(
     pubkey: PublicKey,
@@ -445,13 +447,28 @@ impl SignerHandler {
             // a per-app, per-kind grant so subsequent requests within the
             // window skip the prompt. `JustThisTime` is the one-shot default
             // and does not persist; the next request prompts again.
-            match result.remember {
+            //
+            // NIP-98 (kind 27235) is never remembered: its security-relevant
+            // url/method live in tags the prompt does not surface, so a
+            // per-(app,kind) grant would auto-approve any url/method after one
+            // tap (bearer-credential threat). Force per-request approval.
+            let remember = if kind == NIP98_HTTP_AUTH {
+                RememberDuration::JustThisTime
+            } else {
+                result.remember
+            };
+            match remember {
                 RememberDuration::JustThisTime => {}
                 RememberDuration::Forever => {
                     self.permissions
                         .lock()
                         .await
                         .grant_kind_forever(&app_pubkey, kind);
+                    self.audit.lock().await.log(
+                        AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
+                            .with_event_kind(kind)
+                            .with_reason("grant kind forever"),
+                    );
                 }
                 timed => {
                     if let Some(secs) = timed.as_seconds() {
@@ -459,6 +476,11 @@ impl SignerHandler {
                             .lock()
                             .await
                             .grant_kind_for(&app_pubkey, kind, secs);
+                        self.audit.lock().await.log(
+                            AuditEntry::new(AuditAction::PermissionChanged, app_pubkey)
+                                .with_event_kind(kind)
+                                .with_reason(format!("grant kind for {secs}s")),
+                        );
                     }
                 }
             }
@@ -1421,5 +1443,108 @@ mod tests {
 
         handler.revoke_all_clients().await;
         assert_eq!(handler.list_clients().await.len(), 0);
+    }
+
+    /// Approves every request with a fixed `remember` value and counts how many
+    /// `sign_event` prompts fired, so a test can assert whether a remembered
+    /// grant skipped the prompt on the next request.
+    struct RememberingCallbacks {
+        remember: RememberDuration,
+        sign_event_prompts: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::types::ServerCallbacks for RememberingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            if request.method == "sign_event" {
+                self.sign_event_prompts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            ApprovalResult {
+                approved: true,
+                remember: self.remember,
+            }
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    }
+
+    #[tokio::test]
+    async fn remembered_grant_skips_next_same_kind_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RememberingCallbacks {
+            remember: RememberDuration::Forever,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let first = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "one");
+        handler.handle_sign_event(app, first).await.unwrap();
+
+        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "two");
+        handler.handle_sign_event(app, second).await.unwrap();
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a Forever grant must skip the prompt on the next same-kind request"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip98_is_never_remembered_even_when_approved_forever() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RememberingCallbacks {
+            remember: RememberDuration::Forever,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler =
+            SignerHandler::new(keyring, Arc::clone(&permissions), audit, Some(cb.clone()))
+                .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let tags = vec![
+            Tag::parse(["u", "https://a.example/api"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ];
+        let first = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            tags.clone(),
+            "",
+        );
+        handler.handle_sign_event(app, first).await.unwrap();
+
+        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        handler.handle_sign_event(app, second).await.unwrap();
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "NIP-98 must prompt on every request even after approve=Forever"
+        );
+        let pm = permissions.lock().await;
+        let granted = pm.get_app(&app).unwrap();
+        assert!(
+            !granted.auto_approve_kinds.contains(&NIP98_HTTP_AUTH),
+            "NIP-98 must not be persisted as an auto-approve kind"
+        );
+        assert!(
+            !granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH),
+            "NIP-98 must not be persisted as a timed grant"
+        );
     }
 }

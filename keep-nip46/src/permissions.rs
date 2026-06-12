@@ -104,8 +104,10 @@ pub struct AppPermission {
     pub auto_approve_kinds: HashSet<Kind>,
     /// Per-app, per-kind grants with an explicit expiry (unix epoch seconds).
     /// Set by the user picking a timed remember-duration on the per-request
-    /// prompt (#575). Skipped on read once `now() >= expiry`.
-    #[serde(default)]
+    /// prompt (#575). Skipped on read once `now() >= expiry`. Intentionally
+    /// process-lifetime only: `#[serde(skip)]` because the restore path does
+    /// not carry timed grants, so they must not appear to survive a restart.
+    #[serde(skip)]
     pub timed_kind_grants: HashMap<Kind, u64>,
     pub connected_at: Timestamp,
     pub last_used: Timestamp,
@@ -151,10 +153,12 @@ impl AppPermission {
 
 fn now_unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // On clock error saturate to u64::MAX so timed-grant expiry checks
+    // (`now < expiry`) read as expired (fail-closed) rather than eternal.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(u64::MAX)
 }
 
 pub struct PermissionManager {
@@ -312,23 +316,23 @@ impl PermissionManager {
         if secs == 0 {
             return;
         }
+        let now = now_unix_secs();
+        // Clock error reads as u64::MAX (fail-closed for expiry checks); refuse
+        // to write a grant we could not bound, otherwise it would read as
+        // eternal once the clock recovers.
+        if now == u64::MAX {
+            return;
+        }
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.prune_expired_kind_grants();
             // A Forever grant already covers this kind; don't downgrade it.
             if app.auto_approve_kinds.contains(&kind) {
                 return;
             }
-            let expiry = now_unix_secs().saturating_add(secs);
-            // Take the LATER of any existing expiry and the new one so a user
-            // re-approving with a shorter window does not shrink an existing
-            // longer window unintentionally.
-            let final_expiry = app
-                .timed_kind_grants
-                .get(&kind)
-                .copied()
-                .map(|existing| existing.max(expiry))
-                .unwrap_or(expiry);
-            app.timed_kind_grants.insert(kind, final_expiry);
+            // An explicit re-approval sets the new expiry, even if shorter, so
+            // a user can deliberately shrink an over-granted window.
+            let expiry = now.saturating_add(secs);
+            app.timed_kind_grants.insert(kind, expiry);
             app.last_used = Timestamp::now();
         }
     }
@@ -598,8 +602,9 @@ mod tests {
         pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
         assert!(!pm.needs_approval(&pubkey, Kind::TextNote));
 
-        // Force the grant to expire and verify needs_approval returns true
-        // again once the expired entry is pruned.
+        // Force the grant to expire: needs_approval skips the expired entry and
+        // returns true again. The stale entry stays in the map until the next
+        // mutation prunes it; the read path does not remove it.
         if let Some(app) = pm.apps.get_mut(&pubkey) {
             app.timed_kind_grants.insert(Kind::TextNote, 1);
         }
@@ -635,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_grant_keeps_longer_existing_window() {
+    fn timed_grant_replaces_window_on_reapproval() {
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
         pm.connect(pubkey, "App".into());
@@ -643,10 +648,11 @@ mod tests {
         pm.grant_kind_for(&pubkey, Kind::TextNote, 24 * 60 * 60);
         let before = pm.get_app(&pubkey).unwrap().timed_kind_grants[&Kind::TextNote];
 
-        // Re-approve with a shorter window: the longer existing expiry stands.
+        // An explicit re-approval with a shorter window replaces the existing
+        // expiry so a user can deliberately shrink an over-granted window.
         pm.grant_kind_for(&pubkey, Kind::TextNote, 60);
         let after = pm.get_app(&pubkey).unwrap().timed_kind_grants[&Kind::TextNote];
-        assert_eq!(before, after);
+        assert!(after < before);
     }
 
     #[test]

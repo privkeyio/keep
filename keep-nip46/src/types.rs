@@ -147,3 +147,19 @@ pub(crate) struct PartialEvent {
     pub tags: Vec<Vec<String>>,
     pub created_at: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_duration_as_seconds_mapping() {
+        assert_eq!(RememberDuration::JustThisTime.as_seconds(), None);
+        assert_eq!(RememberDuration::Forever.as_seconds(), None);
+        assert_eq!(RememberDuration::OneMinute.as_seconds(), Some(60));
+        assert_eq!(RememberDuration::FiveMinutes.as_seconds(), Some(5 * 60));
+        assert_eq!(RememberDuration::TenMinutes.as_seconds(), Some(10 * 60));
+        assert_eq!(RememberDuration::OneHour.as_seconds(), Some(60 * 60));
+        assert_eq!(RememberDuration::OneDay.as_seconds(), Some(24 * 60 * 60));
+    }
+}
