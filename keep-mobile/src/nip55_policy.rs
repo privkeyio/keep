@@ -347,10 +347,31 @@ mod tests {
     #[test]
     fn raw_timestamp_export_matches_monotonic_window() {
         // 1h grant, monotonic stamp present.
-        assert!(!nip55_timestamp_expired(None, 0, 1_000, Some(HOUR_MS), 1_000 + HOUR_MS - 1, 0));
-        assert!(nip55_timestamp_expired(None, 0, 1_000, Some(HOUR_MS), 1_000 + HOUR_MS, 0));
+        assert!(!nip55_timestamp_expired(
+            None,
+            0,
+            1_000,
+            Some(HOUR_MS),
+            1_000 + HOUR_MS - 1,
+            0
+        ));
+        assert!(nip55_timestamp_expired(
+            None,
+            0,
+            1_000,
+            Some(HOUR_MS),
+            1_000 + HOUR_MS,
+            0
+        ));
         // No lifetime fields -> never expires.
-        assert!(!nip55_timestamp_expired(None, 0, 0, None, i64::MAX, i64::MAX));
+        assert!(!nip55_timestamp_expired(
+            None,
+            0,
+            0,
+            None,
+            i64::MAX,
+            i64::MAX
+        ));
     }
 
     #[test]
