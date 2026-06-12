@@ -6,8 +6,10 @@ use crate::{KeepMobile, KeepMobileError};
 use keep_nip46::types::{
     ApprovalRequest, ApprovalResult, LogEvent, RememberDuration, ServerCallbacks,
 };
-use keep_nip46::{NetworkFrostSigner, Permission, RateLimitConfig, Server, ServerConfig};
-use nostr_sdk::Kind;
+use keep_nip46::{
+    NetworkFrostSigner, Permission, RateLimitConfig, Server, ServerConfig, SignerHandler,
+};
+use nostr_sdk::{Kind, PublicKey};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
@@ -160,6 +162,7 @@ pub struct BunkerHandler {
     status: Arc<AtomicU8>,
     bunker_url: std::sync::Mutex<Option<String>>,
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    handler: std::sync::Mutex<Option<Arc<SignerHandler>>>,
 }
 
 impl BunkerHandler {
@@ -181,6 +184,7 @@ impl BunkerHandler {
             status: Arc::new(AtomicU8::new(STATUS_STOPPED)),
             bunker_url: std::sync::Mutex::new(None),
             shutdown_tx: std::sync::Mutex::new(None),
+            handler: std::sync::Mutex::new(None),
         }
     }
 
@@ -213,6 +217,44 @@ impl BunkerHandler {
             let _ = tx.send(());
         }
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Revokes a single client, dropping its in-memory permission grants in the
+    /// running engine so any remembered (auto-approved) kinds stop signing
+    /// immediately. No-op when the bunker is not running. The pubkey is the
+    /// client's hex-encoded x-only public key.
+    pub fn revoke_client(&self, pubkey: String) -> Result<(), KeepMobileError> {
+        let handler = self
+            .handler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(handler) = handler else {
+            return Ok(());
+        };
+        let pubkey = PublicKey::from_hex(&pubkey).map_err(|_| KeepMobileError::InvalidInput {
+            msg: "Invalid client pubkey hex".into(),
+        })?;
+        self.mobile
+            .runtime
+            .block_on(async { handler.revoke_client(&pubkey).await });
+        Ok(())
+    }
+
+    /// Revokes every client, clearing all in-memory permission grants in the
+    /// running engine. No-op when the bunker is not running.
+    pub fn revoke_all_clients(&self) {
+        let handler = self
+            .handler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(handler) = handler {
+            self.mobile
+                .runtime
+                .block_on(async { handler.revoke_all_clients().await });
+        }
     }
 
     pub fn get_bunker_url(&self) -> Option<String> {
@@ -437,6 +479,7 @@ impl BunkerHandler {
             .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
 
             *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
+            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.handler());
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
