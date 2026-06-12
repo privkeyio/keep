@@ -54,6 +54,12 @@ pub fn nip55_verify_caller(
     let Some(current) = current_signature else {
         return Nip55CallerVerification::NotInstalled;
     };
+    // An empty hash is not a verifiable identity. Fail closed so it can never be
+    // persisted as the trusted value and later collide with another empty-hash
+    // caller via `ct_eq("", "")`.
+    if current.is_empty() {
+        return Nip55CallerVerification::NotInstalled;
+    }
     let Some(trusted) = trusted_signature else {
         return Nip55CallerVerification::FirstUseRequiresApproval { signature: current };
     };
@@ -119,9 +125,7 @@ impl Nip55NonceStore {
 
     /// Drop expired nonces. Called opportunistically (e.g. on foreground).
     pub fn cleanup_expired(&self) {
-        let now = Instant::now();
-        let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
-        nonces.retain(|_, d| now < d.expires_at);
+        self.cleanup_expired_at(Instant::now());
     }
 
     pub fn clear(&self) {
@@ -152,6 +156,15 @@ impl Nip55NonceStore {
         nonce
     }
 
+    fn cleanup_expired_at(&self, now: Instant) {
+        let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
+        nonces.retain(|_, d| now < d.expires_at);
+    }
+
+    // Android carries a second clock-anomaly clause (`expiresAt - now > NONCE_EXPIRY`)
+    // to guard against `elapsedRealtime` jumps; it is intentionally omitted here
+    // because `Instant` is monotonic and cannot move that way. Do not "restore
+    // parity" with the Kotlin: it would be dead code.
     fn consume_at(&self, nonce: &str, now: Instant) -> Nip55NonceResult {
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
         match nonces.remove(nonce) {
@@ -259,5 +272,72 @@ mod tests {
     fn unknown_nonce_is_invalid() {
         let store = Nip55NonceStore::new();
         assert_eq!(store.consume("deadbeef".into()), Nip55NonceResult::Invalid);
+    }
+
+    #[test]
+    fn empty_current_signature_is_not_installed() {
+        // An empty hash must not be treated as a verifiable identity, on either
+        // first use or comparison against an empty trusted value.
+        assert_eq!(
+            nip55_verify_caller(Some(String::new()), None),
+            Nip55CallerVerification::NotInstalled
+        );
+        assert_eq!(
+            nip55_verify_caller(Some(String::new()), Some(String::new())),
+            Nip55CallerVerification::NotInstalled
+        );
+    }
+
+    #[test]
+    fn eviction_trims_to_half_keeping_newest() {
+        let store = Nip55NonceStore::new();
+        let t0 = Instant::now();
+        let mut nonces = Vec::new();
+        // One past the cap triggers eviction down to MAX/2, keeping the
+        // newest-expiring entries.
+        for i in 0..=MAX_ACTIVE_NONCES {
+            let now = t0 + Duration::from_millis(i as u64);
+            nonces.push(store.generate_at(format!("pkg{i}"), now));
+        }
+        // The oldest nonce was evicted.
+        assert_eq!(
+            store.consume_at(&nonces[0], t0 + Duration::from_secs(1)),
+            Nip55NonceResult::Invalid
+        );
+        // The newest nonce was retained.
+        let newest = nonces.last().unwrap();
+        let newest_now = t0 + Duration::from_millis(MAX_ACTIVE_NONCES as u64);
+        assert!(matches!(
+            store.consume_at(newest, newest_now + Duration::from_secs(1)),
+            Nip55NonceResult::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn cleanup_expired_drops_only_expired() {
+        let store = Nip55NonceStore::new();
+        let t0 = Instant::now();
+        let old = store.generate_at("old".into(), t0);
+        let fresh = store.generate_at("fresh".into(), t0 + Duration::from_secs(4 * 60));
+        // `old` has expired, `fresh` has not.
+        let now = t0 + NONCE_EXPIRY + Duration::from_secs(30);
+        store.cleanup_expired_at(now);
+        assert_eq!(store.consume_at(&old, now), Nip55NonceResult::Invalid);
+        assert!(matches!(
+            store.consume_at(&fresh, now),
+            Nip55NonceResult::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn clear_removes_all_nonces() {
+        let store = Nip55NonceStore::new();
+        let t0 = Instant::now();
+        let nonce = store.generate_at("com.app".into(), t0);
+        store.clear();
+        assert_eq!(
+            store.consume_at(&nonce, t0 + Duration::from_secs(1)),
+            Nip55NonceResult::Invalid
+        );
     }
 }
