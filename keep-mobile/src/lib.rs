@@ -12,6 +12,7 @@ mod nip55;
 mod nip55_audit;
 mod nip55_caller;
 mod nip55_policy;
+mod nip55_ratelimit;
 mod persistence;
 mod policy;
 mod psbt;
