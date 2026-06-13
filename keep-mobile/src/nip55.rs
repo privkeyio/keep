@@ -144,6 +144,96 @@ pub fn nip55_parse_permissions(json: Option<String>) -> Vec<Nip55DeclaredPermiss
     out
 }
 
+/// Outcome of the NIP-42 relay-auth whitelist gate for a kind-22242 request.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum Nip55RelayAuthGate {
+    /// Relay is whitelisted — auto-approve without prompting.
+    AutoAccept,
+    /// A non-empty whitelist does not contain this relay — auto-reject.
+    AutoReject,
+    /// No whitelist configured (or it is empty) — fall through to normal grant resolution.
+    Defer,
+}
+
+// Canonicalizes a relay URL to `host[:port]`: strips the ws/wss scheme
+// (case-insensitively), any path and trailing slash, drops default ports
+// (:443/:80) and a trailing FQDN dot, and lowercases (ASCII-only). Rejects
+// non-ASCII hosts and blank input (returns None). The SAME normalization is
+// used on whitelist entries and on the extracted relay host before gating so
+// they compare consistently.
+#[uniffi::export]
+pub fn nip55_normalize_relay_host(url: String) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("wss://")
+        .or_else(|| lower.strip_prefix("ws://"))
+        .unwrap_or(lower.as_str());
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .trim_end_matches('/');
+    if !host.is_ascii() {
+        return None;
+    }
+    let host = host
+        .strip_suffix(":443")
+        .or_else(|| host.strip_suffix(":80"))
+        .unwrap_or(host)
+        .trim_end_matches('.');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+// Extracts the normalized relay host from a NIP-42 (kind 22242) auth event's
+// `relay` tag. Returns None if the event is malformed or has no usable relay tag.
+#[uniffi::export]
+pub fn nip55_extract_relay_host(event_json: String) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(&event_json).ok()?;
+    if event.get("kind").and_then(|k| k.as_u64()) != Some(22242) {
+        return None;
+    }
+    let tags = event.get("tags")?.as_array()?;
+    let mut relay_url: Option<&str> = None;
+    for tag in tags {
+        let Some(arr) = tag.as_array() else {
+            continue;
+        };
+        if arr.first().and_then(|v| v.as_str()) == Some("relay") {
+            if relay_url.is_some() {
+                return None;
+            }
+            relay_url = Some(arr.get(1).and_then(|v| v.as_str())?);
+        }
+    }
+    nip55_normalize_relay_host(relay_url?.to_string())
+}
+
+// Applies the relay-auth whitelist gate. An empty whitelist defers to normal grant
+// resolution; otherwise a request is auto-accepted iff its relay is whitelisted,
+// and auto-rejected otherwise (including when the relay could not be determined).
+// Whitelist entries are expected to be pre-normalized via nip55_normalize_relay_host.
+#[uniffi::export]
+pub fn nip55_relay_auth_gate(
+    relay_host: Option<String>,
+    whitelist: Vec<String>,
+) -> Nip55RelayAuthGate {
+    if whitelist.is_empty() {
+        return Nip55RelayAuthGate::Defer;
+    }
+    match relay_host {
+        Some(host) if whitelist.contains(&host) => Nip55RelayAuthGate::AutoAccept,
+        _ => Nip55RelayAuthGate::AutoReject,
+    }
+}
+
 impl Nip55Response {
     fn ok(result: String) -> Self {
         Self {
@@ -949,6 +1039,127 @@ mod tests {
         assert!(obj["signature"].is_null());
         assert!(obj["result"].is_null());
         assert_eq!(obj["rejected"], true);
+    }
+
+    #[test]
+    fn normalize_relay_host_strips_scheme_path_and_lowercases() {
+        assert_eq!(
+            nip55_normalize_relay_host("wss://Relay.Example.com/".into()),
+            Some("relay.example.com".into())
+        );
+        assert_eq!(
+            nip55_normalize_relay_host("ws://relay.example.com:7777/path".into()),
+            Some("relay.example.com:7777".into())
+        );
+        assert_eq!(nip55_normalize_relay_host("   ".into()), None);
+    }
+
+    #[test]
+    fn normalize_relay_host_scheme_less_and_default_ports() {
+        // Scheme-less input is accepted as-is.
+        assert_eq!(
+            nip55_normalize_relay_host("relay.example.com".into()),
+            Some("relay.example.com".into())
+        );
+        // Default ports canonicalize away (wss :443, ws :80).
+        assert_eq!(
+            nip55_normalize_relay_host("relay.com".into()),
+            nip55_normalize_relay_host("relay.com:443".into())
+        );
+        assert_eq!(
+            nip55_normalize_relay_host("ws://relay.com:80".into()),
+            Some("relay.com".into())
+        );
+        // Uppercase scheme is stripped case-insensitively.
+        assert_eq!(
+            nip55_normalize_relay_host("WSS://Relay.Example.com".into()),
+            Some("relay.example.com".into())
+        );
+        // Trailing FQDN dot is stripped.
+        assert_eq!(
+            nip55_normalize_relay_host("relay.com.".into()),
+            Some("relay.com".into())
+        );
+    }
+
+    #[test]
+    fn normalize_relay_host_rejects_non_ascii_homograph() {
+        // U+212A KELVIN SIGN lowercases to ASCII 'k' under full Unicode case
+        // folding; reject non-ASCII hosts to prevent a whitelist bypass.
+        assert_eq!(
+            nip55_normalize_relay_host("wss://\u{212a}raken-relay.com".into()),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_relay_host_from_22242_event() {
+        let event =
+            r#"{"kind":22242,"tags":[["relay","wss://relay.example.com/"],["challenge","abc"]]}"#;
+        assert_eq!(
+            nip55_extract_relay_host(event.into()),
+            Some("relay.example.com".into())
+        );
+        // No relay tag, or malformed -> None (fail-closed).
+        assert_eq!(
+            nip55_extract_relay_host(r#"{"kind":22242,"tags":[["challenge","abc"]]}"#.into()),
+            None
+        );
+        assert_eq!(nip55_extract_relay_host("not json".into()), None);
+    }
+
+    #[test]
+    fn extract_relay_host_fail_closed_cases() {
+        // Non-22242 kind is rejected even with a valid relay tag.
+        assert_eq!(
+            nip55_extract_relay_host(
+                r#"{"kind":1,"tags":[["relay","wss://relay.example.com/"]]}"#.into()
+            ),
+            None
+        );
+        // More than one relay tag is ambiguous -> None.
+        assert_eq!(
+            nip55_extract_relay_host(
+                r#"{"kind":22242,"tags":[["relay","wss://a.example.com"],["relay","wss://b.example.com"]]}"#
+                    .into()
+            ),
+            None
+        );
+        // Relay tag missing its URL element -> None.
+        assert_eq!(
+            nip55_extract_relay_host(r#"{"kind":22242,"tags":[["relay"]]}"#.into()),
+            None
+        );
+    }
+
+    #[test]
+    fn relay_auth_gate_semantics() {
+        // Empty whitelist defers to normal resolution.
+        assert_eq!(
+            nip55_relay_auth_gate(Some("relay.example.com".into()), vec![]),
+            Nip55RelayAuthGate::Defer
+        );
+        // Whitelisted relay auto-accepts.
+        assert_eq!(
+            nip55_relay_auth_gate(
+                Some("relay.example.com".into()),
+                vec!["relay.example.com".into()]
+            ),
+            Nip55RelayAuthGate::AutoAccept
+        );
+        // Non-empty whitelist without this relay auto-rejects.
+        assert_eq!(
+            nip55_relay_auth_gate(
+                Some("other.example.com".into()),
+                vec!["relay.example.com".into()]
+            ),
+            Nip55RelayAuthGate::AutoReject
+        );
+        // Unknown relay against a non-empty whitelist auto-rejects.
+        assert_eq!(
+            nip55_relay_auth_gate(None, vec!["relay.example.com".into()]),
+            Nip55RelayAuthGate::AutoReject
+        );
     }
 
     #[test]
