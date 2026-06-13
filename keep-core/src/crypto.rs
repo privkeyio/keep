@@ -708,7 +708,12 @@ pub mod nip44 {
     const NIP44_V3_MIN_PAYLOAD: usize = 1 + 32 + 32 + 4 + 4 + 4;
     const NIP44_V3_MIN_PADDING: u64 = 32;
     const NIP44_V3_PAD_THRESHOLD: u64 = 32768;
+    // The draft uses a u32 length prefix; cap plaintext at i32::MAX so the
+    // length fits the prefix without truncation and v3_target_size cannot
+    // overflow its shift, while still allowing payloads beyond v2's 65535 limit.
+    const NIP44_V3_MAX_PLAINTEXT: usize = i32::MAX as usize;
 
+    #[allow(clippy::type_complexity)]
     fn v3_derive_keys(
         shared_secret: &[u8; 32],
         nonce: &[u8; 32],
@@ -742,7 +747,7 @@ pub mod nip44 {
     }
 
     fn v3_pad(plaintext: &[u8]) -> Result<Vec<u8>> {
-        if plaintext.len() > MAX_PLAINTEXT_SIZE {
+        if plaintext.len() > NIP44_V3_MAX_PLAINTEXT {
             return Err(CryptoError::encryption("NIP-44 v3 plaintext too large").into());
         }
         let prefixed = 4u64
@@ -763,7 +768,7 @@ pub mod nip44 {
             return Err(CryptoError::decryption("NIP-44 v3 padded buffer too short").into());
         }
         let plen = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
-        if plen > MAX_PLAINTEXT_SIZE
+        if plen > NIP44_V3_MAX_PLAINTEXT
             || 4usize
                 .checked_add(plen)
                 .is_none_or(|end| end > padded.len())
