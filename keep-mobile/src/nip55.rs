@@ -155,30 +155,40 @@ pub enum Nip55RelayAuthGate {
     Defer,
 }
 
-// Canonicalizes a relay URL to `host[:port]`: strips the ws/wss scheme, any path,
-// and a trailing slash, and lowercases. Returns None for blank input. The SAME
-// normalization is used on grant-write, lookup, and whitelist entries so they
-// compare consistently.
+// Canonicalizes a relay URL to `host[:port]`: strips the ws/wss scheme
+// (case-insensitively), any path and trailing slash, drops default ports
+// (:443/:80) and a trailing FQDN dot, and lowercases (ASCII-only). Rejects
+// non-ASCII hosts and blank input (returns None). The SAME normalization is
+// used on whitelist entries and on the extracted relay host before gating so
+// they compare consistently.
 #[uniffi::export]
 pub fn nip55_normalize_relay_host(url: String) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let without_scheme = trimmed
+    let lower = trimmed.to_ascii_lowercase();
+    let without_scheme = lower
         .strip_prefix("wss://")
-        .or_else(|| trimmed.strip_prefix("ws://"))
-        .unwrap_or(trimmed);
+        .or_else(|| lower.strip_prefix("ws://"))
+        .unwrap_or(lower.as_str());
     let host = without_scheme
         .split('/')
         .next()
         .unwrap_or(without_scheme)
-        .trim_end_matches('/')
-        .to_lowercase();
+        .trim_end_matches('/');
+    if !host.is_ascii() {
+        return None;
+    }
+    let host = host
+        .strip_suffix(":443")
+        .or_else(|| host.strip_suffix(":80"))
+        .unwrap_or(host)
+        .trim_end_matches('.');
     if host.is_empty() {
         None
     } else {
-        Some(host)
+        Some(host.to_string())
     }
 }
 
@@ -187,21 +197,24 @@ pub fn nip55_normalize_relay_host(url: String) -> Option<String> {
 #[uniffi::export]
 pub fn nip55_extract_relay_host(event_json: String) -> Option<String> {
     let event: serde_json::Value = serde_json::from_str(&event_json).ok()?;
+    if event.get("kind").and_then(|k| k.as_u64()) != Some(22242) {
+        return None;
+    }
     let tags = event.get("tags")?.as_array()?;
+    let mut relay_url: Option<&str> = None;
     for tag in tags {
         let arr = match tag.as_array() {
             Some(a) => a,
             None => continue,
         };
         if arr.first().and_then(|v| v.as_str()) == Some("relay") {
-            if let Some(url) = arr.get(1).and_then(|v| v.as_str()) {
-                if let Some(host) = nip55_normalize_relay_host(url.to_string()) {
-                    return Some(host);
-                }
+            if relay_url.is_some() {
+                return None;
             }
+            relay_url = Some(arr.get(1).and_then(|v| v.as_str())?);
         }
     }
-    None
+    nip55_normalize_relay_host(relay_url?.to_string())
 }
 
 // Applies the relay-auth whitelist gate. An empty whitelist defers to normal grant
@@ -1043,6 +1056,44 @@ mod tests {
     }
 
     #[test]
+    fn normalize_relay_host_scheme_less_and_default_ports() {
+        // Scheme-less input is accepted as-is.
+        assert_eq!(
+            nip55_normalize_relay_host("relay.example.com".into()),
+            Some("relay.example.com".into())
+        );
+        // Default ports canonicalize away (wss :443, ws :80).
+        assert_eq!(
+            nip55_normalize_relay_host("relay.com".into()),
+            nip55_normalize_relay_host("relay.com:443".into())
+        );
+        assert_eq!(
+            nip55_normalize_relay_host("ws://relay.com:80".into()),
+            Some("relay.com".into())
+        );
+        // Uppercase scheme is stripped case-insensitively.
+        assert_eq!(
+            nip55_normalize_relay_host("WSS://Relay.Example.com".into()),
+            Some("relay.example.com".into())
+        );
+        // Trailing FQDN dot is stripped.
+        assert_eq!(
+            nip55_normalize_relay_host("relay.com.".into()),
+            Some("relay.com".into())
+        );
+    }
+
+    #[test]
+    fn normalize_relay_host_rejects_non_ascii_homograph() {
+        // U+212A KELVIN SIGN lowercases to ASCII 'k' under full Unicode case
+        // folding; reject non-ASCII hosts to prevent a whitelist bypass.
+        assert_eq!(
+            nip55_normalize_relay_host("wss://\u{212a}raken-relay.com".into()),
+            None
+        );
+    }
+
+    #[test]
     fn extract_relay_host_from_22242_event() {
         let event =
             r#"{"kind":22242,"tags":[["relay","wss://relay.example.com/"],["challenge","abc"]]}"#;
@@ -1056,6 +1107,30 @@ mod tests {
             None
         );
         assert_eq!(nip55_extract_relay_host("not json".into()), None);
+    }
+
+    #[test]
+    fn extract_relay_host_fail_closed_cases() {
+        // Non-22242 kind is rejected even with a valid relay tag.
+        assert_eq!(
+            nip55_extract_relay_host(
+                r#"{"kind":1,"tags":[["relay","wss://relay.example.com/"]]}"#.into()
+            ),
+            None
+        );
+        // More than one relay tag is ambiguous -> None.
+        assert_eq!(
+            nip55_extract_relay_host(
+                r#"{"kind":22242,"tags":[["relay","wss://a.example.com"],["relay","wss://b.example.com"]]}"#
+                    .into()
+            ),
+            None
+        );
+        // Relay tag missing its URL element -> None.
+        assert_eq!(
+            nip55_extract_relay_host(r#"{"kind":22242,"tags":[["relay"]]}"#.into()),
+            None
+        );
     }
 
     #[test]
