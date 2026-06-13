@@ -28,6 +28,10 @@ pub enum Nip55VelocityResult {
 /// Apply the hourly/daily/weekly request-count limits to the supplied window
 /// counts (queried from the Android velocity log). The thresholds and ordering
 /// are the single source of truth here. Mirrors `PermissionStore.checkLimit`.
+///
+/// Counts are the pre-insert window totals (the limit blocks on `>=`), so the
+/// caller must check before recording the current request, matching Kotlin's
+/// check-then-`velocityDao.insert` ordering.
 #[uniffi::export]
 pub fn nip55_check_velocity(
     hourly_count: u32,
@@ -62,6 +66,7 @@ const FRONT_DOOR_MAX_ENTRIES: usize = 1000;
 struct RateEntry {
     count: u32,
     window_start_ms: u64,
+    last_seen_ms: u64,
 }
 
 /// Coarse front-door limiter: at most 30 requests per second per caller,
@@ -91,13 +96,14 @@ impl Nip55RequestRateLimiter {
     /// Record a request and return whether it is within the per-second limit.
     /// A blank package name is always rejected.
     pub fn check(&self, package_name: String, now_elapsed_ms: u64) -> bool {
-        if package_name.is_empty() {
+        if package_name.trim().is_empty() {
             return false;
         }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
 
         match entries.get_mut(&package_name) {
             Some(entry) => {
+                entry.last_seen_ms = now_elapsed_ms;
                 if now_elapsed_ms.saturating_sub(entry.window_start_ms) >= FRONT_DOOR_WINDOW_MS {
                     entry.count = 1;
                     entry.window_start_ms = now_elapsed_ms;
@@ -109,9 +115,13 @@ impl Nip55RequestRateLimiter {
             }
             None => {
                 if entries.len() >= FRONT_DOOR_MAX_ENTRIES {
+                    // Evict the least-recently-seen caller (access-order LRU,
+                    // matching the Kotlin `LinkedHashMap`), not the oldest
+                    // window: a caller still being flooded inside its window
+                    // must not be the eviction target, or its count resets.
                     if let Some(oldest) = entries
                         .iter()
-                        .min_by_key(|(_, e)| e.window_start_ms)
+                        .min_by_key(|(_, e)| e.last_seen_ms)
                         .map(|(k, _)| k.clone())
                     {
                         entries.remove(&oldest);
@@ -122,6 +132,7 @@ impl Nip55RequestRateLimiter {
                     RateEntry {
                         count: 1,
                         window_start_ms: now_elapsed_ms,
+                        last_seen_ms: now_elapsed_ms,
                     },
                 );
                 true
@@ -202,5 +213,56 @@ mod tests {
         assert!(!limiter.check("com.a".into(), 1000));
         // A different caller is unaffected.
         assert!(limiter.check("com.b".into(), 1000));
+    }
+
+    #[test]
+    fn front_door_rejects_whitespace_package() {
+        let limiter = Nip55RequestRateLimiter::new();
+        assert!(!limiter.check("   ".into(), 1000));
+    }
+
+    #[test]
+    fn velocity_blocks_at_exact_boundary() {
+        // limit-1 passes, limit blocks, for daily and weekly windows.
+        assert_eq!(
+            nip55_check_velocity(0, VELOCITY_DAILY_LIMIT - 1, 0),
+            Nip55VelocityResult::Allowed
+        );
+        match nip55_check_velocity(0, VELOCITY_DAILY_LIMIT, 0) {
+            Nip55VelocityResult::Blocked { window_ms, .. } => assert_eq!(window_ms, DAY_MS),
+            other => panic!("expected daily Blocked, got {other:?}"),
+        }
+        assert_eq!(
+            nip55_check_velocity(0, 0, VELOCITY_WEEKLY_LIMIT - 1),
+            Nip55VelocityResult::Allowed
+        );
+        match nip55_check_velocity(0, 0, VELOCITY_WEEKLY_LIMIT) {
+            Nip55VelocityResult::Blocked { window_ms, .. } => assert_eq!(window_ms, WEEK_MS),
+            other => panic!("expected weekly Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn front_door_eviction_is_bounded_and_drops_least_recently_seen() {
+        let limiter = Nip55RequestRateLimiter::new();
+        // Fill the table to capacity, each caller last seen at an increasing time.
+        for i in 0..FRONT_DOOR_MAX_ENTRIES {
+            assert!(limiter.check(format!("com.app{i}"), i as u64));
+        }
+        // Re-touch app0 so it is no longer the least-recently-seen entry; app1
+        // (untouched, earliest last_seen) becomes the eviction target.
+        let later = FRONT_DOOR_MAX_ENTRIES as u64 + 1;
+        assert!(limiter.check("com.app0".into(), later));
+
+        // Inserting a new caller must evict exactly one entry, keeping the map
+        // bounded, and must drop app1 rather than the freshly-touched app0.
+        assert!(limiter.check("com.newcomer".into(), later + 1));
+        {
+            let entries = limiter.entries.lock().unwrap();
+            assert_eq!(entries.len(), FRONT_DOOR_MAX_ENTRIES);
+            assert!(entries.contains_key("com.app0"));
+            assert!(entries.contains_key("com.newcomer"));
+            assert!(!entries.contains_key("com.app1"));
+        }
     }
 }
