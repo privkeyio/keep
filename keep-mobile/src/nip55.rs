@@ -32,6 +32,9 @@ const MAX_REQUESTS_PER_WINDOW: u32 = 60;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
+const MAX_PERMISSIONS_COUNT: usize = 32;
+const MAX_PERMISSIONS_JSON_BYTES: usize = 8 * 1024;
+const MAX_EVENT_KIND: i32 = 65535;
 
 fn pubkey_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
@@ -85,41 +88,58 @@ pub struct Nip55DeclaredPermission {
 
 // Parses the NIP-55 `permissions` array (`[{"type":"sign_event","kind":22242},
 // {"type":"nip44_decrypt"}]`) into the methods/kinds a client wants pre-authorized.
-// Unknown method types are dropped; `kind` is honored only for sign_event, and a
-// kind-less sign_event entry is dropped (a sign grant must name a kind). Malformed
-// input parses to an empty list (fail-closed: nothing pre-authorized).
+// Unknown method types are dropped, as are `get_public_key` entries (that is the
+// entry method itself, not a grantable permission); `kind` is honored only for
+// sign_event, and a kind-less sign_event entry is dropped (a sign grant must name
+// a kind). Duplicate `(request_type, kind)` entries collapse to the first seen, and
+// at most `MAX_PERMISSIONS_COUNT` entries are accepted. Input over
+// `MAX_PERMISSIONS_JSON_BYTES` and malformed input both parse to an empty list
+// (fail-closed: nothing pre-authorized).
 #[uniffi::export]
 pub fn nip55_parse_permissions(json: Option<String>) -> Vec<Nip55DeclaredPermission> {
     let Some(json) = json else {
         return Vec::new();
     };
+    if json.len() > MAX_PERMISSIONS_JSON_BYTES {
+        return Vec::new();
+    }
     let entries: Vec<serde_json::Value> = match serde_json::from_str(&json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<Nip55DeclaredPermission> = Vec::new();
     for entry in &entries {
+        if out.len() >= MAX_PERMISSIONS_COUNT {
+            break;
+        }
         let Some(type_str) = entry.get("type").and_then(|t| t.as_str()) else {
             continue;
         };
         let Ok(request_type) = parse_request_type(type_str) else {
             continue;
         };
+        if request_type == Nip55RequestType::GetPublicKey {
+            continue;
+        }
         let kind = if request_type == Nip55RequestType::SignEvent {
-            match entry
+            let Some(kind) = entry
                 .get("kind")
                 .and_then(|k| k.as_i64())
                 .and_then(|k| i32::try_from(k).ok())
-                .filter(|k| (0..=65535).contains(k))
-            {
-                Some(k) => Some(k),
+                .filter(|k| (0..=MAX_EVENT_KIND).contains(k))
+            else {
                 // A sign_event permission with no (valid) kind cannot be granted.
-                None => continue,
-            }
+                continue;
+            };
+            Some(kind)
         } else {
             None
         };
-        out.push(Nip55DeclaredPermission { request_type, kind });
+        let permission = Nip55DeclaredPermission { request_type, kind };
+        if out.contains(&permission) {
+            continue;
+        }
+        out.push(permission);
     }
     out
 }
@@ -973,6 +993,74 @@ mod tests {
             nip55_parse_permissions(Some(r#"[{"type":"sign_event","kind":99999}]"#.into()))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parse_permissions_empty_array_is_empty() {
+        assert!(nip55_parse_permissions(Some("[]".into())).is_empty());
+    }
+
+    #[test]
+    fn parse_permissions_dedups_to_first_seen() {
+        let json = r#"[{"type":"nip44_decrypt"},{"type":"nip44_decrypt"},{"type":"sign_event","kind":1},{"type":"sign_event","kind":1}]"#;
+        let perms = nip55_parse_permissions(Some(json.into()));
+        assert_eq!(
+            perms,
+            vec![
+                Nip55DeclaredPermission {
+                    request_type: Nip55RequestType::Nip44Decrypt,
+                    kind: None,
+                },
+                Nip55DeclaredPermission {
+                    request_type: Nip55RequestType::SignEvent,
+                    kind: Some(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_drops_get_public_key() {
+        let json = r#"[{"type":"get_public_key"},{"type":"nip44_decrypt"}]"#;
+        let perms = nip55_parse_permissions(Some(json.into()));
+        assert_eq!(
+            perms,
+            vec![Nip55DeclaredPermission {
+                request_type: Nip55RequestType::Nip44Decrypt,
+                kind: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_drops_non_object_elements() {
+        let perms = nip55_parse_permissions(Some(r#"["sign_event",42,null]"#.into()));
+        assert!(perms.is_empty());
+    }
+
+    #[test]
+    fn parse_permissions_drops_string_kind() {
+        let json = r#"[{"type":"sign_event","kind":"22242"}]"#;
+        assert!(nip55_parse_permissions(Some(json.into())).is_empty());
+    }
+
+    #[test]
+    fn parse_permissions_enforces_count_cap() {
+        let entries: Vec<String> = (0..MAX_PERMISSIONS_COUNT as i32 + 10)
+            .map(|k| format!(r#"{{"type":"sign_event","kind":{k}}}"#))
+            .collect();
+        let json = format!("[{}]", entries.join(","));
+        let perms = nip55_parse_permissions(Some(json));
+        assert_eq!(perms.len(), MAX_PERMISSIONS_COUNT);
+    }
+
+    #[test]
+    fn parse_permissions_rejects_oversized_input() {
+        let entry = r#"{"type":"nip44_decrypt"}"#;
+        let count = MAX_PERMISSIONS_JSON_BYTES / entry.len() + 10;
+        let json = format!("[{}]", vec![entry; count].join(","));
+        assert!(json.len() > MAX_PERMISSIONS_JSON_BYTES);
+        assert!(nip55_parse_permissions(Some(json)).is_empty());
     }
 
     #[test]
