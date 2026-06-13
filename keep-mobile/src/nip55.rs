@@ -905,4 +905,28 @@ mod tests {
         assert_eq!(json[1]["id"], "2");
         assert_eq!(json[1]["rejected"], true);
     }
+
+    #[test]
+    fn batch_results_empty_is_empty_array() {
+        assert_eq!(serialize_batch_results_json(&[]), "[]");
+    }
+
+    // Amber's batch wire format puts the signature in BOTH `signature` and
+    // `result` and never emits the assembled event; the per-request `event`
+    // payload is only for the single-result intent path.
+    #[test]
+    fn batch_results_sign_event_uses_signature_not_event() {
+        let responses = vec![Nip55Response {
+            result: "sighex".into(),
+            event: Some("{\"id\":\"deadbeef\",\"sig\":\"sighex\"}".into()),
+            error: None,
+            id: Some("c".into()),
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["signature"], "sighex");
+        assert_eq!(obj["result"], "sighex");
+        assert!(obj.get("event").is_none());
+    }
 }
