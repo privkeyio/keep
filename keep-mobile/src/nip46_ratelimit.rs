@@ -18,7 +18,6 @@ const BACKOFF_MAX_MS: u64 = 60_000;
 const BACKOFF_MAX_EXPONENT: u32 = 6;
 const GLOBAL_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 const GLOBAL_MAX_REQUESTS_PER_WINDOW: usize = 100;
-const GLOBAL_REQUEST_HISTORY_MAX_SIZE: usize = 200;
 const MAX_TRACKED_CLIENTS: usize = 1000;
 
 #[derive(Default)]
@@ -77,25 +76,39 @@ impl Nip46BunkerRateLimiter {
             return true;
         }
 
-        // Per-client backoff.
-        if let Some(c) = clients.get(&client_pubkey) {
+        // Per-client backoff. Refresh last_seen on every request that passes the
+        // global cap so a backed-off client is not the eviction victim, which
+        // would reset its penalty (see the eviction guard below).
+        if let Some(c) = clients.get_mut(&client_pubkey) {
+            c.last_seen = now;
             if now < c.backoff_until {
                 return true;
             }
         }
 
-        // Bound the tracked-client set, evicting the least-recently-seen.
+        // Bound the tracked-client set. Evict the least-recently-seen client
+        // that is not currently in backoff, so attacker pubkey churn cannot
+        // flush an active penalty; fall back to the overall least-recently-seen
+        // only if every tracked client is still backing off.
         if clients.len() >= MAX_TRACKED_CLIENTS && !clients.contains_key(&client_pubkey) {
-            if let Some(oldest) = clients
+            let victim = clients
                 .iter()
+                .filter(|(_, c)| now >= c.backoff_until)
                 .min_by_key(|(_, c)| c.last_seen)
                 .map(|(k, _)| k.clone())
-            {
+                .or_else(|| {
+                    clients
+                        .iter()
+                        .min_by_key(|(_, c)| c.last_seen)
+                        .map(|(k, _)| k.clone())
+                });
+            if let Some(oldest) = victim {
                 clients.remove(&oldest);
             }
         }
 
         let client = clients.entry(client_pubkey).or_default();
+        client.last_seen = now;
         let client_cutoff = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
         client.history.retain(|&t| t >= client_cutoff);
 
@@ -108,11 +121,6 @@ impl Nip46BunkerRateLimiter {
         }
 
         client.history.push(now);
-        client.last_seen = now;
-
-        if global_history.len() >= GLOBAL_REQUEST_HISTORY_MAX_SIZE {
-            global_history.pop_front();
-        }
         global_history.push_back(now);
         false
     }
@@ -182,18 +190,124 @@ mod tests {
     }
 
     #[test]
-    fn reset_consecutive_is_callable_and_limiter_recovers() {
-        let limiter = Nip46BunkerRateLimiter::new();
-        for _ in 0..MAX_REQUESTS_PER_WINDOW {
-            limiter.is_rate_limited("a".into(), 1000);
+    fn reset_consecutive_shortens_subsequent_backoff() {
+        // Escalate the same client to a high consecutive count in two limiters,
+        // reset one of them, then show the reset limiter recovers while the
+        // other is still serving a long (capped) backoff. The window fill is
+        // spread across ~29s so the per-client window drops below the limit
+        // before a full 60s backoff would expire, isolating backoff length from
+        // the window check. A no-op `reset_consecutive` would make both
+        // limiters behave identically and fail the final assertions.
+        fn escalate(limiter: &Nip46BunkerRateLimiter) {
+            for _ in 0..MAX_REQUESTS_PER_WINDOW {
+                limiter.is_rate_limited("a".into(), 1000);
+            }
+            // Trip the window repeatedly, each call landing exactly when the
+            // previous backoff expires (so it isn't swallowed by the backoff
+            // early-return) while the t=1000 window is still full. Backoff
+            // doubles 1->2->4->8->16->32s, all inside the 60s window, climbing
+            // `consecutive` to the exponent cap.
+            let mut t = 1000u64;
+            let mut applied = BACKOFF_BASE_MS;
+            for _ in 0..BACKOFF_MAX_EXPONENT {
+                assert!(limiter.is_rate_limited("a".into(), t));
+                t = t.saturating_add(applied);
+                applied = (applied * 2).min(BACKOFF_MAX_MS);
+            }
         }
-        assert!(limiter.is_rate_limited("a".into(), 1000));
-        limiter.reset_consecutive("a".into());
-        // Well past both the per-client window and the max backoff, the client
-        // is served again.
+
+        let with_reset = Nip46BunkerRateLimiter::new();
+        let without_reset = Nip46BunkerRateLimiter::new();
+        escalate(&with_reset);
+        escalate(&without_reset);
+        with_reset.reset_consecutive("a".into());
+
+        let t0 = 1000 + RATE_LIMIT_WINDOW_MS + BACKOFF_MAX_MS + 1;
+        let step = 1_000;
+        for limiter in [&with_reset, &without_reset] {
+            for i in 0..MAX_REQUESTS_PER_WINDOW as u64 {
+                limiter.is_rate_limited("a".into(), t0 + i * step);
+            }
+        }
+        let trip = t0 + (MAX_REQUESTS_PER_WINDOW as u64 - 1) * step;
+        assert!(with_reset.is_rate_limited("a".into(), trip));
+        assert!(without_reset.is_rate_limited("a".into(), trip));
+
+        // Probe where the per-client window has aged below the limit but a full
+        // 60s backoff is still active.
+        let probe = trip + 32_000;
         assert!(
-            !limiter.is_rate_limited("a".into(), 1000 + RATE_LIMIT_WINDOW_MS + BACKOFF_MAX_MS + 1)
+            !with_reset.is_rate_limited("a".into(), probe),
+            "reset client should recover on the short base backoff"
         );
+        assert!(
+            without_reset.is_rate_limited("a".into(), probe),
+            "un-reset client should still be in the long escalated backoff"
+        );
+    }
+
+    #[test]
+    fn eviction_is_bounded_and_drops_least_recently_seen() {
+        let limiter = Nip46BunkerRateLimiter::new();
+        // Register MAX_TRACKED_CLIENTS unique clients, advancing the clock each
+        // global window so the global cap does not block registrations, and
+        // giving each client a distinct, increasing last_seen.
+        let mut t = 0u64;
+        for i in 0..MAX_TRACKED_CLIENTS {
+            if i % GLOBAL_MAX_REQUESTS_PER_WINDOW == 0 {
+                t += GLOBAL_RATE_LIMIT_WINDOW_MS + 1;
+            }
+            t += 1;
+            assert!(!limiter.is_rate_limited(format!("c{i}"), t));
+        }
+        // Re-touch c0 so it is no longer the least-recently-seen entry.
+        let later = t + GLOBAL_RATE_LIMIT_WINDOW_MS + 1;
+        assert!(!limiter.is_rate_limited("c0".into(), later));
+        // A newcomer must evict exactly one entry (c1, the earliest last_seen),
+        // keeping the table bounded at the cap.
+        assert!(!limiter.is_rate_limited("newcomer".into(), later + 1));
+
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.clients.len(), MAX_TRACKED_CLIENTS);
+        assert!(state.clients.contains_key("c0"));
+        assert!(state.clients.contains_key("newcomer"));
+        assert!(!state.clients.contains_key("c1"));
+    }
+
+    #[test]
+    fn eviction_spares_backed_off_client_over_idle_lru() {
+        // White-box: reaching MAX_TRACKED_CLIENTS through the global cap takes
+        // far longer than any backoff lasts, so construct a full table directly
+        // with the overall least-recently-seen client (c0) currently in backoff.
+        let limiter = Nip46BunkerRateLimiter::new();
+        let now = 1_000_000u64;
+        {
+            let mut state = limiter.state.lock().unwrap();
+            for i in 0..MAX_TRACKED_CLIENTS {
+                let c = ClientState {
+                    last_seen: i as u64, // c0 is the oldest, c{N-1} the newest
+                    backoff_until: if i == 0 { now + 10_000 } else { 0 }, // c0 still backing off
+                    ..Default::default()
+                };
+                state.clients.insert(format!("c{i}"), c);
+            }
+        }
+        // A newcomer triggers eviction. Plain LRU would drop c0; the fix must
+        // spare the backed-off c0 and instead drop c1, the oldest client that
+        // is not currently in backoff.
+        assert!(!limiter.is_rate_limited("newcomer".into(), now));
+
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.clients.len(), MAX_TRACKED_CLIENTS);
+        assert!(
+            state.clients.contains_key("c0"),
+            "backed-off least-recently-seen client must be spared"
+        );
+        assert!(
+            !state.clients.contains_key("c1"),
+            "oldest non-backed-off client should be evicted instead"
+        );
+        assert!(state.clients.contains_key("newcomer"));
     }
 
     #[test]
