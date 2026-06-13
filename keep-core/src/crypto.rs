@@ -537,7 +537,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 /// key operations rather than from a single private key.
 pub mod nip44 {
     use chacha20::cipher::StreamCipher;
-    use chacha20::{KeyIvInit, XChaCha20};
+    use chacha20::{ChaCha20, KeyIvInit, XChaCha20};
     use hkdf::Hkdf;
     use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
@@ -692,6 +692,295 @@ pub mod nip44 {
         cipher.apply_keystream(&mut plaintext);
 
         unpad_plaintext(&plaintext)
+    }
+
+    // --- NIP-44 v3 (nostr-land/nip44v3 draft): kind/scope-aware ---
+    //
+    // Differs from v2: keys are derived per-message with the salt
+    // `"nip44-v3\0" || nonce`, ChaCha20 (IETF 96-bit zero nonce) replaces
+    // XChaCha20, and a decryptor-supplied (kind, scope) context is authenticated
+    // alongside the ciphertext so a payload cannot be replayed in a different
+    // context. Raw payload (pre-base64):
+    //   0x03 | nonce(32) | mac(32) | kind(u32be) | scope_len(u32be) | scope | ciphertext
+    const NIP44_V3_VERSION: u8 = 0x03;
+    const NIP44_V3_SALT_PREFIX: &[u8] = b"nip44-v3\x00";
+    // version + nonce(32) + mac(32) + kind(4) + scope_len(4) + min ciphertext(4)
+    const NIP44_V3_MIN_PAYLOAD: usize = 1 + 32 + 32 + 4 + 4 + 4;
+    const NIP44_V3_MIN_PADDING: u64 = 32;
+    const NIP44_V3_PAD_THRESHOLD: u64 = 32768;
+
+    fn v3_derive_keys(
+        shared_secret: &[u8; 32],
+        nonce: &[u8; 32],
+    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>)> {
+        let mut salt = Vec::with_capacity(NIP44_V3_SALT_PREFIX.len() + 32);
+        salt.extend_from_slice(NIP44_V3_SALT_PREFIX);
+        salt.extend_from_slice(nonce);
+        let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+        let mut enc = Zeroizing::new([0u8; 32]);
+        let mut mac = Zeroizing::new([0u8; 32]);
+        hk.expand(b"encryption_key", enc.as_mut())
+            .map_err(|_| CryptoError::kdf("NIP-44 v3 encryption key derivation failed"))?;
+        hk.expand(b"mac_key", mac.as_mut())
+            .map_err(|_| CryptoError::kdf("NIP-44 v3 mac key derivation failed"))?;
+        Ok((enc, mac))
+    }
+
+    // Matches the draft's padding schedule (used on the 4-byte-length-prefixed plaintext).
+    fn v3_target_size(len: u64) -> u64 {
+        if len == 0 {
+            return NIP44_V3_MIN_PADDING;
+        }
+        let next_power = if len == 1 {
+            1
+        } else {
+            1u64 << (u64::BITS - (len - 1).leading_zeros())
+        };
+        let subdivs: u64 = if next_power >= NIP44_V3_PAD_THRESHOLD {
+            8
+        } else {
+            4
+        };
+        let chunk = core::cmp::max(NIP44_V3_MIN_PADDING, next_power / subdivs);
+        chunk * len.div_ceil(chunk)
+    }
+
+    fn v3_pad(plaintext: &[u8]) -> Result<Vec<u8>> {
+        let prefixed = 4u64
+            .checked_add(plaintext.len() as u64)
+            .ok_or_else(|| CryptoError::encryption("NIP-44 v3 plaintext too large"))?;
+        let target = v3_target_size(prefixed);
+        if target > usize::MAX as u64 {
+            return Err(CryptoError::encryption("NIP-44 v3 padded length overflow").into());
+        }
+        let mut out = vec![0u8; target as usize];
+        out[0..4].copy_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        out[4..4 + plaintext.len()].copy_from_slice(plaintext);
+        Ok(out)
+    }
+
+    fn v3_unpad(padded: &[u8]) -> Result<Vec<u8>> {
+        if padded.len() < 4 {
+            return Err(CryptoError::decryption("NIP-44 v3 padded buffer too short").into());
+        }
+        let plen = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
+        if 4usize
+            .checked_add(plen)
+            .is_none_or(|end| end > padded.len())
+        {
+            return Err(CryptoError::decryption("NIP-44 v3 invalid padding length").into());
+        }
+        // The draft does not mandate a canonical padded length, so only require the
+        // trailing region to be all zeroes (checked without early exit on length).
+        let mut diff = 0u8;
+        for &b in &padded[4 + plen..] {
+            diff |= b;
+        }
+        if diff != 0 {
+            return Err(CryptoError::decryption("NIP-44 v3 non-zero padding").into());
+        }
+        Ok(padded[4..4 + plen].to_vec())
+    }
+
+    fn v3_mac(
+        mac_key: &[u8; 32],
+        nonce: &[u8; 32],
+        kind: u32,
+        scope: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Hmac<Sha256>> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key)
+            .map_err(|_| CryptoError::encryption("Failed to create NIP-44 v3 HMAC"))?;
+        mac.update(nonce);
+        mac.update(&kind.to_be_bytes());
+        mac.update(&(scope.len() as u32).to_be_bytes());
+        mac.update(scope);
+        mac.update(ciphertext);
+        Ok(mac)
+    }
+
+    /// Encrypt with NIP-44 v3 using a raw ECDH shared secret. `kind`/`scope` are
+    /// authenticated into the payload. Returns the raw payload (pre-base64).
+    pub fn encrypt_v3(
+        shared_secret: &[u8; 32],
+        plaintext: &[u8],
+        kind: u32,
+        scope: &str,
+    ) -> Result<Vec<u8>> {
+        let nonce: [u8; 32] = entropy::random_bytes();
+        encrypt_v3_with_nonce(shared_secret, plaintext, kind, scope, &nonce)
+    }
+
+    // Nonce-injectable core; production callers must use [encrypt_v3], which supplies
+    // a fresh random nonce.
+    fn encrypt_v3_with_nonce(
+        shared_secret: &[u8; 32],
+        plaintext: &[u8],
+        kind: u32,
+        scope: &str,
+        nonce: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let (enc_key, mac_key) = v3_derive_keys(shared_secret, nonce)?;
+        let mut buf = v3_pad(plaintext)?;
+        let zero_nonce = [0u8; 12];
+        let mut cipher = ChaCha20::new((&*enc_key).into(), (&zero_nonce).into());
+        cipher.apply_keystream(&mut buf);
+
+        let scope_bytes = scope.as_bytes();
+        let tag = v3_mac(&mac_key, nonce, kind, scope_bytes, &buf)?
+            .finalize()
+            .into_bytes();
+
+        let mut payload = Vec::with_capacity(1 + 32 + 32 + 4 + 4 + scope_bytes.len() + buf.len());
+        payload.push(NIP44_V3_VERSION);
+        payload.extend_from_slice(nonce);
+        payload.extend_from_slice(&tag);
+        payload.extend_from_slice(&kind.to_be_bytes());
+        payload.extend_from_slice(&(scope_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(scope_bytes);
+        payload.extend_from_slice(&buf);
+        Ok(payload)
+    }
+
+    /// Decrypt a NIP-44 v3 payload, verifying the (kind, scope) context binds to the
+    /// caller's expectations. Returns the plaintext.
+    pub fn decrypt_v3(
+        shared_secret: &[u8; 32],
+        payload: &[u8],
+        expected_kind: u32,
+        expected_scope: &str,
+    ) -> Result<Vec<u8>> {
+        if payload.len() < NIP44_V3_MIN_PAYLOAD {
+            return Err(CryptoError::decryption("NIP-44 v3 payload too short").into());
+        }
+        if payload[0] != NIP44_V3_VERSION {
+            return Err(CryptoError::decryption("Unsupported NIP-44 version").into());
+        }
+        let nonce: [u8; 32] = payload[1..33]
+            .try_into()
+            .map_err(|_| CryptoError::decryption("NIP-44 v3 bad nonce"))?;
+        let provided_mac = &payload[33..65];
+        let kind = u32::from_be_bytes([payload[65], payload[66], payload[67], payload[68]]);
+        let scope_len =
+            u32::from_be_bytes([payload[69], payload[70], payload[71], payload[72]]) as usize;
+        let scope_off = 73usize;
+        let scope_end = scope_off
+            .checked_add(scope_len)
+            .filter(|&end| end <= payload.len())
+            .ok_or_else(|| CryptoError::decryption("NIP-44 v3 scope length out of bounds"))?;
+        let scope = &payload[scope_off..scope_end];
+        let ciphertext = &payload[scope_end..];
+        if ciphertext.len() < 4 {
+            return Err(CryptoError::decryption("NIP-44 v3 ciphertext too short").into());
+        }
+        // Context binding: reject a payload encrypted for a different kind/scope.
+        if kind != expected_kind || scope != expected_scope.as_bytes() {
+            return Err(CryptoError::decryption("NIP-44 v3 context mismatch").into());
+        }
+
+        let (enc_key, mac_key) = v3_derive_keys(shared_secret, &nonce)?;
+        v3_mac(&mac_key, &nonce, kind, scope, ciphertext)?
+            .verify_slice(provided_mac)
+            .map_err(|_| CryptoError::decryption("NIP-44 v3 invalid MAC"))?;
+
+        let mut buf = ciphertext.to_vec();
+        let zero_nonce = [0u8; 12];
+        let mut cipher = ChaCha20::new((&*enc_key).into(), (&zero_nonce).into());
+        cipher.apply_keystream(&mut buf);
+        v3_unpad(&buf)
+    }
+
+    #[cfg(test)]
+    mod v3_tests {
+        use super::*;
+        use base64::Engine;
+
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        fn unhex32(s: &str) -> [u8; 32] {
+            unhex(s).try_into().unwrap()
+        }
+        fn hex_lower(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        #[test]
+        fn v3_target_size_matches_draft_table() {
+            let table: [(u64, u64); 12] = [
+                (0, 32),
+                (1, 32),
+                (32, 32),
+                (33, 64),
+                (34, 64),
+                (64, 64),
+                (65, 96),
+                (66, 96),
+                (96, 96),
+                (97, 128),
+                (98, 128),
+                (128, 128),
+            ];
+            for (len, expected) in table {
+                assert_eq!(v3_target_size(len), expected, "target_size({len})");
+            }
+        }
+
+        // nostr-land/nip44v3 draft vector (encrypt_decrypt[0]); shared_secret is the
+        // x-only ECDH of the vector's key pair, verified against its published prk.
+        #[test]
+        fn v3_known_answer_vector() {
+            let ss = unhex32("dff79f877ba3953557c8502bf6da24c6f378419d138786e5ddd53034e84077d6");
+            let nonce = unhex32("b5451a6d90ec575b4cdcedf4987429eeab1bbaa192ea3db89eafa058826885a6");
+            let pt = unhex("efbbbf48656c6c6f20776f726c6421");
+            let (enc, mac) = v3_derive_keys(&ss, &nonce).unwrap();
+            assert_eq!(
+                hex_lower(&*enc),
+                "de94e4663af538351a9b75b8af31e968ed8b88241ddbce43ad1d4ae2b984327d"
+            );
+            assert_eq!(
+                hex_lower(&*mac),
+                "70e65d5ff8769e92fbdf163b00b1b317bd4d30fe82de6b00d05cd74fb576febd"
+            );
+            let payload = encrypt_v3_with_nonce(&ss, &pt, 1, "", &nonce).unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD.encode(&payload),
+                "A7VFGm2Q7FdbTNzt9Jh0Ke6rG7qhkuo9uJ6voFiCaIWmMJrEDBNRRCorotVxmP7ge14Y+UtDn1/Pn3uzAaNNzHUAAAABAAAAAPJgoFXpn6mjFE0hUZrnZljeaYwSdqBKbVDXcyLgVGC8"
+            );
+            assert_eq!(decrypt_v3(&ss, &payload, 1, "").unwrap(), pt);
+        }
+
+        #[test]
+        fn v3_round_trips_with_kind_and_scope() {
+            let ss = [7u8; 32];
+            let cases: [(u32, &str, &[u8]); 3] = [
+                (1, "", b"hi"),
+                (4, "dm", b"secret message"),
+                (22242, "wss://relay.example.com", b""),
+            ];
+            for (kind, scope, msg) in cases {
+                let payload = encrypt_v3(&ss, msg, kind, scope).unwrap();
+                assert_eq!(decrypt_v3(&ss, &payload, kind, scope).unwrap(), msg);
+            }
+        }
+
+        #[test]
+        fn v3_rejects_context_mismatch_and_tamper() {
+            let ss = [9u8; 32];
+            let payload = encrypt_v3(&ss, b"hello", 4, "dm").unwrap();
+            // Wrong kind or scope must fail (context binding).
+            assert!(decrypt_v3(&ss, &payload, 5, "dm").is_err());
+            assert!(decrypt_v3(&ss, &payload, 4, "other").is_err());
+            // Tampered ciphertext fails the MAC.
+            let mut bad = payload.clone();
+            *bad.last_mut().unwrap() ^= 0x01;
+            assert!(decrypt_v3(&ss, &bad, 4, "dm").is_err());
+            // Wrong key fails.
+            assert!(decrypt_v3(&[8u8; 32], &payload, 4, "dm").is_err());
+        }
     }
 }
 
