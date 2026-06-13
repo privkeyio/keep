@@ -8,6 +8,7 @@ mod dkg;
 mod error;
 mod network;
 mod nip46;
+mod nip46_ratelimit;
 mod nip55;
 mod nip55_audit;
 mod nip55_caller;
