@@ -731,11 +731,7 @@ pub mod nip44 {
         if len == 0 {
             return NIP44_V3_MIN_PADDING;
         }
-        let next_power = if len == 1 {
-            1
-        } else {
-            1u64 << (u64::BITS - (len - 1).leading_zeros())
-        };
+        let next_power = 1u64 << (u64::BITS - (len - 1).leading_zeros());
         let subdivs: u64 = if next_power >= NIP44_V3_PAD_THRESHOLD {
             8
         } else {
@@ -746,6 +742,9 @@ pub mod nip44 {
     }
 
     fn v3_pad(plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.len() > MAX_PLAINTEXT_SIZE {
+            return Err(CryptoError::encryption("NIP-44 v3 plaintext too large").into());
+        }
         let prefixed = 4u64
             .checked_add(plaintext.len() as u64)
             .ok_or_else(|| CryptoError::encryption("NIP-44 v3 plaintext too large"))?;
@@ -764,9 +763,10 @@ pub mod nip44 {
             return Err(CryptoError::decryption("NIP-44 v3 padded buffer too short").into());
         }
         let plen = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
-        if 4usize
-            .checked_add(plen)
-            .is_none_or(|end| end > padded.len())
+        if plen > MAX_PLAINTEXT_SIZE
+            || 4usize
+                .checked_add(plen)
+                .is_none_or(|end| end > padded.len())
         {
             return Err(CryptoError::decryption("NIP-44 v3 invalid padding length").into());
         }
@@ -782,21 +782,18 @@ pub mod nip44 {
         Ok(padded[4..4 + plen].to_vec())
     }
 
-    fn v3_mac(
-        mac_key: &[u8; 32],
+    fn v3_mac_update(
+        mac: &mut Hmac<Sha256>,
         nonce: &[u8; 32],
         kind: u32,
         scope: &[u8],
         ciphertext: &[u8],
-    ) -> Result<Hmac<Sha256>> {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key)
-            .map_err(|_| CryptoError::encryption("Failed to create NIP-44 v3 HMAC"))?;
+    ) {
         mac.update(nonce);
         mac.update(&kind.to_be_bytes());
         mac.update(&(scope.len() as u32).to_be_bytes());
         mac.update(scope);
         mac.update(ciphertext);
-        Ok(mac)
     }
 
     /// Encrypt with NIP-44 v3 using a raw ECDH shared secret. `kind`/`scope` are
@@ -827,9 +824,10 @@ pub mod nip44 {
         cipher.apply_keystream(&mut buf);
 
         let scope_bytes = scope.as_bytes();
-        let tag = v3_mac(&mac_key, nonce, kind, scope_bytes, &buf)?
-            .finalize()
-            .into_bytes();
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&*mac_key)
+            .map_err(|_| CryptoError::encryption("Failed to create NIP-44 v3 HMAC"))?;
+        v3_mac_update(&mut mac, nonce, kind, scope_bytes, &buf);
+        let tag = mac.finalize().into_bytes();
 
         let mut payload = Vec::with_capacity(1 + 32 + 32 + 4 + 4 + scope_bytes.len() + buf.len());
         payload.push(NIP44_V3_VERSION);
@@ -870,17 +868,16 @@ pub mod nip44 {
             .ok_or_else(|| CryptoError::decryption("NIP-44 v3 scope length out of bounds"))?;
         let scope = &payload[scope_off..scope_end];
         let ciphertext = &payload[scope_end..];
-        if ciphertext.len() < 4 {
-            return Err(CryptoError::decryption("NIP-44 v3 ciphertext too short").into());
-        }
         // Context binding: reject a payload encrypted for a different kind/scope.
         if kind != expected_kind || scope != expected_scope.as_bytes() {
             return Err(CryptoError::decryption("NIP-44 v3 context mismatch").into());
         }
 
         let (enc_key, mac_key) = v3_derive_keys(shared_secret, &nonce)?;
-        v3_mac(&mac_key, &nonce, kind, scope, ciphertext)?
-            .verify_slice(provided_mac)
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&*mac_key)
+            .map_err(|_| CryptoError::decryption("Failed to create NIP-44 v3 HMAC"))?;
+        v3_mac_update(&mut mac, &nonce, kind, scope, ciphertext);
+        mac.verify_slice(provided_mac)
             .map_err(|_| CryptoError::decryption("NIP-44 v3 invalid MAC"))?;
 
         let mut buf = ciphertext.to_vec();
@@ -980,6 +977,44 @@ pub mod nip44 {
             assert!(decrypt_v3(&ss, &bad, 4, "dm").is_err());
             // Wrong key fails.
             assert!(decrypt_v3(&[8u8; 32], &payload, 4, "dm").is_err());
+        }
+
+        #[test]
+        fn v3_rejects_wrong_version() {
+            let ss = [3u8; 32];
+            let mut payload = encrypt_v3(&ss, b"hi", 1, "").unwrap();
+            payload[0] = 0x02;
+            assert!(decrypt_v3(&ss, &payload, 1, "").is_err());
+        }
+
+        #[test]
+        fn v3_rejects_short_payload() {
+            let ss = [3u8; 32];
+            let payload = vec![NIP44_V3_VERSION; NIP44_V3_MIN_PAYLOAD - 1];
+            assert!(decrypt_v3(&ss, &payload, 1, "").is_err());
+        }
+
+        #[test]
+        fn v3_rejects_scope_len_out_of_bounds() {
+            let ss = [3u8; 32];
+            let mut payload = encrypt_v3(&ss, b"hi", 1, "dm").unwrap();
+            // scope_len occupies bytes 69..73.
+            payload[69..73].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+            assert!(decrypt_v3(&ss, &payload, 1, "dm").is_err());
+        }
+
+        #[test]
+        fn v3_unpad_rejects_nonzero_trailing_and_accepts_zero() {
+            // Declared length 2 with all-zero trailing region decodes cleanly.
+            let mut good = vec![0u8; 8];
+            good[0..4].copy_from_slice(&2u32.to_be_bytes());
+            good[4] = 0xaa;
+            good[5] = 0xbb;
+            assert_eq!(v3_unpad(&good).unwrap(), vec![0xaa, 0xbb]);
+            // A non-zero byte in the trailing region is rejected.
+            let mut bad = good.clone();
+            bad[6] = 0x01;
+            assert!(v3_unpad(&bad).is_err());
         }
     }
 }
