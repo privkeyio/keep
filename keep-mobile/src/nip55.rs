@@ -95,6 +95,34 @@ impl Nip55Response {
     }
 }
 
+// A failed/rejected request carries null signature/result and rejected=true; a
+// success sets both signature and result to the operation output. Matches the
+// `Result` object shape that NIP-55 signer clients parse from the results array.
+fn serialize_batch_results_json(responses: &[Nip55Response]) -> String {
+    let results: Vec<serde_json::Value> = responses
+        .iter()
+        .map(|r| {
+            if r.error.is_some() {
+                serde_json::json!({
+                    "id": r.id,
+                    "package": serde_json::Value::Null,
+                    "signature": serde_json::Value::Null,
+                    "result": serde_json::Value::Null,
+                    "rejected": true,
+                })
+            } else {
+                serde_json::json!({
+                    "id": r.id,
+                    "package": serde_json::Value::Null,
+                    "signature": r.result,
+                    "result": r.result,
+                })
+            }
+        })
+        .collect();
+    serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
+}
+
 #[derive(Default)]
 struct RateLimitState {
     requests: Vec<Instant>,
@@ -278,24 +306,10 @@ impl Nip55Handler {
         Ok(intent)
     }
 
+    // Serializes batch results to the NIP-55 `results` extra wire format used by
+    // signer clients: a JSON array of {id, package, signature, result, rejected?}.
     pub fn serialize_batch_results(&self, responses: Vec<Nip55Response>) -> String {
-        let results: Vec<serde_json::Value> = responses
-            .iter()
-            .map(|r| {
-                let mut obj = serde_json::json!({ "result": r.result });
-                if let Some(ref event) = r.event {
-                    obj["event"] = event.clone().into();
-                }
-                if let Some(ref error) = r.error {
-                    obj["error"] = error.clone().into();
-                }
-                if let Some(ref id) = r.id {
-                    obj["id"] = id.clone().into();
-                }
-                obj
-            })
-            .collect();
-        serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
+        serialize_batch_results_json(&responses)
     }
 }
 
@@ -827,4 +841,92 @@ pub(crate) fn compute_nostr_event_id(
 
     let hash = Sha256::digest(json_str.as_bytes());
     Ok(hash.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_results_success_carries_signature_and_result() {
+        let responses = vec![Nip55Response {
+            result: "sig123".into(),
+            event: None,
+            error: None,
+            id: Some("a".into()),
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["id"], "a");
+        assert!(obj["package"].is_null());
+        assert_eq!(obj["signature"], "sig123");
+        assert_eq!(obj["result"], "sig123");
+        assert!(obj.get("rejected").is_none());
+    }
+
+    #[test]
+    fn batch_results_error_is_rejected_with_null_values() {
+        let responses = vec![Nip55Response {
+            result: String::new(),
+            event: None,
+            error: Some("request failed".into()),
+            id: Some("b".into()),
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["id"], "b");
+        assert!(obj["signature"].is_null());
+        assert!(obj["result"].is_null());
+        assert_eq!(obj["rejected"], true);
+    }
+
+    #[test]
+    fn batch_results_preserves_order_and_mixes_outcomes() {
+        let responses = vec![
+            Nip55Response {
+                result: "ok".into(),
+                event: None,
+                error: None,
+                id: Some("1".into()),
+            },
+            Nip55Response {
+                result: String::new(),
+                event: None,
+                error: Some("boom".into()),
+                id: Some("2".into()),
+            },
+        ];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(json[0]["result"], "ok");
+        assert_eq!(json[1]["id"], "2");
+        assert_eq!(json[1]["rejected"], true);
+    }
+
+    #[test]
+    fn batch_results_empty_is_empty_array() {
+        assert_eq!(serialize_batch_results_json(&[]), "[]");
+    }
+
+    // Amber's batch wire format puts the signature in BOTH `signature` and
+    // `result` and never emits the assembled event; the per-request `event`
+    // payload is only for the single-result intent path.
+    #[test]
+    fn batch_results_sign_event_uses_signature_not_event() {
+        let responses = vec![Nip55Response {
+            result: "sighex".into(),
+            event: Some("{\"id\":\"deadbeef\",\"sig\":\"sighex\"}".into()),
+            error: None,
+            id: Some("c".into()),
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["signature"], "sighex");
+        assert_eq!(obj["result"], "sighex");
+        assert!(obj.get("event").is_none());
+    }
 }
