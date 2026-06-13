@@ -75,6 +75,55 @@ pub struct Nip55Response {
     pub id: Option<String>,
 }
 
+// A single method (+ optional sign_event kind) a client requests to pre-authorize
+// via the NIP-55 `permissions` array passed with get_public_key.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct Nip55DeclaredPermission {
+    pub request_type: Nip55RequestType,
+    pub kind: Option<i32>,
+}
+
+// Parses the NIP-55 `permissions` array (`[{"type":"sign_event","kind":22242},
+// {"type":"nip44_decrypt"}]`) into the methods/kinds a client wants pre-authorized.
+// Unknown method types are dropped; `kind` is honored only for sign_event, and a
+// kind-less sign_event entry is dropped (a sign grant must name a kind). Malformed
+// input parses to an empty list (fail-closed: nothing pre-authorized).
+#[uniffi::export]
+pub fn nip55_parse_permissions(json: Option<String>) -> Vec<Nip55DeclaredPermission> {
+    let Some(json) = json else {
+        return Vec::new();
+    };
+    let entries: Vec<serde_json::Value> = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in &entries {
+        let Some(type_str) = entry.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Ok(request_type) = parse_request_type(type_str) else {
+            continue;
+        };
+        let kind = if request_type == Nip55RequestType::SignEvent {
+            match entry
+                .get("kind")
+                .and_then(|k| k.as_i64())
+                .and_then(|k| i32::try_from(k).ok())
+                .filter(|k| (0..=65535).contains(k))
+            {
+                Some(k) => Some(k),
+                // A sign_event permission with no (valid) kind cannot be granted.
+                None => continue,
+            }
+        } else {
+            None
+        };
+        out.push(Nip55DeclaredPermission { request_type, kind });
+    }
+    out
+}
+
 impl Nip55Response {
     fn ok(result: String) -> Self {
         Self {
@@ -880,6 +929,50 @@ mod tests {
         assert!(obj["signature"].is_null());
         assert!(obj["result"].is_null());
         assert_eq!(obj["rejected"], true);
+    }
+
+    #[test]
+    fn parse_permissions_spec_example() {
+        let json = r#"[{"type":"sign_event","kind":22242},{"type":"nip44_decrypt"}]"#;
+        let perms = nip55_parse_permissions(Some(json.into()));
+        assert_eq!(
+            perms,
+            vec![
+                Nip55DeclaredPermission {
+                    request_type: Nip55RequestType::SignEvent,
+                    kind: Some(22242),
+                },
+                Nip55DeclaredPermission {
+                    request_type: Nip55RequestType::Nip44Decrypt,
+                    kind: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_drops_kindless_sign_event_and_unknown_types() {
+        let json = r#"[{"type":"sign_event"},{"type":"bogus"},{"type":"nip04_encrypt","kind":4}]"#;
+        let perms = nip55_parse_permissions(Some(json.into()));
+        // kindless sign_event dropped, unknown dropped, non-sign kind ignored.
+        assert_eq!(
+            perms,
+            vec![Nip55DeclaredPermission {
+                request_type: Nip55RequestType::Nip04Encrypt,
+                kind: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_fail_closed_on_garbage_or_none() {
+        assert!(nip55_parse_permissions(None).is_empty());
+        assert!(nip55_parse_permissions(Some("not json".into())).is_empty());
+        assert!(nip55_parse_permissions(Some("{}".into())).is_empty());
+        assert!(
+            nip55_parse_permissions(Some(r#"[{"type":"sign_event","kind":99999}]"#.into()))
+                .is_empty()
+        );
     }
 
     #[test]
