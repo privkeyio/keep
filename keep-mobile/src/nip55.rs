@@ -203,9 +203,8 @@ pub fn nip55_extract_relay_host(event_json: String) -> Option<String> {
     let tags = event.get("tags")?.as_array()?;
     let mut relay_url: Option<&str> = None;
     for tag in tags {
-        let arr = match tag.as_array() {
-            Some(a) => a,
-            None => continue,
+        let Some(arr) = tag.as_array() else {
+            continue;
         };
         if arr.first().and_then(|v| v.as_str()) == Some("relay") {
             if relay_url.is_some() {
@@ -230,7 +229,7 @@ pub fn nip55_relay_auth_gate(
         return Nip55RelayAuthGate::Defer;
     }
     match relay_host {
-        Some(host) if whitelist.iter().any(|w| w == &host) => Nip55RelayAuthGate::AutoAccept,
+        Some(host) if whitelist.contains(&host) => Nip55RelayAuthGate::AutoAccept,
         _ => Nip55RelayAuthGate::AutoReject,
     }
 }
