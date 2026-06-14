@@ -76,6 +76,7 @@ pub struct Nip55Response {
     pub event: Option<String>,
     pub error: Option<String>,
     pub id: Option<String>,
+    pub rejected: bool,
 }
 
 // A single method (+ optional sign_event kind) a client requests to pre-authorize
@@ -241,6 +242,7 @@ impl Nip55Response {
             event: None,
             error: None,
             id: None,
+            rejected: false,
         }
     }
 
@@ -250,6 +252,7 @@ impl Nip55Response {
             event: Some(event),
             error: None,
             id: None,
+            rejected: false,
         }
     }
 }
@@ -261,7 +264,7 @@ fn serialize_batch_results_json(responses: &[Nip55Response]) -> String {
     let results: Vec<serde_json::Value> = responses
         .iter()
         .map(|r| {
-            if r.error.is_some() {
+            if r.rejected || r.error.is_some() {
                 serde_json::json!({
                     "id": r.id,
                     "package": serde_json::Value::Null,
@@ -417,6 +420,7 @@ impl Nip55Handler {
                 event: None,
                 error: Some("batch size exceeded".into()),
                 id: None,
+                rejected: false,
             }];
         }
 
@@ -430,6 +434,7 @@ impl Nip55Handler {
                         event: None,
                         error: Some("request failed".into()),
                         id: req_id,
+                        rejected: false,
                     })
             })
             .collect()
@@ -1013,6 +1018,7 @@ mod tests {
             event: None,
             error: None,
             id: Some("a".into()),
+            rejected: false,
         }];
         let json: serde_json::Value =
             serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
@@ -1031,6 +1037,7 @@ mod tests {
             event: None,
             error: Some("request failed".into()),
             id: Some("b".into()),
+            rejected: false,
         }];
         let json: serde_json::Value =
             serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
@@ -1282,12 +1289,14 @@ mod tests {
                 event: None,
                 error: None,
                 id: Some("1".into()),
+                rejected: false,
             },
             Nip55Response {
                 result: String::new(),
                 event: None,
                 error: Some("boom".into()),
                 id: Some("2".into()),
+                rejected: false,
             },
         ];
         let json: serde_json::Value =
@@ -1296,6 +1305,24 @@ mod tests {
         assert_eq!(json[0]["result"], "ok");
         assert_eq!(json[1]["id"], "2");
         assert_eq!(json[1]["rejected"], true);
+    }
+
+    #[test]
+    fn batch_results_rejected_flag_emits_rejected_without_error() {
+        let responses = vec![Nip55Response {
+            result: String::new(),
+            event: None,
+            error: None,
+            id: Some("r".into()),
+            rejected: true,
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["id"], "r");
+        assert!(obj["signature"].is_null());
+        assert!(obj["result"].is_null());
+        assert_eq!(obj["rejected"], true);
     }
 
     #[test]
@@ -1313,6 +1340,7 @@ mod tests {
             event: Some("{\"id\":\"deadbeef\",\"sig\":\"sighex\"}".into()),
             error: None,
             id: Some("c".into()),
+            rejected: false,
         }];
         let json: serde_json::Value =
             serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
