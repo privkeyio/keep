@@ -1326,6 +1326,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_results_rejected_nulls_populated_result() {
+        let responses = vec![Nip55Response {
+            result: "should-be-ignored".into(),
+            event: None,
+            error: None,
+            id: Some("r".into()),
+            rejected: true,
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize_batch_results_json(&responses)).unwrap();
+        let obj = &json[0];
+        assert_eq!(obj["id"], "r");
+        assert!(obj["result"].is_null());
+        assert!(obj["signature"].is_null());
+        assert_eq!(obj["rejected"], true);
+    }
+
+    #[test]
     fn batch_results_empty_is_empty_array() {
         assert_eq!(serialize_batch_results_json(&[]), "[]");
     }
