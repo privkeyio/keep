@@ -439,6 +439,7 @@ dictionary Nip55Response {
     string? event;
     string? error;
     string? id;
+    boolean rejected;
 };
 
 interface Nip55Handler {
