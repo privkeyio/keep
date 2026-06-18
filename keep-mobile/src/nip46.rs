@@ -433,36 +433,25 @@ impl BunkerHandler {
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
-            let share_info = self
-                .mobile
-                .get_share_info()
-                .ok_or(KeepMobileError::NotInitialized)?;
-
-            let group_pubkey_bytes: [u8; 32] = hex::decode(&share_info.group_pubkey)
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "Invalid group pubkey hex".into(),
-                })?
-                .try_into()
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "Invalid group pubkey length".into(),
-                })?;
-
             // An imported nsec is a 1-of-1 FROST share; its single locally-held
             // share satisfies the threshold, so the bunker can sign locally
             // instead of dispatching a networked FROST session that no peer will
             // ever answer (which otherwise times out). Multi-share groups still
             // need the network to gather co-signers.
             //
-            // The gate and the signer must agree on a single source of truth.
-            // Both the threshold check and the share secret come from the node's
-            // already-decrypted, authenticated in-memory copy (loaded at init
-            // while biometric auth was available); reading the gate from
-            // plaintext storage metadata instead could disagree with the share
-            // FrostSigner is built from and fail the bunker outright rather than
-            // fall back to the network path. Re-decrypting from storage here
-            // would also fail: the bunker auto-starts in a background service
-            // with no staged biometric cipher, so the storage callback throws
-            // StorageException.
+            // The gate, the group pubkey, and the signer share all come from the
+            // node's in-memory, decrypted-at-init copy (loaded while biometric
+            // auth was available). Deriving the group pubkey from plaintext
+            // storage metadata instead could disagree with the share FrostSigner
+            // is built from and fail the bunker outright rather than fall back to
+            // the network path. Note the in-memory metadata is not itself
+            // cryptographically authenticated (ShareMetadata is stored plaintext
+            // beside the AEAD ciphertext; only the key_package is integrity-
+            // protected), but using it consistently keeps the gate and signer in
+            // agreement. Re-decrypting from storage here would also fail: the
+            // bunker auto-starts in a background service with no staged biometric
+            // cipher, so the storage callback throws StorageException.
+            let group_pubkey_bytes: [u8; 32] = node.share_package().metadata.group_pubkey;
             let local_complete = {
                 let meta = &node.share_package().metadata;
                 meta.threshold == 1 && meta.total_shares == 1
