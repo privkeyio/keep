@@ -7,8 +7,8 @@ use keep_nip46::types::{
     ApprovalRequest, ApprovalResult, LogEvent, RememberDuration, ServerCallbacks,
 };
 use keep_nip46::{
-    NetworkFrostSigner, Permission, PreGrantedApp, RateLimitConfig, Server, ServerConfig,
-    SignerHandler,
+    FrostSigner, NetworkFrostSigner, Permission, PreGrantedApp, RateLimitConfig, Server,
+    ServerConfig, SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -433,22 +433,29 @@ impl BunkerHandler {
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
-            let share_info = self
-                .mobile
-                .get_share_info()
-                .ok_or(KeepMobileError::NotInitialized)?;
-
-            let group_pubkey_bytes: [u8; 32] = hex::decode(&share_info.group_pubkey)
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "Invalid group pubkey hex".into(),
-                })?
-                .try_into()
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "Invalid group pubkey length".into(),
-                })?;
-
-            let network_signer =
-                NetworkFrostSigner::with_shared_node(group_pubkey_bytes, Arc::clone(node));
+            // An imported nsec is a 1-of-1 FROST share; its single locally-held
+            // share satisfies the threshold, so the bunker can sign locally
+            // instead of dispatching a networked FROST session that no peer will
+            // ever answer (which otherwise times out). Multi-share groups still
+            // need the network to gather co-signers.
+            //
+            // The gate, the group pubkey, and the signer share all come from the
+            // node's in-memory, decrypted-at-init copy (loaded while biometric
+            // auth was available). Deriving the group pubkey from plaintext
+            // storage metadata instead could disagree with the share FrostSigner
+            // is built from and fail the bunker outright rather than fall back to
+            // the network path. Note the in-memory metadata is not itself
+            // cryptographically authenticated (ShareMetadata is stored plaintext
+            // beside the AEAD ciphertext; only the key_package is integrity-
+            // protected), but using it consistently keeps the gate and signer in
+            // agreement. Re-decrypting from storage here would also fail: the
+            // bunker auto-starts in a background service with no staged biometric
+            // cipher, so the storage callback throws StorageException.
+            let group_pubkey_bytes: [u8; 32] = node.share_package().metadata.group_pubkey;
+            let local_complete = {
+                let meta = &node.share_package().metadata;
+                meta.threshold == 1 && meta.total_shares == 1
+            };
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
 
@@ -487,19 +494,49 @@ impl BunkerHandler {
                 ..ServerConfig::default()
             };
 
-            let server = Server::new_network_frost_with_proxy(
-                network_signer,
-                *transport_secret,
-                &relays,
-                Some(Arc::new(CallbackBridge {
-                    callbacks,
-                    mobile: Arc::clone(&self.mobile),
-                }) as Arc<dyn ServerCallbacks>),
-                config,
-                proxy,
-            )
-            .await
-            .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+            let server_callbacks = Some(Arc::new(CallbackBridge {
+                callbacks,
+                mobile: Arc::clone(&self.mobile),
+            }) as Arc<dyn ServerCallbacks>);
+
+            let server = if local_complete {
+                // Wrap the node's in-memory share in a FrostSigner for local
+                // signing. The share is re-encrypted under an ephemeral data key
+                // purely to satisfy the FrostSigner API; it never leaves the
+                // process.
+                let active_share = node.share_package();
+                let data_key = keep_core::crypto::SecretKey::generate()
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+                let stored = keep_core::frost::StoredShare::encrypt(active_share, &data_key)
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+                let frost_signer = FrostSigner::new(group_pubkey_bytes, vec![stored], data_key)
+                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+
+                Server::new_frost_with_proxy(
+                    frost_signer,
+                    *transport_secret,
+                    &relays,
+                    server_callbacks,
+                    config,
+                    proxy,
+                )
+                .await
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+            } else {
+                let network_signer =
+                    NetworkFrostSigner::with_shared_node(group_pubkey_bytes, Arc::clone(node));
+
+                Server::new_network_frost_with_proxy(
+                    network_signer,
+                    *transport_secret,
+                    &relays,
+                    server_callbacks,
+                    config,
+                    proxy,
+                )
+                .await
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?
+            };
 
             *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
             *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.handler());

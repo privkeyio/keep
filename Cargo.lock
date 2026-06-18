@@ -4587,6 +4587,7 @@ version = "0.4.9"
 dependencies = [
  "bitflags 2.13.0",
  "chrono",
+ "frost-secp256k1-tr",
  "hex",
  "keep-core",
  "keep-frost-net",

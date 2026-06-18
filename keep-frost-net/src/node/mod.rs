@@ -1002,6 +1002,14 @@ impl KfpNode {
         self.share.metadata.identifier
     }
 
+    /// The node's already-decrypted share material, held in memory since init.
+    /// Lets callers build a local signer without re-reading and re-decrypting
+    /// from storage (which, on mobile, requires a biometric-gated key that is
+    /// unavailable in a background service context).
+    pub fn share_package(&self) -> &SharePackage {
+        &self.share
+    }
+
     /// Test-only: inject a fully-formed descriptor session directly into the
     /// node's session manager. Used by integration tests that need a
     /// `Complete` migration session as a precondition for sweep coordination,
