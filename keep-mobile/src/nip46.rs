@@ -453,14 +453,20 @@ impl BunkerHandler {
             // ever answer (which otherwise times out). Multi-share groups still
             // need the network to gather co-signers.
             //
-            // The threshold is read from plaintext metadata; the share secret is
-            // taken from the node's already-decrypted in-memory copy (loaded at
-            // init while biometric auth was available). Re-decrypting from
-            // storage here would fail: the bunker auto-starts in a background
-            // service with no staged biometric cipher, so the storage callback
-            // throws StorageException.
-            let local_complete =
-                share_info.threshold == 1 && share_info.total_shares == 1;
+            // The gate and the signer must agree on a single source of truth.
+            // Both the threshold check and the share secret come from the node's
+            // already-decrypted, authenticated in-memory copy (loaded at init
+            // while biometric auth was available); reading the gate from
+            // plaintext storage metadata instead could disagree with the share
+            // FrostSigner is built from and fail the bunker outright rather than
+            // fall back to the network path. Re-decrypting from storage here
+            // would also fail: the bunker auto-starts in a background service
+            // with no staged biometric cipher, so the storage callback throws
+            // StorageException.
+            let local_complete = {
+                let meta = &node.share_package().metadata;
+                meta.threshold == 1 && meta.total_shares == 1
+            };
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
 
@@ -526,7 +532,7 @@ impl BunkerHandler {
                     proxy,
                 )
                 .await
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
             } else {
                 let network_signer =
                     NetworkFrostSigner::with_shared_node(group_pubkey_bytes, Arc::clone(node));
