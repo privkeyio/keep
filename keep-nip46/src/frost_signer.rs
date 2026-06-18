@@ -103,6 +103,7 @@ impl NetworkFrostSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keep_core::crypto::SecretKey;
     use keep_core::frost::{ShareMetadata, SharePackage};
     use nostr_sdk::prelude::*;
 
