@@ -392,6 +392,27 @@ impl Server {
         .await
     }
 
+    pub async fn new_frost_with_proxy(
+        frost_signer: FrostSigner,
+        transport_secret: [u8; 32],
+        relay_urls: &[String],
+        callbacks: Option<Arc<dyn ServerCallbacks>>,
+        config: ServerConfig,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        Self::new_with_config_and_proxy(
+            keyring,
+            Some(frost_signer),
+            Some(transport_secret),
+            relay_urls,
+            callbacks,
+            config,
+            proxy,
+        )
+        .await
+    }
+
     pub async fn new_network_frost(
         network_signer: NetworkFrostSigner,
         transport_secret: [u8; 32],

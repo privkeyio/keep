@@ -3284,7 +3284,7 @@ impl KeepMobile {
         }
     }
 
-    fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
+    pub(crate) fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
         let key = match self.storage.get_active_share_key() {
             Some(k) => k,
             None => self.resolve_active_share()?,
