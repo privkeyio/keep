@@ -452,9 +452,15 @@ impl BunkerHandler {
             // instead of dispatching a networked FROST session that no peer will
             // ever answer (which otherwise times out). Multi-share groups still
             // need the network to gather co-signers.
-            let active_share = self.mobile.load_share_package()?;
-            let local_complete = active_share.metadata.threshold == 1
-                && active_share.metadata.total_shares == 1;
+            //
+            // The threshold is read from plaintext metadata; the share secret is
+            // taken from the node's already-decrypted in-memory copy (loaded at
+            // init while biometric auth was available). Re-decrypting from
+            // storage here would fail: the bunker auto-starts in a background
+            // service with no staged biometric cipher, so the storage callback
+            // throws StorageException.
+            let local_complete =
+                share_info.threshold == 1 && share_info.total_shares == 1;
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
 
@@ -499,12 +505,14 @@ impl BunkerHandler {
             }) as Arc<dyn ServerCallbacks>);
 
             let server = if local_complete {
-                // Wrap the active share in a FrostSigner for local signing. The
-                // share is re-encrypted under an ephemeral data key purely to
-                // satisfy the FrostSigner API; it never leaves the process.
+                // Wrap the node's in-memory share in a FrostSigner for local
+                // signing. The share is re-encrypted under an ephemeral data key
+                // purely to satisfy the FrostSigner API; it never leaves the
+                // process.
+                let active_share = node.share_package();
                 let data_key = keep_core::crypto::SecretKey::generate()
                     .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
-                let stored = keep_core::frost::StoredShare::encrypt(&active_share, &data_key)
+                let stored = keep_core::frost::StoredShare::encrypt(active_share, &data_key)
                     .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
                 let frost_signer = FrostSigner::new(group_pubkey_bytes, vec![stored], data_key)
                     .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
