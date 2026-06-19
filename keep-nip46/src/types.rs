@@ -7,6 +7,13 @@ use nostr_sdk::prelude::*;
 /// auto-approve this kind to avoid a per-request prompt that would time out.
 pub const NIP98_HTTP_AUTH: Kind = Kind::Custom(27235);
 
+/// #613: maximum lifetime (seconds) for an opt-in NIP-98 (kind 27235) timed
+/// remember-grant. NIP-98 carries a per-request `u`/`method` that the approval
+/// prompt does not surface, so a remembered grant is a short-lived bearer
+/// credential: clamp it hard. Single source of truth for both the approval-path
+/// clamp and the authoritative `grant_kind_for` write-path cap.
+pub const NIP98_MAX_REMEMBER_SECS: u64 = 600;
+
 #[derive(Debug, Clone)]
 pub struct LogEvent {
     pub app: String,
