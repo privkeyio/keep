@@ -21,10 +21,8 @@ use crate::permissions::{AppPermission, Permission, PermissionDuration, Permissi
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
     ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
+    NIP98_MAX_REMEMBER_SECS,
 };
-
-// #613: short clamp for the kind-27235 bearer-credential threat (10 minutes).
-const NIP98_MAX_REMEMBER_SECS: u64 = 600;
 
 fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
     match remember.as_seconds() {
@@ -1630,14 +1628,24 @@ mod tests {
         );
         handler.handle_sign_event(app, first).await.unwrap();
 
-        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        // Second request uses a DIFFERENT url/method: the grant is scoped to
+        // (app, kind) only, so within the window it covers any url/method. This
+        // documents the time-only scope boundary (#613) rather than implying
+        // per-url scoping.
+        let other_tags = vec![
+            Tag::parse(["u", "https://b.example/other"]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+        ];
+        let second =
+            UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, other_tags, "");
         handler.handle_sign_event(app, second).await.unwrap();
 
         assert_eq!(
             cb.sign_event_prompts
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "an opt-in OneMinute remember must skip the prompt on the next NIP-98 request"
+            "an opt-in OneMinute remember skips the prompt on the next NIP-98 request, \
+             even for a different url/method within the clamped window"
         );
         let pm = permissions.lock().await;
         let granted = pm.get_app(&app).unwrap();
@@ -1648,6 +1656,11 @@ mod tests {
     #[test]
     fn clamp_nip98_remember_never_exceeds_max() {
         use RememberDuration::*;
+        // Lock the over-limit fallback to the constant: the clamp returns
+        // `TenMinutes` for anything past the cap, which is only safe while
+        // `TenMinutes` equals `NIP98_MAX_REMEMBER_SECS`. Catches drift if either
+        // the constant or the variant's seconds change independently.
+        assert_eq!(TenMinutes.as_seconds(), Some(NIP98_MAX_REMEMBER_SECS));
         assert_eq!(clamp_nip98_remember(JustThisTime), JustThisTime);
         assert_eq!(clamp_nip98_remember(OneMinute), OneMinute);
         assert_eq!(clamp_nip98_remember(FiveMinutes), FiveMinutes);
