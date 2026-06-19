@@ -23,6 +23,18 @@ use crate::types::{
     ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
 };
 
+// #613: short clamp for the kind-27235 bearer-credential threat (10 minutes).
+const NIP98_MAX_REMEMBER_SECS: u64 = 600;
+
+fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
+    match remember.as_seconds() {
+        None if remember == RememberDuration::JustThisTime => RememberDuration::JustThisTime,
+        None => RememberDuration::TenMinutes,
+        Some(secs) if secs <= NIP98_MAX_REMEMBER_SECS => remember,
+        Some(_) => RememberDuration::TenMinutes,
+    }
+}
+
 fn prepare_frost_event(
     pubkey: PublicKey,
     unsigned: &UnsignedEvent,
@@ -448,12 +460,13 @@ impl SignerHandler {
             // window skip the prompt. `JustThisTime` is the one-shot default
             // and does not persist; the next request prompts again.
             //
-            // NIP-98 (kind 27235) is never remembered: its security-relevant
-            // url/method live in tags the prompt does not surface, so a
-            // per-(app,kind) grant would auto-approve any url/method after one
-            // tap (bearer-credential threat). Force per-request approval.
+            // #613: NIP-98 (kind 27235) carries security-relevant url/method
+            // in tags the prompt does not surface, so a long-lived grant would
+            // auto-approve any url/method after one tap (bearer-credential
+            // threat). The remember is opt-in and clamped to a short window
+            // (`NIP98_MAX_REMEMBER_SECS`); `Forever` is never honored.
             let remember = if kind == NIP98_HTTP_AUTH {
-                RememberDuration::JustThisTime
+                clamp_nip98_remember(result.remember)
             } else {
                 result.remember
             };
@@ -1537,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nip98_is_never_remembered_even_when_approved_forever() {
+    async fn nip98_forever_is_clamped_to_timed_remember() {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
@@ -1572,19 +1585,92 @@ mod tests {
         assert_eq!(
             cb.sign_event_prompts
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "NIP-98 must prompt on every request even after approve=Forever"
+            1,
+            "NIP-98 Forever is clamped to a timed remember, so the second request must skip the prompt"
         );
         let pm = permissions.lock().await;
         let granted = pm.get_app(&app).unwrap();
         assert!(
             !granted.auto_approve_kinds.contains(&NIP98_HTTP_AUTH),
-            "NIP-98 must not be persisted as an auto-approve kind"
+            "NIP-98 must never be granted forever (auto-approve kind)"
         );
         assert!(
-            !granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH),
-            "NIP-98 must not be persisted as a timed grant"
+            granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH),
+            "NIP-98 Forever must be persisted as a short timed grant"
         );
+    }
+
+    #[tokio::test]
+    async fn nip98_opt_in_short_remember_skips_next_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RememberingCallbacks {
+            remember: RememberDuration::OneMinute,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler =
+            SignerHandler::new(keyring, Arc::clone(&permissions), audit, Some(cb.clone()))
+                .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let tags = vec![
+            Tag::parse(["u", "https://a.example/api"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ];
+        let first = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            tags.clone(),
+            "",
+        );
+        handler.handle_sign_event(app, first).await.unwrap();
+
+        let second = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        handler.handle_sign_event(app, second).await.unwrap();
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an opt-in OneMinute remember must skip the prompt on the next NIP-98 request"
+        );
+        let pm = permissions.lock().await;
+        let granted = pm.get_app(&app).unwrap();
+        assert!(granted.has_unexpired_timed_grant(NIP98_HTTP_AUTH));
+        assert!(!granted.auto_approve_kinds.contains(&NIP98_HTTP_AUTH));
+    }
+
+    #[test]
+    fn clamp_nip98_remember_never_exceeds_max() {
+        use RememberDuration::*;
+        assert_eq!(clamp_nip98_remember(JustThisTime), JustThisTime);
+        assert_eq!(clamp_nip98_remember(OneMinute), OneMinute);
+        assert_eq!(clamp_nip98_remember(FiveMinutes), FiveMinutes);
+        assert_eq!(clamp_nip98_remember(TenMinutes), TenMinutes);
+        assert_eq!(clamp_nip98_remember(OneHour), TenMinutes);
+        assert_eq!(clamp_nip98_remember(OneDay), TenMinutes);
+        assert_eq!(clamp_nip98_remember(Forever), TenMinutes);
+        for variant in [
+            JustThisTime,
+            OneMinute,
+            FiveMinutes,
+            TenMinutes,
+            OneHour,
+            OneDay,
+            Forever,
+        ] {
+            if let Some(secs) = clamp_nip98_remember(variant).as_seconds() {
+                assert!(
+                    secs <= NIP98_MAX_REMEMBER_SECS,
+                    "{variant:?} clamped above the NIP-98 max"
+                );
+            }
+        }
     }
 
     /// Captures every `persist_permissions` snapshot so a test can assert the

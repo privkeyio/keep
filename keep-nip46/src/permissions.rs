@@ -287,12 +287,16 @@ impl PermissionManager {
     }
 
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
-        // #575: NIP-98 (kind 27235) must ALWAYS prompt per-request and can
-        // never be auto-approved by any per-app, global, or timed grant. This
-        // is the authoritative chokepoint: even a 27235 entry that slipped into
-        // a grant set or a persisted/upgraded config cannot bypass the prompt.
+        // #613: NIP-98 (kind 27235) is opt-in remembered only via an explicit,
+        // short, unexpired per-app timed grant written by the approval path. It
+        // is never covered by a forever (auto_approve) or global grant: those
+        // channels stay blocked here so a 27235 entry that slipped into a grant
+        // set or a persisted/upgraded config cannot bypass the prompt. Only a
+        // live, clamped timed grant skips it.
         if kind == NIP98_HTTP_AUTH {
-            return true;
+            return !self.apps.get(pubkey).is_some_and(|app| {
+                !app.duration.is_expired(app.connected_at) && app.has_unexpired_timed_grant(kind)
+            });
         }
         if let Some(app) = self.apps.get(pubkey) {
             if !app.duration.is_expired(app.connected_at) {
@@ -344,10 +348,6 @@ impl PermissionManager {
     /// callers only audit real state changes.
     pub fn grant_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) -> bool {
         if secs == 0 {
-            return false;
-        }
-        // #575: NIP-98 (kind 27235) is never remembered.
-        if kind == NIP98_HTTP_AUTH {
             return false;
         }
         let now = now_unix_secs();
@@ -423,7 +423,7 @@ impl PermissionManager {
                 timed_kind_grants: app
                     .timed_kind_grants
                     .iter()
-                    .filter(|(_, expiry)| now < **expiry)
+                    .filter(|(kind, expiry)| **kind != NIP98_HTTP_AUTH && now < **expiry)
                     .map(|(k, expiry)| StoredTimedKindGrant {
                         kind: k.as_u16(),
                         expires_at: *expiry,
@@ -784,24 +784,55 @@ mod tests {
     }
 
     #[test]
-    fn nip98_always_needs_approval_despite_every_grant() {
+    fn nip98_skipped_only_by_explicit_timed_grant() {
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
         pm.connect(pubkey, "App".into());
 
-        // Force NIP-98 into every auto-approve channel directly, bypassing the
-        // write-path guards, to prove the read-path chokepoint is authoritative.
+        // #613: a forever (auto_approve) or global grant must NOT bypass NIP-98,
+        // even when forced directly into the sets past the write-path guards.
         pm.set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
         if let Some(app) = pm.apps.get_mut(&pubkey) {
             app.auto_approve_kinds.insert(NIP98_HTTP_AUTH);
-            app.timed_kind_grants
-                .insert(NIP98_HTTP_AUTH, now_unix_secs() + 3600);
         }
-
         assert!(
             pm.needs_approval(&pubkey, NIP98_HTTP_AUTH),
-            "NIP-98 must always need approval even when present in per-app, \
-             global, and unexpired timed grant sets"
+            "NIP-98 must still prompt when only forever/global grants cover it"
+        );
+
+        // Only an explicit, unexpired per-app timed grant skips the prompt.
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.timed_kind_grants
+                .insert(NIP98_HTTP_AUTH, now_unix_secs() + 600);
+        }
+        assert!(
+            !pm.needs_approval(&pubkey, NIP98_HTTP_AUTH),
+            "an explicit unexpired NIP-98 timed grant skips the prompt"
+        );
+    }
+
+    #[test]
+    fn nip98_timed_grant_does_not_outlive_app_duration() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.timed_kind_grants
+                .insert(NIP98_HTTP_AUTH, now_unix_secs() + 600);
+        }
+        assert!(
+            !pm.needs_approval(&pubkey, NIP98_HTTP_AUTH),
+            "a live NIP-98 timed grant skips the prompt while the app duration holds"
+        );
+
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.duration = PermissionDuration::Seconds(0);
+            app.connected_at = Timestamp::from(1);
+        }
+        assert!(
+            pm.needs_approval(&pubkey, NIP98_HTTP_AUTH),
+            "an expired app duration must override a live NIP-98 timed grant"
         );
     }
 
@@ -845,8 +876,8 @@ mod tests {
         pm.connect(pubkey, "App".into());
 
         pm.grant_kind_for(&pubkey, Kind::TextNote, 3600);
-        // grant_kind_for refuses NIP-98, so inject it directly to model a
-        // hostile/legacy persisted row.
+        // Inject a NIP-98 timed grant directly to model a hostile/legacy
+        // persisted row; restore must drop it regardless of how it got there.
         if let Some(app) = pm.apps.get_mut(&pubkey) {
             app.timed_kind_grants
                 .insert(NIP98_HTTP_AUTH, now_unix_secs() + 3600);
