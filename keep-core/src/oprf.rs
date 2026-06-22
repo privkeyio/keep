@@ -141,7 +141,10 @@ mod tests {
         let b2 = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
         let e2 = server.blind_evaluate(&b2.message);
         let out2 = b2.state.finalize(input, &e2).expect("finalize");
-        assert_eq!(out1, out2, "same input + key must give a stable OPRF output");
+        assert_eq!(
+            out1, out2,
+            "same input + key must give a stable OPRF output"
+        );
 
         // Different input -> different output.
         let other: &[u8] = b"keep-node-other";
@@ -180,7 +183,10 @@ mod tests {
             let p_j = threshold::partial_eval(&shares[j], &b.message).expect("partial j");
             let eval = threshold::combine(&[p_i, p_j]).expect("combine");
             let thresh = b.state.finalize(input, &eval).expect("threshold finalize");
-            assert_eq!(single, thresh, "quorum {{{i},{j}}} must equal the single-key output");
+            assert_eq!(
+                single, thresh,
+                "quorum {{{i},{j}}} must equal the single-key output"
+            );
 
             // End to end: the LUKS key derived from the threshold output matches the single-key
             // one, and is a stable 32 bytes.
@@ -196,7 +202,11 @@ mod tests {
         let out = b"oprf-output-bytes-for-the-kdf-test--";
         let k = derive_luks_key(out, "vault0", 1);
         assert_eq!(k, derive_luks_key(out, "vault0", 1), "stable");
-        assert_ne!(k, derive_luks_key(out, "vault1", 1), "separated by volume id");
+        assert_ne!(
+            k,
+            derive_luks_key(out, "vault1", 1),
+            "separated by volume id"
+        );
         assert_ne!(k, derive_luks_key(out, "vault0", 2), "separated by epoch");
     }
 }

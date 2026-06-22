@@ -59,11 +59,11 @@ pub mod keys;
 pub mod migration;
 /// BIP-39 mnemonic generation and validation.
 pub mod mnemonic;
+/// NIP-06 key derivation from mnemonic seed phrase.
+pub mod nip06;
 /// Threshold-OPRF unlock primitive (frost-gate v2). Opt-in via the `oprf` feature.
 #[cfg(feature = "oprf")]
 pub mod oprf;
-/// NIP-06 key derivation from mnemonic seed phrase.
-pub mod nip06;
 pub(crate) mod rate_limit;
 /// Relay configuration for FROST shares.
 pub mod relay;
