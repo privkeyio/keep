@@ -66,8 +66,14 @@ pub mod threshold {
         n: usize,
         rng: impl rand_core_06::RngCore + rand_core_06::CryptoRng,
     ) -> Result<Vec<KeyShare>, String> {
-        vsss_rs::shamir::split_secret::<KeyShare>(t, n, &IdentifierPrimeField(*secret), rng)
-            .map_err(|e| format!("split: {e:?}"))
+        use zeroize::Zeroize;
+        // Our transient copy of the key; zeroize it once split. (The caller owns the original
+        // `secret` and the returned shares, and is responsible for their secure handling.)
+        let mut wrapped = IdentifierPrimeField(*secret);
+        let res = vsss_rs::shamir::split_secret::<KeyShare>(t, n, &wrapped, rng)
+            .map_err(|e| format!("split: {e:?}"));
+        wrapped.0.zeroize();
+        res
     }
 
     /// A share-holder's partial evaluation: `P_i = s_i * B`, carrying the same identifier so the
@@ -76,18 +82,31 @@ pub mod threshold {
         share: &KeyShare,
         blinded: &BlindedElement<Secp256k1Sha256>,
     ) -> Result<PartialEval, String> {
+        use zeroize::Zeroize;
         let b = point_from_bytes(blinded.serialize().as_slice())?;
-        let s_i: Scalar = **share.value();
+        let mut s_i: Scalar = **share.value();
+        let p_i = b * s_i;
+        s_i.zeroize();
         Ok(DefaultShare::with_identifier_and_value(
             *share.identifier(),
-            ValueGroup::from(b * s_i),
+            ValueGroup::from(p_i),
         ))
     }
 
-    /// Combine >= t partial evaluations into the evaluation element `B^s` (Lagrange in the
-    /// exponent, via vsss-rs), then hand back a voprf `EvaluationElement` for `finalize`. The
-    /// key is never reconstructed.
-    pub fn combine(partials: &[PartialEval]) -> Result<EvaluationElement<Secp256k1Sha256>, String> {
+    /// Combine partial evaluations into the evaluation element `B^s` (Lagrange in the exponent,
+    /// via vsss-rs), then hand back a voprf `EvaluationElement` for `finalize`. The key is never
+    /// reconstructed. `threshold` is the configured `t`: fewer than `t` partials silently
+    /// interpolate a wrong key (still fail-safe at LUKS, but rejected here explicitly).
+    pub fn combine(
+        partials: &[PartialEval],
+        threshold: usize,
+    ) -> Result<EvaluationElement<Secp256k1Sha256>, String> {
+        if partials.len() < threshold {
+            return Err(format!(
+                "combine: need >= {threshold} partials, got {}",
+                partials.len()
+            ));
+        }
         let bs: ValueGroup<ProjectivePoint> =
             partials.combine().map_err(|e| format!("combine: {e:?}"))?;
         EvaluationElement::deserialize(bs.0.to_encoded_point(true).as_bytes())
@@ -95,24 +114,41 @@ pub mod threshold {
     }
 
     fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, String> {
+        use k256::elliptic_curve::group::Group;
         let ep = EncodedPoint::from_bytes(bytes).map_err(|e| format!("encoded point: {e:?}"))?;
-        Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
-            .ok_or_else(|| "bad point".into())
+        let p = Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
+            .ok_or_else(|| "bad point".to_string())?;
+        // Defense in depth: reject the identity (the sole caller already passes voprf-validated
+        // bytes, but never let an identity element through if this is reused on raw input).
+        if bool::from(p.is_identity()) {
+            return Err("identity point rejected".into());
+        }
+        Ok(p)
     }
 }
 
-/// Derive a 32-byte LUKS key from an OPRF output via HKDF-Expand (RFC 5869).
+/// Derive a 32-byte LUKS key from an OPRF output via HKDF (RFC 5869).
 ///
-/// The OPRF `Finalize` output is already uniform and high-entropy, so HKDF-Extract is not
-/// needed; HKDF-Expand with a domain-separating `info` is sufficient. The `info` separates
-/// multiple volumes and supports rotation without changing the OPRF key:
-/// `keep-node/luks/v1/<volume_id>/<epoch>`. Feed the result to a LUKS2 keyslot
-/// (`cryptsetup luksFormat/open --key-file - --keyfile-size 32`).
-pub fn derive_luks_key(oprf_output: &[u8], volume_id: &str, epoch: u32) -> [u8; 32] {
-    let info = format!("keep-node/luks/v1/{volume_id}/{epoch}");
+/// `Hkdf::new(None, ...)` runs HKDF-Extract with a zero salt, then Expand. The OPRF `Finalize`
+/// output is already a uniform SHA-256 PRF value, so Extract is not strictly required, but a
+/// zero-salt Extract is sound. The `info` is built INJECTIVELY (length-prefixed) so two distinct
+/// `(volume_id, epoch)` pairs can never collide into the same key: a fixed label, then the
+/// big-endian length of `volume_id`, then `volume_id`, then the big-endian `epoch`. This
+/// separates multiple volumes and supports rotation without changing the OPRF key. Feed the
+/// result to a LUKS2 keyslot (`cryptsetup luksFormat/open --key-file - --keyfile-size 32`).
+pub fn derive_luks_key(
+    oprf_output: &[u8],
+    volume_id: &str,
+    epoch: u32,
+) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut info = Vec::with_capacity(25 + volume_id.len() + 4);
+    info.extend_from_slice(b"keep-node/luks/v1");
+    info.extend_from_slice(&(volume_id.len() as u64).to_be_bytes());
+    info.extend_from_slice(volume_id.as_bytes());
+    info.extend_from_slice(&epoch.to_be_bytes());
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, oprf_output);
-    let mut key = [0u8; 32];
-    hk.expand(info.as_bytes(), &mut key)
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(&info, &mut key[..])
         .expect("32 bytes is within HKDF output limit");
     key
 }
@@ -181,7 +217,7 @@ mod tests {
         for (i, j) in [(0, 1), (0, 2), (1, 2)] {
             let p_i = threshold::partial_eval(&shares[i], &b.message).expect("partial i");
             let p_j = threshold::partial_eval(&shares[j], &b.message).expect("partial j");
-            let eval = threshold::combine(&[p_i, p_j]).expect("combine");
+            let eval = threshold::combine(&[p_i, p_j], 2).expect("combine");
             let thresh = b.state.finalize(input, &eval).expect("threshold finalize");
             assert_eq!(
                 single, thresh,
@@ -192,7 +228,7 @@ mod tests {
             // one, and is a stable 32 bytes.
             let k_single = derive_luks_key(single.as_slice(), "vault0", 1);
             let k_thresh = derive_luks_key(thresh.as_slice(), "vault0", 1);
-            assert_eq!(k_single, k_thresh);
+            assert_eq!(*k_single, *k_thresh);
             assert_eq!(k_thresh.len(), 32);
         }
     }
@@ -201,12 +237,19 @@ mod tests {
     fn luks_key_derivation_is_stable_and_domain_separated() {
         let out = b"oprf-output-bytes-for-the-kdf-test--";
         let k = derive_luks_key(out, "vault0", 1);
-        assert_eq!(k, derive_luks_key(out, "vault0", 1), "stable");
+        assert_eq!(*k, *derive_luks_key(out, "vault0", 1), "stable");
         assert_ne!(
-            k,
-            derive_luks_key(out, "vault1", 1),
+            *k,
+            *derive_luks_key(out, "vault1", 1),
             "separated by volume id"
         );
-        assert_ne!(k, derive_luks_key(out, "vault0", 2), "separated by epoch");
+        assert_ne!(*k, *derive_luks_key(out, "vault0", 2), "separated by epoch");
+        // Injectivity: a volume_id containing the old '/' separator must NOT collide with a
+        // different (volume_id, epoch) pair (the length-prefixed info prevents this).
+        assert_ne!(
+            *derive_luks_key(out, "a/b", 1),
+            *derive_luks_key(out, "a", 1),
+            "length-prefixed info is injective over volume_id"
+        );
     }
 }
