@@ -2160,6 +2160,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-where"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4426,12 +4437,14 @@ dependencies = [
  "memsecurity",
  "proptest",
  "rand 0.10.1",
+ "rand_core 0.6.4",
  "redb 2.6.3",
  "redb 4.1.0",
  "scrypt 0.12.0",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "subtle",
  "temp-env",
@@ -4439,6 +4452,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "unicode-normalization",
+ "voprf",
  "zeroize",
 ]
 
@@ -9512,6 +9526,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "voprf"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28f59c30c76e2fea54cdece6a054e2662feffa7ab19658a7887524265ee39470"
+dependencies = [
+ "curve25519-dalek",
+ "derive-where",
+ "digest 0.10.7",
+ "displaydoc",
+ "elliptic-curve",
+ "generic-array",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
