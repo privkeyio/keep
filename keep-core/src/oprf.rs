@@ -27,6 +27,74 @@ impl CipherSuite for Secp256k1Sha256 {
     type Hash = sha2_010::Sha256;
 }
 
+/// 2-of-3 (configurable t-of-n) threshold layer over the secp256k1 OPRF.
+///
+/// The OPRF key is Shamir-shared across the share-holders (box / phone / replica). Each holder
+/// returns a partial evaluation `s_i * B` of the client's blinded element `B`; a quorum is
+/// combined in the exponent (Lagrange) to `B^s` WITHOUT reconstructing the key. The combined
+/// element is fed back into voprf's unchanged `finalize`.
+///
+/// Vetted libraries do the dangerous parts: `vsss-rs` for the Shamir split and the in-exponent
+/// Lagrange combination (`combine_shares_group`), `k256` for the group arithmetic, `voprf` for
+/// blind/finalize. The only bespoke step is `s_i * B`. DLEQ verifiability (malicious-server
+/// protection) is a follow-on; this layer proves the threshold combination is correct.
+pub mod threshold {
+    use super::Secp256k1Sha256;
+    use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+    use k256::{EncodedPoint, ProjectivePoint, Scalar};
+    use voprf::{BlindedElement, EvaluationElement};
+    use vsss_rs::{
+        DefaultShare, IdentifierPrimeField, ReadableShareSet, Share, ValueGroup, ValuePrimeField,
+    };
+
+    type Id = IdentifierPrimeField<Scalar>;
+    /// A scalar share of the OPRF key (held by a box / phone / replica).
+    pub type KeyShare = DefaultShare<Id, ValuePrimeField<Scalar>>;
+    /// A share-holder's partial evaluation `s_i * B` (a group element, same identifier).
+    pub type PartialEval = DefaultShare<Id, ValueGroup<ProjectivePoint>>;
+
+    /// Split an OPRF key into `n` shares with threshold `t` over secp256k1's scalar field.
+    pub fn split_key(
+        secret: &Scalar,
+        t: usize,
+        n: usize,
+        rng: impl rand_core_06::RngCore + rand_core_06::CryptoRng,
+    ) -> Result<Vec<KeyShare>, String> {
+        vsss_rs::shamir::split_secret::<KeyShare>(t, n, &IdentifierPrimeField(*secret), rng)
+            .map_err(|e| format!("split: {e:?}"))
+    }
+
+    /// A share-holder's partial evaluation: `P_i = s_i * B`, carrying the same identifier so the
+    /// combination knows its Lagrange index. The share `s_i` never leaves the holder.
+    pub fn partial_eval(
+        share: &KeyShare,
+        blinded: &BlindedElement<Secp256k1Sha256>,
+    ) -> Result<PartialEval, String> {
+        let b = point_from_bytes(blinded.serialize().as_slice())?;
+        let s_i: Scalar = **share.value();
+        Ok(DefaultShare::with_identifier_and_value(
+            *share.identifier(),
+            ValueGroup::from(b * s_i),
+        ))
+    }
+
+    /// Combine >= t partial evaluations into the evaluation element `B^s` (Lagrange in the
+    /// exponent, via vsss-rs), then hand back a voprf `EvaluationElement` for `finalize`. The
+    /// key is never reconstructed.
+    pub fn combine(partials: &[PartialEval]) -> Result<EvaluationElement<Secp256k1Sha256>, String> {
+        let bs: ValueGroup<ProjectivePoint> =
+            partials.combine().map_err(|e| format!("combine: {e:?}"))?;
+        EvaluationElement::deserialize(bs.0.to_encoded_point(true).as_bytes())
+            .map_err(|e| format!("deserialize eval: {e:?}"))
+    }
+
+    fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, String> {
+        let ep = EncodedPoint::from_bytes(bytes).map_err(|e| format!("encoded point: {e:?}"))?;
+        Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
+            .ok_or_else(|| "bad point".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +127,38 @@ mod tests {
         let e3 = server.blind_evaluate(&b3.message);
         let out3 = b3.state.finalize(other, &e3).expect("finalize");
         assert_ne!(out1, out3, "different input must give a different output");
+    }
+
+    /// Correctness oracle for the threshold layer: for the SAME blinded element, the 2-of-3
+    /// threshold combination must produce exactly the same OPRF output as a single-key server
+    /// holding the un-split key, for every quorum pair. If they match, the in-exponent Lagrange
+    /// combination is correct and no party ever reconstructed the key.
+    #[test]
+    fn threshold_matches_single_key() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let input: &[u8] = b"keep-node-vault-v1";
+
+        // One key, two ways: a single-key voprf server, and a 2-of-3 Shamir split of the same key.
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let server = OprfServer::<Secp256k1Sha256>::new_with_key(s.to_bytes().as_slice())
+            .expect("server from key");
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        assert_eq!(shares.len(), 3);
+
+        // One blind; evaluate it both ways and finalize with the same client state.
+        let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
+        let single = b
+            .state
+            .finalize(input, &server.blind_evaluate(&b.message))
+            .expect("single finalize");
+
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let p_i = threshold::partial_eval(&shares[i], &b.message).expect("partial i");
+            let p_j = threshold::partial_eval(&shares[j], &b.message).expect("partial j");
+            let eval = threshold::combine(&[p_i, p_j]).expect("combine");
+            let thresh = b.state.finalize(input, &eval).expect("threshold finalize");
+            assert_eq!(single, thresh, "quorum {{{i},{j}}} must equal the single-key output");
+        }
     }
 }
