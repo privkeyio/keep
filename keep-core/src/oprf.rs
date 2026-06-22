@@ -36,8 +36,14 @@ impl CipherSuite for Secp256k1Sha256 {
 ///
 /// Vetted libraries do the dangerous parts: `vsss-rs` for the Shamir split and the in-exponent
 /// Lagrange combination (`combine_shares_group`), `k256` for the group arithmetic, `voprf` for
-/// blind/finalize. The only bespoke step is `s_i * B`. DLEQ verifiability (malicious-server
-/// protection) is a follow-on; this layer proves the threshold combination is correct.
+/// blind/finalize. The only bespoke step is `s_i * B`.
+///
+/// DLEQ verifiability (a per-partial proof that a share-holder used its committed share) is a
+/// deliberate follow-on, NOT a security gate for the core guarantee: a wrong partial yields a
+/// wrong combined `B^s`, hence a wrong derived key, which LUKS rejects at the keyslot digest
+/// check. So a misbehaving share-holder (a compromised own-device) causes a *failed unlock*,
+/// never a key leak or silent corruption. DLEQ upgrades that fail-safe into a diagnosable,
+/// DoS-resistant one; it does not change what an attacker can learn.
 pub mod threshold {
     use super::Secp256k1Sha256;
     use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
@@ -93,6 +99,22 @@ pub mod threshold {
         Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
             .ok_or_else(|| "bad point".into())
     }
+}
+
+/// Derive a 32-byte LUKS key from an OPRF output via HKDF-Expand (RFC 5869).
+///
+/// The OPRF `Finalize` output is already uniform and high-entropy, so HKDF-Extract is not
+/// needed; HKDF-Expand with a domain-separating `info` is sufficient. The `info` separates
+/// multiple volumes and supports rotation without changing the OPRF key:
+/// `keep-node/luks/v1/<volume_id>/<epoch>`. Feed the result to a LUKS2 keyslot
+/// (`cryptsetup luksFormat/open --key-file - --keyfile-size 32`).
+pub fn derive_luks_key(oprf_output: &[u8], volume_id: &str, epoch: u32) -> [u8; 32] {
+    let info = format!("keep-node/luks/v1/{volume_id}/{epoch}");
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, oprf_output);
+    let mut key = [0u8; 32];
+    hk.expand(info.as_bytes(), &mut key)
+        .expect("32 bytes is within HKDF output limit");
+    key
 }
 
 #[cfg(test)]
@@ -159,6 +181,22 @@ mod tests {
             let eval = threshold::combine(&[p_i, p_j]).expect("combine");
             let thresh = b.state.finalize(input, &eval).expect("threshold finalize");
             assert_eq!(single, thresh, "quorum {{{i},{j}}} must equal the single-key output");
+
+            // End to end: the LUKS key derived from the threshold output matches the single-key
+            // one, and is a stable 32 bytes.
+            let k_single = derive_luks_key(single.as_slice(), "vault0", 1);
+            let k_thresh = derive_luks_key(thresh.as_slice(), "vault0", 1);
+            assert_eq!(k_single, k_thresh);
+            assert_eq!(k_thresh.len(), 32);
         }
+    }
+
+    #[test]
+    fn luks_key_derivation_is_stable_and_domain_separated() {
+        let out = b"oprf-output-bytes-for-the-kdf-test--";
+        let k = derive_luks_key(out, "vault0", 1);
+        assert_eq!(k, derive_luks_key(out, "vault0", 1), "stable");
+        assert_ne!(k, derive_luks_key(out, "vault1", 1), "separated by volume id");
+        assert_ne!(k, derive_luks_key(out, "vault0", 2), "separated by epoch");
     }
 }
