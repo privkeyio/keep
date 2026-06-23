@@ -130,7 +130,7 @@ pub mod threshold {
             .map_err(|_| CryptoError::invalid_key("OPRF combined evaluation element is invalid"))
     }
 
-    fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, CryptoError> {
+    pub(crate) fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, CryptoError> {
         use k256::elliptic_curve::group::Group;
         let ep = EncodedPoint::from_bytes(bytes)
             .map_err(|_| CryptoError::invalid_key("OPRF point: malformed SEC1 encoding"))?;
@@ -373,32 +373,24 @@ mod tests {
     #[test]
     fn point_parsing_rejects_bad_and_identity() {
         use k256::elliptic_curve::group::Group;
-        use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-        use k256::{EncodedPoint, ProjectivePoint};
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::ProjectivePoint;
 
-        // Identity (point at infinity) encodes to a single 0x00 byte in SEC1; from_encoded_point
-        // accepts it, so our explicit identity rejection is what guards this case.
-        let id = <ProjectivePoint as Group>::identity();
-        let id_bytes = id.to_encoded_point(true);
-        let decoded = Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(
-            &EncodedPoint::from_bytes(id_bytes.as_bytes()).expect("identity sec1 parses"),
-        ))
-        .expect("identity decodes");
+        // Identity (point at infinity) encodes to a single 0x00 byte in SEC1 and from_encoded_point
+        // accepts it, so point_from_bytes' explicit identity rejection is what must guard this case.
+        let id_bytes = <ProjectivePoint as Group>::identity().to_encoded_point(true);
         assert!(
-            bool::from(decoded.is_identity()),
-            "identity must be recognized so the parser can reject it"
+            threshold::point_from_bytes(id_bytes.as_bytes()).is_err(),
+            "identity element must be rejected by point_from_bytes"
         );
 
         // Garbage compressed point: valid prefix tag, but x is not on the curve.
         let mut garbage = [0u8; 33];
         garbage[0] = 0x02;
         garbage[1..].fill(0xff);
-        let parsed = EncodedPoint::from_bytes(garbage).ok().and_then(|ep| {
-            Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
-        });
         assert!(
-            parsed.is_none(),
-            "an off-curve x must not decode to a point"
+            threshold::point_from_bytes(&garbage).is_err(),
+            "an off-curve x must be rejected by point_from_bytes"
         );
     }
 }
