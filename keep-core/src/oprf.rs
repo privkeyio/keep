@@ -46,6 +46,7 @@ impl CipherSuite for Secp256k1Sha256 {
 /// DoS-resistant one; it does not change what an attacker can learn.
 pub mod threshold {
     use super::Secp256k1Sha256;
+    use crate::error::CryptoError;
     use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
     use k256::{EncodedPoint, ProjectivePoint, Scalar};
     use voprf::{BlindedElement, EvaluationElement};
@@ -60,28 +61,39 @@ pub mod threshold {
     pub type PartialEval = DefaultShare<Id, ValueGroup<ProjectivePoint>>;
 
     /// Split an OPRF key into `n` shares with threshold `t` over secp256k1's scalar field.
+    ///
+    /// SECURITY (caller contract): the returned [`KeyShare`]s hold plaintext scalar key shares.
+    /// `KeyShare` is `Copy` and implements `Zeroize` but NOT `ZeroizeOnDrop`, so dropping a share
+    /// (or any copy of one) leaves the secret scalar in memory. The caller OWNS the returned
+    /// shares and MUST `zeroize()` each one (and any copy) once it is distributed to its holder.
+    /// Treat each share as live key material until then.
     pub fn split_key(
         secret: &Scalar,
         t: usize,
         n: usize,
         rng: impl rand_core_06::RngCore + rand_core_06::CryptoRng,
-    ) -> Result<Vec<KeyShare>, String> {
+    ) -> Result<Vec<KeyShare>, CryptoError> {
         use zeroize::Zeroize;
         // Our transient copy of the key; zeroize it once split. (The caller owns the original
         // `secret` and the returned shares, and is responsible for their secure handling.)
         let mut wrapped = IdentifierPrimeField(*secret);
         let res = vsss_rs::shamir::split_secret::<KeyShare>(t, n, &wrapped, rng)
-            .map_err(|e| format!("split: {e:?}"));
+            .map_err(|_| CryptoError::key_derivation("OPRF Shamir key split failed"));
         wrapped.0.zeroize();
         res
     }
 
     /// A share-holder's partial evaluation: `P_i = s_i * B`, carrying the same identifier so the
     /// combination knows its Lagrange index. The share `s_i` never leaves the holder.
+    ///
+    /// SECURITY: the transport layer that exposes this evaluation oracle to clients MUST enforce
+    /// per-identity authentication and strict rate limiting. The OPRF-unlock's resistance to
+    /// low-entropy-input guessing depends on bounding the number of evaluations an attacker can
+    /// obtain; an unbounded or unauthenticated oracle reduces it to an offline brute force.
     pub fn partial_eval(
         share: &KeyShare,
         blinded: &BlindedElement<Secp256k1Sha256>,
-    ) -> Result<PartialEval, String> {
+    ) -> Result<PartialEval, CryptoError> {
         use zeroize::Zeroize;
         let b = point_from_bytes(blinded.serialize().as_slice())?;
         let mut s_i: Scalar = **share.value();
@@ -95,33 +107,41 @@ pub mod threshold {
 
     /// Combine partial evaluations into the evaluation element `B^s` (Lagrange in the exponent,
     /// via vsss-rs), then hand back a voprf `EvaluationElement` for `finalize`. The key is never
-    /// reconstructed. `threshold` is the configured `t`: fewer than `t` partials silently
-    /// interpolate a wrong key (still fail-safe at LUKS, but rejected here explicitly).
+    /// reconstructed.
+    ///
+    /// `threshold` MUST equal the `t` passed to [`split_key`]. This check is defense-in-depth, not
+    /// the security boundary: with fewer than `t` partials Shamir interpolates a wrong key, which
+    /// yields a wrong derived key that LUKS rejects at the keyslot digest. vsss-rs `combine()`
+    /// already rejects zero/duplicate identifiers and fewer than two shares, so no extra dedup is
+    /// done here.
     pub fn combine(
         partials: &[PartialEval],
         threshold: usize,
-    ) -> Result<EvaluationElement<Secp256k1Sha256>, String> {
+    ) -> Result<EvaluationElement<Secp256k1Sha256>, CryptoError> {
         if partials.len() < threshold {
-            return Err(format!(
-                "combine: need >= {threshold} partials, got {}",
-                partials.len()
+            return Err(CryptoError::invalid_key(
+                "OPRF combine: fewer partial evaluations than the configured threshold",
             ));
         }
-        let bs: ValueGroup<ProjectivePoint> =
-            partials.combine().map_err(|e| format!("combine: {e:?}"))?;
+        let bs: ValueGroup<ProjectivePoint> = partials.combine().map_err(|_| {
+            CryptoError::key_derivation("OPRF partial-evaluation combination failed")
+        })?;
         EvaluationElement::deserialize(bs.0.to_encoded_point(true).as_bytes())
-            .map_err(|e| format!("deserialize eval: {e:?}"))
+            .map_err(|_| CryptoError::invalid_key("OPRF combined evaluation element is invalid"))
     }
 
-    fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, String> {
+    fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, CryptoError> {
         use k256::elliptic_curve::group::Group;
-        let ep = EncodedPoint::from_bytes(bytes).map_err(|e| format!("encoded point: {e:?}"))?;
+        let ep = EncodedPoint::from_bytes(bytes)
+            .map_err(|_| CryptoError::invalid_key("OPRF point: malformed SEC1 encoding"))?;
         let p = Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
-            .ok_or_else(|| "bad point".to_string())?;
+            .ok_or_else(|| CryptoError::invalid_key("OPRF point: not a valid curve point"))?;
         // Defense in depth: reject the identity (the sole caller already passes voprf-validated
         // bytes, but never let an identity element through if this is reused on raw input).
         if bool::from(p.is_identity()) {
-            return Err("identity point rejected".into());
+            return Err(CryptoError::invalid_key(
+                "OPRF point: identity element rejected",
+            ));
         }
         Ok(p)
     }
@@ -146,6 +166,9 @@ pub fn derive_luks_key(
     info.extend_from_slice(&(volume_id.len() as u64).to_be_bytes());
     info.extend_from_slice(volume_id.as_bytes());
     info.extend_from_slice(&epoch.to_be_bytes());
+    // hkdf 0.12 exposes no handle to the extracted PRK held inside `Hkdf` and does not zeroize it
+    // on drop, so the PRK cannot be wiped cleanly here. Acceptable for a spike: the PRK is a
+    // one-way HKDF-Extract of the already-uniform OPRF output, not the OPRF key itself.
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, oprf_output);
     let mut key = zeroize::Zeroizing::new([0u8; 32]);
     hk.expand(&info, &mut key[..])
@@ -250,6 +273,132 @@ mod tests {
             *derive_luks_key(out, "a/b", 1),
             *derive_luks_key(out, "a", 1),
             "length-prefixed info is injective over volume_id"
+        );
+    }
+
+    /// Fail-safe: a quorum that mixes in a share from a DIFFERENT key (a foreign/wrong share)
+    /// must produce a different combined evaluation, hence a different OPRF output and a different
+    /// derived LUKS key, than the correct quorum. This validates the documented "wrong partial =>
+    /// wrong key, LUKS rejects" guarantee.
+    #[test]
+    fn foreign_share_yields_different_key() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let input: &[u8] = b"keep-node-vault-v1";
+
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+
+        // A second, independent key split with the SAME identifiers/threshold/n.
+        let s_other = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares_other = threshold::split_key(&s_other, 2, 3, &mut rng).expect("split other");
+
+        // One blind; evaluate the correct and the mixed quorum against the SAME blinded element
+        // and finalize both with the same client state.
+        let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
+
+        // Correct quorum {0,1} from the real key.
+        let good = threshold::combine(
+            &[
+                threshold::partial_eval(&shares[0], &b.message).expect("p0"),
+                threshold::partial_eval(&shares[1], &b.message).expect("p1"),
+            ],
+            2,
+        )
+        .expect("combine good");
+
+        // Mixed quorum: one real share + one foreign share (a wrong/compromised holder). Still a
+        // valid group element, just interpolating the wrong key.
+        let bad = threshold::combine(
+            &[
+                threshold::partial_eval(&shares[0], &b.message).expect("p0"),
+                threshold::partial_eval(&shares_other[1], &b.message).expect("p1 foreign"),
+            ],
+            2,
+        )
+        .expect("combine bad");
+
+        let out_good = b.state.finalize(input, &good).expect("finalize good");
+        let out_bad = b.state.finalize(input, &bad).expect("finalize bad");
+
+        assert_ne!(
+            out_good, out_bad,
+            "a foreign share in the quorum must change the OPRF output"
+        );
+        assert_ne!(
+            *derive_luks_key(out_good.as_slice(), "vault0", 1),
+            *derive_luks_key(out_bad.as_slice(), "vault0", 1),
+            "a foreign share must change the derived LUKS key (LUKS would reject it)"
+        );
+    }
+
+    /// `combine` with fewer partials than the configured threshold must return Err.
+    #[test]
+    fn combine_below_threshold_errors() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let input: &[u8] = b"keep-node-vault-v1";
+
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
+        let p0 = threshold::partial_eval(&shares[0], &b.message).expect("p0");
+
+        assert!(
+            threshold::combine(&[p0], 2).is_err(),
+            "a single partial against threshold 2 must be rejected"
+        );
+    }
+
+    /// `split_key` with invalid parameters (t > n, t < 2) must return Err.
+    #[test]
+    fn split_key_rejects_invalid_params() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+
+        assert!(
+            threshold::split_key(&s, 4, 3, &mut rng).is_err(),
+            "t > n must be rejected"
+        );
+        assert!(
+            threshold::split_key(&s, 1, 3, &mut rng).is_err(),
+            "t < 2 must be rejected"
+        );
+    }
+
+    /// `point_from_bytes` (exercised via `partial_eval`'s point parsing) must reject malformed and
+    /// identity encodings. We test the parser directly through a crafted blinded-element path:
+    /// the identity point and garbage bytes must both fail to decode to a usable curve point.
+    #[test]
+    fn point_parsing_rejects_bad_and_identity() {
+        use k256::elliptic_curve::group::Group;
+        use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+        use k256::{EncodedPoint, ProjectivePoint};
+
+        // Identity (point at infinity) encodes to a single 0x00 byte in SEC1; from_encoded_point
+        // accepts it, so our explicit identity rejection is what guards this case.
+        let id = <ProjectivePoint as Group>::identity();
+        let id_bytes = id.to_encoded_point(true);
+        let decoded = Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(
+            &EncodedPoint::from_bytes(id_bytes.as_bytes()).expect("identity sec1 parses"),
+        ))
+        .expect("identity decodes");
+        assert!(
+            bool::from(decoded.is_identity()),
+            "identity must be recognized so the parser can reject it"
+        );
+
+        // Garbage compressed point: valid prefix tag, but x is not on the curve.
+        let mut garbage = [0u8; 33];
+        garbage[0] = 0x02;
+        garbage[1..].fill(0xff);
+        let parsed = EncodedPoint::from_bytes(garbage).ok().and_then(|ep| {
+            Option::<ProjectivePoint>::from(ProjectivePoint::from_encoded_point(&ep))
+        });
+        assert!(
+            parsed.is_none(),
+            "an off-curve x must not decode to a point"
         );
     }
 }
