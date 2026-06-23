@@ -3,9 +3,10 @@
 //!
 //! RFC 9497 standardizes OPRF/VOPRF but defines no secp256k1 ciphersuite, so we bind the
 //! generic 2HashDH construction to secp256k1 by implementing [`voprf::CipherSuite`] over
-//! `k256::Secp256k1`. k256's `GroupDigest` provides the RFC 9380
-//! `secp256k1_XMD:SHA-256_SSWU_RO_` hash-to-curve, and voprf's `Group` is blanket-implemented
-//! for any `GroupDigest`, so no upstream patch is needed.
+//! `k256::Secp256k1`. k256's `GroupDigest` (the `hash2curve` feature) provides the RFC 9380
+//! `secp256k1_XMD:SHA-256_SSWU_RO_` hash-to-curve. voprf 0.5 implements `Group` for any `C`
+//! where `C: GroupDigest` and `ProjectivePoint<C>: CofactorGroup + ToEncodedPoint<C>`;
+//! `k256::Secp256k1` with `hash2curve` satisfies those bounds, so no upstream patch is needed.
 //!
 //! The suite `ID` is KeepNode-specific (no standard secp256k1 suite exists) and MUST be
 //! pinned: it feeds the RFC 9497 context string / DST, so changing it changes every derived
