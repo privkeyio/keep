@@ -311,6 +311,56 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    pub fn oprf_eval_request(
+        keys: &Keys,
+        recipient: &PublicKey,
+        request: OprfEvalRequestPayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::OprfEvalRequest(request.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(request.group_pubkey)],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(request.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["oprf_eval_request"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
+    pub fn oprf_eval_share(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: OprfEvalSharePayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::OprfEvalShare(payload.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(payload.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["oprf_eval_share"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn xpub_announce(
         keys: &Keys,
         recipient: &PublicKey,

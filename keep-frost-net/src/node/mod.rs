@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod descriptor;
 mod ecdh;
+mod oprf;
 mod psbt;
 mod signing;
 
@@ -35,6 +36,7 @@ use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::nonce_pool::{NonceId, NoncePool};
 use crate::nonce_store::{FileNonceStore, NonceStore};
+use crate::oprf_session::{OprfEvalRateLimiter, OprfUnlockSessionManager};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
@@ -353,6 +355,23 @@ pub trait SigningHooks: Send + Sync {
     /// This is for notification purposes and cannot fail. Long-running
     /// operations should be offloaded to a separate task.
     fn post_sign(&self, session: &SessionInfo, signature: &[u8; 64]);
+
+    /// Called by an OPRF-unlock holder before it evaluates a requester's blinded
+    /// element. Returning `false` declines the evaluation without producing a
+    /// partial. The default permits every (already attested and rate-limited)
+    /// request so existing `SigningHooks` impls compile unchanged.
+    ///
+    /// Returns a boxed future rather than using `async fn` so the trait stays
+    /// object-safe (`Arc<dyn SigningHooks>`), avoiding an `async-trait`
+    /// dependency for one method.
+    fn approve_oprf_eval(
+        &self,
+        requester_share_index: u16,
+        session_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let _ = (requester_share_index, session_id);
+        Box::pin(async { true })
+    }
 }
 
 pub struct NoOpHooks;
@@ -450,6 +469,21 @@ pub enum KfpNodeEvent {
         shared_secret: Zeroizing<[u8; 32]>,
     },
     EcdhFailed {
+        session_id: [u8; 32],
+        error: String,
+    },
+    /// A holder received and accepted an OPRF evaluation request (emitted around
+    /// the approval hook, before the partial is produced).
+    OprfEvalRequested {
+        session_id: [u8; 32],
+        requester_index: u16,
+    },
+    /// The box collected a quorum of partials and derived the LUKS key locally.
+    OprfUnlockComplete {
+        session_id: [u8; 32],
+        luks_key: Zeroizing<[u8; 32]>,
+    },
+    OprfUnlockFailed {
         session_id: [u8; 32],
         error: String,
     },
@@ -585,6 +619,24 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .finish(),
             Self::EcdhFailed { session_id, error } => f
                 .debug_struct("EcdhFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
+            Self::OprfEvalRequested {
+                session_id,
+                requester_index,
+            } => f
+                .debug_struct("OprfEvalRequested")
+                .field("session_id", &hex::encode(session_id))
+                .field("requester_index", requester_index)
+                .finish(),
+            Self::OprfUnlockComplete { session_id, .. } => f
+                .debug_struct("OprfUnlockComplete")
+                .field("session_id", &hex::encode(session_id))
+                .field("luks_key", &"[REDACTED]")
+                .finish(),
+            Self::OprfUnlockFailed { session_id, error } => f
+                .debug_struct("OprfUnlockFailed")
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
                 .finish(),
@@ -725,6 +777,15 @@ pub struct KfpNode {
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
     pub(crate) nonce_pool: NoncePool,
     pub(crate) ecdh_sessions: Arc<RwLock<EcdhSessionManager>>,
+    /// Dedicated OPRF key share for the threshold-OPRF unlock. SEPARATE from the
+    /// FROST signing share: the holder applies this via
+    /// `keep_core::oprf::unlock::evaluate`, never the signing share. `None` on a
+    /// node that is not an OPRF holder, which then ignores eval requests.
+    pub(crate) oprf_key_share: Option<keep_core::oprf::threshold::KeyShare>,
+    /// Box-side OPRF unlock sessions (initiator only). Holders keep no session.
+    pub(crate) oprf_sessions: Arc<RwLock<OprfUnlockSessionManager>>,
+    /// Per-requester sliding-window limiter guarding the holder eval oracle.
+    pub(crate) oprf_rate_limiter: Arc<RwLock<OprfEvalRateLimiter>>,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
     pub(crate) peers: Arc<RwLock<PeerManager>>,
@@ -895,6 +956,11 @@ impl KfpNode {
             None => EcdhSessionManager::new(),
         };
 
+        let oprf_manager = match session_timeout {
+            Some(t) => OprfUnlockSessionManager::new().with_timeout(t),
+            None => OprfUnlockSessionManager::new(),
+        };
+
         let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
         let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
 
@@ -906,6 +972,9 @@ impl KfpNode {
             sessions: Arc::new(RwLock::new(session_manager)),
             nonce_pool: NoncePool::new(),
             ecdh_sessions: Arc::new(RwLock::new(ecdh_manager)),
+            oprf_key_share: None,
+            oprf_sessions: Arc::new(RwLock::new(oprf_manager)),
+            oprf_rate_limiter: Arc::new(RwLock::new(OprfEvalRateLimiter::new())),
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
@@ -1147,6 +1216,20 @@ impl KfpNode {
             .read()
             .get_peer_recovery_xpubs(share_index)
             .map(|xpubs| xpubs.to_vec())
+    }
+
+    /// Install this node's dedicated OPRF key share, making it an OPRF-unlock
+    /// holder and enabling `request_oprf_unlock` as an initiator. This is a
+    /// separate key from the FROST signing share; the holder applies it only via
+    /// `keep_core::oprf::unlock::evaluate`.
+    pub fn set_oprf_key_share(&mut self, share: keep_core::oprf::threshold::KeyShare) {
+        self.oprf_key_share = Some(share);
+    }
+
+    /// Builder form of [`set_oprf_key_share`](Self::set_oprf_key_share).
+    pub fn with_oprf_key_share(mut self, share: keep_core::oprf::threshold::KeyShare) -> Self {
+        self.oprf_key_share = Some(share);
+        self
     }
 
     pub fn set_descriptor_proposers(&self, indices: HashSet<u16>) {
@@ -1405,6 +1488,7 @@ impl KfpNode {
                 _ = cleanup_interval.tick() => {
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
+                    self.oprf_sessions.write().cleanup_expired();
                     let expired = self.descriptor_sessions.write().cleanup_expired();
                     for (session_id, reason) in expired {
                         let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -1486,7 +1570,10 @@ impl KfpNode {
 
         if !matches!(
             msg,
-            KfpMessage::Announce(_) | KfpMessage::SignRequest(_) | KfpMessage::EcdhRequest(_)
+            KfpMessage::Announce(_)
+                | KfpMessage::SignRequest(_)
+                | KfpMessage::EcdhRequest(_)
+                | KfpMessage::OprfEvalRequest(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -1521,6 +1608,12 @@ impl KfpNode {
             }
             KfpMessage::EcdhComplete(payload) => {
                 self.handle_ecdh_complete(event.pubkey, payload).await?;
+            }
+            KfpMessage::OprfEvalRequest(payload) => {
+                self.handle_oprf_eval_request(event.pubkey, payload).await?;
+            }
+            KfpMessage::OprfEvalShare(payload) => {
+                self.handle_oprf_eval_share(event.pubkey, payload).await?;
             }
             KfpMessage::RefreshRequest(_)
             | KfpMessage::RefreshRound1(_)
