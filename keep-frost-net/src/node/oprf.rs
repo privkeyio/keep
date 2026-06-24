@@ -118,8 +118,9 @@ impl KfpNode {
             requester_index: request.requester_share_index,
         });
 
-        // Operator approval hook (default-allow). Clone the Arc so the read guard
-        // is dropped before awaiting.
+        // Operator approval hook (default-DENY; a holder must opt in with an
+        // explicit policy). Clone the Arc so the read guard is dropped before
+        // awaiting.
         let hooks = self.hooks.read().clone();
         if !hooks
             .approve_oprf_eval(request.requester_share_index, request.session_id)
@@ -294,13 +295,25 @@ impl KfpNode {
         // ECDH #561.
         let mut rx = self.event_tx.subscribe();
 
-        for (share_index, pubkey) in participant_peers {
-            let event = KfpEventBuilder::oprf_eval_request(&self.keys, &pubkey, request.clone())?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-            debug!(share_index, "Sent OPRF eval request");
+        // Tear the just-created session down on any send failure, instead of
+        // letting it linger until cleanup_expired reaps it (matches the teardown
+        // on the timeout/error path below).
+        let send_result: Result<()> = async {
+            for (share_index, pubkey) in participant_peers {
+                let event =
+                    KfpEventBuilder::oprf_eval_request(&self.keys, &pubkey, request.clone())?;
+                self.client
+                    .send_event(&event)
+                    .await
+                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                debug!(share_index, "Sent OPRF eval request");
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = send_result {
+            self.oprf_sessions.write().complete_session(&session_id);
+            return Err(e);
         }
 
         // Single-participant (threshold=1) or quorum already met by our own
