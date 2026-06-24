@@ -361,6 +361,59 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    /// Dealer → holder: the trusted-dealer OPRF enrollment carrying the holder's
+    /// secret key share. NIP-44-encrypted to the target peer so the relay only
+    /// ever sees ciphertext (the `share` is the most sensitive payload).
+    pub fn oprf_enroll(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: OprfEnrollPayload,
+    ) -> Result<Event> {
+        let group_pubkey = payload.group_pubkey;
+        let session_id = payload.session_id;
+        let msg = KfpMessage::OprfEnroll(payload);
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+            .tag(Tag::custom(TagKind::custom("t"), ["oprf_enroll"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
+    /// Holder → dealer: acknowledgement of a received enrollment share.
+    pub fn oprf_enroll_ack(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: OprfEnrollAckPayload,
+    ) -> Result<Event> {
+        let msg = KfpMessage::OprfEnrollAck(payload.clone());
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(
+                TagKind::custom("s"),
+                [hex::encode(payload.session_id)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["oprf_enroll_ack"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn xpub_announce(
         keys: &Keys,
         recipient: &PublicKey,

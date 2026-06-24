@@ -812,7 +812,10 @@ pub(crate) async fn frost_event_listener(
                     // desktop UI yet (KeepNode appliance flow).
                     Ok(KfpNodeEvent::OprfEvalRequested { .. })
                     | Ok(KfpNodeEvent::OprfUnlockComplete { .. })
-                    | Ok(KfpNodeEvent::OprfUnlockFailed { .. }) => {}
+                    | Ok(KfpNodeEvent::OprfUnlockFailed { .. })
+                    | Ok(KfpNodeEvent::OprfShareReceived { .. })
+                    | Ok(KfpNodeEvent::OprfEnrollComplete { .. })
+                    | Ok(KfpNodeEvent::OprfEnrollFailed { .. }) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

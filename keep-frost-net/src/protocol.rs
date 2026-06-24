@@ -104,6 +104,8 @@ pub enum KfpMessage {
     EcdhComplete(EcdhCompletePayload),
     OprfEvalRequest(OprfEvalRequestPayload),
     OprfEvalShare(OprfEvalSharePayload),
+    OprfEnroll(OprfEnrollPayload),
+    OprfEnrollAck(OprfEnrollAckPayload),
     RefreshRequest(RefreshRequestPayload),
     RefreshRound1(RefreshRound1Payload),
     RefreshRound2(RefreshRound2Payload),
@@ -138,6 +140,8 @@ impl KfpMessage {
             KfpMessage::EcdhComplete(_) => "ecdh_complete",
             KfpMessage::OprfEvalRequest(_) => "oprf_eval_request",
             KfpMessage::OprfEvalShare(_) => "oprf_eval_share",
+            KfpMessage::OprfEnroll(_) => "oprf_enroll",
+            KfpMessage::OprfEnrollAck(_) => "oprf_enroll_ack",
             KfpMessage::RefreshRequest(_) => "refresh_request",
             KfpMessage::RefreshRound1(_) => "refresh_round1",
             KfpMessage::RefreshRound2(_) => "refresh_round2",
@@ -170,6 +174,8 @@ impl KfpMessage {
             KfpMessage::EcdhComplete(p) => Some(&p.session_id),
             KfpMessage::OprfEvalRequest(p) => Some(&p.session_id),
             KfpMessage::OprfEvalShare(p) => Some(&p.session_id),
+            KfpMessage::OprfEnroll(p) => Some(&p.session_id),
+            KfpMessage::OprfEnrollAck(p) => Some(&p.session_id),
             KfpMessage::RefreshRequest(p) => Some(&p.session_id),
             KfpMessage::RefreshRound1(p) => Some(&p.session_id),
             KfpMessage::RefreshRound2(p) => Some(&p.session_id),
@@ -196,6 +202,7 @@ impl KfpMessage {
             KfpMessage::NonceCommitment(p) => Some(&p.group_pubkey),
             KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
             KfpMessage::OprfEvalRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::OprfEnroll(p) => Some(&p.group_pubkey),
             KfpMessage::RefreshRequest(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorPropose(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorContribute(p) => Some(&p.group_pubkey),
@@ -353,6 +360,32 @@ impl KfpMessage {
                 // 33-byte compressed point (see keep_core::oprf::threshold).
                 if p.partial.len() != OPRF_PARTIAL_LEN {
                     return Err("Invalid OPRF partial size");
+                }
+            }
+            KfpMessage::OprfEnroll(p) => {
+                // The secret share is exactly the serialized key-share length.
+                if p.share.len() != keep_core::oprf::threshold::KEY_SHARE_LEN {
+                    return Err("Invalid OPRF key share size");
+                }
+                if p.dealer_index == 0 {
+                    return Err("dealer_index must be non-zero");
+                }
+                if p.target_index == 0 {
+                    return Err("target_index must be non-zero");
+                }
+                if p.threshold < 2 {
+                    return Err("threshold must be at least 2");
+                }
+                if p.threshold > p.total {
+                    return Err("threshold must not exceed total");
+                }
+                if p.total as usize > MAX_PARTICIPANTS {
+                    return Err("total exceeds maximum participants");
+                }
+            }
+            KfpMessage::OprfEnrollAck(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
                 }
             }
             KfpMessage::RefreshRequest(p) => {
@@ -1233,6 +1266,88 @@ impl OprfEvalSharePayload {
             session_id,
             share_index,
             partial,
+        }
+    }
+}
+
+/// Dealer (box) → holder: a trusted-dealer OPRF enrollment carrying the holder's
+/// dedicated OPRF secret key share. `share` is the 64-byte
+/// `keep_core::oprf::threshold::serialize_key_share` output and is the most
+/// sensitive payload in the protocol; it is delivered NIP-44 encrypted to the
+/// target peer's pubkey and REDACTED from `Debug` (mirrors [`EcdhCompletePayload`]).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OprfEnrollPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    pub dealer_index: u16,
+    pub target_index: u16,
+    pub threshold: u16,
+    pub total: u16,
+    #[serde(with = "hex_vec_zeroizing")]
+    pub share: Zeroizing<Vec<u8>>,
+    pub created_at: u64,
+}
+
+impl OprfEnrollPayload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        dealer_index: u16,
+        target_index: u16,
+        threshold: u16,
+        total: u16,
+        share: Zeroizing<Vec<u8>>,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            dealer_index,
+            target_index,
+            threshold,
+            total,
+            share,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+impl std::fmt::Debug for OprfEnrollPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OprfEnrollPayload")
+            .field("session_id", &hex::encode(self.session_id))
+            .field("group_pubkey", &hex::encode(self.group_pubkey))
+            .field("dealer_index", &self.dealer_index)
+            .field("target_index", &self.target_index)
+            .field("threshold", &self.threshold)
+            .field("total", &self.total)
+            .field("share", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// Holder → dealer: acknowledgement that the enrollment share was received and
+/// validated. Carries the holder's own FROST share index so the dealer can bind
+/// the acking pubkey to a known peer.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OprfEnrollAckPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+}
+
+impl OprfEnrollAckPayload {
+    pub fn new(session_id: [u8; 32], share_index: u16) -> Self {
+        Self {
+            session_id,
+            share_index,
         }
     }
 }

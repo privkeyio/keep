@@ -2639,3 +2639,221 @@ async fn test_oprf_eval_rejects_replayed_request() {
         "a stale request must be rejected with ReplayDetected, got {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Trusted-dealer OPRF enrollment tests.
+//
+// The "box" (dealer) has already split an OPRF secret and now ships each remote
+// holder that holder's secret key share, collecting an ack from each. Like the
+// eval oracle, taking custody of a key share is gated on STRICT (`Verified`)
+// attestation of the dealer.
+// ---------------------------------------------------------------------------
+
+/// Happy path: a 2-of-3 group where the dealer (id 1) distributes the holder's
+/// (id 2) OPRF secret key share. The holder, seeing the dealer as `Verified`,
+/// takes custody (emits `OprfShareReceived` with a share that round-trips
+/// through `deserialize_key_share` and equals what was sent) and acks, so the
+/// dealer's `distribute_oprf_shares` completes.
+#[tokio::test]
+async fn test_oprf_enroll_distributes_share_and_completes() {
+    use std::sync::Arc;
+    use zeroize::Zeroizing;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll").unwrap();
+    let share1 = shares.remove(0); // FROST id 1 = dealer (box)
+    let share2 = shares.remove(0); // FROST id 2 = holder
+
+    let oprf = split_oprf_key_2of3();
+    // The remote target (holder id 2) gets the vsss share at index 2 (oprf[1]).
+    // The dealer keeps its own share (oprf[0]) sealed locally; it is NOT sent.
+    let target_bytes = keep_core::oprf::threshold::serialize_key_share(&oprf[1]).to_vec();
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("dealer node");
+    let mut node2 = KfpNode::new(share2, vec![relay])
+        .await
+        .expect("holder node");
+
+    let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node1_run = Arc::clone(&node1);
+    let node2_run = Arc::clone(&node2);
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1_run.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2_run.run().await;
+    });
+
+    let mut n1 = 0u32;
+    let mut n2 = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        loop {
+            tokio::select! {
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => n1 += 1,
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => n2 += 1,
+            }
+            if n1 >= 1 && n2 >= 1 {
+                return;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        panic!("Peer discovery timed out: node1={n1}, node2={n2}");
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The holder must see the dealer as Verified to take custody of a share.
+    node2.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+    // Watch the holder for OprfShareReceived (rx2 already subscribed, so the
+    // event is buffered even if it arrives before we await).
+    let recv_task = tokio::spawn(async move {
+        loop {
+            match rx2.recv().await {
+                Ok(KfpNodeEvent::OprfShareReceived {
+                    dealer_index,
+                    threshold,
+                    total,
+                    share,
+                }) => return Some((dealer_index, threshold, total, share)),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    });
+
+    let dist = timeout(
+        Duration::from_secs(45),
+        node1.distribute_oprf_shares(vec![(2u16, Zeroizing::new(target_bytes.clone()))], 2, 3),
+    )
+    .await;
+
+    let received = timeout(Duration::from_secs(5), recv_task).await;
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+
+    match dist {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("distribute_oprf_shares failed: {e}"),
+        Err(_) => panic!("distribute_oprf_shares timed out (no ack)"),
+    }
+
+    let received = received
+        .expect("holder OprfShareReceived wait timed out")
+        .expect("holder recv task panicked")
+        .expect("holder must emit OprfShareReceived");
+    let (dealer_index, threshold, total, share) = received;
+    assert_eq!(dealer_index, 1, "share came from the dealer at index 1");
+    assert_eq!(threshold, 2);
+    assert_eq!(total, 3);
+    assert_eq!(
+        share.as_slice(),
+        target_bytes.as_slice(),
+        "the received share must equal exactly what the dealer sent"
+    );
+    keep_core::oprf::threshold::deserialize_key_share(&share)
+        .expect("the received share must be a valid OPRF key share");
+}
+
+/// Build a well-formed OPRF enrollment for `holder` (FROST id 2) from a synthetic
+/// dealer at share index 1, returning the dealer pubkey and the payload.
+fn make_oprf_enroll(holder: &KfpNode) -> (nostr_sdk::PublicKey, keep_frost_net::OprfEnrollPayload) {
+    let dealer_pubkey = nostr_sdk::Keys::generate().public_key();
+    let oprf = split_oprf_key_2of3();
+    let share = keep_core::oprf::threshold::serialize_key_share(&oprf[1]).to_vec();
+    let payload = keep_frost_net::OprfEnrollPayload::new(
+        [0x01u8; 32],
+        *holder.group_pubkey(),
+        1, // dealer_index
+        2, // target_index = holder FROST id 2
+        2, // threshold
+        3, // total
+        zeroize::Zeroizing::new(share),
+    );
+    (dealer_pubkey, payload)
+}
+
+/// Gate (attestation): a dealer whose peer is NOT `Verified` (default
+/// `NotProvided`) is rejected with `UntrustedPeer` before the share is taken
+/// into custody, and the holder emits no `OprfShareReceived` (and sends no ack).
+#[tokio::test]
+async fn test_oprf_enroll_rejects_unattested_dealer() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll-unattested").unwrap();
+    let _ = shares.remove(0); // id 1 (dealer is synthetic)
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+
+    let (dealer_pubkey, payload) = make_oprf_enroll(&holder);
+    // Inject the dealer with the DEFAULT attestation status (NotProvided).
+    holder.test_inject_peer(keep_frost_net::Peer::new(dealer_pubkey, 1));
+
+    let mut rx = holder.subscribe();
+    let result = holder.test_handle_oprf_enroll(dealer_pubkey, payload).await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::UntrustedPeer(_))),
+        "an unattested dealer must be rejected with UntrustedPeer, got {result:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no OprfShareReceived may be emitted for a rejected unattested dealer"
+    );
+}
+
+/// With a designated dealer pinned, an enrollment from a different index is refused even when the
+/// sender is attested (defense in depth against a compromised-but-attested group member).
+#[tokio::test]
+async fn test_oprf_enroll_rejects_non_designated_dealer() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll-pin").unwrap();
+    let _ = shares.remove(0); // id 1
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    // Pin the designated dealer to index 2; the enrollment below arrives from index 1.
+    holder.set_expected_oprf_dealer(2);
+
+    let (dealer_pubkey, payload) = make_oprf_enroll(&holder); // dealer_index = 1
+    holder.test_inject_peer(keep_frost_net::Peer::new(dealer_pubkey, 1));
+    // Attest the sender, so the pin (not attestation) is what rejects it.
+    holder.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+    let mut rx = holder.subscribe();
+    let result = holder.test_handle_oprf_enroll(dealer_pubkey, payload).await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::UntrustedPeer(_))),
+        "a non-designated dealer must be rejected even when attested, got {result:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no OprfShareReceived may be emitted for a non-designated dealer"
+    );
+}

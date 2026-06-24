@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod descriptor;
 mod ecdh;
+mod enroll;
 mod oprf;
 mod psbt;
 mod signing;
@@ -32,6 +33,7 @@ use crate::attestation::{verify_peer_attestation, ExpectedPcrs};
 use crate::audit::SigningAuditLog;
 use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
+use crate::enroll_session::OprfEnrollSessionManager;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::nonce_pool::{NonceId, NoncePool};
@@ -500,6 +502,26 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         error: String,
     },
+    /// A holder took custody of a validated OPRF secret key share from a trusted
+    /// dealer. The node/app must seal `share` (TPM or keystore).
+    ///
+    /// SECURITY: this carries live key material on the shared broadcast bus; the
+    /// `Debug` impl redacts it and it is never serialized to the wire. Prefer
+    /// sealing it immediately and do not log the event payload.
+    OprfShareReceived {
+        dealer_index: u16,
+        threshold: u16,
+        total: u16,
+        share: Zeroizing<Vec<u8>>,
+    },
+    /// The dealer collected an ack from every enrollment target.
+    OprfEnrollComplete {
+        session_id: [u8; 32],
+    },
+    OprfEnrollFailed {
+        session_id: [u8; 32],
+        error: String,
+    },
     DescriptorProposed {
         session_id: [u8; 32],
     },
@@ -653,6 +675,27 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("error", error)
                 .finish(),
+            Self::OprfShareReceived {
+                dealer_index,
+                threshold,
+                total,
+                ..
+            } => f
+                .debug_struct("OprfShareReceived")
+                .field("dealer_index", dealer_index)
+                .field("threshold", threshold)
+                .field("total", total)
+                .field("share", &"[REDACTED]")
+                .finish(),
+            Self::OprfEnrollComplete { session_id } => f
+                .debug_struct("OprfEnrollComplete")
+                .field("session_id", &hex::encode(session_id))
+                .finish(),
+            Self::OprfEnrollFailed { session_id, error } => f
+                .debug_struct("OprfEnrollFailed")
+                .field("session_id", &hex::encode(session_id))
+                .field("error", error)
+                .finish(),
             Self::DescriptorProposed { session_id } => f
                 .debug_struct("DescriptorProposed")
                 .field("session_id", &hex::encode(session_id))
@@ -799,6 +842,12 @@ pub struct KfpNode {
     pub(crate) oprf_sessions: Arc<RwLock<OprfUnlockSessionManager>>,
     /// Per-requester sliding-window limiter guarding the holder eval oracle.
     pub(crate) oprf_rate_limiter: Arc<RwLock<OprfEvalRateLimiter>>,
+    /// Dealer-side OPRF enrollment sessions (trusted-dealer share distribution).
+    pub(crate) enroll_sessions: Arc<RwLock<OprfEnrollSessionManager>>,
+    /// Holder-side pin of the only share index allowed to deal an OPRF enrollment to this node.
+    /// `None` accepts an enrollment from any attested, authorized group peer; setting it (to the
+    /// box's index) refuses a share from any peer other than the designated dealer.
+    pub(crate) expected_oprf_dealer: Option<u16>,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
     pub(crate) peers: Arc<RwLock<PeerManager>>,
@@ -974,6 +1023,11 @@ impl KfpNode {
             None => OprfUnlockSessionManager::new(),
         };
 
+        let enroll_manager = match session_timeout {
+            Some(t) => OprfEnrollSessionManager::new().with_timeout(t),
+            None => OprfEnrollSessionManager::new(),
+        };
+
         let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
         let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
 
@@ -988,6 +1042,8 @@ impl KfpNode {
             oprf_key_share: None,
             oprf_sessions: Arc::new(RwLock::new(oprf_manager)),
             oprf_rate_limiter: Arc::new(RwLock::new(OprfEvalRateLimiter::new())),
+            enroll_sessions: Arc::new(RwLock::new(enroll_manager)),
+            expected_oprf_dealer: None,
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
@@ -1142,6 +1198,19 @@ impl KfpNode {
         self.handle_oprf_eval_request(from, request).await
     }
 
+    /// Test-only: drive the holder-side OPRF enrollment handler directly. Lets the
+    /// gate tests assert on the returned `Result` (attestation, replay, policy)
+    /// without a full dealer round-trip.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn test_handle_oprf_enroll(
+        &self,
+        from: PublicKey,
+        payload: OprfEnrollPayload,
+    ) -> Result<()> {
+        self.handle_oprf_enroll(from, payload).await
+    }
+
     pub fn set_replay_window(&mut self, secs: u64) {
         self.replay_window_secs = secs;
     }
@@ -1277,6 +1346,19 @@ impl KfpNode {
     pub fn with_oprf_key_share(mut self, share: keep_core::oprf::threshold::KeyShare) -> Self {
         self.oprf_key_share = Some(share);
         self
+    }
+
+    /// Pin the only share index permitted to deal an OPRF enrollment to this node (the box). When
+    /// set, `handle_oprf_enroll` refuses a share from any other peer, even an attested one, so a
+    /// compromised-but-attested group member cannot poison or overwrite this holder's share.
+    pub fn with_expected_oprf_dealer(mut self, dealer_index: u16) -> Self {
+        self.expected_oprf_dealer = Some(dealer_index);
+        self
+    }
+
+    /// Setter form of [`with_expected_oprf_dealer`](Self::with_expected_oprf_dealer).
+    pub fn set_expected_oprf_dealer(&mut self, dealer_index: u16) {
+        self.expected_oprf_dealer = Some(dealer_index);
     }
 
     pub fn set_descriptor_proposers(&self, indices: HashSet<u16>) {
@@ -1536,6 +1618,7 @@ impl KfpNode {
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
                     self.oprf_sessions.write().cleanup_expired();
+                    self.enroll_sessions.write().cleanup_expired();
                     let expired = self.descriptor_sessions.write().cleanup_expired();
                     for (session_id, reason) in expired {
                         let _ = self.event_tx.send(KfpNodeEvent::DescriptorFailed {
@@ -1621,6 +1704,7 @@ impl KfpNode {
                 | KfpMessage::SignRequest(_)
                 | KfpMessage::EcdhRequest(_)
                 | KfpMessage::OprfEvalRequest(_)
+                | KfpMessage::OprfEnroll(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -1661,6 +1745,12 @@ impl KfpNode {
             }
             KfpMessage::OprfEvalShare(payload) => {
                 self.handle_oprf_eval_share(event.pubkey, payload).await?;
+            }
+            KfpMessage::OprfEnroll(payload) => {
+                self.handle_oprf_enroll(event.pubkey, payload).await?;
+            }
+            KfpMessage::OprfEnrollAck(payload) => {
+                self.handle_oprf_enroll_ack(event.pubkey, payload).await?;
             }
             KfpMessage::RefreshRequest(_)
             | KfpMessage::RefreshRound1(_)
