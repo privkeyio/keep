@@ -1,23 +1,23 @@
-//! KeepNode threshold-OPRF unlock primitive (frost-gate v2), step 1: the secp256k1 OPRF
-//! ciphersuite.
+//! Threshold Oblivious PRF over secp256k1, for deriving a symmetric key from a t-of-n quorum
+//! without any single party reconstructing the key.
 //!
-//! RFC 9497 standardizes OPRF/VOPRF but defines no secp256k1 ciphersuite, so we bind the
-//! generic 2HashDH construction to secp256k1 by implementing [`voprf::CipherSuite`] over
+//! RFC 9497 standardizes the OPRF/VOPRF construction but defines no secp256k1 ciphersuite, so the
+//! generic 2HashDH construction is bound to secp256k1 by implementing [`voprf::CipherSuite`] over
 //! `k256::Secp256k1`. k256's `GroupDigest` (the `hash2curve` feature) provides the RFC 9380
-//! `secp256k1_XMD:SHA-256_SSWU_RO_` hash-to-curve. voprf 0.5 implements `Group` for any `C`
-//! where `C: GroupDigest` and `ProjectivePoint<C>: CofactorGroup + ToEncodedPoint<C>`;
-//! `k256::Secp256k1` with `hash2curve` satisfies those bounds, so no upstream patch is needed.
+//! `secp256k1_XMD:SHA-256_SSWU_RO_` hash-to-curve. voprf implements `Group` for any `C` where
+//! `C: GroupDigest` and `ProjectivePoint<C>: CofactorGroup + ToEncodedPoint<C>`, which
+//! `k256::Secp256k1` satisfies, so no upstream changes are required.
 //!
-//! The suite `ID` is KeepNode-specific (no standard secp256k1 suite exists) and MUST be
-//! pinned: it feeds the RFC 9497 context string / DST, so changing it changes every derived
-//! key. This module is the single-server primitive only; the 2-of-3 threshold layer (Shamir
-//! key-sharing + Lagrange combination + DLEQ verifiability) lands on top of it.
+//! The suite `ID` is non-standard (RFC 9497 defines no secp256k1 suite) and is pinned here. It
+//! feeds the RFC 9497 context string / DST, so it must never change once it has derived keys that
+//! protect data: changing it changes every derived key.
 //!
-//! Design + threat model: see SPIKE-frost-unlock-v2.
+//! This module provides the ciphersuite, the [`threshold`] layer (Shamir-shared key, in-exponent
+//! Lagrange combination of partial evaluations), and [`derive_luks_key`].
 
 use voprf::CipherSuite;
 
-/// KeepNode's secp256k1 OPRF ciphersuite: the RFC 9497 construction on secp256k1 with SHA-256.
+/// The secp256k1 OPRF ciphersuite: the RFC 9497 construction on secp256k1 with SHA-256.
 #[derive(Debug, Clone, Copy)]
 pub struct Secp256k1Sha256;
 
@@ -167,9 +167,9 @@ pub fn derive_luks_key(
     info.extend_from_slice(&(volume_id.len() as u64).to_be_bytes());
     info.extend_from_slice(volume_id.as_bytes());
     info.extend_from_slice(&epoch.to_be_bytes());
-    // hkdf 0.12 exposes no handle to the extracted PRK held inside `Hkdf` and does not zeroize it
-    // on drop, so the PRK cannot be wiped cleanly here. Acceptable for a spike: the PRK is a
-    // one-way HKDF-Extract of the already-uniform OPRF output, not the OPRF key itself.
+    // The `hkdf` crate exposes no handle to the extracted PRK held inside `Hkdf` and does not
+    // zeroize it on drop, so the PRK is not wiped here. The PRK is a one-way HKDF-Extract of the
+    // already-uniform OPRF output, not the OPRF key, so it exposes no recoverable key material.
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, oprf_output);
     let mut key = zeroize::Zeroizing::new([0u8; 32]);
     hk.expand(&info, &mut key[..])
