@@ -61,6 +61,13 @@ pub mod threshold {
     /// A share-holder's partial evaluation `s_i * B` (a group element, same identifier).
     pub type PartialEval = DefaultShare<Id, ValueGroup<ProjectivePoint>>;
 
+    /// Wire layout of a serialized partial: a 32-byte identifier scalar followed by a 33-byte
+    /// compressed point. Named once so `serialize_partial`/`deserialize_partial` can't drift.
+    pub(super) const ID_LEN: usize = 32;
+    const POINT_LEN: usize = 33;
+    /// Total serialized-partial length (`ID_LEN + POINT_LEN`).
+    pub(super) const PARTIAL_LEN: usize = ID_LEN + POINT_LEN;
+
     /// Split an OPRF key into `n` shares with threshold `t` over secp256k1's scalar field.
     ///
     /// SECURITY (caller contract): the returned [`KeyShare`]s hold plaintext scalar key shares.
@@ -95,11 +102,19 @@ pub mod threshold {
         share: &KeyShare,
         blinded: &BlindedElement<Secp256k1Sha256>,
     ) -> Result<PartialEval, CryptoError> {
+        use k256::elliptic_curve::group::Group;
         use zeroize::Zeroize;
         let b = point_from_bytes(blinded.serialize().as_slice())?;
         let mut s_i: Scalar = **share.value();
         let p_i = b * s_i;
         s_i.zeroize();
+        // Unreachable today (`b` is non-identity and `s_i` non-zero on a prime-order curve), but
+        // guard so an identity partial can never reach the fixed-size `serialize_partial`.
+        if bool::from(p_i.is_identity()) {
+            return Err(CryptoError::invalid_key(
+                "OPRF partial: identity evaluation rejected",
+            ));
+        }
         Ok(DefaultShare::with_identifier_and_value(
             *share.identifier(),
             ValueGroup::from(p_i),
@@ -129,6 +144,41 @@ pub mod threshold {
         })?;
         EvaluationElement::deserialize(bs.0.to_encoded_point(true).as_bytes())
             .map_err(|_| CryptoError::invalid_key("OPRF combined evaluation element is invalid"))
+    }
+
+    /// Wire encoding of a partial evaluation: the 32-byte identifier scalar (the Shamir
+    /// x-coordinate, needed for the Lagrange combine) followed by the 33-byte compressed point
+    /// `s_i * B`. The point reveals nothing about `s_i` (discrete log), so this is not secret.
+    pub(super) fn serialize_partial(p: &PartialEval) -> [u8; PARTIAL_LEN] {
+        use k256::elliptic_curve::PrimeField;
+        let mut out = [0u8; PARTIAL_LEN];
+        out[..ID_LEN].copy_from_slice(p.identifier().0.to_repr().as_slice());
+        out[ID_LEN..].copy_from_slice(p.value().0.to_encoded_point(true).as_bytes());
+        out
+    }
+
+    /// Inverse of [`serialize_partial`]. A forged identifier or point only interpolates the wrong
+    /// key (LUKS rejects it); it cannot leak key material, consistent with the module's fail-safe
+    /// model. Identity points are rejected by [`point_from_bytes`].
+    pub(super) fn deserialize_partial(bytes: &[u8]) -> Result<PartialEval, CryptoError> {
+        use k256::elliptic_curve::PrimeField;
+        if bytes.len() != PARTIAL_LEN {
+            return Err(CryptoError::invalid_key("OPRF partial: wrong length"));
+        }
+        let mut repr = k256::FieldBytes::default();
+        repr.copy_from_slice(&bytes[..ID_LEN]);
+        let id = Option::<Scalar>::from(Scalar::from_repr(repr))
+            .ok_or_else(|| CryptoError::invalid_key("OPRF partial: non-canonical identifier"))?;
+        // Reject the zero identifier (the secret's own evaluation point) explicitly at this trust
+        // boundary rather than relying on `combine()`'s internal zero/duplicate rejection.
+        if bool::from(id.is_zero()) {
+            return Err(CryptoError::invalid_key("OPRF partial: zero identifier"));
+        }
+        let point = point_from_bytes(&bytes[ID_LEN..])?;
+        Ok(DefaultShare::with_identifier_and_value(
+            IdentifierPrimeField(id),
+            ValueGroup::from(point),
+        ))
     }
 
     pub(crate) fn point_from_bytes(bytes: &[u8]) -> Result<ProjectivePoint, CryptoError> {
@@ -177,10 +227,101 @@ pub fn derive_luks_key(
     key
 }
 
+/// Byte-oriented client/holder API for the threshold-OPRF unlock.
+///
+/// Keeps the voprf/vsss/k256 stack behind an opaque-bytes boundary so a transport
+/// (`keep-frost-net`) and callers (`keep-node`) shuttle wire bytes without depending on the OPRF
+/// crate ecosystem. The box is the client ([`blind`] then [`Client::finalize_luks_key`]); the
+/// box / phone / replica are holders ([`evaluate`]). No holder, and not the client, ever
+/// reconstructs the key.
+pub mod unlock {
+    use super::derive_luks_key;
+    use super::threshold::{self, KeyShare};
+    use super::Secp256k1Sha256;
+    use crate::error::CryptoError;
+    use voprf::{BlindedElement, OprfClient};
+
+    /// Client state for one unlock attempt: the voprf blinding secret plus the unlock input,
+    /// both needed at [`Client::finalize_luks_key`]. The input is a fixed, low-entropy label, so
+    /// the eval oracle MUST be authenticated and rate-limited (see [`evaluate`]).
+    pub struct Client {
+        state: OprfClient<Secp256k1Sha256>,
+        input: Vec<u8>,
+    }
+
+    /// Blind the unlock `input`. Returns the [`Client`] (kept until finalize) and the wire bytes
+    /// of the blinded element to send to each holder.
+    pub fn blind(input: &[u8]) -> Result<(Client, Vec<u8>), CryptoError> {
+        let mut rng = rand_core_06::OsRng;
+        let res = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng)
+            .map_err(|_| CryptoError::key_derivation("OPRF blind failed"))?;
+        Ok((
+            Client {
+                state: res.state,
+                input: input.to_vec(),
+            },
+            res.message.serialize().to_vec(),
+        ))
+    }
+
+    impl Client {
+        /// Combine holder partial evaluations (each as wire bytes from [`evaluate`]) into the OPRF
+        /// output and derive the 32-byte LUKS key. `threshold` MUST equal the `t` used at split.
+        pub fn finalize_luks_key(
+            &self,
+            partials: &[impl AsRef<[u8]>],
+            threshold: usize,
+            volume_id: &str,
+            epoch: u32,
+        ) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
+            let parts = partials
+                .iter()
+                .map(|p| threshold::deserialize_partial(p.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let eval = threshold::combine(&parts, threshold)?;
+            let out = self
+                .state
+                .finalize(&self.input, &eval)
+                .map_err(|_| CryptoError::key_derivation("OPRF finalize failed"))?;
+            Ok(derive_luks_key(out.as_slice(), volume_id, epoch))
+        }
+    }
+
+    /// Holder side: evaluate the client's blinded element (wire bytes from [`blind`]) with this
+    /// holder's key share, returning the partial evaluation as wire bytes. The share never leaves
+    /// the holder.
+    ///
+    /// SECURITY: the transport exposing this oracle MUST authenticate the caller and strictly
+    /// rate-limit it. Bounding evaluations is what keeps the fixed, low-entropy unlock input from
+    /// being brute-forced offline (see [`super::threshold::partial_eval`]).
+    pub fn evaluate(
+        share: &KeyShare,
+        blinded: &[u8],
+    ) -> Result<[u8; threshold::PARTIAL_LEN], CryptoError> {
+        let be = BlindedElement::<Secp256k1Sha256>::deserialize(blinded)
+            .map_err(|_| CryptoError::invalid_key("OPRF blinded element: malformed"))?;
+        let partial = threshold::partial_eval(share, &be)?;
+        Ok(threshold::serialize_partial(&partial))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use voprf::{OprfClient, OprfServer};
+
+    /// One key, two ways: a single-key voprf server and a 2-of-3 Shamir split of the SAME key, for
+    /// the tests that cross-check the threshold path against the un-split key.
+    fn single_key_server_and_2of3_shares() -> (OprfServer<Secp256k1Sha256>, Vec<threshold::KeyShare>)
+    {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let server = OprfServer::<Secp256k1Sha256>::new_with_key(s.to_bytes().as_slice())
+            .expect("server from key");
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        (server, shares)
+    }
 
     /// Full single-server OPRF round-trip on secp256k1: blind -> blind_evaluate -> finalize.
     /// The same input under the same key must reproduce the same output (the PRF property the
@@ -220,15 +361,10 @@ mod tests {
     /// combination is correct and no party ever reconstructed the key.
     #[test]
     fn threshold_matches_single_key() {
-        use k256::Scalar;
         let mut rng = rand_core_06::OsRng;
         let input: &[u8] = b"keep-node-vault-v1";
 
-        // One key, two ways: a single-key voprf server, and a 2-of-3 Shamir split of the same key.
-        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let server = OprfServer::<Secp256k1Sha256>::new_with_key(s.to_bytes().as_slice())
-            .expect("server from key");
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let (server, shares) = single_key_server_and_2of3_shares();
         assert_eq!(shares.len(), 3);
 
         // One blind; evaluate it both ways and finalize with the same client state.
@@ -351,6 +487,92 @@ mod tests {
         );
     }
 
+    /// End-to-end through the byte-oriented [`unlock`] API: for every 2-of-3 quorum, the LUKS key
+    /// derived from `blind -> evaluate (wire bytes) -> finalize_luks_key` must equal the key from a
+    /// single-key server holding the un-split key. This exercises the wire serialization of the
+    /// blinded element and the partial evaluations, with a fresh blind per quorum.
+    #[test]
+    fn unlock_wire_api_matches_single_key() {
+        let mut rng = rand_core_06::OsRng;
+        let input: &[u8] = b"keep-node-vault-v1";
+
+        let (server, shares) = single_key_server_and_2of3_shares();
+
+        let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
+        let single = b
+            .state
+            .finalize(input, &server.blind_evaluate(&b.message))
+            .expect("single finalize");
+        let k_single = derive_luks_key(single.as_slice(), "vault0", 1);
+
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let (client, wire) = unlock::blind(input).expect("blind");
+            let p_i = unlock::evaluate(&shares[i], &wire).expect("eval i");
+            let p_j = unlock::evaluate(&shares[j], &wire).expect("eval j");
+            let k = client
+                .finalize_luks_key(&[p_i, p_j], 2, "vault0", 1)
+                .expect("finalize");
+            assert_eq!(
+                *k, *k_single,
+                "quorum {{{i},{j}}} via wire API must match single key"
+            );
+        }
+    }
+
+    /// The holder oracle must reject a malformed blinded element, and finalize must reject a
+    /// malformed partial (wrong length / off-curve point), rather than panic.
+    #[test]
+    fn unlock_wire_api_rejects_malformed_input() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+
+        assert!(
+            unlock::evaluate(&shares[0], &[0u8; 10]).is_err(),
+            "malformed blinded element must be rejected"
+        );
+
+        let (client, wire) = unlock::blind(b"keep-node-vault-v1").expect("blind");
+        let good = unlock::evaluate(&shares[0], &wire).expect("eval");
+        assert!(
+            client
+                .finalize_luks_key(&[good.to_vec(), vec![0u8; 10]], 2, "vault0", 1)
+                .is_err(),
+            "a wrong-length partial must be rejected"
+        );
+
+        // A correct-length partial carrying an off-curve point (the deserialize path that the
+        // wrong-length branch above does not reach) must also be rejected, not panic.
+        let mut bad_point = good;
+        bad_point[threshold::ID_LEN] = 0x02; // valid compressed prefix...
+        bad_point[threshold::ID_LEN + 1..].fill(0xff); // ...over an x that is not on the curve
+        assert!(
+            client
+                .finalize_luks_key(&[good.to_vec(), bad_point.to_vec()], 2, "vault0", 1)
+                .is_err(),
+            "a correct-length partial with an off-curve point must be rejected"
+        );
+    }
+
+    /// Security: a single compromised holder must not be able to forge a quorum by replaying its
+    /// own partial. Two partials with the SAME identifier must be rejected by the combine (vsss-rs
+    /// rejects duplicate identifiers), so finalize must `Err` rather than derive a key.
+    #[test]
+    fn unlock_wire_api_rejects_duplicate_identifier() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+
+        let (client, wire) = unlock::blind(b"keep-node-vault-v1").expect("blind");
+        let p0 = unlock::evaluate(&shares[0], &wire).expect("eval");
+        assert!(
+            client.finalize_luks_key(&[p0, p0], 2, "vault0", 1).is_err(),
+            "a replayed partial (duplicate identifier) must not forge a quorum"
+        );
+    }
+
     /// `split_key` with invalid parameters (t > n, t < 2) must return Err.
     #[test]
     fn split_key_rejects_invalid_params() {
@@ -392,6 +614,23 @@ mod tests {
         assert!(
             threshold::point_from_bytes(&garbage).is_err(),
             "an off-curve x must be rejected by point_from_bytes"
+        );
+    }
+
+    /// `deserialize_partial` must reject the zero identifier (the secret's own evaluation point),
+    /// independent of `combine()`'s internal duplicate/zero rejection.
+    #[test]
+    fn deserialize_partial_rejects_zero_identifier() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let (_client, wire) = unlock::blind(b"keep-node-vault-v1").expect("blind");
+        let mut bytes = unlock::evaluate(&shares[0], &wire).expect("eval");
+        bytes[..threshold::ID_LEN].fill(0); // zero the identifier, keep the valid point
+        assert!(
+            threshold::deserialize_partial(&bytes).is_err(),
+            "a zero identifier must be rejected"
         );
     }
 }
