@@ -2261,3 +2261,381 @@ async fn test_psbt_migration_sweep_end_to_end() {
     graceful_shutdown(shutdown1, node1_handle).await;
     graceful_shutdown(shutdown2, node2_handle).await;
 }
+
+// ---------------------------------------------------------------------------
+// Threshold-OPRF unlock session tests.
+//
+// These mirror the ECDH harness above: a 2-of-3 FROST group on a MockRelay
+// where the "box" (initiator) gathers holder partial evaluations and derives a
+// LUKS key locally. The OPRF oracle defaults CLOSED (security fixes #621), so a
+// happy-path holder MUST (a) install a SigningHooks impl whose
+// `approve_oprf_eval` returns true and (b) see the box peer as
+// `AttestationStatus::Verified`. The negative-path tests drive the holder
+// handler directly to assert each gate rejects without producing a share.
+// ---------------------------------------------------------------------------
+
+const OPRF_INPUT: &[u8] = b"keep-node-vault-v1";
+
+/// Holder-side hook that approves every OPRF evaluation. Required for the happy
+/// path because `approve_oprf_eval` defaults to DENY.
+struct ApproveOprfHooks;
+
+impl keep_frost_net::SigningHooks for ApproveOprfHooks {
+    fn pre_sign(&self, _session: &keep_frost_net::SessionInfo) -> keep_frost_net::Result<()> {
+        Ok(())
+    }
+    fn post_sign(&self, _session: &keep_frost_net::SessionInfo, _signature: &[u8; 64]) {}
+    fn approve_oprf_eval(
+        &self,
+        _requester_share_index: u16,
+        _session_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+}
+
+/// Split one OPRF key 2-of-3. `KeyShare` at index `i` is the vsss share for
+/// FROST identifier `i + 1`.
+fn split_oprf_key_2of3() -> Vec<keep_core::oprf::threshold::KeyShare> {
+    use k256::elliptic_curve::rand_core::OsRng;
+    use k256::Scalar;
+    let mut rng = OsRng;
+    let secret = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+    keep_core::oprf::threshold::split_key(&secret, 2, 3, rng).expect("split oprf key")
+}
+
+/// Happy path: a 2-of-3 group with the box (id 1) and one holder (id 2) online,
+/// both carrying an OPRF share. The holder approves evaluations and sees the box
+/// as Verified, so `request_oprf_unlock` collects the holder's partial, reaches
+/// quorum, and derives a 32-byte LUKS key. Two independent runs (fresh blinds)
+/// must derive the SAME key, since finalize strips the per-attempt blinding.
+#[tokio::test]
+async fn test_oprf_unlock_completes_with_one_holder() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pkg) = dealer.generate("test-oprf-unlock").unwrap();
+    let share1 = shares.remove(0); // FROST id 1 = box
+    let share2 = shares.remove(0); // FROST id 2 = holder
+
+    let oprf = split_oprf_key_2of3();
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("Failed to create box node");
+    node1.set_oprf_key_share(oprf[0]); // box holds vsss index 1
+    let mut node2 = KfpNode::new(share2, vec![relay])
+        .await
+        .expect("Failed to create holder node");
+    node2.set_oprf_key_share(oprf[1]); // holder holds vsss index 2
+    node2.set_hooks(Arc::new(ApproveOprfHooks));
+
+    let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node1_run = Arc::clone(&node1);
+    let node2_run = Arc::clone(&node2);
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1_run.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2_run.run().await;
+    });
+
+    let mut n1 = 0u32;
+    let mut n2 = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        loop {
+            tokio::select! {
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => n1 += 1,
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => n2 += 1,
+            }
+            if n1 >= 1 && n2 >= 1 {
+                return;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        panic!("Peer discovery timed out: node1={n1}, node2={n2}");
+    }
+
+    // Let the reciprocal announces flush, then mark the box Verified on the
+    // holder. Re-announces are 20s apart, so this stays Verified for the brief
+    // window the (sub-second) request occupies.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node2.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+    let key1 = match timeout(
+        Duration::from_secs(45),
+        node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
+    )
+    .await
+    {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            graceful_shutdown(shutdown1, node1_handle).await;
+            graceful_shutdown(shutdown2, node2_handle).await;
+            panic!("request_oprf_unlock failed: {e}");
+        }
+        Err(_) => {
+            graceful_shutdown(shutdown1, node1_handle).await;
+            graceful_shutdown(shutdown2, node2_handle).await;
+            panic!("request_oprf_unlock timed out");
+        }
+    };
+    assert_eq!(key1.len(), 32, "derived LUKS key must be 32 bytes");
+
+    // Second independent run (fresh blind) must derive the same key: the OPRF
+    // output is a deterministic PRF of (input, key, volume, epoch).
+    node2.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+    let key2 = match timeout(
+        Duration::from_secs(45),
+        node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
+    )
+    .await
+    {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            graceful_shutdown(shutdown1, node1_handle).await;
+            graceful_shutdown(shutdown2, node2_handle).await;
+            panic!("second request_oprf_unlock failed: {e}");
+        }
+        Err(_) => {
+            graceful_shutdown(shutdown1, node1_handle).await;
+            graceful_shutdown(shutdown2, node2_handle).await;
+            panic!("second request_oprf_unlock timed out");
+        }
+    };
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+
+    assert_eq!(
+        *key1, *key2,
+        "two independent unlock runs must derive the same LUKS key (PRF determinism)"
+    );
+}
+
+/// Build a well-formed OPRF eval request for `holder` from a synthetic box at
+/// FROST share index 1, returning the box pubkey, the request payload (with a
+/// real blinded element), and the raw blinded bytes for box-side partials.
+fn make_oprf_request(
+    holder: &KfpNode,
+) -> (
+    nostr_sdk::PublicKey,
+    keep_frost_net::OprfEvalRequestPayload,
+    Vec<u8>,
+) {
+    let box_pubkey = nostr_sdk::Keys::generate().public_key();
+    let (_client, blinded) = keep_core::oprf::unlock::blind(OPRF_INPUT).expect("blind");
+    let blinded_arr: [u8; 33] = blinded.as_slice().try_into().expect("33-byte blinded");
+    let payload = keep_frost_net::OprfEvalRequestPayload::new(
+        [0x01u8; 32],
+        *holder.group_pubkey(),
+        blinded_arr,
+        vec![1, 2, 3],
+        1,
+    );
+    (box_pubkey, payload, blinded)
+}
+
+/// Gate (approval declined): a Verified, in-budget requester whose evaluation
+/// the holder's hook declines (the default DENY hook) gets NO partial. The
+/// handler returns `Ok(())` (declined, not errored) and emits `OprfEvalRequested`
+/// (proving every prior gate passed, so the decline is the hook), but produces
+/// no share, so a box with only its own partial never reaches quorum.
+#[tokio::test]
+async fn test_oprf_eval_declined_by_hook_sends_no_share() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-decline").unwrap();
+    let _ = shares.remove(0); // id 1 (box is synthetic)
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let oprf = split_oprf_key_2of3();
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_oprf_key_share(oprf[1]);
+    // No approving hook installed: the default NoOpHooks denies every eval.
+
+    let (box_pubkey, payload, blinded) = make_oprf_request(&holder);
+    holder.test_inject_peer(
+        keep_frost_net::Peer::new(box_pubkey, 1)
+            .with_attestation_status(keep_frost_net::AttestationStatus::Verified),
+    );
+
+    let mut rx = holder.subscribe();
+    let result = holder
+        .test_handle_oprf_eval_request(box_pubkey, payload)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a declined eval must return Ok(()), got {result:?}"
+    );
+
+    // The holder accepted the request (passed every gate) and only then declined
+    // at the hook.
+    let requested = rx.try_recv();
+    assert!(
+        matches!(
+            requested,
+            Ok(KfpNodeEvent::OprfEvalRequested {
+                requester_index: 1,
+                ..
+            })
+        ),
+        "holder must emit OprfEvalRequested before the hook declines, got {requested:?}"
+    );
+
+    // No share was produced, so a box holding only its own partial cannot reach
+    // the 2-of-3 quorum.
+    let (client, _) = keep_core::oprf::unlock::blind(OPRF_INPUT).expect("blind");
+    let box_partial = keep_core::oprf::unlock::evaluate(&oprf[0], &blinded).expect("box partial");
+    let mut session = keep_frost_net::OprfUnlockSession::new(
+        [0x01u8; 32],
+        client,
+        2,
+        vec![1, 2, 3],
+        "vault0".into(),
+        1,
+    );
+    session
+        .add_partial(1, box_partial.to_vec())
+        .expect("add box partial");
+    assert!(
+        !session.has_quorum(),
+        "box must not reach quorum without the holder's declined partial"
+    );
+}
+
+/// Gate (attestation): a requester whose peer is NOT `Verified` (default
+/// `NotProvided`) is rejected with `UntrustedPeer` before any partial is
+/// produced, and the holder emits no `OprfEvalRequested`.
+#[tokio::test]
+async fn test_oprf_eval_rejects_unattested_requester() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-unattested").unwrap();
+    let _ = shares.remove(0);
+    let holder_share = shares.remove(0);
+
+    let oprf = split_oprf_key_2of3();
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_oprf_key_share(oprf[1]);
+    holder.set_hooks(std::sync::Arc::new(ApproveOprfHooks));
+
+    let (box_pubkey, payload, _blinded) = make_oprf_request(&holder);
+    // Inject the requester with the DEFAULT attestation status (NotProvided).
+    holder.test_inject_peer(keep_frost_net::Peer::new(box_pubkey, 1));
+
+    let mut rx = holder.subscribe();
+    let result = holder
+        .test_handle_oprf_eval_request(box_pubkey, payload)
+        .await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::UntrustedPeer(_))),
+        "an unattested requester must be rejected with UntrustedPeer, got {result:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no OprfEvalRequested may be emitted for a rejected unattested requester"
+    );
+}
+
+/// Gate (rate limit): from one Verified + approved requester, the first
+/// `MAX_OPRF_EVALS_PER_WINDOW` evaluations succeed; the next is refused with
+/// `RateLimited`. The limiter keys on the requester pubkey, so distinct
+/// session_ids share one budget.
+#[tokio::test]
+async fn test_oprf_eval_rate_limited_after_budget() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-ratelimit").unwrap();
+    let _ = shares.remove(0);
+    let holder_share = shares.remove(0);
+
+    let oprf = split_oprf_key_2of3();
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_oprf_key_share(oprf[1]);
+    holder.set_hooks(std::sync::Arc::new(ApproveOprfHooks));
+
+    let (box_pubkey, base_payload, _blinded) = make_oprf_request(&holder);
+    holder.test_inject_peer(
+        keep_frost_net::Peer::new(box_pubkey, 1)
+            .with_attestation_status(keep_frost_net::AttestationStatus::Verified),
+    );
+
+    for i in 0..keep_frost_net::MAX_OPRF_EVALS_PER_WINDOW {
+        let mut payload = base_payload.clone();
+        payload.session_id = [i as u8; 32];
+        let r = holder
+            .test_handle_oprf_eval_request(box_pubkey, payload)
+            .await;
+        assert!(r.is_ok(), "eval {i} within budget must succeed, got {r:?}");
+    }
+
+    let mut over = base_payload.clone();
+    over.session_id = [0xFFu8; 32];
+    let result = holder.test_handle_oprf_eval_request(box_pubkey, over).await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::RateLimited(_))),
+        "exceeding the per-window budget must be rejected with RateLimited, got {result:?}"
+    );
+}
+
+/// Gate (replay): a request whose `created_at` predates the replay window is
+/// rejected with `ReplayDetected` before any peer/attestation check, and no
+/// share is produced.
+#[tokio::test]
+async fn test_oprf_eval_rejects_replayed_request() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-replay").unwrap();
+    let _ = shares.remove(0);
+    let holder_share = shares.remove(0);
+
+    let oprf = split_oprf_key_2of3();
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_oprf_key_share(oprf[1]);
+
+    let (box_pubkey, mut payload, _blinded) = make_oprf_request(&holder);
+    // Backdate well past the default 300s replay window.
+    payload.created_at = nostr_sdk::Timestamp::now().as_secs() - 400;
+
+    let result = holder
+        .test_handle_oprf_eval_request(box_pubkey, payload)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(keep_frost_net::FrostNetError::ReplayDetected(_))
+        ),
+        "a stale request must be rejected with ReplayDetected, got {result:?}"
+    );
+}

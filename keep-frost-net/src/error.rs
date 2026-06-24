@@ -54,6 +54,9 @@ pub enum FrostNetError {
     #[error("Replay detected: {0}")]
     ReplayDetected(String),
 
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
+
     #[error("Nonce already consumed for session: {0}")]
     NonceConsumed(String),
 

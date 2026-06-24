@@ -13,7 +13,7 @@ testing = ["keep-core/allow-ws"]
 
 [dependencies]
 keep-bitcoin = { path = "../keep-bitcoin" }
-keep-core = { path = "../keep-core" }
+keep-core = { path = "../keep-core", features = ["oprf"] }
 keep-enclave-host = { path = "../keep-enclave/host", optional = true }
 
 nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
@@ -50,7 +50,7 @@ tokio-test = "0.4"
 nostr-relay-builder = "0.44"
 chrono = "0.4"
 proptest = "1.11"
-keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal"] }
+keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal", "oprf"] }
 
 [[test]]
 name = "multinode_test"

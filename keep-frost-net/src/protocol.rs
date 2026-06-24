@@ -16,6 +16,9 @@ pub const MAX_COMMITMENT_SIZE: usize = 128;
 pub const MAX_NONCE_COMMITMENTS: usize = 256;
 pub const MAX_SIGNATURE_SHARE_SIZE: usize = 64;
 pub const MAX_PARTICIPANTS: usize = 255;
+/// Serialized length of a threshold-OPRF partial evaluation: a 32-byte identifier
+/// scalar followed by a 33-byte compressed point (`keep_core::oprf::threshold`).
+pub const OPRF_PARTIAL_LEN: usize = 65;
 pub const MAX_NAME_LENGTH: usize = 256;
 pub const MAX_CAPABILITY_LENGTH: usize = 64;
 pub const MAX_CAPABILITIES: usize = 32;
@@ -99,6 +102,8 @@ pub enum KfpMessage {
     EcdhRequest(EcdhRequestPayload),
     EcdhShare(EcdhSharePayload),
     EcdhComplete(EcdhCompletePayload),
+    OprfEvalRequest(OprfEvalRequestPayload),
+    OprfEvalShare(OprfEvalSharePayload),
     RefreshRequest(RefreshRequestPayload),
     RefreshRound1(RefreshRound1Payload),
     RefreshRound2(RefreshRound2Payload),
@@ -131,6 +136,8 @@ impl KfpMessage {
             KfpMessage::EcdhRequest(_) => "ecdh_request",
             KfpMessage::EcdhShare(_) => "ecdh_share",
             KfpMessage::EcdhComplete(_) => "ecdh_complete",
+            KfpMessage::OprfEvalRequest(_) => "oprf_eval_request",
+            KfpMessage::OprfEvalShare(_) => "oprf_eval_share",
             KfpMessage::RefreshRequest(_) => "refresh_request",
             KfpMessage::RefreshRound1(_) => "refresh_round1",
             KfpMessage::RefreshRound2(_) => "refresh_round2",
@@ -161,6 +168,8 @@ impl KfpMessage {
             KfpMessage::EcdhRequest(p) => Some(&p.session_id),
             KfpMessage::EcdhShare(p) => Some(&p.session_id),
             KfpMessage::EcdhComplete(p) => Some(&p.session_id),
+            KfpMessage::OprfEvalRequest(p) => Some(&p.session_id),
+            KfpMessage::OprfEvalShare(p) => Some(&p.session_id),
             KfpMessage::RefreshRequest(p) => Some(&p.session_id),
             KfpMessage::RefreshRound1(p) => Some(&p.session_id),
             KfpMessage::RefreshRound2(p) => Some(&p.session_id),
@@ -186,6 +195,7 @@ impl KfpMessage {
             KfpMessage::SignRequest(p) => Some(&p.group_pubkey),
             KfpMessage::NonceCommitment(p) => Some(&p.group_pubkey),
             KfpMessage::EcdhRequest(p) => Some(&p.group_pubkey),
+            KfpMessage::OprfEvalRequest(p) => Some(&p.group_pubkey),
             KfpMessage::RefreshRequest(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorPropose(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorContribute(p) => Some(&p.group_pubkey),
@@ -322,6 +332,27 @@ impl KfpMessage {
             KfpMessage::EcdhComplete(p) => {
                 if p.shared_secret.len() != 32 {
                     return Err("Invalid shared secret size");
+                }
+            }
+            KfpMessage::OprfEvalRequest(p) => {
+                if p.participants.is_empty() {
+                    return Err("Participants list must not be empty");
+                }
+                if p.participants.len() > MAX_PARTICIPANTS {
+                    return Err("Participants list exceeds maximum size");
+                }
+                if p.requester_share_index == 0 {
+                    return Err("requester_share_index must be non-zero");
+                }
+            }
+            KfpMessage::OprfEvalShare(p) => {
+                if p.share_index == 0 {
+                    return Err("share_index must be non-zero");
+                }
+                // Wire layout of an OPRF partial: 32-byte identifier scalar plus a
+                // 33-byte compressed point (see keep_core::oprf::threshold).
+                if p.partial.len() != OPRF_PARTIAL_LEN {
+                    return Err("Invalid OPRF partial size");
                 }
             }
             KfpMessage::RefreshRequest(p) => {
@@ -1141,6 +1172,67 @@ impl EcdhCompletePayload {
         Self {
             session_id,
             shared_secret: Zeroizing::new(shared_secret.to_vec()),
+        }
+    }
+}
+
+/// Box → holder: a request to evaluate the box's blinded element with the
+/// holder's dedicated OPRF key share. Mirrors [`EcdhRequestPayload`] but carries
+/// a 33-byte blinded element instead of a recipient pubkey, plus the requester's
+/// share index so the holder can bind the requester pubkey to a known peer.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OprfEvalRequestPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes_33")]
+    pub blinded: [u8; 33],
+    pub participants: Vec<u16>,
+    pub requester_share_index: u16,
+    pub created_at: u64,
+}
+
+impl OprfEvalRequestPayload {
+    pub fn new(
+        session_id: [u8; 32],
+        group_pubkey: [u8; 32],
+        blinded: [u8; 33],
+        participants: Vec<u16>,
+        requester_share_index: u16,
+    ) -> Self {
+        Self {
+            session_id,
+            group_pubkey,
+            blinded,
+            participants,
+            requester_share_index,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+/// Holder → box: a partial OPRF evaluation. `partial` is the 65-byte wire
+/// encoding from `keep_core::oprf::unlock::evaluate`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OprfEvalSharePayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    #[serde(with = "hex_vec")]
+    pub partial: Vec<u8>,
+}
+
+impl OprfEvalSharePayload {
+    pub fn new(session_id: [u8; 32], share_index: u16, partial: Vec<u8>) -> Self {
+        Self {
+            session_id,
+            share_index,
+            partial,
         }
     }
 }

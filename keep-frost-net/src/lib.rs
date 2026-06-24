@@ -67,6 +67,7 @@ mod event;
 mod node;
 mod nonce_pool;
 mod nonce_store;
+mod oprf_session;
 mod peer;
 pub mod proof;
 mod protocol;
@@ -98,28 +99,33 @@ pub use node::{
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
+pub use oprf_session::{
+    derive_oprf_session_id, OprfEvalRateLimiter, OprfUnlockSession, OprfUnlockSessionManager,
+    OprfUnlockSessionState, MAX_OPRF_EVALS_PER_WINDOW, OPRF_EVAL_WINDOW,
+};
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
     DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
     EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, NonceCommitmentPayload, NonceRef,
-    PingPayload, PolicyTier, PongPayload, PreExchangedCommitment, PsbtAbortPayload,
-    PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo, PsbtProposePayload, PsbtSignPayload,
-    RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
-    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, WalletPolicy,
-    XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS,
-    DESCRIPTOR_ACK_TIMEOUT_SECS, DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS,
-    DESCRIPTOR_FINALIZE_TIMEOUT_SECS, DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS,
-    DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND, KFP_VERSION, MAX_CAPABILITIES,
-    MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE, MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH,
-    MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH, MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE,
-    MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH, MAX_NAME_LENGTH, MAX_NONCE_COMMITMENTS,
-    MAX_PARTICIPANTS, MAX_PSBT_ADDRESS_LENGTH, MAX_PSBT_INPUTS, MAX_PSBT_OUTPUTS, MAX_PSBT_SIZE,
-    MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS, MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH,
-    MAX_XPUB_LENGTH, MIN_XPUB_LENGTH, MSG_TYPE_NOSTR_EVENT, MSG_TYPE_RAW,
-    PSBT_FINALIZE_PHASE_TIMEOUT_SECS, PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS,
-    PSBT_SIGNING_PHASE_TIMEOUT_SECS, VALID_NETWORKS, VALID_XPUB_PREFIXES,
+    OprfEvalRequestPayload, OprfEvalSharePayload, PingPayload, PolicyTier, PongPayload,
+    PreExchangedCommitment, PsbtAbortPayload, PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo,
+    PsbtProposePayload, PsbtSignPayload, RefreshCompletePayload, RefreshRequestPayload,
+    RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload,
+    SignatureSharePayload, WalletPolicy, XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS,
+    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
+    DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
+    KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
+    MAX_DESCRIPTOR_LENGTH, MAX_ERROR_CODE_LENGTH, MAX_ERROR_MESSAGE_LENGTH, MAX_FINGERPRINT_LENGTH,
+    MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH,
+    MAX_NAME_LENGTH, MAX_NONCE_COMMITMENTS, MAX_PARTICIPANTS, MAX_PSBT_ADDRESS_LENGTH,
+    MAX_PSBT_INPUTS, MAX_PSBT_OUTPUTS, MAX_PSBT_SIZE, MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS,
+    MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, MIN_XPUB_LENGTH,
+    MSG_TYPE_NOSTR_EVENT, MSG_TYPE_RAW, OPRF_PARTIAL_LEN, PSBT_FINALIZE_PHASE_TIMEOUT_SECS,
+    PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS,
+    VALID_NETWORKS, VALID_XPUB_PREFIXES,
 };
 pub use psbt_session::{
     derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,
