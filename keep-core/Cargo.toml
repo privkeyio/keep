@@ -13,6 +13,9 @@ allow-ws = []
 # WARNING: allow-internal disables SSRF internal-host checks. MUST NOT be enabled in production.
 allow-internal = []
 ed25519 = ["dep:frost-ed25519"]
+# Threshold-OPRF unlock primitive (frost-gate v2 / KeepNode). Opt-in; pulls voprf.
+# hash2curve (k256 GroupDigest / RFC 9380) is only needed for the OPRF path, so gate it here.
+oprf = ["dep:voprf", "dep:sha2_010", "dep:rand_core_06", "dep:vsss-rs", "k256/hash2curve"]
 
 [dependencies]
 argon2 = "0.5"
@@ -28,6 +31,15 @@ k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.10"
 frost-secp256k1-tr = "3.0.0"
 frost-ed25519 = { version = "3.0.0", optional = true }
+# RFC 9497 OPRF reference implementation (MIT). secp256k1 bound via a local CipherSuite.
+# voprf rides the elliptic-curve 0.13 / digest 0.10 ecosystem, so the OPRF hash must be the
+# matching sha2 0.10 (coexists with keep-core's sha2 0.11 via Cargo multi-versioning).
+voprf = { version = "0.5", optional = true }
+sha2_010 = { package = "sha2", version = "0.10", optional = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"], optional = true }
+# Vetted Shamir/VSS over secp256k1 (Apache-2.0 OR MIT). Used for the t-of-n key split and the
+# in-exponent Lagrange combination of partial evaluations (combine_shares_group).
+vsss-rs = { version = "5", optional = true }
 
 bip39 = { workspace = true }
 bitcoin = { workspace = true }
