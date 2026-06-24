@@ -13,7 +13,7 @@ keep-nip46 = { path = "../keep-nip46" }
 keep-frost-net = { path = "../keep-frost-net" }
 
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
