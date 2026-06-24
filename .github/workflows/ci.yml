@@ -10,14 +10,14 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   lint:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft != true && github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -34,7 +34,7 @@ jobs:
       matrix:
         os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
@@ -55,7 +55,7 @@ jobs:
     runs-on: windows-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -66,7 +66,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build twice and compare
         run: |
           docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft != true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@master
         with:

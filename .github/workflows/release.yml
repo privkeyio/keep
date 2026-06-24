@@ -12,7 +12,7 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build reproducible binary
         run: docker build -f Dockerfile.reproducible -o type=local,dest=./dist .
       - name: Rename binaries
@@ -29,7 +29,7 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: xcode-select --install || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,7 @@ jobs:
   build-macos-arm:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: xcode-select --install || true
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,7 +69,7 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
