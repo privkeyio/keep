@@ -358,8 +358,15 @@ pub trait SigningHooks: Send + Sync {
 
     /// Called by an OPRF-unlock holder before it evaluates a requester's blinded
     /// element. Returning `false` declines the evaluation without producing a
-    /// partial. The default permits every (already attested and rate-limited)
-    /// request so existing `SigningHooks` impls compile unchanged.
+    /// partial.
+    ///
+    /// SECURITY: the default is DENY. The OPRF input is a fixed, low-entropy
+    /// label and the box already holds one share, so in a 2-of-3 a single
+    /// auto-answered evaluation is enough to derive the volume key (the rate
+    /// limit does not help: one eval suffices). A holder MUST therefore opt in
+    /// explicitly by overriding this with a real policy (human approval on the
+    /// phone, an out-of-band confirmation on the replica). Leaving the default
+    /// keeps the oracle closed.
     ///
     /// Returns a boxed future rather than using `async fn` so the trait stays
     /// object-safe (`Arc<dyn SigningHooks>`), avoiding an `async-trait`
@@ -370,7 +377,7 @@ pub trait SigningHooks: Send + Sync {
         session_id: [u8; 32],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let _ = (requester_share_index, session_id);
-        Box::pin(async { true })
+        Box::pin(async { false })
     }
 }
 
@@ -479,6 +486,12 @@ pub enum KfpNodeEvent {
         requester_index: u16,
     },
     /// The box collected a quorum of partials and derived the LUKS key locally.
+    ///
+    /// SECURITY: this carries the derived key on the shared broadcast bus, so any
+    /// `subscribe()`er in-process sees it (the `Debug` impl redacts it, and it is
+    /// never serialized to the wire). This mirrors `EcdhComplete`; prefer the
+    /// `request_oprf_unlock` return value and do not log the event payload. See
+    /// the follow-up to move both off the broadcast bus to a per-session channel.
     OprfUnlockComplete {
         session_id: [u8; 32],
         luks_key: Zeroizing<[u8; 32]>,
@@ -1093,6 +1106,40 @@ impl KfpNode {
         self.descriptor_sessions
             .write()
             .test_insert_session(session);
+    }
+
+    /// Test-only: inject a peer directly into the peer table, bypassing the
+    /// announce/proof-of-share flow. Used by OPRF integration tests that need a
+    /// requester peer present with a specific `AttestationStatus` (e.g.
+    /// `Verified`) without standing up the full attestation machinery.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_inject_peer(&self, peer: Peer) {
+        self.peers.write().add_peer(peer);
+    }
+
+    /// Test-only: override the attestation status of an already-known peer. The
+    /// happy-path OPRF test discovers peers naturally, then flips the requester's
+    /// status to `Verified` to satisfy the holder's strict attestation gate.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_set_peer_attestation(&self, share_index: u16, status: AttestationStatus) {
+        if let Some(peer) = self.peers.write().get_peer_mut(share_index) {
+            peer.attestation_status = status;
+        }
+    }
+
+    /// Test-only: drive the holder-side OPRF eval handler directly. Lets the
+    /// negative-path tests assert on the returned `Result` (gate rejections,
+    /// rate limiting, replay) without a full box round-trip.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn test_handle_oprf_eval_request(
+        &self,
+        from: PublicKey,
+        request: OprfEvalRequestPayload,
+    ) -> Result<()> {
+        self.handle_oprf_eval_request(from, request).await
     }
 
     pub fn set_replay_window(&mut self, secs: u64) {

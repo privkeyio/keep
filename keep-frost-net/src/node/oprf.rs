@@ -21,6 +21,8 @@ use crate::event::KfpEventBuilder;
 use crate::oprf_session::derive_oprf_session_id;
 use crate::protocol::*;
 
+use crate::peer::AttestationStatus;
+
 use super::{KfpNode, KfpNodeEvent};
 
 impl KfpNode {
@@ -73,7 +75,11 @@ impl KfpNode {
         // Bind the requester's pubkey to its claimed share index.
         self.verify_peer_share_index(from, request.requester_share_index)?;
 
-        // Attestation gate: the eval oracle only answers attested holders/boxes.
+        // Attestation gate: the eval oracle requires VERIFIED attestation of the
+        // requester, not merely `is_attested()`. `is_attested()` also accepts
+        // `NotConfigured` (this node set no expected PCRs); for the OPRF oracle
+        // that would be fail-open, so a node guarding a real vault MUST configure
+        // expected PCRs and only answer a requester whose measured boot verified.
         {
             let peers = self.peers.read();
             let peer = peers
@@ -84,10 +90,10 @@ impl KfpNode {
                         request.requester_share_index
                     ))
                 })?;
-            if !peer.is_attested() {
+            if !matches!(peer.attestation_status, AttestationStatus::Verified) {
                 return Err(FrostNetError::UntrustedPeer(format!(
-                    "OPRF requester share {} is not attested",
-                    request.requester_share_index
+                    "OPRF requester share {} attestation not Verified ({:?})",
+                    request.requester_share_index, peer.attestation_status
                 )));
             }
         }
@@ -176,7 +182,22 @@ impl KfpNode {
             session.add_partial(payload.share_index, payload.partial.clone())?;
 
             if session.has_quorum() {
-                session.try_finalize()?
+                // On a finalize failure (e.g. a wrong partial from a misbehaving
+                // holder) emit OprfUnlockFailed so the box fails fast instead of
+                // blocking on its 30s timeout.
+                match session.try_finalize() {
+                    Ok(key) => key,
+                    Err(e) => {
+                        // Use the already-held write guard; re-locking would
+                        // deadlock (parking_lot is not reentrant).
+                        oprf_sessions.complete_session(&payload.session_id);
+                        let _ = self.event_tx.send(KfpNodeEvent::OprfUnlockFailed {
+                            session_id: payload.session_id,
+                            error: e.to_string(),
+                        });
+                        return Err(e);
+                    }
+                }
             } else {
                 None
             }
@@ -204,6 +225,15 @@ impl KfpNode {
     /// Box public API: blind `input`, gather a quorum of holder partial
     /// evaluations, and derive the 32-byte LUKS key. The node must hold an OPRF
     /// key share. Mirrors [`KfpNode::request_ecdh`].
+    ///
+    /// PROVISIONING CONTRACT: eligible peers are the FROST signing peers, and a
+    /// selected peer with no OPRF key share silently does not answer (it is not a
+    /// holder), so the box would miss quorum and time out. Therefore every
+    /// signing peer MUST be issued an OPRF key share 1:1, and the OPRF key MUST be
+    /// split with the SAME threshold `t` as the FROST group (this method passes
+    /// the FROST threshold to `finalize_luks_key`); a mismatch makes every
+    /// finalize fail. The node with FROST identifier `i` must hold the OPRF share
+    /// at vsss index `i`.
     pub async fn request_oprf_unlock(
         &self,
         input: &[u8],

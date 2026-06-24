@@ -330,6 +330,13 @@ impl OprfEvalRateLimiter {
                 ts.retain(|&t| cutoff.map(|c| t >= c).unwrap_or(true));
                 !ts.is_empty()
             });
+            // Hard cap: if pruning emptied nothing, refuse to track a new
+            // identity rather than grow without bound. Only attested, announced
+            // peers reach the limiter, so this is never hit in practice; it is a
+            // backstop, and refusing fails closed (the request is rejected).
+            if self.events.len() >= MAX_TRACKED_REQUESTERS {
+                return false;
+            }
         }
 
         let entry = self.events.entry(requester).or_default();
@@ -495,6 +502,25 @@ mod tests {
         assert!(
             rl.check_and_record_at(a, base + OPRF_EVAL_WINDOW + Duration::from_secs(1)),
             "the budget must reset after the window elapses"
+        );
+    }
+
+    /// The limiter table is a hard cap: once `MAX_TRACKED_REQUESTERS` identities
+    /// have live windows, a new identity is refused (fail-closed) rather than
+    /// growing the table without bound.
+    #[test]
+    fn rate_limiter_table_is_hard_capped() {
+        let mut rl = OprfEvalRateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_TRACKED_REQUESTERS {
+            let id = nostr_sdk::Keys::generate().public_key();
+            assert!(rl.check_and_record_at(id, now));
+        }
+        // Table is full of live windows; a brand-new identity is refused.
+        let overflow = nostr_sdk::Keys::generate().public_key();
+        assert!(
+            !rl.check_and_record_at(overflow, now),
+            "a new identity past the table cap must be refused"
         );
     }
 
