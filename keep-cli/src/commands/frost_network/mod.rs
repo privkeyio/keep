@@ -959,17 +959,22 @@ fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
 /// full protection. Used for the LUKS key and the box's own OPRF share.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     // Clear any stale temp from a crashed run; create_new below still fails closed if an attacker
     // races to recreate it, so this never writes through someone else's file.
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // 0600 at creation is the Unix appliance's protection; the mode bit is Unix-only, so gate it
+    // (create_new still gives O_EXCL everywhere). This feature targets the NixOS boot gate.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&tmp)
         .map_err(|e| KeepError::Runtime(format!("create {}: {e}", tmp.display())))?;
     f.write_all(bytes)
