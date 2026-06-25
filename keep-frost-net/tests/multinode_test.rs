@@ -2679,6 +2679,8 @@ async fn test_oprf_enroll_distributes_share_and_completes() {
     let mut node2 = KfpNode::new(share2, vec![relay])
         .await
         .expect("holder node");
+    // Pin the box (FROST id 1) as the designated dealer (fail-closed default).
+    node2.set_expected_oprf_dealer(1);
 
     let mut rx1 = node1.subscribe();
     let mut rx2 = node2.subscribe();
@@ -2730,7 +2732,14 @@ async fn test_oprf_enroll_distributes_share_and_completes() {
                     threshold,
                     total,
                     share,
-                }) => return Some((dealer_index, threshold, total, share)),
+                    seal_ack,
+                }) => {
+                    // Confirm durable custody so the holder acks the dealer.
+                    if let Some(tx) = seal_ack.lock().unwrap().take() {
+                        let _ = tx.send(true);
+                    }
+                    return Some((dealer_index, threshold, total, share));
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => return None,
@@ -2803,9 +2812,11 @@ async fn test_oprf_enroll_rejects_unattested_dealer() {
     let _ = shares.remove(0); // id 1 (dealer is synthetic)
     let holder_share = shares.remove(0); // id 2 = holder
 
+    // Allow unpinned enrollment so the attestation gate (not the dealer pin) is what rejects.
     let holder = KfpNode::new(holder_share, vec![relay])
         .await
-        .expect("holder");
+        .expect("holder")
+        .allow_unpinned_oprf_dealer(true);
 
     let (dealer_pubkey, payload) = make_oprf_enroll(&holder);
     // Inject the dealer with the DEFAULT attestation status (NotProvided).
@@ -2856,4 +2867,157 @@ async fn test_oprf_enroll_rejects_non_designated_dealer() {
         rx.try_recv().is_err(),
         "no OprfShareReceived may be emitted for a non-designated dealer"
     );
+}
+
+/// Durable custody: with the share addressed, attested, and pinned but NO subscriber to take
+/// custody (seal) it, `handle_oprf_enroll` returns Err and sends no ack. A non-empty subscriber
+/// count is not enough; here there are zero receivers, so the broadcast send fails outright.
+#[tokio::test]
+async fn test_oprf_enroll_no_subscriber_refuses_ack() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll-no-sub").unwrap();
+    let _ = shares.remove(0); // id 1
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_expected_oprf_dealer(1);
+
+    let (dealer_pubkey, payload) = make_oprf_enroll(&holder);
+    holder.test_inject_peer(keep_frost_net::Peer::new(dealer_pubkey, 1));
+    holder.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+    // Deliberately do NOT subscribe: nothing will take custody of the share.
+    let result = holder.test_handle_oprf_enroll(dealer_pubkey, payload).await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::Session(_))),
+        "with no subscriber to seal the share the holder must refuse to ack, got {result:?}"
+    );
+}
+
+/// Replay window: an enrollment whose `created_at` is far in the past is rejected with
+/// `ReplayDetected` at the replay gate, before any custody is taken.
+#[tokio::test]
+async fn test_oprf_enroll_rejects_stale_created_at() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll-stale").unwrap();
+    let _ = shares.remove(0); // id 1
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+
+    let (dealer_pubkey, mut payload) = make_oprf_enroll(&holder);
+    payload.created_at = nostr_sdk::Timestamp::now().as_secs() - 400;
+
+    let mut rx = holder.subscribe();
+    let result = holder.test_handle_oprf_enroll(dealer_pubkey, payload).await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::ReplayDetected(_))),
+        "a stale enrollment must be rejected with ReplayDetected, got {result:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no OprfShareReceived may be emitted for a replayed enrollment"
+    );
+}
+
+/// Build a dealer node (FROST id 1) over a mock relay. The relay handle is returned so the caller
+/// keeps it alive for the node's lifetime.
+async fn make_dealer_node() -> (KfpNode, MockRelay) {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-distribute").unwrap();
+    let share1 = shares.remove(0); // id 1 = dealer
+    let node = KfpNode::new(share1, vec![relay])
+        .await
+        .expect("dealer node");
+    (node, mock_relay)
+}
+
+/// Dealer-side `distribute_oprf_shares` rejects every malformed round up front, before any share
+/// leaves the box: bad threshold/total bounds, empty input, the dealer's own index, a zero index,
+/// a malformed share, and an unannounced target.
+#[tokio::test]
+async fn test_distribute_oprf_shares_early_validations() {
+    use zeroize::Zeroizing;
+
+    let (node, _relay) = make_dealer_node().await;
+    let valid =
+        || Zeroizing::new(keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec());
+
+    // Empty input.
+    assert!(node.distribute_oprf_shares(vec![], 2, 3).await.is_err());
+
+    // threshold < 2.
+    assert!(node
+        .distribute_oprf_shares(vec![(2u16, valid())], 1, 3)
+        .await
+        .is_err());
+
+    // threshold > total.
+    assert!(node
+        .distribute_oprf_shares(vec![(2u16, valid())], 3, 2)
+        .await
+        .is_err());
+
+    // total exceeds MAX_PARTICIPANTS.
+    assert!(node
+        .distribute_oprf_shares(vec![(2u16, valid())], 2, 256)
+        .await
+        .is_err());
+
+    // Zero target index.
+    assert!(node
+        .distribute_oprf_shares(vec![(0u16, valid())], 2, 3)
+        .await
+        .is_err());
+
+    // The dealer's own index (1) must never be distributed.
+    assert!(node
+        .distribute_oprf_shares(vec![(1u16, valid())], 2, 3)
+        .await
+        .is_err());
+
+    // A malformed share aborts the whole round.
+    assert!(node
+        .distribute_oprf_shares(vec![(2u16, Zeroizing::new(vec![0u8; 8]))], 2, 3)
+        .await
+        .is_err());
+
+    // An unannounced target peer.
+    let result = node
+        .distribute_oprf_shares(vec![(2u16, valid())], 2, 3)
+        .await;
+    assert!(
+        matches!(result, Err(keep_frost_net::FrostNetError::UntrustedPeer(_))),
+        "an unannounced target must be rejected with UntrustedPeer, got {result:?}"
+    );
+}
+
+/// A duplicate target index is rejected even when the peer is announced and sendable.
+#[tokio::test]
+async fn test_distribute_oprf_shares_rejects_duplicate_target() {
+    use zeroize::Zeroizing;
+
+    let (node, _relay) = make_dealer_node().await;
+    let peer2 = nostr_sdk::Keys::generate().public_key();
+    node.test_inject_peer(keep_frost_net::Peer::new(peer2, 2));
+
+    let valid =
+        || Zeroizing::new(keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec());
+
+    let result = node
+        .distribute_oprf_shares(vec![(2u16, valid()), (2u16, valid())], 2, 3)
+        .await;
+    assert!(result.is_err(), "a duplicate target index must be rejected");
 }

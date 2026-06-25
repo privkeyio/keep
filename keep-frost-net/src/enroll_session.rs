@@ -110,10 +110,6 @@ impl OprfEnrollSession {
         self.state.clone()
     }
 
-    pub fn is_target(&self, share_index: u16) -> bool {
-        self.expected.contains(&share_index)
-    }
-
     /// Record one holder ack. Rejects a non-expected target, a duplicate, or an
     /// ack on a session no longer collecting. Flips to `Complete` once every
     /// expected target has acked.

@@ -445,6 +445,13 @@ pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
 /// How often the early-exit liveness ping re-checks for pongs while waiting.
 const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Durable-custody ack-back channel for [`KfpNodeEvent::OprfShareReceived`]. The
+/// subscriber that durably seals the share takes the sender and reports the seal
+/// result; the holder acks the dealer only on a confirmed `true`. Wrapped in
+/// `Arc<Mutex<Option<_>>>` so the broadcast event remains `Clone` while the
+/// single-shot sender can be taken by exactly one subscriber.
+pub type OprfShareSealAck = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>;
+
 #[derive(Clone)]
 pub enum KfpNodeEvent {
     PeerDiscovered {
@@ -513,6 +520,15 @@ pub enum KfpNodeEvent {
         threshold: u16,
         total: u16,
         share: Zeroizing<Vec<u8>>,
+        /// Durable-custody ack-back. The consumer that seals `share` MUST take the
+        /// sender (`lock().take()`) and send `true` on a confirmed seal or `false`
+        /// on failure. The holder withholds its enrollment ack to the dealer until
+        /// it observes `true`: if every subscriber ignores the event the sender is
+        /// dropped and the receiver resolves `Err`, so custody is reported failed
+        /// rather than the dealer being told enrollment completed with nothing
+        /// sealed. Wrapped so the broadcast event stays `Clone`; only one
+        /// subscriber can take the single-shot sender.
+        seal_ack: OprfShareSealAck,
     },
     /// The dealer collected an ack from every enrollment target.
     OprfEnrollComplete {
@@ -845,9 +861,19 @@ pub struct KfpNode {
     /// Dealer-side OPRF enrollment sessions (trusted-dealer share distribution).
     pub(crate) enroll_sessions: Arc<RwLock<OprfEnrollSessionManager>>,
     /// Holder-side pin of the only share index allowed to deal an OPRF enrollment to this node.
-    /// `None` accepts an enrollment from any attested, authorized group peer; setting it (to the
-    /// box's index) refuses a share from any peer other than the designated dealer.
+    /// `None` requires an explicit opt-out (`allow_unpinned_oprf_dealer`) and otherwise refuses
+    /// enrollment fail-closed; setting it (to the box's index) refuses a share from any peer
+    /// other than the designated dealer.
     pub(crate) expected_oprf_dealer: Option<u16>,
+    /// Holder-side opt-out for the fail-closed dealer pin. In a trusted-dealer model only the box
+    /// should deal shares, so with no `expected_oprf_dealer` pinned enrollment is refused unless
+    /// this is explicitly set, which keeps the default secure while preserving open-enrollment
+    /// flows (e.g. tests) that knowingly accept a share from any attested, authorized peer.
+    pub(crate) allow_unpinned_oprf_dealer: bool,
+    /// Resolved session timeout (configured or default). The dealer derives its enrollment/unlock
+    /// ack wait from this so a short session timeout cannot expire the session before the wait,
+    /// stranding completion. See [`KfpNode::dealer_wait_timeout`].
+    pub(crate) session_timeout: Duration,
     pub(crate) descriptor_sessions: Arc<RwLock<DescriptorSessionManager>>,
     pub(crate) psbt_sessions: Arc<RwLock<PsbtSessionManager>>,
     pub(crate) peers: Arc<RwLock<PeerManager>>,
@@ -867,6 +893,13 @@ pub struct KfpNode {
     /// stops a peer forcing repeated secp256k1 deserialization by perturbing the
     /// timestamp. Value is `created_at` for time-based retention.
     pub(crate) seen_nonce_commitments: RwLock<HashMap<(u16, [u8; 32]), u64>>,
+    /// Holder-side de-duplication for `OprfEnroll` deliveries, keyed by
+    /// `(dealer_index, session_id)` so a relay redelivering the same enrollment
+    /// inside the replay window cannot re-emit live key material on the broadcast
+    /// bus or re-ack. The `dealer_index` is bound to the sender pubkey by
+    /// `verify_peer_share_index` before insertion. Value is `created_at` for
+    /// replay-window pruning.
+    pub(crate) seen_oprf_enrolls: RwLock<HashMap<(u16, [u8; 32]), u64>>,
     /// Per-session de-duplication for `DescriptorMigrate` link broadcasts.
     /// Keyed by `(session_id, new_descriptor_hash)` so an attacker cannot
     /// bypass dedupe by perturbing `created_at`. Value is `created_at` for
@@ -1027,6 +1060,9 @@ impl KfpNode {
             Some(t) => OprfEnrollSessionManager::new().with_timeout(t),
             None => OprfEnrollSessionManager::new(),
         };
+        // Mirror the managers' own default so the dealer ack wait tracks the
+        // configured session lifetime rather than a hardcoded constant.
+        let resolved_session_timeout = session_timeout.unwrap_or(Duration::from_secs(30));
 
         let audit_hmac_key = derive_audit_hmac_key(&keys, &group_pubkey);
         let audit_log = Arc::new(SigningAuditLog::new(audit_hmac_key));
@@ -1044,6 +1080,8 @@ impl KfpNode {
             oprf_rate_limiter: Arc::new(RwLock::new(OprfEvalRateLimiter::new())),
             enroll_sessions: Arc::new(RwLock::new(enroll_manager)),
             expected_oprf_dealer: None,
+            allow_unpinned_oprf_dealer: false,
+            session_timeout: resolved_session_timeout,
             descriptor_sessions: Arc::new(RwLock::new(descriptor_manager)),
             psbt_sessions: Arc::new(RwLock::new(psbt_manager)),
             peers: Arc::new(RwLock::new(PeerManager::new(our_index))),
@@ -1057,6 +1095,7 @@ impl KfpNode {
             expected_pcrs: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
             seen_nonce_commitments: RwLock::new(HashMap::new()),
+            seen_oprf_enrolls: RwLock::new(HashMap::new()),
             seen_descriptor_migrates: RwLock::new(HashMap::new()),
             descriptor_proposers: RwLock::new(HashSet::new()),
             psbt_proposers: RwLock::new(HashSet::new()),
@@ -1361,6 +1400,28 @@ impl KfpNode {
         self.expected_oprf_dealer = Some(dealer_index);
     }
 
+    /// Opt out of the fail-closed dealer pin: accept an OPRF enrollment share from any attested,
+    /// authorized peer when no `expected_oprf_dealer` is pinned. The default refuses unpinned
+    /// enrollment because in a trusted-dealer model only the box should deal shares; set this only
+    /// for deliberate open-enrollment flows that accept that weaker trust assumption.
+    pub fn allow_unpinned_oprf_dealer(mut self, allow: bool) -> Self {
+        self.allow_unpinned_oprf_dealer = allow;
+        self
+    }
+
+    /// Setter form of [`allow_unpinned_oprf_dealer`](Self::allow_unpinned_oprf_dealer).
+    pub fn set_allow_unpinned_oprf_dealer(&mut self, allow: bool) {
+        self.allow_unpinned_oprf_dealer = allow;
+    }
+
+    /// Dealer-side wait for enrollment/unlock acks, derived from the configured session timeout so
+    /// the wait and the session lifetime stay coupled: a short session timeout would otherwise
+    /// expire the session before a hardcoded 30s wait elapsed, so the final ack would be refused as
+    /// expired and completion would never fire.
+    pub(crate) fn dealer_wait_timeout(&self) -> Duration {
+        self.session_timeout
+    }
+
     pub fn set_descriptor_proposers(&self, indices: HashSet<u16>) {
         *self.descriptor_proposers.write() = indices;
     }
@@ -1644,6 +1705,9 @@ impl KfpNode {
                         self.seen_nonce_commitments.write().retain(|_, ts| {
                             now.saturating_sub(window) <= *ts
                         });
+                        self.seen_oprf_enrolls.write().retain(|_, ts| {
+                            now.saturating_sub(window) <= *ts
+                        });
                         self.seen_descriptor_migrates.write().retain(|_, ts| {
                             now.saturating_sub(window) <= *ts
                         });
@@ -1698,6 +1762,11 @@ impl KfpNode {
             }
         };
 
+        // Allowlist of initiating REQUESTS exempt from the trusted-peer requirement; each gates
+        // itself by attestation/policy inside its handler. Every response/share/ack message,
+        // including `OprfEnrollAck`, is deliberately absent so it still requires a trusted peer
+        // (defense in depth), matching `EcdhShare` / `SignatureShare` / `OprfEvalShare` /
+        // `DescriptorAck`. Do NOT add `OprfEnrollAck` here: that would exempt it from the gate.
         if !matches!(
             msg,
             KfpMessage::Announce(_)

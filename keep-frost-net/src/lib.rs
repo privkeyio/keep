@@ -99,8 +99,8 @@ pub use error::{FrostNetError, Result};
 pub use event::KfpEventBuilder;
 pub use node::{
     DescriptorLookupUnavailable, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent,
-    NoOpHooks, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawSignatureHooks,
-    SessionInfo, SigningHooks, SuccessorLookup,
+    NoOpHooks, OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
+    RefuseRawSignatureHooks, SessionInfo, SigningHooks, SuccessorLookup,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};

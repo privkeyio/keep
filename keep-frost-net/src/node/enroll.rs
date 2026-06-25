@@ -11,9 +11,10 @@
 //! on the holder side; the share is the most sensitive payload in the system and
 //! is never logged.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use nostr_sdk::prelude::*;
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
@@ -23,7 +24,7 @@ use crate::event::KfpEventBuilder;
 use crate::peer::AttestationStatus;
 use crate::protocol::*;
 
-use super::{KfpNode, KfpNodeEvent};
+use super::{KfpNode, KfpNodeEvent, OprfShareSealAck};
 
 impl KfpNode {
     /// Dealer side: distribute each remote target's OPRF secret key share and
@@ -110,7 +111,10 @@ impl KfpNode {
             }
         }
 
-        let nonce = Timestamp::now().as_secs();
+        // Random, not wall-clock seconds: two enroll rounds for the same target set within the
+        // same second would otherwise derive an identical session_id and the second be refused as
+        // already active. The domain separator and group/target binding live in the derivation.
+        let nonce = ::rand::random::<u64>();
         let session_id = derive_oprf_enroll_session_id(&self.group_pubkey, &target_indices, nonce);
 
         info!(
@@ -161,7 +165,7 @@ impl KfpNode {
             return Err(e);
         }
 
-        let timeout = Duration::from_secs(30);
+        let timeout = self.dealer_wait_timeout();
         let result = tokio::time::timeout(timeout, async {
             loop {
                 match rx.recv().await {
@@ -240,15 +244,45 @@ impl KfpNode {
         // 5. Bind the dealer's pubkey to its claimed share index.
         self.verify_peer_share_index(from, payload.dealer_index)?;
 
-        // 5b. If a designated dealer is pinned, refuse enrollment from any other index, so a
-        // compromised-but-attested group member cannot poison or overwrite this holder's share.
-        if let Some(expected) = self.expected_oprf_dealer {
-            if payload.dealer_index != expected {
+        // 5b. Dealer pin (fail-closed). In a trusted-dealer model only the box deals shares, so a
+        // pinned dealer is required: enrollment from any other index is refused, and with no pin at
+        // all enrollment is refused entirely unless the holder explicitly opted into open
+        // enrollment. This stops a compromised-but-attested group member poisoning or overwriting
+        // this holder's share, and keeps the default secure rather than accepting from any peer.
+        match self.expected_oprf_dealer {
+            Some(expected) if payload.dealer_index != expected => {
                 return Err(FrostNetError::UntrustedPeer(format!(
                     "OPRF enrollment from share {} but the designated dealer is {expected}",
                     payload.dealer_index
                 )));
             }
+            None if !self.allow_unpinned_oprf_dealer => {
+                return Err(FrostNetError::UntrustedPeer(
+                    "OPRF enrollment refused: no designated dealer pinned and unpinned enrollment \
+                     not enabled"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+
+        // 5c. Replay dedup: a relay redelivering the same OprfEnroll within the replay window
+        // re-passes every gate, so drop a repeat keyed on (dealer_index, session_id) before it can
+        // re-emit live key material on the broadcast bus or re-ack. The dealer_index is bound to
+        // `from` by step 5, so another peer cannot evict or forge this entry. A genuine retry uses
+        // a fresh random session_id and so is not deduped here.
+        if self
+            .seen_oprf_enrolls
+            .write()
+            .insert((payload.dealer_index, payload.session_id), payload.created_at)
+            .is_some()
+        {
+            debug!(
+                session_id = %hex::encode(payload.session_id),
+                dealer = payload.dealer_index,
+                "Dropping duplicate OPRF enrollment"
+            );
+            return Ok(());
         }
 
         // 6. Attestation gate: taking custody of a key share from an unattested
@@ -286,11 +320,17 @@ impl KfpNode {
             "Received OPRF enrollment share"
         );
 
-        // Hand the validated share to the node/app to seal (TPM or keystore); that
-        // is not this protocol's job. The Debug impl redacts the share. A broadcast
-        // send errors only when there are zero receivers: if nothing is subscribed
-        // to take custody, the share would be silently dropped, so refuse to ack
-        // rather than tell the dealer enrollment succeeded with no share sealed.
+        // Hand the validated share to the node/app to seal (TPM or keystore); that is not this
+        // protocol's job. The Debug impl redacts the share. Acking means DURABLE CUSTODY, not mere
+        // receipt: a non-empty subscriber count is not enough because an idle subscriber that
+        // ignores the event (e.g. desktop's `=> {}` arm) would let the ack fire while nothing
+        // sealed the share, leaving the dealer believing enrollment completed with no sealed share.
+        // So pass a one-shot ack-back and ack only on a confirmed seal. A broadcast send errors
+        // only with zero receivers; once delivered, the sealer takes the sender and reports the
+        // result, and if every subscriber ignores the event the sender is dropped and the receiver
+        // resolves Err, which we treat as custody failed.
+        let (seal_tx, seal_rx) = oneshot::channel::<bool>();
+        let seal_ack: OprfShareSealAck = Arc::new(Mutex::new(Some(seal_tx)));
         if self
             .event_tx
             .send(KfpNodeEvent::OprfShareReceived {
@@ -298,12 +338,32 @@ impl KfpNode {
                 threshold: payload.threshold,
                 total: payload.total,
                 share: Zeroizing::new(share_bytes.to_vec()),
+                seal_ack,
             })
             .is_err()
         {
             return Err(FrostNetError::Session(
                 "No subscriber to take custody of OPRF share; not acking".into(),
             ));
+        }
+
+        match tokio::time::timeout(self.dealer_wait_timeout(), seal_rx).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return Err(FrostNetError::Session(
+                    "OPRF share sealing failed; not acking".into(),
+                ));
+            }
+            Ok(Err(_)) => {
+                return Err(FrostNetError::Session(
+                    "No subscriber sealed the OPRF share; not acking".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(FrostNetError::Timeout(
+                    "OPRF share sealing confirmation timed out".into(),
+                ));
+            }
         }
 
         let ack = OprfEnrollAckPayload::new(payload.session_id, self.share.metadata.identifier);
