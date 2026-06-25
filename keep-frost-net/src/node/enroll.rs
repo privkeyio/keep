@@ -81,14 +81,14 @@ impl KfpNode {
                 // failing on a holder. Scrub the decoded live scalar immediately.
                 {
                     use zeroize::Zeroize;
-                    let mut decoded =
-                        keep_core::oprf::threshold::deserialize_key_share(&share_bytes).map_err(
-                            |e| {
-                                FrostNetError::Protocol(format!(
-                                    "OPRF enrollment share {target_index} invalid: {e}"
-                                ))
-                            },
-                        )?;
+                    let mut decoded = keep_core::oprf::threshold::deserialize_key_share(
+                        &share_bytes,
+                    )
+                    .map_err(|e| {
+                        FrostNetError::Protocol(format!(
+                            "OPRF enrollment share {target_index} invalid: {e}"
+                        ))
+                    })?;
                     decoded.zeroize();
                 }
                 if target_indices.contains(&target_index) {
@@ -296,7 +296,10 @@ impl KfpNode {
         if self
             .seen_oprf_enrolls
             .write()
-            .insert((payload.dealer_index, payload.session_id), payload.created_at)
+            .insert(
+                (payload.dealer_index, payload.session_id),
+                payload.created_at,
+            )
             .is_some()
         {
             debug!(

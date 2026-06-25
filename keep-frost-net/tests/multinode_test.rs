@@ -2869,6 +2869,76 @@ async fn test_oprf_enroll_rejects_non_designated_dealer() {
     );
 }
 
+/// Durable custody is fail-closed: if a subscriber takes the seal-ack sender but drops it without
+/// confirming a seal, the holder withholds the ack rather than confirm custody it did not take.
+/// This drives the `Ok(Err(_))` arm directly (the dropped sender resolves the receiver to Err),
+/// distinct from the timeout arm that fires when no subscriber touches the sender at all.
+#[tokio::test]
+async fn test_oprf_enroll_withholds_ack_when_seal_sender_dropped() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-enroll-seal-drop").unwrap();
+    let _ = shares.remove(0); // id 1 = dealer
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+
+    let (dealer_pubkey, payload) = make_oprf_enroll(&holder); // dealer_index = 1
+                                                              // Pin the dealer (fail-closed default refuses enrollment with no pin), inject and attest it, so
+                                                              // every gate passes and the handler reaches the seal step.
+    let mut holder = holder;
+    holder.set_expected_oprf_dealer(1);
+    holder.test_inject_peer(keep_frost_net::Peer::new(dealer_pubkey, 1));
+    holder.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+    let holder = std::sync::Arc::new(holder);
+    let mut rx = holder.subscribe();
+    let h = std::sync::Arc::clone(&holder);
+    let handle =
+        tokio::spawn(async move { h.test_handle_oprf_enroll(dealer_pubkey, payload).await });
+
+    // Take the seal sender out of the shared Option and drop it without confirming a seal. take()
+    // moves the sender out, so the broadcast ring buffer's retained clone no longer keeps it alive
+    // and the holder's receiver resolves to Err. Bounded so the test cannot hang.
+    let took = timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(KfpNodeEvent::OprfShareReceived { seal_ack, .. }) => {
+                    let _ = seal_ack.lock().unwrap().take();
+                    return true;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        took,
+        "handler must emit OprfShareReceived so a subscriber can take custody"
+    );
+
+    let result = timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("handler did not return in time")
+        .expect("handler task panicked");
+    match result {
+        Err(keep_frost_net::FrostNetError::Session(msg)) => {
+            assert!(
+                msg.contains("No subscriber sealed"),
+                "expected the dropped-seal failure, got: {msg}"
+            );
+        }
+        other => panic!("dropping the seal sender must withhold the ack, got {other:?}"),
+    }
+}
+
 /// Durable custody: with the share addressed, attested, and pinned but NO subscriber to take
 /// custody (seal) it, `handle_oprf_enroll` returns Err and sends no ack. A non-empty subscriber
 /// count is not enough; here there are zero receivers, so the broadcast send fails outright.
@@ -2921,7 +2991,10 @@ async fn test_oprf_enroll_rejects_stale_created_at() {
     let mut rx = holder.subscribe();
     let result = holder.test_handle_oprf_enroll(dealer_pubkey, payload).await;
     assert!(
-        matches!(result, Err(keep_frost_net::FrostNetError::ReplayDetected(_))),
+        matches!(
+            result,
+            Err(keep_frost_net::FrostNetError::ReplayDetected(_))
+        ),
         "a stale enrollment must be rejected with ReplayDetected, got {result:?}"
     );
     assert!(
@@ -2952,8 +3025,11 @@ async fn test_distribute_oprf_shares_early_validations() {
     use zeroize::Zeroizing;
 
     let (node, _relay) = make_dealer_node().await;
-    let valid =
-        || Zeroizing::new(keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec());
+    let valid = || {
+        Zeroizing::new(
+            keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec(),
+        )
+    };
 
     // Empty input.
     assert!(node.distribute_oprf_shares(vec![], 2, 3).await.is_err());
@@ -3013,8 +3089,11 @@ async fn test_distribute_oprf_shares_rejects_duplicate_target() {
     let peer2 = nostr_sdk::Keys::generate().public_key();
     node.test_inject_peer(keep_frost_net::Peer::new(peer2, 2));
 
-    let valid =
-        || Zeroizing::new(keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec());
+    let valid = || {
+        Zeroizing::new(
+            keep_core::oprf::threshold::serialize_key_share(&split_oprf_key_2of3()[1]).to_vec(),
+        )
+    };
 
     let result = node
         .distribute_oprf_shares(vec![(2u16, valid()), (2u16, valid())], 2, 3)
