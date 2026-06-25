@@ -123,6 +123,14 @@ impl OprfEnrollSession {
                 "Invalid share_index: must be non-zero".into(),
             ));
         }
+        // Reject a late ack on a session whose timeout has elapsed: the stored `state` field stays
+        // `Collecting` until something consults the time-based `state()` path, so without this an
+        // ack could still flip an expired session to `Complete`.
+        if self.is_expired() {
+            return Err(FrostNetError::Session(
+                "OPRF enrollment session expired".into(),
+            ));
+        }
         if self.state != OprfEnrollSessionState::Collecting {
             return Err(FrostNetError::Session(
                 "Not accepting OPRF enrollment acks".into(),
@@ -292,6 +300,18 @@ mod tests {
         assert!(session.is_complete());
         // A late ack on a completed session is refused (no longer collecting).
         assert!(session.record_ack(2).is_err());
+    }
+
+    #[test]
+    fn record_ack_rejected_after_expiry() {
+        let expected: HashSet<u16> = [2u16, 3u16].into_iter().collect();
+        let mut session = OprfEnrollSession::new([0x11u8; 32], [0x22u8; 32], expected, 2, 3)
+            .with_timeout(Duration::from_secs(0));
+        assert!(session.is_expired(), "zero timeout expires immediately");
+        // A late ack on an expired session must not transition it to Complete.
+        assert!(session.record_ack(2).is_err());
+        assert!(!session.is_complete());
+        assert!(!session.has_all_acks());
     }
 
     #[test]

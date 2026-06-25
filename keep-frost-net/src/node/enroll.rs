@@ -74,10 +74,21 @@ impl KfpNode {
                         "Dealer must not distribute its own OPRF share".into(),
                     ));
                 }
-                if share_bytes.len() != keep_core::oprf::threshold::KEY_SHARE_LEN {
-                    return Err(FrostNetError::Protocol(
-                        "OPRF enrollment share has wrong length".into(),
-                    ));
+                // Canonically validate every share (length, canonical scalars, non-zero id) by
+                // deserializing it before anything leaves the box, so a single malformed share
+                // aborts the whole round up front instead of being partially distributed and
+                // failing on a holder. Scrub the decoded live scalar immediately.
+                {
+                    use zeroize::Zeroize;
+                    let mut decoded =
+                        keep_core::oprf::threshold::deserialize_key_share(&share_bytes).map_err(
+                            |e| {
+                                FrostNetError::Protocol(format!(
+                                    "OPRF enrollment share {target_index} invalid: {e}"
+                                ))
+                            },
+                        )?;
+                    decoded.zeroize();
                 }
                 if target_indices.contains(&target_index) {
                     return Err(FrostNetError::Protocol(
@@ -276,13 +287,24 @@ impl KfpNode {
         );
 
         // Hand the validated share to the node/app to seal (TPM or keystore); that
-        // is not this protocol's job. The Debug impl redacts the share.
-        let _ = self.event_tx.send(KfpNodeEvent::OprfShareReceived {
-            dealer_index: payload.dealer_index,
-            threshold: payload.threshold,
-            total: payload.total,
-            share: Zeroizing::new(share_bytes.to_vec()),
-        });
+        // is not this protocol's job. The Debug impl redacts the share. A broadcast
+        // send errors only when there are zero receivers: if nothing is subscribed
+        // to take custody, the share would be silently dropped, so refuse to ack
+        // rather than tell the dealer enrollment succeeded with no share sealed.
+        if self
+            .event_tx
+            .send(KfpNodeEvent::OprfShareReceived {
+                dealer_index: payload.dealer_index,
+                threshold: payload.threshold,
+                total: payload.total,
+                share: Zeroizing::new(share_bytes.to_vec()),
+            })
+            .is_err()
+        {
+            return Err(FrostNetError::Session(
+                "No subscriber to take custody of OPRF share; not acking".into(),
+            ));
+        }
 
         let ack = OprfEnrollAckPayload::new(payload.session_id, self.share.metadata.identifier);
         let event = KfpEventBuilder::oprf_enroll_ack(&self.keys, &from, ack)?;

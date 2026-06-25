@@ -1747,6 +1747,21 @@ impl KfpNode {
                 self.handle_oprf_eval_share(event.pubkey, payload).await?;
             }
             KfpMessage::OprfEnroll(payload) => {
+                // Defense in depth: a share must arrive NIP-44 encrypted and directly addressed
+                // to us. decrypt_message treats a non-addressed event's content as plaintext, so
+                // require our `p` tag here; an addressed event that reached this point was
+                // necessarily decrypted (a forged plaintext payload would have failed decryption).
+                let addressed_to_us = event.tags.filter(TagKind::p()).any(|t| {
+                    matches!(
+                        t.as_standardized(),
+                        Some(TagStandard::PublicKey { public_key, .. })
+                            if public_key == &self.keys.public_key()
+                    )
+                });
+                if !addressed_to_us {
+                    debug!(from = %event.pubkey, "Rejecting OPRF enrollment: not directly addressed");
+                    return Ok(());
+                }
                 self.handle_oprf_enroll(event.pubkey, payload).await?;
             }
             KfpMessage::OprfEnrollAck(payload) => {
