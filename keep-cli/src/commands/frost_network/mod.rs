@@ -950,13 +950,13 @@ fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
     (1..=total).filter(|&j| j != box_id).collect()
 }
 
-/// Write `bytes` to `path`, truncating, with mode 0600. Used for the LUKS key
-/// and the box's own OPRF share; the caller owns zeroizing `bytes`.
-/// Write secret bytes to `path` atomically and 0600. The bytes go to a fresh sibling temp file
-/// opened with `create_new` (O_CREAT|O_EXCL, which refuses to follow or clobber a symlink and forces
-/// the 0600 mode on a guaranteed-new file), are fsync'd, then `rename`d into place. This avoids both
-/// the `mode()`-only-applies-on-create gap and symlink/TOCTOU on the destination that plain
-/// open-truncate has. The containing directory MUST be root-owned for full protection.
+/// Write secret `bytes` to `path` atomically with mode 0600; the caller owns zeroizing `bytes`.
+/// The bytes go to a fresh sibling temp file opened with `create_new` (O_CREAT|O_EXCL, which refuses
+/// to follow or clobber a symlink and forces the 0600 mode on a guaranteed-new file), are fsync'd,
+/// then `rename`d into place, after which the parent directory is fsync'd so the new name is durable
+/// across a crash. This avoids both the `mode()`-only-applies-on-create gap and symlink/TOCTOU on
+/// the destination that plain open-truncate has. The containing directory MUST be root-owned for
+/// full protection. Used for the LUKS key and the box's own OPRF share.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -979,6 +979,15 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path)
         .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
+    // fsync the containing directory so the new directory entry is durable across a crash; a
+    // rename only persists once the parent directory's metadata is synced.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| KeepError::Runtime(format!("sync dir {}: {e}", parent.display())))?;
     Ok(())
 }
 
@@ -1164,6 +1173,18 @@ pub fn cmd_frost_network_oprf_provision(
     let box_id = share.metadata.identifier;
     let box_name = share.metadata.name.clone();
 
+    // The OPRF holder set IS the FROST group: remote shares are routed to the group's holder
+    // indices, and `oprf-unlock` derives its quorum size from `share.metadata.threshold`. A
+    // `--threshold`/`--total` that diverges from the group metadata would distribute shares to
+    // non-existent holders or format the volume against a key no future unlock can reproduce, so
+    // refuse the mismatch before generating any key material.
+    if total != share.metadata.total_shares || threshold != share.metadata.threshold {
+        return Err(KeepError::InvalidInput(format!(
+            "OPRF {threshold}-of-{total} must match the FROST group {}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        )));
+    }
+
     out.newline();
     out.header("OPRF Provision");
     out.field("Group", group_npub);
@@ -1254,10 +1275,18 @@ pub fn cmd_frost_network_oprf_provision(
     // must not be formatted against this key. Always zeroize the share vector.
     let write_result = match dist {
         Ok(()) => {
-            let r1 = write_secret_file(key_out, &k_luks[..]);
+            // Write the box's own OPRF share first and the LUKS key last: the key file is the
+            // "provisioning succeeded" marker a boot gate formats the volume against, so it must
+            // only appear once the share needed to service future unlocks is durable. If either
+            // write fails, remove whatever was already written so a partial run never leaves an
+            // orphaned secret on disk.
             let own = keep_core::oprf::threshold::serialize_key_share(&shares[box_id as usize - 1]);
-            let r2 = write_secret_file(share_out, &own[..]);
-            r1.and(r2)
+            write_secret_file(share_out, &own[..])
+                .and_then(|()| write_secret_file(key_out, &k_luks[..]))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(key_out);
+                    let _ = std::fs::remove_file(share_out);
+                })
         }
         Err(e) => Err(e),
     };

@@ -380,16 +380,28 @@ pub mod unlock {
         // The secret is no longer needed once split: the shares carry it (t-of-n). Wipe our copy
         // regardless of whether the split succeeded.
         secret.zeroize();
-        let shares = split?;
+        let mut shares = split?;
 
         // Derive K_luks via the quorum path with our own shares, so it matches a future unlock.
-        let (client, blinded) = blind(input)?;
-        let mut partials = Vec::with_capacity(t);
-        for share in shares.iter().take(t) {
-            partials.push(evaluate(share, &blinded)?.to_vec());
+        // `shares` is live key material that is NOT zeroized on drop, so any error after the split
+        // must wipe it before propagating rather than leaking the scalar shares on a `?` path.
+        let derive = (|| {
+            let (client, blinded) = blind(input)?;
+            let mut partials = Vec::with_capacity(t);
+            for share in shares.iter().take(t) {
+                partials.push(evaluate(share, &blinded)?.to_vec());
+            }
+            client.finalize_luks_key(&partials, t, volume_id, epoch)
+        })();
+        match derive {
+            Ok(k_luks) => Ok((k_luks, shares)),
+            Err(e) => {
+                for s in shares.iter_mut() {
+                    s.zeroize();
+                }
+                Err(e)
+            }
         }
-        let k_luks = client.finalize_luks_key(&partials, t, volume_id, epoch)?;
-        Ok((k_luks, shares))
     }
 }
 
