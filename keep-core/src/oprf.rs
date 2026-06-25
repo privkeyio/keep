@@ -67,6 +67,9 @@ pub mod threshold {
     const POINT_LEN: usize = 33;
     /// Total serialized-partial length (`ID_LEN + POINT_LEN`).
     pub(super) const PARTIAL_LEN: usize = ID_LEN + POINT_LEN;
+    /// Serialized SECRET key-share length: a 32-byte identifier scalar followed by a 32-byte
+    /// value scalar (`ID_LEN + ID_LEN`).
+    pub const KEY_SHARE_LEN: usize = ID_LEN + ID_LEN;
 
     /// Split an OPRF key into `n` shares with threshold `t` over secp256k1's scalar field.
     ///
@@ -178,6 +181,52 @@ pub mod threshold {
         Ok(DefaultShare::with_identifier_and_value(
             IdentifierPrimeField(id),
             ValueGroup::from(point),
+        ))
+    }
+
+    /// Parse a canonical secp256k1 scalar from its 32-byte big-endian representation, zeroizing the
+    /// transient buffer (the bytes may be secret key material). Rejects a non-canonical encoding.
+    fn scalar_from_repr(b: &[u8]) -> Result<Scalar, CryptoError> {
+        use k256::elliptic_curve::PrimeField;
+        use zeroize::Zeroize;
+        let mut repr = k256::FieldBytes::default();
+        repr.copy_from_slice(b);
+        let s = Option::<Scalar>::from(Scalar::from_repr(repr));
+        repr.as_mut_slice().zeroize();
+        s.ok_or_else(|| CryptoError::invalid_key("OPRF: non-canonical scalar"))
+    }
+
+    /// Serialize a SECRET key share: the 32-byte identifier scalar followed by the 32-byte value
+    /// scalar.
+    ///
+    /// SECURITY: the output is live key material (the holder's Shamir share). The returned buffer
+    /// is `Zeroizing`, but any copy the caller makes (when sealing to the TPM or placing it in an
+    /// enrollment message) MUST itself be zeroized once consumed. Used to TPM-seal the box's share
+    /// and to carry a share inside the separately encrypted enrollment message.
+    pub fn serialize_key_share(share: &KeyShare) -> zeroize::Zeroizing<[u8; KEY_SHARE_LEN]> {
+        use k256::elliptic_curve::PrimeField;
+        let mut out = zeroize::Zeroizing::new([0u8; KEY_SHARE_LEN]);
+        out[..ID_LEN].copy_from_slice(share.identifier().0.to_repr().as_slice());
+        out[ID_LEN..].copy_from_slice((**share.value()).to_repr().as_slice());
+        out
+    }
+
+    /// Inverse of [`serialize_key_share`]. Rejects a wrong length, a non-canonical scalar, or a
+    /// zero identifier (Shamir's `x = 0` is the secret's own point, never a valid share index).
+    pub fn deserialize_key_share(bytes: &[u8]) -> Result<KeyShare, CryptoError> {
+        if bytes.len() != KEY_SHARE_LEN {
+            return Err(CryptoError::invalid_key("OPRF key share: wrong length"));
+        }
+        let id = scalar_from_repr(&bytes[..ID_LEN])?;
+        if bool::from(id.is_zero()) {
+            return Err(CryptoError::invalid_key("OPRF key share: zero identifier"));
+        }
+        let value = scalar_from_repr(&bytes[ID_LEN..])?;
+        // `ValuePrimeField` is a type alias for `IdentifierPrimeField`, so the value wrapper is
+        // constructed with the same tuple struct.
+        Ok(DefaultShare::with_identifier_and_value(
+            IdentifierPrimeField(id),
+            IdentifierPrimeField(value),
         ))
     }
 
@@ -570,6 +619,42 @@ mod tests {
         assert!(
             client.finalize_luks_key(&[p0, p0], 2, "vault0", 1).is_err(),
             "a replayed partial (duplicate identifier) must not forge a quorum"
+        );
+    }
+
+    /// A key share that is serialized then deserialized must behave identically to the original:
+    /// it produces the same partial evaluation. Malformed encodings are rejected.
+    #[test]
+    fn key_share_serialization_round_trips() {
+        use k256::Scalar;
+        let mut rng = rand_core_06::OsRng;
+        let input: &[u8] = b"keep-node-vault-v1";
+        let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
+        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
+
+        for share in &shares {
+            let bytes = threshold::serialize_key_share(share);
+            assert_eq!(bytes.len(), threshold::KEY_SHARE_LEN);
+            let restored = threshold::deserialize_key_share(&bytes[..]).expect("deserialize");
+            let p_orig = threshold::partial_eval(share, &b.message).expect("p orig");
+            let p_restored = threshold::partial_eval(&restored, &b.message).expect("p restored");
+            assert_eq!(
+                threshold::serialize_partial(&p_orig),
+                threshold::serialize_partial(&p_restored),
+                "restored share must produce the same partial evaluation"
+            );
+        }
+
+        assert!(
+            threshold::deserialize_key_share(&[0u8; 10]).is_err(),
+            "wrong length must be rejected"
+        );
+        let mut zero_id = [1u8; threshold::KEY_SHARE_LEN];
+        zero_id[..32].fill(0);
+        assert!(
+            threshold::deserialize_key_share(&zero_id).is_err(),
+            "zero identifier must be rejected"
         );
     }
 

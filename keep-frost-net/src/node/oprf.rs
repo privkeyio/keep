@@ -10,8 +10,6 @@
 //! session in [`super::ecdh`], with the holder-side asymmetry and the #621
 //! ship-gate (attestation + rate limit + approval) on the eval oracle.
 
-use std::time::Duration;
-
 use nostr_sdk::prelude::*;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
@@ -349,7 +347,7 @@ impl KfpNode {
             }
         }
 
-        let timeout = Duration::from_secs(30);
+        let timeout = self.dealer_wait_timeout();
 
         let result = tokio::time::timeout(timeout, async {
             loop {
