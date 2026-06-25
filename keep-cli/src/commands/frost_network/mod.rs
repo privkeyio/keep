@@ -952,20 +952,33 @@ fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
 
 /// Write `bytes` to `path`, truncating, with mode 0600. Used for the LUKS key
 /// and the box's own OPRF share; the caller owns zeroizing `bytes`.
+/// Write secret bytes to `path` atomically and 0600. The bytes go to a fresh sibling temp file
+/// opened with `create_new` (O_CREAT|O_EXCL, which refuses to follow or clobber a symlink and forces
+/// the 0600 mode on a guaranteed-new file), are fsync'd, then `rename`d into place. This avoids both
+/// the `mode()`-only-applies-on-create gap and symlink/TOCTOU on the destination that plain
+/// open-truncate has. The containing directory MUST be root-owned for full protection.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    // Clear any stale temp from a crashed run; create_new below still fails closed if an attacker
+    // races to recreate it, so this never writes through someone else's file.
+    let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|e| KeepError::Runtime(format!("open {}: {e}", path.display())))?;
+        .open(&tmp)
+        .map_err(|e| KeepError::Runtime(format!("create {}: {e}", tmp.display())))?;
     f.write_all(bytes)
-        .map_err(|e| KeepError::Runtime(format!("write {}: {e}", path.display())))?;
-    f.flush()
-        .map_err(|e| KeepError::Runtime(format!("flush {}: {e}", path.display())))?;
+        .map_err(|e| KeepError::Runtime(format!("write {}: {e}", tmp.display())))?;
+    f.sync_all()
+        .map_err(|e| KeepError::Runtime(format!("sync {}: {e}", tmp.display())))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -1007,6 +1020,12 @@ pub fn cmd_frost_network_oprf_unlock(
         None => keep.frost_get_share(&group_pubkey)?,
     };
 
+    // Build the async runtime BEFORE materializing the OPRF key share, so a runtime-construction
+    // failure cannot leave the live secret scalar (Copy + Zeroize, not ZeroizeOnDrop) resident on
+    // an early `?` return.
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
     // Read this box's OPRF key share credential (64 raw bytes; the TPM-unsealed
     // secret at boot). Held in a Zeroizing buffer so the raw bytes are wiped on
     // drop; deserialize it, then explicitly wipe and drop the buffer.
@@ -1037,9 +1056,6 @@ pub fn cmd_frost_network_oprf_unlock(
     out.field("Volume", volume_id);
     out.field("Epoch", &epoch.to_string());
     out.newline();
-
-    let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let result = rt.block_on(async move {
         let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
@@ -1158,6 +1174,12 @@ pub fn cmd_frost_network_oprf_provision(
     out.field("Epoch", &epoch.to_string());
     out.newline();
 
+    // Build the async runtime BEFORE generating the OPRF key, so a runtime-construction failure
+    // cannot leave the live shares (Copy + Zeroize, not ZeroizeOnDrop) resident on an early `?`
+    // return before the zeroize loop below.
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
     // Generate the OPRF key, split it t-of-n, and derive the matching LUKS key.
     // `shares` is positional: shares[k] has vsss identifier k+1, i.e. shares[i-1]
     // belongs to FROST participant i. These are live key material.
@@ -1187,9 +1209,6 @@ pub fn cmd_frost_network_oprf_provision(
         let ser = keep_core::oprf::threshold::serialize_key_share(&shares[j as usize - 1]);
         targets.push((j, zeroize::Zeroizing::new(ser.to_vec())));
     }
-
-    let rt =
-        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let dist = rt.block_on(async move {
         let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
