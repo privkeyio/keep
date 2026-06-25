@@ -445,6 +445,13 @@ pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
 /// How often the early-exit liveness ping re-checks for pongs while waiting.
 const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Upper bound on how long a holder blocks the inbound-message loop waiting for a subscriber to
+/// confirm it durably sealed an OPRF enrollment share. Kept well under the default session timeout
+/// so the loop is not deaf for a full session and the resulting ack still reaches the dealer inside
+/// its own ack-wait. A real TPM/keystore seal completes in well under this; the bound exists to
+/// catch a subscriber that never seals.
+pub(crate) const OPRF_SEAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Durable-custody ack-back channel for [`KfpNodeEvent::OprfShareReceived`]. The
 /// subscriber that durably seals the share takes the sender and reports the seal
 /// result; the holder acks the dealer only on a confirmed `true`. Wrapped in
@@ -1420,6 +1427,14 @@ impl KfpNode {
     /// expired and completion would never fire.
     pub(crate) fn dealer_wait_timeout(&self) -> Duration {
         self.session_timeout
+    }
+
+    /// Holder-side bound on the inline wait for OPRF seal confirmation: the smaller of
+    /// [`OPRF_SEAL_CONFIRM_TIMEOUT`] and half the session timeout, so a very short configured
+    /// session timeout shrinks the wait too and the ack always lands inside the dealer's ack-wait
+    /// window rather than arriving after the session has already expired.
+    pub(crate) fn seal_confirm_timeout(&self) -> Duration {
+        OPRF_SEAL_CONFIRM_TIMEOUT.min(self.session_timeout / 2)
     }
 
     pub fn set_descriptor_proposers(&self, indices: HashSet<u16>) {

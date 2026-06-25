@@ -266,25 +266,6 @@ impl KfpNode {
             _ => {}
         }
 
-        // 5c. Replay dedup: a relay redelivering the same OprfEnroll within the replay window
-        // re-passes every gate, so drop a repeat keyed on (dealer_index, session_id) before it can
-        // re-emit live key material on the broadcast bus or re-ack. The dealer_index is bound to
-        // `from` by step 5, so another peer cannot evict or forge this entry. A genuine retry uses
-        // a fresh random session_id and so is not deduped here.
-        if self
-            .seen_oprf_enrolls
-            .write()
-            .insert((payload.dealer_index, payload.session_id), payload.created_at)
-            .is_some()
-        {
-            debug!(
-                session_id = %hex::encode(payload.session_id),
-                dealer = payload.dealer_index,
-                "Dropping duplicate OPRF enrollment"
-            );
-            return Ok(());
-        }
-
         // 6. Attestation gate: taking custody of a key share from an unattested
         // dealer is unsafe, so require VERIFIED attestation (STRICT, like the eval
         // oracle), not merely `is_attested()`.
@@ -302,6 +283,28 @@ impl KfpNode {
                     payload.dealer_index, peer.attestation_status
                 )));
             }
+        }
+
+        // Replay dedup, placed after the attestation gate but before share deserialization: a relay
+        // redelivering the same OprfEnroll within the replay window re-passes every gate, so drop a
+        // repeat keyed on (dealer_index, session_id) before it can deserialize the secret again,
+        // re-emit live key material on the broadcast bus, or re-ack. Recording only after attestation
+        // means a delivery that failed that gate (e.g. dealer not yet Verified) does not poison the
+        // entry, so a later legitimate redelivery still proceeds. The dealer_index is bound to `from`
+        // by the pubkey↔index check above, so another peer cannot forge or evict this entry. A
+        // genuine dealer retry uses a fresh random session_id and so is never deduped here.
+        if self
+            .seen_oprf_enrolls
+            .write()
+            .insert((payload.dealer_index, payload.session_id), payload.created_at)
+            .is_some()
+        {
+            debug!(
+                session_id = %hex::encode(payload.session_id),
+                dealer = payload.dealer_index,
+                "Dropping duplicate OPRF enrollment"
+            );
+            return Ok(());
         }
 
         // 7. Validate the share itself (length / canonical scalars / non-zero id), then scrub the
@@ -347,7 +350,12 @@ impl KfpNode {
             ));
         }
 
-        match tokio::time::timeout(self.dealer_wait_timeout(), seal_rx).await {
+        // Bound the inline wait to the seal-confirm window (a fraction of the session/dealer wait),
+        // NOT the full session timeout: this caps how long the single inbound-message loop is
+        // blocked on the sealing subscriber, and keeps the ack inside the dealer's own ack-wait so
+        // completion can still fire. A subscriber that never seals is caught here by timeout and the
+        // ack is withheld (durable-custody, not mere receipt).
+        match tokio::time::timeout(self.seal_confirm_timeout(), seal_rx).await {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
                 return Err(FrostNetError::Session(
