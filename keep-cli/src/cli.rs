@@ -679,6 +679,57 @@ pub(crate) enum FrostNetworkCommands {
         #[arg(long, default_value = "10", help = "Timeout in seconds")]
         timeout: u64,
     },
+    /// Reconstruct a LUKS key from a 2-of-3 threshold-OPRF quorum and write the
+    /// 32 raw key bytes to STDOUT (pipe to `cryptsetup open --key-file -`).
+    /// All progress/log output goes to STDERR; the key is the only thing on STDOUT.
+    OprfUnlock {
+        #[arg(short, long, help = "FROST group npub")]
+        group: String,
+        #[arg(short, long, help = "Coordination relay URL")]
+        relay: Option<String>,
+        #[arg(short, long, help = "Local FROST share index to use")]
+        share: Option<u16>,
+        #[arg(long, help = "LUKS volume identifier")]
+        volume_id: String,
+        #[arg(long, default_value = "1", help = "OPRF key epoch")]
+        epoch: u32,
+        #[arg(
+            long,
+            help = "Path to this box's 64-byte OPRF key share (TPM-unsealed at boot)"
+        )]
+        share_file: PathBuf,
+    },
+    /// One-time setup: act as the trusted dealer, generate the OPRF key, split
+    /// it, distribute the remote shares to online holders, and write the LUKS
+    /// key and this box's own OPRF share to 0600 files.
+    OprfProvision {
+        #[arg(short, long, help = "FROST group npub")]
+        group: String,
+        #[arg(short, long, help = "Coordination relay URL")]
+        relay: Option<String>,
+        #[arg(short, long, help = "Local FROST share index to use")]
+        share: Option<u16>,
+        #[arg(long, help = "LUKS volume identifier")]
+        volume_id: String,
+        #[arg(long, default_value = "1", help = "OPRF key epoch")]
+        epoch: u32,
+        #[arg(
+            short,
+            long,
+            default_value = "2",
+            help = "OPRF unlock threshold (t in t-of-n)"
+        )]
+        threshold: u16,
+        #[arg(short = 'n', long, default_value = "3", help = "Total OPRF holders")]
+        total: u16,
+        #[arg(long, help = "Write the 32-byte LUKS key here (mode 0600)")]
+        key_out: PathBuf,
+        #[arg(
+            long,
+            help = "Write this box's own 64-byte OPRF share here (mode 0600)"
+        )]
+        share_out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

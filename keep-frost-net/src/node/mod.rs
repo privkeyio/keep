@@ -920,6 +920,17 @@ pub struct KfpNode {
         Option<Arc<dyn crate::recovery_signers::RecoverySignerRegistry>>,
 }
 
+impl Drop for KfpNode {
+    fn drop(&mut self) {
+        // `KeyShare` is `Copy + Zeroize` but not `ZeroizeOnDrop`, so the stored OPRF key share
+        // would otherwise linger in memory after the node is released. Wipe it explicitly.
+        if let Some(share) = self.oprf_key_share.as_mut() {
+            use zeroize::Zeroize;
+            share.zeroize();
+        }
+    }
+}
+
 /// Strip control characters, clamp to `MAX_NACK_REASON_LENGTH`, and return a
 /// placeholder when the result is empty. Shared between descriptor and PSBT
 /// coordination paths, which both accept peer-supplied reason strings.

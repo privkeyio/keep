@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
 use tracing::debug;
+use zeroize::Zeroize;
 
 use keep_core::error::{FrostError, KeepError, NetworkError, Result};
 use keep_core::wallet::{WalletDescriptor, INITIAL_DESCRIPTOR_VERSION};
@@ -22,6 +23,11 @@ mod hardware;
 
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
+
+/// Fixed OPRF unlock input (the design's fixed label). Both provisioning and
+/// every boot-time unlock derive the LUKS key from this same input, so they
+/// agree by construction.
+const OPRF_UNLOCK_INPUT: &[u8] = b"keep-node-vault-v1";
 
 /// Build a `KeepDescriptorLookup` from an `Arc<Mutex<Keep>>`. Logs a warning
 /// and returns no match when the vault is locked or the mutex is poisoned.
@@ -937,6 +943,366 @@ pub fn cmd_frost_network_health_check(
     Ok(())
 }
 
+/// FROST-index routing for OPRF share distribution: every holder index in
+/// `1..=total` except this box's own index. The serialized OPRF share for
+/// holder `j` lives at `shares[j - 1]` (positional, vsss identifier `j`).
+fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
+    (1..=total).filter(|&j| j != box_id).collect()
+}
+
+/// Write secret `bytes` to `path` atomically with mode 0600; the caller owns zeroizing `bytes`.
+/// The bytes go to a fresh sibling temp file opened with `create_new` (O_CREAT|O_EXCL, which refuses
+/// to follow or clobber a symlink and forces the 0600 mode on a guaranteed-new file), are fsync'd,
+/// then `rename`d into place, after which the parent directory is fsync'd so the new name is durable
+/// across a crash. This avoids both the `mode()`-only-applies-on-create gap and symlink/TOCTOU on
+/// the destination that plain open-truncate has. The containing directory MUST be root-owned for
+/// full protection. Used for the LUKS key and the box's own OPRF share.
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    // Clear any stale temp from a crashed run; create_new below still fails closed if an attacker
+    // races to recreate it, so this never writes through someone else's file.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| KeepError::Runtime(format!("create {}: {e}", tmp.display())))?;
+    f.write_all(bytes)
+        .map_err(|e| KeepError::Runtime(format!("write {}: {e}", tmp.display())))?;
+    f.sync_all()
+        .map_err(|e| KeepError::Runtime(format!("sync {}: {e}", tmp.display())))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
+    // fsync the containing directory so the new directory entry is durable across a crash; a
+    // rename only persists once the parent directory's metadata is synced.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| KeepError::Runtime(format!("sync dir {}: {e}", parent.display())))?;
+    Ok(())
+}
+
+/// Reconstruct a LUKS key from a threshold-OPRF quorum and write the 32 raw key
+/// bytes to STDOUT (and nothing else), so a boot gate can pipe it to
+/// `cryptsetup open --key-file -`. All human/progress output goes to STDERR via
+/// `Output` (which is backed by `Term::stderr()`); the key is never logged.
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_frost_network_oprf_unlock(
+    out: &Output,
+    path: &Path,
+    group_npub: &str,
+    relay: &str,
+    share_index: Option<u16>,
+    volume_id: &str,
+    epoch: u32,
+    share_file: &Path,
+) -> Result<()> {
+    debug!(
+        group = group_npub,
+        relay,
+        share = ?share_index,
+        volume_id,
+        epoch,
+        "frost network oprf-unlock"
+    );
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+
+    // Build the async runtime BEFORE materializing the OPRF key share, so a runtime-construction
+    // failure cannot leave the live secret scalar (Copy + Zeroize, not ZeroizeOnDrop) resident on
+    // an early `?` return.
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    // Read this box's OPRF key share credential (64 raw bytes; the TPM-unsealed
+    // secret at boot). Held in a Zeroizing buffer so the raw bytes are wiped on
+    // drop; deserialize it, then explicitly wipe and drop the buffer.
+    let mut share_bytes = zeroize::Zeroizing::new(
+        std::fs::read(share_file)
+            .map_err(|e| KeepError::Runtime(format!("read OPRF share file: {e}")))?,
+    );
+    let mut oprf_share = keep_core::oprf::threshold::deserialize_key_share(&share_bytes)
+        .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
+    share_bytes.zeroize();
+    drop(share_bytes);
+
+    out.newline();
+    out.header("OPRF Unlock");
+    out.field("Group", group_npub);
+    out.field(
+        "Share",
+        &format!("{} ({})", share.metadata.identifier, share.metadata.name),
+    );
+    out.field(
+        "Threshold",
+        &format!(
+            "{}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        ),
+    );
+    out.field("Relay", relay);
+    out.field("Volume", volume_id);
+    out.field("Epoch", &epoch.to_string());
+    out.newline();
+
+    let result = rt.block_on(async move {
+        let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        // Install the OPRF key share BEFORE running so this box can answer its
+        // own quorum's evaluate requests.
+        node.set_oprf_key_share(oprf_share);
+
+        out.info("Starting FROST coordination node...");
+        let shutdown_tx = node.take_shutdown_handle();
+        let node = std::sync::Arc::new(node);
+        let node_clone = node.clone();
+        let _run_guard = NodeRunGuard {
+            handle: tokio::spawn(async move {
+                let _ = node_clone.run().await;
+            }),
+            shutdown: shutdown_tx,
+        };
+
+        out.info("Discovering peers...");
+        for i in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if node.online_peers() > 0 {
+                break;
+            }
+            if i < 11 {
+                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+            }
+        }
+        if node.online_peers() == 0 {
+            return Err(KeepError::Frost("No peers online after 24s.".into()));
+        }
+        out.success(&format!("Found {} online peer(s)", node.online_peers()));
+        out.info("Waiting for peers to discover us...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        node.request_oprf_unlock(OPRF_UNLOCK_INPUT, volume_id, epoch)
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))
+    });
+    // `KeyShare` is `Copy` + `Zeroize` but NOT `ZeroizeOnDrop`: the copy moved
+    // into the async block is gone with the node, but our local copy must be
+    // wiped by hand on both the Ok and Err paths.
+    oprf_share.zeroize();
+    let key = result?;
+
+    // The reconstructed 32-byte LUKS key is the ONLY thing written to STDOUT.
+    // It is never logged.
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&key[..])
+        .map_err(|e| KeepError::Runtime(format!("write key to stdout: {e}")))?;
+    stdout
+        .flush()
+        .map_err(|e| KeepError::Runtime(format!("flush stdout: {e}")))?;
+
+    out.success("Unlock key written to stdout.");
+    Ok(())
+}
+
+/// One-time setup: this box is the trusted dealer. Generate the OPRF key, split
+/// it `threshold`-of-`total`, distribute the remote holders' shares over the
+/// network (NIP-44 encrypted), and write the matching LUKS key and this box's
+/// own OPRF share to 0600 files. Secrets only ever reach the 0600 files or
+/// `distribute_oprf_shares`; they are never logged.
+#[tracing::instrument(skip(out), fields(path = %path.display()))]
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_frost_network_oprf_provision(
+    out: &Output,
+    path: &Path,
+    group_npub: &str,
+    relay: &str,
+    share_index: Option<u16>,
+    volume_id: &str,
+    epoch: u32,
+    threshold: u16,
+    total: u16,
+    key_out: &Path,
+    share_out: &Path,
+) -> Result<()> {
+    debug!(
+        group = group_npub,
+        relay,
+        share = ?share_index,
+        volume_id,
+        epoch,
+        threshold,
+        total,
+        "frost network oprf-provision"
+    );
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    spinner.finish();
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let share = match share_index {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+    let box_id = share.metadata.identifier;
+    let box_name = share.metadata.name.clone();
+
+    // The OPRF holder set IS the FROST group: remote shares are routed to the group's holder
+    // indices, and `oprf-unlock` derives its quorum size from `share.metadata.threshold`. A
+    // `--threshold`/`--total` that diverges from the group metadata would distribute shares to
+    // non-existent holders or format the volume against a key no future unlock can reproduce, so
+    // refuse the mismatch before generating any key material.
+    if total != share.metadata.total_shares || threshold != share.metadata.threshold {
+        return Err(KeepError::InvalidInput(format!(
+            "OPRF {threshold}-of-{total} must match the FROST group {}-of-{}",
+            share.metadata.threshold, share.metadata.total_shares
+        )));
+    }
+
+    out.newline();
+    out.header("OPRF Provision");
+    out.field("Group", group_npub);
+    out.field("Box share", &format!("{box_id} ({box_name})"));
+    out.field("Threshold", &format!("{threshold}-of-{total}"));
+    out.field("Relay", relay);
+    out.field("Volume", volume_id);
+    out.field("Epoch", &epoch.to_string());
+    out.newline();
+
+    // Build the async runtime BEFORE generating the OPRF key, so a runtime-construction failure
+    // cannot leave the live shares (Copy + Zeroize, not ZeroizeOnDrop) resident on an early `?`
+    // return before the zeroize loop below.
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    // Generate the OPRF key, split it t-of-n, and derive the matching LUKS key.
+    // `shares` is positional: shares[k] has vsss identifier k+1, i.e. shares[i-1]
+    // belongs to FROST participant i. These are live key material.
+    let (k_luks, mut shares) = keep_core::oprf::unlock::provision(
+        OPRF_UNLOCK_INPUT,
+        volume_id,
+        epoch,
+        threshold as usize,
+        total as usize,
+    )
+    .map_err(|e| KeepError::Frost(format!("OPRF provision failed: {e}")))?;
+
+    if box_id == 0 || box_id as usize > shares.len() {
+        for s in shares.iter_mut() {
+            s.zeroize();
+        }
+        return Err(KeepError::InvalidInput(format!(
+            "box share index {box_id} is outside 1..={total}"
+        )));
+    }
+
+    // Serialize the REMOTE holders' shares (every index except this box's) into
+    // distribution targets; each serialized buffer is Zeroizing.
+    let remote = remote_share_indices(box_id, total);
+    let mut targets: Vec<(u16, zeroize::Zeroizing<Vec<u8>>)> = Vec::with_capacity(remote.len());
+    for &j in &remote {
+        let ser = keep_core::oprf::threshold::serialize_key_share(&shares[j as usize - 1]);
+        targets.push((j, zeroize::Zeroizing::new(ser.to_vec())));
+    }
+
+    let dist = rt.block_on(async move {
+        let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))?;
+
+        out.info("Starting FROST coordination node...");
+        let shutdown_tx = node.take_shutdown_handle();
+        let node = std::sync::Arc::new(node);
+        let node_clone = node.clone();
+        let _run_guard = NodeRunGuard {
+            handle: tokio::spawn(async move {
+                let _ = node_clone.run().await;
+            }),
+            shutdown: shutdown_tx,
+        };
+
+        out.info("Discovering peers (holders must be online to receive)...");
+        for i in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if node.online_peers() > 0 {
+                break;
+            }
+            if i < 11 {
+                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+            }
+        }
+        if node.online_peers() == 0 {
+            return Err(KeepError::Frost("No peers online after 24s.".into()));
+        }
+        out.success(&format!("Found {} online peer(s)", node.online_peers()));
+        out.info("Waiting for peers to discover us...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        out.info("Distributing OPRF shares to remote holders...");
+        node.distribute_oprf_shares(targets, threshold, total)
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))
+    });
+
+    // Write the LUKS key and the box's own share only if distribution succeeded;
+    // a failed distribution means the quorum can never be reached, so the volume
+    // must not be formatted against this key. Always zeroize the share vector.
+    let write_result = match dist {
+        Ok(()) => {
+            // Write the box's own OPRF share first and the LUKS key last: the key file is the
+            // "provisioning succeeded" marker a boot gate formats the volume against, so it must
+            // only appear once the share needed to service future unlocks is durable. If either
+            // write fails, remove whatever was already written so a partial run never leaves an
+            // orphaned secret on disk.
+            let own = keep_core::oprf::threshold::serialize_key_share(&shares[box_id as usize - 1]);
+            write_secret_file(share_out, &own[..])
+                .and_then(|()| write_secret_file(key_out, &k_luks[..]))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(key_out);
+                    let _ = std::fs::remove_file(share_out);
+                })
+        }
+        Err(e) => Err(e),
+    };
+    for s in shares.iter_mut() {
+        s.zeroize();
+    }
+    write_result?;
+
+    out.newline();
+    out.success(&format!(
+        "Provisioned: distributed {} remote OPRF share(s); wrote LUKS key and own share (mode 0600).",
+        remote.len()
+    ));
+    Ok(())
+}
+
 fn format_duration_ago(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s ago")
@@ -952,6 +1318,18 @@ fn format_duration_ago(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_share_indices_excludes_box_and_covers_rest() {
+        // Box 2 of a 3-holder set must route to holders 1 and 3 only; the OPRF
+        // share for holder j lives at shares[j-1], so a wrong index map would
+        // hand a holder the wrong share and break every future quorum.
+        assert_eq!(remote_share_indices(2, 3), vec![1, 3]);
+        assert_eq!(remote_share_indices(1, 3), vec![2, 3]);
+        assert_eq!(remote_share_indices(3, 3), vec![1, 2]);
+        // Single-holder edge case: nothing to distribute.
+        assert_eq!(remote_share_indices(1, 1), Vec::<u16>::new());
+    }
 
     #[test]
     fn build_unsigned_frost_event_matches_canonical_nostr_id() {

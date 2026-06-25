@@ -433,6 +433,43 @@ fn dispatch_frost_network(
                 out, path, &group, relay, share, timeout,
             )
         }
+        FrostNetworkCommands::OprfUnlock {
+            group,
+            relay,
+            share,
+            volume_id,
+            epoch,
+            share_file,
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_oprf_unlock(
+                out,
+                path,
+                &group,
+                relay,
+                share,
+                &volume_id,
+                epoch,
+                &share_file,
+            )
+        }
+        FrostNetworkCommands::OprfProvision {
+            group,
+            relay,
+            share,
+            volume_id,
+            epoch,
+            threshold,
+            total,
+            key_out,
+            share_out,
+        } => {
+            let relay = relay.as_deref().unwrap_or(default_relay);
+            commands::frost_network::cmd_frost_network_oprf_provision(
+                out, path, &group, relay, share, &volume_id, epoch, threshold, total, &key_out,
+                &share_out,
+            )
+        }
     }
 }
 

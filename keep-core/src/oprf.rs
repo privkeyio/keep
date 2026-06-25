@@ -352,6 +352,57 @@ pub mod unlock {
         let partial = threshold::partial_eval(share, &be)?;
         Ok(threshold::serialize_partial(&partial))
     }
+
+    /// Provision a fresh OPRF key for a new volume: generate a random key, split it `t`-of-`n`, and
+    /// derive the 32-byte LUKS key it produces for `(input, volume_id, epoch)`.
+    ///
+    /// The LUKS key is derived through the quorum path using the freshly split shares (`t` partials
+    /// combined in the exponent), so it is identical to the key every future 2-of-3 unlock will
+    /// derive, by construction. The transient secret is zeroized before returning.
+    ///
+    /// SECURITY: the returned shares are live key material; the caller OWNS them and MUST zeroize
+    /// each once it is sealed (the box's own share) or distributed to its holder (see
+    /// [`threshold::split_key`]). The returned LUKS key is `Zeroizing`.
+    pub fn provision(
+        input: &[u8],
+        volume_id: &str,
+        epoch: u32,
+        t: usize,
+        n: usize,
+    ) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<KeyShare>), CryptoError> {
+        use k256::elliptic_curve::Field;
+        use k256::Scalar;
+        use zeroize::Zeroize;
+
+        let mut rng = rand_core_06::OsRng;
+        let mut secret = Scalar::random(&mut rng);
+        let split = threshold::split_key(&secret, t, n, rng);
+        // The secret is no longer needed once split: the shares carry it (t-of-n). Wipe our copy
+        // regardless of whether the split succeeded.
+        secret.zeroize();
+        let mut shares = split?;
+
+        // Derive K_luks via the quorum path with our own shares, so it matches a future unlock.
+        // `shares` is live key material that is NOT zeroized on drop, so any error after the split
+        // must wipe it before propagating rather than leaking the scalar shares on a `?` path.
+        let derive = (|| {
+            let (client, blinded) = blind(input)?;
+            let mut partials = Vec::with_capacity(t);
+            for share in shares.iter().take(t) {
+                partials.push(evaluate(share, &blinded)?.to_vec());
+            }
+            client.finalize_luks_key(&partials, t, volume_id, epoch)
+        })();
+        match derive {
+            Ok(k_luks) => Ok((k_luks, shares)),
+            Err(e) => {
+                for s in shares.iter_mut() {
+                    s.zeroize();
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +671,29 @@ mod tests {
             client.finalize_luks_key(&[p0, p0], 2, "vault0", 1).is_err(),
             "a replayed partial (duplicate identifier) must not forge a quorum"
         );
+    }
+
+    /// `provision` returns a LUKS key that every 2-of-3 quorum unlock with the produced shares
+    /// reproduces, so the volume formatted at provisioning time opens on every future unlock.
+    #[test]
+    fn provision_matches_every_quorum_unlock() {
+        let input: &[u8] = b"keep-node-vault-v1";
+        let (k_luks, shares) = unlock::provision(input, "vault0", 1, 2, 3).expect("provision");
+        assert_eq!(shares.len(), 3);
+        assert_eq!(k_luks.len(), 32);
+
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let (client, blinded) = unlock::blind(input).expect("blind");
+            let pi = unlock::evaluate(&shares[i], &blinded).expect("pi");
+            let pj = unlock::evaluate(&shares[j], &blinded).expect("pj");
+            let k = client
+                .finalize_luks_key(&[pi.to_vec(), pj.to_vec()], 2, "vault0", 1)
+                .expect("finalize");
+            assert_eq!(
+                *k, *k_luks,
+                "quorum {{{i},{j}}} must reproduce the provisioned LUKS key"
+            );
+        }
     }
 
     /// A key share that is serialized then deserialized must behave identically to the original:
