@@ -1610,11 +1610,8 @@ impl KfpNode {
         // rejected by any peer that pins a policy.
         let tpm_attestation = match &self.announce_attestor {
             Some(attestor) => {
-                let nonce = derive_announce_attestation_nonce(
-                    &self.group_pubkey,
-                    share_index,
-                    timestamp,
-                );
+                let nonce =
+                    derive_announce_attestation_nonce(&self.group_pubkey, share_index, timestamp);
                 let evidence =
                     tokio::time::timeout(ANNOUNCE_QUOTE_TIMEOUT, attestor.request_quote(nonce))
                         .await
