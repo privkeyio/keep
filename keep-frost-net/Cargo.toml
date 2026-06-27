@@ -9,6 +9,10 @@ license = "MIT"
 [features]
 default = ["nitro-attestation"]
 nitro-attestation = ["dep:keep-enclave-host"]
+# TPM-side quote PRODUCER (links tpm2-tss C stack). Off by default: only TPM
+# nodes producing their own measured-boot quote need it; the pure-Rust verifier
+# (tpm_quote.rs) requires no TPM and is always built.
+tpm-attestation = ["dep:tss-esapi"]
 testing = ["keep-core/allow-ws"]
 
 [dependencies]
@@ -23,6 +27,8 @@ k256 = { version = "0.13.4", features = ["schnorr"] }
 # NIST P-256 ECDSA, for verifying TPM2 quote signatures (the AK is a P-256 key).
 # Verifier-side only: pure Rust, no TPM / libtss2 (see tpm_quote.rs).
 p256 = { version = "0.13", features = ["ecdsa"] }
+# TPM-side quote producer only (feature `tpm-attestation`); links libtss2.
+tss-esapi = { version = "7.7", optional = true }
 
 tokio = { version = "1", features = ["full", "sync"] }
 parking_lot = "0.12"

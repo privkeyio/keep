@@ -76,6 +76,8 @@ mod psbt_session;
 mod recovery_signers;
 mod session;
 mod tpm_policy;
+#[cfg(feature = "tpm-attestation")]
+pub mod tpm_producer;
 pub mod tpm_quote;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
@@ -145,6 +147,8 @@ pub use session::{
     derive_session_id, derive_session_id_salted, NetworkSession, SessionManager, SessionState,
 };
 pub use tpm_policy::TpmAttestationPolicy;
+#[cfg(feature = "tpm-attestation")]
+pub use tpm_producer::{TpmQuoter, DEFAULT_PCR_SLOTS};
 
 pub fn install_default_crypto_provider() {
     rustls::crypto::ring::default_provider()
