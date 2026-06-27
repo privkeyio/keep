@@ -19,13 +19,14 @@
 //! not perform EK credential activation (there is no manufacturer IDevID to
 //! anchor for a self-hosted box, per ATTESTATION-DESIGN.md).
 
+use sha2::{Digest, Sha256};
 use tss_esapi::abstraction::pcr;
-use tss_esapi::handles::KeyHandle;
+use tss_esapi::handles::{KeyHandle, ObjectHandle};
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::ecc::EccCurve;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
 use tss_esapi::structures::{
-    Data, EccScheme, HashScheme, KeyDerivationFunctionScheme, PcrSelectionList,
+    AttestInfo, Data, EccScheme, HashScheme, KeyDerivationFunctionScheme, PcrSelectionList,
     PcrSelectionListBuilder, PcrSlot, Public, PublicBuilder, PublicEccParametersBuilder, Signature,
     SignatureScheme,
 };
@@ -161,7 +162,15 @@ impl TpmQuoter {
             })
             .map_err(tpm_err)?;
 
-        let ak_sec1 = ecc_sec1(&primary.out_public)?;
+        // From here the AK is allocated in the TPM; flush it on any error so a
+        // transient handle does not leak. Once the struct is built, Drop owns it.
+        let ak_sec1 = match ecc_sec1(&primary.out_public) {
+            Ok(sec1) => sec1,
+            Err(e) => {
+                let _ = context.flush_context(ObjectHandle::from(primary.key_handle));
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             context,
@@ -189,41 +198,80 @@ impl TpmQuoter {
     pub fn quote(&mut self, nonce: &[u8]) -> Result<TpmQuoteEvidence> {
         let qualifying_data = Data::try_from(nonce.to_vec())
             .map_err(|_| att("quote nonce too long for TPM2B_DATA"))?;
-        let selection = self.pcr_selection.clone();
-        let ak_handle = self.ak_handle;
 
-        // Restricted key: scheme must be Null so the key's own scheme is used.
-        let (attest, signature) = self
-            .context
-            .execute_with_nullauth_session(|ctx| {
-                ctx.quote(ak_handle, qualifying_data, SignatureScheme::Null, selection)
-            })
-            .map_err(tpm_err)?;
+        // The quote attests a PCR composite captured at quote time; the reported
+        // PCR values are read separately, right after. If a selected PCR changes
+        // in between, the values would no longer reproduce the attested digest and
+        // the verifier (which recomputes the composite, check 5) would reject an
+        // otherwise-honest quote. Re-quote a bounded number of times until the
+        // read reproduces the attested digest, so the evidence is self-consistent.
+        const MAX_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let selection = self.pcr_selection.clone();
+            let ak_handle = self.ak_handle;
+            // Restricted key: scheme must be Null so the key's own scheme is used.
+            let (attest, signature) = self
+                .context
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.quote(
+                        ak_handle,
+                        qualifying_data.clone(),
+                        SignatureScheme::Null,
+                        selection,
+                    )
+                })
+                .map_err(tpm_err)?;
 
-        let attest_bytes = attest.marshall().map_err(tpm_err)?;
-        let signature = ecdsa_rs(&signature)?;
+            let attested_digest = match attest.attested() {
+                AttestInfo::Quote { info } => info.pcr_digest().value().to_vec(),
+                _ => return Err(att("TPM returned a non-quote attestation")),
+            };
 
-        // Read the live PCR values to report alongside the quote, in the same
-        // ascending order the verifier recomputes the composite digest in.
-        let pcr_data =
-            pcr::read_all(&mut self.context, self.pcr_selection.clone()).map_err(tpm_err)?;
-        let bank = pcr_data
-            .pcr_bank(HashingAlgorithm::Sha256)
-            .ok_or_else(|| att("TPM returned no SHA-256 PCR bank"))?;
-        let mut pcr_values = Vec::with_capacity(self.ordered_slots.len());
-        for slot in &self.ordered_slots {
-            let digest = bank
-                .get_digest(*slot)
-                .ok_or_else(|| att("TPM did not return a value for a selected PCR"))?;
-            pcr_values.push(hex::encode(digest.value()));
+            // Read the live PCR values in the same ascending order the verifier
+            // recomputes the composite digest in, accumulating that composite.
+            let pcr_data =
+                pcr::read_all(&mut self.context, self.pcr_selection.clone()).map_err(tpm_err)?;
+            let bank = pcr_data
+                .pcr_bank(HashingAlgorithm::Sha256)
+                .ok_or_else(|| att("TPM returned no SHA-256 PCR bank"))?;
+            let mut pcr_values = Vec::with_capacity(self.ordered_slots.len());
+            let mut composite = Sha256::new();
+            for slot in &self.ordered_slots {
+                let digest = bank
+                    .get_digest(*slot)
+                    .ok_or_else(|| att("TPM did not return a value for a selected PCR"))?;
+                composite.update(digest.value());
+                pcr_values.push(hex::encode(digest.value()));
+            }
+
+            // A selected PCR changed between the quote and the read; discard this
+            // inconsistent pair and re-quote.
+            if composite.finalize().as_slice() != attested_digest.as_slice() {
+                continue;
+            }
+
+            return Ok(TpmQuoteEvidence {
+                attest: attest.marshall().map_err(tpm_err)?,
+                signature: ecdsa_rs(&signature)?,
+                ak_sec1: self.ak_sec1.clone(),
+                pcr_values,
+            });
         }
 
-        Ok(TpmQuoteEvidence {
-            attest: attest_bytes,
-            signature,
-            ak_sec1: self.ak_sec1.clone(),
-            pcr_values,
-        })
+        Err(att(
+            "PCR state changed during quoting; no consistent quote after retries",
+        ))
+    }
+}
+
+impl Drop for TpmQuoter {
+    /// Flush the transient AK so it does not linger in the TPM's limited object
+    /// memory after the quoter is dropped (a direct swtpm/`/dev/tpm0` connection,
+    /// unlike a resource manager, does not auto-flush on close).
+    fn drop(&mut self) {
+        let _ = self
+            .context
+            .flush_context(ObjectHandle::from(self.ak_handle));
     }
 }
 
