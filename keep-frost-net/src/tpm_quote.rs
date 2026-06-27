@@ -11,7 +11,7 @@
 //! (see ATTESTATION-DESIGN.md / RFC 9683 / tpm2_checkquote):
 //!   1. magic == `TPM_GENERATED` (0xFF544347)        [GHSA-5495-c38w-gr6f]
 //!   2. attest type == `TPM_ST_ATTEST_QUOTE` (0x8018)
-//!   3. extraData == the expected nonce              (binds the quote to this group)
+//!   3. extraData == the expected nonce              (binds the quote to this announce)
 //!   4. quoted pcrSelection == the pinned selection    [GHSA-8rjm-5f5f-h4q6]
 //!   5. recomputed PCR composite digest == attested pcrDigest
 //!   6. claimed PCR values == pinned reference values
@@ -20,11 +20,13 @@
 //! The AK public key is pinned out of band (TOFU at provisioning); this module
 //! does not establish AK->device identity (that is the EK/MakeCredential flow).
 //!
-//! Freshness: the announce nonce is a static, group-derived value, so check 3 provides
-//! domain separation (a quote for one group cannot be replayed to another), NOT per-request
-//! freshness. Anti-replay of the surrounding announce comes from its signed timestamp
-//! (`ANNOUNCE_MAX_AGE_SECS`); a genuine challenge-response nonce is a future hardening. As with
-//! all attestation, this proves boot-time state, not runtime (TOCTOU).
+//! Freshness: the announce nonce is bound to the specific announce that carries the quote. The
+//! production caller derives it from the group public key, the announcing share index, and the
+//! announce timestamp, and the quote producer MUST quote with that exact value as `qualifyingData`.
+//! Check 3 therefore stops a valid quote from being lifted into a different or forged announce
+//! (cross-announce replay), and the signed announce timestamp (`ANNOUNCE_MAX_AGE_SECS`) bounds
+//! replay of the announce itself. As with all attestation, this proves boot-time state, not
+//! runtime (TOCTOU).
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
@@ -140,7 +142,7 @@ pub fn verify_quote(
 ) -> Result<()> {
     let q = parse_quote(attest)?; // checks 1, 2
 
-    // 3: nonce equality (binds the quote to this group; see module docs on freshness), constant-time.
+    // 3: nonce equality (binds the quote to this announce; see module docs on freshness), constant-time.
     if q.extra_data.ct_eq(expected_nonce).unwrap_u8() != 1 {
         return Err(att("TPM quote: nonce mismatch"));
     }
@@ -183,6 +185,26 @@ pub fn verify_quote(
     ak.verify_prehash(&prehash, &sig)
         .map_err(|_| att("TPM quote: signature does not verify against the pinned AK"))?;
     Ok(())
+}
+
+/// Decode hex-encoded PCR values (each a 32-byte SHA-256 digest) into fixed arrays.
+/// Every entry must be exactly 64 hex characters; the length is checked BEFORE decoding
+/// so the decode allocation is never sized by attacker-controlled input. Fail-closed: any
+/// malformed entry is an error. The number of values is bounded by the caller.
+pub(crate) fn decode_pcr_values(
+    values: &[String],
+) -> core::result::Result<Vec<[u8; PCR_DIGEST_LEN]>, &'static str> {
+    let mut out = Vec::with_capacity(values.len());
+    for v in values {
+        if v.len() != 64 {
+            return Err("TPM PCR value must be 64 hex characters");
+        }
+        let bytes = hex::decode(v).map_err(|_| "TPM PCR value must be 32 hex-encoded bytes")?;
+        let arr = <[u8; PCR_DIGEST_LEN]>::try_from(bytes.as_slice())
+            .map_err(|_| "TPM PCR value must be 32 hex-encoded bytes")?;
+        out.push(arr);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

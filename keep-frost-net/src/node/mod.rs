@@ -2029,6 +2029,9 @@ impl KfpNode {
             payload.timestamp,
         )?;
 
+        // The attestation blobs sit outside `proof_signature`; their integrity rests on the
+        // fail-closed admission below (AK pin plus nonce bound to the signed share_index/timestamp),
+        // so unsigned or swapped evidence cannot be admitted.
         let attestation_status = self.verify_announce_attestation(&payload);
 
         // When the node requires attestation (any policy configured), admit a peer ONLY if its
@@ -2107,7 +2110,10 @@ impl KfpNode {
         // reserved for a node that enforces no attestation whatsoever.
         let has_policy = self.require_attestation();
 
-        // A peer presents one evidence type; the TPM-quote path takes precedence.
+        // A peer presents one evidence type. When TPM-quote evidence is present it takes
+        // precedence over (shadows) the enclave `attestation` field; this is safe because the
+        // announce is self-signed (proof_signature over share_index + timestamp), so a network
+        // attacker cannot swap or inject the evidence without breaking that signature.
         if let Some(ev) = &payload.tpm_attestation {
             return match &self.tpm_attestation_policy {
                 Some(pol) => appraise_tpm_quote(

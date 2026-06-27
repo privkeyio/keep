@@ -5,7 +5,7 @@
 //! [`crate::attestation`] path. A node pins, out of band (TOFU at provisioning),
 //! each peer's AK public key, the PCR selection it must quote, and the reference
 //! PCR values it must report. [`appraise_tpm_quote`] checks a presented
-//! [`TpmQuoteEvidence`] against that policy and the group-derived nonce, yielding
+//! [`TpmQuoteEvidence`] against that policy and the announce-bound nonce, yielding
 //! the normalized [`AttestationStatus`] the OPRF oracle gates on.
 
 use std::collections::HashMap;
@@ -43,8 +43,8 @@ impl TpmAttestationPolicy {
 
 /// Appraise a TPM quote evidence against a pinned policy and an expected nonce.
 /// Fail-closed: any pin miss, parse failure, or verification error yields
-/// [`AttestationStatus::Failed`]. The nonce is a parameter so the broadcast
-/// (group-derived) nonce is supplied by the caller.
+/// [`AttestationStatus::Failed`]. The nonce is a parameter so the caller can supply
+/// the announce-bound value derived from the announce that carries the quote.
 pub(crate) fn appraise_tpm_quote(
     share_index: u16,
     ev: &TpmQuoteEvidence,
@@ -71,16 +71,10 @@ pub(crate) fn appraise_tpm_quote(
         Err(e) => return AttestationStatus::Failed(format!("TPM AK parse failed: {e}")),
     };
 
-    let mut pcr_values = Vec::with_capacity(ev.pcr_values.len());
-    for v in &ev.pcr_values {
-        match hex::decode(v) {
-            Ok(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
-                Ok(arr) => pcr_values.push(arr),
-                Err(_) => return AttestationStatus::Failed("TPM PCR value is not 32 bytes".into()),
-            },
-            Err(e) => return AttestationStatus::Failed(format!("TPM PCR hex decode failed: {e}")),
-        }
-    }
+    let pcr_values = match crate::tpm_quote::decode_pcr_values(&ev.pcr_values) {
+        Ok(v) => v,
+        Err(e) => return AttestationStatus::Failed(e.to_string()),
+    };
 
     match crate::tpm_quote::verify_quote(
         &ev.attest,
@@ -205,5 +199,81 @@ mod tests {
     fn tpm_appraise_rejects_wrong_nonce() {
         let status = appraise_tpm_quote(SHARE_INDEX, &evidence(), &policy(), &[0u8; 16]);
         assert!(matches!(status, AttestationStatus::Failed(_)));
+    }
+
+    // Build a self-consistent, signed TPMS_ATTEST quote with the given qualifyingData (nonce),
+    // PCR selection, and single PCR value, signed with `sk`. This exercises the full
+    // nonce-derivation-to-verify wiring with a 32-byte announce-bound nonce, which the fixed
+    // test-vector quote (a 16-byte nonce) cannot.
+    fn build_signed_quote(
+        nonce: &[u8],
+        pcr_select: &[u8],
+        pcr_value: &[u8; 32],
+        sk: &p256::ecdsa::SigningKey,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::{signature::Signer, Signature};
+        use sha2::{Digest, Sha256};
+
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&0xFF54_4347u32.to_be_bytes()); // TPM_GENERATED
+        attest.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
+        attest.extend_from_slice(&0u16.to_be_bytes()); // TPM2B_NAME qualifiedSigner: empty
+        attest.extend_from_slice(&(nonce.len() as u16).to_be_bytes()); // TPM2B_DATA extraData
+        attest.extend_from_slice(nonce);
+        attest.extend_from_slice(&[0u8; 17]); // TPMS_CLOCK_INFO
+        attest.extend_from_slice(&[0u8; 8]); // firmwareVersion
+        attest.extend_from_slice(pcr_select); // TPML_PCR_SELECTION (== pinned selection)
+        let digest = Sha256::digest(pcr_value);
+        attest.extend_from_slice(&(digest.len() as u16).to_be_bytes()); // TPM2B_DIGEST pcrDigest
+        attest.extend_from_slice(&digest);
+
+        let sig: Signature = sk.sign(&attest); // ECDSA-P256 over SHA-256(attest)
+        (attest, sig.to_bytes().to_vec())
+    }
+
+    #[test]
+    fn tpm_appraise_verifies_announce_bound_derived_nonce() {
+        use crate::attestation::derive_announce_attestation_nonce;
+
+        let group = [7u8; 32];
+        let share_index: u16 = 2;
+        let timestamp: u64 = 1_700_000_000;
+        let nonce = derive_announce_attestation_nonce(&group, share_index, timestamp);
+
+        let sk = p256::ecdsa::SigningKey::from_slice(&[0x42u8; 32]).unwrap();
+        let ak_sec1 = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+
+        let pcr_select = h("00000001000b03800000"); // sha256, one PCR
+        let pcr_value = [0x11u8; 32];
+        let (attest, signature) = build_signed_quote(&nonce, &pcr_select, &pcr_value, &sk);
+
+        let ev = TpmQuoteEvidence {
+            attest,
+            signature,
+            ak_sec1: ak_sec1.clone(),
+            pcr_values: vec![hex::encode(pcr_value)],
+        };
+        let mut pinned = HashMap::new();
+        pinned.insert(share_index, ak_sec1);
+        let pol = TpmAttestationPolicy::new(pcr_select, vec![pcr_value], pinned);
+
+        // The 32-byte announce-bound nonce derived from this announce verifies end to end.
+        assert_eq!(
+            appraise_tpm_quote(share_index, &ev, &pol, &nonce),
+            AttestationStatus::Verified
+        );
+
+        // The same quote appraised against a DIFFERENT announce (one tick later) fails: the
+        // qualifyingData no longer matches the derived nonce, so the quote cannot be replayed
+        // across announces.
+        let other = derive_announce_attestation_nonce(&group, share_index, timestamp + 1);
+        assert!(matches!(
+            appraise_tpm_quote(share_index, &ev, &pol, &other),
+            AttestationStatus::Failed(_)
+        ));
     }
 }

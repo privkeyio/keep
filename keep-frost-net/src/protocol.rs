@@ -269,17 +269,9 @@ impl KfpMessage {
                     if tpm.pcr_values.is_empty() || tpm.pcr_values.len() > MAX_TPM_PCR_VALUES {
                         return Err("TPM PCR value count out of range");
                     }
-                    for v in &tpm.pcr_values {
-                        // Reject the length BEFORE hex-decoding, so the decode allocation is never
-                        // sized by attacker-controlled input (a 32-byte digest is 64 hex chars).
-                        if v.len() != 64 {
-                            return Err("TPM PCR value must be 64 hex characters");
-                        }
-                        match hex::decode(v) {
-                            Ok(bytes) if bytes.len() == 32 => {}
-                            _ => return Err("TPM PCR value must be 32 hex-encoded bytes"),
-                        }
-                    }
+                    // Validate each PCR value's hex shape with the same fail-closed decoder the
+                    // appraisal uses, so the wire validator and verifier cannot diverge.
+                    crate::tpm_quote::decode_pcr_values(&tpm.pcr_values)?;
                 }
             }
             KfpMessage::SignRequest(p) => {
