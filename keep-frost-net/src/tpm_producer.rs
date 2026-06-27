@@ -60,8 +60,8 @@ fn att(msg: impl Into<String>) -> FrostNetError {
 /// Left-pad a big-endian ECC parameter to a fixed 32 bytes. The TPM may return r,
 /// s, x, or y with leading zero bytes trimmed; P-256 fields are 32 bytes wide.
 fn pad32(bytes: &[u8]) -> Result<[u8; 32]> {
-    if bytes.len() > 32 {
-        return Err(att("TPM ECC parameter longer than 32 bytes"));
+    if bytes.is_empty() || bytes.len() > 32 {
+        return Err(att("TPM ECC parameter not in 1..=32 bytes"));
     }
     let mut out = [0u8; 32];
     out[32 - bytes.len()..].copy_from_slice(bytes);
@@ -196,6 +196,9 @@ impl TpmQuoter {
     /// announce-bound value from [`crate::attestation::derive_announce_attestation_nonce`]).
     /// The returned evidence is ready to attach to an announce.
     pub fn quote(&mut self, nonce: &[u8]) -> Result<TpmQuoteEvidence> {
+        if nonce.len() != 32 {
+            return Err(att("quote nonce must be exactly 32 bytes"));
+        }
         let qualifying_data = Data::try_from(nonce.to_vec())
             .map_err(|_| att("quote nonce too long for TPM2B_DATA"))?;
 
@@ -282,7 +285,65 @@ mod tests {
     use crate::peer::AttestationStatus;
     use crate::tpm_policy::{appraise_tpm_quote, TpmAttestationPolicy};
     use std::collections::HashMap;
+    use tss_esapi::attributes::ObjectAttributesBuilder;
+    use tss_esapi::interface_types::key_bits::RsaKeyBits;
+    use tss_esapi::structures::{PublicKeyRsa, PublicRsaParametersBuilder, RsaScheme};
     use tss_esapi::{Context, TctiNameConf};
+
+    #[test]
+    fn pad32_rejects_empty() {
+        assert!(pad32(&[]).is_err());
+    }
+
+    #[test]
+    fn pad32_full_width_roundtrips() {
+        let input = [7u8; 32];
+        assert_eq!(pad32(&input).unwrap(), input);
+    }
+
+    #[test]
+    fn pad32_left_pads_short_input() {
+        let out = pad32(&[0xaa, 0xbb]).unwrap();
+        let mut expected = [0u8; 32];
+        expected[30] = 0xaa;
+        expected[31] = 0xbb;
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn pad32_rejects_oversized_input() {
+        assert!(pad32(&[0u8; 33]).is_err());
+    }
+
+    #[test]
+    fn ecc_sec1_rejects_non_ecc_key() {
+        let object_attributes = ObjectAttributesBuilder::new().build().unwrap();
+        let rsa_params = PublicRsaParametersBuilder::new()
+            .with_scheme(RsaScheme::Null)
+            .with_key_bits(RsaKeyBits::Rsa2048)
+            .build()
+            .unwrap();
+        let public = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::Rsa)
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(object_attributes)
+            .with_rsa_parameters(rsa_params)
+            .with_rsa_unique_identifier(PublicKeyRsa::default())
+            .build()
+            .unwrap();
+        match ecc_sec1(&public) {
+            Err(FrostNetError::Attestation(m)) => assert_eq!(m, "AK is not an ECC key"),
+            other => panic!("expected non-ECC attestation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ecdsa_rs_rejects_non_ecdsa_signature() {
+        match ecdsa_rs(&Signature::Null) {
+            Err(FrostNetError::Attestation(m)) => assert_eq!(m, "AK quote signature is not ECDSA"),
+            other => panic!("expected non-ECDSA attestation error, got {other:?}"),
+        }
+    }
 
     // Marshalled TPML_PCR_SELECTION for the SHA-256 bank over DEFAULT_PCR_SLOTS
     // {0,2,4,7,11,12}: count=1, alg=0x000b, sizeofSelect=3, bitmap 0x95 0x18 0x00.
