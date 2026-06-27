@@ -270,6 +270,11 @@ impl KfpMessage {
                         return Err("TPM PCR value count out of range");
                     }
                     for v in &tpm.pcr_values {
+                        // Reject the length BEFORE hex-decoding, so the decode allocation is never
+                        // sized by attacker-controlled input (a 32-byte digest is 64 hex chars).
+                        if v.len() != 64 {
+                            return Err("TPM PCR value must be 64 hex characters");
+                        }
                         match hex::decode(v) {
                             Ok(bytes) if bytes.len() == 32 => {}
                             _ => return Err("TPM PCR value must be 32 hex-encoded bytes"),

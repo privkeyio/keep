@@ -29,7 +29,9 @@ use keep_core::relay::{
     validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
 };
 
-use crate::attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
+use crate::attestation::{
+    derive_announce_attestation_nonce, verify_peer_attestation, ExpectedPcrs,
+};
 use crate::audit::SigningAuditLog;
 use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
@@ -2112,7 +2114,13 @@ impl KfpNode {
                     payload.share_index,
                     ev,
                     pol,
-                    &derive_attestation_nonce(&self.group_pubkey),
+                    // Bind the quote to THIS announce (share index + timestamp), not just the group,
+                    // so a valid quote cannot be replayed into a different/forged announce.
+                    &derive_announce_attestation_nonce(
+                        &self.group_pubkey,
+                        payload.share_index,
+                        payload.timestamp,
+                    ),
                 ),
                 None if has_policy => AttestationStatus::Failed(
                     "TPM quote evidence presented but this node has no TPM attestation policy"
