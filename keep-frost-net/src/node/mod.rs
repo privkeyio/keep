@@ -29,7 +29,9 @@ use keep_core::relay::{
     validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
 };
 
-use crate::attestation::{verify_peer_attestation, ExpectedPcrs};
+use crate::attestation::{
+    derive_announce_attestation_nonce, verify_peer_attestation, ExpectedPcrs,
+};
 use crate::audit::SigningAuditLog;
 use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
@@ -43,6 +45,7 @@ use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
+use crate::tpm_policy::{appraise_tpm_quote, TpmAttestationPolicy};
 
 /// Error returned by [`PersistedDescriptorLookup::latest_version_for`] when
 /// the underlying descriptor store cannot be queried (e.g. vault locked or
@@ -892,6 +895,10 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
+    /// Pinned policy for verifying peer TPM-quote attestation evidence. The
+    /// parallel to `expected_pcrs` for the Nitro path; `None` means TPM quotes
+    /// are not configured and appraise to `NotConfigured`.
+    tpm_attestation_policy: Option<TpmAttestationPolicy>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
     /// `(share_index, content_hash)` where `content_hash` covers the sorted
@@ -1111,6 +1118,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
+            tpm_attestation_policy: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
             seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_oprf_enrolls: RwLock::new(HashMap::new()),
@@ -1181,8 +1189,17 @@ impl KfpNode {
         self.expected_pcrs = Some(pcrs);
     }
 
+    pub fn with_tpm_attestation_policy(mut self, policy: TpmAttestationPolicy) -> Self {
+        self.tpm_attestation_policy = Some(policy);
+        self
+    }
+
+    pub fn set_tpm_attestation_policy(&mut self, policy: TpmAttestationPolicy) {
+        self.tpm_attestation_policy = Some(policy);
+    }
+
     pub fn require_attestation(&self) -> bool {
-        self.expected_pcrs.is_some()
+        self.expected_pcrs.is_some() || self.tpm_attestation_policy.is_some()
     }
 
     pub fn pubkey(&self) -> PublicKey {
@@ -1240,6 +1257,15 @@ impl KfpNode {
         if let Some(peer) = self.peers.write().get_peer_mut(share_index) {
             peer.attestation_status = status;
         }
+    }
+
+    /// Test-only: run the attestation-evidence dispatch for an announce payload,
+    /// to assert the appraised status (e.g. that unappraisable cross-type evidence
+    /// is `Failed`, not silently `NotConfigured`).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_attestation_status(&self, payload: &AnnouncePayload) -> AttestationStatus {
+        self.verify_announce_attestation(payload)
     }
 
     /// Test-only: drive the holder-side OPRF eval handler directly. Lets the
@@ -2003,30 +2029,26 @@ impl KfpNode {
             payload.timestamp,
         )?;
 
+        // The attestation blobs sit outside `proof_signature`; their integrity rests on the
+        // fail-closed admission below (AK pin plus nonce bound to the signed share_index/timestamp),
+        // so unsigned or swapped evidence cannot be admitted.
         let attestation_status = self.verify_announce_attestation(&payload);
 
-        if self.expected_pcrs.is_some() {
-            if let AttestationStatus::Failed(ref reason) = attestation_status {
-                warn!(
-                    share_index = payload.share_index,
-                    reason = %reason,
-                    "Rejecting peer with failed attestation"
-                );
-                return Err(FrostNetError::Attestation(format!(
-                    "Peer {} attestation failed: {}",
-                    payload.share_index, reason
-                )));
-            }
-            if attestation_status == AttestationStatus::NotProvided {
-                warn!(
-                    share_index = payload.share_index,
-                    "Rejecting peer without attestation (attestation required)"
-                );
-                return Err(FrostNetError::Attestation(format!(
-                    "Peer {} did not provide attestation",
-                    payload.share_index
-                )));
-            }
+        // When the node requires attestation (any policy configured), admit a peer ONLY if its
+        // attestation is `Verified`. This rejects `Failed`, `NotProvided`, and `NotConfigured`
+        // alike, and is keyed on ALL configured policies (not just the Nitro `expected_pcrs`), so a
+        // TPM-only node enforces admission and a peer cannot downgrade by presenting unappraisable
+        // evidence of the wrong type.
+        if self.require_attestation() && attestation_status != AttestationStatus::Verified {
+            warn!(
+                share_index = payload.share_index,
+                status = ?attestation_status,
+                "Rejecting peer: attestation not Verified (attestation required)"
+            );
+            return Err(FrostNetError::Attestation(format!(
+                "Peer {} attestation not verified: {:?}",
+                payload.share_index, attestation_status
+            )));
         }
 
         let mut peer = Peer::new(pubkey, payload.share_index)
@@ -2081,20 +2103,53 @@ impl KfpNode {
     }
 
     fn verify_announce_attestation(&self, payload: &AnnouncePayload) -> AttestationStatus {
-        let attestation = match &payload.attestation {
-            Some(att) => att,
-            None => return AttestationStatus::NotProvided,
-        };
+        // The node "requires attestation" if it has configured ANY attestation policy. In that
+        // mode, evidence of a type we cannot appraise (the matching policy is absent) is a
+        // DOWNGRADE attempt and is rejected as `Failed`, never silently treated as `NotConfigured`
+        // (which would be more permissive than presenting no evidence at all). `NotConfigured` is
+        // reserved for a node that enforces no attestation whatsoever.
+        let has_policy = self.require_attestation();
 
-        let expected = match &self.expected_pcrs {
-            Some(pcrs) => pcrs,
-            None => return AttestationStatus::NotConfigured,
-        };
-
-        match verify_peer_attestation(attestation, expected, &self.group_pubkey) {
-            Ok(()) => AttestationStatus::Verified,
-            Err(e) => AttestationStatus::Failed(e.to_string()),
+        // A peer presents one evidence type. When TPM-quote evidence is present it takes
+        // precedence over (shadows) the enclave `attestation` field; this is safe because the
+        // announce is self-signed (proof_signature over share_index + timestamp), so a network
+        // attacker cannot swap or inject the evidence without breaking that signature.
+        if let Some(ev) = &payload.tpm_attestation {
+            return match &self.tpm_attestation_policy {
+                Some(pol) => appraise_tpm_quote(
+                    payload.share_index,
+                    ev,
+                    pol,
+                    // Bind the quote to THIS announce (share index + timestamp), not just the group,
+                    // so a valid quote cannot be replayed into a different/forged announce.
+                    &derive_announce_attestation_nonce(
+                        &self.group_pubkey,
+                        payload.share_index,
+                        payload.timestamp,
+                    ),
+                ),
+                None if has_policy => AttestationStatus::Failed(
+                    "TPM quote evidence presented but this node has no TPM attestation policy"
+                        .to_string(),
+                ),
+                None => AttestationStatus::NotConfigured,
+            };
         }
+
+        if let Some(att) = &payload.attestation {
+            return match &self.expected_pcrs {
+                Some(pcrs) => match verify_peer_attestation(att, pcrs, &self.group_pubkey) {
+                    Ok(()) => AttestationStatus::Verified,
+                    Err(e) => AttestationStatus::Failed(e.to_string()),
+                },
+                None if has_policy => AttestationStatus::Failed(
+                    "Enclave attestation presented but this node has no expected PCRs".to_string(),
+                ),
+                None => AttestationStatus::NotConfigured,
+            };
+        }
+
+        AttestationStatus::NotProvided
     }
 
     pub(crate) fn verify_peer_share_index(&self, from: PublicKey, share_index: u16) -> Result<()> {

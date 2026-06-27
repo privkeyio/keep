@@ -53,6 +53,24 @@ pub fn derive_attestation_nonce(group_pubkey: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Announce-bound attestation nonce for the TPM-quote path: binds the quote to a SPECIFIC announce
+/// (its share index and timestamp), not just the group, so a valid quote cannot be lifted into a
+/// different/forged announce. The quote producer MUST quote with this exact value as
+/// `qualifyingData`, computed from the same announce it ships the quote in. (The Nitro path keeps
+/// the group-only nonce above, whose value is coordinated with the enclave producer.)
+pub fn derive_announce_attestation_nonce(
+    group_pubkey: &[u8; 32],
+    share_index: u16,
+    timestamp: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep-frost-attestation-nonce-v2");
+    hasher.update(group_pubkey);
+    hasher.update(share_index.to_be_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    hasher.finalize().into()
+}
+
 #[cfg(feature = "nitro-attestation")]
 pub fn verify_peer_attestation(
     attestation: &EnclaveAttestation,
@@ -197,6 +215,21 @@ mod tests {
         let different_group = [2u8; 32];
         let nonce3 = derive_attestation_nonce(&different_group);
         assert_ne!(nonce, nonce3);
+    }
+
+    #[test]
+    fn test_derive_announce_attestation_nonce_binds_to_announce() {
+        let g = [1u8; 32];
+        let base = derive_announce_attestation_nonce(&g, 2, 1000);
+        assert_eq!(base.len(), 32);
+        // Deterministic for the same announce.
+        assert_eq!(base, derive_announce_attestation_nonce(&g, 2, 1000));
+        // Bound to share index and timestamp, so a quote cannot be lifted to a different announce.
+        assert_ne!(base, derive_announce_attestation_nonce(&g, 3, 1000));
+        assert_ne!(base, derive_announce_attestation_nonce(&g, 2, 1001));
+        assert_ne!(base, derive_announce_attestation_nonce(&[2u8; 32], 2, 1000));
+        // Domain-separated from the group-only (Nitro) nonce.
+        assert_ne!(base, derive_attestation_nonce(&g));
     }
 
     #[cfg(not(feature = "nitro-attestation"))]
