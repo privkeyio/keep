@@ -45,24 +45,24 @@ fn att(msg: &str) -> FrostNetError {
 
 /// Minimal big-endian, bounds-checked cursor over the marshaled attest bytes.
 struct Cursor<'a> {
-    b: &'a [u8],
-    o: usize,
+    bytes: &'a [u8],
+    offset: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, o: 0 }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self
-            .o
+            .offset
             .checked_add(n)
             .ok_or_else(|| att("TPM quote: length overflow"))?;
         let s = self
-            .b
-            .get(self.o..end)
+            .bytes
+            .get(self.offset..end)
             .ok_or_else(|| att("TPM quote: truncated"))?;
-        self.o = end;
+        self.offset = end;
         Ok(s)
     }
     fn u8(&mut self) -> Result<u8> {
@@ -108,14 +108,14 @@ fn parse_quote(attest: &[u8]) -> Result<ParsedQuote<'_>> {
     let _firmware_version = c.take(8)?; // UINT64
                                         // TPMS_QUOTE_INFO.pcrSelect = TPML_PCR_SELECTION:
                                         //   count: u32, then count * { hash: u16, sizeofSelect: u8, select[sizeofSelect] }
-    let sel_start = c.o;
+    let sel_start = c.offset;
     let count = c.u32()?;
     for _ in 0..count {
         let _hash = c.u16()?;
         let size = c.u8()? as usize;
         c.take(size)?;
     }
-    let pcr_select = &attest[sel_start..c.o];
+    let pcr_select = &attest[sel_start..c.offset];
     let pcr_digest = c.tpm2b()?; // TPM2B_DIGEST (the attested composite)
     Ok(ParsedQuote {
         extra_data,
