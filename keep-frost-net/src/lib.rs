@@ -75,6 +75,7 @@ mod protocol;
 mod psbt_session;
 mod recovery_signers;
 mod session;
+pub mod tpm_quote;
 
 pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};

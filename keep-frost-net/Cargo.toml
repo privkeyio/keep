@@ -20,6 +20,9 @@ nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
 frost-secp256k1-tr = "3.0"
 rand = "0.10"
 k256 = { version = "0.13.4", features = ["schnorr"] }
+# NIST P-256 ECDSA, for verifying TPM2 quote signatures (the AK is a P-256 key).
+# Verifier-side only: pure Rust, no TPM / libtss2 (see tpm_quote.rs).
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 tokio = { version = "1", features = ["full", "sync"] }
 parking_lot = "0.12"
