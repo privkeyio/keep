@@ -345,6 +345,39 @@ mod tests {
         }
     }
 
+    // The producer ships `attest.marshall()` (see `quote`), and the verifier's
+    // `parse_quote` consumes the inner TPMS_ATTEST with no outer size prefix. This
+    // round-trips a real swtpm quote through the exact type and trait the producer
+    // uses, proving `marshall()` reproduces that byte-exact framing and that the
+    // result verifies end-to-end, with no TPM. It catches a tss-esapi re-marshal
+    // drift in CI that the TPM-gated roundtrip below cannot.
+    #[test]
+    fn marshalled_attest_matches_verifier_wire_format() {
+        use crate::tpm_quote::{test_vector as v, verify_quote};
+        use tss_esapi::structures::Attest;
+        use tss_esapi::traits::UnMarshall;
+
+        let wire = v::h(v::ATTEST);
+        let attest = Attest::unmarshall(&wire).expect("real swtpm attest must unmarshall");
+        let remarshalled = attest.marshall().expect("attest must re-marshall");
+        assert_eq!(
+            remarshalled, wire,
+            "Attest::marshall() must reproduce the byte-exact TPMS_ATTEST the verifier parses"
+        );
+
+        let pcrs = v::pcrs();
+        verify_quote(
+            &remarshalled,
+            &v::sig_rs(),
+            &v::ak(),
+            &v::h(v::NONCE),
+            &v::h(v::PCR_SELECT),
+            &pcrs,
+            &pcrs,
+        )
+        .expect("marshalled producer bytes must verify against the pinned AK");
+    }
+
     // Marshalled TPML_PCR_SELECTION for the SHA-256 bank over DEFAULT_PCR_SLOTS
     // {0,2,4,7,11,12}: count=1, alg=0x000b, sizeofSelect=3, bitmap 0x95 0x18 0x00.
     // The verifier pins exactly these bytes (check 4).
