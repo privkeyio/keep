@@ -3100,3 +3100,57 @@ async fn test_distribute_oprf_shares_rejects_duplicate_target() {
         .await;
     assert!(result.is_err(), "a duplicate target index must be rejected");
 }
+
+/// Cross-attestation downgrade guard: on a node that REQUIRES attestation (an enclave PCR policy
+/// set, but no TPM policy), a peer presenting unappraisable TPM-quote evidence must be appraised
+/// `Failed`, NOT `NotConfigured` (which would admit it, more permissively than presenting no
+/// evidence). A node with no attestation policy at all stays permissive (`NotConfigured`).
+#[tokio::test]
+async fn test_unappraisable_tpm_evidence_is_failed_not_downgraded() {
+    use keep_frost_net::{AttestationStatus, ExpectedPcrs, TpmQuoteEvidence};
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-tpm-downgrade").unwrap();
+    let _ = shares.remove(0);
+    let required_share = shares.remove(0); // id 2
+    let permissive_share = shares.remove(0); // id 3
+
+    // Junk evidence that nonetheless satisfies `validate()`.
+    let junk = TpmQuoteEvidence {
+        attest: vec![0xff; 16],
+        signature: vec![0u8; 64],
+        ak_sec1: {
+            let mut v = vec![0u8; 65];
+            v[0] = 0x04;
+            v
+        },
+        pcr_values: vec!["00".repeat(32)],
+    };
+    let payload = AnnouncePayload::new([1u8; 32], 2, [2u8; 33], [3u8; 64], 1_700_000_000)
+        .with_tpm_attestation(junk);
+
+    // A node that requires attestation (enclave PCRs) but has NO TPM policy: the cross-type
+    // evidence is unappraisable -> Failed (the downgrade is refused).
+    let mut required = KfpNode::new(required_share, vec![relay.clone()])
+        .await
+        .expect("required node");
+    required.set_expected_pcrs(ExpectedPcrs::new([1u8; 48], [2u8; 48], [3u8; 48]));
+    let status = required.test_attestation_status(&payload);
+    assert!(
+        matches!(status, AttestationStatus::Failed(_)),
+        "unappraisable TPM evidence on an attestation-requiring node must be Failed, got {status:?}"
+    );
+
+    // A node with no attestation policy at all stays permissive.
+    let permissive = KfpNode::new(permissive_share, vec![relay])
+        .await
+        .expect("permissive node");
+    assert_eq!(
+        permissive.test_attestation_status(&payload),
+        AttestationStatus::NotConfigured,
+        "a node enforcing no attestation must report NotConfigured, not reject"
+    );
+}

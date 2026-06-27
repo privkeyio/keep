@@ -11,7 +11,7 @@
 //! (see ATTESTATION-DESIGN.md / RFC 9683 / tpm2_checkquote):
 //!   1. magic == `TPM_GENERATED` (0xFF544347)        [GHSA-5495-c38w-gr6f]
 //!   2. attest type == `TPM_ST_ATTEST_QUOTE` (0x8018)
-//!   3. extraData == the expected (verifier) nonce    (freshness / anti-replay)
+//!   3. extraData == the expected nonce              (binds the quote to this group)
 //!   4. quoted pcrSelection == the pinned selection    [GHSA-8rjm-5f5f-h4q6]
 //!   5. recomputed PCR composite digest == attested pcrDigest
 //!   6. claimed PCR values == pinned reference values
@@ -19,6 +19,12 @@
 //!
 //! The AK public key is pinned out of band (TOFU at provisioning); this module
 //! does not establish AK->device identity (that is the EK/MakeCredential flow).
+//!
+//! Freshness: the announce nonce is a static, group-derived value, so check 3 provides
+//! domain separation (a quote for one group cannot be replayed to another), NOT per-request
+//! freshness. Anti-replay of the surrounding announce comes from its signed timestamp
+//! (`ANNOUNCE_MAX_AGE_SECS`); a genuine challenge-response nonce is a future hardening. As with
+//! all attestation, this proves boot-time state, not runtime (TOCTOU).
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
@@ -134,7 +140,7 @@ pub fn verify_quote(
 ) -> Result<()> {
     let q = parse_quote(attest)?; // checks 1, 2
 
-    // 3: nonce (freshness / anti-replay), constant-time.
+    // 3: nonce equality (binds the quote to this group; see module docs on freshness), constant-time.
     if q.extra_data.ct_eq(expected_nonce).unwrap_u8() != 1 {
         return Err(att("TPM quote: nonce mismatch"));
     }
