@@ -20,6 +20,13 @@ pub const MAX_PARTICIPANTS: usize = 255;
 /// scalar followed by a 33-byte compressed point (`keep_core::oprf::threshold`).
 pub const OPRF_PARTIAL_LEN: usize = 65;
 pub const MAX_NAME_LENGTH: usize = 256;
+/// Upper bound on a marshaled `TPMS_ATTEST` carried in a TPM quote evidence. A
+/// real quote is well under 256 bytes; the cap rejects oversized blobs before
+/// any parsing work.
+pub const MAX_TPM_ATTEST_SIZE: usize = 1024;
+/// Upper bound on the number of PCR values in a TPM quote evidence (a TPM bank
+/// has 24 PCRs).
+pub const MAX_TPM_PCR_VALUES: usize = 24;
 pub const MAX_CAPABILITY_LENGTH: usize = 64;
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
@@ -247,6 +254,26 @@ impl KfpMessage {
                 for cap in &p.capabilities {
                     if cap.len() > MAX_CAPABILITY_LENGTH {
                         return Err("Capability string exceeds maximum length");
+                    }
+                }
+                if let Some(ref tpm) = p.tpm_attestation {
+                    if tpm.attest.is_empty() || tpm.attest.len() > MAX_TPM_ATTEST_SIZE {
+                        return Err("TPM attest exceeds maximum size");
+                    }
+                    if tpm.signature.len() != 64 {
+                        return Err("TPM signature must be 64 bytes");
+                    }
+                    if tpm.ak_sec1.len() != 65 || tpm.ak_sec1[0] != 0x04 {
+                        return Err("TPM AK must be a 65-byte uncompressed SEC1 point");
+                    }
+                    if tpm.pcr_values.is_empty() || tpm.pcr_values.len() > MAX_TPM_PCR_VALUES {
+                        return Err("TPM PCR value count out of range");
+                    }
+                    for v in &tpm.pcr_values {
+                        match hex::decode(v) {
+                            Ok(bytes) if bytes.len() == 32 => {}
+                            _ => return Err("TPM PCR value must be 32 hex-encoded bytes"),
+                        }
                     }
                 }
             }
@@ -767,6 +794,28 @@ pub struct AnnouncePayload {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attestation: Option<EnclaveAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpm_attestation: Option<TpmQuoteEvidence>,
+}
+
+/// TPM 2.0 quote attestation evidence, the parallel to [`EnclaveAttestation`]
+/// for nodes whose measured-boot state is rooted in a TPM rather than an AWS
+/// Nitro enclave. Verified by [`crate::tpm_quote::verify_quote`] against a
+/// TOFU-pinned AK and pinned reference PCRs.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TpmQuoteEvidence {
+    /// Marshaled `TPMS_ATTEST` (the bytes the TPM signed).
+    #[serde(with = "base64_vec")]
+    pub attest: Vec<u8>,
+    /// 64-byte ECDSA-P256 `r || s` signature over `SHA-256(attest)`.
+    #[serde(with = "hex_vec")]
+    pub signature: Vec<u8>,
+    /// 65-byte uncompressed SEC1 point `0x04 || x || y`: the AK identity,
+    /// TOFU-pinned at the verifier.
+    #[serde(with = "hex_vec")]
+    pub ak_sec1: Vec<u8>,
+    /// Hex PCR digests in selection order (32 bytes each).
+    pub pcr_values: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -830,6 +879,7 @@ impl AnnouncePayload {
             capabilities: vec!["sign".into()],
             name: None,
             attestation: None,
+            tpm_attestation: None,
         }
     }
 
@@ -845,6 +895,11 @@ impl AnnouncePayload {
 
     pub fn with_attestation(mut self, attestation: EnclaveAttestation) -> Self {
         self.attestation = Some(attestation);
+        self
+    }
+
+    pub fn with_tpm_attestation(mut self, evidence: TpmQuoteEvidence) -> Self {
+        self.tpm_attestation = Some(evidence);
         self
     }
 }
@@ -2206,6 +2261,34 @@ mod tests {
             }
             _ => panic!("expected Announce"),
         }
+    }
+
+    #[test]
+    fn test_announce_tpm_validate_rejects_bad_evidence() {
+        let good_ak = {
+            let mut v = vec![0x04u8];
+            v.extend_from_slice(&[1u8; 64]);
+            v
+        };
+        let mk = |sig: Vec<u8>, ak: Vec<u8>| {
+            let ev = TpmQuoteEvidence {
+                attest: vec![0xff; 8],
+                signature: sig,
+                ak_sec1: ak,
+                pcr_values: vec!["00".repeat(32)],
+            };
+            KfpMessage::Announce(
+                AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 1234567890)
+                    .with_tpm_attestation(ev),
+            )
+        };
+
+        // A 63-byte signature is rejected.
+        assert!(mk(vec![0u8; 63], good_ak.clone()).validate().is_err());
+        // A 64-byte ak_sec1 is rejected.
+        assert!(mk(vec![0u8; 64], vec![0x04u8; 64]).validate().is_err());
+        // The well-formed evidence passes the bound checks.
+        assert!(mk(vec![0u8; 64], good_ak).validate().is_ok());
     }
 
     #[test]

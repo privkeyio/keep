@@ -29,7 +29,7 @@ use keep_core::relay::{
     validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
 };
 
-use crate::attestation::{verify_peer_attestation, ExpectedPcrs};
+use crate::attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
 use crate::audit::SigningAuditLog;
 use crate::descriptor_session::DescriptorSessionManager;
 use crate::ecdh::EcdhSessionManager;
@@ -43,6 +43,7 @@ use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
+use crate::tpm_policy::{appraise_tpm_quote, TpmAttestationPolicy};
 
 /// Error returned by [`PersistedDescriptorLookup::latest_version_for`] when
 /// the underlying descriptor store cannot be queried (e.g. vault locked or
@@ -892,6 +893,10 @@ pub struct KfpNode {
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
     expected_pcrs: Option<ExpectedPcrs>,
+    /// Pinned policy for verifying peer TPM-quote attestation evidence. The
+    /// parallel to `expected_pcrs` for the Nitro path; `None` means TPM quotes
+    /// are not configured and appraise to `NotConfigured`.
+    tpm_attestation_policy: Option<TpmAttestationPolicy>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
     /// `(share_index, content_hash)` where `content_hash` covers the sorted
@@ -1111,6 +1116,7 @@ impl KfpNode {
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
             expected_pcrs: None,
+            tpm_attestation_policy: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
             seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_oprf_enrolls: RwLock::new(HashMap::new()),
@@ -1179,6 +1185,15 @@ impl KfpNode {
 
     pub fn set_expected_pcrs(&mut self, pcrs: ExpectedPcrs) {
         self.expected_pcrs = Some(pcrs);
+    }
+
+    pub fn with_tpm_attestation_policy(mut self, policy: TpmAttestationPolicy) -> Self {
+        self.tpm_attestation_policy = Some(policy);
+        self
+    }
+
+    pub fn set_tpm_attestation_policy(&mut self, policy: TpmAttestationPolicy) {
+        self.tpm_attestation_policy = Some(policy);
     }
 
     pub fn require_attestation(&self) -> bool {
@@ -2081,6 +2096,12 @@ impl KfpNode {
     }
 
     fn verify_announce_attestation(&self, payload: &AnnouncePayload) -> AttestationStatus {
+        // A peer presents one evidence type; the TPM-quote path takes precedence
+        // when present, mirroring the additive Nitro path below.
+        if let Some(ev) = &payload.tpm_attestation {
+            return self.verify_tpm_quote_evidence(payload.share_index, ev);
+        }
+
         let attestation = match &payload.attestation {
             Some(att) => att,
             None => return AttestationStatus::NotProvided,
@@ -2095,6 +2116,22 @@ impl KfpNode {
             Ok(()) => AttestationStatus::Verified,
             Err(e) => AttestationStatus::Failed(e.to_string()),
         }
+    }
+
+    /// Verify a peer's TPM-quote evidence against the pinned TPM attestation
+    /// policy, using the group-derived broadcast nonce. Returns `NotConfigured`
+    /// when no policy is set; otherwise delegates to [`appraise_tpm_quote`].
+    fn verify_tpm_quote_evidence(
+        &self,
+        share_index: u16,
+        ev: &TpmQuoteEvidence,
+    ) -> AttestationStatus {
+        let pol = match &self.tpm_attestation_policy {
+            Some(p) => p,
+            None => return AttestationStatus::NotConfigured,
+        };
+        let nonce = derive_attestation_nonce(&self.group_pubkey);
+        appraise_tpm_quote(share_index, ev, pol, &nonce)
     }
 
     pub(crate) fn verify_peer_share_index(&self, from: PublicKey, share_index: u16) -> Result<()> {
