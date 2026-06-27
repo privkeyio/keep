@@ -207,30 +207,36 @@ pub(crate) fn decode_pcr_values(
     Ok(out)
 }
 
+/// Canonical real-swtpm quote vector (swtpm 0.10.1 + tpm2-tools 5.7, ECDSA-P256/
+/// SHA-256 AK over sha256:0,2,4,7,11,12, verified by tpm2_checkquote). Shared by
+/// the verifier tests below and the producer's marshal-contract test, so both
+/// sides are pinned to the same wire bytes.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_vector {
     use super::*;
     use p256::{EncodedPoint, FieldBytes};
 
-    fn h(s: &str) -> Vec<u8> {
+    pub(crate) const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
+    pub(crate) const SIG_R: &str =
+        "0408dac9c80e649049e75fc74d6e1634fa4922066ce488b49b5110e7125b172b";
+    pub(crate) const SIG_S: &str =
+        "124fd1dc171546bde98f4409ad002fa7ccad75a65374ea7ee96381de337b34f0";
+    pub(crate) const AK_X: &str =
+        "f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb327";
+    pub(crate) const AK_Y: &str =
+        "1b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
+    pub(crate) const NONCE: &str = "00112233445566778899aabbccddeeff";
+    pub(crate) const PCR_SELECT: &str = "00000001000b03951800";
+    pub(crate) const PCR11: &str =
+        "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0";
+
+    pub(crate) fn h(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()
     }
-    fn h32(s: &str) -> [u8; 32] {
+    pub(crate) fn h32(s: &str) -> [u8; 32] {
         h(s).try_into().unwrap()
     }
-
-    // Real TPM2 quote: swtpm 0.10.1 + tpm2-tools 5.7, ECDSA-P256/SHA256 AK, over
-    // sha256:0,2,4,7,11,12; verified by tpm2_checkquote. (keep-node/tpm-quote-test-vector.json)
-    const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
-    const SIG_R: &str = "0408dac9c80e649049e75fc74d6e1634fa4922066ce488b49b5110e7125b172b";
-    const SIG_S: &str = "124fd1dc171546bde98f4409ad002fa7ccad75a65374ea7ee96381de337b34f0";
-    const AK_X: &str = "f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb327";
-    const AK_Y: &str = "1b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
-    const NONCE: &str = "00112233445566778899aabbccddeeff";
-    const PCR_SELECT: &str = "00000001000b03951800";
-    const PCR11: &str = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0";
-
-    fn ak() -> VerifyingKey {
+    pub(crate) fn ak() -> VerifyingKey {
         let x = h(AK_X);
         let y = h(AK_Y);
         let point = EncodedPoint::from_affine_coordinates(
@@ -240,16 +246,20 @@ mod tests {
         );
         VerifyingKey::from_encoded_point(&point).unwrap()
     }
-
-    fn sig_rs() -> Vec<u8> {
+    pub(crate) fn sig_rs() -> Vec<u8> {
         [h(SIG_R), h(SIG_S)].concat()
     }
-
-    fn pcrs() -> [[u8; 32]; 6] {
+    pub(crate) fn pcrs() -> [[u8; 32]; 6] {
         let z = [0u8; 32];
         // selection order: PCR 0, 2, 4, 7, 11, 12
         [z, z, z, z, h32(PCR11), z]
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_vector::*;
+    use super::*;
 
     #[test]
     fn verifies_real_swtpm_quote() {
