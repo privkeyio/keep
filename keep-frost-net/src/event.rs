@@ -11,6 +11,7 @@ use crate::protocol::*;
 pub struct KfpEventBuilder;
 
 impl KfpEventBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub fn announcement(
         keys: &Keys,
         group_pubkey: &[u8; 32],
@@ -18,8 +19,9 @@ impl KfpEventBuilder {
         signing_share: &[u8; 32],
         verifying_share: &[u8; 33],
         name: Option<&str>,
+        timestamp: u64,
+        tpm_attestation: Option<TpmQuoteEvidence>,
     ) -> Result<Event> {
-        let timestamp = Timestamp::now().as_secs();
         let proof_signature = proof::sign_proof(
             signing_share,
             group_pubkey,
@@ -37,6 +39,9 @@ impl KfpEventBuilder {
         );
         if let Some(n) = name {
             payload = payload.with_name(n);
+        }
+        if let Some(ev) = tpm_attestation {
+            payload = payload.with_tpm_attestation(ev);
         }
 
         let msg = KfpMessage::Announce(payload);
@@ -573,6 +578,8 @@ mod tests {
             &signing_share,
             &verifying_share,
             Some("test"),
+            Timestamp::now().as_secs(),
+            None,
         )
         .unwrap();
 
@@ -594,9 +601,56 @@ mod tests {
                 payload.timestamp,
             )
             .expect("proof verification should succeed");
+            assert!(payload.tpm_attestation.is_none());
         } else {
             panic!("expected Announce message");
         }
+    }
+
+    #[test]
+    fn test_announcement_attaches_tpm_evidence() {
+        let keys = Keys::generate();
+        let group_pubkey = [2u8; 32];
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let mut signing_share = [0u8; 32];
+        signing_share.copy_from_slice(&signing_key.to_bytes());
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x02;
+        verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
+
+        let evidence = TpmQuoteEvidence {
+            attest: vec![0xff; 16],
+            signature: vec![7u8; 64],
+            ak_sec1: {
+                let mut v = vec![0u8; 65];
+                v[0] = 0x04;
+                v
+            },
+            pcr_values: vec!["00".repeat(32)],
+        };
+
+        let event = KfpEventBuilder::announcement(
+            &keys,
+            &group_pubkey,
+            1,
+            &signing_share,
+            &verifying_share,
+            None,
+            Timestamp::now().as_secs(),
+            Some(evidence.clone()),
+        )
+        .unwrap();
+
+        let parsed = KfpMessage::from_json(&event.content).unwrap();
+        let KfpMessage::Announce(payload) = parsed else {
+            panic!("expected Announce message");
+        };
+        let attached = payload.tpm_attestation.expect("evidence must be attached");
+        assert_eq!(attached.attest, evidence.attest);
+        assert_eq!(attached.signature, evidence.signature);
+        assert_eq!(attached.ak_sec1, evidence.ak_sec1);
+        assert_eq!(attached.pcr_values, evidence.pcr_values);
     }
 
     #[test]
