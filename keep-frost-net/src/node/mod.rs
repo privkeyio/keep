@@ -1610,7 +1610,7 @@ impl KfpNode {
         // rejected by any peer that pins a policy.
         let tpm_attestation = match &self.announce_attestor {
             Some(attestor) => {
-                let nonce = crate::attestation::derive_announce_attestation_nonce(
+                let nonce = derive_announce_attestation_nonce(
                     &self.group_pubkey,
                     share_index,
                     timestamp,
