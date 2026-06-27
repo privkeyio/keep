@@ -446,6 +446,10 @@ pub struct HealthCheckResult {
 pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+/// Maximum time to wait for a TPM quote during announce before failing closed.
+/// The TPM `quote()` is a blocking hardware call; bounding it keeps a wedged or
+/// slow TPM from stalling the inbound message-processing loop.
+const ANNOUNCE_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the early-exit liveness ping re-checks for pongs while waiting.
 const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1588,15 +1592,6 @@ impl KfpNode {
             .key_package()
             .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
 
-        let signing_share = key_package.signing_share();
-        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            signing_share
-                .serialize()
-                .as_slice()
-                .try_into()
-                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
-        );
-
         let verifying_share = key_package.verifying_share();
         let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
             FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
@@ -1620,13 +1615,30 @@ impl KfpNode {
                     share_index,
                     timestamp,
                 );
-                let evidence = attestor.request_quote(nonce).await.map_err(|_| {
-                    FrostNetError::Attestation("TPM quote service is unavailable".into())
-                })??;
+                let evidence =
+                    tokio::time::timeout(ANNOUNCE_QUOTE_TIMEOUT, attestor.request_quote(nonce))
+                        .await
+                        .map_err(|_| {
+                            FrostNetError::Attestation("TPM quote service timed out".into())
+                        })?
+                        .map_err(|_| {
+                            FrostNetError::Attestation("TPM quote service is unavailable".into())
+                        })??;
                 Some(evidence)
             }
             None => None,
         };
+
+        // Derive the FROST signing share only after the quote round-trip, keeping
+        // the secret's in-memory residency window as small as possible.
+        let signing_share = key_package.signing_share();
+        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share
+                .serialize()
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
 
         let event = KfpEventBuilder::announcement(
             &self.keys,
