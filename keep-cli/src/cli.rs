@@ -598,6 +598,25 @@ pub(crate) enum FrostNetworkCommands {
         #[arg(short, long)]
         relay: Option<String>,
     },
+    /// Author an attestation-config from observed announces (trust-on-first-use).
+    AttestationProvision {
+        #[arg(short, long, help = "FROST group npub")]
+        group: String,
+        #[arg(short, long, help = "Coordination relay URL")]
+        relay: Option<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Write the attestation policy TOML here"
+        )]
+        out: PathBuf,
+        #[arg(
+            long,
+            default_value = "25",
+            help = "Seconds to listen for announces (>= one announce interval)"
+        )]
+        wait: u64,
+    },
     Dkg {
         #[arg(short, long, help = "Group name for the new keyset")]
         group: String,

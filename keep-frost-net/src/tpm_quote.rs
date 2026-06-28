@@ -124,6 +124,15 @@ fn parse_quote(attest: &[u8]) -> Result<ParsedQuote<'_>> {
     })
 }
 
+/// Extract the marshaled `TPML_PCR_SELECTION` bytes from a quote's `TPMS_ATTEST`.
+/// The selection a verifier must pin lives only inside the signed quote, so
+/// trust-on-first-use provisioning reads it from an observed announce. This
+/// validates magic and type but performs NO signature or freshness check: the
+/// caller is establishing trust, not relying on it.
+pub fn pcr_selection_from_attest(attest: &[u8]) -> Result<Vec<u8>> {
+    Ok(parse_quote(attest)?.pcr_select.to_vec())
+}
+
 /// Verify a TPM2 quote against a pinned AK, expected nonce, pinned PCR selection,
 /// and pinned reference PCR values. `pcr_values` are the holder's claimed PCR
 /// digests in the SAME order as the selection; `attest` is the marshaled
@@ -260,6 +269,19 @@ pub(crate) mod test_vector {
 mod tests {
     use super::test_vector::*;
     use super::*;
+
+    #[test]
+    fn pcr_selection_from_attest_matches_pinned_selection() {
+        // The selection extracted from the real quote equals the pinned bytes
+        // the verifier checks (`PCR_SELECT`), so TOFU provisioning recovers it.
+        let sel = super::pcr_selection_from_attest(&h(ATTEST)).expect("extract selection");
+        assert_eq!(sel, h(PCR_SELECT));
+    }
+
+    #[test]
+    fn pcr_selection_from_attest_rejects_non_quote() {
+        assert!(super::pcr_selection_from_attest(&[0u8; 8]).is_err());
+    }
 
     #[test]
     fn verifies_real_swtpm_quote() {

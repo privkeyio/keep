@@ -28,6 +28,7 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 - **Remote signing**: NIP-46 bunker mode for any compatible Nostr client
 - **Threshold signatures**: FROST t-of-n key splitting with distributed key generation (DKG)
 - **Network signing**: Coordinate FROST signing across devices over Nostr relays
+- **Threshold vault unlock**: Reconstruct a disk-encryption key at boot from a t-of-n OPRF quorum across TPM-attested holders (powers [keep-node](https://github.com/privkeyio/keep-node))
 - **Bitcoin**: BIP-86 Taproot addresses, PSBT signing, wallet descriptor coordination
 - **Enclaves**: AWS Nitro Enclave signing with attestation-based KMS
 - **Agent SDK**: Constrained signing sessions for AI agents (Python, TypeScript, MCP)

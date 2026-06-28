@@ -87,3 +87,4 @@ bitcoin = { workspace = true }
 tempfile = "3.27"
 sha2 = "0.10"
 hex = "0.4"
+k256 = { version = "0.13.4", features = ["schnorr"] }
