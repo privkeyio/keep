@@ -55,6 +55,8 @@ pub fn cmd_frost_network_serve(
     refuse_raw_sign: bool,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
+    oprf_share_file: Option<&Path>,
+    oprf_dealer: Option<u16>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
 
@@ -88,12 +90,31 @@ pub fn cmd_frost_network_serve(
     out.field("Relay", relay);
     out.newline();
 
+    // Load this holder's OPRF key share if the file is present, so the node can
+    // answer evaluation requests. An absent file means the node serves without a
+    // share (e.g. awaiting its first enrollment); the share is sealed into this
+    // same path on enrollment and takes effect on the next start.
+    let oprf_share: Option<keep_core::oprf::threshold::KeyShare> = match oprf_share_file {
+        Some(p) if p.exists() => {
+            let bytes = zeroize::Zeroizing::new(
+                std::fs::read(p)
+                    .map_err(|e| KeepError::Runtime(format!("read OPRF share file: {e}")))?,
+            );
+            let share = keep_core::oprf::threshold::deserialize_key_share(&bytes)
+                .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
+            Some(share)
+        }
+        _ => None,
+    };
+    // Where an enrolled share is sealed, owned so the event loop can move it.
+    let oprf_seal_path = oprf_share_file.map(|p| p.to_path_buf());
+
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
 
-    rt.block_on(async move {
+    let unlock_result = rt.block_on(async move {
         out.info("Starting FROST coordination node...");
 
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
@@ -118,6 +139,18 @@ pub fn cmd_frost_network_serve(
                 "refuse raw (`message_type=raw` rejected, see #524)",
             );
         }
+        // OPRF holder runtime: install the loaded share so this node answers
+        // evaluation requests, and pin the dealer that may enroll it.
+        if let Some(share) = oprf_share {
+            node = node.with_oprf_key_share(share);
+            out.field("OPRF holder", "share loaded (answering evaluations)");
+        } else if oprf_share_file.is_some() {
+            out.field("OPRF holder", "no share yet (awaiting enrollment)");
+        }
+        if let Some(dealer) = oprf_dealer {
+            node.set_expected_oprf_dealer(dealer);
+            out.field("OPRF dealer", &format!("pinned to share {dealer}"));
+        }
         let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();
@@ -129,6 +162,7 @@ pub fn cmd_frost_network_serve(
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
         let event_keep = keep.clone();
+        let event_seal_path = oprf_seal_path.clone();
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
@@ -344,6 +378,41 @@ pub fn cmd_frost_network_serve(
                         let session = hex::encode(&session_id[..8]);
                         tracing::error!(session, error, "descriptor session failed");
                     }
+                    Ok(keep_frost_net::KfpNodeEvent::OprfShareReceived {
+                        dealer_index,
+                        share,
+                        seal_ack,
+                        ..
+                    }) => {
+                        // Durable custody: seal the enrolled share to disk, then
+                        // ack only on a confirmed write so the dealer is never told
+                        // enrollment completed with nothing sealed.
+                        let sealed = match &event_seal_path {
+                            Some(path) => match write_secret_file(path, share.as_slice()) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        dealer_index,
+                                        path = %path.display(),
+                                        "sealed enrolled OPRF share; restart serve with --oprf-share-file to answer evaluations"
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "failed to seal enrolled OPRF share");
+                                    false
+                                }
+                            },
+                            None => {
+                                tracing::error!(
+                                    "received an OPRF enrollment but --oprf-share-file is not set; cannot seal"
+                                );
+                                false
+                            }
+                        };
+                        if let Some(tx) = seal_ack.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(sealed);
+                        }
+                    }
                     Err(_) => break,
                     _ => {}
                 }
@@ -356,7 +425,14 @@ pub fn cmd_frost_network_serve(
         event_task.abort();
 
         Ok::<_, KeepError>(())
-    })?;
+    });
+
+    // `KeyShare` is `Copy` + `Zeroize` but not `ZeroizeOnDrop`: the copy installed
+    // on the node is gone with it, but our local copy must be wiped by hand.
+    if let Some(mut share) = oprf_share {
+        share.zeroize();
+    }
+    unlock_result?;
 
     Ok(())
 }
