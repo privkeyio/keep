@@ -29,6 +29,7 @@ use keep_core::relay::{
     validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
 };
 
+use crate::announce_attestor::AnnounceAttestor;
 use crate::attestation::{
     derive_announce_attestation_nonce, verify_peer_attestation, ExpectedPcrs,
 };
@@ -445,6 +446,10 @@ pub struct HealthCheckResult {
 pub(crate) const ANNOUNCE_MAX_AGE_SECS: u64 = 300;
 /// Maximum clock skew tolerance for future timestamps (30 seconds)
 pub(crate) const ANNOUNCE_MAX_FUTURE_SECS: u64 = 30;
+/// Maximum time to wait for a TPM quote during announce before failing closed.
+/// The TPM `quote()` is a blocking hardware call; bounding it keeps a wedged or
+/// slow TPM from stalling the inbound message-processing loop.
+const ANNOUNCE_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the early-exit liveness ping re-checks for pongs while waiting.
 const LIVENESS_PING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -899,6 +904,9 @@ pub struct KfpNode {
     /// parallel to `expected_pcrs` for the Nitro path; `None` means TPM quotes
     /// are not configured and appraise to `NotConfigured`.
     tpm_attestation_policy: Option<TpmAttestationPolicy>,
+    /// Producer side: when set, every announce carries a fresh TPM quote bound to
+    /// it. `None` means this node attaches no TPM attestation to its announces.
+    announce_attestor: Option<Arc<dyn AnnounceAttestor>>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
     /// `(share_index, content_hash)` where `content_hash` covers the sorted
@@ -1119,6 +1127,7 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             tpm_attestation_policy: None,
+            announce_attestor: None,
             seen_xpub_announces: RwLock::new(HashSet::new()),
             seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_oprf_enrolls: RwLock::new(HashMap::new()),
@@ -1196,6 +1205,18 @@ impl KfpNode {
 
     pub fn set_tpm_attestation_policy(&mut self, policy: TpmAttestationPolicy) {
         self.tpm_attestation_policy = Some(policy);
+    }
+
+    /// Attach a TPM quote, produced by `attestor`, to every announce this node
+    /// makes. The producer side of [`with_tpm_attestation_policy`]; see
+    /// [`AnnounceAttestor`].
+    pub fn with_announce_attestor(mut self, attestor: Arc<dyn AnnounceAttestor>) -> Self {
+        self.announce_attestor = Some(attestor);
+        self
+    }
+
+    pub fn set_announce_attestor(&mut self, attestor: Arc<dyn AnnounceAttestor>) {
+        self.announce_attestor = Some(attestor);
     }
 
     pub fn require_attestation(&self) -> bool {
@@ -1566,19 +1587,38 @@ impl KfpNode {
     }
 
     pub async fn announce(&self) -> Result<()> {
+        let share_index = self.share.metadata.identifier;
+        let timestamp = Timestamp::now().as_secs();
+
+        // If this node attests via a TPM, bind a fresh quote to THIS announce
+        // (group, share, timestamp) and attach it. Fail-closed: if quoting fails
+        // we do not announce, since a configured-but-unattested announce would be
+        // rejected by any peer that pins a policy. Done BEFORE deserializing the
+        // share so no signing-key material is resident during the quote wait.
+        let tpm_attestation = match &self.announce_attestor {
+            Some(attestor) => {
+                let nonce =
+                    derive_announce_attestation_nonce(&self.group_pubkey, share_index, timestamp);
+                let evidence =
+                    tokio::time::timeout(ANNOUNCE_QUOTE_TIMEOUT, attestor.request_quote(nonce))
+                        .await
+                        .map_err(|_| {
+                            FrostNetError::Attestation("TPM quote service timed out".into())
+                        })?
+                        .map_err(|_| {
+                            FrostNetError::Attestation("TPM quote service is unavailable".into())
+                        })??;
+                Some(evidence)
+            }
+            None => None,
+        };
+
+        // Deserialize the share and its key material only after attestation has
+        // succeeded, minimizing the secret's in-memory residency window.
         let key_package = self
             .share
             .key_package()
             .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
-
-        let signing_share = key_package.signing_share();
-        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            signing_share
-                .serialize()
-                .as_slice()
-                .try_into()
-                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
-        );
 
         let verifying_share = key_package.verifying_share();
         let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
@@ -1589,13 +1629,24 @@ impl KfpNode {
             .try_into()
             .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
 
+        let signing_share = key_package.signing_share();
+        let signing_share_serialized = Zeroizing::new(signing_share.serialize());
+        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share_serialized
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
+
         let event = KfpEventBuilder::announcement(
             &self.keys,
             &self.group_pubkey,
-            self.share.metadata.identifier,
+            share_index,
             &signing_share_bytes,
             &verifying_share_bytes,
             Some(&self.share.metadata.name),
+            timestamp,
+            tpm_attestation,
         )?;
 
         self.client

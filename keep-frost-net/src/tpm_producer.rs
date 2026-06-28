@@ -278,6 +278,145 @@ impl Drop for TpmQuoter {
     }
 }
 
+type QuoteRequest = (
+    [u8; 32],
+    tokio::sync::oneshot::Sender<Result<TpmQuoteEvidence>>,
+);
+
+/// A [`crate::announce_attestor::AnnounceAttestor`] backed by a real TPM.
+///
+/// The [`TpmQuoter`] (and its `!Send` `tss-esapi` context) lives on a dedicated
+/// thread; this handle forwards quote requests to it over a channel and is
+/// `Send + Sync`, so it can be held by the async node as `Arc<dyn AnnounceAttestor>`.
+/// Quoting is serialized on the worker thread, which is correct: a TPM processes
+/// one command at a time.
+/// Bound on in-flight quote requests. Announces are periodic and serialized per
+/// node, so this is generous; if it is ever exceeded the request is rejected
+/// (backpressure) rather than queued without limit.
+const QUOTE_QUEUE_BOUND: usize = 16;
+/// How long [`TpmQuoteService::spawn`] waits for the worker to report readiness
+/// before failing startup, so a hung TCTI connection cannot block forever.
+const WORKER_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub struct TpmQuoteService {
+    tx: Option<tokio::sync::mpsc::Sender<QuoteRequest>>,
+    ak_sec1: Vec<u8>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TpmQuoteService {
+    /// Open a TPM context over `tcti` on a dedicated thread, create the AK, and
+    /// return a handle once it is ready. Blocks briefly while the worker creates
+    /// the AK; returns the worker's error if that fails, or a timeout error if it
+    /// does not report readiness within [`WORKER_SETUP_TIMEOUT`].
+    pub fn spawn(tcti: tss_esapi::TctiNameConf, slots: Vec<PcrSlot>) -> Result<Self> {
+        let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<Vec<u8>>>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<QuoteRequest>(QUOTE_QUEUE_BOUND);
+
+        let worker = std::thread::Builder::new()
+            .name("tpm-quote-service".into())
+            .spawn(move || {
+                let mut quoter = match Context::new(tcti).map_err(tpm_err).and_then(|ctx| {
+                    let slots = slots; // moved in
+                    TpmQuoter::create(ctx, &slots)
+                }) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e));
+                        return;
+                    }
+                };
+                if setup_tx.send(Ok(quoter.ak_sec1().to_vec())).is_err() {
+                    return; // spawner gave up
+                }
+                drop(setup_tx);
+                // Serve quote requests until every sender is dropped.
+                while let Some((nonce, reply)) = rx.blocking_recv() {
+                    // Skip work whose caller already gave up (announce timed out
+                    // and dropped the receiver), so a backlog drains without
+                    // spending scarce TPM time on stale requests.
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let _ = reply.send(quoter.quote(&nonce));
+                }
+                // `quoter` drops here, flushing the AK.
+            })
+            .map_err(|e| att(format!("failed to spawn TPM quote thread: {e}")))?;
+
+        match setup_rx.recv_timeout(WORKER_SETUP_TIMEOUT) {
+            Ok(Ok(ak_sec1)) => Ok(Self {
+                tx: Some(tx),
+                ak_sec1,
+                worker: Some(worker),
+            }),
+            Ok(Err(e)) => {
+                let _ = worker.join();
+                Err(e)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                Err(att("TPM quote thread exited before reporting readiness"))
+            }
+            // The worker is stuck (e.g. a hung TCTI connect). Do NOT join, which
+            // would hang too; drop the handle and fail startup. The detached
+            // thread unwinds if and when the blocking call returns.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(att("TPM quote service did not become ready in time"))
+            }
+        }
+    }
+
+    /// Convenience constructor over [`DEFAULT_PCR_SLOTS`].
+    pub fn spawn_default(tcti: tss_esapi::TctiNameConf) -> Result<Self> {
+        Self::spawn(tcti, DEFAULT_PCR_SLOTS.to_vec())
+    }
+}
+
+impl crate::announce_attestor::AnnounceAttestor for TpmQuoteService {
+    fn ak_sec1(&self) -> Vec<u8> {
+        self.ak_sec1.clone()
+    }
+
+    fn request_quote(
+        &self,
+        nonce: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<Result<TpmQuoteEvidence>> {
+        use tokio::sync::mpsc::error::TrySendError;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match &self.tx {
+            // Non-blocking send: this is a sync method and must not stall the
+            // caller. A full queue means too many quotes are already in flight, so
+            // reject with backpressure rather than block.
+            Some(tx) => match tx.try_send((nonce, reply_tx)) {
+                Ok(()) => {}
+                Err(TrySendError::Full((_, reply_tx))) => {
+                    let _ = reply_tx.send(Err(att("TPM quote service queue is full")));
+                }
+                Err(TrySendError::Closed((_, reply_tx))) => {
+                    let _ = reply_tx.send(Err(att("TPM quote service has stopped")));
+                }
+            },
+            None => {
+                let _ = reply_tx.send(Err(att("TPM quote service has stopped")));
+            }
+        }
+        reply_rx
+    }
+}
+
+impl Drop for TpmQuoteService {
+    fn drop(&mut self) {
+        // Drop the sender first so the worker's `blocking_recv` returns `None` and
+        // it exits its loop (flushing the AK as the quoter drops); then join so the
+        // TPM context is finalized before we return.
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +571,42 @@ mod tests {
                 AttestationStatus::Failed(_)
             ),
             "the quote must not verify against a different announce"
+        );
+    }
+
+    // The threaded TpmQuoteService (the AnnounceAttestor the node holds) must
+    // produce, over its worker thread + channel, a quote that verifies. Exercises
+    // the spawn/request/Drop path against a real TPM.
+    #[test]
+    #[ignore = "requires a TPM; run against swtpm with TPM2TOOLS_TCTI set"]
+    fn service_quote_via_trait_verifies() {
+        use crate::announce_attestor::AnnounceAttestor;
+
+        let tcti = TctiNameConf::from_environment_variable().expect("set TPM2TOOLS_TCTI / TCTI");
+        let service = TpmQuoteService::spawn_default(tcti).expect("spawn TPM quote service");
+        let ak_sec1 = service.ak_sec1();
+        assert_eq!(ak_sec1.len(), 65);
+
+        let group = [4u8; 32];
+        let share_index: u16 = 3;
+        let timestamp: u64 = 1_700_000_500;
+        let nonce = derive_announce_attestation_nonce(&group, share_index, timestamp);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ev = rt
+            .block_on(service.request_quote(nonce))
+            .expect("worker replied")
+            .expect("quote produced");
+
+        let pcr_values = crate::tpm_quote::decode_pcr_values(&ev.pcr_values).unwrap();
+        let mut pinned = HashMap::new();
+        pinned.insert(share_index, ak_sec1);
+        let pol =
+            TpmAttestationPolicy::new(hex::decode(DEFAULT_SELECTION).unwrap(), pcr_values, pinned);
+        assert_eq!(
+            appraise_tpm_quote(share_index, &ev, &pol, &nonce),
+            AttestationStatus::Verified,
+            "a quote from the threaded service must verify"
         );
     }
 }

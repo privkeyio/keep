@@ -3154,3 +3154,113 @@ async fn test_unappraisable_tpm_evidence_is_failed_not_downgraded() {
         "a node enforcing no attestation must report NotConfigured, not reject"
     );
 }
+
+/// A test [`AnnounceAttestor`] that records the nonces it is asked to quote and
+/// returns either canned evidence or a failure, without needing a TPM.
+struct RecordingAttestor {
+    nonces: std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+    succeed: bool,
+}
+
+impl keep_frost_net::AnnounceAttestor for RecordingAttestor {
+    fn ak_sec1(&self) -> Vec<u8> {
+        let mut v = vec![0u8; 65];
+        v[0] = 0x04;
+        v
+    }
+
+    fn request_quote(
+        &self,
+        nonce: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
+    {
+        self.nonces.lock().unwrap().push(nonce);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let result = if self.succeed {
+            Ok(keep_frost_net::TpmQuoteEvidence {
+                attest: vec![0xff; 16],
+                signature: vec![0u8; 64],
+                ak_sec1: self.ak_sec1(),
+                pcr_values: vec!["00".repeat(32)],
+            })
+        } else {
+            Err(keep_frost_net::FrostNetError::Attestation(
+                "mock quote failure".into(),
+            ))
+        };
+        let _ = tx.send(result);
+        rx
+    }
+}
+
+/// The announce path must bind the TPM quote's nonce to THIS announce: the nonce
+/// the attestor is asked to quote must be `derive_announce_attestation_nonce`
+/// over the node's group, share index, and the announce's own timestamp.
+#[tokio::test]
+async fn test_announce_binds_tpm_quote_nonce_to_announce() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-announce-quote").unwrap();
+    let share = shares.remove(0);
+
+    let nonces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut node = KfpNode::new(share, vec![relay]).await.expect("node");
+    node.set_announce_attestor(std::sync::Arc::new(RecordingAttestor {
+        nonces: nonces.clone(),
+        succeed: true,
+    }));
+
+    let group = *node.group_pubkey();
+    let idx = node.share_index();
+
+    let t0 = chrono::Utc::now().timestamp() as u64;
+    node.announce().await.expect("announce");
+    let t1 = chrono::Utc::now().timestamp() as u64;
+
+    let recorded = nonces.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the attestor must be asked for exactly one quote per announce"
+    );
+    // The exact second is the node's own `Timestamp::now()`; it lies within the
+    // bracket we measured around the call.
+    let candidates: Vec<[u8; 32]> = (t0..=t1 + 1)
+        .map(|ts| keep_frost_net::derive_announce_attestation_nonce(&group, idx, ts))
+        .collect();
+    assert!(
+        candidates.contains(&recorded[0]),
+        "the quote nonce must be bound to the announce's group, share, and timestamp"
+    );
+}
+
+/// If a node is configured to attest but quoting fails, the announce must fail
+/// closed (a configured-but-unattested announce would be rejected by any peer
+/// that pins a policy, so emitting it is pointless and masks the failure).
+#[tokio::test]
+async fn test_announce_fails_closed_when_quote_fails() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-announce-quote-fail").unwrap();
+    let share = shares.remove(0);
+
+    let nonces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut node = KfpNode::new(share, vec![relay]).await.expect("node");
+    node.set_announce_attestor(std::sync::Arc::new(RecordingAttestor {
+        nonces,
+        succeed: false,
+    }));
+
+    let err = node
+        .announce()
+        .await
+        .expect_err("announce must fail closed when the configured attestor cannot quote");
+    assert!(
+        matches!(err, keep_frost_net::FrostNetError::Attestation(_)),
+        "the failure must be the attestation fail-closed path, got {err:?}"
+    );
+}

@@ -56,6 +56,7 @@
 
 #![forbid(unsafe_code)]
 
+mod announce_attestor;
 mod attestation;
 mod audit;
 mod cert_pin;
@@ -80,7 +81,11 @@ mod tpm_policy;
 pub mod tpm_producer;
 pub mod tpm_quote;
 
-pub use attestation::{derive_attestation_nonce, verify_peer_attestation, ExpectedPcrs};
+pub use announce_attestor::AnnounceAttestor;
+pub use attestation::{
+    derive_announce_attestation_nonce, derive_attestation_nonce, verify_peer_attestation,
+    ExpectedPcrs,
+};
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
@@ -148,7 +153,7 @@ pub use session::{
 };
 pub use tpm_policy::TpmAttestationPolicy;
 #[cfg(feature = "tpm-attestation")]
-pub use tpm_producer::{TpmQuoter, DEFAULT_PCR_SLOTS};
+pub use tpm_producer::{TpmQuoteService, TpmQuoter, DEFAULT_PCR_SLOTS};
 
 pub fn install_default_crypto_provider() {
     rustls::crypto::ring::default_provider()
