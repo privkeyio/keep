@@ -208,6 +208,31 @@ pub fn build_announce_attestor(
     ))
 }
 
+/// Build the announce attestor only when `--tpm-tcti` is set, returning `Ok(None)`
+/// otherwise. Built before unlocking so a config mistake fails fast.
+pub fn optional_announce_attestor(
+    out: &Output,
+    tpm_tcti: Option<&str>,
+) -> Result<Option<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>>> {
+    match tpm_tcti {
+        Some(tcti) => Ok(Some(build_announce_attestor(out, tcti)?)),
+        None => Ok(None),
+    }
+}
+
+/// Install an announce attestor on `node` and report it, so every node that
+/// attaches a TPM quote to its announces surfaces the same status field.
+pub fn set_optional_announce_attestor(
+    out: &Output,
+    node: &mut keep_frost_net::KfpNode,
+    attestor: Option<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>>,
+) {
+    if let Some(attestor) = attestor {
+        node.set_announce_attestor(attestor);
+        out.field("Self-attestation", "attaching a TPM quote to announces");
+    }
+}
+
 /// Parse an announced AK exactly as the policy loader will (`parse_tpm_policy`):
 /// a 65-byte uncompressed SEC1 point on P-256. Returns `None` for anything the
 /// loader would later reject, so a bad AK is dropped at capture instead of

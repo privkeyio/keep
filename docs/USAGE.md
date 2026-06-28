@@ -286,7 +286,9 @@ policy (its attestation key and reference PCRs). Author that policy by observing
 the group's announces, then enforce it:
 
 ```bash
-# Capture pins from online peers (trust-on-first-use; run on a trusted network):
+# The peer to be pinned must be online and attesting (running with `--tpm-tcti`,
+# e.g. `keep frost network serve --tpm-tcti device:/dev/tpmrm0`) so its announce
+# carries a quote. Then capture the pins (trust-on-first-use; trusted network):
 keep frost network attestation-provision --group npub1... --out keep-attestation.toml
 
 # Enforce it — holders refuse OPRF evaluations from unverified peers:
@@ -300,6 +302,11 @@ keep frost network serve --group npub1... --insecure-no-attestation
 The TPM quote producer (`--tpm-tcti`) requires a build with the
 `tpm-attestation` feature (`cargo build --features tpm-attestation`); it links
 the tpm2-tss stack and is off by default.
+
+Point `--tpm-tcti` at a LOCAL TPM device (e.g. `device:/dev/tpmrm0`) for a
+meaningful measured-boot guarantee. A remote or virtual TCTI (e.g.
+`swtpm:host=...`) lets an operator self-attest from a TPM they do not physically
+control, which defeats the purpose of pinning the quote.
 
 ### Policy Enforcement (Warden)
 
