@@ -27,7 +27,7 @@ const-oid = "0.10"
 k256 = { version = "0.13.4", features = ["schnorr"] }
 signature = "3.0"
 getrandom = "0.4"
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.0"
 base64 = "0.22"
 redb.workspace = true
 rand_core = "0.10"
