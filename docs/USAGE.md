@@ -286,7 +286,9 @@ policy (its attestation key and reference PCRs). Author that policy by observing
 the group's announces, then enforce it:
 
 ```bash
-# Capture pins from online peers (trust-on-first-use; run on a trusted network):
+# The peer to be pinned must be online and attesting (running with `--tpm-tcti`,
+# e.g. `keep frost network serve --tpm-tcti device:/dev/tpmrm0`) so its announce
+# carries a quote. Then capture the pins (trust-on-first-use; trusted network):
 keep frost network attestation-provision --group npub1... --out keep-attestation.toml
 
 # Enforce it — holders refuse OPRF evaluations from unverified peers:

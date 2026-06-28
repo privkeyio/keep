@@ -58,6 +58,7 @@ pub fn cmd_frost_network_serve(
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
     oprf_dealer: Option<u16>,
+    tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
 
@@ -65,6 +66,14 @@ pub fn cmd_frost_network_serve(
     // invalid one fails before we prompt for the password or touch the vault.
     let tpm_policy =
         attestation::resolve_serve_policy(out, attestation_config, insecure_no_attestation)?;
+
+    // Producer side: when this node attests via a TPM, attach a quote to every
+    // announce so peers can verify it (and a holder can pin it via
+    // `attestation-provision`). Built before unlocking so it fails fast.
+    let attestor = match tpm_tcti {
+        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
+        None => None,
+    };
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -155,6 +164,10 @@ pub fn cmd_frost_network_serve(
         if let Some(dealer) = oprf_dealer {
             node.set_expected_oprf_dealer(dealer);
             out.field("OPRF dealer", &format!("pinned to share {dealer}"));
+        }
+        if let Some(attestor) = attestor {
+            node.set_announce_attestor(attestor);
+            out.field("Attestation", "attaching a TPM quote to announces");
         }
         let node = std::sync::Arc::new(node);
 

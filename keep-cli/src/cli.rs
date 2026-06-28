@@ -591,6 +591,11 @@ pub(crate) enum FrostNetworkCommands {
         /// dealer; without it, enrollment is refused fail-closed.
         #[arg(long, value_name = "INDEX")]
         oprf_dealer: Option<u16>,
+        /// Attach a TPM quote to this node's announces (e.g. device:/dev/tpmrm0)
+        /// so peers can verify it and a holder can pin it via
+        /// `attestation-provision`. Needs the tpm-attestation build feature.
+        #[arg(long, value_name = "TCTI")]
+        tpm_tcti: Option<String>,
     },
     Peers {
         #[arg(short, long)]
