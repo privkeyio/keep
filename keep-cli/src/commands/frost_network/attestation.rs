@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use p256::ecdsa::VerifyingKey;
 use serde::Deserialize;
 
 use keep_core::error::{KeepError, Result};
@@ -47,6 +48,34 @@ fn err(msg: impl Into<String>) -> KeepError {
     KeepError::Frost(msg.into())
 }
 
+/// Count the PCRs selected by a marshalled `TPML_PCR_SELECTION`:
+/// `count: u32`, then `count` * `{ hash: u16, sizeofSelect: u8, select[sizeofSelect] }`,
+/// summing the set bits across every selection bitmap. Mirrors the parse in
+/// `keep_frost_net::tpm_quote`, so the reference count can be reconciled at load.
+fn count_selected_pcrs(selection: &[u8]) -> Result<usize> {
+    let bad = || err("attestation `selection` is not a valid TPML_PCR_SELECTION");
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8]> {
+        let end = pos.checked_add(n).ok_or_else(bad)?;
+        let slice = selection.get(*pos..end).ok_or_else(bad)?;
+        *pos = end;
+        Ok(slice)
+    };
+    let count = u32::from_be_bytes(take(&mut pos, 4)?.try_into().map_err(|_| bad())?);
+    let mut selected = 0usize;
+    for _ in 0..count {
+        take(&mut pos, 2)?; // hash alg
+        let size = take(&mut pos, 1)?[0] as usize;
+        for &b in take(&mut pos, size)? {
+            selected += b.count_ones() as usize;
+        }
+    }
+    if pos != selection.len() {
+        return Err(bad());
+    }
+    Ok(selected)
+}
+
 /// Read and parse a TOML attestation policy file.
 pub fn load_tpm_policy(path: &Path) -> Result<TpmAttestationPolicy> {
     let text = std::fs::read_to_string(path)
@@ -63,6 +92,7 @@ fn parse_tpm_policy(text: &str) -> Result<TpmAttestationPolicy> {
     if selection.is_empty() {
         return Err(err("attestation `selection` must not be empty"));
     }
+    let selected = count_selected_pcrs(&selection)?;
 
     if cfg.reference_pcrs.is_empty() {
         return Err(err(
@@ -77,6 +107,15 @@ fn parse_tpm_policy(text: &str) -> Result<TpmAttestationPolicy> {
             .try_into()
             .map_err(|_| err(format!("`reference_pcrs[{i}]` must be 32 bytes")))?;
         reference_pcrs.push(digest);
+    }
+    // The reference count must equal the PCRs the selection actually picks, or
+    // the policy would look "enforced" yet reject every peer on the count check
+    // in `verify_quote`.
+    if reference_pcrs.len() != selected {
+        return Err(err(format!(
+            "attestation `selection` picks {selected} PCR(s) but `reference_pcrs` lists {}",
+            reference_pcrs.len()
+        )));
     }
 
     if cfg.peer.is_empty() {
@@ -94,6 +133,11 @@ fn parse_tpm_policy(text: &str) -> Result<TpmAttestationPolicy> {
                 p.index
             )));
         }
+        // Reject a pin that is not a valid P-256 point at load time, so a typo'd
+        // AK is a clear config error here rather than every peer silently failing
+        // attestation later (`appraise_tpm_quote` parses the pin the same way).
+        VerifyingKey::from_sec1_bytes(&ak)
+            .map_err(|_| err(format!("peer {} `ak` is not a valid P-256 point", p.index)))?;
         if pinned_aks.insert(p.index, ak).is_some() {
             return Err(err(format!(
                 "peer index {} is pinned more than once",
@@ -164,10 +208,14 @@ mod tests {
         assert_eq!(pol.pinned_aks.get(&2).unwrap().len(), 65);
     }
 
+    // A 1-PCR selection (picks PCR 0 only) so single-`reference_pcrs` fixtures
+    // pass the count cross-check and exercise their intended validation.
+    const ONE_PCR_SELECTION: &str = "00000001000b03010000";
+
     #[test]
     fn rejects_no_peers() {
         let cfg = r#"
-            selection = "00000001000b03951800"
+            selection = "00000001000b03010000"
             reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
         "#;
         assert!(parse_tpm_policy(cfg).is_err());
@@ -176,11 +224,40 @@ mod tests {
     #[test]
     fn rejects_bad_ak() {
         let cfg = r#"
-            selection = "00000001000b03951800"
+            selection = "00000001000b03010000"
             reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
             [[peer]]
             index = 2
             ak = "0400"
+        "#;
+        assert!(parse_tpm_policy(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_off_curve_ak() {
+        // 65 bytes, 0x04 prefix, but not a valid P-256 point.
+        let cfg = format!(
+            r#"
+            selection = "{ONE_PCR_SELECTION}"
+            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            [[peer]]
+            index = 2
+            ak = "04{}"
+        "#,
+            "ff".repeat(64)
+        );
+        assert!(parse_tpm_policy(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_reference_count_mismatch() {
+        // selection picks 6 PCRs but only one reference value is listed.
+        let cfg = r#"
+            selection = "00000001000b03951800"
+            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            [[peer]]
+            index = 2
+            ak = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb"
         "#;
         assert!(parse_tpm_policy(cfg).is_err());
     }
@@ -220,7 +297,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_peer() {
         let cfg = r#"
-            selection = "00000001000b03951800"
+            selection = "00000001000b03010000"
             reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
             [[peer]]
             index = 2
