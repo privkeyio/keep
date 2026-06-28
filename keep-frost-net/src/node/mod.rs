@@ -907,6 +907,12 @@ pub struct KfpNode {
     /// Producer side: when set, every announce carries a fresh TPM quote bound to
     /// it. `None` means this node attaches no TPM attestation to its announces.
     announce_attestor: Option<Arc<dyn AnnounceAttestor>>,
+    /// In-flight background re-announce, if any. Holds at most one task: a new
+    /// `spawn_announce` is suppressed while this one is unfinished, so a slow TPM
+    /// quote cannot pile up concurrent quotes, concurrent signing-share copies,
+    /// or emit duplicate same-second announces. Aborted when `run` exits so a
+    /// queued announce cannot fire (or hold share material) after shutdown.
+    announce_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
     /// `(share_index, content_hash)` where `content_hash` covers the sorted
@@ -968,8 +974,12 @@ pub(crate) fn sanitize_reason(reason: &str) -> String {
 /// `&KfpNode` so the slow part (TPM quote + relay send) can run off the node's
 /// event loop without borrowing it. The `SharePackage` is `ZeroizeOnDrop` and
 /// not `Clone`, so its signing share is serialized here into a `Zeroizing`
-/// buffer; that copy lives only for the announce and is wiped on drop (the
-/// original is resident in `self.share` for the node's lifetime regardless).
+/// buffer wiped on drop. Running off-loop trades away the old ordering that
+/// produced the quote *before* materializing the share: this copy is now
+/// resident for the full quote round-trip (up to `ANNOUNCE_QUOTE_TIMEOUT`).
+/// The marginal exposure is bounded: the original share is resident in
+/// `self.share` for the node's lifetime regardless, and `spawn_announce`'s
+/// single-flight guard keeps at most one such copy alive at a time.
 struct AnnounceJob {
     keys: Keys,
     client: Client,
@@ -1145,6 +1155,7 @@ impl KfpNode {
             expected_pcrs: None,
             tpm_attestation_policy: None,
             announce_attestor: None,
+            announce_task: std::sync::Mutex::new(None),
             seen_xpub_announces: RwLock::new(HashSet::new()),
             seen_nonce_commitments: RwLock::new(HashMap::new()),
             seen_oprf_enrolls: RwLock::new(HashMap::new()),
@@ -1698,15 +1709,29 @@ impl KfpNode {
     /// periodic and reciprocal re-announces so a slow TPM quote cannot stall the
     /// event loop (and with it every other inbound protocol message).
     fn spawn_announce(&self) {
+        // Single-flight: while one background announce is still running, skip
+        // spawning another. Both call sites (the periodic tick and the inbound
+        // reciprocal-announce path) run on the node's `run` task, so this lock is
+        // uncontended; it exists for interior mutability and the shutdown abort.
+        // Without this, a burst of new-peer discoveries (or a tick overlapping a
+        // slow quote) would spawn concurrent TPM quotes, hold several signing-
+        // share copies at once, and emit duplicate same-second announces.
+        let mut slot = self.announce_task.lock().unwrap();
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
         match self.announce_job() {
             Ok(job) => {
-                tokio::spawn(async move {
+                *slot = Some(tokio::spawn(async move {
                     if let Err(e) = Self::run_announce_job(job).await {
                         warn!(error = %e, "Background re-announce failed");
                     }
-                });
+                }));
             }
-            Err(e) => warn!(error = %e, "Failed to prepare re-announce"),
+            Err(e) => {
+                *slot = None;
+                warn!(error = %e, "Failed to prepare re-announce");
+            }
         }
     }
 
@@ -1882,6 +1907,12 @@ impl KfpNode {
                     }
                 }
             }
+        }
+
+        // Abort any in-flight background re-announce so it cannot emit a stale
+        // announce, or hold the signing-share copy, past the node's run loop.
+        if let Some(handle) = self.announce_task.lock().unwrap().take() {
+            handle.abort();
         }
 
         Ok(())
