@@ -3663,3 +3663,154 @@ async fn test_slow_announce_quote_does_not_block_event_loop() {
         health.responsive
     );
 }
+
+/// A valid attestor with a configurable quote delay that records the peak number
+/// of quote requests in flight at once. The single-flight test asserts on that
+/// peak: a second background announce that lands while a first is still awaiting
+/// its quote must be suppressed rather than starting a concurrent quote.
+struct ConcurrentQuoteProbe {
+    inner: ValidQuoteAttestor,
+    delay: Duration,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl keep_frost_net::AnnounceAttestor for ConcurrentQuoteProbe {
+    fn ak_sec1(&self) -> Vec<u8> {
+        self.inner.ak_sec1.clone()
+    }
+    fn request_quote(
+        &self,
+        nonce: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
+    {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let (attest, signature) = build_signed_quote(
+            &nonce,
+            &one_pcr_selection(),
+            &self.inner.pcr_value,
+            &self.inner.sk,
+        );
+        let ev = keep_frost_net::TpmQuoteEvidence {
+            attest,
+            signature,
+            ak_sec1: self.inner.ak_sec1.clone(),
+            pcr_values: vec![hex::encode(self.inner.pcr_value)],
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let delay = self.delay;
+        let in_flight = std::sync::Arc::clone(&self.in_flight);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(Ok(ev));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+        rx
+    }
+}
+
+/// Single-flight regression: while one slow background announce is in flight, a
+/// second `spawn_announce` must be skipped rather than starting a concurrent
+/// quote. node1 carries a slow attestor that records the peak number of in-flight
+/// quotes; node2 and node3 come online only after node1 is past its synchronous
+/// startup announce, so the reciprocal announces node1 attempts on discovering
+/// them fall inside one slow-quote window. The recorded peak must stay at one.
+#[tokio::test]
+async fn test_single_flight_suppresses_concurrent_announce_quotes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-single-flight").unwrap();
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("node1");
+    node1.set_announce_attestor(Arc::new(ConcurrentQuoteProbe {
+        inner: ValidQuoteAttestor::new(),
+        delay: Duration::from_millis(4500),
+        in_flight: Arc::clone(&in_flight),
+        max_in_flight: Arc::clone(&max_in_flight),
+    }));
+
+    let mut rx1 = node1.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let node1 = Arc::new(node1);
+    let r1 = Arc::clone(&node1);
+    let h1 = tokio::spawn(async move {
+        let _ = r1.run().await;
+    });
+
+    // Hold node2/node3 back until node1 is past its ~4.5s synchronous startup
+    // announce and into its loop, so the peers are discovered (and reciprocated)
+    // only while a single slow background announce can already be in flight. This
+    // keeps the startup announce from overlapping a reciprocal spawn, isolating
+    // the single-flight guard as the only thing bounding concurrency.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()])
+        .await
+        .expect("node2");
+    let mut node3 = KfpNode::new(share3, vec![relay]).await.expect("node3");
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+    let node2 = Arc::new(node2);
+    let node3 = Arc::new(node3);
+    let r2 = Arc::clone(&node2);
+    let r3 = Arc::clone(&node3);
+    let h2 = tokio::spawn(async move {
+        let _ = r2.run().await;
+    });
+    let h3 = tokio::spawn(async move {
+        let _ = r3.run().await;
+    });
+
+    // Wait until node1 has discovered both peers; each new-peer discovery drives a
+    // reciprocal spawn_announce, so this guarantees the suppression path is hit.
+    let mut seen2 = false;
+    let mut seen3 = false;
+    let discovered = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(KfpNodeEvent::PeerDiscovered { share_index, .. }) = rx1.recv().await {
+                if share_index == 2 {
+                    seen2 = true;
+                }
+                if share_index == 3 {
+                    seen3 = true;
+                }
+                if seen2 && seen3 {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+
+    // Give the reciprocal spawns time to reach request_quote before sampling.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let peak = max_in_flight.load(Ordering::SeqCst);
+
+    graceful_shutdown(shutdown1, h1).await;
+    graceful_shutdown(shutdown2, h2).await;
+    graceful_shutdown(shutdown3, h3).await;
+
+    assert!(
+        discovered.is_ok(),
+        "node1 must discover both peers to exercise the suppression path"
+    );
+    assert!(
+        peak <= 1,
+        "single-flight must keep at most one background announce quote in flight (peak={peak})"
+    );
+}

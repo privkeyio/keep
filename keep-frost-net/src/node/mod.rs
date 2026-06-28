@@ -910,8 +910,10 @@ pub struct KfpNode {
     /// In-flight background re-announce, if any. Holds at most one task: a new
     /// `spawn_announce` is suppressed while this one is unfinished, so a slow TPM
     /// quote cannot pile up concurrent quotes, concurrent signing-share copies,
-    /// or emit duplicate same-second announces. Aborted when `run` exits so a
-    /// queued announce cannot fire (or hold share material) after shutdown.
+    /// or emit duplicate same-second announces. Aborted both when `run` exits and
+    /// on drop; the abort is best-effort cancellation (the task ends on its next
+    /// poll, so an announce already mid-send may still reach the relay) that bounds
+    /// how long a queued announce keeps its share copy alive after shutdown.
     announce_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) seen_xpub_announces: RwLock<HashSet<(u16, u64, [u8; 32])>>,
     /// Per-peer de-duplication for `NonceCommitment` broadcasts, keyed by
@@ -949,6 +951,17 @@ impl Drop for KfpNode {
             use zeroize::Zeroize;
             share.zeroize();
         }
+        // If `run` was cancelled (its future dropped) rather than shutdown-signalled,
+        // its run-exit abort never ran; cancel any orphaned announce task here so it
+        // stops holding its `Zeroizing` signing-share copy.
+        if let Some(handle) = self
+            .announce_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -980,6 +993,10 @@ pub(crate) fn sanitize_reason(reason: &str) -> String {
 /// The marginal exposure is bounded: the original share is resident in
 /// `self.share` for the node's lifetime regardless, and `spawn_announce`'s
 /// single-flight guard keeps at most one such copy alive at a time.
+/// The same bounded-exposure argument covers the `keys` clone: it carries the
+/// Nostr identity secret and is resident for the same quote round-trip, but the
+/// original is held in `self.keys` for the node's lifetime regardless and the
+/// single-flight guard bounds it to one copy at a time.
 struct AnnounceJob {
     keys: Keys,
     client: Client,
@@ -1716,7 +1733,10 @@ impl KfpNode {
         // Without this, a burst of new-peer discoveries (or a tick overlapping a
         // slow quote) would spawn concurrent TPM quotes, hold several signing-
         // share copies at once, and emit duplicate same-second announces.
-        let mut slot = self.announce_task.lock().unwrap();
+        let mut slot = self
+            .announce_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -1909,9 +1929,17 @@ impl KfpNode {
             }
         }
 
-        // Abort any in-flight background re-announce so it cannot emit a stale
-        // announce, or hold the signing-share copy, past the node's run loop.
-        if let Some(handle) = self.announce_task.lock().unwrap().take() {
+        // Request cancellation of any in-flight background re-announce so a queued
+        // announce stops promptly and drops its share copy. abort() is best-effort
+        // (the task ends on its next poll; an announce already mid-`send_event` may
+        // still reach the relay), so this bounds residency rather than guaranteeing
+        // no further send.
+        if let Some(handle) = self
+            .announce_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             handle.abort();
         }
 
