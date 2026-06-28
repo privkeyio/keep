@@ -23,14 +23,14 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use p256::ecdsa::VerifyingKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use keep_core::error::{KeepError, Result};
 use keep_frost_net::TpmAttestationPolicy;
 
 use crate::output::Output;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct AttestationConfig {
     selection: String,
     reference_pcrs: Vec<String>,
@@ -38,7 +38,7 @@ struct AttestationConfig {
     peer: Vec<PeerPin>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PeerPin {
     index: u16,
     ak: String,
@@ -208,6 +208,140 @@ pub fn build_announce_attestor(
     ))
 }
 
+/// Build an attestation policy from observed group announces (trust-on-first-use):
+/// pin each attested peer's AK, and take the shared PCR selection + reference
+/// values from the first attested announce. Warns (via `out`) if a later peer
+/// disagrees on the selection or reference PCRs, which means a heterogeneous
+/// group the single-reference policy cannot express. The captured pins are NOT
+/// verified here; the caller establishes trust by running this in a trusted moment.
+fn capture_policy_from_announces(
+    out: &Output,
+    events: &[nostr_sdk::Event],
+) -> Result<AttestationConfig> {
+    use std::collections::BTreeMap;
+
+    let mut selection: Option<String> = None;
+    let mut reference_pcrs: Option<Vec<String>> = None;
+    let mut peers: BTreeMap<u16, String> = BTreeMap::new();
+
+    for event in events {
+        let payload = match keep_frost_net::KfpMessage::from_json(&event.content) {
+            Ok(keep_frost_net::KfpMessage::Announce(p)) => p,
+            _ => continue,
+        };
+        let Some(tpm) = payload.tpm_attestation else {
+            continue;
+        };
+        // The selection a verifier pins lives only inside the signed quote.
+        let sel = match keep_frost_net::tpm_quote::pcr_selection_from_attest(&tpm.attest) {
+            Ok(s) => hex::encode(s),
+            Err(_) => continue, // malformed quote; ignore this announce
+        };
+
+        match &selection {
+            None => selection = Some(sel),
+            Some(s) if *s != sel => out.warn(&format!(
+                "peer {} announced a different PCR selection; keeping the first observed",
+                payload.share_index
+            )),
+            _ => {}
+        }
+        match &reference_pcrs {
+            None => reference_pcrs = Some(tpm.pcr_values.clone()),
+            Some(r) if *r != tpm.pcr_values => out.warn(&format!(
+                "peer {} announced different reference PCRs; keeping the first observed",
+                payload.share_index
+            )),
+            _ => {}
+        }
+        peers.insert(payload.share_index, hex::encode(&tpm.ak_sec1));
+    }
+
+    let selection =
+        selection.ok_or_else(|| err("no attested announce observed; are the holders online?"))?;
+    Ok(AttestationConfig {
+        selection,
+        reference_pcrs: reference_pcrs.unwrap_or_default(),
+        peer: peers
+            .into_iter()
+            .map(|(index, ak)| PeerPin { index, ak })
+            .collect(),
+    })
+}
+
+/// Serialize a captured policy to TOML and write it, after re-parsing it through
+/// the loader so a written file is guaranteed to load back into a valid policy.
+fn write_policy_toml(path: &Path, config: &AttestationConfig) -> Result<()> {
+    let text = toml::to_string_pretty(config).map_err(|e| err(format!("serialize policy: {e}")))?;
+    parse_tpm_policy(&text)?; // never write a file the loader would reject
+    std::fs::write(path, text).map_err(|e| err(format!("write {}: {e}", path.display())))
+}
+
+/// `keep frost network attestation-provision`: observe the group's announces over
+/// the relay for `wait_secs`, capture each attested peer's AK + reference PCRs
+/// (trust-on-first-use), and write an `--attestation-config` TOML file.
+pub fn cmd_frost_network_attestation_provision(
+    out: &Output,
+    group_npub: &str,
+    relay: &str,
+    out_path: &Path,
+    wait_secs: u64,
+) -> Result<()> {
+    use nostr_sdk::prelude::*;
+
+    let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+    let wait = wait_secs.max(1);
+
+    out.newline();
+    out.header("Attestation Policy Provisioning");
+    out.field("Group", group_npub);
+    out.field("Relay", relay);
+    out.field("Output", &out_path.display().to_string());
+    out.warn(
+        "TRUST-ON-FIRST-USE: AK pins and reference PCRs are captured from observed announces \
+         WITHOUT verifying them. Run this only on a trusted network while your holders are online.",
+    );
+    out.newline();
+
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+
+    let config = rt.block_on(async {
+        let client = Client::new(Keys::generate());
+        client
+            .add_relay(relay)
+            .await
+            .map_err(|e| err(format!("add relay {relay}: {e}")))?;
+        client.connect().await;
+
+        let filter = Filter::new()
+            .kind(Kind::Custom(keep_frost_net::KFP_EVENT_KIND))
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::G),
+                hex::encode(group_pubkey),
+            )
+            .since(Timestamp::now() - std::time::Duration::from_secs(wait));
+
+        let spinner = out.spinner(&format!("Listening {wait}s for attested announces..."));
+        let events = client
+            .fetch_events(filter, std::time::Duration::from_secs(wait))
+            .await
+            .map_err(|e| err(format!("fetch announces: {e}")))?;
+        spinner.finish();
+
+        capture_policy_from_announces(out, &events.into_iter().collect::<Vec<_>>())
+    })?;
+
+    let pinned = config.peer.len();
+    write_policy_toml(out_path, &config)?;
+    out.success(&format!(
+        "Wrote attestation policy pinning {pinned} peer(s) to {}",
+        out_path.display()
+    ));
+    out.info("Review it, then pass it to `keep frost network serve --attestation-config <FILE>`.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +483,57 @@ mod tests {
             ak = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb"
         "#;
         assert!(parse_tpm_policy(cfg).is_err());
+    }
+
+    #[test]
+    fn capture_policy_from_announce_round_trips_through_loader() {
+        use keep_frost_net::{AnnouncePayload, KfpMessage, TpmQuoteEvidence, KFP_EVENT_KIND};
+        use nostr_sdk::{EventBuilder, Keys, Kind};
+
+        // The real swtpm quote vector: selection {0,2,4,7,11,12}, a valid AK.
+        const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
+        const AK: &str = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
+        let zero = "00".repeat(32);
+        let pcr11 = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0".to_string();
+
+        let evidence = TpmQuoteEvidence {
+            attest: hex::decode(ATTEST).unwrap(),
+            signature: vec![0u8; 64],
+            ak_sec1: hex::decode(AK).unwrap(),
+            pcr_values: vec![
+                zero.clone(),
+                zero.clone(),
+                zero.clone(),
+                zero.clone(),
+                pcr11,
+                zero,
+            ],
+        };
+        let payload = AnnouncePayload::new([7u8; 32], 2, [2u8; 33], [0u8; 64], 1_700_000_000)
+            .with_tpm_attestation(evidence);
+        let content = KfpMessage::Announce(payload).to_json().unwrap();
+        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &[event]).expect("capture");
+        assert_eq!(config.selection, "00000001000b03951800");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.peer[0].index, 2);
+        assert_eq!(config.reference_pcrs.len(), 6);
+
+        // The written file must load back into a valid policy.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        write_policy_toml(&path, &config).expect("write");
+        let pol = load_tpm_policy(&path).expect("written policy must load");
+        assert_eq!(pol.pinned_aks.len(), 1);
+    }
+
+    #[test]
+    fn capture_errors_without_an_attested_announce() {
+        let out = Output::new();
+        assert!(capture_policy_from_announces(&out, &[]).is_err());
     }
 }

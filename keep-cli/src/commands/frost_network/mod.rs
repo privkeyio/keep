@@ -22,6 +22,7 @@ mod attestation;
 mod dkg;
 mod hardware;
 
+pub use attestation::cmd_frost_network_attestation_provision;
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
 
