@@ -1733,10 +1733,7 @@ impl KfpNode {
         // Without this, a burst of new-peer discoveries (or a tick overlapping a
         // slow quote) would spawn concurrent TPM quotes, hold several signing-
         // share copies at once, and emit duplicate same-second announces.
-        let mut slot = self
-            .announce_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.announce_task.lock().unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -1929,18 +1926,19 @@ impl KfpNode {
             }
         }
 
-        // Request cancellation of any in-flight background re-announce so a queued
-        // announce stops promptly and drops its share copy. abort() is best-effort
-        // (the task ends on its next poll; an announce already mid-`send_event` may
-        // still reach the relay), so this bounds residency rather than guaranteeing
-        // no further send.
-        if let Some(handle) = self
+        // Cancel any in-flight background re-announce and await it, so its
+        // `Zeroizing` share copy is dropped and wiped before `run` returns.
+        // abort() takes effect at the task's next await point (an announce already
+        // mid-`send_event` may still reach the relay); awaiting the handle bounds
+        // that to completion rather than leaving the task running past `run`.
+        let handle = self
             .announce_task
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .take();
+        if let Some(handle) = handle {
             handle.abort();
+            let _ = handle.await;
         }
 
         Ok(())

@@ -3547,10 +3547,13 @@ async fn test_oprf_unlock_blocked_when_box_unattested() {
 }
 
 /// A valid attestor whose quote arrives after a delay (still within the
-/// announce timeout), to exercise the slow-quote path.
+/// announce timeout), to exercise the slow-quote path. `quote_starts` counts
+/// each `request_quote` so a test can wait until a particular quote (e.g. the
+/// reciprocal one) is genuinely in flight before probing.
 struct SlowQuoteAttestor {
     inner: ValidQuoteAttestor,
     delay: Duration,
+    quote_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl keep_frost_net::AnnounceAttestor for SlowQuoteAttestor {
@@ -3562,6 +3565,8 @@ impl keep_frost_net::AnnounceAttestor for SlowQuoteAttestor {
         nonce: [u8; 32],
     ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
     {
+        self.quote_starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (attest, signature) = build_signed_quote(
             &nonce,
             &one_pcr_selection(),
@@ -3592,6 +3597,7 @@ impl keep_frost_net::AnnounceAttestor for SlowQuoteAttestor {
 /// inline-await code would leave node1 unresponsive for the whole quote.)
 #[tokio::test]
 async fn test_slow_announce_quote_does_not_block_event_loop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     let mock_relay = MockRelay::run().await.expect("relay");
@@ -3602,12 +3608,14 @@ async fn test_slow_announce_quote_does_not_block_event_loop() {
     let share1 = shares.remove(0); // node1: slow attestor
     let share2 = shares.remove(0); // node2: normal
 
+    let quote_starts = Arc::new(AtomicUsize::new(0));
     let mut node1 = KfpNode::new(share1, vec![relay.clone()])
         .await
         .expect("node1");
     node1.set_announce_attestor(Arc::new(SlowQuoteAttestor {
         inner: ValidQuoteAttestor::new(),
         delay: Duration::from_millis(4500),
+        quote_starts: Arc::clone(&quote_starts),
     }));
     let mut node2 = KfpNode::new(share2, vec![relay]).await.expect("node2");
 
@@ -3644,6 +3652,23 @@ async fn test_slow_announce_quote_does_not_block_event_loop() {
         panic!("node2 never discovered node1");
     }
 
+    // Wait until node1's RECIPROCAL quote is actually in flight before probing:
+    // the first quote is its startup announce; the second is the reciprocal it
+    // spawns on seeing node2. Probing only after `quote_starts >= 2` guarantees a
+    // slow announce is genuinely outstanding (otherwise the ping could race ahead
+    // of the reciprocal and pass even on the old blocking code).
+    let reciprocal_started = timeout(Duration::from_secs(10), async {
+        while quote_starts.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if reciprocal_started.is_err() {
+        graceful_shutdown(shutdown1, h1).await;
+        graceful_shutdown(shutdown2, h2).await;
+        panic!("node1's reciprocal announce quote never started");
+    }
+
     // node1 is mid slow reciprocal announce now; its loop must still pong within
     // a window shorter than the 4.5s quote, proving it is not blocked on it.
     let health = timeout(
@@ -3664,15 +3689,17 @@ async fn test_slow_announce_quote_does_not_block_event_loop() {
     );
 }
 
-/// A valid attestor with a configurable quote delay that records the peak number
-/// of quote requests in flight at once. The single-flight test asserts on that
-/// peak: a second background announce that lands while a first is still awaiting
-/// its quote must be suppressed rather than starting a concurrent quote.
+/// A valid attestor with a configurable quote delay that records both the peak
+/// number of concurrent quotes and the TOTAL number of quotes started. The
+/// single-flight test asserts on the total: while one background announce is
+/// awaiting its quote, further reciprocal announces must be suppressed (not
+/// merely serialized), so exactly one reciprocal quote is issued.
 struct ConcurrentQuoteProbe {
     inner: ValidQuoteAttestor,
     delay: Duration,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl keep_frost_net::AnnounceAttestor for ConcurrentQuoteProbe {
@@ -3685,6 +3712,7 @@ impl keep_frost_net::AnnounceAttestor for ConcurrentQuoteProbe {
     ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
     {
         use std::sync::atomic::Ordering;
+        self.total_starts.fetch_add(1, Ordering::SeqCst);
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         let (attest, signature) = build_signed_quote(
@@ -3733,6 +3761,7 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let total_starts = Arc::new(AtomicUsize::new(0));
 
     let mut node1 = KfpNode::new(share1, vec![relay.clone()])
         .await
@@ -3742,6 +3771,7 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
         delay: Duration::from_millis(4500),
         in_flight: Arc::clone(&in_flight),
         max_in_flight: Arc::clone(&max_in_flight),
+        total_starts: Arc::clone(&total_starts),
     }));
 
     let mut rx1 = node1.subscribe();
@@ -3800,6 +3830,7 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
     // Give the reciprocal spawns time to reach request_quote before sampling.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let peak = max_in_flight.load(Ordering::SeqCst);
+    let total = total_starts.load(Ordering::SeqCst);
 
     graceful_shutdown(shutdown1, h1).await;
     graceful_shutdown(shutdown2, h2).await;
@@ -3812,5 +3843,13 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
     assert!(
         peak <= 1,
         "single-flight must keep at most one background announce quote in flight (peak={peak})"
+    );
+    // The startup announce issues exactly one quote; discovering two peers within
+    // one slow-quote window must add exactly one reciprocal quote (the second is
+    // suppressed, not serialized). Total == 2 verifies suppression, which `peak`
+    // alone cannot (two sequential reciprocal quotes would also keep peak at 1).
+    assert_eq!(
+        total, 2,
+        "expected 1 startup + 1 reciprocal quote (second reciprocal suppressed), got {total}"
     );
 }
