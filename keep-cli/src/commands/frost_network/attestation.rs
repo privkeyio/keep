@@ -180,9 +180,50 @@ pub fn resolve_serve_policy(
     }
 }
 
+/// Build the TPM-backed announce attestor for this box from a `--tpm-tcti`
+/// string, so its announces carry a fresh measured-boot quote peers can verify.
+/// Only available when built with the `tpm-attestation` feature.
+#[cfg(feature = "tpm-attestation")]
+pub fn build_announce_attestor(
+    out: &Output,
+    tcti: &str,
+) -> Result<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>> {
+    use keep_frost_net::AnnounceAttestor;
+    let service = keep_frost_net::TpmQuoteService::spawn_from_tcti(tcti)
+        .map_err(|e| err(format!("start TPM quote service: {e}")))?;
+    out.field("Attestation key", &hex::encode(service.ak_sec1()));
+    Ok(std::sync::Arc::new(service))
+}
+
+/// Without the `tpm-attestation` feature there is no TPM producer; `--tpm-tcti`
+/// is rejected so the build limitation is explicit rather than silently ignored.
+#[cfg(not(feature = "tpm-attestation"))]
+pub fn build_announce_attestor(
+    _out: &Output,
+    _tcti: &str,
+) -> Result<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>> {
+    Err(err(
+        "this build has no TPM support; rebuild with `--features tpm-attestation` to use --tpm-tcti",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A default build (no `tpm-attestation`) must reject `--tpm-tcti` with a
+    // message pointing at the feature flag, not silently ignore it.
+    #[cfg(not(feature = "tpm-attestation"))]
+    #[test]
+    fn rejects_tpm_tcti_without_feature() {
+        let out = Output::new();
+        let rejected = build_announce_attestor(&out, "device:/dev/tpmrm0")
+            .is_err_and(|e| e.to_string().contains("tpm-attestation"));
+        assert!(
+            rejected,
+            "default build must reject --tpm-tcti via the feature flag"
+        );
+    }
 
     // A valid config over the default selection {0,2,4,7,11,12} with one peer.
     const VALID: &str = r#"

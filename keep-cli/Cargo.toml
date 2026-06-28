@@ -78,6 +78,9 @@ uuid = { version = "1.23", features = ["v4", "serde"], optional = true }
 default = []
 testing = ["keep-core/testing"]
 warden = ["dep:reqwest", "dep:uuid"]
+# TPM-side quote producer for the on-prem box (links the tpm2-tss C stack via
+# keep-frost-net). Off by default; only a node that attests via a TPM needs it.
+tpm-attestation = ["keep-frost-net/tpm-attestation"]
 
 [dev-dependencies]
 bitcoin = { workspace = true }

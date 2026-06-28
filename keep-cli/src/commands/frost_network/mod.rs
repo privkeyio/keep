@@ -1030,6 +1030,7 @@ pub fn cmd_frost_network_oprf_unlock(
     volume_id: &str,
     epoch: u32,
     share_file: &Path,
+    tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(
         group = group_npub,
@@ -1041,6 +1042,15 @@ pub fn cmd_frost_network_oprf_unlock(
     );
 
     let mut keep = Keep::open(path)?;
+
+    // Build the announce attestor BEFORE unlocking, so a config mistake (a build
+    // without `tpm-attestation`, or an unparseable/unreachable TPM) fails fast
+    // without prompting for the password or materializing the OPRF secret.
+    let attestor = match tpm_tcti {
+        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
+        None => None,
+    };
+
     let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
@@ -1097,6 +1107,12 @@ pub fn cmd_frost_network_oprf_unlock(
         // Install the OPRF key share BEFORE running so this box can answer its
         // own quorum's evaluate requests.
         node.set_oprf_key_share(oprf_share);
+
+        // If a TPM is configured, attach the fresh measured-boot quote source to
+        // every announce so holders can verify this box before answering evals.
+        if let Some(attestor) = attestor {
+            node.set_announce_attestor(attestor);
+        }
 
         out.info("Starting FROST coordination node...");
         let shutdown_tx = node.take_shutdown_handle();
