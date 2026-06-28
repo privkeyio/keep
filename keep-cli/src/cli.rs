@@ -782,6 +782,7 @@ pub(crate) enum FrostNetworkCommands {
         share_out: PathBuf,
         #[arg(
             long,
+            required = true,
             value_name = "TCTI",
             help = "Attest this box to the holders by attaching a TPM quote to its announces \
                     (e.g. device:/dev/tpmrm0). Required: holders refuse a share from an \
