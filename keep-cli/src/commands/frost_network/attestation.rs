@@ -211,6 +211,17 @@ pub fn build_announce_attestor(
 mod tests {
     use super::*;
 
+    // A default build (no `tpm-attestation`) must reject `--tpm-tcti` with a
+    // message pointing at the feature flag, not silently ignore it.
+    #[cfg(not(feature = "tpm-attestation"))]
+    #[test]
+    fn rejects_tpm_tcti_without_feature() {
+        let out = Output::new();
+        let rejected = build_announce_attestor(&out, "device:/dev/tpmrm0")
+            .is_err_and(|e| e.to_string().contains("tpm-attestation"));
+        assert!(rejected, "default build must reject --tpm-tcti via the feature flag");
+    }
+
     // A valid config over the default selection {0,2,4,7,11,12} with one peer.
     const VALID: &str = r#"
         selection = "00000001000b03951800"

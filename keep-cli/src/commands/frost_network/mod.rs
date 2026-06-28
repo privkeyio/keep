@@ -1021,7 +1021,6 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `Output` (which is backed by `Term::stderr()`); the key is never logged.
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_oprf_unlock(
     out: &Output,
     path: &Path,
@@ -1043,6 +1042,15 @@ pub fn cmd_frost_network_oprf_unlock(
     );
 
     let mut keep = Keep::open(path)?;
+
+    // Build the announce attestor BEFORE unlocking, so a config mistake (a build
+    // without `tpm-attestation`, or an unparseable/unreachable TPM) fails fast
+    // without prompting for the password or materializing the OPRF secret.
+    let attestor = match tpm_tcti {
+        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
+        None => None,
+    };
+
     let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
@@ -1100,10 +1108,9 @@ pub fn cmd_frost_network_oprf_unlock(
         // own quorum's evaluate requests.
         node.set_oprf_key_share(oprf_share);
 
-        // If a TPM is configured, attach a fresh measured-boot quote to every
-        // announce so holders can verify this box before answering its evals.
-        if let Some(tcti) = tpm_tcti {
-            let attestor = attestation::build_announce_attestor(out, tcti)?;
+        // If a TPM is configured, attach the fresh measured-boot quote source to
+        // every announce so holders can verify this box before answering evals.
+        if let Some(attestor) = attestor {
             node.set_announce_attestor(attestor);
         }
 
