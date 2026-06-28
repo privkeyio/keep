@@ -311,6 +311,8 @@ fn dispatch_frost_network(
             share,
             auto_contribute_descriptor,
             refuse_raw_sign,
+            attestation_config,
+            insecure_no_attestation,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_serve(
@@ -321,6 +323,8 @@ fn dispatch_frost_network(
                 share,
                 auto_contribute_descriptor,
                 refuse_raw_sign,
+                attestation_config.as_deref(),
+                insecure_no_attestation,
             )
         }
         FrostNetworkCommands::Peers { group, relay } => {

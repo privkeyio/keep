@@ -18,6 +18,7 @@ use crate::signer::HardwareSigner;
 
 use super::get_password;
 
+mod attestation;
 mod dkg;
 mod hardware;
 
@@ -43,6 +44,7 @@ fn descriptor_lookup_for(
 }
 
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_serve(
     out: &Output,
     path: &Path,
@@ -51,8 +53,15 @@ pub fn cmd_frost_network_serve(
     share_index: Option<u16>,
     auto_contribute_descriptor: bool,
     refuse_raw_sign: bool,
+    attestation_config: Option<&Path>,
+    insecure_no_attestation: bool,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
+
+    // Resolve the attestation policy up front (fail-closed) so a missing or
+    // invalid one fails before we prompt for the password or touch the vault.
+    let tpm_policy =
+        attestation::resolve_serve_policy(out, attestation_config, insecure_no_attestation)?;
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -84,14 +93,24 @@ pub fn cmd_frost_network_serve(
 
     let keep = std::sync::Arc::new(std::sync::Mutex::new(keep));
 
-    rt.block_on(async {
+    rt.block_on(async move {
         out.info("Starting FROST coordination node...");
 
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node =
+        let mut node =
             node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        if let Some(policy) = tpm_policy {
+            let pinned = policy.pinned_aks.len();
+            node.set_tpm_attestation_policy(policy);
+            out.field(
+                "Attestation",
+                &format!("TPM policy enforced ({pinned} peer(s) pinned)"),
+            );
+        } else {
+            out.field("Attestation", "DISABLED (--insecure-no-attestation)");
+        }
         if refuse_raw_sign {
             node.set_hooks(Arc::new(keep_frost_net::RefuseRawSignatureHooks));
             out.field(
