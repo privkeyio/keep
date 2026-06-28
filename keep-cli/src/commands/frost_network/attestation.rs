@@ -219,7 +219,10 @@ mod tests {
         let out = Output::new();
         let rejected = build_announce_attestor(&out, "device:/dev/tpmrm0")
             .is_err_and(|e| e.to_string().contains("tpm-attestation"));
-        assert!(rejected, "default build must reject --tpm-tcti via the feature flag");
+        assert!(
+            rejected,
+            "default build must reject --tpm-tcti via the feature flag"
+        );
     }
 
     // A valid config over the default selection {0,2,4,7,11,12} with one peer.

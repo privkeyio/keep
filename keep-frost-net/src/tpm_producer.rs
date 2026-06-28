@@ -539,6 +539,16 @@ mod tests {
         Context::new(tcti).expect("open TPM context")
     }
 
+    // Resolve the TCTI configuration string with the same precedence
+    // `TctiNameConf::from_environment_variable` uses, so a string-TCTI test works
+    // whether the environment exports TPM2TOOLS_TCTI, TCTI, or TEST_TCTI.
+    fn tcti_env_string() -> String {
+        std::env::var("TPM2TOOLS_TCTI")
+            .or_else(|_| std::env::var("TCTI"))
+            .or_else(|_| std::env::var("TEST_TCTI"))
+            .expect("set TPM2TOOLS_TCTI / TCTI (e.g. swtpm:host=localhost,port=2321)")
+    }
+
     // End-to-end against a real (virtual) TPM: produce a quote with the producer,
     // then appraise it with the pure-Rust verifier. Ignored by default because it
     // needs a TPM; run with a swtpm and TPM2TOOLS_TCTI set.
@@ -591,7 +601,7 @@ mod tests {
     #[ignore = "requires a TPM; run against swtpm with TPM2TOOLS_TCTI set"]
     fn spawn_from_tcti_string_works() {
         use crate::announce_attestor::AnnounceAttestor;
-        let tcti = std::env::var("TPM2TOOLS_TCTI").expect("set TPM2TOOLS_TCTI");
+        let tcti = tcti_env_string();
         let service = TpmQuoteService::spawn_from_tcti(&tcti).expect("spawn from TCTI string");
         assert_eq!(service.ak_sec1().len(), 65);
     }
