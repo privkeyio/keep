@@ -964,6 +964,23 @@ pub(crate) fn sanitize_reason(reason: &str) -> String {
     }
 }
 
+/// Owned inputs for building and sending one announce, extracted from a
+/// `&KfpNode` so the slow part (TPM quote + relay send) can run off the node's
+/// event loop without borrowing it. The `SharePackage` is `ZeroizeOnDrop` and
+/// not `Clone`, so its signing share is serialized here into a `Zeroizing`
+/// buffer; that copy lives only for the announce and is wiped on drop (the
+/// original is resident in `self.share` for the node's lifetime regardless).
+struct AnnounceJob {
+    keys: Keys,
+    client: Client,
+    group_pubkey: [u8; 32],
+    share_index: u16,
+    name: String,
+    signing_share: Zeroizing<[u8; 32]>,
+    verifying_share: [u8; 33],
+    attestor: Option<Arc<dyn AnnounceAttestor>>,
+}
+
 impl KfpNode {
     pub async fn new(share: SharePackage, relays: Vec<String>) -> Result<Self> {
         Self::with_nonce_store(share, relays, None, None, None).await
@@ -1586,19 +1603,57 @@ impl KfpNode {
         Ok((participants, participant_peers))
     }
 
-    pub async fn announce(&self) -> Result<()> {
-        let share_index = self.share.metadata.identifier;
-        let timestamp = Timestamp::now().as_secs();
+    /// Extract everything needed to send one announce. Fast and synchronous (no
+    /// TPM, no network), so it can run on the event loop without blocking it.
+    fn announce_job(&self) -> Result<AnnounceJob> {
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
 
-        // If this node attests via a TPM, bind a fresh quote to THIS announce
-        // (group, share, timestamp) and attach it. Fail-closed: if quoting fails
-        // we do not announce, since a configured-but-unattested announce would be
-        // rejected by any peer that pins a policy. Done BEFORE deserializing the
-        // share so no signing-key material is resident during the quote wait.
-        let tpm_attestation = match &self.announce_attestor {
+        let verifying_share = key_package.verifying_share();
+        let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
+            FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
+        })?;
+        let verifying_share: [u8; 33] = verifying_share_serialized
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
+
+        let signing_share_serialized = Zeroizing::new(key_package.signing_share().serialize());
+        let signing_share: Zeroizing<[u8; 32]> = Zeroizing::new(
+            signing_share_serialized
+                .as_slice()
+                .try_into()
+                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
+        );
+
+        Ok(AnnounceJob {
+            keys: self.keys.clone(),
+            client: self.client.clone(),
+            group_pubkey: self.group_pubkey,
+            share_index: self.share.metadata.identifier,
+            name: self.share.metadata.name.clone(),
+            signing_share,
+            verifying_share,
+            attestor: self.announce_attestor.clone(),
+        })
+    }
+
+    /// Produce the (optional) TPM quote bound to this announce, build the event,
+    /// and send it. This is the slow part (the quote round-trips to a TPM), and
+    /// it takes owned data so it can run in a spawned task off the event loop.
+    /// Fail-closed: if quoting fails, no announce is sent (a configured-but-
+    /// unattested announce would be rejected by any peer that pins a policy).
+    async fn run_announce_job(job: AnnounceJob) -> Result<()> {
+        let timestamp = Timestamp::now().as_secs();
+        let tpm_attestation = match &job.attestor {
             Some(attestor) => {
-                let nonce =
-                    derive_announce_attestation_nonce(&self.group_pubkey, share_index, timestamp);
+                let nonce = derive_announce_attestation_nonce(
+                    &job.group_pubkey,
+                    job.share_index,
+                    timestamp,
+                );
                 let evidence =
                     tokio::time::timeout(ANNOUNCE_QUOTE_TIMEOUT, attestor.request_quote(nonce))
                         .await
@@ -1613,52 +1668,46 @@ impl KfpNode {
             None => None,
         };
 
-        // Deserialize the share and its key material only after attestation has
-        // succeeded, minimizing the secret's in-memory residency window.
-        let key_package = self
-            .share
-            .key_package()
-            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
-
-        let verifying_share = key_package.verifying_share();
-        let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
-            FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
-        })?;
-        let verifying_share_bytes: [u8; 33] = verifying_share_serialized
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
-
-        let signing_share = key_package.signing_share();
-        let signing_share_serialized = Zeroizing::new(signing_share.serialize());
-        let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            signing_share_serialized
-                .as_slice()
-                .try_into()
-                .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,
-        );
-
         let event = KfpEventBuilder::announcement(
-            &self.keys,
-            &self.group_pubkey,
-            share_index,
-            &signing_share_bytes,
-            &verifying_share_bytes,
-            Some(&self.share.metadata.name),
+            &job.keys,
+            &job.group_pubkey,
+            job.share_index,
+            &job.signing_share,
+            &job.verifying_share,
+            Some(&job.name),
             timestamp,
             tpm_attestation,
         )?;
 
-        self.client
+        job.client
             .send_event(&event)
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-        info!(
-            share_index = self.share.metadata.identifier,
-            "Announced presence"
-        );
+        info!(share_index = job.share_index, "Announced presence");
         Ok(())
+    }
+
+    /// Send one announce, awaiting completion. Used at startup so a quote failure
+    /// fails the node fast (fail-closed) before it begins serving.
+    pub async fn announce(&self) -> Result<()> {
+        Self::run_announce_job(self.announce_job()?).await
+    }
+
+    /// Send one announce in the background, returning immediately. Used for the
+    /// periodic and reciprocal re-announces so a slow TPM quote cannot stall the
+    /// event loop (and with it every other inbound protocol message).
+    fn spawn_announce(&self) {
+        match self.announce_job() {
+            Ok(job) => {
+                tokio::spawn(async move {
+                    if let Err(e) = Self::run_announce_job(job).await {
+                        warn!(error = %e, "Background re-announce failed");
+                    }
+                });
+            }
+            Err(e) => warn!(error = %e, "Failed to prepare re-announce"),
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -1767,9 +1816,8 @@ impl KfpNode {
                     break;
                 }
                 _ = announce_interval.tick() => {
-                    if let Err(e) = self.announce().await {
-                        warn!(error = %e, "Failed to re-announce");
-                    }
+                    // Spawn so a slow TPM quote cannot stall the select loop.
+                    self.spawn_announce();
                 }
                 _ = replenish_interval.tick() => {
                     if self.nonce_pool.own_deficit() > 0 {
@@ -2134,10 +2182,9 @@ impl KfpNode {
             // Without this, an initiator's short discovery window can miss an
             // already-online co-signer. Gated on `is_new_peer` so the exchange
             // terminates: once a peer knows us, our announce no longer looks
-            // new to it and it won't reciprocate again.
-            if let Err(e) = self.announce().await {
-                warn!(peer = %pubkey, error = %e, "Failed to reciprocate announce to new peer");
-            }
+            // new to it and it won't reciprocate again. Spawned so a slow TPM
+            // quote cannot stall this inbound-event handler.
+            self.spawn_announce();
 
             // A newly discovered peer may have come online after we last
             // replenished (whose broadcast only carries freshly generated

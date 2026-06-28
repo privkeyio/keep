@@ -3545,3 +3545,121 @@ async fn test_oprf_unlock_blocked_when_box_unattested() {
         "unlock must NOT succeed when the box is unattested (gate bypassed)"
     );
 }
+
+/// A valid attestor whose quote arrives after a delay (still within the
+/// announce timeout), to exercise the slow-quote path.
+struct SlowQuoteAttestor {
+    inner: ValidQuoteAttestor,
+    delay: Duration,
+}
+
+impl keep_frost_net::AnnounceAttestor for SlowQuoteAttestor {
+    fn ak_sec1(&self) -> Vec<u8> {
+        self.inner.ak_sec1.clone()
+    }
+    fn request_quote(
+        &self,
+        nonce: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
+    {
+        let (attest, signature) = build_signed_quote(
+            &nonce,
+            &one_pcr_selection(),
+            &self.inner.pcr_value,
+            &self.inner.sk,
+        );
+        let ev = keep_frost_net::TpmQuoteEvidence {
+            attest,
+            signature,
+            ak_sec1: self.inner.ak_sec1.clone(),
+            pcr_values: vec![hex::encode(self.inner.pcr_value)],
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let delay = self.delay;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(Ok(ev));
+        });
+        rx
+    }
+}
+
+/// Regression test for keep-w7t2: a slow TPM quote must not stall the node's
+/// event loop. node1 has a valid but slow (4.5s, under the 5s announce timeout)
+/// attestor; after it discovers node2 it spawns a slow reciprocal announce. Its
+/// loop must keep serving, so a liveness ping still gets a prompt pong well
+/// inside the quote window. (Passes for the spawned-announce fix; the old
+/// inline-await code would leave node1 unresponsive for the whole quote.)
+#[tokio::test]
+async fn test_slow_announce_quote_does_not_block_event_loop() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-slow-announce").unwrap();
+    let share1 = shares.remove(0); // node1: slow attestor
+    let share2 = shares.remove(0); // node2: normal
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("node1");
+    node1.set_announce_attestor(Arc::new(SlowQuoteAttestor {
+        inner: ValidQuoteAttestor::new(),
+        delay: Duration::from_millis(4500),
+    }));
+    let mut node2 = KfpNode::new(share2, vec![relay]).await.expect("node2");
+
+    let mut rx2 = node2.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let r1 = Arc::clone(&node1);
+    let r2 = Arc::clone(&node2);
+    let h1 = tokio::spawn(async move {
+        let _ = r1.run().await;
+    });
+    let h2 = tokio::spawn(async move {
+        let _ = r2.run().await;
+    });
+
+    // node1's startup announce is sync and waits for its slow quote, so node2
+    // discovers it only after that; node1 then spawns a slow reciprocal announce
+    // on seeing node2. The generous timeout covers the ~4.5s startup quote.
+    let discovered = timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(KfpNodeEvent::PeerDiscovered { share_index, .. }) = rx2.recv().await {
+                if share_index == 1 {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    if discovered.is_err() {
+        graceful_shutdown(shutdown1, h1).await;
+        graceful_shutdown(shutdown2, h2).await;
+        panic!("node2 never discovered node1");
+    }
+
+    // node1 is mid slow reciprocal announce now; its loop must still pong within
+    // a window shorter than the 4.5s quote, proving it is not blocked on it.
+    let health = timeout(
+        Duration::from_secs(10),
+        node2.health_check(Duration::from_secs(3)),
+    )
+    .await
+    .expect("health_check did not return")
+    .expect("health_check error");
+
+    graceful_shutdown(shutdown1, h1).await;
+    graceful_shutdown(shutdown2, h2).await;
+
+    assert!(
+        health.responsive.contains(&1),
+        "node1 must answer a ping while a slow announce is in flight (responsive={:?})",
+        health.responsive
+    );
+}
