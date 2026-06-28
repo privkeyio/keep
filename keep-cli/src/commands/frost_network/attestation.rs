@@ -208,6 +208,26 @@ pub fn build_announce_attestor(
     ))
 }
 
+/// Parse an announced AK exactly as the policy loader will (`parse_tpm_policy`):
+/// a 65-byte uncompressed SEC1 point on P-256. Returns `None` for anything the
+/// loader would later reject, so a bad AK is dropped at capture instead of
+/// poisoning the batch.
+fn validated_ak(ak_sec1: &[u8]) -> Option<VerifyingKey> {
+    if ak_sec1.len() != 65 || ak_sec1[0] != 0x04 {
+        return None;
+    }
+    VerifyingKey::from_sec1_bytes(ak_sec1).ok()
+}
+
+/// Decode announced PCR values into 32-byte digests, rejecting any entry that is
+/// not exactly 32 bytes of hex (the same shape `parse_tpm_policy` requires).
+fn decode_pcr_digests(values: &[String]) -> Option<Vec<[u8; 32]>> {
+    values
+        .iter()
+        .map(|v| hex::decode(v.trim()).ok()?.try_into().ok())
+        .collect()
+}
+
 /// Build an attestation policy from observed group announces (trust-on-first-use):
 /// pin each attested peer's AK, and take the shared PCR selection + reference
 /// values from the first attested announce. A peer that disagrees on the selection
@@ -263,10 +283,57 @@ fn capture_policy_from_announces(
             continue;
         };
         // The selection a verifier pins lives only inside the signed quote.
-        let sel = match keep_frost_net::tpm_quote::pcr_selection_from_attest(&tpm.attest) {
-            Ok(s) => hex::encode(s),
+        let sel_bytes = match keep_frost_net::tpm_quote::pcr_selection_from_attest(&tpm.attest) {
+            Ok(s) => s,
             Err(_) => continue, // malformed quote; ignore this announce
         };
+        // Authenticate the TPM evidence against THIS signed announce before any of
+        // it is trusted: run the same AK/PCR-shape checks the policy loader enforces,
+        // then verify the quote the way the runtime appraisal does (`verify_quote`):
+        // the nonce binds the quote to this announce, the AK signs the attest, and
+        // the PCR values recompute to the attested digest. A peer failing any check
+        // is skipped, so malformed or forged evidence can neither seed the capture
+        // baseline (selection/reference) nor be pinned.
+        let Some(ak) = validated_ak(&tpm.ak_sec1) else {
+            out.warn(&format!(
+                "peer {} announced an invalid attestation key; ignoring its announce",
+                payload.share_index
+            ));
+            continue;
+        };
+        let pcr_digests = match decode_pcr_digests(&tpm.pcr_values) {
+            Some(d) if d.len() == count_selected_pcrs(&sel_bytes).unwrap_or(0) => d,
+            _ => {
+                out.warn(&format!(
+                    "peer {} announced PCR values inconsistent with its selection; ignoring it",
+                    payload.share_index
+                ));
+                continue;
+            }
+        };
+        let nonce = keep_frost_net::derive_announce_attestation_nonce(
+            &payload.group_pubkey,
+            payload.share_index,
+            payload.timestamp,
+        );
+        if keep_frost_net::tpm_quote::verify_quote(
+            &tpm.attest,
+            &tpm.signature,
+            &ak,
+            &nonce,
+            &sel_bytes,
+            &pcr_digests,
+            &pcr_digests,
+        )
+        .is_err()
+        {
+            out.warn(&format!(
+                "peer {} TPM quote did not authenticate against its announce; ignoring it",
+                payload.share_index
+            ));
+            continue;
+        }
+        let sel = hex::encode(&sel_bytes);
 
         // The first attested peer fixes the shared selection + reference PCRs; a
         // later peer that disagrees is skipped (it cannot be admitted under a
@@ -551,11 +618,10 @@ mod tests {
         assert!(parse_tpm_policy(cfg).is_err());
     }
 
-    // The real swtpm quote vector: selection {0,2,4,7,11,12}, a valid AK.
-    const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
-    const AK: &str = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
+    // Marshalled TPML_PCR_SELECTION for {0,2,4,7,11,12} (6 PCRs).
+    const SELECTION: &str = "00000001000b03951800";
 
-    // The 6 reference PCRs the canned ATTEST selection {0,2,4,7,11,12} picks.
+    // The 6 reference PCRs the SELECTION picks.
     fn default_pcrs() -> Vec<String> {
         let zero = "00".repeat(32);
         let pcr11 = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0".to_string();
@@ -589,9 +655,83 @@ mod tests {
         (verifying_share, sig)
     }
 
-    // Build an attested announce event with a valid proof-of-share, given the
-    // captured-into-policy fields that the tests vary. Uses the canned ATTEST
-    // selection {0,2,4,7,11,12} unless `attest` overrides it.
+    // The test AK: a fixed P-256 key the synthetic quotes are signed under.
+    fn ak_signing_key() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).expect("valid AK scalar")
+    }
+
+    fn ak_sec1() -> Vec<u8> {
+        ak_signing_key()
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
+    }
+
+    // Build a marshalled TPMS_ATTEST quote over the given nonce, selection, and
+    // PCR values (digest = SHA-256 of the concatenated values), matching what
+    // `verify_quote` parses and checks.
+    fn build_attest(nonce: &[u8], selection: &[u8], pcr_values: &[String]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for v in pcr_values {
+            h.update(hex::decode(v.trim()).unwrap());
+        }
+        let pcr_digest = h.finalize();
+        let mut a = Vec::new();
+        a.extend_from_slice(&0xFF54_4347u32.to_be_bytes()); // TPM_GENERATED
+        a.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
+        a.extend_from_slice(&0u16.to_be_bytes()); // TPM2B_NAME (empty)
+        a.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+        a.extend_from_slice(nonce); // extraData
+        a.extend_from_slice(&[0u8; 17]); // TPMS_CLOCK_INFO
+        a.extend_from_slice(&[0u8; 8]); // firmware version
+        a.extend_from_slice(selection); // TPML_PCR_SELECTION
+        a.extend_from_slice(&(pcr_digest.len() as u16).to_be_bytes());
+        a.extend_from_slice(&pcr_digest);
+        a
+    }
+
+    // A TPM evidence blob whose quote is signed under the test AK over `nonce`.
+    fn evidence(
+        nonce: &[u8],
+        selection: &[u8],
+        pcr_values: Vec<String>,
+    ) -> keep_frost_net::TpmQuoteEvidence {
+        use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
+        use sha2::{Digest, Sha256};
+
+        let attest = build_attest(nonce, selection, &pcr_values);
+        let sig: Signature = ak_signing_key()
+            .sign_prehash(&Sha256::digest(&attest))
+            .expect("sign attest");
+        keep_frost_net::TpmQuoteEvidence {
+            attest,
+            signature: sig.to_bytes().to_vec(),
+            ak_sec1: ak_sec1(),
+            pcr_values,
+        }
+    }
+
+    fn announce_event(
+        group: &[u8; 32],
+        index: u16,
+        timestamp: u64,
+        evidence: keep_frost_net::TpmQuoteEvidence,
+        proof: ([u8; 33], [u8; 64]),
+    ) -> nostr_sdk::Event {
+        use keep_frost_net::{AnnouncePayload, KfpMessage, KFP_EVENT_KIND};
+        use nostr_sdk::{EventBuilder, Keys, Kind};
+
+        let payload = AnnouncePayload::new(*group, index, proof.0, proof.1, timestamp)
+            .with_tpm_attestation(evidence);
+        let content = KfpMessage::Announce(payload).to_json().unwrap();
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    // An announce carrying a valid, announce-bound quote and proof-of-share.
     fn attested_event(
         group: &[u8; 32],
         index: u16,
@@ -599,32 +739,21 @@ mod tests {
         pcr_values: Vec<String>,
         proof: ([u8; 33], [u8; 64]),
     ) -> nostr_sdk::Event {
-        attested_event_with_attest(group, index, timestamp, ATTEST, pcr_values, proof)
+        attested_event_sel(group, index, timestamp, SELECTION, pcr_values, proof)
     }
 
-    fn attested_event_with_attest(
+    fn attested_event_sel(
         group: &[u8; 32],
         index: u16,
         timestamp: u64,
-        attest: &str,
+        selection_hex: &str,
         pcr_values: Vec<String>,
         proof: ([u8; 33], [u8; 64]),
     ) -> nostr_sdk::Event {
-        use keep_frost_net::{AnnouncePayload, KfpMessage, TpmQuoteEvidence, KFP_EVENT_KIND};
-        use nostr_sdk::{EventBuilder, Keys, Kind};
-
-        let evidence = TpmQuoteEvidence {
-            attest: hex::decode(attest).unwrap(),
-            signature: vec![0u8; 64],
-            ak_sec1: hex::decode(AK).unwrap(),
-            pcr_values,
-        };
-        let payload = AnnouncePayload::new(*group, index, proof.0, proof.1, timestamp)
-            .with_tpm_attestation(evidence);
-        let content = KfpMessage::Announce(payload).to_json().unwrap();
-        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
-            .sign_with_keys(&Keys::generate())
-            .unwrap()
+        let nonce = keep_frost_net::derive_announce_attestation_nonce(group, index, timestamp);
+        let selection = hex::decode(selection_hex).unwrap();
+        let ev = evidence(&nonce, &selection, pcr_values);
+        announce_event(group, index, timestamp, ev, proof)
     }
 
     #[test]
@@ -721,10 +850,8 @@ mod tests {
 
     #[test]
     fn capture_skips_peer_with_divergent_selection() {
-        // Same canned quote but the PCR selection bitmap changed to {0} only, so
-        // peer 3's selection differs from peer 2's and it is skipped.
-        let attest_alt = ATTEST.replace("000b03951800", "000b03010000");
-        assert_ne!(attest_alt, ATTEST);
+        // Peer 3 quotes a different selection ({0} only) the single-reference
+        // policy cannot express, so only peer 2 is pinned.
         let group = [7u8; 32];
         let events = vec![
             attested_event(
@@ -734,11 +861,11 @@ mod tests {
                 default_pcrs(),
                 signed_share(&group, 2, 1_700_000_000),
             ),
-            attested_event_with_attest(
+            attested_event_sel(
                 &group,
                 3,
                 1_700_000_000,
-                &attest_alt,
+                "00000001000b03010000",
                 vec!["00".repeat(32)],
                 signed_share(&group, 3, 1_700_000_000),
             ),
@@ -747,6 +874,60 @@ mod tests {
         let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 2);
+    }
+
+    #[test]
+    fn capture_ignores_announce_with_unauthenticated_quote() {
+        // Valid proof-of-share, but the quote's nonce is bound to a different
+        // timestamp than the announce carries, so verify_quote rejects it and
+        // nothing is captured.
+        let group = [7u8; 32];
+        let selection = hex::decode(SELECTION).unwrap();
+        let wrong_nonce =
+            keep_frost_net::derive_announce_attestation_nonce(&group, 2, 1_700_000_999);
+        let ev = evidence(&wrong_nonce, &selection, default_pcrs());
+        let event = announce_event(
+            &group,
+            2,
+            1_700_000_000,
+            ev,
+            signed_share(&group, 2, 1_700_000_000),
+        );
+        let out = Output::new();
+        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+    }
+
+    #[test]
+    fn capture_bad_first_announce_does_not_poison_capture() {
+        // A malformed first announce (invalid AK) must be skipped before it can
+        // seed the baseline; a later valid peer is still captured.
+        let group = [7u8; 32];
+        let selection = hex::decode(SELECTION).unwrap();
+        let nonce2 = keep_frost_net::derive_announce_attestation_nonce(&group, 2, 1_700_000_000);
+        let mut bad = evidence(&nonce2, &selection, default_pcrs());
+        bad.ak_sec1 = vec![0u8; 10]; // not a 65-byte SEC1 point
+        let nonce3 = keep_frost_net::derive_announce_attestation_nonce(&group, 3, 1_700_000_000);
+        let good = evidence(&nonce3, &selection, default_pcrs());
+        let events = vec![
+            announce_event(
+                &group,
+                2,
+                1_700_000_000,
+                bad,
+                signed_share(&group, 2, 1_700_000_000),
+            ),
+            announce_event(
+                &group,
+                3,
+                1_700_000_000,
+                good,
+                signed_share(&group, 3, 1_700_000_000),
+            ),
+        ];
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.peer[0].index, 3);
     }
 
     #[test]
