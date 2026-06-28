@@ -167,7 +167,7 @@ pub fn cmd_frost_network_serve(
         }
         if let Some(attestor) = attestor {
             node.set_announce_attestor(attestor);
-            out.field("Attestation", "attaching a TPM quote to announces");
+            out.field("Self-attestation", "attaching a TPM quote to announces");
         }
         let node = std::sync::Arc::new(node);
 
