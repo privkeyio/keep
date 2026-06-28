@@ -70,10 +70,7 @@ pub fn cmd_frost_network_serve(
     // Producer side: when this node attests via a TPM, attach a quote to every
     // announce so peers can verify it (and a holder can pin it via
     // `attestation-provision`). Built before unlocking so it fails fast.
-    let attestor = match tpm_tcti {
-        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
-        None => None,
-    };
+    let attestor = attestation::optional_announce_attestor(out, tpm_tcti)?;
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -165,10 +162,7 @@ pub fn cmd_frost_network_serve(
             node.set_expected_oprf_dealer(dealer);
             out.field("OPRF dealer", &format!("pinned to share {dealer}"));
         }
-        if let Some(attestor) = attestor {
-            node.set_announce_attestor(attestor);
-            out.field("Self-attestation", "attaching a TPM quote to announces");
-        }
+        attestation::set_optional_announce_attestor(out, &mut node, attestor);
         let node = std::sync::Arc::new(node);
 
         let pk = node.pubkey();
@@ -1165,10 +1159,7 @@ pub fn cmd_frost_network_oprf_unlock(
     // Build the announce attestor BEFORE unlocking, so a config mistake (a build
     // without `tpm-attestation`, or an unparseable/unreachable TPM) fails fast
     // without prompting for the password or materializing the OPRF secret.
-    let attestor = match tpm_tcti {
-        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
-        None => None,
-    };
+    let attestor = attestation::optional_announce_attestor(out, tpm_tcti)?;
 
     let password = get_password("Enter password")?;
 
@@ -1229,9 +1220,7 @@ pub fn cmd_frost_network_oprf_unlock(
 
         // If a TPM is configured, attach the fresh measured-boot quote source to
         // every announce so holders can verify this box before answering evals.
-        if let Some(attestor) = attestor {
-            node.set_announce_attestor(attestor);
-        }
+        attestation::set_optional_announce_attestor(out, &mut node, attestor);
 
         out.info("Starting FROST coordination node...");
         let shutdown_tx = node.take_shutdown_handle();
@@ -1324,10 +1313,7 @@ pub fn cmd_frost_network_oprf_provision(
     // without `tpm-attestation`, or an unparseable/unreachable TPM) fails fast.
     // The dealer MUST attest: holders gate enrollment on a Verified dealer, so a
     // box that does not attach a quote here cannot distribute any share.
-    let attestor = match tpm_tcti {
-        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
-        None => None,
-    };
+    let attestor = attestation::optional_announce_attestor(out, tpm_tcti)?;
 
     let password = get_password("Enter password")?;
 
@@ -1405,9 +1391,7 @@ pub fn cmd_frost_network_oprf_provision(
         let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        if let Some(attestor) = attestor {
-            node.set_announce_attestor(attestor);
-        }
+        attestation::set_optional_announce_attestor(out, &mut node, attestor);
 
         out.info("Starting FROST coordination node...");
         let shutdown_tx = node.take_shutdown_handle();

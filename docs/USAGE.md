@@ -303,6 +303,11 @@ The TPM quote producer (`--tpm-tcti`) requires a build with the
 `tpm-attestation` feature (`cargo build --features tpm-attestation`); it links
 the tpm2-tss stack and is off by default.
 
+Point `--tpm-tcti` at a LOCAL TPM device (e.g. `device:/dev/tpmrm0`) for a
+meaningful measured-boot guarantee. A remote or virtual TCTI (e.g.
+`swtpm:host=...`) lets an operator self-attest from a TPM they do not physically
+control, which defeats the purpose of pinning the quote.
+
 ### Policy Enforcement (Warden)
 
 Integrate with [Warden](https://github.com/privkeyio/warden) for policy-based signing controls:
