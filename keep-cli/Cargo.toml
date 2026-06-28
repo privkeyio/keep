@@ -39,6 +39,7 @@ url = "2.5"
 base64 = "0.22"
 
 frost-secp256k1-tr = "3.0.0"
+p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10.9"
 rand = "0.10"
 

@@ -567,6 +567,17 @@ pub(crate) enum FrostNetworkCommands {
         /// See #524 for the deeper protocol-level fix.
         #[arg(long)]
         refuse_raw_sign: bool,
+        /// TOML file pinning each peer's TPM attestation key and the reference
+        /// PCRs they must quote. The node verifies a peer's measured-boot state
+        /// against this before answering its OPRF evaluation requests. Required
+        /// unless `--insecure-no-attestation` is set.
+        #[arg(long, value_name = "FILE")]
+        attestation_config: Option<PathBuf>,
+        /// Run WITHOUT verifying peer TPM attestation. Test/dev only: an
+        /// unattested holder answers OPRF evaluations from any peer, which can
+        /// leak the unlock key. Mutually exclusive with `--attestation-config`.
+        #[arg(long)]
+        insecure_no_attestation: bool,
     },
     Peers {
         #[arg(short, long)]

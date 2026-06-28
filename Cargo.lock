@@ -4493,6 +4493,7 @@ dependencies = [
  "keep-frost-net",
  "keep-nip46",
  "nostr-sdk",
+ "p256",
  "rand 0.10.1",
  "ratatui",
  "reqwest",
