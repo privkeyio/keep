@@ -259,10 +259,12 @@ they can also be run directly.
 # 1. One-time provisioning by the dealer/box, with every holder online and
 #    serving (step 2) so they receive and seal their shares: generates the OPRF
 #    key, splits it t-of-n, distributes the remote shares, and writes the LUKS
-#    key plus this box's own share.
+#    key plus this box's own share. `--tpm-tcti` is required — holders refuse a
+#    share from a dealer they cannot attest.
 keep frost network oprf-provision --group npub1... \
   --threshold 2 --total 3 --volume-id vault0 \
-  --key-out luks.key --share-out box.share
+  --key-out luks.key --share-out box.share \
+  --tpm-tcti device:/dev/tpmrm0
 
 # 2. Each holder runs a node that seals its enrolled share, loads it on the next
 #    start, and answers evaluations, verifying the box's attestation first

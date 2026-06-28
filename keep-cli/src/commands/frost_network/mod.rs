@@ -1292,6 +1292,7 @@ pub fn cmd_frost_network_oprf_provision(
     total: u16,
     key_out: &Path,
     share_out: &Path,
+    tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(
         group = group_npub,
@@ -1305,6 +1306,16 @@ pub fn cmd_frost_network_oprf_provision(
     );
 
     let mut keep = Keep::open(path)?;
+
+    // Build the announce attestor BEFORE unlocking, so a config mistake (a build
+    // without `tpm-attestation`, or an unparseable/unreachable TPM) fails fast.
+    // The dealer MUST attest: holders gate enrollment on a Verified dealer, so a
+    // box that does not attach a quote here cannot distribute any share.
+    let attestor = match tpm_tcti {
+        Some(tcti) => Some(attestation::build_announce_attestor(out, tcti)?),
+        None => None,
+    };
+
     let password = get_password("Enter password")?;
 
     let spinner = out.spinner("Unlocking vault...");
@@ -1381,6 +1392,9 @@ pub fn cmd_frost_network_oprf_provision(
         let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
+        if let Some(attestor) = attestor {
+            node.set_announce_attestor(attestor);
+        }
 
         out.info("Starting FROST coordination node...");
         let shutdown_tx = node.take_shutdown_handle();

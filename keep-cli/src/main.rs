@@ -484,11 +484,22 @@ fn dispatch_frost_network(
             total,
             key_out,
             share_out,
+            tpm_tcti,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_oprf_provision(
-                out, path, &group, relay, share, &volume_id, epoch, threshold, total, &key_out,
+                out,
+                path,
+                &group,
+                relay,
+                share,
+                &volume_id,
+                epoch,
+                threshold,
+                total,
+                &key_out,
                 &share_out,
+                tpm_tcti.as_deref(),
             )
         }
     }

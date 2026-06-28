@@ -780,6 +780,14 @@ pub(crate) enum FrostNetworkCommands {
             help = "Write this box's own 64-byte OPRF share here (mode 0600)"
         )]
         share_out: PathBuf,
+        #[arg(
+            long,
+            value_name = "TCTI",
+            help = "Attest this box to the holders by attaching a TPM quote to its announces \
+                    (e.g. device:/dev/tpmrm0). Required: holders refuse a share from an \
+                    unattested dealer. Needs the tpm-attestation build feature."
+        )]
+        tpm_tcti: Option<String>,
     },
 }
 
