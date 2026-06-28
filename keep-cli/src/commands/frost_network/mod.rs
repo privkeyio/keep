@@ -162,7 +162,7 @@ pub fn cmd_frost_network_serve(
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
         let event_keep = keep.clone();
-        let event_seal_path = oprf_seal_path.clone();
+        let event_seal_path = oprf_seal_path;
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
@@ -393,17 +393,16 @@ pub fn cmd_frost_network_serve(
                                 // keep those blocking syscalls off the executor.
                                 let bytes =
                                     zeroize::Zeroizing::new(share.as_slice().to_vec());
-                                let path = path.clone();
-                                let log_path = path.clone();
+                                let owned_path = path.clone();
                                 let write = tokio::task::spawn_blocking(move || {
-                                    write_secret_file(&path, bytes.as_slice())
+                                    write_secret_file(&owned_path, bytes.as_slice())
                                 })
                                 .await;
                                 match write {
                                     Ok(Ok(())) => {
                                         tracing::info!(
                                             dealer_index,
-                                            path = %log_path.display(),
+                                            path = %path.display(),
                                             "sealed enrolled OPRF share; restart serve with --oprf-share-file to answer evaluations"
                                         );
                                         true
