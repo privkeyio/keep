@@ -168,8 +168,9 @@ pub fn resolve_serve_policy(
         (Some(path), false) => Ok(Some(load_tpm_policy(path)?)),
         (None, true) => {
             out.warn(
-                "INSECURE: --insecure-no-attestation set; this node will NOT verify peer TPM \
-                 attestation before answering OPRF evaluations.",
+                "INSECURE: --insecure-no-attestation set; this node configures no peer-attestation \
+                 policy. The OPRF oracle still requires a Verified peer, so without a policy it \
+                 serves NO OPRF evaluations; the node participates only in FROST coordination.",
             );
             Ok(None)
         }
