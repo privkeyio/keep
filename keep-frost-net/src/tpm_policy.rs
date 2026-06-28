@@ -201,35 +201,12 @@ mod tests {
         assert!(matches!(status, AttestationStatus::Failed(_)));
     }
 
-    // Build a self-consistent, signed TPMS_ATTEST quote with the given qualifyingData (nonce),
-    // PCR selection, and single PCR value, signed with `sk`. This exercises the full
-    // nonce-derivation-to-verify wiring with a 32-byte announce-bound nonce, which the fixed
-    // test-vector quote (a 16-byte nonce) cannot.
-    fn build_signed_quote(
-        nonce: &[u8],
-        pcr_select: &[u8],
-        pcr_value: &[u8; 32],
-        sk: &p256::ecdsa::SigningKey,
-    ) -> (Vec<u8>, Vec<u8>) {
-        use p256::ecdsa::{signature::Signer, Signature};
-        use sha2::{Digest, Sha256};
-
-        let mut attest = Vec::new();
-        attest.extend_from_slice(&0xFF54_4347u32.to_be_bytes()); // TPM_GENERATED
-        attest.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
-        attest.extend_from_slice(&0u16.to_be_bytes()); // TPM2B_NAME qualifiedSigner: empty
-        attest.extend_from_slice(&(nonce.len() as u16).to_be_bytes()); // TPM2B_DATA extraData
-        attest.extend_from_slice(nonce);
-        attest.extend_from_slice(&[0u8; 17]); // TPMS_CLOCK_INFO
-        attest.extend_from_slice(&[0u8; 8]); // firmwareVersion
-        attest.extend_from_slice(pcr_select); // TPML_PCR_SELECTION (== pinned selection)
-        let digest = Sha256::digest(pcr_value);
-        attest.extend_from_slice(&(digest.len() as u16).to_be_bytes()); // TPM2B_DIGEST pcrDigest
-        attest.extend_from_slice(&digest);
-
-        let sig: Signature = sk.sign(&attest); // ECDSA-P256 over SHA-256(attest)
-        (attest, sig.to_bytes().to_vec())
-    }
+    // The single-PCR `TPMS_ATTEST` builder lives in `crate::test_support` so the
+    // verifier's unit tests and the end-to-end attestation tests share one wire
+    // format. This case exercises the full nonce-derivation-to-verify wiring with
+    // a 32-byte announce-bound nonce, which the fixed test-vector quote (a 16-byte
+    // nonce) cannot.
+    use crate::test_support::build_signed_quote;
 
     #[test]
     fn tpm_appraise_verifies_announce_bound_derived_nonce() {
@@ -247,7 +224,7 @@ mod tests {
             .as_bytes()
             .to_vec();
 
-        let pcr_select = h("00000001000b03800000"); // sha256, one PCR
+        let pcr_select = crate::test_support::one_pcr_selection(); // sha256, one PCR
         let pcr_value = [0x11u8; 32];
         let (attest, signature) = build_signed_quote(&nonce, &pcr_select, &pcr_value, &sk);
 

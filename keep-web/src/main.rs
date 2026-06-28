@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod api;
 mod auth;
 mod bunker;
