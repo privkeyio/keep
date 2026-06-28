@@ -19,6 +19,7 @@ Keep runs as a CLI, a desktop app (Linux/macOS/Windows), a mobile library (Andro
 | this repo | Rust | Encrypted vault, CLI, desktop app, Nitro Enclave signing, and [`keep-web`](keep-web) headless co-signer |
 | [keep-android](https://github.com/privkeyio/keep-android) | Kotlin | FROST mobile signer with NIP-55 and NIP-46 |
 | [keep-esp32](https://github.com/privkeyio/keep-esp32) | C | Air-gapped ESP32-S3 hardware signer |
+| [keep-node](https://github.com/privkeyio/keep-node) | Nix | Self-sovereign NixOS security appliance with threshold-OPRF boot unlock |
 | [keep-startos](https://github.com/start9-community/keep-startos) | TypeScript | Always-on FROST co-signer node packaging |
 
 ## Features

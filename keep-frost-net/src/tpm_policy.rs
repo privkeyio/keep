@@ -51,16 +51,12 @@ pub(crate) fn appraise_tpm_quote(
     pol: &TpmAttestationPolicy,
     nonce: &[u8],
 ) -> AttestationStatus {
-    // TOFU: the AK must be pinned for this share and match exactly.
-    let pinned = match pol.pinned_aks.get(&share_index) {
-        Some(ak) => ak,
-        None => {
-            return AttestationStatus::Failed(format!(
-                "AK not pinned or changed for share {share_index}"
-            ))
-        }
-    };
-    if pinned.as_slice().ct_eq(ev.ak_sec1.as_slice()).unwrap_u8() != 1 {
+    // TOFU: the AK must be pinned for this share and match exactly (constant-time).
+    let pinned_ok = pol
+        .pinned_aks
+        .get(&share_index)
+        .is_some_and(|ak| ak.as_slice().ct_eq(ev.ak_sec1.as_slice()).unwrap_u8() == 1);
+    if !pinned_ok {
         return AttestationStatus::Failed(format!(
             "AK not pinned or changed for share {share_index}"
         ));
@@ -94,25 +90,12 @@ pub(crate) fn appraise_tpm_quote(
 mod tests {
     use super::*;
 
-    // Real swtpm quote (keep-node/tpm-quote-test-vector.json), tpm2_checkquote-verified.
-    const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
-    const SIG_R: &str = "0408dac9c80e649049e75fc74d6e1634fa4922066ce488b49b5110e7125b172b";
-    const SIG_S: &str = "124fd1dc171546bde98f4409ad002fa7ccad75a65374ea7ee96381de337b34f0";
-    const AK_X: &str = "f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb327";
-    const AK_Y: &str = "1b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
-    const NONCE: &str = "00112233445566778899aabbccddeeff";
-    const PCR_SELECT: &str = "00000001000b03951800";
-    const PCR11: &str = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0";
+    // The real swtpm quote vector (ATTEST/SIG_*/AK_*/NONCE/PCR_SELECT/PCR11 and
+    // h/h32) is the single source of truth in `tpm_quote::test_vector`.
+    use crate::tpm_quote::test_vector::*;
+
     const ZERO_PCR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const SHARE_INDEX: u16 = 2;
-
-    fn h(s: &str) -> Vec<u8> {
-        hex::decode(s).unwrap()
-    }
-
-    fn h32(s: &str) -> [u8; 32] {
-        h(s).try_into().unwrap()
-    }
 
     fn ak_sec1() -> Vec<u8> {
         let mut v = vec![0x04u8];

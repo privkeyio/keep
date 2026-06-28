@@ -573,9 +573,11 @@ pub(crate) enum FrostNetworkCommands {
         /// unless `--insecure-no-attestation` is set.
         #[arg(long, value_name = "FILE")]
         attestation_config: Option<PathBuf>,
-        /// Run WITHOUT verifying peer TPM attestation. Test/dev only: an
-        /// unattested holder answers OPRF evaluations from any peer, which can
-        /// leak the unlock key. Mutually exclusive with `--attestation-config`.
+        /// Run without a peer-attestation policy (test/dev only). The OPRF
+        /// oracle independently requires a `Verified` peer, so with no policy no
+        /// peer is ever verified and the node serves NO OPRF evaluations; it
+        /// still participates in FROST coordination. Mutually exclusive with
+        /// `--attestation-config`.
         #[arg(long)]
         insecure_no_attestation: bool,
         /// Act as an OPRF holder: load this 64-byte OPRF key share at boot so the
