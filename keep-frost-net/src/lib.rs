@@ -76,6 +76,8 @@ mod protocol;
 mod psbt_session;
 mod recovery_signers;
 mod session;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
 mod tpm_policy;
 #[cfg(feature = "tpm-attestation")]
 pub mod tpm_producer;

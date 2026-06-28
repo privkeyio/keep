@@ -3280,36 +3280,7 @@ async fn test_announce_fails_closed_when_quote_fails() {
 // reaching `Verified` on its own before answering the box's OPRF evaluation.
 // This is the protocol capstone for the 3-node deployment.
 
-/// Marshalled `TPML_PCR_SELECTION` for the SHA-256 bank over a single PCR.
-fn one_pcr_selection() -> Vec<u8> {
-    hex::decode("00000001000b03800000").unwrap()
-}
-
-/// Build a self-consistent, signed `TPMS_ATTEST` quote over one PCR bound to
-/// `nonce`, signed with `sk`. Mirrors the producer's exact wire format.
-fn build_signed_quote(
-    nonce: &[u8],
-    pcr_select: &[u8],
-    pcr_value: &[u8; 32],
-    sk: &p256::ecdsa::SigningKey,
-) -> (Vec<u8>, Vec<u8>) {
-    use p256::ecdsa::{signature::Signer, Signature};
-    use sha2::{Digest, Sha256};
-    let mut attest = Vec::new();
-    attest.extend_from_slice(&0xFF54_4347u32.to_be_bytes()); // TPM_GENERATED
-    attest.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
-    attest.extend_from_slice(&0u16.to_be_bytes()); // qualifiedSigner: empty
-    attest.extend_from_slice(&(nonce.len() as u16).to_be_bytes()); // extraData len
-    attest.extend_from_slice(nonce);
-    attest.extend_from_slice(&[0u8; 17]); // TPMS_CLOCK_INFO
-    attest.extend_from_slice(&[0u8; 8]); // firmwareVersion
-    attest.extend_from_slice(pcr_select); // TPML_PCR_SELECTION
-    let digest = Sha256::digest(pcr_value);
-    attest.extend_from_slice(&(digest.len() as u16).to_be_bytes()); // pcrDigest len
-    attest.extend_from_slice(&digest);
-    let sig: Signature = sk.sign(&attest); // ECDSA-P256 over SHA-256(attest)
-    (attest, sig.to_bytes().to_vec())
-}
+use keep_frost_net::test_support::{build_signed_quote, one_pcr_selection};
 
 /// A test announce attestor that signs a valid quote for each announce nonce,
 /// the in-process stand-in for `TpmQuoteService` (proven against swtpm elsewhere).
@@ -3415,20 +3386,38 @@ async fn test_oprf_unlock_with_real_tpm_attestation_2of3() {
     let (mut n1, mut n2) = (0u32, 0u32);
     let discovery = timeout(Duration::from_secs(45), async {
         loop {
+            // Match the full `recv()` result: a closed stream (a crashed node)
+            // must surface as a legible error, not a `select!` "all branches
+            // disabled" panic that hides which node died. A lagged stream is
+            // transient and ignored, matching the original tolerant behaviour.
+            use tokio::sync::broadcast::error::RecvError;
             tokio::select! {
-                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => n1 += 1,
-                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => n2 += 1,
+                ev = rx1.recv() => match ev {
+                    Ok(KfpNodeEvent::PeerDiscovered { .. }) => n1 += 1,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return Err("box event stream closed".to_string()),
+                },
+                ev = rx2.recv() => match ev {
+                    Ok(KfpNodeEvent::PeerDiscovered { .. }) => n2 += 1,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return Err("holder event stream closed".to_string()),
+                },
             }
             if n1 >= 1 && n2 >= 1 {
-                return;
+                return Ok(());
             }
         }
     })
     .await;
-    if discovery.is_err() {
+    let discovery_failure = match discovery {
+        Ok(Ok(())) => None,
+        Ok(Err(msg)) => Some(msg),
+        Err(_) => Some(format!("discovery timed out: n1={n1}, n2={n2}")),
+    };
+    if let Some(msg) = discovery_failure {
         graceful_shutdown(shutdown1, h1).await;
         graceful_shutdown(shutdown2, h2).await;
-        panic!("discovery timed out: n1={n1}, n2={n2}");
+        panic!("{msg}");
     }
 
     let result = timeout(
@@ -3477,6 +3466,7 @@ async fn test_oprf_unlock_blocked_when_box_unattested() {
     node2.set_tpm_attestation_policy(policy);
 
     let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
     let shutdown1 = node1.take_shutdown_handle();
     let shutdown2 = node2.take_shutdown_handle();
     let node1 = Arc::new(node1);
@@ -3506,6 +3496,31 @@ async fn test_oprf_unlock_blocked_when_box_unattested() {
         panic!("box never discovered the holder");
     }
 
+    // Watch the holder's stream: it must NEVER discover the unattested box
+    // (share index 1). That is the gate firing, and it attributes the blocked
+    // unlock to attestation rejection rather than to an incidental timeout or a
+    // dropped relay message. The flag is read after the unlock window closes.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::broadcast::error::RecvError;
+    let holder_admitted_box = Arc::new(AtomicBool::new(false));
+    // A lagged stream means a dropped event could have hidden a bypass, so we
+    // fail safe rather than let the assertion pass on incomplete evidence.
+    let watcher_lagged = Arc::new(AtomicBool::new(false));
+    let admitted = Arc::clone(&holder_admitted_box);
+    let lagged = Arc::clone(&watcher_lagged);
+    let watcher = tokio::spawn(async move {
+        loop {
+            match rx2.recv().await {
+                Ok(KfpNodeEvent::PeerDiscovered { share_index: 1, .. }) => {
+                    admitted.store(true, Ordering::SeqCst);
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => lagged.store(true, Ordering::SeqCst),
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+
     // The holder never sends a partial, so the box stays below threshold; this
     // window only needs to be long enough to be sure it will not succeed.
     let result = timeout(
@@ -3513,8 +3528,18 @@ async fn test_oprf_unlock_blocked_when_box_unattested() {
         node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
     )
     .await;
+    watcher.abort();
+    let _ = watcher.await; // join the aborted task so its flag write is visible
     graceful_shutdown(shutdown1, h1).await;
     graceful_shutdown(shutdown2, h2).await;
+    assert!(
+        !watcher_lagged.load(Ordering::SeqCst),
+        "holder event watcher lagged: cannot prove the attestation gate held"
+    );
+    assert!(
+        !holder_admitted_box.load(Ordering::SeqCst),
+        "holder must never discover the unattested box: the attestation gate was bypassed"
+    );
     assert!(
         !matches!(result, Ok(Ok(_))),
         "unlock must NOT succeed when the box is unattested (gate bypassed)"
