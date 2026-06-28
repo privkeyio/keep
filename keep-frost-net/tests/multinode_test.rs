@@ -444,10 +444,17 @@ async fn test_health_check_then_sign_no_deadlock() {
         panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
     }
 
-    // The deadlock manifested here: before the fix this never returned.
+    // node3 having discovered both peers does not guarantee they have processed
+    // node3's announce yet; let the reciprocal announces flush so both are ready
+    // to answer node3's ping before we measure responsiveness.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The deadlock manifested here: before the fix this never returned. The ping
+    // window is generous so a loaded (e.g. macOS CI) runner still collects both
+    // pongs; the point of the test is that health_check returns at all.
     let health = timeout(
-        Duration::from_secs(15),
-        node3.health_check(Duration::from_secs(2)),
+        Duration::from_secs(20),
+        node3.health_check(Duration::from_secs(8)),
     )
     .await;
 
