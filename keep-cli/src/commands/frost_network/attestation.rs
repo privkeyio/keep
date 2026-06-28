@@ -472,6 +472,13 @@ pub fn cmd_frost_network_attestation_provision(
             .map_err(|e| err(format!("add relay {relay}: {e}")))?;
         client.connect().await;
 
+        // Announces are ephemeral (KFP_EVENT_KIND is in the NIP-16 ephemeral range), so relays
+        // do not store them: a point-in-time fetch (which returns on EOSE) only catches one if a
+        // peer happens to broadcast in the brief window before EOSE, making capture a race.
+        // Peers re-announce on a fixed interval, so hold a live subscription open for the full
+        // `wait` and collect every announce that arrives instead, guaranteeing we observe at
+        // least one periodic re-announce from each online peer (pick `wait` >= that interval).
+        let mut notifications = client.notifications();
         let filter = Filter::new()
             .kind(Kind::Custom(keep_frost_net::KFP_EVENT_KIND))
             .custom_tag(
@@ -479,15 +486,30 @@ pub fn cmd_frost_network_attestation_provision(
                 hex::encode(group_pubkey),
             )
             .since(Timestamp::now() - std::time::Duration::from_secs(wait));
+        client
+            .subscribe(filter, None)
+            .await
+            .map_err(|e| err(format!("subscribe announces: {e}")))?;
 
         let spinner = out.spinner(&format!("Listening {wait}s for attested announces..."));
-        let events = client
-            .fetch_events(filter, std::time::Duration::from_secs(wait))
-            .await
-            .map_err(|e| err(format!("fetch announces: {e}")))?;
+        let mut events: Vec<Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
+        loop {
+            match tokio::time::timeout_at(deadline, notifications.recv()).await {
+                Err(_) => break, // the full wait window elapsed: the normal success path
+                Ok(Ok(RelayPoolNotification::Event { event, .. })) => events.push(*event),
+                Ok(Ok(_)) => {} // non-event notifications: ignore
+                // Fell behind the broadcast buffer: some notifications were dropped, but peers
+                // re-announce on their interval, so keep listening rather than aborting.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                // The stream closed before the window elapsed (relay pool shut down): surface a
+                // clear failure instead of silently capturing a partial/empty set.
+                Ok(Err(e)) => return Err(err(format!("announce subscription ended early: {e}"))),
+            }
+        }
         spinner.finish();
 
-        capture_policy_from_announces(out, &group_pubkey, &events.into_iter().collect::<Vec<_>>())
+        capture_policy_from_announces(out, &group_pubkey, &events)
     })?;
 
     let pinned = config.peer.len();
