@@ -3264,3 +3264,252 @@ async fn test_announce_fails_closed_when_quote_fails() {
         "the failure must be the attestation fail-closed path, got {err:?}"
     );
 }
+
+// ===== keep-4zhi: end-to-end threshold-OPRF unlock with REAL attestation =====
+//
+// The unlock/enroll tests above inject `Verified` via `test_set_peer_attestation`.
+// These instead drive attestation through the real path: the box attaches a TPM
+// quote to its announce, and the holder appraises it against a pinned policy,
+// reaching `Verified` on its own before answering the box's OPRF evaluation.
+// This is the protocol capstone for the 3-node deployment.
+
+/// Marshalled `TPML_PCR_SELECTION` for the SHA-256 bank over a single PCR.
+fn one_pcr_selection() -> Vec<u8> {
+    hex::decode("00000001000b03800000").unwrap()
+}
+
+/// Build a self-consistent, signed `TPMS_ATTEST` quote over one PCR bound to
+/// `nonce`, signed with `sk`. Mirrors the producer's exact wire format.
+fn build_signed_quote(
+    nonce: &[u8],
+    pcr_select: &[u8],
+    pcr_value: &[u8; 32],
+    sk: &p256::ecdsa::SigningKey,
+) -> (Vec<u8>, Vec<u8>) {
+    use p256::ecdsa::{signature::Signer, Signature};
+    use sha2::{Digest, Sha256};
+    let mut attest = Vec::new();
+    attest.extend_from_slice(&0xFF54_4347u32.to_be_bytes()); // TPM_GENERATED
+    attest.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
+    attest.extend_from_slice(&0u16.to_be_bytes()); // qualifiedSigner: empty
+    attest.extend_from_slice(&(nonce.len() as u16).to_be_bytes()); // extraData len
+    attest.extend_from_slice(nonce);
+    attest.extend_from_slice(&[0u8; 17]); // TPMS_CLOCK_INFO
+    attest.extend_from_slice(&[0u8; 8]); // firmwareVersion
+    attest.extend_from_slice(pcr_select); // TPML_PCR_SELECTION
+    let digest = Sha256::digest(pcr_value);
+    attest.extend_from_slice(&(digest.len() as u16).to_be_bytes()); // pcrDigest len
+    attest.extend_from_slice(&digest);
+    let sig: Signature = sk.sign(&attest); // ECDSA-P256 over SHA-256(attest)
+    (attest, sig.to_bytes().to_vec())
+}
+
+/// A test announce attestor that signs a valid quote for each announce nonce,
+/// the in-process stand-in for `TpmQuoteService` (proven against swtpm elsewhere).
+struct ValidQuoteAttestor {
+    sk: p256::ecdsa::SigningKey,
+    ak_sec1: Vec<u8>,
+    pcr_value: [u8; 32],
+}
+
+impl ValidQuoteAttestor {
+    fn new() -> Self {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[0x77u8; 32]).unwrap();
+        let ak_sec1 = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        Self {
+            sk,
+            ak_sec1,
+            pcr_value: [0x11u8; 32],
+        }
+    }
+
+    /// The verifier policy a peer pins to verify quotes from this attestor.
+    fn policy(&self, box_index: u16) -> keep_frost_net::TpmAttestationPolicy {
+        let mut pinned = std::collections::HashMap::new();
+        pinned.insert(box_index, self.ak_sec1.clone());
+        keep_frost_net::TpmAttestationPolicy::new(one_pcr_selection(), vec![self.pcr_value], pinned)
+    }
+}
+
+impl keep_frost_net::AnnounceAttestor for ValidQuoteAttestor {
+    fn ak_sec1(&self) -> Vec<u8> {
+        self.ak_sec1.clone()
+    }
+    fn request_quote(
+        &self,
+        nonce: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<keep_frost_net::Result<keep_frost_net::TpmQuoteEvidence>>
+    {
+        let (attest, signature) =
+            build_signed_quote(&nonce, &one_pcr_selection(), &self.pcr_value, &self.sk);
+        let ev = keep_frost_net::TpmQuoteEvidence {
+            attest,
+            signature,
+            ak_sec1: self.ak_sec1.clone(),
+            pcr_values: vec![hex::encode(self.pcr_value)],
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(ev));
+        rx
+    }
+}
+
+/// Happy path: the box attaches a real TPM quote to its announce; the holder
+/// pins the box's AK and reaches `Verified` on its own (no injection), then
+/// answers the box's evaluation. A 2-of-3 unlock derives the 32-byte key.
+#[tokio::test]
+async fn test_oprf_unlock_with_real_tpm_attestation_2of3() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-attest-ok").unwrap();
+    let share1 = shares.remove(0); // box id 1
+    let share2 = shares.remove(0); // holder id 2
+    let oprf = split_oprf_key_2of3();
+
+    let attestor = Arc::new(ValidQuoteAttestor::new());
+    let policy = attestor.policy(1);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("box");
+    node1.set_oprf_key_share(oprf[0]);
+    node1.set_announce_attestor(attestor); // box self-attests on every announce
+
+    let mut node2 = KfpNode::new(share2, vec![relay]).await.expect("holder");
+    node2.set_oprf_key_share(oprf[1]);
+    node2.set_hooks(Arc::new(ApproveOprfHooks));
+    node2.set_tpm_attestation_policy(policy); // holder verifies the box
+
+    let mut rx1 = node1.subscribe();
+    let mut rx2 = node2.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let r1 = Arc::clone(&node1);
+    let r2 = Arc::clone(&node2);
+    let h1 = tokio::spawn(async move {
+        let _ = r1.run().await;
+    });
+    let h2 = tokio::spawn(async move {
+        let _ = r2.run().await;
+    });
+
+    // Mutual discovery: the holder discovering the box means it processed AND
+    // verified the box's quote, so the box is `Verified` with no injection.
+    let (mut n1, mut n2) = (0u32, 0u32);
+    let discovery = timeout(Duration::from_secs(45), async {
+        loop {
+            tokio::select! {
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv() => n1 += 1,
+                Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx2.recv() => n2 += 1,
+            }
+            if n1 >= 1 && n2 >= 1 {
+                return;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, h1).await;
+        graceful_shutdown(shutdown2, h2).await;
+        panic!("discovery timed out: n1={n1}, n2={n2}");
+    }
+
+    let result = timeout(
+        Duration::from_secs(45),
+        node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
+    )
+    .await;
+    graceful_shutdown(shutdown1, h1).await;
+    graceful_shutdown(shutdown2, h2).await;
+    match result {
+        Ok(Ok(key)) => assert_eq!(key.len(), 32, "derived LUKS key must be 32 bytes"),
+        Ok(Err(e)) => panic!("unlock failed despite valid attestation: {e}"),
+        Err(_) => panic!("unlock timed out despite valid attestation"),
+    }
+}
+
+/// Negative: the box attaches NO quote, so the holder (which requires
+/// attestation) refuses to answer. With the holder out, the box is alone below
+/// threshold and the unlock cannot complete: the gate, reached naturally,
+/// prevents a single share from opening the volume.
+#[tokio::test]
+async fn test_oprf_unlock_blocked_when_box_unattested() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-attest-blocked").unwrap();
+    let share1 = shares.remove(0); // box id 1
+    let share2 = shares.remove(0); // holder id 2
+    let oprf = split_oprf_key_2of3();
+
+    // The holder pins a policy but the box presents NO attestor, so it never
+    // reaches Verified at the holder.
+    let policy = ValidQuoteAttestor::new().policy(1);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("box");
+    node1.set_oprf_key_share(oprf[0]); // box: no announce attestor
+
+    let mut node2 = KfpNode::new(share2, vec![relay]).await.expect("holder");
+    node2.set_oprf_key_share(oprf[1]);
+    node2.set_hooks(Arc::new(ApproveOprfHooks));
+    node2.set_tpm_attestation_policy(policy);
+
+    let mut rx1 = node1.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let r1 = Arc::clone(&node1);
+    let r2 = Arc::clone(&node2);
+    let h1 = tokio::spawn(async move {
+        let _ = r1.run().await;
+    });
+    let h2 = tokio::spawn(async move {
+        let _ = r2.run().await;
+    });
+
+    // The box (no policy) discovers the holder; the holder rejects the box's
+    // unattested announce, so we only wait on the box side.
+    let discovered = timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    if discovered.is_err() {
+        graceful_shutdown(shutdown1, h1).await;
+        graceful_shutdown(shutdown2, h2).await;
+        panic!("box never discovered the holder");
+    }
+
+    // The holder never sends a partial, so the box stays below threshold; this
+    // window only needs to be long enough to be sure it will not succeed.
+    let result = timeout(
+        Duration::from_secs(12),
+        node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
+    )
+    .await;
+    graceful_shutdown(shutdown1, h1).await;
+    graceful_shutdown(shutdown2, h2).await;
+    assert!(
+        !matches!(result, Ok(Ok(_))),
+        "unlock must NOT succeed when the box is unattested (gate bypassed)"
+    );
+}
