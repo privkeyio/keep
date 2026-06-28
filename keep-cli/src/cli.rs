@@ -709,6 +709,14 @@ pub(crate) enum FrostNetworkCommands {
             help = "Path to this box's 64-byte OPRF key share (TPM-unsealed at boot)"
         )]
         share_file: PathBuf,
+        #[arg(
+            long,
+            value_name = "TCTI",
+            help = "Attest this box's measured boot to holders by attaching a TPM quote to its \
+                    announces. TCTI of the TPM (e.g. device:/dev/tpmrm0). Requires the \
+                    tpm-attestation build feature."
+        )]
+        tpm_tcti: Option<String>,
     },
     /// One-time setup: act as the trusted dealer, generate the OPRF key, split
     /// it, distribute the remote shares to online holders, and write the LUKS

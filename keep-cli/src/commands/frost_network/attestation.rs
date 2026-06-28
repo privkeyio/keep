@@ -180,6 +180,33 @@ pub fn resolve_serve_policy(
     }
 }
 
+/// Build the TPM-backed announce attestor for this box from a `--tpm-tcti`
+/// string, so its announces carry a fresh measured-boot quote peers can verify.
+/// Only available when built with the `tpm-attestation` feature.
+#[cfg(feature = "tpm-attestation")]
+pub fn build_announce_attestor(
+    out: &Output,
+    tcti: &str,
+) -> Result<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>> {
+    use keep_frost_net::AnnounceAttestor;
+    let service = keep_frost_net::TpmQuoteService::spawn_from_tcti(tcti)
+        .map_err(|e| err(format!("start TPM quote service: {e}")))?;
+    out.field("Attestation key", &hex::encode(service.ak_sec1()));
+    Ok(std::sync::Arc::new(service))
+}
+
+/// Without the `tpm-attestation` feature there is no TPM producer; `--tpm-tcti`
+/// is rejected so the build limitation is explicit rather than silently ignored.
+#[cfg(not(feature = "tpm-attestation"))]
+pub fn build_announce_attestor(
+    _out: &Output,
+    _tcti: &str,
+) -> Result<std::sync::Arc<dyn keep_frost_net::AnnounceAttestor>> {
+    Err(err(
+        "this build has no TPM support; rebuild with `--features tpm-attestation` to use --tpm-tcti",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

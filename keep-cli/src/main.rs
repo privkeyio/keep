@@ -444,6 +444,7 @@ fn dispatch_frost_network(
             volume_id,
             epoch,
             share_file,
+            tpm_tcti,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_oprf_unlock(
@@ -455,6 +456,7 @@ fn dispatch_frost_network(
                 &volume_id,
                 epoch,
                 &share_file,
+                tpm_tcti.as_deref(),
             )
         }
         FrostNetworkCommands::OprfProvision {

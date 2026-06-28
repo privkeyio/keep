@@ -1021,6 +1021,7 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `Output` (which is backed by `Term::stderr()`); the key is never logged.
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_oprf_unlock(
     out: &Output,
     path: &Path,
@@ -1030,6 +1031,7 @@ pub fn cmd_frost_network_oprf_unlock(
     volume_id: &str,
     epoch: u32,
     share_file: &Path,
+    tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(
         group = group_npub,
@@ -1097,6 +1099,13 @@ pub fn cmd_frost_network_oprf_unlock(
         // Install the OPRF key share BEFORE running so this box can answer its
         // own quorum's evaluate requests.
         node.set_oprf_key_share(oprf_share);
+
+        // If a TPM is configured, attach a fresh measured-boot quote to every
+        // announce so holders can verify this box before answering its evals.
+        if let Some(tcti) = tpm_tcti {
+            let attestor = attestation::build_announce_attestor(out, tcti)?;
+            node.set_announce_attestor(attestor);
+        }
 
         out.info("Starting FROST coordination node...");
         let shutdown_tx = node.take_shutdown_handle();
