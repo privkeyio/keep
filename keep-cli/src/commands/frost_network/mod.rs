@@ -388,20 +388,36 @@ pub fn cmd_frost_network_serve(
                         // ack only on a confirmed write so the dealer is never told
                         // enrollment completed with nothing sealed.
                         let sealed = match &event_seal_path {
-                            Some(path) => match write_secret_file(path, share.as_slice()) {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        dealer_index,
-                                        path = %path.display(),
-                                        "sealed enrolled OPRF share; restart serve with --oprf-share-file to answer evaluations"
-                                    );
-                                    true
+                            Some(path) => {
+                                // The seal write fsyncs the file and its parent dir;
+                                // keep those blocking syscalls off the executor.
+                                let bytes =
+                                    zeroize::Zeroizing::new(share.as_slice().to_vec());
+                                let path = path.clone();
+                                let log_path = path.clone();
+                                let write = tokio::task::spawn_blocking(move || {
+                                    write_secret_file(&path, bytes.as_slice())
+                                })
+                                .await;
+                                match write {
+                                    Ok(Ok(())) => {
+                                        tracing::info!(
+                                            dealer_index,
+                                            path = %log_path.display(),
+                                            "sealed enrolled OPRF share; restart serve with --oprf-share-file to answer evaluations"
+                                        );
+                                        true
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::error!(error = %e, "failed to seal enrolled OPRF share");
+                                        false
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "seal write task failed");
+                                        false
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "failed to seal enrolled OPRF share");
-                                    false
-                                }
-                            },
+                            }
                             None => {
                                 tracing::error!(
                                     "received an OPRF enrollment but --oprf-share-file is not set; cannot seal"
@@ -409,8 +425,17 @@ pub fn cmd_frost_network_serve(
                                 false
                             }
                         };
-                        if let Some(tx) = seal_ack.lock().ok().and_then(|mut g| g.take()) {
-                            let _ = tx.send(sealed);
+                        match seal_ack.lock() {
+                            Ok(mut g) => {
+                                if let Some(tx) = g.take() {
+                                    let _ = tx.send(sealed);
+                                }
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    "seal_ack mutex poisoned; cannot ack OPRF enrollment, dealer will time out"
+                                );
+                            }
                         }
                     }
                     Err(_) => break,
@@ -427,8 +452,9 @@ pub fn cmd_frost_network_serve(
         Ok::<_, KeepError>(())
     });
 
-    // `KeyShare` is `Copy` + `Zeroize` but not `ZeroizeOnDrop`: the copy installed
-    // on the node is gone with it, but our local copy must be wiped by hand.
+    // The sealed file bytes are wiped via `Zeroizing`, and the node-resident copy is
+    // wiped by `KfpNode`'s `Drop`. `KeyShare` is `Copy` + `Zeroize` but not
+    // `ZeroizeOnDrop`, so this wipes our remaining local copy by hand.
     if let Some(mut share) = oprf_share {
         share.zeroize();
     }
