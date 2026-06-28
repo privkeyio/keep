@@ -1587,27 +1587,14 @@ impl KfpNode {
     }
 
     pub async fn announce(&self) -> Result<()> {
-        let key_package = self
-            .share
-            .key_package()
-            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
-
-        let verifying_share = key_package.verifying_share();
-        let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
-            FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
-        })?;
-        let verifying_share_bytes: [u8; 33] = verifying_share_serialized
-            .as_slice()
-            .try_into()
-            .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
-
         let share_index = self.share.metadata.identifier;
         let timestamp = Timestamp::now().as_secs();
 
         // If this node attests via a TPM, bind a fresh quote to THIS announce
         // (group, share, timestamp) and attach it. Fail-closed: if quoting fails
         // we do not announce, since a configured-but-unattested announce would be
-        // rejected by any peer that pins a policy.
+        // rejected by any peer that pins a policy. Done BEFORE deserializing the
+        // share so no signing-key material is resident during the quote wait.
         let tpm_attestation = match &self.announce_attestor {
             Some(attestor) => {
                 let nonce =
@@ -1626,12 +1613,26 @@ impl KfpNode {
             None => None,
         };
 
-        // Derive the FROST signing share only after the quote round-trip, keeping
-        // the secret's in-memory residency window as small as possible.
+        // Deserialize the share and its key material only after attestation has
+        // succeeded, minimizing the secret's in-memory residency window.
+        let key_package = self
+            .share
+            .key_package()
+            .map_err(|e| FrostNetError::Crypto(format!("Failed to get key package: {e}")))?;
+
+        let verifying_share = key_package.verifying_share();
+        let verifying_share_serialized = verifying_share.serialize().map_err(|e| {
+            FrostNetError::Crypto(format!("Failed to serialize verifying share: {e}"))
+        })?;
+        let verifying_share_bytes: [u8; 33] = verifying_share_serialized
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
+
         let signing_share = key_package.signing_share();
+        let signing_share_serialized = Zeroizing::new(signing_share.serialize());
         let signing_share_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            signing_share
-                .serialize()
+            signing_share_serialized
                 .as_slice()
                 .try_into()
                 .map_err(|_| FrostNetError::Crypto("Invalid signing share length".into()))?,

@@ -3255,8 +3255,12 @@ async fn test_announce_fails_closed_when_quote_fails() {
         succeed: false,
     }));
 
+    let err = node
+        .announce()
+        .await
+        .expect_err("announce must fail closed when the configured attestor cannot quote");
     assert!(
-        node.announce().await.is_err(),
-        "announce must fail closed when the configured attestor cannot quote"
+        matches!(err, keep_frost_net::FrostNetError::Attestation(_)),
+        "the failure must be the attestation fail-closed path, got {err:?}"
     );
 }

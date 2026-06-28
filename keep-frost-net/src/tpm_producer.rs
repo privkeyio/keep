@@ -290,8 +290,16 @@ type QuoteRequest = (
 /// `Send + Sync`, so it can be held by the async node as `Arc<dyn AnnounceAttestor>`.
 /// Quoting is serialized on the worker thread, which is correct: a TPM processes
 /// one command at a time.
+/// Bound on in-flight quote requests. Announces are periodic and serialized per
+/// node, so this is generous; if it is ever exceeded the request is rejected
+/// (backpressure) rather than queued without limit.
+const QUOTE_QUEUE_BOUND: usize = 16;
+/// How long [`TpmQuoteService::spawn`] waits for the worker to report readiness
+/// before failing startup, so a hung TCTI connection cannot block forever.
+const WORKER_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct TpmQuoteService {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<QuoteRequest>>,
+    tx: Option<tokio::sync::mpsc::Sender<QuoteRequest>>,
     ak_sec1: Vec<u8>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -299,10 +307,11 @@ pub struct TpmQuoteService {
 impl TpmQuoteService {
     /// Open a TPM context over `tcti` on a dedicated thread, create the AK, and
     /// return a handle once it is ready. Blocks briefly while the worker creates
-    /// the AK; returns the worker's error if that fails.
+    /// the AK; returns the worker's error if that fails, or a timeout error if it
+    /// does not report readiness within [`WORKER_SETUP_TIMEOUT`].
     pub fn spawn(tcti: tss_esapi::TctiNameConf, slots: Vec<PcrSlot>) -> Result<Self> {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<Vec<u8>>>();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QuoteRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<QuoteRequest>(QUOTE_QUEUE_BOUND);
 
         let worker = std::thread::Builder::new()
             .name("tpm-quote-service".into())
@@ -323,13 +332,19 @@ impl TpmQuoteService {
                 drop(setup_tx);
                 // Serve quote requests until every sender is dropped.
                 while let Some((nonce, reply)) = rx.blocking_recv() {
+                    // Skip work whose caller already gave up (announce timed out
+                    // and dropped the receiver), so a backlog drains without
+                    // spending scarce TPM time on stale requests.
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let _ = reply.send(quoter.quote(&nonce));
                 }
                 // `quoter` drops here, flushing the AK.
             })
             .map_err(|e| att(format!("failed to spawn TPM quote thread: {e}")))?;
 
-        match setup_rx.recv() {
+        match setup_rx.recv_timeout(WORKER_SETUP_TIMEOUT) {
             Ok(Ok(ak_sec1)) => Ok(Self {
                 tx: Some(tx),
                 ak_sec1,
@@ -339,9 +354,15 @@ impl TpmQuoteService {
                 let _ = worker.join();
                 Err(e)
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = worker.join();
                 Err(att("TPM quote thread exited before reporting readiness"))
+            }
+            // The worker is stuck (e.g. a hung TCTI connect). Do NOT join, which
+            // would hang too; drop the handle and fail startup. The detached
+            // thread unwinds if and when the blocking call returns.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(att("TPM quote service did not become ready in time"))
             }
         }
     }
@@ -361,15 +382,21 @@ impl crate::announce_attestor::AnnounceAttestor for TpmQuoteService {
         &self,
         nonce: [u8; 32],
     ) -> tokio::sync::oneshot::Receiver<Result<TpmQuoteEvidence>> {
+        use tokio::sync::mpsc::error::TrySendError;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         match &self.tx {
-            Some(tx) => {
-                if let Err(tokio::sync::mpsc::error::SendError((_, reply_tx))) =
-                    tx.send((nonce, reply_tx))
-                {
+            // Non-blocking send: this is a sync method and must not stall the
+            // caller. A full queue means too many quotes are already in flight, so
+            // reject with backpressure rather than block.
+            Some(tx) => match tx.try_send((nonce, reply_tx)) {
+                Ok(()) => {}
+                Err(TrySendError::Full((_, reply_tx))) => {
+                    let _ = reply_tx.send(Err(att("TPM quote service queue is full")));
+                }
+                Err(TrySendError::Closed((_, reply_tx))) => {
                     let _ = reply_tx.send(Err(att("TPM quote service has stopped")));
                 }
-            }
+            },
             None => {
                 let _ = reply_tx.send(Err(att("TPM quote service has stopped")));
             }
