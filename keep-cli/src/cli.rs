@@ -578,6 +578,17 @@ pub(crate) enum FrostNetworkCommands {
         /// leak the unlock key. Mutually exclusive with `--attestation-config`.
         #[arg(long)]
         insecure_no_attestation: bool,
+        /// Act as an OPRF holder: load this 64-byte OPRF key share at boot so the
+        /// node answers evaluation requests, and seal a freshly enrolled share
+        /// here. If the file is absent the node serves without a share until one
+        /// is enrolled (see --oprf-dealer).
+        #[arg(long, value_name = "FILE")]
+        oprf_share_file: Option<PathBuf>,
+        /// Pin the share index allowed to deal this node an OPRF enrollment. Set
+        /// it to the box's index to accept a share only from the designated
+        /// dealer; without it, enrollment is refused fail-closed.
+        #[arg(long, value_name = "INDEX")]
+        oprf_dealer: Option<u16>,
     },
     Peers {
         #[arg(short, long)]

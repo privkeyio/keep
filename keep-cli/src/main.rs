@@ -313,6 +313,8 @@ fn dispatch_frost_network(
             refuse_raw_sign,
             attestation_config,
             insecure_no_attestation,
+            oprf_share_file,
+            oprf_dealer,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_serve(
@@ -325,6 +327,8 @@ fn dispatch_frost_network(
                 refuse_raw_sign,
                 attestation_config.as_deref(),
                 insecure_no_attestation,
+                oprf_share_file.as_deref(),
+                oprf_dealer,
             )
         }
         FrostNetworkCommands::Peers { group, relay } => {
