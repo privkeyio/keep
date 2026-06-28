@@ -95,16 +95,20 @@ pub fn cmd_frost_network_serve(
     // share (e.g. awaiting its first enrollment); the share is sealed into this
     // same path on enrollment and takes effect on the next start.
     let oprf_share: Option<keep_core::oprf::threshold::KeyShare> = match oprf_share_file {
-        Some(p) if p.exists() => {
-            let bytes = zeroize::Zeroizing::new(
-                std::fs::read(p)
-                    .map_err(|e| KeepError::Runtime(format!("read OPRF share file: {e}")))?,
-            );
-            let share = keep_core::oprf::threshold::deserialize_key_share(&bytes)
-                .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
-            Some(share)
-        }
-        _ => None,
+        Some(p) => match std::fs::read(p) {
+            Ok(raw) => {
+                let bytes = zeroize::Zeroizing::new(raw);
+                let share = keep_core::oprf::threshold::deserialize_key_share(&bytes)
+                    .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
+                Some(share)
+            }
+            // Absent file: serve without a share (e.g. awaiting first enrollment).
+            // Any other failure (permissions, I/O) on a configured path is fatal,
+            // not silently ignored.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(KeepError::Runtime(format!("read OPRF share file: {e}"))),
+        },
+        None => None,
     };
     // Where an enrolled share is sealed, owned so the event loop can move it.
     let oprf_seal_path = oprf_share_file.map(|p| p.to_path_buf());
