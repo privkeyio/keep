@@ -210,14 +210,22 @@ pub fn build_announce_attestor(
 
 /// Build an attestation policy from observed group announces (trust-on-first-use):
 /// pin each attested peer's AK, and take the shared PCR selection + reference
-/// values from the first attested announce. Warns (via `out`) if a later peer
-/// disagrees on the selection or reference PCRs, which means a heterogeneous
-/// group the single-reference policy cannot express. The captured pins are NOT
-/// verified here; the caller establishes trust by running this in a trusted moment.
+/// values from the first attested announce. A peer that disagrees on the selection
+/// or reference PCRs cannot be expressed by this single-reference policy (it would
+/// be rejected at serve time), so it is skipped with a warning rather than written
+/// into a policy guaranteed to lock it out.
+///
+/// Capture matches the runtime `handle_announce` admission bar: announces for a
+/// different group, or whose proof-of-share does not verify, are ignored, so this
+/// step never trusts the relay more than a running node does. The AK pins remain
+/// trust-on-first-use: the operator establishes trust by running this in a trusted
+/// moment while the genuine holders are online.
 fn capture_policy_from_announces(
     out: &Output,
+    group_pubkey: &[u8; 32],
     events: &[nostr_sdk::Event],
 ) -> Result<AttestationConfig> {
+    use std::collections::btree_map::Entry;
     use std::collections::BTreeMap;
 
     let mut selection: Option<String> = None;
@@ -229,6 +237,28 @@ fn capture_policy_from_announces(
             Ok(keep_frost_net::KfpMessage::Announce(p)) => p,
             _ => continue,
         };
+        // The relay's `g` filter is advisory; the signed payload is authoritative.
+        if payload.group_pubkey != *group_pubkey {
+            continue;
+        }
+        // Reject announces whose proof-of-share does not verify, matching the
+        // runtime `handle_announce` path so a forged or self-inconsistent announce
+        // on the relay is not pinned.
+        if keep_frost_net::proof::verify_proof(
+            &payload.verifying_share,
+            &payload.proof_signature,
+            &payload.group_pubkey,
+            payload.share_index,
+            payload.timestamp,
+        )
+        .is_err()
+        {
+            out.warn(&format!(
+                "peer {} proof-of-share did not verify; ignoring its announce",
+                payload.share_index
+            ));
+            continue;
+        }
         let Some(tpm) = payload.tpm_attestation else {
             continue;
         };
@@ -238,30 +268,51 @@ fn capture_policy_from_announces(
             Err(_) => continue, // malformed quote; ignore this announce
         };
 
+        // The first attested peer fixes the shared selection + reference PCRs; a
+        // later peer that disagrees is skipped (it cannot be admitted under a
+        // single-reference policy), so the pinned count reflects reality.
         match &selection {
-            None => selection = Some(sel),
-            Some(s) if *s != sel => out.warn(&format!(
-                "peer {} announced a different PCR selection; keeping the first observed",
-                payload.share_index
-            )),
+            None => selection = Some(sel.clone()),
+            Some(s) if *s != sel => {
+                out.warn(&format!(
+                    "peer {} announced a different PCR selection; not pinning it",
+                    payload.share_index
+                ));
+                continue;
+            }
             _ => {}
         }
         match &reference_pcrs {
             None => reference_pcrs = Some(tpm.pcr_values.clone()),
-            Some(r) if *r != tpm.pcr_values => out.warn(&format!(
-                "peer {} announced different reference PCRs; keeping the first observed",
-                payload.share_index
-            )),
+            Some(r) if *r != tpm.pcr_values => {
+                out.warn(&format!(
+                    "peer {} announced different reference PCRs; not pinning it",
+                    payload.share_index
+                ));
+                continue;
+            }
             _ => {}
         }
-        peers.insert(payload.share_index, hex::encode(&tpm.ak_sec1));
+        // First-wins on the AK pin, consistent with the selection/reference above:
+        // a later announce for an already-pinned index never silently replaces it.
+        match peers.entry(payload.share_index) {
+            Entry::Vacant(e) => {
+                e.insert(hex::encode(&tpm.ak_sec1));
+            }
+            Entry::Occupied(_) => out.warn(&format!(
+                "peer {} announced more than once; keeping the first AK pin",
+                payload.share_index
+            )),
+        }
     }
 
     let selection =
         selection.ok_or_else(|| err("no attested announce observed; are the holders online?"))?;
+    let reference_pcrs = reference_pcrs
+        .ok_or_else(|| err("no attested announce observed; are the holders online?"))?;
     Ok(AttestationConfig {
         selection,
-        reference_pcrs: reference_pcrs.unwrap_or_default(),
+        reference_pcrs,
         peer: peers
             .into_iter()
             .map(|(index, ak)| PeerPin { index, ak })
@@ -272,9 +323,24 @@ fn capture_policy_from_announces(
 /// Serialize a captured policy to TOML and write it, after re-parsing it through
 /// the loader so a written file is guaranteed to load back into a valid policy.
 fn write_policy_toml(path: &Path, config: &AttestationConfig) -> Result<()> {
+    use std::io::Write;
     let text = toml::to_string_pretty(config).map_err(|e| err(format!("serialize policy: {e}")))?;
     parse_tpm_policy(&text)?; // never write a file the loader would reject
-    std::fs::write(path, text).map_err(|e| err(format!("write {}: {e}", path.display())))
+                              // `create_new` fails closed if the path exists, so a re-run never
+                              // clobbers a hand-edited attestation policy.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => err(format!(
+                "refusing to overwrite existing policy {}; remove it or choose another --out",
+                path.display()
+            )),
+            _ => err(format!("write {}: {e}", path.display())),
+        })?;
+    f.write_all(text.as_bytes())
+        .map_err(|e| err(format!("write {}: {e}", path.display())))
 }
 
 /// `keep frost network attestation-provision`: observe the group's announces over
@@ -329,7 +395,7 @@ pub fn cmd_frost_network_attestation_provision(
             .map_err(|e| err(format!("fetch announces: {e}")))?;
         spinner.finish();
 
-        capture_policy_from_announces(out, &events.into_iter().collect::<Vec<_>>())
+        capture_policy_from_announces(out, &group_pubkey, &events.into_iter().collect::<Vec<_>>())
     })?;
 
     let pinned = config.peer.len();
@@ -485,39 +551,95 @@ mod tests {
         assert!(parse_tpm_policy(cfg).is_err());
     }
 
-    #[test]
-    fn capture_policy_from_announce_round_trips_through_loader() {
+    // The real swtpm quote vector: selection {0,2,4,7,11,12}, a valid AK.
+    const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
+    const AK: &str = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
+
+    // The 6 reference PCRs the canned ATTEST selection {0,2,4,7,11,12} picks.
+    fn default_pcrs() -> Vec<String> {
+        let zero = "00".repeat(32);
+        let pcr11 = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0".to_string();
+        vec![
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            pcr11,
+            zero,
+        ]
+    }
+
+    // A valid proof-of-share for the announce fields, so capture's verify_proof
+    // gate (matching the runtime admission path) accepts the announce.
+    fn signed_share(group: &[u8; 32], index: u16, timestamp: u64) -> ([u8; 33], [u8; 64]) {
+        use k256::schnorr::SigningKey;
+        let signing_share = [7u8; 32]; // any valid nonzero scalar
+        let sk = SigningKey::from_bytes(&signing_share).expect("valid scalar");
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x02;
+        verifying_share[1..].copy_from_slice(&sk.verifying_key().to_bytes());
+        let sig = keep_frost_net::proof::sign_proof(
+            &signing_share,
+            group,
+            index,
+            &verifying_share,
+            timestamp,
+        )
+        .expect("sign proof");
+        (verifying_share, sig)
+    }
+
+    // Build an attested announce event with a valid proof-of-share, given the
+    // captured-into-policy fields that the tests vary. Uses the canned ATTEST
+    // selection {0,2,4,7,11,12} unless `attest` overrides it.
+    fn attested_event(
+        group: &[u8; 32],
+        index: u16,
+        timestamp: u64,
+        pcr_values: Vec<String>,
+        proof: ([u8; 33], [u8; 64]),
+    ) -> nostr_sdk::Event {
+        attested_event_with_attest(group, index, timestamp, ATTEST, pcr_values, proof)
+    }
+
+    fn attested_event_with_attest(
+        group: &[u8; 32],
+        index: u16,
+        timestamp: u64,
+        attest: &str,
+        pcr_values: Vec<String>,
+        proof: ([u8; 33], [u8; 64]),
+    ) -> nostr_sdk::Event {
         use keep_frost_net::{AnnouncePayload, KfpMessage, TpmQuoteEvidence, KFP_EVENT_KIND};
         use nostr_sdk::{EventBuilder, Keys, Kind};
 
-        // The real swtpm quote vector: selection {0,2,4,7,11,12}, a valid AK.
-        const ATTEST: &str = "ff54434780180022000bb9df3193fe4f66ac5a3ee8f8552e454d20bbae633354bcff12b65d581f9d38c7001000112233445566778899aabbccddeeff000000000000041f000000010000000001202401250012000000000001000b03951800002094d0f020a3c4d09b8b88e69e7a093a38ec0ff9715cfdc70285d99d236c52990a";
-        const AK: &str = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb";
-        let zero = "00".repeat(32);
-        let pcr11 = "cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0".to_string();
-
         let evidence = TpmQuoteEvidence {
-            attest: hex::decode(ATTEST).unwrap(),
+            attest: hex::decode(attest).unwrap(),
             signature: vec![0u8; 64],
             ak_sec1: hex::decode(AK).unwrap(),
-            pcr_values: vec![
-                zero.clone(),
-                zero.clone(),
-                zero.clone(),
-                zero.clone(),
-                pcr11,
-                zero,
-            ],
+            pcr_values,
         };
-        let payload = AnnouncePayload::new([7u8; 32], 2, [2u8; 33], [0u8; 64], 1_700_000_000)
+        let payload = AnnouncePayload::new(*group, index, proof.0, proof.1, timestamp)
             .with_tpm_attestation(evidence);
         let content = KfpMessage::Announce(payload).to_json().unwrap();
-        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
             .sign_with_keys(&Keys::generate())
-            .unwrap();
+            .unwrap()
+    }
+
+    #[test]
+    fn capture_policy_from_announce_round_trips_through_loader() {
+        let group = [7u8; 32];
+        let event = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            signed_share(&group, 2, 1_700_000_000),
+        );
 
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &[event]).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &[event]).expect("capture");
         assert_eq!(config.selection, "00000001000b03951800");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 2);
@@ -534,6 +656,122 @@ mod tests {
     #[test]
     fn capture_errors_without_an_attested_announce() {
         let out = Output::new();
-        assert!(capture_policy_from_announces(&out, &[]).is_err());
+        assert!(capture_policy_from_announces(&out, &[7u8; 32], &[]).is_err());
+    }
+
+    #[test]
+    fn capture_ignores_announce_with_bad_proof() {
+        // A real announce body but a zero (invalid) proof-of-share: rejected like
+        // the runtime path, leaving nothing to capture.
+        let group = [7u8; 32];
+        let event = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            ([2u8; 33], [0u8; 64]),
+        );
+        let out = Output::new();
+        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+    }
+
+    #[test]
+    fn capture_ignores_announce_for_other_group() {
+        let group = [7u8; 32];
+        let other = [9u8; 32];
+        let event = attested_event(
+            &other,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            signed_share(&other, 2, 1_700_000_000),
+        );
+        let out = Output::new();
+        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+    }
+
+    #[test]
+    fn capture_skips_peer_with_divergent_reference_pcrs() {
+        // Peer 2 fixes the reference; peer 3 announces different PCR values the
+        // single-reference policy cannot express, so only peer 2 is pinned.
+        let group = [7u8; 32];
+        let mut divergent = default_pcrs();
+        divergent[0] = "11".repeat(32);
+        let events = vec![
+            attested_event(
+                &group,
+                2,
+                1_700_000_000,
+                default_pcrs(),
+                signed_share(&group, 2, 1_700_000_000),
+            ),
+            attested_event(
+                &group,
+                3,
+                1_700_000_000,
+                divergent,
+                signed_share(&group, 3, 1_700_000_000),
+            ),
+        ];
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.peer[0].index, 2);
+    }
+
+    #[test]
+    fn capture_skips_peer_with_divergent_selection() {
+        // Same canned quote but the PCR selection bitmap changed to {0} only, so
+        // peer 3's selection differs from peer 2's and it is skipped.
+        let attest_alt = ATTEST.replace("000b03951800", "000b03010000");
+        assert_ne!(attest_alt, ATTEST);
+        let group = [7u8; 32];
+        let events = vec![
+            attested_event(
+                &group,
+                2,
+                1_700_000_000,
+                default_pcrs(),
+                signed_share(&group, 2, 1_700_000_000),
+            ),
+            attested_event_with_attest(
+                &group,
+                3,
+                1_700_000_000,
+                &attest_alt,
+                vec!["00".repeat(32)],
+                signed_share(&group, 3, 1_700_000_000),
+            ),
+        ];
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.peer[0].index, 2);
+    }
+
+    #[test]
+    fn capture_keeps_first_ak_on_repeat_announce() {
+        // The same index announcing twice keeps the first pin (first-wins),
+        // consistent with the selection/reference handling.
+        let group = [7u8; 32];
+        let events = vec![
+            attested_event(
+                &group,
+                2,
+                1_700_000_000,
+                default_pcrs(),
+                signed_share(&group, 2, 1_700_000_000),
+            ),
+            attested_event(
+                &group,
+                2,
+                1_700_000_001,
+                default_pcrs(),
+                signed_share(&group, 2, 1_700_000_001),
+            ),
+        ];
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        assert_eq!(config.peer.len(), 1);
     }
 }
