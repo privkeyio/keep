@@ -245,6 +245,60 @@ keep frost network sign --group npub1... --message "hello"
 keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"
 ```
 
+### Threshold-OPRF Vault Unlock (advanced)
+
+Reconstruct a disk-encryption (LUKS) key at boot from a *t-of-n* Oblivious-PRF
+quorum across holders (for example an on-prem box, a phone, and a remote
+replica), so no single device can decrypt the volume. A holder answers an OPRF
+evaluation only after verifying the requester's measured-boot state by TPM
+attestation. These are the building blocks the
+[keep-node](https://github.com/privkeyio/keep-node) appliance drives at boot;
+they can also be run directly.
+
+```bash
+# 1. One-time provisioning by the dealer/box, with every holder online and
+#    serving (step 2) so they receive and seal their shares: generates the OPRF
+#    key, splits it t-of-n, distributes the remote shares, and writes the LUKS
+#    key plus this box's own share.
+keep frost network oprf-provision --group npub1... \
+  --threshold 2 --total 3 --volume-id vault0 \
+  --key-out luks.key --share-out box.share
+
+# 2. Each holder runs a node that seals its enrolled share, loads it on the next
+#    start, and answers evaluations, verifying the box's attestation first
+#    (see "Attestation policy" below):
+keep frost network serve --group npub1... \
+  --oprf-share-file holder.share --oprf-dealer 1 \
+  --attestation-config keep-attestation.toml
+
+# 3. The box requests an unlock at boot, attaching its own TPM quote:
+keep frost network oprf-unlock --group npub1... \
+  --volume-id vault0 --share-file box.share \
+  --tpm-tcti device:/dev/tpmrm0
+```
+
+#### Attestation policy
+
+A holder only answers an evaluation from a peer whose TPM quote matches a pinned
+policy (its attestation key and reference PCRs). Author that policy by observing
+the group's announces, then enforce it:
+
+```bash
+# Capture pins from online peers (trust-on-first-use; run on a trusted network):
+keep frost network attestation-provision --group npub1... --out keep-attestation.toml
+
+# Enforce it — holders refuse OPRF evaluations from unverified peers:
+keep frost network serve --group npub1... --attestation-config keep-attestation.toml
+
+# Test/dev only — run with no policy (the node then serves no OPRF evaluations,
+# only FROST coordination):
+keep frost network serve --group npub1... --insecure-no-attestation
+```
+
+The TPM quote producer (`--tpm-tcti`) requires a build with the
+`tpm-attestation` feature (`cargo build --features tpm-attestation`); it links
+the tpm2-tss stack and is off by default.
+
 ### Policy Enforcement (Warden)
 
 Integrate with [Warden](https://github.com/privkeyio/warden) for policy-based signing controls:
