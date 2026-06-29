@@ -68,6 +68,18 @@ pub fn cmd_frost_network_serve(
     let tpm_policy =
         attestation::resolve_serve_policy(out, attestation_config, insecure_no_attestation)?;
 
+    // --oprf-auto-approve is meaningless (and a footgun) without attestation: with
+    // --insecure-no-attestation no requester can ever reach Verified, so the OPRF
+    // oracle's attestation gate refuses every eval regardless of this opt-in. Fail
+    // closed here, before unlocking the vault, rather than silently never answering.
+    if oprf_auto_approve && insecure_no_attestation {
+        return Err(KeepError::Frost(
+            "--oprf-auto-approve requires attestation; it cannot be combined with \
+             --insecure-no-attestation (no peer can reach Verified, so evals are always refused)"
+                .into(),
+        ));
+    }
+
     // Producer side: when this node attests via a TPM, attach a quote to every
     // announce so peers can verify it (and a holder can pin it via
     // `attestation-provision`). Built before unlocking so it fails fast.

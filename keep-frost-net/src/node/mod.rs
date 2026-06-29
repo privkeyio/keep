@@ -440,15 +440,16 @@ impl SigningHooks for RefuseRawSignatureHooks {
 /// signing requests (see [`RefuseRawSignatureHooks`]), and optionally
 /// auto-approve OPRF evaluation requests.
 ///
-/// Auto-approving the OPRF oracle is safe ONLY because [`handle_oprf_eval_request`]
-/// enforces the security-critical gates BEFORE this hook runs: the requester must
-/// have VERIFIED measured-boot attestation (`NotConfigured` is rejected, so the
-/// oracle fails closed), and a per-requester rate limiter bounds evaluations so
-/// the fixed low-entropy unlock input cannot be brute-forced offline. This flag is
-/// the explicit operator policy the default-DENY `approve_oprf_eval` asks for: it
-/// lets an autonomous holder (e.g. a replica) answer attested, rate-limited
-/// requests without an interactive prompt. Leave it off for a holder that should
-/// gate each evaluation behind a human (e.g. a phone).
+/// Auto-approving the OPRF oracle is the explicit operator policy the default-DENY
+/// `approve_oprf_eval` requires. The security boundary is enforced before this hook
+/// runs and rests on two things: VERIFIED measured-boot attestation of the requester
+/// (`NotConfigured` is rejected, so the oracle fails closed), and this explicit
+/// opt-in. A single evaluation of a verified requester is the intended unlock, so
+/// safety rests on WHO is answered, not on how many evals occur. The per-requester
+/// rate limiter is abuse control (defense in depth), not part of that boundary. This
+/// flag lets an autonomous holder (e.g. a replica) answer such verified requests
+/// unattended; leave it off for a holder that gates each evaluation behind a human
+/// (e.g. a phone).
 pub struct ServeHooks {
     pub refuse_raw_sign: bool,
     pub auto_approve_oprf_eval: bool,
@@ -456,18 +457,10 @@ pub struct ServeHooks {
 
 impl SigningHooks for ServeHooks {
     fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
-        if self.refuse_raw_sign
-            && session
-                .message_type
-                .trim()
-                .eq_ignore_ascii_case(crate::MSG_TYPE_RAW)
-        {
-            return Err(FrostNetError::PolicyViolation(format!(
-                "co-signer refuses message_type=\"raw\" (group coordinates structured signatures only; see #524). \
-                 session_id={}, requester=share {}",
-                hex::encode(session.session_id),
-                session.requester
-            )));
+        // Delegate to the shared raw-sign policy so the predicate and message stay
+        // centralized rather than duplicated here.
+        if self.refuse_raw_sign {
+            RefuseRawSignatureHooks.pre_sign(session)?;
         }
         Ok(())
     }
