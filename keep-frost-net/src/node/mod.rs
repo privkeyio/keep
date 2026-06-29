@@ -436,6 +436,52 @@ impl SigningHooks for RefuseRawSignatureHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Hooks for `frost network serve`: optionally refuse `message_type="raw"`
+/// signing requests (see [`RefuseRawSignatureHooks`]), and optionally
+/// auto-approve OPRF evaluation requests.
+///
+/// Auto-approving the OPRF oracle is safe ONLY because [`handle_oprf_eval_request`]
+/// enforces the security-critical gates BEFORE this hook runs: the requester must
+/// have VERIFIED measured-boot attestation (`NotConfigured` is rejected, so the
+/// oracle fails closed), and a per-requester rate limiter bounds evaluations so
+/// the fixed low-entropy unlock input cannot be brute-forced offline. This flag is
+/// the explicit operator policy the default-DENY `approve_oprf_eval` asks for: it
+/// lets an autonomous holder (e.g. a replica) answer attested, rate-limited
+/// requests without an interactive prompt. Leave it off for a holder that should
+/// gate each evaluation behind a human (e.g. a phone).
+pub struct ServeHooks {
+    pub refuse_raw_sign: bool,
+    pub auto_approve_oprf_eval: bool,
+}
+
+impl SigningHooks for ServeHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
+        if self.refuse_raw_sign
+            && session
+                .message_type
+                .trim()
+                .eq_ignore_ascii_case(crate::MSG_TYPE_RAW)
+        {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "co-signer refuses message_type=\"raw\" (group coordinates structured signatures only; see #524). \
+                 session_id={}, requester=share {}",
+                hex::encode(session.session_id),
+                session.requester
+            )));
+        }
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+    fn approve_oprf_eval(
+        &self,
+        _requester_share_index: u16,
+        _session_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let approve = self.auto_approve_oprf_eval;
+        Box::pin(async move { approve })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HealthCheckResult {
     pub responsive: Vec<u16>,

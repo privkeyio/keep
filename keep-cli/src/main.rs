@@ -315,6 +315,7 @@ fn dispatch_frost_network(
             insecure_no_attestation,
             oprf_share_file,
             oprf_dealer,
+            oprf_auto_approve,
             tpm_tcti,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
@@ -330,6 +331,7 @@ fn dispatch_frost_network(
                 insecure_no_attestation,
                 oprf_share_file.as_deref(),
                 oprf_dealer,
+                oprf_auto_approve,
                 tpm_tcti.as_deref(),
             )
         }

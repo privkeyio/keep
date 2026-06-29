@@ -58,6 +58,7 @@ pub fn cmd_frost_network_serve(
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
     oprf_dealer: Option<u16>,
+    oprf_auto_approve: bool,
     tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
@@ -143,11 +144,22 @@ pub fn cmd_frost_network_serve(
         } else {
             out.field("Attestation", "DISABLED (--insecure-no-attestation)");
         }
+        if refuse_raw_sign || oprf_auto_approve {
+            node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
+                refuse_raw_sign,
+                auto_approve_oprf_eval: oprf_auto_approve,
+            }));
+        }
         if refuse_raw_sign {
-            node.set_hooks(Arc::new(keep_frost_net::RefuseRawSignatureHooks));
             out.field(
                 "Sign policy",
                 "refuse raw (`message_type=raw` rejected, see #524)",
+            );
+        }
+        if oprf_auto_approve {
+            out.field(
+                "OPRF approval",
+                "auto-answer attested, rate-limited evals (--oprf-auto-approve)",
             );
         }
         // OPRF holder runtime: install the loaded share so this node answers

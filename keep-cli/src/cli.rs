@@ -591,6 +591,13 @@ pub(crate) enum FrostNetworkCommands {
         /// dealer; without it, enrollment is refused fail-closed.
         #[arg(long, value_name = "INDEX")]
         oprf_dealer: Option<u16>,
+        /// Auto-answer OPRF evaluation requests instead of declining them (the
+        /// default). Safe only because the oracle already requires the requester
+        /// to have VERIFIED attestation and is rate-limited; this is the explicit
+        /// opt-in for an autonomous holder (e.g. a replica) that must answer
+        /// attested requests unattended. Leave off to gate each eval behind a human.
+        #[arg(long)]
+        oprf_auto_approve: bool,
         /// Attach a TPM quote to this node's announces (e.g. device:/dev/tpmrm0)
         /// so peers can verify it and a holder can pin it via
         /// `attestation-provision`. Needs the tpm-attestation build feature.
