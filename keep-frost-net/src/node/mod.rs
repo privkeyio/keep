@@ -436,6 +436,48 @@ impl SigningHooks for RefuseRawSignatureHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Hooks for `frost network serve`: optionally refuse `message_type="raw"`
+/// signing requests (see [`RefuseRawSignatureHooks`]), and optionally
+/// auto-approve OPRF evaluation requests.
+///
+/// Auto-approving the OPRF oracle is the explicit operator policy the default-DENY
+/// `approve_oprf_eval` requires. The real and ONLY security boundary for auto-approve
+/// is VERIFIED TPM attestation of the requester (AK pinning plus PCR correctness;
+/// `NotConfigured` is rejected, so the oracle fails closed) combined with this explicit
+/// opt-in. Safety rests on WHO is answered, not on how many evals occur. The
+/// per-requester rate limiter is NOT a meaningful barrier against a determined attacker:
+/// the requester transport pubkey it keys on is derived deterministically from the
+/// public `(group_pubkey, identifier)`, so an attacker who knows the public group key can
+/// rotate member identities to sidestep both the rate limiter and the share-index gate.
+/// The rate limiter is best-effort abuse control against accidental or naive
+/// over-querying only. This flag lets an autonomous holder (e.g. a replica) answer
+/// verified requests unattended; leave it off for a holder that gates each evaluation
+/// behind a human (e.g. a phone).
+pub struct ServeHooks {
+    pub refuse_raw_sign: bool,
+    pub auto_approve_oprf_eval: bool,
+}
+
+impl SigningHooks for ServeHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
+        // Delegate to the shared raw-sign policy so the predicate and message stay
+        // centralized rather than duplicated here.
+        if self.refuse_raw_sign {
+            RefuseRawSignatureHooks.pre_sign(session)?;
+        }
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+    fn approve_oprf_eval(
+        &self,
+        _requester_share_index: u16,
+        _session_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let approve = self.auto_approve_oprf_eval;
+        Box::pin(async move { approve })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HealthCheckResult {
     pub responsive: Vec<u16>,
@@ -1837,7 +1879,7 @@ impl KfpNode {
         // window reliably catches a periodic announce even if the immediate
         // reciprocal announce (see handle_announce) is missed. Must stay well
         // under the peer offline threshold so peers don't flap offline.
-        let mut announce_interval = tokio::time::interval(crate::peer::PEER_ANNOUNCE_INTERVAL);
+        let mut announce_interval = tokio::time::interval(crate::peer::peer_announce_interval());
         announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Reap expired sessions on roughly the signing round cadence so an
@@ -2541,6 +2583,21 @@ mod tests {
 
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_hooks_oprf_auto_approve_opt_in() {
+        let approving = ServeHooks {
+            refuse_raw_sign: false,
+            auto_approve_oprf_eval: true,
+        };
+        assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
+
+        let declining = ServeHooks {
+            refuse_raw_sign: false,
+            auto_approve_oprf_eval: false,
+        };
+        assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
 
     fn descriptor_version(

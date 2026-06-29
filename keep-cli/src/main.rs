@@ -49,12 +49,17 @@ fn init_logging() {
             .expect("static directive is valid"),
     );
 
+    // Logs MUST go to stderr: commands like `frost network oprf-unlock` emit the raw
+    // 32-byte LUKS key as the ONLY thing on stdout (a boot gate reads it with
+    // `cryptsetup --keyfile-size 32`), so a single log line on stdout would corrupt the
+    // key. `tracing_subscriber::fmt()` defaults to stdout, hence the explicit writer.
     if use_json {
         tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
             .with_span_events(FmtSpan::CLOSE)
             .with_current_span(true)
+            .with_writer(std::io::stderr)
             .init();
     } else {
         tracing_subscriber::fmt()
@@ -62,6 +67,7 @@ fn init_logging() {
             .with_target(false)
             .without_time()
             .with_span_events(FmtSpan::CLOSE)
+            .with_writer(std::io::stderr)
             .init();
     }
 }
@@ -315,6 +321,7 @@ fn dispatch_frost_network(
             insecure_no_attestation,
             oprf_share_file,
             oprf_dealer,
+            oprf_auto_approve,
             tpm_tcti,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
@@ -330,6 +337,7 @@ fn dispatch_frost_network(
                 insecure_no_attestation,
                 oprf_share_file.as_deref(),
                 oprf_dealer,
+                oprf_auto_approve,
                 tpm_tcti.as_deref(),
             )
         }

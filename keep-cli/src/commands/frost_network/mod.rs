@@ -44,6 +44,13 @@ fn descriptor_lookup_for(
     })
 }
 
+/// `--oprf-auto-approve` is meaningless (and a footgun) without attestation:
+/// with `--insecure-no-attestation` no requester can ever reach Verified, so the
+/// OPRF oracle's attestation gate refuses every eval regardless of the opt-in.
+fn auto_approve_conflicts(oprf_auto_approve: bool, insecure_no_attestation: bool) -> bool {
+    oprf_auto_approve && insecure_no_attestation
+}
+
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_serve(
@@ -58,6 +65,7 @@ pub fn cmd_frost_network_serve(
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
     oprf_dealer: Option<u16>,
+    oprf_auto_approve: bool,
     tpm_tcti: Option<&str>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
@@ -66,6 +74,16 @@ pub fn cmd_frost_network_serve(
     // invalid one fails before we prompt for the password or touch the vault.
     let tpm_policy =
         attestation::resolve_serve_policy(out, attestation_config, insecure_no_attestation)?;
+
+    // See `auto_approve_conflicts` for why these flags are incompatible. Fail closed
+    // here, before unlocking the vault, rather than silently never answering.
+    if auto_approve_conflicts(oprf_auto_approve, insecure_no_attestation) {
+        return Err(KeepError::Frost(
+            "--oprf-auto-approve requires attestation; it cannot be combined with \
+             --insecure-no-attestation (no peer can reach Verified, so evals are always refused)"
+                .into(),
+        ));
+    }
 
     // Producer side: when this node attests via a TPM, attach a quote to every
     // announce so peers can verify it (and a holder can pin it via
@@ -143,11 +161,22 @@ pub fn cmd_frost_network_serve(
         } else {
             out.field("Attestation", "DISABLED (--insecure-no-attestation)");
         }
+        if refuse_raw_sign || oprf_auto_approve {
+            node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
+                refuse_raw_sign,
+                auto_approve_oprf_eval: oprf_auto_approve,
+            }));
+        }
         if refuse_raw_sign {
-            node.set_hooks(Arc::new(keep_frost_net::RefuseRawSignatureHooks));
             out.field(
                 "Sign policy",
                 "refuse raw (`message_type=raw` rejected, see #524)",
+            );
+        }
+        if oprf_auto_approve {
+            out.field(
+                "OPRF approval",
+                "auto-answer attested, rate-limited evals (--oprf-auto-approve)",
             );
         }
         // OPRF holder runtime: install the loaded share so this node answers
@@ -1475,6 +1504,14 @@ fn format_duration_ago(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_approve_conflicts_only_when_both_set() {
+        assert!(auto_approve_conflicts(true, true));
+        assert!(!auto_approve_conflicts(true, false));
+        assert!(!auto_approve_conflicts(false, true));
+        assert!(!auto_approve_conflicts(false, false));
+    }
 
     #[test]
     fn remote_share_indices_excludes_box_and_covers_rest() {
