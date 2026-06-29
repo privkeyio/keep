@@ -13,17 +13,22 @@ use crate::protocol::AnnouncedXpub;
 /// tests and local dev that need fast, deterministic peer rendezvous: peer
 /// discovery polls for a bounded window, so a shorter announce interval makes
 /// that window reliably overlap an announce instead of racing a 20s cadence.
-/// Clamped to >= 1s; read once and cached.
+/// Clamped to >= 1s; read once and cached. Because the value is cached
+/// process-wide on first read, `KEEP_PEER_ANNOUNCE_INTERVAL_SECS` must be set
+/// before the process launches (e.g. by subprocess-spawned integration tests);
+/// setting it in-process after any peer code runs has no effect.
 pub(crate) fn peer_announce_interval() -> Duration {
     use std::sync::OnceLock;
     static CACHED: OnceLock<Duration> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("KEEP_PEER_ANNOUNCE_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .map_or(Duration::from_secs(20), Duration::from_secs)
+        parse_announce_interval(std::env::var("KEEP_PEER_ANNOUNCE_INTERVAL_SECS").ok())
     })
+}
+
+fn parse_announce_interval(raw: Option<String>) -> Duration {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .map_or(Duration::from_secs(20), Duration::from_secs)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,5 +366,26 @@ mod tests {
         assert_eq!(pm.offline_threshold(), peer_announce_interval() * 2);
         assert!(pm.offline_threshold() > peer_announce_interval());
         assert!(pm.offline_threshold() < peer_announce_interval() * 3);
+    }
+
+    #[test]
+    fn test_parse_announce_interval() {
+        assert_eq!(parse_announce_interval(None), Duration::from_secs(20));
+        assert_eq!(
+            parse_announce_interval(Some("0".into())),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            parse_announce_interval(Some("abc".into())),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            parse_announce_interval(Some("5".into())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_announce_interval(Some("99999".into())),
+            Duration::from_secs(99999)
+        );
     }
 }

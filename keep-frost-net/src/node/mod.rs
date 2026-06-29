@@ -441,15 +441,18 @@ impl SigningHooks for RefuseRawSignatureHooks {
 /// auto-approve OPRF evaluation requests.
 ///
 /// Auto-approving the OPRF oracle is the explicit operator policy the default-DENY
-/// `approve_oprf_eval` requires. The security boundary is enforced before this hook
-/// runs and rests on two things: VERIFIED measured-boot attestation of the requester
-/// (`NotConfigured` is rejected, so the oracle fails closed), and this explicit
-/// opt-in. A single evaluation of a verified requester is the intended unlock, so
-/// safety rests on WHO is answered, not on how many evals occur. The per-requester
-/// rate limiter is abuse control (defense in depth), not part of that boundary. This
-/// flag lets an autonomous holder (e.g. a replica) answer such verified requests
-/// unattended; leave it off for a holder that gates each evaluation behind a human
-/// (e.g. a phone).
+/// `approve_oprf_eval` requires. The real and ONLY security boundary for auto-approve
+/// is VERIFIED TPM attestation of the requester (AK pinning plus PCR correctness;
+/// `NotConfigured` is rejected, so the oracle fails closed) combined with this explicit
+/// opt-in. Safety rests on WHO is answered, not on how many evals occur. The
+/// per-requester rate limiter is NOT a meaningful barrier against a determined attacker:
+/// the requester transport pubkey it keys on is derived deterministically from the
+/// public `(group_pubkey, identifier)`, so an attacker who knows the public group key can
+/// rotate member identities to sidestep both the rate limiter and the share-index gate.
+/// The rate limiter is best-effort abuse control against accidental or naive
+/// over-querying only. This flag lets an autonomous holder (e.g. a replica) answer
+/// verified requests unattended; leave it off for a holder that gates each evaluation
+/// behind a human (e.g. a phone).
 pub struct ServeHooks {
     pub refuse_raw_sign: bool,
     pub auto_approve_oprf_eval: bool,
@@ -2580,6 +2583,21 @@ mod tests {
 
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_hooks_oprf_auto_approve_opt_in() {
+        let approving = ServeHooks {
+            refuse_raw_sign: false,
+            auto_approve_oprf_eval: true,
+        };
+        assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
+
+        let declining = ServeHooks {
+            refuse_raw_sign: false,
+            auto_approve_oprf_eval: false,
+        };
+        assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
 
     fn descriptor_version(

@@ -44,6 +44,13 @@ fn descriptor_lookup_for(
     })
 }
 
+/// `--oprf-auto-approve` is meaningless (and a footgun) without attestation:
+/// with `--insecure-no-attestation` no requester can ever reach Verified, so the
+/// OPRF oracle's attestation gate refuses every eval regardless of the opt-in.
+fn auto_approve_conflicts(oprf_auto_approve: bool, insecure_no_attestation: bool) -> bool {
+    oprf_auto_approve && insecure_no_attestation
+}
+
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_serve(
@@ -72,7 +79,7 @@ pub fn cmd_frost_network_serve(
     // --insecure-no-attestation no requester can ever reach Verified, so the OPRF
     // oracle's attestation gate refuses every eval regardless of this opt-in. Fail
     // closed here, before unlocking the vault, rather than silently never answering.
-    if oprf_auto_approve && insecure_no_attestation {
+    if auto_approve_conflicts(oprf_auto_approve, insecure_no_attestation) {
         return Err(KeepError::Frost(
             "--oprf-auto-approve requires attestation; it cannot be combined with \
              --insecure-no-attestation (no peer can reach Verified, so evals are always refused)"
@@ -1499,6 +1506,14 @@ fn format_duration_ago(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_approve_conflicts_only_when_both_set() {
+        assert!(auto_approve_conflicts(true, true));
+        assert!(!auto_approve_conflicts(true, false));
+        assert!(!auto_approve_conflicts(false, true));
+        assert!(!auto_approve_conflicts(false, false));
+    }
 
     #[test]
     fn remote_share_indices_excludes_box_and_covers_rest() {
