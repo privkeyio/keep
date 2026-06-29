@@ -37,7 +37,7 @@ keep-nip46 = { path = "keep-nip46" }
 
 # Crypto
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 blake2 = "0.10"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
 rand = "0.10"
