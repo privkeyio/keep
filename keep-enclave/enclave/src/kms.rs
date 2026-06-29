@@ -42,7 +42,7 @@ impl EnclaveKms {
         let cipher = Aes256Gcm::new_from_slice(&data_key)
             .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
 
-        let nonce = Nonce::from_slice(&encrypted.nonce);
+        let nonce = &Nonce::from(encrypted.nonce);
         let wallet_key = cipher
             .decrypt(nonce, encrypted.encrypted_wallet_key.as_ref())
             .map_err(|e| EnclaveError::Kms(format!("Decryption failed: {}", e)))?;
@@ -106,7 +106,7 @@ impl EnclaveKms {
             return Err(EnclaveError::Kms("Invalid encrypted key format".into()));
         }
 
-        let nonce = Nonce::from_slice(&encrypted_key[..12]);
+        let nonce = &Nonce::try_from(&encrypted_key[..12]).expect("slice is exactly 12 bytes");
         let ciphertext = &encrypted_key[12..];
 
         let cipher = Aes256Gcm::new_from_slice(&*self.ephemeral_secret)
@@ -126,7 +126,7 @@ mod tests {
     fn encrypt_data_key(master_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         let nonce_bytes: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let cipher = Aes256Gcm::new_from_slice(master_key).unwrap();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &Nonce::from(nonce_bytes);
         let mut ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
         let mut result = nonce_bytes.to_vec();
         result.append(&mut ciphertext);
@@ -135,7 +135,7 @@ mod tests {
 
     fn encrypt_wallet_key(data_key: &[u8], wallet_key: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
         let cipher = Aes256Gcm::new_from_slice(data_key).unwrap();
-        let n = Nonce::from_slice(nonce);
+        let n = &Nonce::from(*nonce);
         cipher.encrypt(n, wallet_key).unwrap()
     }
 

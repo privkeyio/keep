@@ -419,7 +419,7 @@ mod tests {
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
         let server = OprfServer::<Secp256k1Sha256>::new_with_key(s.to_bytes().as_slice())
             .expect("server from key");
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
         (server, shares)
     }
 
@@ -524,11 +524,11 @@ mod tests {
         let input: &[u8] = b"keep-node-vault-v1";
 
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
 
         // A second, independent key split with the SAME identifiers/threshold/n.
         let s_other = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares_other = threshold::split_key(&s_other, 2, 3, &mut rng).expect("split other");
+        let shares_other = threshold::split_key(&s_other, 2, 3, rng).expect("split other");
 
         // One blind; evaluate the correct and the mixed quorum against the SAME blinded element
         // and finalize both with the same client state.
@@ -577,7 +577,7 @@ mod tests {
         let input: &[u8] = b"keep-node-vault-v1";
 
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
         let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
         let p0 = threshold::partial_eval(&shares[0], &b.message).expect("p0");
 
@@ -626,7 +626,7 @@ mod tests {
         use k256::Scalar;
         let mut rng = rand_core_06::OsRng;
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
 
         assert!(
             unlock::evaluate(&shares[0], &[0u8; 10]).is_err(),
@@ -663,7 +663,7 @@ mod tests {
         use k256::Scalar;
         let mut rng = rand_core_06::OsRng;
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
 
         let (client, wire) = unlock::blind(b"keep-node-vault-v1").expect("blind");
         let p0 = unlock::evaluate(&shares[0], &wire).expect("eval");
@@ -704,7 +704,7 @@ mod tests {
         let mut rng = rand_core_06::OsRng;
         let input: &[u8] = b"keep-node-vault-v1";
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
         let b = OprfClient::<Secp256k1Sha256>::blind(input, &mut rng).expect("blind");
 
         for share in &shares {
@@ -740,11 +740,11 @@ mod tests {
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
 
         assert!(
-            threshold::split_key(&s, 4, 3, &mut rng).is_err(),
+            threshold::split_key(&s, 4, 3, rng).is_err(),
             "t > n must be rejected"
         );
         assert!(
-            threshold::split_key(&s, 1, 3, &mut rng).is_err(),
+            threshold::split_key(&s, 1, 3, rng).is_err(),
             "t < 2 must be rejected"
         );
     }
@@ -783,7 +783,7 @@ mod tests {
         use k256::Scalar;
         let mut rng = rand_core_06::OsRng;
         let s = <Scalar as k256::elliptic_curve::Field>::random(&mut rng);
-        let shares = threshold::split_key(&s, 2, 3, &mut rng).expect("split");
+        let shares = threshold::split_key(&s, 2, 3, rng).expect("split");
         let (_client, wire) = unlock::blind(b"keep-node-vault-v1").expect("blind");
         let mut bytes = unlock::evaluate(&shares[0], &wire).expect("eval");
         bytes[..threshold::ID_LEN].fill(0); // zero the identifier, keep the valid point

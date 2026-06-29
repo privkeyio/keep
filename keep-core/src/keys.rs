@@ -279,9 +279,8 @@ pub fn bytes_to_npub(pubkey: &[u8; 32]) -> String {
 /// NIP-49 encrypted private key (ncryptsec) support.
 pub mod nip49 {
     use bech32::{Bech32, Hrp};
-    use chacha20poly1305::aead::generic_array::GenericArray;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-    use chacha20poly1305::XChaCha20Poly1305;
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
     use unicode_normalization::UnicodeNormalization;
     use zeroize::{Zeroize, Zeroizing};
 
@@ -313,13 +312,14 @@ pub mod nip49 {
         let nonce: [u8; 24] = entropy::random_bytes();
         let key_security_byte: u8 = 0x01;
 
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
+        let cipher = XChaCha20Poly1305::new_from_slice(symmetric_key.as_ref())
+            .map_err(|_| CryptoError::encryption("NIP-49 key init failed"))?;
         let payload = Payload {
             msg: secret_key.as_slice(),
             aad: &[key_security_byte],
         };
         let ciphertext = cipher
-            .encrypt(GenericArray::from_slice(&nonce), payload)
+            .encrypt(&XNonce::from(nonce), payload)
             .map_err(|_| CryptoError::encryption("NIP-49 encryption failed"))?;
 
         let mut concat = Vec::with_capacity(91);
@@ -377,13 +377,14 @@ pub mod nip49 {
         let password_nfkc = Zeroizing::new(password.nfkc().collect::<String>());
         let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
 
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(symmetric_key.as_ref()));
+        let cipher = XChaCha20Poly1305::new_from_slice(symmetric_key.as_ref())
+            .map_err(|_| KeepError::DecryptionFailed)?;
         let payload = Payload {
             msg: &ciphertext,
             aad: &[key_security_byte],
         };
         let mut plaintext = cipher
-            .decrypt(GenericArray::from_slice(&nonce), payload)
+            .decrypt(&XNonce::from(nonce), payload)
             .map_err(|_| KeepError::DecryptionFailed)?;
 
         if plaintext.len() != 32 {

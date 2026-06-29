@@ -14,8 +14,8 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
-    aead::{generic_array::GenericArray, Aead, KeyInit},
-    XChaCha20Poly1305,
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
 };
 use memsecurity::EncryptedMem;
 use zeroize::{Zeroize, Zeroizing};
@@ -451,14 +451,14 @@ pub fn encrypt_with_aad(plaintext: &[u8], aad: &[u8], key: &SecretKey) -> Result
     use chacha20poly1305::aead::Payload;
 
     let decrypted = key.decrypt()?;
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted));
+    let cipher = XChaCha20Poly1305::new_from_slice(&*decrypted)
+        .map_err(|_| KeepError::Encryption("Encryption failed".into()))?;
 
     let nonce: [u8; NONCE_SIZE] = entropy::random_bytes();
-    let nonce_ga = GenericArray::from_slice(&nonce);
 
     let ciphertext = cipher
         .encrypt(
-            nonce_ga,
+            &XNonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -480,12 +480,12 @@ pub fn decrypt_with_aad(
     use chacha20poly1305::aead::Payload;
 
     let decrypted_key = key.decrypt()?;
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&*decrypted_key));
-    let nonce = GenericArray::from_slice(&encrypted.nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(&*decrypted_key)
+        .map_err(|_| KeepError::DecryptionFailed)?;
 
     let plaintext = cipher
         .decrypt(
-            nonce,
+            &XNonce::from(encrypted.nonce),
             Payload {
                 msg: encrypted.ciphertext.as_ref(),
                 aad,

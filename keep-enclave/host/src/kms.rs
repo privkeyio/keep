@@ -48,7 +48,7 @@ impl<K: KmsProvider> EnvelopeEncryption<K> {
         let cipher = Aes256Gcm::new_from_slice(&data_key_result.plaintext)
             .map_err(|e| EnclaveError::Kms(format!("Invalid key: {e}")))?;
 
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &Nonce::from(nonce_bytes);
         let encrypted_wallet_key = cipher
             .encrypt(nonce, wallet_key)
             .map_err(|e| EnclaveError::Kms(format!("Encryption failed: {e}")))?;
@@ -75,7 +75,7 @@ impl<K: KmsProvider> EnvelopeEncryption<K> {
         let cipher = Aes256Gcm::new_from_slice(&data_key)
             .map_err(|e| EnclaveError::Kms(format!("Invalid key: {e}")))?;
 
-        let nonce = Nonce::from_slice(&encrypted.nonce);
+        let nonce = &Nonce::from(encrypted.nonce);
         let wallet_key = cipher
             .decrypt(nonce, encrypted.encrypted_wallet_key.as_ref())
             .map_err(|e| EnclaveError::Kms(format!("Decryption failed: {e}")))?;
@@ -121,7 +121,7 @@ impl KmsProvider for MockKmsProvider {
         let cipher = Aes256Gcm::new_from_slice(&self.master_key)
             .map_err(|e| EnclaveError::Kms(format!("Invalid master key: {e}")))?;
 
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &Nonce::from(nonce_bytes);
         let mut ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
             .map_err(|e| EnclaveError::Kms(format!("Failed to encrypt data key: {e}")))?;
@@ -143,7 +143,7 @@ impl KmsProvider for MockKmsProvider {
             return Err(EnclaveError::Kms("Invalid encrypted key".into()));
         }
 
-        let nonce = Nonce::from_slice(&encrypted_key[..12]);
+        let nonce = &Nonce::try_from(&encrypted_key[..12]).expect("slice is exactly 12 bytes");
         let ciphertext = &encrypted_key[12..];
 
         let cipher = Aes256Gcm::new_from_slice(&self.master_key)
