@@ -26,7 +26,7 @@ pub(crate) fn peer_announce_interval() -> Duration {
 }
 
 fn parse_announce_interval(raw: Option<String>) -> Duration {
-    raw.and_then(|s| s.parse::<u64>().ok())
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n >= 1)
         .map_or(Duration::from_secs(20), Duration::from_secs)
 }
@@ -381,6 +381,10 @@ mod tests {
         );
         assert_eq!(
             parse_announce_interval(Some("5".into())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_announce_interval(Some(" 5 ".into())),
             Duration::from_secs(5)
         );
         assert_eq!(
