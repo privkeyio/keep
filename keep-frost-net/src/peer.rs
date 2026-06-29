@@ -8,7 +8,23 @@ use crate::protocol::AnnouncedXpub;
 
 /// How often a node re-announces itself to peers. The offline threshold and the
 /// node's announce loop are both derived from this so they stay in lockstep.
-pub(crate) const PEER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(20);
+///
+/// Defaults to 20s. It can be lowered via `KEEP_PEER_ANNOUNCE_INTERVAL_SECS` for
+/// tests and local dev that need fast, deterministic peer rendezvous: peer
+/// discovery polls for a bounded window, so a shorter announce interval makes
+/// that window reliably overlap an announce instead of racing a 20s cadence.
+/// Clamped to >= 1s; read once and cached.
+pub(crate) fn peer_announce_interval() -> Duration {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Duration> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("KEEP_PEER_ANNOUNCE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .map_or(Duration::from_secs(20), Duration::from_secs)
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerStatus {
@@ -130,7 +146,7 @@ impl PeerManager {
             // stops being selected quickly instead of lingering for a full
             // minute (issue #412). A peer that drops mid-round is still caught
             // by the signing-round timeout and failover exclusion.
-            offline_threshold: PEER_ANNOUNCE_INTERVAL.saturating_mul(2),
+            offline_threshold: peer_announce_interval().saturating_mul(2),
         }
     }
 
@@ -342,8 +358,8 @@ mod tests {
         // threshold tolerates exactly one missed announce, not several (issue
         // #412 regressed when this drifted up to a full minute).
         let pm = PeerManager::new(1);
-        assert_eq!(pm.offline_threshold(), PEER_ANNOUNCE_INTERVAL * 2);
-        assert!(pm.offline_threshold() > PEER_ANNOUNCE_INTERVAL);
-        assert!(pm.offline_threshold() < PEER_ANNOUNCE_INTERVAL * 3);
+        assert_eq!(pm.offline_threshold(), peer_announce_interval() * 2);
+        assert!(pm.offline_threshold() > peer_announce_interval());
+        assert!(pm.offline_threshold() < peer_announce_interval() * 3);
     }
 }

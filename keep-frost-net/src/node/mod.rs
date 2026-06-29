@@ -1883,7 +1883,7 @@ impl KfpNode {
         // window reliably catches a periodic announce even if the immediate
         // reciprocal announce (see handle_announce) is missed. Must stay well
         // under the peer offline threshold so peers don't flap offline.
-        let mut announce_interval = tokio::time::interval(crate::peer::PEER_ANNOUNCE_INTERVAL);
+        let mut announce_interval = tokio::time::interval(crate::peer::peer_announce_interval());
         announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Reap expired sessions on roughly the signing round cadence so an
