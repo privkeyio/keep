@@ -2600,6 +2600,26 @@ mod tests {
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
 
+    #[test]
+    fn serve_hooks_refuse_raw_sign_gates_pre_sign() {
+        let hooks = ServeHooks {
+            refuse_raw_sign: true,
+            auto_approve_oprf_eval: false,
+        };
+
+        let raw = raw_session();
+        assert!(
+            hooks.pre_sign(&raw).is_err(),
+            "refuse_raw_sign must reject message_type=\"raw\""
+        );
+
+        let mut structured = raw_session();
+        structured.message_type = "nostr-event".to_string();
+        hooks
+            .pre_sign(&structured)
+            .expect("non-raw session must pass pre_sign");
+    }
+
     fn descriptor_version(
         group: [u8; 32],
         external: &str,
