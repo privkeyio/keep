@@ -23,8 +23,8 @@ mod types;
 mod velocity;
 
 pub use audit::{
-    AuditEntry, AuditEventType, AuditLog, AuditStorage, ChainStatus, SigningAuditEntry,
-    SigningAuditLog, SigningAuditStorage, SigningDecision, SigningRequestType,
+    AuditEntry, AuditEventType, AuditLog, AuditStorage, SigningAuditEntry, SigningAuditLog,
+    SigningAuditStorage, SigningDecision, SigningRequestType,
 };
 pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
 pub use error::KeepMobileError;

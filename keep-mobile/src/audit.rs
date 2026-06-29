@@ -466,16 +466,6 @@ impl SigningAuditEntry {
         data.extend_from_slice(&self.prev_hash);
         blake2b_256(&data)
     }
-
-    fn verify(&self, prev_hash: &[u8]) -> bool {
-        if prev_hash.len() != 32 || self.prev_hash.len() != 32 || self.hash.len() != 32 {
-            return false;
-        }
-        let prev_hash_match = self.prev_hash.ct_eq(prev_hash);
-        let computed = self.compute_hash();
-        let hash_match = self.hash.ct_eq(&computed);
-        (prev_hash_match & hash_match).into()
-    }
 }
 
 #[derive(Serialize)]
@@ -512,12 +502,6 @@ impl TryFrom<SigningAuditEntry> for SigningAuditEntryExport {
             hash: hex::encode(e.hash),
         })
     }
-}
-
-#[derive(uniffi::Record, Clone, Debug)]
-pub struct ChainStatus {
-    pub verified: bool,
-    pub entry_count: u32,
 }
 
 #[uniffi::export(with_foreign)]
@@ -672,34 +656,6 @@ impl SigningAuditLog {
 
     pub fn get_distinct_callers(&self) -> Result<Vec<String>, KeepMobileError> {
         self.storage.distinct_callers()
-    }
-
-    pub fn verify_chain(&self) -> Result<ChainStatus, KeepMobileError> {
-        let entries = self.load_all_checked()?;
-        let count = entries.len() as u32;
-
-        let mut prev_hash = [0u8; 32];
-        for entry in entries {
-            if !entry.verify(&prev_hash) {
-                return Ok(ChainStatus {
-                    verified: false,
-                    entry_count: count,
-                });
-            }
-            prev_hash =
-                entry
-                    .hash
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| KeepMobileError::Serialization {
-                        msg: "Invalid hash length".into(),
-                    })?;
-        }
-
-        Ok(ChainStatus {
-            verified: true,
-            entry_count: count,
-        })
     }
 
     pub fn export_json(&self) -> Result<String, KeepMobileError> {
@@ -994,37 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn test_signing_audit_chain_verification() {
-        let storage = Arc::new(MockSigningStorage::new());
-        let log = SigningAuditLog::new(storage).unwrap();
-
-        log.log_event(
-            SigningRequestType::SignEvent,
-            SigningDecision::Approved,
-            false,
-            "app1".into(),
-            Some("Test App".into()),
-            Some(1),
-            None,
-        )
-        .unwrap();
-        log.log_event(
-            SigningRequestType::Nip44Encrypt,
-            SigningDecision::Denied,
-            true,
-            "app2".into(),
-            None,
-            None,
-            Some("rate limited".into()),
-        )
-        .unwrap();
-
-        let status = log.verify_chain().unwrap();
-        assert!(status.verified);
-        assert_eq!(status.entry_count, 2);
-    }
-
-    #[test]
     fn test_signing_audit_pagination() {
         let storage = Arc::new(MockSigningStorage::new());
         let log = SigningAuditLog::new(storage).unwrap();
@@ -1135,48 +1060,5 @@ mod tests {
                 i - 1
             );
         }
-    }
-
-    #[test]
-    fn test_signing_audit_tamper_detection() {
-        let mock = Arc::new(MockSigningStorage::new());
-        let storage: Arc<dyn SigningAuditStorage> =
-            Arc::clone(&mock) as Arc<dyn SigningAuditStorage>;
-        let log = SigningAuditLog::new(storage).unwrap();
-
-        log.log_event(
-            SigningRequestType::SignEvent,
-            SigningDecision::Approved,
-            false,
-            "app1".into(),
-            None,
-            Some(1),
-            None,
-        )
-        .unwrap();
-        log.log_event(
-            SigningRequestType::SignEvent,
-            SigningDecision::Denied,
-            true,
-            "app1".into(),
-            None,
-            Some(1),
-            None,
-        )
-        .unwrap();
-
-        {
-            let mut entries = mock.entries.lock().unwrap();
-            if let Some(first) = entries.first_mut() {
-                let mut entry: SigningAuditEntry = serde_json::from_str(first).unwrap();
-                entry.was_automatic = true;
-                *first = serde_json::to_string(&entry).unwrap();
-            }
-        }
-
-        let storage2: Arc<dyn SigningAuditStorage> = mock;
-        let log2 = SigningAuditLog::new(storage2).unwrap();
-        let status = log2.verify_chain().unwrap();
-        assert!(!status.verified);
     }
 }
