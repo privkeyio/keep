@@ -877,16 +877,22 @@ impl KeepMobile {
         Some((&metadata).into())
     }
 
+    /// Drop pending sign requests and null the live node so the next active
+    /// share re-initializes a fresh node instead of reusing the stale one.
+    fn invalidate_live_node(&self) {
+        self.runtime.block_on(async {
+            self.pending_requests.lock().await.clear();
+            *self.node.write().await = None;
+        });
+    }
+
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
         self.storage.load_share_by_key(group_pubkey.clone())?;
         self.storage.set_active_share_key(Some(group_pubkey))?;
 
-        self.runtime.block_on(async {
-            self.pending_requests.lock().await.clear();
-            *self.node.write().await = None;
-        });
+        self.invalidate_live_node();
 
         Ok(())
     }
@@ -2657,10 +2663,7 @@ impl KeepMobile {
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
-        self.runtime.block_on(async {
-            self.pending_requests.lock().await.clear();
-            *self.node.write().await = None;
-        });
+        self.invalidate_live_node();
 
         Ok(ShareInfo {
             name: metadata_info.name,
@@ -2885,10 +2888,7 @@ impl KeepMobile {
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
-        self.runtime.block_on(async {
-            self.pending_requests.lock().await.clear();
-            *self.node.write().await = None;
-        });
+        self.invalidate_live_node();
 
         Ok(ShareInfo {
             name: metadata.name,
@@ -3464,12 +3464,14 @@ mod import_teardown_tests {
         }
     }
 
-    // A successful import must run the same teardown set_active_share does:
-    // clear pending requests and null the live node so the imported group can
-    // announce without a restart. Seeding a pending request lets us observe the
-    // teardown block executed (before the fix it never ran on the import path).
+    // A successful import must run invalidate_live_node, the same teardown
+    // set_active_share does, so the imported group can announce without a
+    // restart. The node starts None in this harness (a real KfpNode needs a
+    // live network), so we observe the teardown via the pending request it
+    // clears: seeding one lets us prove the block ran (before the fix it never
+    // ran on the import path).
     #[test]
-    fn import_nsec_invalidates_live_node() {
+    fn import_nsec_runs_node_teardown() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
@@ -3497,10 +3499,6 @@ mod import_teardown_tests {
             assert!(
                 mobile.pending_requests.lock().await.is_empty(),
                 "import must clear pending requests via node teardown"
-            );
-            assert!(
-                mobile.node.read().await.is_none(),
-                "import must invalidate the live node"
             );
         });
         assert_eq!(
