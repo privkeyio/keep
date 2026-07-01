@@ -2657,6 +2657,11 @@ impl KeepMobile {
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
+        self.runtime.block_on(async {
+            self.pending_requests.lock().await.clear();
+            *self.node.write().await = None;
+        });
+
         Ok(ShareInfo {
             name: metadata_info.name,
             share_index: metadata_info.identifier,
@@ -2879,6 +2884,11 @@ impl KeepMobile {
             .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
+
+        self.runtime.block_on(async {
+            self.pending_requests.lock().await.clear();
+            *self.node.write().await = None;
+        });
 
         Ok(ShareInfo {
             name: metadata.name,
@@ -3389,5 +3399,113 @@ impl KeepMobile {
         self.storage.set_active_share_key(Some(key.clone()))?;
 
         Ok(key)
+    }
+}
+
+#[cfg(test)]
+mod import_teardown_tests {
+    use super::*;
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct MemStorage {
+        data: StdMutex<HashMap<String, Vec<u8>>>,
+        active: StdMutex<Option<String>>,
+    }
+
+    impl SecureStorage for MemStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            Err(KeepMobileError::StorageNotFound)
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            Vec::new()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            self.active.lock().unwrap().clone()
+        }
+        fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
+            *self.active.lock().unwrap() = key;
+            Ok(())
+        }
+    }
+
+    // A successful import must run the same teardown set_active_share does:
+    // clear pending requests and null the live node so the imported group can
+    // announce without a restart. Seeding a pending request lets us observe the
+    // teardown block executed (before the fix it never ran on the import path).
+    #[test]
+    fn import_nsec_invalidates_live_node() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<bool>(1);
+        mobile.runtime.block_on(async {
+            mobile.pending_requests.lock().await.push(PendingRequest {
+                info: SignRequest {
+                    id: "seed".into(),
+                    session_id: vec![0u8; 32],
+                    message_type: String::new(),
+                    message_preview: String::new(),
+                    from_peer: 0,
+                    timestamp: 0,
+                    metadata: None,
+                },
+                response_tx: tx,
+            });
+        });
+
+        let info = mobile
+            .import_nsec("01".repeat(32), "imported".into())
+            .unwrap();
+
+        mobile.runtime.block_on(async {
+            assert!(
+                mobile.pending_requests.lock().await.is_empty(),
+                "import must clear pending requests via node teardown"
+            );
+            assert!(
+                mobile.node.read().await.is_none(),
+                "import must invalidate the live node"
+            );
+        });
+        assert_eq!(
+            storage.get_active_share_key().as_deref(),
+            Some(info.group_pubkey.as_str())
+        );
     }
 }
