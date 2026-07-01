@@ -420,6 +420,11 @@ impl SigningHooks for MobileSigningHooks {
 #[derive(uniffi::Object)]
 pub struct KeepMobile {
     pub(crate) node: Arc<RwLock<Option<Arc<KfpNode>>>>,
+    /// Handles for the node's spawned run + event-listener tasks. Nulling the
+    /// `node` Arc alone does not stop them: each task holds its own Arc clone,
+    /// so the node never drops and keeps signing on the relays. Held here so
+    /// invalidate_live_node can abort them.
+    node_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     dkg_session: DkgSession,
@@ -564,6 +569,7 @@ impl KeepMobile {
 
         Ok(Self {
             node: Arc::new(RwLock::new(None)),
+            node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_session: DkgSession::new(),
@@ -877,9 +883,20 @@ impl KeepMobile {
         Some((&metadata).into())
     }
 
-    /// Drop pending sign requests and null the live node so the next active
-    /// share re-initializes a fresh node instead of reusing the stale one.
+    /// Abort the running node's tasks, drop pending sign requests, and null the
+    /// live node so the next active share re-initializes a fresh node instead of
+    /// leaving the stale one signing on the relays. Aborting the tasks lets them
+    /// release their Arc clones, so the node drops and its share material
+    /// zeroizes once the runtime finishes cancelling them.
     fn invalidate_live_node(&self) {
+        for handle in self
+            .node_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            handle.abort();
+        }
         self.runtime.block_on(async {
             self.pending_requests.lock().await.clear();
             *self.node.write().await = None;
@@ -907,9 +924,7 @@ impl KeepMobile {
 
         if is_active {
             self.storage.set_active_share_key(None)?;
-            self.runtime.block_on(async {
-                *self.node.write().await = None;
-            });
+            self.invalidate_live_node();
         }
 
         self.storage.delete_share_by_key(group_pubkey)?;
@@ -2597,16 +2612,30 @@ impl KeepMobile {
                 callback: self.state_callback.clone(),
                 rev: self.state_rev.clone(),
             };
-            tokio::spawn(async move {
+            let listener_handle = tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
             });
 
             let run_node = node.clone();
-            tokio::spawn(async move {
+            let run_handle = tokio::spawn(async move {
                 if let Err(e) = run_node.run().await {
                     tracing::error!("Node run failed: {e}");
                 }
             });
+
+            {
+                let mut tasks = self
+                    .node_tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Abort any node whose tasks were left running from a prior
+                // initialize that skipped invalidate_live_node.
+                for handle in tasks.drain(..) {
+                    handle.abort();
+                }
+                tasks.push(listener_handle);
+                tasks.push(run_handle);
+            }
 
             *self.node.write().await = Some(node);
             Ok(())
@@ -3464,17 +3493,11 @@ mod import_teardown_tests {
         }
     }
 
-    // A successful import must run invalidate_live_node, the same teardown
-    // set_active_share does, so the imported group can announce without a
-    // restart. The node starts None in this harness (a real KfpNode needs a
-    // live network), so we observe the teardown via the pending request it
-    // clears: seeding one lets us prove the block ran (before the fix it never
-    // ran on the import path).
-    #[test]
-    fn import_nsec_runs_node_teardown() {
-        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
-        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
-
+    // Seed one pending request so we can observe invalidate_live_node running:
+    // the node starts None in this harness (a real KfpNode needs a live
+    // network), so the pending request it clears is the observable proof the
+    // teardown block ran on the import path.
+    fn seed_pending_request(mobile: &KeepMobile) {
         let (tx, _rx) = mpsc::channel::<bool>(1);
         mobile.runtime.block_on(async {
             mobile.pending_requests.lock().await.push(PendingRequest {
@@ -3490,17 +3513,57 @@ mod import_teardown_tests {
                 response_tx: tx,
             });
         });
+    }
 
-        let info = mobile
-            .import_nsec("01".repeat(32), "imported".into())
-            .unwrap();
-
+    fn assert_pending_cleared(mobile: &KeepMobile) {
         mobile.runtime.block_on(async {
             assert!(
                 mobile.pending_requests.lock().await.is_empty(),
                 "import must clear pending requests via node teardown"
             );
         });
+    }
+
+    // A successful import must run invalidate_live_node, the same teardown
+    // set_active_share does, so the imported group can announce without a
+    // restart. Before the fix it never ran on the import path.
+    #[test]
+    fn import_nsec_runs_node_teardown() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+
+        let info = mobile
+            .import_nsec("01".repeat(32), "imported".into())
+            .unwrap();
+
+        assert_pending_cleared(&mobile);
+        assert_eq!(
+            storage.get_active_share_key().as_deref(),
+            Some(info.group_pubkey.as_str())
+        );
+    }
+
+    // The import_share path lands in store_share_package, which got the same
+    // invalidate_live_node() call; guard it so a future removal is caught.
+    #[test]
+    fn store_share_package_runs_node_teardown() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+
+        let key_bytes = Zeroizing::new(hex::decode("02".repeat(32)).unwrap());
+        let (key_package, pubkey_package, vk_bytes) =
+            KeepMobile::build_nsec_packages(&key_bytes).unwrap();
+        let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "imported-share".into());
+        let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
+
+        let info = mobile.store_share_package(&share).unwrap();
+
+        assert_pending_cleared(&mobile);
         assert_eq!(
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
