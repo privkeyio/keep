@@ -2500,6 +2500,34 @@ impl KeepMobile {
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
+    /// Install a freshly spawned node's tasks, aborting any left running from a
+    /// prior initialize that skipped invalidate_live_node. When a prior node is
+    /// replaced its pending sign requests belong to the now-aborted sessions, so
+    /// mirror invalidate_live_node and drop them too, keeping a first init clean.
+    async fn swap_node_tasks(
+        &self,
+        listener_handle: tokio::task::JoinHandle<()>,
+        run_handle: tokio::task::JoinHandle<()>,
+    ) {
+        let replaced_prior_node = {
+            let mut tasks = self
+                .node_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let had_prior = !tasks.is_empty();
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+            tasks.push(listener_handle);
+            tasks.push(run_handle);
+            had_prior
+        };
+
+        if replaced_prior_node {
+            self.pending_requests.lock().await.clear();
+        }
+    }
+
     fn do_initialize(
         &self,
         relays: Vec<String>,
@@ -2623,28 +2651,7 @@ impl KeepMobile {
                 }
             });
 
-            let replaced_prior_node = {
-                let mut tasks = self
-                    .node_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // Abort any node whose tasks were left running from a prior
-                // initialize that skipped invalidate_live_node.
-                let had_prior = !tasks.is_empty();
-                for handle in tasks.drain(..) {
-                    handle.abort();
-                }
-                tasks.push(listener_handle);
-                tasks.push(run_handle);
-                had_prior
-            };
-
-            // Mirror invalidate_live_node: a replaced node's pending sign
-            // requests belong to now-aborted sessions, so drop them here too so
-            // a re-init starts clean even when invalidate_live_node was skipped.
-            if replaced_prior_node {
-                self.pending_requests.lock().await.clear();
-            }
+            self.swap_node_tasks(listener_handle, run_handle).await;
 
             *self.node.write().await = Some(node);
             Ok(())
@@ -3552,6 +3559,53 @@ mod import_teardown_tests {
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
         );
+    }
+
+    // A re-initialize that replaces a live node aborts the prior tasks and, like
+    // invalidate_live_node, must drop its pending requests so the fresh node does
+    // not surface sign requests from the torn-down session.
+    #[test]
+    fn swap_node_tasks_clears_pending_when_replacing() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+        mobile.runtime.block_on(async {
+            // Stand in for a prior node's still-running task.
+            mobile
+                .node_tasks
+                .lock()
+                .unwrap()
+                .push(tokio::spawn(async { std::future::pending::<()>().await }));
+
+            let listener = tokio::spawn(async {});
+            let run = tokio::spawn(async {});
+            mobile.swap_node_tasks(listener, run).await;
+
+            assert_eq!(mobile.node_tasks.lock().unwrap().len(), 2);
+        });
+        assert_pending_cleared(&mobile);
+    }
+
+    // A first initialize with no prior node must leave pending requests untouched:
+    // there is no torn-down session whose requests need dropping.
+    #[test]
+    fn swap_node_tasks_keeps_pending_on_first_init() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+        mobile.runtime.block_on(async {
+            let listener = tokio::spawn(async {});
+            let run = tokio::spawn(async {});
+            mobile.swap_node_tasks(listener, run).await;
+
+            assert_eq!(
+                mobile.pending_requests.lock().await.len(),
+                1,
+                "first init must not drop pending requests"
+            );
+        });
     }
 
     // The import_share path lands in store_share_package, which got the same
