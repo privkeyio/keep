@@ -85,9 +85,9 @@ impl KeepAgentSession {
 
         let pubkey: [u8; 32] = if let Some(ref sk) = secret_bytes {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let scalar = k256::NonZeroScalar::try_from(sk.as_ref().as_slice())
+            let sk = k256::SecretKey::from_slice(sk.as_slice())
                 .map_err(|_| Error::from_reason("Invalid secret key"))?;
-            let pk = k256::PublicKey::from_secret_scalar(&scalar);
+            let pk = sk.public_key();
             let point = pk.to_encoded_point(true);
             let bytes = point.as_bytes();
             let mut arr = [0u8; 32];
@@ -314,7 +314,7 @@ impl KeepAgentSession {
 
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
 
-        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let hex = Zeroizing::new(hex::encode(secret.as_slice()));
         let keys = Keys::parse(hex.as_str())
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
@@ -368,10 +368,11 @@ impl KeepAgentSession {
             .check_operation(&Operation::SignPsbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = Zeroizing::new(*self
+        let mut secret = self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?
+            .clone();
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -451,10 +452,11 @@ impl KeepAgentSession {
             .check_operation(&Operation::GetBitcoinAddress)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = Zeroizing::new(*self
+        let mut secret = self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?
+            .clone();
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,

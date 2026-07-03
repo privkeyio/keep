@@ -188,9 +188,9 @@ impl PyAgentSession {
 
         let pubkey_bytes: [u8; 32] = if let Some(ref sk) = secret_bytes {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let scalar = k256::NonZeroScalar::try_from(sk.as_ref().as_slice())
+            let sk = k256::SecretKey::from_slice(sk.as_slice())
                 .map_err(|_| PyValueError::new_err("Invalid secret key"))?;
-            let pk = k256::PublicKey::from_secret_scalar(&scalar);
+            let pk = sk.public_key();
             let point = pk.to_encoded_point(true);
             let bytes = point.as_bytes();
             let mut arr = [0u8; 32];
@@ -308,7 +308,7 @@ impl PyAgentSession {
 
         use nostr_sdk::prelude::*;
 
-        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
+        let hex = Zeroizing::new(hex::encode(secret.as_slice()));
         let keys = Keys::parse(hex.as_str())
             .map_err(to_py_value_err)?;
 
@@ -360,8 +360,9 @@ impl PyAgentSession {
 
         session.check_operation(&Operation::SignPsbt).map_err(to_py_err)?;
 
-        let mut secret = Zeroizing::new(*self.secret_key.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?);
+        let mut secret = self.secret_key.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?
+            .clone();
 
         let network = match network.unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -431,8 +432,9 @@ impl PyAgentSession {
 
         session.check_operation(&Operation::GetBitcoinAddress).map_err(to_py_err)?;
 
-        let mut secret = Zeroizing::new(*self.secret_key.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?);
+        let mut secret = self.secret_key.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?
+            .clone();
 
         let network = match network.unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
