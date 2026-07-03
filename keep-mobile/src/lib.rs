@@ -2500,15 +2500,14 @@ impl KeepMobile {
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
-    /// Install a freshly spawned node's tasks, aborting any left running from a
-    /// prior initialize that skipped invalidate_live_node. When a prior node is
-    /// replaced its pending sign requests belong to the now-aborted sessions, so
-    /// mirror invalidate_live_node and drop them too, keeping a first init clean.
-    async fn swap_node_tasks(
-        &self,
-        listener_handle: tokio::task::JoinHandle<()>,
-        run_handle: tokio::task::JoinHandle<()>,
-    ) {
+    /// Abort any prior node's tasks and drop their pending sign requests before a
+    /// replacement node starts. Must run before the new node's listener/run tasks
+    /// spawn: clearing up front means the clear cannot race the fresh session,
+    /// whose requests can only be enqueued once those tasks are live, so a
+    /// replacement never loses the new session's requests. A first init has no
+    /// prior tasks, so pending is left untouched. Mirrors invalidate_live_node
+    /// minus nulling the node, which do_initialize overwrites immediately after.
+    async fn retire_prior_node_tasks(&self) {
         let replaced_prior_node = {
             let mut tasks = self
                 .node_tasks
@@ -2518,8 +2517,6 @@ impl KeepMobile {
             for handle in tasks.drain(..) {
                 handle.abort();
             }
-            tasks.push(listener_handle);
-            tasks.push(run_handle);
             had_prior
         };
 
@@ -2640,6 +2637,12 @@ impl KeepMobile {
                 callback: self.state_callback.clone(),
                 rev: self.state_rev.clone(),
             };
+            // Retire any prior node before starting the new one so its pending
+            // requests are cleared up front. Clearing before the tasks below
+            // spawn is what keeps the new session's requests: they can only be
+            // enqueued once its listener/run tasks are live.
+            self.retire_prior_node_tasks().await;
+
             let listener_handle = tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
             });
@@ -2651,7 +2654,10 @@ impl KeepMobile {
                 }
             });
 
-            self.swap_node_tasks(listener_handle, run_handle).await;
+            self.node_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
             Ok(())
@@ -3565,7 +3571,7 @@ mod import_teardown_tests {
     // invalidate_live_node, must drop its pending requests so the fresh node does
     // not surface sign requests from the torn-down session.
     #[test]
-    fn swap_node_tasks_clears_pending_when_replacing() {
+    fn retire_prior_node_tasks_clears_pending_when_replacing() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
@@ -3595,9 +3601,7 @@ mod import_teardown_tests {
                 }));
             tokio::task::yield_now().await;
 
-            let listener = tokio::spawn(async {});
-            let run = tokio::spawn(async {});
-            mobile.swap_node_tasks(listener, run).await;
+            mobile.retire_prior_node_tasks().await;
 
             // abort() is asynchronous; let the runtime cancel and drop the future.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3605,7 +3609,8 @@ mod import_teardown_tests {
                 aborted.load(std::sync::atomic::Ordering::SeqCst),
                 "prior node task must be aborted, not detached and left signing"
             );
-            assert_eq!(mobile.node_tasks.lock().unwrap().len(), 2);
+            // Prior handles are drained; do_initialize installs the new ones next.
+            assert!(mobile.node_tasks.lock().unwrap().is_empty());
         });
         assert_pending_cleared(&mobile);
     }
@@ -3613,15 +3618,13 @@ mod import_teardown_tests {
     // A first initialize with no prior node must leave pending requests untouched:
     // there is no torn-down session whose requests need dropping.
     #[test]
-    fn swap_node_tasks_keeps_pending_on_first_init() {
+    fn retire_prior_node_tasks_keeps_pending_on_first_init() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
         seed_pending_request(&mobile);
         mobile.runtime.block_on(async {
-            let listener = tokio::spawn(async {});
-            let run = tokio::spawn(async {});
-            mobile.swap_node_tasks(listener, run).await;
+            mobile.retire_prior_node_tasks().await;
 
             assert_eq!(
                 mobile.pending_requests.lock().await.len(),
