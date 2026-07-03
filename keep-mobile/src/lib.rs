@@ -2623,18 +2623,27 @@ impl KeepMobile {
                 }
             });
 
-            {
+            let replaced_prior_node = {
                 let mut tasks = self
                     .node_tasks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Abort any node whose tasks were left running from a prior
                 // initialize that skipped invalidate_live_node.
+                let had_prior = !tasks.is_empty();
                 for handle in tasks.drain(..) {
                     handle.abort();
                 }
                 tasks.push(listener_handle);
                 tasks.push(run_handle);
+                had_prior
+            };
+
+            // Mirror invalidate_live_node: a replaced node's pending sign
+            // requests belong to now-aborted sessions, so drop them here too so
+            // a re-init starts clean even when invalidate_live_node was skipped.
+            if replaced_prior_node {
+                self.pending_requests.lock().await.clear();
             }
 
             *self.node.write().await = Some(node);
