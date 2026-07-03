@@ -3569,19 +3569,38 @@ mod import_teardown_tests {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
+        // A drop-guard whose Drop only runs if the task's future is dropped, i.e.
+        // the task was aborted. Detaching (dropping the JoinHandle without abort)
+        // leaves the future running and never fires Drop, so this distinguishes a
+        // real abort from a silently removed handle.abort().
+        struct AbortFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         seed_pending_request(&mobile);
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prior_flag = AbortFlag(Arc::clone(&aborted));
         mobile.runtime.block_on(async {
             // Stand in for a prior node's still-running task.
-            mobile
-                .node_tasks
-                .lock()
-                .unwrap()
-                .push(tokio::spawn(async { std::future::pending::<()>().await }));
+            mobile.node_tasks.lock().unwrap().push(tokio::spawn(async move {
+                let _flag = prior_flag;
+                std::future::pending::<()>().await;
+            }));
+            tokio::task::yield_now().await;
 
             let listener = tokio::spawn(async {});
             let run = tokio::spawn(async {});
             mobile.swap_node_tasks(listener, run).await;
 
+            // abort() is asynchronous; let the runtime cancel and drop the future.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "prior node task must be aborted, not detached and left signing"
+            );
             assert_eq!(mobile.node_tasks.lock().unwrap().len(), 2);
         });
         assert_pending_cleared(&mobile);
