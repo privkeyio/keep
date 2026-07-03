@@ -3585,10 +3585,14 @@ mod import_teardown_tests {
         let prior_flag = AbortFlag(Arc::clone(&aborted));
         mobile.runtime.block_on(async {
             // Stand in for a prior node's still-running task.
-            mobile.node_tasks.lock().unwrap().push(tokio::spawn(async move {
-                let _flag = prior_flag;
-                std::future::pending::<()>().await;
-            }));
+            mobile
+                .node_tasks
+                .lock()
+                .unwrap()
+                .push(tokio::spawn(async move {
+                    let _flag = prior_flag;
+                    std::future::pending::<()>().await;
+                }));
             tokio::task::yield_now().await;
 
             let listener = tokio::spawn(async {});
