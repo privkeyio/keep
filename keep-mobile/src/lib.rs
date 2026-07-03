@@ -2500,6 +2500,31 @@ impl KeepMobile {
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
+    /// Abort any prior node's tasks and drop their pending sign requests before a
+    /// replacement node starts. Must run before the new node's listener/run tasks
+    /// spawn: clearing up front means the clear cannot race the fresh session,
+    /// whose requests can only be enqueued once those tasks are live, so a
+    /// replacement never loses the new session's requests. A first init has no
+    /// prior tasks, so pending is left untouched. Mirrors invalidate_live_node
+    /// minus nulling the node, which do_initialize overwrites immediately after.
+    async fn retire_prior_node_tasks(&self) {
+        let replaced_prior_node = {
+            let mut tasks = self
+                .node_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let had_prior = !tasks.is_empty();
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+            had_prior
+        };
+
+        if replaced_prior_node {
+            self.pending_requests.lock().await.clear();
+        }
+    }
+
     fn do_initialize(
         &self,
         relays: Vec<String>,
@@ -2612,6 +2637,12 @@ impl KeepMobile {
                 callback: self.state_callback.clone(),
                 rev: self.state_rev.clone(),
             };
+            // Retire any prior node before starting the new one so its pending
+            // requests are cleared up front. Clearing before the tasks below
+            // spawn is what keeps the new session's requests: they can only be
+            // enqueued once its listener/run tasks are live.
+            self.retire_prior_node_tasks().await;
+
             let listener_handle = tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
             });
@@ -2623,19 +2654,10 @@ impl KeepMobile {
                 }
             });
 
-            {
-                let mut tasks = self
-                    .node_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // Abort any node whose tasks were left running from a prior
-                // initialize that skipped invalidate_live_node.
-                for handle in tasks.drain(..) {
-                    handle.abort();
-                }
-                tasks.push(listener_handle);
-                tasks.push(run_handle);
-            }
+            self.node_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
             Ok(())
@@ -3543,6 +3565,73 @@ mod import_teardown_tests {
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
         );
+    }
+
+    // A re-initialize that replaces a live node aborts the prior tasks and, like
+    // invalidate_live_node, must drop its pending requests so the fresh node does
+    // not surface sign requests from the torn-down session.
+    #[test]
+    fn retire_prior_node_tasks_clears_pending_when_replacing() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        // A drop-guard whose Drop only runs if the task's future is dropped, i.e.
+        // the task was aborted. Detaching (dropping the JoinHandle without abort)
+        // leaves the future running and never fires Drop, so this distinguishes a
+        // real abort from a silently removed handle.abort().
+        struct AbortFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        seed_pending_request(&mobile);
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prior_flag = AbortFlag(Arc::clone(&aborted));
+        mobile.runtime.block_on(async {
+            // Stand in for a prior node's still-running task.
+            mobile
+                .node_tasks
+                .lock()
+                .unwrap()
+                .push(tokio::spawn(async move {
+                    let _flag = prior_flag;
+                    std::future::pending::<()>().await;
+                }));
+            tokio::task::yield_now().await;
+
+            mobile.retire_prior_node_tasks().await;
+
+            // abort() is asynchronous; let the runtime cancel and drop the future.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "prior node task must be aborted, not detached and left signing"
+            );
+            // Prior handles are drained; do_initialize installs the new ones next.
+            assert!(mobile.node_tasks.lock().unwrap().is_empty());
+        });
+        assert_pending_cleared(&mobile);
+    }
+
+    // A first initialize with no prior node must leave pending requests untouched:
+    // there is no torn-down session whose requests need dropping.
+    #[test]
+    fn retire_prior_node_tasks_keeps_pending_on_first_init() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+        mobile.runtime.block_on(async {
+            mobile.retire_prior_node_tasks().await;
+
+            assert_eq!(
+                mobile.pending_requests.lock().await.len(),
+                1,
+                "first init must not drop pending requests"
+            );
+        });
     }
 
     // The import_share path lands in store_share_package, which got the same
