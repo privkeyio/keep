@@ -6,6 +6,8 @@ all-features = true
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained but stable; used in keep-core" },
     { id = "RUSTSEC-2024-0415", reason = "gtk3 bindings unmaintained; no migration path for tray-icon ecosystem" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
 ]
 unmaintained = "workspace"
 
