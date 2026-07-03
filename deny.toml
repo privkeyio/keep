@@ -6,6 +6,9 @@ all-features = true
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained but stable; used in keep-core" },
     { id = "RUSTSEC-2024-0415", reason = "gtk3 bindings unmaintained; no migration path for tray-icon ecosystem" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 unsound VariantStrIter via gtk 0.18 tray/notify; no gtk-rs 0.20 migration path, not in signing/network path" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 quadratic dup-attr via wayland-scanner/gtk desktop deps; pinned upstream (^0.39), not reachable in signing/network path" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 NsReader unbounded namespace alloc via wayland-scanner/gtk desktop deps; pinned upstream (^0.39), not reachable in signing/network path" },
 ]
 unmaintained = "workspace"
 
