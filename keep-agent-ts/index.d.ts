@@ -16,7 +16,7 @@ export declare class KeepAgentSession {
 }
 
 export declare class RemoteSession {
-  static connect(bunkerUrl: string, timeoutSeconds?: number | undefined | null): Promise<RemoteSession>
+  static connect(bunkerUrl: string, timeoutSeconds?: number | undefined | null, proxyPort?: number | undefined | null): Promise<RemoteSession>
   signEvent(eventJson: string): Promise<string>
   getPublicKey(): Promise<string>
   nip44Encrypt(pubkey: string, plaintext: string): Promise<string>

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -27,10 +28,18 @@ pub struct PendingSession {
 
 impl PendingSession {
     pub async fn new(bunker_url: &str, timeout: Duration) -> Result<Self> {
+        Self::new_with_proxy(bunker_url, timeout, None).await
+    }
+
+    pub async fn new_with_proxy(
+        bunker_url: &str,
+        timeout: Duration,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         let (signer_pubkey, relay_url, _) = AgentClient::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
-        let client = Client::new(client_keys.clone());
+        let client = build_client(&client_keys, proxy);
 
         client
             .pool()
@@ -203,10 +212,18 @@ pub struct AgentClient {
 
 impl AgentClient {
     pub async fn connect(bunker_url: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_with_proxy(bunker_url, timeout, None).await
+    }
+
+    pub async fn connect_with_proxy(
+        bunker_url: &str,
+        timeout: Duration,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         let (signer_pubkey, relay_url, secret) = Self::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
-        let client = Client::new(client_keys.clone());
+        let client = build_client(&client_keys, proxy);
 
         client
             .pool()
@@ -601,6 +618,24 @@ async fn wait_for_any_relay_connection(
     .map_err(|_| AgentError::Connection("Relay connection timeout".into()))
 }
 
+fn build_client(keys: &Keys, proxy: Option<SocketAddr>) -> Client {
+    match proxy {
+        Some(addr) => {
+            let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
+            let opts = ClientOptions::new().connection(connection);
+            Client::builder().signer(keys.clone()).opts(opts).build()
+        }
+        None => Client::new(keys.clone()),
+    }
+}
+
+pub fn loopback_proxy(port: u16) -> Result<SocketAddr> {
+    if port == 0 {
+        return Err(AgentError::Connection("Invalid proxy port".into()));
+    }
+    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+}
+
 fn default_relay_opts() -> RelayOptions {
     RelayOptions::default()
         .reconnect(true)
@@ -625,6 +660,18 @@ mod tests {
         let uuid2 = generate_uuid();
         assert_ne!(uuid1, uuid2);
         assert_eq!(uuid1.len(), 36);
+    }
+
+    #[test]
+    fn test_loopback_proxy_rejects_port_zero() {
+        assert!(loopback_proxy(0).is_err());
+    }
+
+    #[test]
+    fn test_loopback_proxy_builds_localhost() {
+        let addr = loopback_proxy(9050).unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.to_string(), "127.0.0.1:9050");
     }
 
     #[test]

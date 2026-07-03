@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use keep_agent::{
-    AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
+    loopback_proxy, AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
     RateLimitConfig, SessionConfig, SessionManager, SessionMetadata, SessionScope, SessionToken,
 };
 
@@ -480,10 +480,19 @@ pub struct RemoteSession {
 #[napi]
 impl RemoteSession {
     #[napi(factory)]
-    pub async fn connect(bunker_url: String, timeout_seconds: Option<u32>) -> Result<Self> {
+    pub async fn connect(
+        bunker_url: String,
+        timeout_seconds: Option<u32>,
+        proxy_port: Option<u16>,
+    ) -> Result<Self> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
 
-        let client = AgentClient::connect(&bunker_url, timeout)
+        let proxy = match proxy_port {
+            Some(port) => Some(loopback_proxy(port).map_err(|e| Error::from_reason(e.to_string()))?),
+            None => None,
+        };
+
+        let client = AgentClient::connect_with_proxy(&bunker_url, timeout, proxy)
             .await
             .map_err(|e| Error::from_reason(format!("Connection failed: {}", e)))?;
 
@@ -564,10 +573,19 @@ pub struct PendingSession {
 #[napi]
 impl PendingSession {
     #[napi(factory)]
-    pub async fn create(bunker_url: String, timeout_seconds: Option<u32>) -> Result<Self> {
+    pub async fn create(
+        bunker_url: String,
+        timeout_seconds: Option<u32>,
+        proxy_port: Option<u16>,
+    ) -> Result<Self> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
 
-        let pending = RustPendingSession::new(&bunker_url, timeout)
+        let proxy = match proxy_port {
+            Some(port) => Some(loopback_proxy(port).map_err(|e| Error::from_reason(e.to_string()))?),
+            None => None,
+        };
+
+        let pending = RustPendingSession::new_with_proxy(&bunker_url, timeout, proxy)
             .await
             .map_err(|e| Error::from_reason(format!("Connection failed: {}", e)))?;
 
