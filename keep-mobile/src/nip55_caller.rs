@@ -246,10 +246,7 @@ mod tests {
             }
         );
         // Single-use: a second consume is Invalid.
-        assert_eq!(
-            store.consume(nonce, t0 + 1000),
-            Nip55NonceResult::Invalid
-        );
+        assert_eq!(store.consume(nonce, t0 + 1000), Nip55NonceResult::Invalid);
     }
 
     #[test]
@@ -292,16 +289,16 @@ mod tests {
         let generated_at: u64 = 10 * NONCE_EXPIRY_MS;
         let nonce = store.generate("com.app".into(), generated_at);
         // `now` is far below the stored expiry (clock jumped backward).
-        assert_eq!(
-            store.consume(nonce, 0),
-            Nip55NonceResult::Expired
-        );
+        assert_eq!(store.consume(nonce, 0), Nip55NonceResult::Expired);
     }
 
     #[test]
     fn unknown_nonce_is_invalid() {
         let store = Nip55NonceStore::new();
-        assert_eq!(store.consume("deadbeef".into(), 1_000), Nip55NonceResult::Invalid);
+        assert_eq!(
+            store.consume("deadbeef".into(), 1_000),
+            Nip55NonceResult::Invalid
+        );
     }
 
     #[test]
@@ -365,9 +362,6 @@ mod tests {
         let t0: u64 = 1_000;
         let nonce = store.generate("com.app".into(), t0);
         store.clear();
-        assert_eq!(
-            store.consume(nonce, t0 + 1000),
-            Nip55NonceResult::Invalid
-        );
+        assert_eq!(store.consume(nonce, t0 + 1000), Nip55NonceResult::Invalid);
     }
 }
