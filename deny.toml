@@ -6,6 +6,7 @@ all-features = true
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained but stable; used in keep-core" },
     { id = "RUSTSEC-2024-0415", reason = "gtk3 bindings unmaintained; no migration path for tray-icon ecosystem" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 unsound VariantStrIter via gtk 0.18 tray/notify; no gtk-rs 0.20 migration path, not in signing/network path" },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
 ]
