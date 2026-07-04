@@ -9,9 +9,8 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
-const NONCE_EXPIRY: Duration = Duration::from_secs(5 * 60);
+const NONCE_EXPIRY_MS: u64 = 5 * 60 * 1000;
 const MAX_ACTIVE_NONCES: usize = 1000;
 
 /// Outcome of comparing a caller's current signing-certificate hash against the
@@ -84,12 +83,13 @@ pub enum Nip55NonceResult {
 
 struct NonceData {
     package_name: String,
-    expires_at: Instant,
+    expires_at_ms: u64,
 }
 
 /// One-time challenge-nonce store for the NIP-55 notification-approval flow: a
 /// nonce is issued when a request notification is shown and consumed when the
-/// approval activity handles it. Monotonic `Instant` expiry (cannot be moved by
+/// approval activity handles it. Expiry is measured on an injected boot-time
+/// clock (`elapsedRealtime` millis, which counts suspend and cannot be moved by
 /// a wall-clock change) and a single-use guarantee (consume removes the entry).
 #[derive(uniffi::Object)]
 pub struct Nip55NonceStore {
@@ -111,44 +111,21 @@ impl Nip55NonceStore {
         }
     }
 
-    /// Issue a fresh 256-bit hex nonce bound to `package_name`, expiring in five
-    /// minutes. Evicts expired (then oldest) entries when the active set is full.
-    pub fn generate(&self, package_name: String) -> String {
-        self.generate_at(package_name, Instant::now())
-    }
-
-    /// Consume a nonce, returning the bound package when valid and unexpired. A
-    /// nonce is single-use: it is removed whether or not it was still valid.
-    pub fn consume(&self, nonce: String) -> Nip55NonceResult {
-        self.consume_at(&nonce, Instant::now())
-    }
-
-    /// Drop expired nonces. Called opportunistically (e.g. on foreground).
-    pub fn cleanup_expired(&self) {
-        self.cleanup_expired_at(Instant::now());
-    }
-
-    pub fn clear(&self) {
-        self.nonces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-    }
-}
-
-impl Nip55NonceStore {
-    fn generate_at(&self, package_name: String, now: Instant) -> String {
+    /// Issue a fresh 256-bit hex nonce bound to `package_name`, expiring five
+    /// minutes after `now_elapsed_ms` (an `elapsedRealtime` boot-time millis
+    /// value). Evicts expired (then oldest) entries when the active set is full.
+    pub fn generate(&self, package_name: String, now_elapsed_ms: u64) -> String {
         let nonce = hex::encode(keep_core::crypto::random_bytes::<32>());
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
         nonces.insert(
             nonce.clone(),
             NonceData {
                 package_name,
-                expires_at: now + NONCE_EXPIRY,
+                expires_at_ms: now_elapsed_ms.saturating_add(NONCE_EXPIRY_MS),
             },
         );
         if nonces.len() > MAX_ACTIVE_NONCES {
-            nonces.retain(|_, d| now < d.expires_at);
+            nonces.retain(|_, d| now_elapsed_ms < d.expires_at_ms);
             if nonces.len() > MAX_ACTIVE_NONCES {
                 evict_oldest(&mut nonces);
             }
@@ -156,24 +133,42 @@ impl Nip55NonceStore {
         nonce
     }
 
-    fn cleanup_expired_at(&self, now: Instant) {
+    /// Consume a nonce, returning the bound package when valid and unexpired. A
+    /// nonce is single-use: it is removed whether or not it was still valid.
+    ///
+    /// Expiry is measured on the injected CLOCK_BOOTTIME (`elapsedRealtime`)
+    /// millis value: it counts time spent in device suspend (the #597 fix, where
+    /// a monotonic `Instant` would pause and silently stretch the window) while
+    /// still resisting wall-clock manipulation. Because that clock now crosses
+    /// the FFI boundary, the Kotlin clock-anomaly clause (`expiresAt - now >
+    /// NONCE_EXPIRY`) is live here: a backward boot-time jump can leave a
+    /// future-dated entry more than the window ahead of `now`, so treat it as
+    /// Expired rather than trusting the stale expiry.
+    pub fn consume(&self, nonce: String, now_elapsed_ms: u64) -> Nip55NonceResult {
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
-        nonces.retain(|_, d| now < d.expires_at);
-    }
-
-    // Android carries a second clock-anomaly clause (`expiresAt - now > NONCE_EXPIRY`)
-    // to guard against `elapsedRealtime` jumps; it is intentionally omitted here
-    // because `Instant` is monotonic and cannot move that way. Do not "restore
-    // parity" with the Kotlin: it would be dead code.
-    fn consume_at(&self, nonce: &str, now: Instant) -> Nip55NonceResult {
-        let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
-        match nonces.remove(nonce) {
+        match nonces.remove(&nonce) {
             None => Nip55NonceResult::Invalid,
-            Some(d) if now >= d.expires_at => Nip55NonceResult::Expired,
+            Some(d) if now_elapsed_ms >= d.expires_at_ms => Nip55NonceResult::Expired,
+            Some(d) if d.expires_at_ms.saturating_sub(now_elapsed_ms) > NONCE_EXPIRY_MS => {
+                Nip55NonceResult::Expired
+            }
             Some(d) => Nip55NonceResult::Valid {
                 package_name: d.package_name,
             },
         }
+    }
+
+    /// Drop expired nonces. Called opportunistically (e.g. on foreground).
+    pub fn cleanup_expired(&self, now_elapsed_ms: u64) {
+        let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
+        nonces.retain(|_, d| now_elapsed_ms < d.expires_at_ms);
+    }
+
+    pub fn clear(&self) {
+        self.nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -185,9 +180,9 @@ fn evict_oldest(nonces: &mut HashMap<String, NonceData>) {
     if nonces.len() <= target {
         return;
     }
-    let mut by_expiry: Vec<(String, Instant)> = nonces
+    let mut by_expiry: Vec<(String, u64)> = nonces
         .iter()
-        .map(|(k, d)| (k.clone(), d.expires_at))
+        .map(|(k, d)| (k.clone(), d.expires_at_ms))
         .collect();
     by_expiry.sort_by_key(|(_, e)| *e);
     let remove_count = nonces.len() - target;
@@ -242,17 +237,17 @@ mod tests {
     #[test]
     fn nonce_round_trip_is_valid_and_single_use() {
         let store = Nip55NonceStore::new();
-        let t0 = Instant::now();
-        let nonce = store.generate_at("com.app".into(), t0);
+        let t0: u64 = 1_000;
+        let nonce = store.generate("com.app".into(), t0);
         assert_eq!(
-            store.consume_at(&nonce, t0 + Duration::from_secs(1)),
+            store.consume(nonce.clone(), t0 + 1000),
             Nip55NonceResult::Valid {
                 package_name: "com.app".into()
             }
         );
         // Single-use: a second consume is Invalid.
         assert_eq!(
-            store.consume_at(&nonce, t0 + Duration::from_secs(1)),
+            store.consume(nonce, t0 + 1000),
             Nip55NonceResult::Invalid
         );
     }
@@ -260,10 +255,45 @@ mod tests {
     #[test]
     fn expired_nonce_is_rejected() {
         let store = Nip55NonceStore::new();
-        let t0 = Instant::now();
-        let nonce = store.generate_at("com.app".into(), t0);
+        let t0: u64 = 1_000;
+        let nonce = store.generate("com.app".into(), t0);
         assert_eq!(
-            store.consume_at(&nonce, t0 + Duration::from_secs(6 * 60)),
+            store.consume(nonce, t0 + 6 * 60 * 1000),
+            Nip55NonceResult::Expired
+        );
+    }
+
+    #[test]
+    fn nonce_expiry_counts_boot_time_millis() {
+        // #597: expiry is measured on injected elapsedRealtime millis, so a
+        // nonce is Valid just under five minutes and Expired at exactly the
+        // five-minute boundary.
+        let store = Nip55NonceStore::new();
+        let t0: u64 = 1_000;
+        let nonce = store.generate("com.app".into(), t0);
+        assert!(matches!(
+            store.consume(nonce, t0 + NONCE_EXPIRY_MS - 1),
+            Nip55NonceResult::Valid { .. }
+        ));
+
+        let store = Nip55NonceStore::new();
+        let nonce = store.generate("com.app".into(), t0);
+        assert_eq!(
+            store.consume(nonce, t0 + NONCE_EXPIRY_MS),
+            Nip55NonceResult::Expired
+        );
+    }
+
+    #[test]
+    fn nonce_anomalous_future_expiry_is_rejected() {
+        // A backward boot-time jump can leave an entry more than a full window
+        // ahead of `now`; the anomaly guard treats it as Expired.
+        let store = Nip55NonceStore::new();
+        let generated_at: u64 = 10 * NONCE_EXPIRY_MS;
+        let nonce = store.generate("com.app".into(), generated_at);
+        // `now` is far below the stored expiry (clock jumped backward).
+        assert_eq!(
+            store.consume(nonce, 0),
             Nip55NonceResult::Expired
         );
     }
@@ -271,7 +301,7 @@ mod tests {
     #[test]
     fn unknown_nonce_is_invalid() {
         let store = Nip55NonceStore::new();
-        assert_eq!(store.consume("deadbeef".into()), Nip55NonceResult::Invalid);
+        assert_eq!(store.consume("deadbeef".into(), 1_000), Nip55NonceResult::Invalid);
     }
 
     #[test]
@@ -291,24 +321,24 @@ mod tests {
     #[test]
     fn eviction_trims_to_half_keeping_newest() {
         let store = Nip55NonceStore::new();
-        let t0 = Instant::now();
+        let t0: u64 = 1_000;
         let mut nonces = Vec::new();
         // One past the cap triggers eviction down to MAX/2, keeping the
         // newest-expiring entries.
         for i in 0..=MAX_ACTIVE_NONCES {
-            let now = t0 + Duration::from_millis(i as u64);
-            nonces.push(store.generate_at(format!("pkg{i}"), now));
+            let now = t0 + i as u64;
+            nonces.push(store.generate(format!("pkg{i}"), now));
         }
         // The oldest nonce was evicted.
         assert_eq!(
-            store.consume_at(&nonces[0], t0 + Duration::from_secs(1)),
+            store.consume(nonces[0].clone(), t0 + 1000),
             Nip55NonceResult::Invalid
         );
         // The newest nonce was retained.
-        let newest = nonces.last().unwrap();
-        let newest_now = t0 + Duration::from_millis(MAX_ACTIVE_NONCES as u64);
+        let newest = nonces.last().unwrap().clone();
+        let newest_now = t0 + MAX_ACTIVE_NONCES as u64;
         assert!(matches!(
-            store.consume_at(newest, newest_now + Duration::from_secs(1)),
+            store.consume(newest, newest_now + 1000),
             Nip55NonceResult::Valid { .. }
         ));
     }
@@ -316,15 +346,15 @@ mod tests {
     #[test]
     fn cleanup_expired_drops_only_expired() {
         let store = Nip55NonceStore::new();
-        let t0 = Instant::now();
-        let old = store.generate_at("old".into(), t0);
-        let fresh = store.generate_at("fresh".into(), t0 + Duration::from_secs(4 * 60));
+        let t0: u64 = 1_000;
+        let old = store.generate("old".into(), t0);
+        let fresh = store.generate("fresh".into(), t0 + 4 * 60 * 1000);
         // `old` has expired, `fresh` has not.
-        let now = t0 + NONCE_EXPIRY + Duration::from_secs(30);
-        store.cleanup_expired_at(now);
-        assert_eq!(store.consume_at(&old, now), Nip55NonceResult::Invalid);
+        let now = t0 + NONCE_EXPIRY_MS + 30 * 1000;
+        store.cleanup_expired(now);
+        assert_eq!(store.consume(old, now), Nip55NonceResult::Invalid);
         assert!(matches!(
-            store.consume_at(&fresh, now),
+            store.consume(fresh, now),
             Nip55NonceResult::Valid { .. }
         ));
     }
@@ -332,11 +362,11 @@ mod tests {
     #[test]
     fn clear_removes_all_nonces() {
         let store = Nip55NonceStore::new();
-        let t0 = Instant::now();
-        let nonce = store.generate_at("com.app".into(), t0);
+        let t0: u64 = 1_000;
+        let nonce = store.generate("com.app".into(), t0);
         store.clear();
         assert_eq!(
-            store.consume_at(&nonce, t0 + Duration::from_secs(1)),
+            store.consume(nonce, t0 + 1000),
             Nip55NonceResult::Invalid
         );
     }
