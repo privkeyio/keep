@@ -84,8 +84,10 @@ impl KeepAgentSession {
         secret_key: Option<String>,
     ) -> Result<Self> {
         let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(ref sk) = secret_key {
-            let decoded = Zeroizing::new(hex::decode(sk)
-                .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?);
+            let decoded = Zeroizing::new(
+                hex::decode(sk)
+                    .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?,
+            );
             if decoded.len() != 32 {
                 return Err(Error::from_reason(format!(
                     "Secret key must be 32 bytes, got {}",
@@ -118,7 +120,9 @@ impl KeepAgentSession {
         let scope = if let Some(config) = scope_config {
             let ops: Vec<Operation> = config
                 .operations
-                .unwrap_or_else(|| vec!["sign_nostr_event".to_string(), "get_public_key".to_string()])
+                .unwrap_or_else(|| {
+                    vec!["sign_nostr_event".to_string(), "get_public_key".to_string()]
+                })
                 .into_iter()
                 .filter_map(|s| match s.as_str() {
                     "sign_nostr_event" => Some(Operation::SignNostrEvent),
@@ -152,7 +156,9 @@ impl KeepAgentSession {
             }
             if let Some(max) = config.max_amount_sats {
                 if max < 0 {
-                    return Err(Error::from_reason("max_amount_sats must be non-negative".to_string()));
+                    return Err(Error::from_reason(
+                        "max_amount_sats must be non-negative".to_string(),
+                    ));
                 }
                 scope = scope.with_max_amount(max as u64);
             }
@@ -331,8 +337,8 @@ impl KeepAgentSession {
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
 
         let hex = Zeroizing::new(hex::encode(secret.as_slice()));
-        let keys = Keys::parse(hex.as_str())
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let keys =
+            Keys::parse(hex.as_str()).map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         let nostr_tags: Vec<Tag> = tags
             .unwrap_or_default()
@@ -369,11 +375,7 @@ impl KeepAgentSession {
     }
 
     #[napi]
-    pub async fn sign_psbt(
-        &self,
-        psbt_base64: String,
-        network: Option<String>,
-    ) -> Result<String> {
+    pub async fn sign_psbt(&self, psbt_base64: String, network: Option<String>) -> Result<String> {
         let token = self.token.lock().await;
         let session = self
             .manager
@@ -435,7 +437,9 @@ impl KeepAgentSession {
             .record_request(&self.session_id)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        signer.sign_psbt(&mut psbt).map_err(|e| Error::from_reason(e.to_string()))?;
+        signer
+            .sign_psbt(&mut psbt)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
 
         Ok(keep_bitcoin::psbt::serialize_psbt_base64(&psbt))
     }

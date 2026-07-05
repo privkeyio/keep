@@ -3,16 +3,15 @@
 
 #![forbid(unsafe_code)]
 
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyRuntimeError, PyValueError, PyConnectionError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use ::keep_agent::{
-    RateLimitConfig, SessionConfig, SessionManager, SessionMetadata,
-    SessionScope, SessionToken, Operation, AgentClient, ApprovalStatus, PendingSession,
-    loopback_proxy,
+    loopback_proxy, AgentClient, ApprovalStatus, Operation, PendingSession, RateLimitConfig,
+    SessionConfig, SessionManager, SessionMetadata, SessionScope, SessionToken,
 };
 
 fn to_py_err(e: impl std::fmt::Display) -> PyErr {
@@ -179,8 +178,10 @@ impl PyAgentSession {
         secret_key: Option<String>,
     ) -> PyResult<Self> {
         let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(sk) = secret_key {
-            let decoded = Zeroizing::new(hex::decode(&sk)
-                .map_err(|e| PyValueError::new_err(format!("Invalid secret key hex: {}", e)))?);
+            let decoded =
+                Zeroizing::new(hex::decode(&sk).map_err(|e| {
+                    PyValueError::new_err(format!("Invalid secret key hex: {}", e))
+                })?);
             if decoded.len() != 32 {
                 return Err(PyValueError::new_err(format!(
                     "Secret key must be 32 bytes, got {}",
@@ -210,8 +211,7 @@ impl PyAgentSession {
 
         let manager = SessionManager::new(pubkey_bytes);
 
-        let mut config = SessionConfig::new(scope.inner)
-            .with_duration_hours(duration_hours);
+        let mut config = SessionConfig::new(scope.inner).with_duration_hours(duration_hours);
 
         if let Some(rl) = rate_limit {
             config = config.with_rate_limit(rl.inner);
@@ -234,7 +234,8 @@ impl PyAgentSession {
     }
 
     fn get_session_info(&self) -> PyResult<PySessionInfo> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
@@ -250,7 +251,8 @@ impl PyAgentSession {
     }
 
     fn check_operation(&self, operation: &str) -> PyResult<bool> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
@@ -271,7 +273,8 @@ impl PyAgentSession {
     }
 
     fn check_event_kind(&self, kind: u16) -> PyResult<bool> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
@@ -282,7 +285,8 @@ impl PyAgentSession {
     }
 
     fn check_amount(&self, sats: u64) -> PyResult<bool> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
@@ -293,32 +297,46 @@ impl PyAgentSession {
     }
 
     fn record_request(&self) -> PyResult<()> {
-        self.manager.record_request(&self.session_id).map_err(to_py_err)
+        self.manager
+            .record_request(&self.session_id)
+            .map_err(to_py_err)
     }
 
     fn close(&self) -> PyResult<bool> {
-        self.manager.revoke_session(&self.session_id).map_err(to_py_err)
+        self.manager
+            .revoke_session(&self.session_id)
+            .map_err(to_py_err)
     }
 
     #[pyo3(signature = (kind, content, tags=None))]
-    fn sign_event(&self, kind: u16, content: &str, tags: Option<Vec<Vec<String>>>) -> PyResult<String> {
-        let session = self.manager
+    fn sign_event(
+        &self,
+        kind: u16,
+        content: &str,
+        tags: Option<Vec<Vec<String>>>,
+    ) -> PyResult<String> {
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
-        session.check_operation(&Operation::SignNostrEvent).map_err(to_py_err)?;
+        session
+            .check_operation(&Operation::SignNostrEvent)
+            .map_err(to_py_err)?;
         session.check_event_kind(kind).map_err(to_py_err)?;
 
-        let secret = self.secret_key.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?;
+        let secret = self.secret_key.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor.")
+        })?;
 
-        self.manager.record_request(&self.session_id).map_err(to_py_err)?;
+        self.manager
+            .record_request(&self.session_id)
+            .map_err(to_py_err)?;
 
         use nostr_sdk::prelude::*;
 
         let hex = Zeroizing::new(hex::encode(secret.as_slice()));
-        let keys = Keys::parse(hex.as_str())
-            .map_err(to_py_value_err)?;
+        let keys = Keys::parse(hex.as_str()).map_err(to_py_value_err)?;
 
         let mut nostr_tags: Vec<Tag> = Vec::new();
         for t in tags.unwrap_or_default() {
@@ -328,10 +346,7 @@ impl PyAgentSession {
             match Tag::parse(&t) {
                 Ok(tag) => nostr_tags.push(tag),
                 Err(e) => {
-                    return Err(PyValueError::new_err(format!(
-                        "Invalid tag {:?}: {}",
-                        t, e
-                    )));
+                    return Err(PyValueError::new_err(format!("Invalid tag {:?}: {}", t, e)));
                 }
             }
         }
@@ -362,14 +377,21 @@ impl PyAgentSession {
 
     #[pyo3(signature = (psbt_base64, network=None))]
     fn sign_psbt(&self, psbt_base64: &str, network: Option<&str>) -> PyResult<String> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
-        session.check_operation(&Operation::SignPsbt).map_err(to_py_err)?;
+        session
+            .check_operation(&Operation::SignPsbt)
+            .map_err(to_py_err)?;
 
-        let mut secret = self.secret_key.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?
+        let mut secret = self
+            .secret_key
+            .as_ref()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor.")
+            })?
             .clone();
 
         let network = match network.unwrap_or("testnet") {
@@ -382,8 +404,7 @@ impl PyAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
             .map_err(|e| PyValueError::new_err(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
-            .map_err(to_py_err)?;
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network).map_err(to_py_err)?;
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
 
@@ -411,7 +432,9 @@ impl PyAgentSession {
             }
         }
 
-        self.manager.record_request(&self.session_id).map_err(to_py_err)?;
+        self.manager
+            .record_request(&self.session_id)
+            .map_err(to_py_err)?;
 
         signer.sign_psbt(&mut psbt).map_err(to_py_err)?;
 
@@ -419,14 +442,19 @@ impl PyAgentSession {
     }
 
     fn get_public_key(&self) -> PyResult<String> {
-        let _ = self.secret_key.as_ref()
+        let _ = self
+            .secret_key
+            .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No secret key configured"))?;
 
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
-        session.check_operation(&Operation::GetPublicKey).map_err(to_py_err)?;
+        session
+            .check_operation(&Operation::GetPublicKey)
+            .map_err(to_py_err)?;
 
         let pubkey = session.pubkey();
         Ok(keep_core::keys::bytes_to_npub(pubkey))
@@ -434,14 +462,21 @@ impl PyAgentSession {
 
     #[pyo3(signature = (network=None))]
     fn get_bitcoin_address(&self, network: Option<&str>) -> PyResult<String> {
-        let session = self.manager
+        let session = self
+            .manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
 
-        session.check_operation(&Operation::GetBitcoinAddress).map_err(to_py_err)?;
+        session
+            .check_operation(&Operation::GetBitcoinAddress)
+            .map_err(to_py_err)?;
 
-        let mut secret = self.secret_key.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor."))?
+        let mut secret = self
+            .secret_key
+            .as_ref()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor.")
+            })?
             .clone();
 
         let network = match network.unwrap_or("testnet") {
@@ -451,8 +486,7 @@ impl PyAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
-            .map_err(to_py_err)?;
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network).map_err(to_py_err)?;
 
         signer.get_receive_address(0).map_err(to_py_err)
     }
@@ -489,7 +523,8 @@ impl PyRemoteSession {
 
         let proxy = resolve_proxy(proxy_port)?;
 
-        let client = rt.block_on(AgentClient::connect_with_proxy(bunker_url, timeout, proxy))
+        let client = rt
+            .block_on(AgentClient::connect_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
 
         Ok(Self {
@@ -500,50 +535,62 @@ impl PyRemoteSession {
 
     fn sign_event(&self, event_json: &str) -> PyResult<String> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let c = client.lock().await;
-            c.sign_event(event_json).await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let c = client.lock().await;
+                c.sign_event(event_json).await
+            })
+            .map_err(to_py_err)
     }
 
     fn get_public_key(&self) -> PyResult<String> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let c = client.lock().await;
-            c.get_public_key().await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let c = client.lock().await;
+                c.get_public_key().await
+            })
+            .map_err(to_py_err)
     }
 
     fn nip44_encrypt(&self, pubkey: &str, plaintext: &str) -> PyResult<String> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let c = client.lock().await;
-            c.nip44_encrypt(pubkey, plaintext).await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let c = client.lock().await;
+                c.nip44_encrypt(pubkey, plaintext).await
+            })
+            .map_err(to_py_err)
     }
 
     fn nip44_decrypt(&self, pubkey: &str, ciphertext: &str) -> PyResult<String> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let c = client.lock().await;
-            c.nip44_decrypt(pubkey, ciphertext).await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let c = client.lock().await;
+                c.nip44_decrypt(pubkey, ciphertext).await
+            })
+            .map_err(to_py_err)
     }
 
     fn ping(&self) -> PyResult<bool> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let c = client.lock().await;
-            c.ping().await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let c = client.lock().await;
+                c.ping().await
+            })
+            .map_err(to_py_err)
     }
 
     fn switch_relays(&self) -> PyResult<Option<Vec<String>>> {
         let client = self.client.clone();
-        self.runtime.block_on(async {
-            let mut c = client.lock().await;
-            c.switch_relays().await
-        }).map_err(to_py_err)
+        self.runtime
+            .block_on(async {
+                let mut c = client.lock().await;
+                c.switch_relays().await
+            })
+            .map_err(to_py_err)
     }
 
     fn disconnect(&self) -> PyResult<()> {
@@ -589,7 +636,8 @@ impl PyPendingSession {
 
         let proxy = resolve_proxy(proxy_port)?;
 
-        let pending = rt.block_on(PendingSession::new_with_proxy(bunker_url, timeout, proxy))
+        let pending = rt
+            .block_on(PendingSession::new_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
 
         let request_id = pending.request_id().to_string();
@@ -618,10 +666,13 @@ impl PyPendingSession {
         let inner = self.inner.clone();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let status = self.runtime.block_on(async {
-            let p = inner.lock().await;
-            p.poll(timeout).await
-        }).map_err(to_py_err)?;
+        let status = self
+            .runtime
+            .block_on(async {
+                let p = inner.lock().await;
+                p.poll(timeout).await
+            })
+            .map_err(to_py_err)?;
 
         Ok(match status {
             ApprovalStatus::Pending => "pending".to_string(),
@@ -635,10 +686,13 @@ impl PyPendingSession {
         let inner = self.inner.clone();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let client = self.runtime.block_on(async {
-            let p = inner.lock().await;
-            p.wait_for_approval(timeout).await
-        }).map_err(|e| PyConnectionError::new_err(e.to_string()))?;
+        let client = self
+            .runtime
+            .block_on(async {
+                let p = inner.lock().await;
+                p.wait_for_approval(timeout).await
+            })
+            .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
 
         Ok(PyRemoteSession {
             client: Arc::new(Mutex::new(client)),
