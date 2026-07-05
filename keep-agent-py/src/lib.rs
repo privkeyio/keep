@@ -23,6 +23,13 @@ fn to_py_value_err(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+fn resolve_proxy(proxy_port: Option<u16>) -> PyResult<Option<std::net::SocketAddr>> {
+    match proxy_port {
+        Some(port) => Ok(Some(loopback_proxy(port).map_err(to_py_value_err)?)),
+        None => Ok(None),
+    }
+}
+
 fn create_runtime() -> PyResult<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -478,10 +485,7 @@ impl PyRemoteSession {
         let rt = create_runtime()?;
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let proxy = match proxy_port {
-            Some(port) => Some(loopback_proxy(port).map_err(to_py_err)?),
-            None => None,
-        };
+        let proxy = resolve_proxy(proxy_port)?;
 
         let client = rt.block_on(AgentClient::connect_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
@@ -581,10 +585,7 @@ impl PyPendingSession {
         let rt = create_runtime()?;
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let proxy = match proxy_port {
-            Some(port) => Some(loopback_proxy(port).map_err(to_py_err)?),
-            None => None,
-        };
+        let proxy = resolve_proxy(proxy_port)?;
 
         let pending = rt.block_on(PendingSession::new_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;

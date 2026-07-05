@@ -438,19 +438,7 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
-        let relay_opts = relay_opts(self.proxy);
-        let mut added = Vec::new();
-        for relay in &valid_relays {
-            if self
-                .client
-                .pool()
-                .add_relay(relay, relay_opts.clone())
-                .await
-                .is_ok()
-            {
-                added.push(relay.clone());
-            }
-        }
+        let added = add_proxied_relays(&self.client, &valid_relays, self.proxy).await;
         if added.is_empty() {
             return Err(AgentError::Connection(
                 "Failed to add any relay during switch".into(),
@@ -645,6 +633,25 @@ fn relay_opts(proxy: Option<SocketAddr>) -> RelayOptions {
     }
 }
 
+/// Re-add `relays` to `client`'s pool with `proxy` applied, returning those that
+/// were added. Isolated from `switch_relays` so the proxy-preservation invariant
+/// (a signer-driven relay switch must never fall back to a direct connection and
+/// deanonymize traffic) stays unit-testable without a live signer.
+async fn add_proxied_relays(
+    client: &Client,
+    relays: &[String],
+    proxy: Option<SocketAddr>,
+) -> Vec<String> {
+    let opts = relay_opts(proxy);
+    let mut added = Vec::new();
+    for relay in relays {
+        if client.pool().add_relay(relay, opts.clone()).await.is_ok() {
+            added.push(relay.clone());
+        }
+    }
+    added
+}
+
 fn generate_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -696,6 +703,24 @@ mod tests {
             .unwrap();
         let relay = client.relay("wss://relay.example.com").await.unwrap();
         assert_eq!(*relay.connection_mode(), ConnectionMode::Direct);
+    }
+
+    #[tokio::test]
+    async fn test_switch_relays_reconnect_preserves_proxy() {
+        // Guards the switch_relays re-add path: a signer-driven relay switch must
+        // re-add relays through the proxy, never fall back to a direct connection.
+        let proxy = loopback_proxy(9050).unwrap();
+        let client = Client::new(Keys::generate());
+        let relays = vec![
+            "wss://relay-a.example.com".to_string(),
+            "wss://relay-b.example.com".to_string(),
+        ];
+        let added = add_proxied_relays(&client, &relays, Some(proxy)).await;
+        assert_eq!(added, relays);
+        for url in &relays {
+            let relay = client.relay(url).await.unwrap();
+            assert_eq!(*relay.connection_mode(), ConnectionMode::Proxy(proxy));
+        }
     }
 
     #[test]
