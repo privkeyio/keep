@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -22,11 +23,20 @@ pub struct PendingSession {
     relay_url: String,
     client_keys: Keys,
     client: Client,
+    proxy: Option<SocketAddr>,
     connect_sent: AtomicBool,
 }
 
 impl PendingSession {
     pub async fn new(bunker_url: &str, timeout: Duration) -> Result<Self> {
+        Self::new_with_proxy(bunker_url, timeout, None).await
+    }
+
+    pub async fn new_with_proxy(
+        bunker_url: &str,
+        timeout: Duration,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         let (signer_pubkey, relay_url, _) = AgentClient::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
@@ -34,7 +44,7 @@ impl PendingSession {
 
         client
             .pool()
-            .add_relay(&relay_url, default_relay_opts())
+            .add_relay(&relay_url, relay_opts(proxy))
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -49,6 +59,7 @@ impl PendingSession {
             relay_url,
             client_keys,
             client,
+            proxy,
             connect_sent: AtomicBool::new(false),
         })
     }
@@ -175,6 +186,7 @@ impl PendingSession {
                         relay_url: self.relay_url.clone(),
                         client_keys: self.client_keys.clone(),
                         client: self.client.clone(),
+                        proxy: self.proxy,
                     };
                     let _ = client.switch_relays().await;
                     return Ok(client);
@@ -199,10 +211,19 @@ pub struct AgentClient {
     relay_url: String,
     client_keys: Keys,
     client: Client,
+    proxy: Option<SocketAddr>,
 }
 
 impl AgentClient {
     pub async fn connect(bunker_url: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_with_proxy(bunker_url, timeout, None).await
+    }
+
+    pub async fn connect_with_proxy(
+        bunker_url: &str,
+        timeout: Duration,
+        proxy: Option<SocketAddr>,
+    ) -> Result<Self> {
         let (signer_pubkey, relay_url, secret) = Self::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
@@ -210,7 +231,7 @@ impl AgentClient {
 
         client
             .pool()
-            .add_relay(&relay_url, default_relay_opts())
+            .add_relay(&relay_url, relay_opts(proxy))
             .await
             .map_err(|e| AgentError::Connection(e.to_string()))?;
 
@@ -222,6 +243,7 @@ impl AgentClient {
             relay_url,
             client_keys,
             client,
+            proxy,
         };
 
         agent_client.send_connect(secret.as_deref()).await?;
@@ -416,19 +438,7 @@ impl AgentClient {
 
         self.client.disconnect().await;
         self.client.remove_all_relays().await;
-        let relay_opts = default_relay_opts();
-        let mut added = Vec::new();
-        for relay in &valid_relays {
-            if self
-                .client
-                .pool()
-                .add_relay(relay, relay_opts.clone())
-                .await
-                .is_ok()
-            {
-                added.push(relay.clone());
-            }
-        }
+        let added = add_proxied_relays(&self.client, &valid_relays, self.proxy).await;
         if added.is_empty() {
             return Err(AgentError::Connection(
                 "Failed to add any relay during switch".into(),
@@ -601,14 +611,45 @@ async fn wait_for_any_relay_connection(
     .map_err(|_| AgentError::Connection("Relay connection timeout".into()))
 }
 
-fn default_relay_opts() -> RelayOptions {
-    RelayOptions::default()
+pub fn loopback_proxy(port: u16) -> Result<SocketAddr> {
+    if port == 0 {
+        return Err(AgentError::Connection("Invalid proxy port".into()));
+    }
+    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+}
+
+fn relay_opts(proxy: Option<SocketAddr>) -> RelayOptions {
+    let opts = RelayOptions::default()
         .reconnect(true)
         .ping(true)
         .retry_interval(Duration::from_secs(10))
         .adjust_retry_interval(true)
         .ban_relay_on_mismatch(true)
-        .max_avg_latency(Some(Duration::from_secs(3)))
+        .max_avg_latency(Some(Duration::from_secs(3)));
+
+    match proxy {
+        Some(addr) => opts.connection_mode(ConnectionMode::Proxy(addr)),
+        None => opts,
+    }
+}
+
+/// Re-add `relays` to `client`'s pool with `proxy` applied, returning those that
+/// were added. Isolated from `switch_relays` so the proxy-preservation invariant
+/// (a signer-driven relay switch must never fall back to a direct connection and
+/// deanonymize traffic) stays unit-testable without a live signer.
+async fn add_proxied_relays(
+    client: &Client,
+    relays: &[String],
+    proxy: Option<SocketAddr>,
+) -> Vec<String> {
+    let opts = relay_opts(proxy);
+    let mut added = Vec::new();
+    for relay in relays {
+        if client.pool().add_relay(relay, opts.clone()).await.is_ok() {
+            added.push(relay.clone());
+        }
+    }
+    added
 }
 
 fn generate_uuid() -> String {
@@ -625,6 +666,61 @@ mod tests {
         let uuid2 = generate_uuid();
         assert_ne!(uuid1, uuid2);
         assert_eq!(uuid1.len(), 36);
+    }
+
+    #[test]
+    fn test_loopback_proxy_rejects_port_zero() {
+        assert!(loopback_proxy(0).is_err());
+    }
+
+    #[test]
+    fn test_loopback_proxy_builds_localhost() {
+        let addr = loopback_proxy(9050).unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.to_string(), "127.0.0.1:9050");
+    }
+
+    #[tokio::test]
+    async fn test_relay_opts_applies_proxy_to_pool_relay() {
+        let proxy = loopback_proxy(9050).unwrap();
+        let client = Client::new(Keys::generate());
+        client
+            .pool()
+            .add_relay("wss://relay.example.com", relay_opts(Some(proxy)))
+            .await
+            .unwrap();
+        let relay = client.relay("wss://relay.example.com").await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Proxy(proxy));
+    }
+
+    #[tokio::test]
+    async fn test_relay_opts_none_yields_direct() {
+        let client = Client::new(Keys::generate());
+        client
+            .pool()
+            .add_relay("wss://relay.example.com", relay_opts(None))
+            .await
+            .unwrap();
+        let relay = client.relay("wss://relay.example.com").await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Direct);
+    }
+
+    #[tokio::test]
+    async fn test_switch_relays_reconnect_preserves_proxy() {
+        // Guards the switch_relays re-add path: a signer-driven relay switch must
+        // re-add relays through the proxy, never fall back to a direct connection.
+        let proxy = loopback_proxy(9050).unwrap();
+        let client = Client::new(Keys::generate());
+        let relays = vec![
+            "wss://relay-a.example.com".to_string(),
+            "wss://relay-b.example.com".to_string(),
+        ];
+        let added = add_proxied_relays(&client, &relays, Some(proxy)).await;
+        assert_eq!(added, relays);
+        for url in &relays {
+            let relay = client.relay(url).await.unwrap();
+            assert_eq!(*relay.connection_mode(), ConnectionMode::Proxy(proxy));
+        }
     }
 
     #[test]

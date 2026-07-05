@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use ::keep_agent::{
     RateLimitConfig, SessionConfig, SessionManager, SessionMetadata,
     SessionScope, SessionToken, Operation, AgentClient, ApprovalStatus, PendingSession,
+    loopback_proxy,
 };
 
 fn to_py_err(e: impl std::fmt::Display) -> PyErr {
@@ -20,6 +21,13 @@ fn to_py_err(e: impl std::fmt::Display) -> PyErr {
 
 fn to_py_value_err(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+fn resolve_proxy(proxy_port: Option<u16>) -> PyResult<Option<std::net::SocketAddr>> {
+    match proxy_port {
+        Some(port) => Ok(Some(loopback_proxy(port).map_err(to_py_value_err)?)),
+        None => Ok(None),
+    }
 }
 
 fn create_runtime() -> PyResult<tokio::runtime::Runtime> {
@@ -472,12 +480,14 @@ pub struct PyRemoteSession {
 #[pymethods]
 impl PyRemoteSession {
     #[staticmethod]
-    #[pyo3(signature = (bunker_url, timeout_secs=30))]
-    fn connect(bunker_url: &str, timeout_secs: u64) -> PyResult<Self> {
+    #[pyo3(signature = (bunker_url, timeout_secs=30, proxy_port=None))]
+    fn connect(bunker_url: &str, timeout_secs: u64, proxy_port: Option<u16>) -> PyResult<Self> {
         let rt = create_runtime()?;
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let client = rt.block_on(AgentClient::connect(bunker_url, timeout))
+        let proxy = resolve_proxy(proxy_port)?;
+
+        let client = rt.block_on(AgentClient::connect_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
 
         Ok(Self {
@@ -570,12 +580,14 @@ pub struct PyPendingSession {
 #[pymethods]
 impl PyPendingSession {
     #[staticmethod]
-    #[pyo3(signature = (bunker_url, timeout_secs=30))]
-    fn create(bunker_url: &str, timeout_secs: u64) -> PyResult<Self> {
+    #[pyo3(signature = (bunker_url, timeout_secs=30, proxy_port=None))]
+    fn create(bunker_url: &str, timeout_secs: u64, proxy_port: Option<u16>) -> PyResult<Self> {
         let rt = create_runtime()?;
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let pending = rt.block_on(PendingSession::new(bunker_url, timeout))
+        let proxy = resolve_proxy(proxy_port)?;
+
+        let pending = rt.block_on(PendingSession::new_with_proxy(bunker_url, timeout, proxy))
             .map_err(|e| PyConnectionError::new_err(e.to_string()))?;
 
         let request_id = pending.request_id().to_string();

@@ -17,7 +17,7 @@ pub mod session;
 pub mod mcp;
 
 pub use attestation::{verify_peer_attestation, ExpectedPcrs, PeerAttestation, VerificationConfig};
-pub use client::{AgentClient, ApprovalStatus, PendingSession};
+pub use client::{loopback_proxy, AgentClient, ApprovalStatus, PendingSession};
 pub use entropy::{get_entropy, is_nitro_enclave};
 pub use error::{AgentError, Result};
 pub use frost::{FrostCommitment, FrostCoordinator, FrostParticipant, FrostSignatureShare};

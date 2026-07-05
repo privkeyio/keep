@@ -10,9 +10,25 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use keep_agent::{
-    AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
+    loopback_proxy, AgentClient, ApprovalStatus, Operation, PendingSession as RustPendingSession,
     RateLimitConfig, SessionConfig, SessionManager, SessionMetadata, SessionScope, SessionToken,
 };
+
+// napi maps JS numbers to u16 via a uint32 cast, silently wrapping out-of-range
+// values (70000 -> 4464). Take u32 and reject anything outside 1..=65535 so a bad
+// port fails loudly instead of routing traffic to the wrong loopback port.
+fn resolve_proxy(proxy_port: Option<u32>) -> Result<Option<std::net::SocketAddr>> {
+    match proxy_port {
+        Some(port) => {
+            let port = u16::try_from(port)
+                .map_err(|_| Error::from_reason(format!("Invalid proxy port: {port}")))?;
+            Ok(Some(
+                loopback_proxy(port).map_err(|e| Error::from_reason(e.to_string()))?,
+            ))
+        }
+        None => Ok(None),
+    }
+}
 
 #[napi(object)]
 pub struct SessionScopeConfig {
@@ -480,10 +496,16 @@ pub struct RemoteSession {
 #[napi]
 impl RemoteSession {
     #[napi(factory)]
-    pub async fn connect(bunker_url: String, timeout_seconds: Option<u32>) -> Result<Self> {
+    pub async fn connect(
+        bunker_url: String,
+        timeout_seconds: Option<u32>,
+        proxy_port: Option<u32>,
+    ) -> Result<Self> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
 
-        let client = AgentClient::connect(&bunker_url, timeout)
+        let proxy = resolve_proxy(proxy_port)?;
+
+        let client = AgentClient::connect_with_proxy(&bunker_url, timeout, proxy)
             .await
             .map_err(|e| Error::from_reason(format!("Connection failed: {}", e)))?;
 
@@ -564,10 +586,16 @@ pub struct PendingSession {
 #[napi]
 impl PendingSession {
     #[napi(factory)]
-    pub async fn create(bunker_url: String, timeout_seconds: Option<u32>) -> Result<Self> {
+    pub async fn create(
+        bunker_url: String,
+        timeout_seconds: Option<u32>,
+        proxy_port: Option<u32>,
+    ) -> Result<Self> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
 
-        let pending = RustPendingSession::new(&bunker_url, timeout)
+        let proxy = resolve_proxy(proxy_port)?;
+
+        let pending = RustPendingSession::new_with_proxy(&bunker_url, timeout, proxy)
             .await
             .map_err(|e| Error::from_reason(format!("Connection failed: {}", e)))?;
 
