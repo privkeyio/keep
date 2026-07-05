@@ -84,8 +84,10 @@ impl KeepAgentSession {
         secret_key: Option<String>,
     ) -> Result<Self> {
         let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(ref sk) = secret_key {
-            let decoded = Zeroizing::new(hex::decode(sk)
-                .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?);
+            let decoded = Zeroizing::new(
+                hex::decode(sk)
+                    .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?,
+            );
             if decoded.len() != 32 {
                 return Err(Error::from_reason(format!(
                     "Secret key must be 32 bytes, got {}",
@@ -101,7 +103,7 @@ impl KeepAgentSession {
 
         let pubkey: [u8; 32] = if let Some(ref sk) = secret_bytes {
             use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let scalar = k256::NonZeroScalar::try_from(sk.as_ref().as_slice())
+            let scalar = k256::NonZeroScalar::try_from(sk.as_slice())
                 .map_err(|_| Error::from_reason("Invalid secret key"))?;
             let pk = k256::PublicKey::from_secret_scalar(&scalar);
             let point = pk.to_encoded_point(true);
@@ -118,7 +120,9 @@ impl KeepAgentSession {
         let scope = if let Some(config) = scope_config {
             let ops: Vec<Operation> = config
                 .operations
-                .unwrap_or_else(|| vec!["sign_nostr_event".to_string(), "get_public_key".to_string()])
+                .unwrap_or_else(|| {
+                    vec!["sign_nostr_event".to_string(), "get_public_key".to_string()]
+                })
                 .into_iter()
                 .filter_map(|s| match s.as_str() {
                     "sign_nostr_event" => Some(Operation::SignNostrEvent),
@@ -152,7 +156,9 @@ impl KeepAgentSession {
             }
             if let Some(max) = config.max_amount_sats {
                 if max < 0 {
-                    return Err(Error::from_reason("max_amount_sats must be non-negative".to_string()));
+                    return Err(Error::from_reason(
+                        "max_amount_sats must be non-negative".to_string(),
+                    ));
                 }
                 scope = scope.with_max_amount(max as u64);
             }
@@ -330,9 +336,9 @@ impl KeepAgentSession {
 
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
 
-        let hex = Zeroizing::new(hex::encode(secret.as_ref()));
-        let keys = Keys::parse(hex.as_str())
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let hex = Zeroizing::new(hex::encode(secret.as_slice()));
+        let keys =
+            Keys::parse(hex.as_str()).map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
         let nostr_tags: Vec<Tag> = tags
             .unwrap_or_default()
@@ -369,11 +375,7 @@ impl KeepAgentSession {
     }
 
     #[napi]
-    pub async fn sign_psbt(
-        &self,
-        psbt_base64: String,
-        network: Option<String>,
-    ) -> Result<String> {
+    pub async fn sign_psbt(&self, psbt_base64: String, network: Option<String>) -> Result<String> {
         let token = self.token.lock().await;
         let session = self
             .manager
@@ -384,10 +386,11 @@ impl KeepAgentSession {
             .check_operation(&Operation::SignPsbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = Zeroizing::new(*self
+        let mut secret = self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?
+            .clone();
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -399,7 +402,7 @@ impl KeepAgentSession {
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(&psbt_base64)
             .map_err(|e| Error::from_reason(format!("Invalid PSBT: {}", e)))?;
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let analysis = signer
@@ -434,7 +437,9 @@ impl KeepAgentSession {
             .record_request(&self.session_id)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        signer.sign_psbt(&mut psbt).map_err(|e| Error::from_reason(e.to_string()))?;
+        signer
+            .sign_psbt(&mut psbt)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
 
         Ok(keep_bitcoin::psbt::serialize_psbt_base64(&psbt))
     }
@@ -467,10 +472,11 @@ impl KeepAgentSession {
             .check_operation(&Operation::GetBitcoinAddress)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        let mut secret = Zeroizing::new(*self
+        let mut secret = self
             .secret_key
             .as_ref()
-            .ok_or_else(|| Error::from_reason("No secret key configured"))?);
+            .ok_or_else(|| Error::from_reason("No secret key configured"))?
+            .clone();
 
         let network = match network.as_deref().unwrap_or("testnet") {
             "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
@@ -479,7 +485,7 @@ impl KeepAgentSession {
             _ => keep_bitcoin::Network::Testnet,
         };
 
-        let signer = keep_bitcoin::BitcoinSigner::new(&mut *secret, network)
+        let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         signer

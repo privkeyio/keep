@@ -25,6 +25,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
+      # keep-agent-py and keep-agent-ts are excluded from the workspace (cdylib
+      # bindings with their own lockfiles), so --workspace never sees them. Check
+      # them explicitly to catch dependency drift that only surfaces on compile.
+      - run: cargo fmt --manifest-path keep-agent-py/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path keep-agent-py/Cargo.toml -- -D warnings
+      - run: cargo fmt --manifest-path keep-agent-ts/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path keep-agent-ts/Cargo.toml -- -D warnings
 
   build:
     runs-on: ${{ matrix.os }}
