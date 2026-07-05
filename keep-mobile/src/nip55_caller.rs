@@ -125,7 +125,7 @@ impl Nip55NonceStore {
             },
         );
         if nonces.len() > MAX_ACTIVE_NONCES {
-            nonces.retain(|_, d| now_elapsed_ms < d.expires_at_ms);
+            nonces.retain(|_, d| is_live(d, now_elapsed_ms));
             if nonces.len() > MAX_ACTIVE_NONCES {
                 evict_oldest(&mut nonces);
             }
@@ -136,32 +136,25 @@ impl Nip55NonceStore {
     /// Consume a nonce, returning the bound package when valid and unexpired. A
     /// nonce is single-use: it is removed whether or not it was still valid.
     ///
-    /// Expiry is measured on the injected CLOCK_BOOTTIME (`elapsedRealtime`)
+    /// Liveness is measured on the injected CLOCK_BOOTTIME (`elapsedRealtime`)
     /// millis value: it counts time spent in device suspend (the #597 fix, where
     /// a monotonic `Instant` would pause and silently stretch the window) while
-    /// still resisting wall-clock manipulation. Because that clock now crosses
-    /// the FFI boundary, the Kotlin clock-anomaly clause (`expiresAt - now >
-    /// NONCE_EXPIRY`) is live here: a backward boot-time jump can leave a
-    /// future-dated entry more than the window ahead of `now`, so treat it as
-    /// Expired rather than trusting the stale expiry.
+    /// still resisting wall-clock manipulation. See [`is_live`] for the window.
     pub fn consume(&self, nonce: String, now_elapsed_ms: u64) -> Nip55NonceResult {
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
         match nonces.remove(&nonce) {
             None => Nip55NonceResult::Invalid,
-            Some(d) if now_elapsed_ms >= d.expires_at_ms => Nip55NonceResult::Expired,
-            Some(d) if d.expires_at_ms.saturating_sub(now_elapsed_ms) > NONCE_EXPIRY_MS => {
-                Nip55NonceResult::Expired
-            }
-            Some(d) => Nip55NonceResult::Valid {
+            Some(d) if is_live(&d, now_elapsed_ms) => Nip55NonceResult::Valid {
                 package_name: d.package_name,
             },
+            Some(_) => Nip55NonceResult::Expired,
         }
     }
 
-    /// Drop expired nonces. Called opportunistically (e.g. on foreground).
+    /// Drop non-live nonces. Called opportunistically (e.g. on foreground).
     pub fn cleanup_expired(&self, now_elapsed_ms: u64) {
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
-        nonces.retain(|_, d| now_elapsed_ms < d.expires_at_ms);
+        nonces.retain(|_, d| is_live(d, now_elapsed_ms));
     }
 
     pub fn clear(&self) {
@@ -170,6 +163,19 @@ impl Nip55NonceStore {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
     }
+}
+
+/// A nonce is live iff `now` sits within its `[generated_at, expires_at)`
+/// window. The upper bound (`now < expires_at`) is ordinary expiry. The lower
+/// bound, expressed as `expires_at - now <= NONCE_EXPIRY_MS`, rejects an entry
+/// whose stored expiry is more than a full window ahead of `now`, reachable
+/// only if the injected clock is not monotonic (a caller feeding an
+/// inconsistent `now_elapsed_ms`), in which case we fail closed rather than
+/// trust the stale expiry. `consume`, `cleanup_expired`, and the `generate`
+/// eviction retain all use this one predicate so their liveness agrees.
+fn is_live(d: &NonceData, now_elapsed_ms: u64) -> bool {
+    now_elapsed_ms < d.expires_at_ms
+        && d.expires_at_ms.saturating_sub(now_elapsed_ms) <= NONCE_EXPIRY_MS
 }
 
 /// Drop the oldest-expiring nonces until the set is at most half of the cap, so
@@ -283,13 +289,33 @@ mod tests {
 
     #[test]
     fn nonce_anomalous_future_expiry_is_rejected() {
-        // A backward boot-time jump can leave an entry more than a full window
-        // ahead of `now`; the anomaly guard treats it as Expired.
+        // A non-monotonic injected clock can leave an entry more than a full
+        // window ahead of `now`; the anomaly guard treats it as Expired.
         let store = Nip55NonceStore::new();
         let generated_at: u64 = 10 * NONCE_EXPIRY_MS;
         let nonce = store.generate("com.app".into(), generated_at);
         // `now` is far below the stored expiry (clock jumped backward).
         assert_eq!(store.consume(nonce, 0), Nip55NonceResult::Expired);
+    }
+
+    #[test]
+    fn anomaly_guard_boundary_is_exact() {
+        // At exactly one window ahead (`now == generated_at`) the nonce is still
+        // Valid; one milli below that, the anomaly guard rejects it as Expired.
+        let generated_at: u64 = 1_000;
+        let store = Nip55NonceStore::new();
+        let nonce = store.generate("com.app".into(), generated_at);
+        assert!(matches!(
+            store.consume(nonce, generated_at),
+            Nip55NonceResult::Valid { .. }
+        ));
+
+        let store = Nip55NonceStore::new();
+        let nonce = store.generate("com.app".into(), generated_at);
+        assert_eq!(
+            store.consume(nonce, generated_at - 1),
+            Nip55NonceResult::Expired
+        );
     }
 
     #[test]
@@ -354,6 +380,18 @@ mod tests {
             store.consume(fresh, now),
             Nip55NonceResult::Valid { .. }
         ));
+    }
+
+    #[test]
+    fn cleanup_drops_anomalous_future_dated_entries() {
+        // cleanup_expired shares `is_live` with consume, so an entry whose
+        // expiry sits more than a window ahead of `now` (non-monotonic clock)
+        // is dropped rather than lingering until eviction.
+        let store = Nip55NonceStore::new();
+        let generated_at: u64 = 10 * NONCE_EXPIRY_MS;
+        let nonce = store.generate("com.app".into(), generated_at);
+        store.cleanup_expired(0);
+        assert_eq!(store.consume(nonce, 0), Nip55NonceResult::Invalid);
     }
 
     #[test]
