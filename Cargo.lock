@@ -1658,9 +1658,9 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
 dependencies = [
  "encode_unicode",
  "libc",
@@ -4227,9 +4227,9 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.18.4"
+version = "0.18.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
+checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
 dependencies = [
  "console",
  "portable-atomic",
@@ -4491,7 +4491,7 @@ dependencies = [
  "keep-bitcoin",
  "keep-core",
  "nostr-sdk",
- "rand 0.10.1",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "subtle",
@@ -4549,7 +4549,7 @@ dependencies = [
  "keep-nip46",
  "nostr-sdk",
  "p256",
- "rand 0.10.1",
+ "rand 0.10.2",
  "ratatui",
  "reqwest",
  "secrecy",
@@ -4598,7 +4598,7 @@ dependencies = [
  "memsec 0.7.0",
  "memsecurity",
  "proptest",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rand_core 0.6.4",
  "redb 2.6.3",
  "redb 4.1.0",
@@ -4638,7 +4638,7 @@ dependencies = [
  "nokhwa",
  "nostr-sdk",
  "notify-rust",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rfd",
  "rustls",
  "rxing",
@@ -4710,7 +4710,7 @@ dependencies = [
  "p256",
  "parking_lot",
  "proptest",
- "rand 0.10.1",
+ "rand 0.10.2",
  "redb 4.1.0",
  "rustls",
  "rustls-pki-types",
@@ -4772,7 +4772,7 @@ dependencies = [
  "keep-frost-net",
  "nostr-relay-builder",
  "nostr-sdk",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rustls",
  "serde",
  "serde_json",
@@ -7252,9 +7252,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20 0.10.1",
  "getrandom 0.4.3",
@@ -7800,9 +7800,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
