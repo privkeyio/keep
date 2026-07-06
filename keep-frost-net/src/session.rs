@@ -70,6 +70,8 @@ pub struct CachedSessionState {
     message_type: String,
     threshold: u16,
     participants: Vec<u16>,
+    #[serde(default)]
+    derivation_path: Vec<u32>,
     state: SessionState,
     commitments: Vec<(Vec<u8>, Vec<u8>)>,
     signature_shares: Vec<(Vec<u8>, Vec<u8>)>,
@@ -91,6 +93,12 @@ pub struct NetworkSession {
     message_type: String,
     threshold: u16,
     participants: Vec<u16>,
+    /// BIP-32 unhardened derivation path off the group pubkey (#487 PR3).
+    /// Empty means "sign under the group key" (pre-#487 behavior). Non-empty
+    /// means every participant tweaks its KeyPackage by the composite
+    /// BIP-32 scalar before running round1/round2, and the aggregate
+    /// signature verifies under the derived child pubkey.
+    derivation_path: Vec<u32>,
     state: SessionState,
     created_at: Instant,
     timeout: Duration,
@@ -116,6 +124,7 @@ impl NetworkSession {
             message_type: String::new(),
             threshold,
             participants,
+            derivation_path: Vec::new(),
             state: SessionState::AwaitingCommitments,
             created_at: Instant::now(),
             timeout: Duration::from_secs(30),
@@ -155,6 +164,19 @@ impl NetworkSession {
 
     pub fn set_message_type(&mut self, message_type: String) {
         self.message_type = message_type;
+    }
+
+    /// BIP-32 unhardened derivation path off the group pubkey (#487 PR3).
+    /// Empty means sign under the group key. Set by the responder when it
+    /// accepts a `SignRequestPayload` that carries a non-empty path so the
+    /// later round2 and aggregation steps see the same value the round1
+    /// commitment was generated against.
+    pub fn derivation_path(&self) -> &[u32] {
+        &self.derivation_path
+    }
+
+    pub fn set_derivation_path(&mut self, path: Vec<u32>) {
+        self.derivation_path = path;
     }
 
     pub fn state(&self) -> SessionState {
@@ -488,6 +510,7 @@ impl NetworkSession {
             message_type: self.message_type.clone(),
             threshold: self.threshold,
             participants: self.participants.clone(),
+            derivation_path: self.derivation_path.clone(),
             state: self.state,
             commitments,
             signature_shares,
@@ -594,6 +617,7 @@ impl NetworkSession {
             message_type: cached.message_type,
             threshold: cached.threshold,
             participants: cached.participants,
+            derivation_path: cached.derivation_path,
             state: cached.state,
             created_at: Instant::now(),
             timeout: Duration::from_secs(30),

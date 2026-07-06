@@ -333,6 +333,12 @@ pub struct SessionInfo {
     /// [`RequireStructuredPayloadHooks`] for hybrid Nostr + Bitcoin groups;
     /// the recompute-and-compare is performed unconditionally when present.
     pub structured_payload: Option<Vec<u8>>,
+    /// BIP-32 unhardened derivation path off the group pubkey (#487 PR3).
+    /// Empty means the request signs under the group key; non-empty means
+    /// the aggregate signature will verify under the derived child pubkey.
+    /// Hooks can inspect this to gate signing under specific chains (e.g.
+    /// enforce `/0/*` for receive and refuse `/1/*` on a receive-only role).
+    pub derivation_path: Vec<u32>,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -352,6 +358,7 @@ impl From<&NetworkSession> for SessionInfo {
             // not the body. Fine for notification purposes; the recompute
             // check runs in pre_sign where the request is in scope.
             structured_payload: None,
+            derivation_path: session.derivation_path().to_vec(),
         }
     }
 }
@@ -2851,6 +2858,7 @@ mod tests {
             requester: 1,
             message_type: "raw".to_string(),
             structured_payload: None,
+            derivation_path: Vec::new(),
         }
     }
 
@@ -2865,6 +2873,7 @@ mod tests {
             requester: 1,
             message_type: crate::MSG_TYPE_NOSTR_EVENT.to_string(),
             structured_payload: structured,
+            derivation_path: Vec::new(),
         }
     }
 

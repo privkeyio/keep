@@ -294,6 +294,16 @@ impl KfpMessage {
                         return Err("Structured payload exceeds maximum size");
                     }
                 }
+                if p.derivation_path.len() > MAX_DERIVATION_PATH_DEPTH {
+                    return Err("Derivation path exceeds maximum depth");
+                }
+                if p.derivation_path
+                    .iter()
+                    .any(|&i| i >= BIP32_HARDENED_INDEX_START)
+                {
+                    return Err("Derivation path contains a hardened index; \
+                         only unhardened indexes are meaningful for FROST groups");
+                }
                 if p.participants.len() > MAX_PARTICIPANTS {
                     return Err("Participants list exceeds maximum size");
                 }
@@ -991,7 +1001,29 @@ pub struct SignRequestPayload {
         with = "hex_bytes_opt"
     )]
     pub structured_payload: Option<Vec<u8>>,
+    /// BIP-32 unhardened derivation path off the group pubkey (#487 PR 3).
+    /// When non-empty, every FROST participant tweaks its KeyPackage by the
+    /// composite BIP-32 scalar for this path before signing, and the
+    /// aggregated signature verifies under the derived child pubkey rather
+    /// than the group pubkey. Empty (or absent, for pre-#487 peers) means
+    /// "sign under the group key" — the pre-existing behavior.
+    ///
+    /// Hardened indexes (>= 2^31) are refused at protocol validation: FROST
+    /// groups have no group secret to hand out for hardened derivation, so
+    /// only unhardened paths (`/0/*`, `/1/*`, etc.) are meaningful.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_path: Vec<u32>,
 }
+
+/// BIP-32 says index >= 2^31 selects hardened derivation (needs the private
+/// key). FROST groups only ever do unhardened public derivation.
+pub(crate) const BIP32_HARDENED_INDEX_START: u32 = 0x8000_0000;
+
+/// Cap on the derivation path depth carried in a sign request. BIP-86-style
+/// wallets never exceed `/0/*` or `/1/*` (depth 2) below the account xpub,
+/// and BIP-32 itself allows at most 255 levels. Bounding this at protocol
+/// validate keeps a hostile peer from forcing a large derivation walk.
+pub const MAX_DERIVATION_PATH_DEPTH: usize = 8;
 
 mod hex_bytes_opt {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -1052,7 +1084,17 @@ impl SignRequestPayload {
             nonce_refs: Vec::new(),
             session_salt: Vec::new(),
             structured_payload: None,
+            derivation_path: Vec::new(),
         }
+    }
+
+    /// Attach a BIP-32 unhardened derivation path off the group pubkey. On
+    /// signing, every participant applies the composite BIP-32 tweak for
+    /// this path and the aggregate signature verifies under the derived
+    /// child pubkey. Empty path returns the request unchanged.
+    pub fn with_derivation_path(mut self, path: Vec<u32>) -> Self {
+        self.derivation_path = path;
+        self
     }
 
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
@@ -2456,6 +2498,39 @@ mod tests {
         assert!(err
             .to_string()
             .contains("structured payload exceeds maximum size"));
+    }
+
+    /// A derivation path deeper than `MAX_DERIVATION_PATH_DEPTH` is refused at
+    /// validation so a hostile peer cannot force a large derivation walk.
+    #[test]
+    fn oversized_derivation_path_refused_at_validate() {
+        let path: Vec<u32> = (0..=MAX_DERIVATION_PATH_DEPTH as u32).collect();
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_derivation_path(path);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    /// A hardened index (>= 2^31) is refused: FROST groups have no group
+    /// secret for hardened derivation, only unhardened paths are meaningful.
+    #[test]
+    fn hardened_derivation_index_refused_at_validate() {
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_derivation_path(vec![0, BIP32_HARDENED_INDEX_START]);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
     }
 
     #[test]

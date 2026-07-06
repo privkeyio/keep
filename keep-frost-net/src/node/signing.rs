@@ -428,8 +428,6 @@ impl KfpNode {
             "Received sign request"
         );
 
-        let key_package = self.share.key_package()?;
-
         let existing_commitment = {
             let sessions = self.sessions.read();
             sessions
@@ -481,6 +479,7 @@ impl KfpNode {
             requester,
             message_type: request.message_type.clone(),
             structured_payload: request.structured_payload.clone(),
+            derivation_path: request.derivation_path.clone(),
         };
 
         // Recompute the digest from the structured payload BEFORE the pre-sign
@@ -645,6 +644,22 @@ impl KfpNode {
             return Ok(());
         }
 
+        // #487 PR3: apply the composite BIP-32 tweak for the requester's
+        // derivation path before we commit. Every subsequent step in this
+        // session (round2 sign, aggregation) must use the SAME tweaked package
+        // for the aggregate signature to verify, so we persist the path on the
+        // session at the same time as the commitment below. Computed here, after
+        // the resend early-return, so a duplicate request that just re-echoes our
+        // cached commitment never recomputes the derivation.
+        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+            &self.share.key_package()?,
+            &self.group_pubkey,
+            &request.derivation_path,
+        )
+        .map_err(|e| {
+            FrostNetError::Crypto(format!("BIP-32 tweak on responder key package failed: {e}"))
+        })?;
+
         // `None` signals that the pre-exchange path required a pooled nonce that
         // vanished (consumed, evicted, or lost on restart) between validation
         // and consume, so the session cannot proceed and must be torn down.
@@ -659,6 +674,7 @@ impl KfpNode {
                 &request.session_salt,
             )?;
             session.set_message_type(request.message_type.clone());
+            session.set_derivation_path(request.derivation_path.clone());
 
             // All nonce_refs have now been validated above, and a pre-exchange
             // request that reaches here covers the full threshold set. The
@@ -849,7 +865,21 @@ impl KfpNode {
                 return Ok(());
             }
 
-            let pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
+            // #487 PR3: aggregate under the composite-tweaked pubkey
+            // package when the session is signing at a derivation path, so
+            // signature-share validation and the aggregate signature line
+            // up under the derived child key.
+            let base_pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
+            let pubkey_pkg = keep_core::frost::bip32_signing::tweak_public_key_package_at_path(
+                &base_pubkey_pkg,
+                &self.group_pubkey,
+                session.derivation_path(),
+            )
+            .map_err(|e| {
+                FrostNetError::Crypto(format!(
+                    "BIP-32 tweak on aggregation pubkey package failed: {e}"
+                ))
+            })?;
             session.try_aggregate(&pubkey_pkg)?.map(|sig| {
                 (
                     sig,
@@ -886,9 +916,7 @@ impl KfpNode {
     }
 
     pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
-        let key_package = self.share.key_package()?;
-
-        let (signing_package, nonces) = {
+        let (signing_package, nonces, derivation_path) = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
@@ -907,8 +935,21 @@ impl KfpNode {
                 None => return Ok(()),
             };
 
-            (signing_package, nonces)
+            let derivation_path = session.derivation_path().to_vec();
+            (signing_package, nonces, derivation_path)
         };
+
+        // #487 PR3: sign under the composite-tweaked key package when the
+        // session carries a derivation path, so the sig share aggregates to
+        // a signature under the derived child pubkey rather than the group.
+        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+            &self.share.key_package()?,
+            &self.group_pubkey,
+            &derivation_path,
+        )
+        .map_err(|e| {
+            FrostNetError::Crypto(format!("BIP-32 tweak on responder key package failed: {e}"))
+        })?;
 
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
@@ -1141,10 +1182,52 @@ impl KfpNode {
     /// cross-domain label spoof before signing.
     pub async fn request_signature_structured(
         &self,
-        mut message: Vec<u8>,
+        message: Vec<u8>,
         message_type: &str,
         structured_payload: Option<Vec<u8>>,
     ) -> Result<[u8; 64]> {
+        self.request_signature_at_path(message, message_type, structured_payload, Vec::new())
+            .await
+    }
+
+    /// Request a threshold signature under a BIP-32 unhardened child of the
+    /// group pubkey. Every participant tweaks its FROST KeyPackage by the
+    /// composite BIP-32 scalar for `derivation_path` before running the
+    /// standard round1/round2, and the aggregated BIP-340 signature verifies
+    /// under the derived child pubkey rather than the group pubkey.
+    ///
+    /// Empty `derivation_path` is equivalent to
+    /// [`Self::request_signature_structured`] and signs under the group
+    /// pubkey; non-empty paths are the entry point for HD spending
+    /// (`/0/*` receive, `/1/*` change) once #487 PR 4 wires the descriptor.
+    /// Hardened indexes are refused at protocol validation.
+    pub async fn request_signature_at_path(
+        &self,
+        mut message: Vec<u8>,
+        message_type: &str,
+        structured_payload: Option<Vec<u8>>,
+        derivation_path: Vec<u32>,
+    ) -> Result<[u8; 64]> {
+        // Reject an oversized or hardened path locally, mirroring the wire-side
+        // check in `KfpMessage::validate`, so a bad path fails fast with a clear
+        // message instead of after a network round-trip.
+        if derivation_path.len() > crate::protocol::MAX_DERIVATION_PATH_DEPTH {
+            return Err(FrostNetError::Protocol(format!(
+                "Derivation path depth {} exceeds maximum {}",
+                derivation_path.len(),
+                crate::protocol::MAX_DERIVATION_PATH_DEPTH
+            )));
+        }
+        if derivation_path
+            .iter()
+            .any(|&i| i >= crate::protocol::BIP32_HARDENED_INDEX_START)
+        {
+            return Err(FrostNetError::Protocol(
+                "Derivation path contains a hardened index; only unhardened indexes are \
+                 meaningful for FROST groups"
+                    .into(),
+            ));
+        }
         // On a round timeout the co-signers that failed to commit are treated as
         // unresponsive and excluded, then we re-select from the remaining online
         // peers and retry. This fails over to other live co-signers in seconds
@@ -1187,6 +1270,7 @@ impl KfpNode {
                     round_message,
                     message_type,
                     structured_payload.clone(),
+                    derivation_path.clone(),
                     &excluded,
                     logical_id,
                     attempt,
@@ -1282,11 +1366,13 @@ impl KfpNode {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn signing_round(
         &self,
         message: Vec<u8>,
         message_type: &str,
         structured_payload: Option<Vec<u8>>,
+        derivation_path: Vec<u32>,
         exclude: &[u16],
         logical_id: [u8; 32],
         attempt: usize,
@@ -1303,12 +1389,23 @@ impl KfpNode {
         // unchanged participant set (everyone responded but no signature was
         // produced) derives a distinct id and fresh nonce instead of colliding
         // with the just-completed attempt and tripping the replay guard. Attempt
-        // 0 uses an empty salt to keep the common single-attempt id stable and
-        // wire-compatible with peers that predate salted failover.
-        let session_salt: Vec<u8> = if attempt == 0 {
+        // 0 with an empty path uses an empty salt to keep the common
+        // single-attempt id stable and wire-compatible with peers that predate
+        // salted failover. The derivation path is folded in so two requests over
+        // the same digest + participant set at DISTINCT child paths derive
+        // distinct session ids: otherwise they collide at attempt 0 and a
+        // responder resends its cached commitment for the first path, never
+        // adopting the second. The responder recomputes and validates the id
+        // from the transmitted salt, so this binds the path on both sides.
+        let session_salt: Vec<u8> = if attempt == 0 && derivation_path.is_empty() {
             Vec::new()
         } else {
-            (attempt as u64).to_be_bytes().to_vec()
+            let mut salt = Vec::with_capacity(8 + derivation_path.len() * 4);
+            salt.extend_from_slice(&(attempt as u64).to_be_bytes());
+            for index in &derivation_path {
+                salt.extend_from_slice(&index.to_be_bytes());
+            }
+            salt
         };
         let session_id =
             derive_session_id_salted(&message, &participants, threshold, &session_salt);
@@ -1330,10 +1427,23 @@ impl KfpNode {
             SigningOperation::SignRequestInitiated,
         );
 
-        let key_package = self
-            .share
-            .key_package()
-            .map_err(|e| SigningRoundError::fatal(e.into()))?;
+        // #487 PR3: apply the composite BIP-32 tweak to our own key package
+        // for the requested path before generating round1 nonces, so the
+        // commitment we announce matches what co-signers will validate
+        // against their own tweaked packages.
+        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+            &self
+                .share
+                .key_package()
+                .map_err(|e| SigningRoundError::fatal(e.into()))?,
+            &self.group_pubkey,
+            &derivation_path,
+        )
+        .map_err(|e| {
+            SigningRoundError::fatal(FrostNetError::Crypto(format!(
+                "BIP-32 tweak on requester key package failed: {e}"
+            )))
+        })?;
         let (nonces, our_commitment) =
             frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
 
@@ -1384,6 +1494,9 @@ impl KfpNode {
         if let Some(sp) = structured_payload.as_ref() {
             request = request.with_structured_payload(sp.clone());
         }
+        if !derivation_path.is_empty() {
+            request = request.with_derivation_path(derivation_path.clone());
+        }
 
         let session_info = SessionInfo {
             session_id,
@@ -1393,6 +1506,7 @@ impl KfpNode {
             requester: self.share.metadata.identifier,
             message_type: message_type.to_string(),
             structured_payload: structured_payload.clone(),
+            derivation_path: derivation_path.clone(),
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
@@ -1407,6 +1521,7 @@ impl KfpNode {
                 &session_salt,
             )?;
             session.set_message_type(message_type.to_string());
+            session.set_derivation_path(derivation_path.clone());
 
             session.set_our_nonces(nonces);
             session.set_our_commitment(our_commitment);

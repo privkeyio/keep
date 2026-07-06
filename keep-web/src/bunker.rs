@@ -432,6 +432,7 @@ mod tests {
             requester: 1,
             message_type: String::new(),
             structured_payload: None,
+            derivation_path: Vec::new(),
         }
     }
 

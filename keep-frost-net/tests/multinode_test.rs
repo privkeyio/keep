@@ -3853,3 +3853,103 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
         "expected 1 startup + 1 reciprocal quote (second reciprocal suppressed), got {total}"
     );
 }
+
+/// #487 PR3: end-to-end multinode signing under a BIP-32 unhardened
+/// derivation path. Every co-signer independently computes the composite
+/// tweak from the request's `derivation_path`, applies it to its
+/// KeyPackage before round1/round2, and aggregates under the tweaked
+/// PublicKeyPackage. The resulting BIP-340 signature MUST verify under the
+/// derived child pubkey and MUST NOT verify under the parent group pubkey.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_full_signing_flow_at_derivation_path() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pubkey_pkg) = dealer.generate("test-bip32-signing").unwrap();
+    let group_pubkey: [u8; 32] = *shares[0].group_pubkey();
+
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+    let share3 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()]).await.unwrap();
+    let mut node2 = KfpNode::new(share2, vec![relay.clone()]).await.unwrap();
+    let mut node3 = KfpNode::new(share3, vec![relay]).await.unwrap();
+
+    let mut rx3 = node3.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node3 = Arc::new(node3);
+    let node3_for_run = Arc::clone(&node3);
+
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = node3_for_run.run().await;
+    });
+
+    let mut peers_discovered = 0u32;
+    let discovery_timeout = timeout(Duration::from_secs(45), async {
+        while peers_discovered < 2 {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { .. }) = rx3.recv().await {
+                peers_discovered += 1;
+            }
+        }
+    })
+    .await;
+
+    if discovery_timeout.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: only {peers_discovered} peers discovered");
+    }
+
+    // 32-byte digest so it fits `Message::from_digest_slice` for BIP-340.
+    let message = [0x33u8; 32].to_vec();
+    let derivation_path = vec![0u32, 5u32];
+
+    let sign_result = timeout(Duration::from_secs(60), async {
+        node3
+            .request_signature_at_path(message.clone(), "raw", None, derivation_path.clone())
+            .await
+    })
+    .await;
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+
+    let sig_bytes = match sign_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("BIP-32 signing failed: {e:?}"),
+        Err(_) => panic!("BIP-32 signing timed out after 60 seconds"),
+    };
+
+    let composite =
+        keep_core::frost::bip32_signing::derive_child(&group_pubkey, &derivation_path).unwrap();
+
+    use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+    let secp = Secp256k1::verification_only();
+    let sig = Signature::from_slice(&sig_bytes).unwrap();
+    let child_xonly = XOnlyPublicKey::from_slice(&composite.child_pubkey).unwrap();
+    let msg = Message::from_digest_slice(&message).unwrap();
+    secp.verify_schnorr(&sig, &msg, &child_xonly)
+        .expect("aggregate signature must verify under the derived child pubkey");
+
+    let group_xonly = XOnlyPublicKey::from_slice(&group_pubkey).unwrap();
+    assert!(
+        secp.verify_schnorr(&sig, &msg, &group_xonly).is_err(),
+        "child-derived signature MUST NOT verify under the parent group pubkey"
+    );
+}
