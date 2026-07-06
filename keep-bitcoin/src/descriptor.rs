@@ -221,6 +221,26 @@ pub fn descriptor_address(descriptor: &str, network: Network) -> Result<bitcoin:
         .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
 }
 
+/// Resolve a ranged OR definite descriptor at a concrete derivation `index` and
+/// return its address on `network`. Unlike [`descriptor_address`], this accepts
+/// a ranged descriptor (`.../0/*`) by resolving it at `index` rather than
+/// rejecting it. Used to pick the single deterministic migration-sweep
+/// destination for a successor FROST wallet descriptor: `index` 0 is the first
+/// external `/0/0` receive address, which both proposer and responder derive
+/// identically from the same persisted descriptor.
+pub fn descriptor_address_at_index(
+    descriptor: &str,
+    network: Network,
+    index: u32,
+) -> Result<bitcoin::Address> {
+    let parsed = parse_descriptor_body(descriptor)?;
+    parsed
+        .at_derivation_index(index)
+        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?
+        .address(network)
+        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
+}
+
 /// Build the raw Base58Check-encoded xpub for a FROST group by combining its
 /// x-only pubkey (lifted to its +even secp256k1 point) with the deterministic
 /// chaincode from #487 PR1. Depth 0, no parent, child number 0: this is the
@@ -398,7 +418,52 @@ mod tests {
                 child_pubkey_descriptor, child_pubkey_bip32_signing,
                 "leaf {leaf}: descriptor-derived key MUST equal FROST-signing child"
             );
+
+            let change_pubkey_bip32_signing =
+                derive_child(&group, &[1, leaf]).unwrap().child_pubkey;
+
+            let change_path = DerivationPath::from(vec![
+                ChildNumber::from_normal_idx(1).unwrap(),
+                ChildNumber::from_normal_idx(leaf).unwrap(),
+            ]);
+            let derived_change_xpub = xpub.derive_pub(&secp, &change_path).unwrap();
+            let change_pubkey_descriptor =
+                derived_change_xpub.public_key.x_only_public_key().0.serialize();
+
+            assert_eq!(
+                change_pubkey_descriptor, change_pubkey_bip32_signing,
+                "leaf {leaf}: CHANGE-chain descriptor-derived key MUST equal FROST-signing child"
+            );
         }
+    }
+
+    /// #487 PR 4: the mainnet output users actually ship uses BIP-86
+    /// `coin_type` 0 and an `xpub` (not tpub) prefix. Testnet/Signet tests
+    /// exercise `coin_type` 1 only, so pin the mainnet branch explicitly.
+    #[test]
+    fn frost_wallet_mainnet_descriptor_uses_coin_type_0() {
+        let group = test_group_pubkey();
+        let export =
+            DescriptorExport::from_frost_wallet(&group, None, Network::Bitcoin).unwrap();
+
+        let fingerprint = export.fingerprint;
+        assert!(
+            export
+                .descriptor
+                .starts_with(&format!("tr([{fingerprint}/86'/0'/0']")),
+            "mainnet descriptor must use coin_type 0: {}",
+            export.descriptor
+        );
+        assert!(
+            export.descriptor.contains("xpub"),
+            "mainnet descriptor must embed an xpub, not a tpub: {}",
+            export.descriptor
+        );
+        assert!(
+            export.descriptor.contains("/0/*)"),
+            "mainnet descriptor must be a ranged external chain: {}",
+            export.descriptor
+        );
     }
 
     /// #487 PR 4: the external chain (`/0/*`) and internal chain (`/1/*`)

@@ -147,12 +147,14 @@ impl KfpNode {
         let network = bitcoin::Network::from_str(&network_str).map_err(|e| {
             format!("REFUSED: successor descriptor has invalid network {network_str}: {e}")
         })?;
-        let expected_addr = keep_bitcoin::descriptor_address(&external_descriptor, network)
-            .map_err(|e| {
-                format!(
-                    "REFUSED: could not derive expected sweep destination from persisted successor descriptor: {e}"
-                )
-            })?;
+        let expected_addr =
+            keep_bitcoin::descriptor_address_at_index(&external_descriptor, network, 0).map_err(
+                |e| {
+                    format!(
+                        "REFUSED: could not derive expected sweep destination from persisted successor descriptor: {e}"
+                    )
+                },
+            )?;
         let expected_script = expected_addr.script_pubkey();
         if tx.output.len() != 1 {
             return Err(format!(
@@ -324,9 +326,12 @@ impl KfpNode {
         }
 
         // 4. Derive the NEW destination address from the finalized descriptor.
-        //    FROST wallet descriptors are definite (`tr(<xonly>,<tree>)`, no
-        //    wildcard), so derive the single address directly and reuse it for
-        //    both the PSBT destination and the display output.
+        //    No-recovery FROST wallet descriptors are ranged BIP-86
+        //    (`tr([fp/86'/coin']xpub/0/*)`), so the destination is the
+        //    descriptor's `/0/0` external address (index 0). Both proposer and
+        //    responder derive index 0 of the SAME persisted successor, so they
+        //    agree on the expected destination. Reuse it for both the PSBT
+        //    destination and the display output.
         //
         // NOTE: this destination derivation is proposer-side only. The sweep
         // rides the generic `request_psbt_spend` path keyed on the OLD
@@ -335,7 +340,7 @@ impl KfpNode {
         // descriptor. Responder-side destination re-derivation is a broader
         // change to the general signing path (keep-desktop/keep-cli signing
         // UIs) and is tracked separately.
-        let dest_addr = keep_bitcoin::descriptor_address(&new_external, network)
+        let dest_addr = keep_bitcoin::descriptor_address_at_index(&new_external, network, 0)
             .map_err(|e| FrostNetError::Session(format!("new receive address: {e}")))?;
         let destination = dest_addr.script_pubkey();
 
