@@ -1003,8 +1003,17 @@ mod hex_bytes_opt {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         let opt = Option::<String>::deserialize(d)?;
-        opt.map(|h| hex::decode(&h).map_err(serde::de::Error::custom))
-            .transpose()
+        match opt {
+            // Bound the encoded length before decoding so an oversized payload
+            // is rejected without first allocating its Vec. Hex is two chars
+            // per byte, so the decoded size cannot exceed the same cap
+            // `validate` enforces.
+            Some(h) if h.len() > super::MAX_STRUCTURED_PAYLOAD_SIZE.saturating_mul(2) => Err(
+                serde::de::Error::custom("structured payload exceeds maximum size"),
+            ),
+            Some(h) => Ok(Some(hex::decode(&h).map_err(serde::de::Error::custom)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2420,6 +2429,33 @@ mod tests {
         .with_structured_payload(oversized);
         let msg = KfpMessage::SignRequest(payload);
         assert!(msg.validate().is_err());
+    }
+
+    /// #529: an oversized *encoded* structured payload is rejected during
+    /// deserialization, before `hex::decode` allocates the Vec, so a peer
+    /// cannot force arbitrary allocation ahead of the `validate` size gate.
+    #[test]
+    fn oversized_encoded_structured_payload_refused_before_decode() {
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        );
+        let msg = KfpMessage::SignRequest(payload);
+        let mut value: serde_json::Value = serde_json::from_str(&msg.to_json().unwrap()).unwrap();
+        // Hex string one decoded byte over the cap (two chars per byte).
+        let oversized_hex = "00".repeat(MAX_STRUCTURED_PAYLOAD_SIZE + 1);
+        value["structured_payload"] = serde_json::Value::String(oversized_hex);
+        let json = serde_json::to_string(&value).unwrap();
+        // Assert on the deserialize-time message so this pins the before-decode
+        // guard specifically, not the later `validate` size gate (which would
+        // also reject and carries a distinct, capitalized message).
+        let err = KfpMessage::from_json(&json).expect_err("oversized payload must be refused");
+        assert!(err
+            .to_string()
+            .contains("structured payload exceeds maximum size"));
     }
 
     #[test]
