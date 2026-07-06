@@ -31,8 +31,8 @@
 
 use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use frost_secp256k1_tr::{
-    keys::{KeyPackage, SigningShare, VerifyingShare},
-    VerifyingKey,
+    keys::{KeyPackage, PublicKeyPackage, SigningShare, VerifyingShare},
+    Identifier, VerifyingKey,
 };
 use zeroize::Zeroizing;
 
@@ -144,6 +144,88 @@ pub fn derive_child(group_pubkey: &[u8; 32], path: &[u32]) -> Result<CompositeDe
     let cc = deterministic_chaincode(group_pubkey);
     derive_path_composite(group_pubkey, &cc, path)
         .map_err(|e| KeepError::Frost(format!("BIP-32 child derivation failed: {e}")))
+}
+
+/// Tweak an unstyled FROST `KeyPackage` for a BIP-32 unhardened path off the
+/// group pubkey. Empty path returns the input unchanged. Used by the network
+/// signing path so every participant applies the same composite tweak to its
+/// own package before running the standard round1/round2 (#487 PR 3/4).
+pub fn tweak_key_package_at_path(
+    kp: &KeyPackage,
+    group_pubkey: &[u8; 32],
+    path: &[u32],
+) -> Result<KeyPackage> {
+    if path.is_empty() {
+        return Ok(kp.clone());
+    }
+    let composite = derive_child(group_pubkey, path)?;
+    tweak_key_package(kp, &composite.aggregate_tweak)
+}
+
+/// Tweak a FROST `PublicKeyPackage` for the same BIP-32 unhardened path so
+/// the aggregation step verifies signature shares under the tweaked
+/// verifying shares and produces a signature over the derived child key.
+/// Empty path returns the input unchanged.
+pub fn tweak_public_key_package_at_path(
+    pkp: &PublicKeyPackage,
+    group_pubkey: &[u8; 32],
+    path: &[u32],
+) -> Result<PublicKeyPackage> {
+    if path.is_empty() {
+        return Ok(pkp.clone());
+    }
+    let composite = derive_child(group_pubkey, path)?;
+    let secp = Secp256k1::verification_only();
+
+    // Same y-parity handling as `tweak_key_package`: when the group's real
+    // VerifyingKey has odd-y, negate the composite scalar so the tweaked
+    // aggregation package lands on the same x-only child pubkey.
+    let vk_bytes = pkp
+        .verifying_key()
+        .serialize()
+        .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
+    let real_vk_is_odd = vk_bytes.first() == Some(&0x03);
+    let mut effective_tweak = composite.aggregate_tweak;
+    if real_vk_is_odd {
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&effective_tweak)
+            .map_err(|e| KeepError::Frost(format!("aggregate tweak invalid: {e}")))?;
+        effective_tweak = sk.negate().secret_bytes();
+    }
+    let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(effective_tweak).map_err(|_| {
+        KeepError::Frost("BIP-32 aggregate tweak >= curve order; refusing to sign".into())
+    })?;
+
+    // Tweak every verifying share so aggregation validates the tweaked
+    // signature shares. Preserve the identifier ordering the input carried.
+    let mut new_shares: std::collections::BTreeMap<Identifier, VerifyingShare> =
+        std::collections::BTreeMap::new();
+    for (id, vs) in pkp.verifying_shares() {
+        let vs_bytes = vs
+            .serialize()
+            .map_err(|e| KeepError::Frost(format!("verifying share serialize: {e}")))?;
+        let vs_pk = bitcoin::secp256k1::PublicKey::from_slice(&vs_bytes)
+            .map_err(|e| KeepError::Frost(format!("verifying share is not a valid point: {e}")))?;
+        let tweaked_vs_pk = vs_pk
+            .add_exp_tweak(&secp, &scalar)
+            .map_err(|e| KeepError::Frost(format!("verifying share + tweak·G invalid: {e}")))?;
+        let tweaked_vs = VerifyingShare::deserialize(&tweaked_vs_pk.serialize())
+            .map_err(|e| KeepError::Frost(format!("tweaked verifying share deserialize: {e}")))?;
+        new_shares.insert(*id, tweaked_vs);
+    }
+
+    let vk_pk = bitcoin::secp256k1::PublicKey::from_slice(&vk_bytes)
+        .map_err(|e| KeepError::Frost(format!("verifying key is not a valid point: {e}")))?;
+    let tweaked_vk_pk = vk_pk
+        .add_exp_tweak(&secp, &scalar)
+        .map_err(|e| KeepError::Frost(format!("verifying key + tweak·G invalid: {e}")))?;
+    let tweaked_verifying_key = VerifyingKey::deserialize(&tweaked_vk_pk.serialize())
+        .map_err(|e| KeepError::Frost(format!("tweaked verifying key deserialize: {e}")))?;
+
+    Ok(PublicKeyPackage::new(
+        new_shares,
+        tweaked_verifying_key,
+        pkp.min_signers(),
+    ))
 }
 
 /// Sign `message` under the FROST group's BIP-32 unhardened child key at
