@@ -658,7 +658,7 @@ impl App {
                 let xonly = keep_bitcoin::bitcoin::XOnlyPublicKey::from_slice(&xonly_bytes)
                     .map_err(|e| format!("xonly decode: {e}"))?;
 
-                let mut psbt = keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+                let psbt = keep_bitcoin::bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
                     .map_err(|e| format!("decode PSBT: {e}"))?;
                 if psbt.inputs.is_empty() {
                     return Err("PSBT has no inputs".to_string());
@@ -681,6 +681,23 @@ impl App {
                     &session_descriptor_hash,
                     &psbt.unsigned_tx,
                 )?;
+
+                // #502 responder-side prevout amount validation. Desktop has no
+                // human approval step, so it is the most exposed responder: a
+                // BIP-341 sighash over an understated `witness_utxo.value`
+                // produces a valid signature that bypasses every fee cap.
+                // Operators configure the chain view via `KEEP_CHAIN_URL`; a
+                // missing / invalid endpoint refuses closed.
+                let chain = keep_bitcoin::esplora_chain_view_from_env()?;
+                // The chain view HTTP client blocks; run it in spawn_blocking so
+                // it does not stall this async task, and hand the PSBT back for
+                // signing.
+                let mut psbt = tokio::task::spawn_blocking(move || {
+                    keep_bitcoin::validate_prevout_amounts_against_chain(&psbt, &chain)
+                        .map(|()| psbt)
+                })
+                .await
+                .map_err(|_| "Background task failed".to_string())??;
 
                 let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
                     .await

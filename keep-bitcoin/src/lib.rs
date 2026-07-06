@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod address;
+pub mod chain_view;
 mod descriptor;
 mod error;
 pub mod key_proof;
@@ -13,6 +14,11 @@ pub mod recovery_tx;
 mod signer;
 
 pub use address::{AddressDerivation, DerivedAddress};
+#[cfg(feature = "esplora-chain-view")]
+pub use chain_view::{esplora_chain_view_from_env, EsploraChainView};
+pub use chain_view::{
+    validate_prevout_amounts_against_chain, ChainView, ChainViewError, KEEP_CHAIN_URL_ENV,
+};
 pub use descriptor::{
     descriptor_address, descriptor_script_pubkey, multipath_from_external, xpub_to_x_only,
     DescriptorExport,
