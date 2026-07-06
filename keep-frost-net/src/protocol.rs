@@ -2453,7 +2453,9 @@ mod tests {
         // guard specifically, not the later `validate` size gate (which would
         // also reject and carries a distinct, capitalized message).
         let err = KfpMessage::from_json(&json).expect_err("oversized payload must be refused");
-        assert!(err.to_string().contains("structured payload exceeds maximum size"));
+        assert!(err
+            .to_string()
+            .contains("structured payload exceeds maximum size"));
     }
 
     #[test]
