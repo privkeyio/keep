@@ -216,10 +216,15 @@ fn verify_bitcoin_sighash(digest: &[u8], structured: &[u8]) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let sighash_flag =
-        TapSighashType::from_consensus_u8(payload.sighash_type as u8).map_err(|e| {
-            FrostNetError::PolicyViolation(format!("bitcoin-sighash flag invalid: {e}"))
-        })?;
+    let sighash_type = u8::try_from(payload.sighash_type).map_err(|_| {
+        FrostNetError::PolicyViolation(format!(
+            "bitcoin-sighash flag {} out of byte range",
+            payload.sighash_type
+        ))
+    })?;
+    let sighash_flag = TapSighashType::from_consensus_u8(sighash_type).map_err(|e| {
+        FrostNetError::PolicyViolation(format!("bitcoin-sighash flag invalid: {e}"))
+    })?;
     let mut cache = SighashCache::new(&psbt.unsigned_tx);
     let sighash = cache
         .taproot_key_spend_signature_hash(idx, &Prevouts::All(&prevouts), sighash_flag)
@@ -373,6 +378,18 @@ mod tests {
         let wrong_digest = [0x42u8; 32];
         let err = verify_structured_payload(MSG_TYPE_NOSTR_EVENT, &wrong_digest, &bytes)
             .expect_err("non-matching payload must be refused on the responder branch");
+        assert!(matches!(err, FrostNetError::PolicyViolation(_)));
+    }
+
+    #[test]
+    fn bitcoin_sighash_out_of_byte_range_flag_refuses() {
+        // A sighash_type outside the u8 range must be rejected, not truncated
+        // into a valid flag (e.g. 256 wrapping to Default).
+        let (digest, mut payload) = build_bitcoin_sighash_payload();
+        payload.sighash_type = 256;
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let err = verify_structured_payload(MSG_TYPE_BITCOIN_SIGHASH, &digest, &bytes)
+            .expect_err("out-of-range sighash flag must be refused");
         assert!(matches!(err, FrostNetError::PolicyViolation(_)));
     }
 
