@@ -431,6 +431,7 @@ mod tests {
             participants: vec![1, 2, 3],
             requester: 1,
             message_type: String::new(),
+            structured_payload: None,
         }
     }
 

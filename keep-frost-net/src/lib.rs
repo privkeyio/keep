@@ -76,6 +76,7 @@ mod protocol;
 mod psbt_session;
 mod recovery_signers;
 mod session;
+mod structured_payload;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
 mod tpm_policy;
@@ -111,7 +112,8 @@ pub use event::KfpEventBuilder;
 pub use node::{
     DescriptorLookupUnavailable, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent,
     NoOpHooks, OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
-    RefuseRawSignatureHooks, ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
+    RefuseRawAndRequireStructuredHooks, RefuseRawSignatureHooks, RequireStructuredPayloadHooks,
+    ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
@@ -139,10 +141,11 @@ pub use protocol::{
     MAX_KEYS_PER_TIER, MAX_MESSAGE_SIZE, MAX_MESSAGE_TYPE_LENGTH, MAX_NACK_REASON_LENGTH,
     MAX_NAME_LENGTH, MAX_NONCE_COMMITMENTS, MAX_PARTICIPANTS, MAX_PSBT_ADDRESS_LENGTH,
     MAX_PSBT_INPUTS, MAX_PSBT_OUTPUTS, MAX_PSBT_SIZE, MAX_RECOVERY_TIERS, MAX_RECOVERY_XPUBS,
-    MAX_SIGNATURE_SHARE_SIZE, MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH, MIN_XPUB_LENGTH,
-    MSG_TYPE_NOSTR_EVENT, MSG_TYPE_RAW, OPRF_PARTIAL_LEN, PSBT_FINALIZE_PHASE_TIMEOUT_SECS,
-    PSBT_SESSION_MAX_TIMEOUT_SECS, PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS,
-    VALID_NETWORKS, VALID_XPUB_PREFIXES,
+    MAX_SIGNATURE_SHARE_SIZE, MAX_STRUCTURED_PAYLOAD_SIZE, MAX_XPUB_LABEL_LENGTH, MAX_XPUB_LENGTH,
+    MIN_XPUB_LENGTH, MSG_TYPE_BITCOIN_SIGHASH, MSG_TYPE_NOSTR_EVENT, MSG_TYPE_RAW,
+    OPRF_PARTIAL_LEN, PSBT_FINALIZE_PHASE_TIMEOUT_SECS, PSBT_SESSION_MAX_TIMEOUT_SECS,
+    PSBT_SESSION_TIMEOUT_SECS, PSBT_SIGNING_PHASE_TIMEOUT_SECS, VALID_NETWORKS,
+    VALID_XPUB_PREFIXES,
 };
 pub use psbt_session::{
     derive_psbt_session_id, PsbtSession, PsbtSessionManager, PsbtSessionState, SignerId,
@@ -153,6 +156,7 @@ pub use recovery_signers::{
 pub use session::{
     derive_session_id, derive_session_id_salted, NetworkSession, SessionManager, SessionState,
 };
+pub use structured_payload::{verify_structured_payload, BitcoinSighashPayload, NostrEventPayload};
 pub use tpm_policy::TpmAttestationPolicy;
 #[cfg(feature = "tpm-attestation")]
 pub use tpm_producer::{TpmQuoteService, TpmQuoter, DEFAULT_PCR_SLOTS};

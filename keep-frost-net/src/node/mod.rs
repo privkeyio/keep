@@ -327,6 +327,12 @@ pub struct SessionInfo {
     /// this to gate (or refuse) requests whose label doesn't match the
     /// expected domain on this group. See [`RefuseRawSignatureHooks`].
     pub message_type: String,
+    /// Optional structured payload the requester attached so the responder
+    /// can recompute the digest from a typed body and reject cross-domain
+    /// label spoofs (#529). Presence is required by
+    /// [`RequireStructuredPayloadHooks`] for hybrid Nostr + Bitcoin groups;
+    /// the recompute-and-compare is performed unconditionally when present.
+    pub structured_payload: Option<Vec<u8>>,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -341,6 +347,11 @@ impl From<&NetworkSession> for SessionInfo {
             // carried through so post_sign sees the original domain label.
             requester: 0,
             message_type: session.message_type().to_string(),
+            // NetworkSession does not persist the structured payload (only the
+            // digest is signed); post_sign observers see the domain label but
+            // not the body. Fine for notification purposes; the recompute
+            // check runs in pre_sign where the request is in scope.
+            structured_payload: None,
         }
     }
 }
@@ -436,6 +447,54 @@ impl SigningHooks for RefuseRawSignatureHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Pre-sign policy that refuses any request without a structured payload
+/// (#529). Complement to [`RefuseRawSignatureHooks`]: raw is refused by
+/// label, everything else must attach a typed body the responder recomputes
+/// against. Combining the two closes the label-spoof hole for hybrid groups
+/// that coordinate both Nostr events and Bitcoin taproot key-spend sighashes:
+/// a caller can no longer relabel a Bitcoin sighash as `"nostr-event"` to
+/// bypass the raw denylist, because the responder rejects a nostr-event that
+/// carries no structured payload before the signing round begins, and
+/// rejects one whose recomputed digest does not match `message`.
+///
+/// Default is OFF: existing groups keep working after a partial upgrade.
+/// Operators flip this on per-group once all participants understand
+/// structured payloads (see the migration story in #529).
+pub struct RequireStructuredPayloadHooks;
+
+impl SigningHooks for RequireStructuredPayloadHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
+        if session.structured_payload.is_none() {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "co-signer requires a structured payload for every sign request (#529). \
+                 session_id={}, requester=share {}, message_type={:?}",
+                hex::encode(session.session_id),
+                session.requester,
+                session.message_type
+            )));
+        }
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+}
+
+/// Combined pre-sign policy for hybrid Nostr + Bitcoin groups (#529): refuses
+/// unstructured `"raw"` requests AND requires a structured payload on every
+/// other request so the label always maps to a recomputable body. This is
+/// the recommended production policy once all group participants understand
+/// structured payloads; the two hooks compose but bundling them here saves
+/// operators from wiring both by hand.
+pub struct RefuseRawAndRequireStructuredHooks;
+
+impl SigningHooks for RefuseRawAndRequireStructuredHooks {
+    fn pre_sign(&self, session: &SessionInfo) -> Result<()> {
+        RefuseRawSignatureHooks.pre_sign(session)?;
+        RequireStructuredPayloadHooks.pre_sign(session)?;
+        Ok(())
+    }
+    fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+}
+
 /// Hooks for `frost network serve`: optionally refuse `message_type="raw"`
 /// signing requests (see [`RefuseRawSignatureHooks`]), and optionally
 /// auto-approve OPRF evaluation requests.
@@ -455,6 +514,7 @@ impl SigningHooks for RefuseRawSignatureHooks {
 /// behind a human (e.g. a phone).
 pub struct ServeHooks {
     pub refuse_raw_sign: bool,
+    pub require_structured_payload: bool,
     pub auto_approve_oprf_eval: bool,
 }
 
@@ -464,6 +524,9 @@ impl SigningHooks for ServeHooks {
         // centralized rather than duplicated here.
         if self.refuse_raw_sign {
             RefuseRawSignatureHooks.pre_sign(session)?;
+        }
+        if self.require_structured_payload {
+            RequireStructuredPayloadHooks.pre_sign(session)?;
         }
         Ok(())
     }
@@ -2589,12 +2652,14 @@ mod tests {
     async fn serve_hooks_oprf_auto_approve_opt_in() {
         let approving = ServeHooks {
             refuse_raw_sign: false,
+            require_structured_payload: false,
             auto_approve_oprf_eval: true,
         };
         assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
 
         let declining = ServeHooks {
             refuse_raw_sign: false,
+            require_structured_payload: false,
             auto_approve_oprf_eval: false,
         };
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
@@ -2604,6 +2669,7 @@ mod tests {
     fn serve_hooks_refuse_raw_sign_gates_pre_sign() {
         let hooks = ServeHooks {
             refuse_raw_sign: true,
+            require_structured_payload: false,
             auto_approve_oprf_eval: false,
         };
 
@@ -2784,7 +2850,60 @@ mod tests {
             participants: vec![1, 2],
             requester: 1,
             message_type: "raw".to_string(),
+            structured_payload: None,
         }
+    }
+
+    /// Build a nostr-event `SessionInfo` for hook tests: 32-byte digest,
+    /// canonical label, with or without a structured payload.
+    fn nostr_session(structured: Option<Vec<u8>>) -> SessionInfo {
+        SessionInfo {
+            session_id: [8u8; 32],
+            message: vec![0u8; 32],
+            threshold: 2,
+            participants: vec![1, 2],
+            requester: 1,
+            message_type: crate::MSG_TYPE_NOSTR_EVENT.to_string(),
+            structured_payload: structured,
+        }
+    }
+
+    /// #529: `RequireStructuredPayloadHooks` refuses any request whose
+    /// `structured_payload` is None, so a caller relabeling a raw digest as
+    /// "nostr-event" without providing a body is rejected before the
+    /// signing round begins.
+    #[test]
+    fn require_structured_payload_refuses_when_absent() {
+        let session = nostr_session(None);
+        let err = crate::RequireStructuredPayloadHooks
+            .pre_sign(&session)
+            .expect_err("absent structured payload must be refused");
+        assert!(matches!(err, FrostNetError::PolicyViolation(_)));
+    }
+
+    /// #529: `RequireStructuredPayloadHooks` accepts requests whose
+    /// structured payload is present; recompute-vs-digest matching is
+    /// enforced by the built-in pre-sign check in the signing loop, not by
+    /// this hook.
+    #[test]
+    fn require_structured_payload_accepts_when_present() {
+        let session = nostr_session(Some(vec![1, 2, 3]));
+        crate::RequireStructuredPayloadHooks
+            .pre_sign(&session)
+            .expect("presence-only check must accept when payload is attached");
+    }
+
+    /// #529: `RefuseRawAndRequireStructuredHooks` composes the two rules
+    /// operators of hybrid groups need: `"raw"` labels are still refused,
+    /// and every other label must attach a structured body.
+    #[test]
+    fn refuse_raw_and_require_structured_composes_both_rules() {
+        let hooks = crate::RefuseRawAndRequireStructuredHooks;
+        assert!(hooks.pre_sign(&raw_session()).is_err());
+        assert!(hooks.pre_sign(&nostr_session(None)).is_err());
+        hooks
+            .pre_sign(&nostr_session(Some(vec![0u8; 4])))
+            .expect("structured nostr-event is accepted");
     }
 
     #[test]

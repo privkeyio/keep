@@ -511,7 +511,12 @@ impl SignerHandler {
             let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
             let (frost_event, event_id) = prepare_frost_event(pubkey, &unsigned_event)?;
-            let sig_bytes = net_frost.sign(event_id.as_bytes()).await?;
+            // #529: pass the full unsigned event as a structured payload so
+            // co-signers can recompute the id and reject a cross-domain
+            // label spoof (e.g. a Bitcoin sighash relabeled as nostr-event).
+            let sig_bytes = net_frost
+                .sign_nostr_event(event_id.as_bytes(), &frost_event)
+                .await?;
             assemble_signed_event(event_id, pubkey, frost_event, &sig_bytes)?
         } else if let Some(ref frost) = self.frost_signer {
             let signer = frost.lock().await;

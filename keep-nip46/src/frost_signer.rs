@@ -98,6 +98,29 @@ impl NetworkFrostSigner {
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))
     }
+
+    /// Sign the 32-byte Nostr event id `message` and attach the structured
+    /// event body so co-signers recompute the id from `(pubkey, created_at,
+    /// kind, tags, content)` and reject a cross-domain label spoof (#529).
+    /// Call this whenever the full [`UnsignedEvent`] is in scope, so the
+    /// signing path is domain-validated end-to-end.
+    pub async fn sign_nostr_event(
+        &self,
+        message: &[u8],
+        event: &nostr_sdk::UnsignedEvent,
+    ) -> Result<[u8; 64]> {
+        let payload = keep_frost_net::NostrEventPayload::from_unsigned_event(event);
+        let structured =
+            serde_json::to_vec(&payload).map_err(|e| KeepError::Frost(e.to_string()))?;
+        self.node
+            .request_signature_structured(
+                message.to_vec(),
+                keep_frost_net::MSG_TYPE_NOSTR_EVENT,
+                Some(structured),
+            )
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()))
+    }
 }
 
 #[cfg(test)]
