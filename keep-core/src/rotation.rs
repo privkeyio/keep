@@ -104,6 +104,56 @@ fn cleanup_rotation_lock(_path: &Path) {
     // rotations. The file lock held by the lock object is sufficient.
 }
 
+/// Reconcile leftover artifacts from an interrupted rotation. Called by
+/// `Storage::open` before it reads `keep.hdr`, so a mid-rotation kill from
+/// either `rotate_password` or `rotate_data_key` (#565, #662) resolves to a
+/// consistent, openable state without operator intervention:
+///
+/// - `keep.hdr.tmp` is always stale: `write_header_atomically` only publishes
+///   via the atomic rename, so a leftover temp file never carries live state.
+/// - `keep.hdr.backup` + `keep.db.backup` present together mean
+///   `rotate_data_key` was in flight. If `keep.hdr` matches the backup byte
+///   for byte, the header rewrite never happened, which in turn means
+///   `reencrypt_database` had not finished either (it runs strictly before
+///   `write_header_atomically`). Restore `keep.db` from `keep.db.backup` so
+///   the DB matches the OLD DEK the header pins. If the header differs from
+///   the backup, the header rewrite succeeded, which means the reencrypt
+///   loop had run to completion first: `keep.db` is fully under the NEW DEK
+///   and the backups are stale.
+/// - `keep.hdr.backup` alone means `rotate_password` was in flight. Both
+///   possible header states (still-old, or already-rewritten to new) are
+///   durable and consistent on their own; the backup is stale.
+///
+/// Errors are non-fatal on purpose: recovery must not turn a partially
+/// interrupted rotation into an unopenable vault, and every write it performs
+/// is idempotent.
+pub(crate) fn recover_rotation_artifacts(path: &Path) {
+    let hdr = path.join("keep.hdr");
+    let hdr_tmp = path.join("keep.hdr.tmp");
+    let hdr_backup = path.join("keep.hdr.backup");
+    let db = path.join("keep.db");
+    let db_backup = path.join("keep.db.backup");
+
+    let _ = fs::remove_file(&hdr_tmp);
+
+    let hdr_backup_exists = hdr_backup.exists();
+    let db_backup_exists = db_backup.exists();
+
+    if hdr_backup_exists && db_backup_exists {
+        let hdr_bytes = fs::read(&hdr).ok();
+        let backup_bytes = fs::read(&hdr_backup).ok();
+        if let (Some(h), Some(b)) = (hdr_bytes, backup_bytes) {
+            if h == b {
+                let _ = copy_with_retry(&db_backup, &db);
+            }
+        }
+        let _ = secure_delete(&hdr_backup);
+        let _ = secure_delete(&db_backup);
+    } else if hdr_backup_exists {
+        let _ = secure_delete(&hdr_backup);
+    }
+}
+
 fn write_header_atomically(path: &Path, header: &Header) -> Result<()> {
     let header_path = path.join("keep.hdr");
     let tmp_path = path.join("keep.hdr.tmp");
@@ -968,13 +1018,13 @@ mod tests {
         let mut storage = Storage::open(&path).unwrap();
         assert!(storage.unlock("new-password-1").is_err());
 
-        // The stale backup must not wedge a fresh rotation: copy_with_retry
-        // truncates keep.hdr.backup, so a real rotation over it commits cleanly.
-        assert!(path.join("keep.hdr.backup").exists());
+        // Recovery on open (#662) deletes the stale backup; a subsequent
+        // rotation commits cleanly against a clean state.
+        assert!(!path.join("keep.hdr.backup").exists());
         let mut storage = Storage::open(&path).unwrap();
         storage
             .rotate_password(old_pw, "committed-new-1")
-            .expect("rotation succeeds despite an orphan .hdr.backup");
+            .expect("rotation succeeds after auto-cleanup of orphan .hdr.backup");
         drop(storage);
         let mut storage = Storage::open(&path).unwrap();
         storage
@@ -1008,14 +1058,14 @@ mod tests {
         storage.unlock(old_pw).expect("old password still unlocks");
         assert_secret_decrypts(&storage, &secret);
 
-        // The leftover tmp must not wedge a fresh rotation: write_header_atomically
-        // truncates keep.hdr.tmp via File::create, so a real rotation over it works.
-        assert!(path.join("keep.hdr.tmp").exists());
+        // Recovery on open (#662) deletes the stale tmp; a subsequent
+        // rotation commits cleanly against a clean state.
+        assert!(!path.join("keep.hdr.tmp").exists());
         drop(storage);
         let mut storage = Storage::open(&path).unwrap();
         storage
             .rotate_password(old_pw, "committed-new-2")
-            .expect("rotation succeeds despite an orphan .hdr.tmp");
+            .expect("rotation succeeds after auto-cleanup of orphan .hdr.tmp");
         drop(storage);
         let mut storage = Storage::open(&path).unwrap();
         storage
@@ -1090,13 +1140,13 @@ mod tests {
             .expect("password unlocks pre-rotation vault");
         assert_secret_decrypts(&storage, &secret);
 
-        // The stale header backup must not wedge a fresh data-key rotation:
-        // copy_with_retry truncates keep.hdr.backup, so rotation over it works
-        // and the seeded secret survives, re-encrypted under the new DEK.
-        assert!(path.join("keep.hdr.backup").exists());
+        // Recovery on open (#662) deletes the stale header backup; the
+        // subsequent data-key rotation commits cleanly and the seeded secret
+        // round-trips under the new DEK.
+        assert!(!path.join("keep.hdr.backup").exists());
         storage
             .rotate_data_key(pw)
-            .expect("data-key rotation succeeds despite an orphan .hdr.backup");
+            .expect("data-key rotation succeeds after auto-cleanup of orphan .hdr.backup");
         assert_secret_decrypts(&storage, &secret);
     }
 
@@ -1106,58 +1156,55 @@ mod tests {
     /// stop `reencrypt_database` midway, so we reproduce the observable state
     /// after the fact: run a full rotation (every row now under the new DEK)
     /// and roll `keep.hdr` back to the old header. With a single seeded row
-    /// this is indistinguishable from a genuine torn write. The vault opens and
-    /// the header unlocks, but decrypting any row under the OLD DEK must fail
-    /// closed (AEAD auth failure, no panic, no silent success), and the
-    /// pristine `keep.db.backup` must remain on disk as the recovery input.
+    /// this is indistinguishable from a genuine torn write.
     ///
-    /// This pins the fail-closed behavior and the surviving backup so a
-    /// follow-up that adds auto-recovery on open (restore `keep.db.backup` ->
-    /// `keep.db`) has a concrete test. Any such recovery must be gated on an
-    /// explicit in-header "rotation in progress" marker, not mere `.backup`
-    /// file presence, so a planted stale backup pair cannot force a downgrade.
+    /// `Storage::open` calls `recover_rotation_artifacts` before reading the
+    /// header (#662). Because `keep.hdr == keep.hdr.backup`, the recovery
+    /// path knows the header rewrite never happened, which implies the
+    /// reencrypt loop also had not finished (it runs strictly before
+    /// `write_header_atomically`). It restores `keep.db` from
+    /// `keep.db.backup` and deletes both backup files, so the caller sees a
+    /// consistent OLD-credential vault that lists the seeded row unchanged.
     #[test]
-    fn crash_mid_reencrypt_data_key_leaves_db_backup_intact() {
+    fn crash_mid_reencrypt_data_key_recovered_on_open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault");
         let pw = "same-password-5";
+        let secret;
         {
             let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
-            let _ = seed_key(&storage);
+            let (_r, s) = seed_key(&storage);
+            secret = s;
         }
 
-        // Snapshot the pre-rotation DB and header, then perform a full
-        // rotation so `keep.db` is under a new DEK. Reintroduce the
-        // pre-rotation snapshots as the `.backup` artifacts a real crash
-        // would have left behind, while `keep.hdr` is rolled back to OLD.
-        // The result: header pins OLD DEK, DB rows are under NEW DEK, matching
-        // the observable state of a kill partway through `reencrypt_database`.
+        // Snapshot pre-rotation state, run a full rotation, then reproduce a
+        // mid-reencrypt kill by rolling `keep.hdr` back to old while leaving
+        // `keep.db` under the new DEK. The `.backup` files are what real
+        // rotation would have written before touching the DB.
         let old_hdr = fs::read(path.join("keep.hdr")).unwrap();
         let old_db = fs::read(path.join("keep.db")).unwrap();
         {
             let mut storage = Storage::open(&path).unwrap();
             storage.rotate_data_key(pw).unwrap();
         }
-        // Roll the header back to old; leave the DB in its rotated state.
         fs::write(path.join("keep.hdr"), &old_hdr).unwrap();
         fs::write(path.join("keep.hdr.backup"), &old_hdr).unwrap();
         fs::write(path.join("keep.db.backup"), &old_db).unwrap();
 
-        // The vault opens and the header unlocks, but any decryption under
-        // the OLD DEK against a NEW-DEK row must fail cleanly (no panic, no
-        // silent success). The `.backup` files are the recovery input.
-        let mut storage = Storage::open(&path).expect("mid-reencrypt state opens");
-        storage.unlock(pw).expect("header unlocks under pw");
-        // list_keys attempts to decrypt every row under the old DEK; at least
-        // one row was re-encrypted under the new DEK, so this must fail.
-        let listed = storage.list_keys();
+        let mut storage = Storage::open(&path).expect("open triggers recovery");
+        storage
+            .unlock(pw)
+            .expect("OLD password unlocks after recovery");
+        assert_secret_decrypts(&storage, &secret);
+
+        // Backups have been cleaned up.
         assert!(
-            listed.is_err(),
-            "OLD-DEK header + NEW-DEK db must not silently list rows"
+            !path.join("keep.hdr.backup").exists(),
+            "hdr backup deleted after recovery"
         );
         assert!(
-            path.join("keep.db.backup").exists(),
-            "backup DB must remain on disk as the recovery input"
+            !path.join("keep.db.backup").exists(),
+            "db backup deleted after recovery"
         );
     }
 
@@ -1261,5 +1308,95 @@ mod tests {
         storage
             .unlock("shared-new-7")
             .expect("new password unlocks the rotated vault");
+    }
+
+    /// #662 recovery: when both backups are present but `keep.hdr` differs
+    /// from `keep.hdr.backup`, the rotation had already completed its header
+    /// rewrite. `reencrypt_database` runs strictly before that rewrite, so
+    /// `keep.db` is fully under the NEW DEK. The recovery path MUST NOT
+    /// restore the (stale) `keep.db.backup` in that case; it must only
+    /// clean up the leftover backup files.
+    #[test]
+    fn recovery_does_not_overwrite_db_when_header_already_rotated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let old_pw = "recovery-old-8";
+        let new_pw = "recovery-new-8";
+        let secret;
+        {
+            let storage = Storage::create(&path, old_pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Snapshot old header + db as the .backup files a crash post-verify,
+        // pre-delete would have left behind after a full rotation.
+        let old_hdr = fs::read(path.join("keep.hdr")).unwrap();
+        let old_db = fs::read(path.join("keep.db")).unwrap();
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_password(old_pw, new_pw).unwrap();
+            storage.rotate_data_key(new_pw).unwrap();
+        }
+        fs::write(path.join("keep.hdr.backup"), &old_hdr).unwrap();
+        fs::write(path.join("keep.db.backup"), &old_db).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open triggers cleanup");
+        // OLD password must not work — recovery must not have downgraded us.
+        assert!(
+            storage.unlock(old_pw).is_err(),
+            "old credential must not unlock after post-rotation cleanup"
+        );
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock(new_pw).expect("new password still unlocks");
+        assert_secret_decrypts(&storage, &secret);
+
+        assert!(!path.join("keep.hdr.backup").exists());
+        assert!(!path.join("keep.db.backup").exists());
+    }
+
+    /// #662 recovery: a lone `keep.hdr.backup` (rotate_password artifact) is
+    /// always stale, since `keep.hdr` alone is authoritative for that
+    /// rotation. Cleanup MUST remove it without touching anything else.
+    #[test]
+    fn recovery_cleans_up_lone_header_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "recovery-lone-9";
+        let secret;
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Simulate a rotate_password that got as far as writing the backup
+        // but died before write_header_atomically completed.
+        fs::copy(path.join("keep.hdr"), path.join("keep.hdr.backup")).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open cleans up lone hdr backup");
+        storage.unlock(pw).unwrap();
+        assert_secret_decrypts(&storage, &secret);
+        assert!(!path.join("keep.hdr.backup").exists());
+    }
+
+    /// #662 recovery: `keep.hdr.tmp` from a torn `write_header_atomically`
+    /// is always stale (rename is the commit point). Cleanup MUST delete
+    /// it on every open, regardless of whether backups are present.
+    #[test]
+    fn recovery_deletes_stale_hdr_tmp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "recovery-tmp-10";
+        {
+            let _ = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+        }
+        fs::write(path.join("keep.hdr.tmp"), vec![0xAB; 32]).unwrap();
+
+        let _ = Storage::open(&path).expect("open with stale .hdr.tmp");
+        assert!(
+            !path.join("keep.hdr.tmp").exists(),
+            "stale .hdr.tmp must be deleted on open"
+        );
     }
 }

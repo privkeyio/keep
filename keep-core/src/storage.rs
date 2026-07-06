@@ -318,6 +318,14 @@ impl Storage {
             return Err(KeepError::NotFound(path.display().to_string()));
         }
 
+        // Reconcile any leftover rotation artifacts (`.hdr.tmp`, `.hdr.backup`,
+        // `.db.backup`) before reading the header. Handles the mid-rotation
+        // kill gap surfaced by #565's tests: without this, a crash inside
+        // `reencrypt_database` for `rotate_data_key` leaves `keep.db` with
+        // rows partially rewritten under the new DEK while `keep.hdr` still
+        // pins the old DEK, and every list post-open fails. See #662.
+        crate::rotation::recover_rotation_artifacts(path);
+
         let header_path = path.join("keep.hdr");
         let header_bytes = fs::read(&header_path)?;
 
