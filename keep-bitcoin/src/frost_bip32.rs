@@ -31,17 +31,20 @@
 //! - **X-only pubkeys** as the public interface: the group key surfaces
 //!   everywhere in this codebase as a BIP-340 x-only 32-byte value, so the
 //!   primitive returns x-only child pubkeys. Internally we work with the
-//!   compressed 33-byte form because that is what `HMAC-SHA512` hashes
-//!   in the BIP-32 spec; the y-parity is chosen as +even (0x02 prefix)
-//!   consistent with how BIP-340 recovers a key from an x-only point.
+//!   compressed 33-byte form because that is what `HMAC-SHA512` hashes in the
+//!   BIP-32 spec. A bare x-only input (the group key, or a single-step
+//!   `derive_child` parent) is lifted to its +even point (0x02 prefix), matching
+//!   how BIP-340 recovers a key from an x-only value. Crucially, a multi-level
+//!   `derive_path` walk carries each intermediate node's *true* compressed parity
+//!   into the next HMAC, exactly as BIP-32 `ckd_pub` does; it does not re-lift
+//!   intermediates to even, so derivation stays byte-for-byte conformant at every
+//!   depth (a receive/change leaf under an odd-y `/0` or `/1` node still matches).
 //!
 //! Reference vectors are cross-checked against `bitcoin::bip32::Xpub::derive_pub`
 //! in tests, so any drift from BIP-32 fails a unit test.
 
-use bitcoin::hashes::{sha256, Hash as _};
-use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, XOnlyPublicKey};
-use hmac::{digest::KeyInit, Hmac, Mac};
-use sha2::Sha512;
+use bitcoin::hashes::{sha256, sha512, Hash as _, HashEngine as _, Hmac, HmacEngine};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 
 use crate::error::{BitcoinError, Result};
 
@@ -61,7 +64,6 @@ pub const HARDENED_INDEX_START: u32 = 0x8000_0000;
 /// implies a sha256 collision.
 pub fn deterministic_chaincode(group_pubkey: &[u8; 32]) -> [u8; 32] {
     let mut engine = sha256::Hash::engine();
-    use bitcoin::hashes::HashEngine;
     engine.input(CHAINCODE_DOMAIN);
     engine.input(group_pubkey);
     sha256::Hash::from_engine(engine).to_byte_array()
@@ -83,41 +85,45 @@ pub struct ChildDerivation {
     pub child_pubkey: [u8; 32],
 }
 
-/// Derive one BIP-32 unhardened child of the given (parent_pubkey, chaincode)
-/// pair. Refuses hardened indexes (>= 2^31) and refuses the vanishingly rare
-/// case where the HMAC left-half scalar is >= n (spec-mandated retry with a
-/// different path segment; we surface it as an error so callers can react).
-pub fn derive_child(
-    parent_pubkey: &[u8; 32],
+/// Lift a BIP-340 x-only value to its +even (0x02 prefix) secp256k1 point,
+/// which is how BIP-340 recovers a public key from a bare x-only value.
+fn even_lift(xonly: &[u8; 32]) -> Result<PublicKey> {
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(xonly);
+    PublicKey::from_slice(&compressed)
+        .map_err(|e| BitcoinError::DerivationPath(format!("x-only pubkey not on curve: {e}")))
+}
+
+/// One BIP-32 unhardened `ckd_pub` step on a full parent point.
+///
+/// Serializes the parent with its *true* compressed parity (0x02 or 0x03) into
+/// the HMAC, exactly as the spec requires, and returns the real child point so
+/// callers can chain further steps without discarding parity. Returns the
+/// scalar tweak `IL`, the child chaincode `IR`, and the child point.
+fn ckd_pub_point(
+    parent_point: &PublicKey,
     chaincode: &[u8; 32],
     index: u32,
-) -> Result<ChildDerivation> {
+) -> Result<([u8; 32], [u8; 32], PublicKey)> {
     if index >= HARDENED_INDEX_START {
-        return Err(BitcoinError::Descriptor(format!(
+        return Err(BitcoinError::DerivationPath(format!(
             "hardened index {index} not supported for FROST groups; \
              only unhardened public derivation is meaningful without a group secret"
         )));
     }
-    // BIP-32 unhardened: HMAC-SHA512(chaincode, ser_P(parent_pubkey) || ser32(index))
-    // where ser_P is the 33-byte compressed pubkey. FROST surfaces its group key
-    // as x-only; recover the +even parity (0x02 prefix), matching BIP-340's
-    // interpretation of a bare x-only value as an even-y point.
-    let mut compressed = [0u8; 33];
-    compressed[0] = 0x02;
-    compressed[1..].copy_from_slice(parent_pubkey);
-    let parent_point = PublicKey::from_slice(&compressed)
-        .map_err(|e| BitcoinError::Descriptor(format!("parent x-only pubkey not on curve: {e}")))?;
-
-    let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(chaincode)
-        .expect("HMAC-SHA512 accepts any key length");
-    mac.update(&compressed);
-    mac.update(&index.to_be_bytes());
-    let hmac = mac.finalize().into_bytes();
+    // BIP-32 unhardened: HMAC-SHA512(chaincode, ser_P(parent_point) || ser32(index)),
+    // where ser_P is the 33-byte compressed pubkey carrying the parent's real parity.
+    let compressed = parent_point.serialize();
+    let mut engine = HmacEngine::<sha512::Hash>::new(chaincode);
+    engine.input(&compressed);
+    engine.input(&index.to_be_bytes());
+    let i = Hmac::<sha512::Hash>::from_engine(engine).to_byte_array();
 
     let mut tweak = [0u8; 32];
-    tweak.copy_from_slice(&hmac[..32]);
+    tweak.copy_from_slice(&i[..32]);
     let mut child_chaincode = [0u8; 32];
-    child_chaincode.copy_from_slice(&hmac[32..]);
+    child_chaincode.copy_from_slice(&i[32..]);
 
     let scalar = Scalar::from_be_bytes(tweak).map_err(|_| {
         // BIP-32 says: "In case parse256(IL) >= n or Ki is the point at infinity,
@@ -125,46 +131,71 @@ pub fn derive_child(
         // value for i." We surface this so callers can retry at their layer;
         // for the deterministic chaincode + reasonable indexes this has
         // never been observed in practice.
-        BitcoinError::Descriptor(format!(
+        BitcoinError::DerivationPath(format!(
             "BIP-32 child tweak >= curve order at index {index}; caller must skip to next index"
         ))
     })?;
     let secp = Secp256k1::verification_only();
     let child_point = parent_point.add_exp_tweak(&secp, &scalar).map_err(|e| {
-        BitcoinError::Descriptor(format!("BIP-32 child tweak produced invalid point: {e}"))
+        BitcoinError::DerivationPath(format!("BIP-32 child tweak produced invalid point: {e}"))
     })?;
-    let (child_xonly, _parity) = XOnlyPublicKey::from(child_point)
-        .public_key(bitcoin::secp256k1::Parity::Even)
-        .x_only_public_key();
+    Ok((tweak, child_chaincode, child_point))
+}
 
+/// Derive one BIP-32 unhardened child of the given (parent_pubkey, chaincode)
+/// pair. Refuses hardened indexes (>= 2^31) and refuses the vanishingly rare
+/// case where the HMAC left-half scalar is >= n (spec-mandated retry with a
+/// different path segment; we surface it as an error so callers can react).
+///
+/// `parent_pubkey` is a bare x-only value and is lifted to its +even point, so
+/// this is only conformant as a single step off the group key. For a multi-level
+/// walk use [`derive_path`], which threads each intermediate node's true parity;
+/// re-feeding this function's x-only output as the next parent would force even
+/// parity and diverge from BIP-32 whenever an intermediate node has odd y.
+pub fn derive_child(
+    parent_pubkey: &[u8; 32],
+    chaincode: &[u8; 32],
+    index: u32,
+) -> Result<ChildDerivation> {
+    let parent_point = even_lift(parent_pubkey)?;
+    let (tweak, child_chaincode, child_point) = ckd_pub_point(&parent_point, chaincode, index)?;
     Ok(ChildDerivation {
         tweak,
         child_chaincode,
-        child_pubkey: child_xonly.serialize(),
+        child_pubkey: child_point.x_only_public_key().0.serialize(),
     })
 }
 
 /// Walk a full BIP-32 path (all unhardened) starting from the group key and
 /// its deterministic chaincode, returning the terminal derivation. Convenience
 /// wrapper: the descriptor path `m/0/*` at index N is `derive_path(&[0, N])`.
+///
+/// The group key is lifted to its +even point once; every intermediate node's
+/// true compressed parity is then carried into the next HMAC, so the walk stays
+/// byte-for-byte BIP-32 conformant even under odd-y intermediate nodes.
 pub fn derive_path(
     group_pubkey: &[u8; 32],
     chaincode: &[u8; 32],
     path: &[u32],
 ) -> Result<ChildDerivation> {
     if path.is_empty() {
-        return Err(BitcoinError::Descriptor(
+        return Err(BitcoinError::DerivationPath(
             "derive_path requires at least one index".into(),
         ));
     }
-    let mut parent_pubkey = *group_pubkey;
+    let mut parent_point = even_lift(group_pubkey)?;
     let mut parent_chaincode = *chaincode;
     let mut last: Option<ChildDerivation> = None;
     for &index in path {
-        let step = derive_child(&parent_pubkey, &parent_chaincode, index)?;
-        parent_pubkey = step.child_pubkey;
-        parent_chaincode = step.child_chaincode;
-        last = Some(step);
+        let (tweak, child_chaincode, child_point) =
+            ckd_pub_point(&parent_point, &parent_chaincode, index)?;
+        parent_point = child_point;
+        parent_chaincode = child_chaincode;
+        last = Some(ChildDerivation {
+            tweak,
+            child_chaincode,
+            child_pubkey: child_point.x_only_public_key().0.serialize(),
+        });
     }
     Ok(last.expect("non-empty path always sets last"))
 }
@@ -214,7 +245,7 @@ mod tests {
         let cc = deterministic_chaincode(&group);
         let err = derive_child(&group, &cc, HARDENED_INDEX_START)
             .expect_err("hardened index must be refused");
-        assert!(matches!(err, BitcoinError::Descriptor(_)));
+        assert!(matches!(err, BitcoinError::DerivationPath(_)));
         // The last unhardened index still works.
         derive_child(&group, &cc, HARDENED_INDEX_START - 1).unwrap();
     }
@@ -251,32 +282,29 @@ mod tests {
         }
     }
 
-    /// Reference vectors: our tweak-based child derivation MUST match
-    /// `bitcoin::bip32::Xpub::derive_pub`, which is a widely deployed BIP-32
-    /// implementation. If this test drifts, we've broken conformance and
-    /// every downstream wallet importing our xpub would derive different
-    /// addresses.
-    #[test]
-    fn matches_bitcoin_bip32_reference() {
-        let group = stable_group_pubkey();
-        let cc = deterministic_chaincode(&group);
-
-        // Build a fake xpub carrying our (group_pubkey, chaincode) so we can
-        // hand it to bitcoin::bip32's normal ckd_pub path. The public
-        // constructor lives on Xpub; use `derive_pub` for the reference walk.
+    /// Build the reference `bitcoin::bip32::Xpub` carrying our (group_pubkey,
+    /// chaincode), rooted at the +even lift of the x-only group key, so we can
+    /// hand it to bitcoin::bip32's normal `ckd_pub` path.
+    fn ref_xpub_for(group: &[u8; 32], cc: &[u8; 32]) -> Xpub {
         let mut compressed = [0u8; 33];
         compressed[0] = 0x02;
-        compressed[1..].copy_from_slice(&group);
+        compressed[1..].copy_from_slice(group);
         let parent_point = bitcoin::secp256k1::PublicKey::from_slice(&compressed).unwrap();
-        let xpub = Xpub {
+        Xpub {
             network: NetworkKind::Main,
             depth: 0,
             parent_fingerprint: Default::default(),
             child_number: ChildNumber::from_normal_idx(0).unwrap(),
             public_key: parent_point,
-            chain_code: ChainCode::from(cc),
-        };
+            chain_code: ChainCode::from(*cc),
+        }
+    }
 
+    /// Assert our derivation matches `bitcoin::bip32::Xpub::derive_pub` byte for
+    /// byte across a spread of single- and multi-level unhardened paths.
+    fn assert_matches_bip32_reference(group: [u8; 32]) {
+        let cc = deterministic_chaincode(&group);
+        let xpub = ref_xpub_for(&group, &cc);
         let secp = Secp256k1::verification_only();
 
         for &path in &[
@@ -309,6 +337,41 @@ mod tests {
                 "path {path:?}: our child chaincode diverges from bitcoin::bip32"
             );
         }
+    }
+
+    /// Reference vectors: our tweak-based child derivation MUST match
+    /// `bitcoin::bip32::Xpub::derive_pub`, which is a widely deployed BIP-32
+    /// implementation. If this test drifts, we've broken conformance and
+    /// every downstream wallet importing our xpub would derive different
+    /// addresses.
+    #[test]
+    fn matches_bitcoin_bip32_reference() {
+        assert_matches_bip32_reference(stable_group_pubkey());
+    }
+
+    /// Regression for the parity-threading bug: a multi-level walk under an
+    /// intermediate node with *odd* y must still match BIP-32. A fixed even-y
+    /// key never exercises this, so search for a group key whose `/0` node is
+    /// odd-y and assert conformance under it. If `derive_path` ever re-lifts
+    /// intermediates to even, `/0/*` and `/1/*` here diverge from the reference.
+    #[test]
+    fn matches_bip32_reference_under_oddy_intermediate() {
+        let secp = Secp256k1::new();
+        let group = (1u8..=255)
+            .find_map(|seed| {
+                let sk = SecretKey::from_slice(&[seed; 32]).ok()?;
+                let (xonly, _) = sk.x_only_public_key(&secp);
+                let g = xonly.serialize();
+                let cc = deterministic_chaincode(&g);
+                let child0 = ref_xpub_for(&g, &cc)
+                    .derive_pub(&secp, &[ChildNumber::from_normal_idx(0).unwrap()])
+                    .unwrap();
+                // Compressed prefix 0x03 == odd y on the `/0` node.
+                (child0.public_key.serialize()[0] == 0x03).then_some(g)
+            })
+            .expect("some group key in range must have an odd-y /0 node");
+
+        assert_matches_bip32_reference(group);
     }
 
     /// The tweak returned by `derive_child` MUST be exactly the scalar
