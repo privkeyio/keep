@@ -10,7 +10,7 @@
 //! `frost::round1`/`round2`/`aggregate` runs against those tweaked packages.
 //! The resulting BIP-340 aggregate signature verifies under the derived
 //! child pubkey returned by
-//! [`keep_bitcoin::frost_bip32::derive_path_composite`].
+//! [`crate::frost_bip32::derive_path_composite`].
 //!
 //! Design notes for the review of #487:
 //!
@@ -29,15 +29,12 @@
 //!   BIP-340. A tweak accounting mistake would fail this check, so a
 //!   silently-wrong signature cannot escape the helper.
 
-use std::collections::BTreeMap;
-
 use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use frost_secp256k1_tr::{
-    self as frost,
-    keys::{KeyPackage, PublicKeyPackage, SigningShare, VerifyingShare},
-    rand_core::OsRng,
-    round1, round2, Identifier, SigningPackage, VerifyingKey,
+    keys::{KeyPackage, SigningShare, VerifyingShare},
+    VerifyingKey,
 };
+use zeroize::Zeroizing;
 
 use super::SharePackage;
 use crate::error::{KeepError, Result};
@@ -67,11 +64,11 @@ fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
     // child pubkey wallets derive, negate the tweak in the odd-y case. The
     // resulting KeyPackage will have `-(child_target)` as its VerifyingKey,
     // which BIP-340 accepts (verification is x-only, ignores sign).
-    let vk_bytes_probe = kp
+    let vk_bytes = kp
         .verifying_key()
         .serialize()
         .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
-    let real_vk_is_odd = vk_bytes_probe.first() == Some(&0x03);
+    let real_vk_is_odd = vk_bytes.first() == Some(&0x03);
     let mut effective_tweak = *tweak;
     if real_vk_is_odd {
         // Negate: n - t, using SecretKey's built-in modular negate (the
@@ -89,20 +86,22 @@ fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
     let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(*tweak).map_err(|_| {
         KeepError::Frost("BIP-32 aggregate tweak >= curve order; refusing to sign".into())
     })?;
-    let tweak_sk = bitcoin::secp256k1::SecretKey::from_slice(tweak).map_err(|e| {
-        KeepError::Frost(format!("BIP-32 aggregate tweak is not a valid scalar: {e}"))
-    })?;
 
     // Signing share: raw 32-byte big-endian scalar. Add tweak modulo n via
     // SecretKey::add_tweak (we abuse the SecretKey type for its modular
-    // arithmetic; the tweak itself is not a secret).
-    let ss_bytes = kp.signing_share().serialize();
-    let ss_sk = bitcoin::secp256k1::SecretKey::from_slice(&ss_bytes)
+    // arithmetic; the tweak itself is not a secret). The share scalar and its
+    // tweaked copy are real secret material, so keep every plaintext copy in a
+    // Zeroizing buffer that scrubs on drop.
+    let ss_bytes = Zeroizing::new(kp.signing_share().serialize());
+    let ss_sk = bitcoin::secp256k1::SecretKey::from_slice(ss_bytes.as_slice())
         .map_err(|e| KeepError::Frost(format!("signing share is not a valid scalar: {e}")))?;
-    let tweaked_ss_sk = ss_sk
-        .add_tweak(&bitcoin::secp256k1::Scalar::from_be_bytes(tweak_sk.secret_bytes()).unwrap())
-        .map_err(|e| KeepError::Frost(format!("signing share + tweak invalid: {e}")))?;
-    let tweaked_signing_share = SigningShare::deserialize(&tweaked_ss_sk.secret_bytes())
+    let tweaked_ss_bytes = Zeroizing::new(
+        ss_sk
+            .add_tweak(&scalar)
+            .map_err(|e| KeepError::Frost(format!("signing share + tweak invalid: {e}")))?
+            .secret_bytes(),
+    );
+    let tweaked_signing_share = SigningShare::deserialize(&*tweaked_ss_bytes)
         .map_err(|e| KeepError::Frost(format!("tweaked signing share deserialize: {e}")))?;
 
     // Verifying share: 33-byte compressed pubkey. Add tweak·G via
@@ -120,10 +119,7 @@ fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
         .map_err(|e| KeepError::Frost(format!("tweaked verifying share deserialize: {e}")))?;
 
     // Verifying key (group-level): same shape as VerifyingShare — 33 bytes.
-    let vk_bytes = kp
-        .verifying_key()
-        .serialize()
-        .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
+    // Reuse the bytes already serialized above for the parity probe.
     let vk_pk = bitcoin::secp256k1::PublicKey::from_slice(&vk_bytes)
         .map_err(|e| KeepError::Frost(format!("verifying key is not a valid point: {e}")))?;
     let tweaked_vk_pk = vk_pk
@@ -143,7 +139,7 @@ fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
 
 /// Derive the child pubkey and aggregate tweak for a group at a given BIP-32
 /// unhardened path, using the deterministic chaincode
-/// (`keep_bitcoin::frost_bip32::deterministic_chaincode`).
+/// (`crate::frost_bip32::deterministic_chaincode`).
 pub fn derive_child(group_pubkey: &[u8; 32], path: &[u32]) -> Result<CompositeDerivation> {
     let cc = deterministic_chaincode(group_pubkey);
     derive_path_composite(group_pubkey, &cc, path)
@@ -167,6 +163,15 @@ pub fn sign_with_local_shares_at_path(
     if shares.is_empty() {
         return Err(KeepError::Frost("No shares provided".into()));
     }
+    // The BIP-340 self-verify below (and every taproot sighash) is over a
+    // 32-byte digest. Reject a wrong-length message up front instead of doing
+    // a full signing round and only failing at the verify step.
+    if message.len() != 32 {
+        return Err(KeepError::Frost(format!(
+            "Signable message must be 32 bytes, got {}",
+            message.len()
+        )));
+    }
     let threshold = shares[0].metadata.threshold as usize;
     if shares.len() < threshold {
         return Err(KeepError::Frost(format!(
@@ -187,47 +192,7 @@ pub fn sign_with_local_shares_at_path(
         .map(|s| tweak_key_package(&s.key_package()?, &composite.aggregate_tweak))
         .collect::<Result<Vec<_>>>()?;
 
-    let mut nonces_map: BTreeMap<Identifier, round1::SigningNonces> = BTreeMap::new();
-    let mut commitments_map: BTreeMap<Identifier, round1::SigningCommitments> = BTreeMap::new();
-    let mut verifying_shares: BTreeMap<Identifier, VerifyingShare> = BTreeMap::new();
-
-    for kp in &tweaked_kps {
-        let (nonces, commitments) = round1::commit(kp.signing_share(), &mut OsRng);
-        nonces_map.insert(*kp.identifier(), nonces);
-        commitments_map.insert(*kp.identifier(), commitments);
-        verifying_shares.insert(*kp.identifier(), *kp.verifying_share());
-    }
-
-    let signing_package = SigningPackage::new(commitments_map, message);
-
-    let mut signature_shares: BTreeMap<Identifier, round2::SignatureShare> = BTreeMap::new();
-    for kp in &tweaked_kps {
-        let id = *kp.identifier();
-        let nonces = nonces_map
-            .remove(&id)
-            .ok_or_else(|| KeepError::Frost("Missing nonces for share".into()))?;
-        let sig_share = round2::sign(&signing_package, &nonces, kp)
-            .map_err(|e| KeepError::Frost(format!("Signing failed: {e}")))?;
-        signature_shares.insert(id, sig_share);
-    }
-
-    let pubkey_pkg = PublicKeyPackage::new(
-        verifying_shares,
-        *tweaked_kps[0].verifying_key(),
-        Some(*tweaked_kps[0].min_signers()),
-    );
-    let signature = frost::aggregate(&signing_package, &signature_shares, &pubkey_pkg)
-        .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))?;
-
-    let serialized = signature
-        .serialize()
-        .map_err(|e| KeepError::Frost(format!("Failed to serialize signature: {e}")))?;
-    let bytes_slice = serialized.as_slice();
-    if bytes_slice.len() != 64 {
-        return Err(KeepError::Frost("Invalid signature length".into()));
-    }
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(bytes_slice);
+    let sig_bytes = super::signing::aggregate_local(&tweaked_kps, message)?;
 
     // Independent verification: the aggregate MUST verify under the derived
     // child pubkey using BIP-340. A wrong tweak on any share would break
@@ -343,6 +308,45 @@ mod tests {
         let xonly = XOnlyPublicKey::from_slice(&composite.child_pubkey).unwrap();
         let msg = Message::from_digest(message);
         secp.verify_schnorr(&sig, &msg, &xonly).unwrap();
+    }
+
+    /// Exercise the odd-y group-VK negation branch in `tweak_key_package`.
+    /// The group's TRUE verifying key has random parity per dealer run, so
+    /// generate until it serializes to 0x03 (odd y), then assert the composed
+    /// signature still verifies under the derived child pubkey. Without this,
+    /// the exact parity-correctness branch is only hit ~50% of the time.
+    #[test]
+    fn odd_y_group_vk_signs_and_verifies_under_child() {
+        let message = [0x77u8; 32];
+        let mut exercised_odd_y = false;
+        for _ in 0..64 {
+            let shares = make_shares(2, 3);
+            let vk_prefix = shares[0]
+                .key_package()
+                .unwrap()
+                .verifying_key()
+                .serialize()
+                .unwrap()[0];
+            if vk_prefix != 0x03 {
+                continue;
+            }
+            exercised_odd_y = true;
+            let group = *shares[0].group_pubkey();
+
+            let sig = sign_with_local_shares_at_path(&shares[..2], &message, &[0, 9]).unwrap();
+
+            let composite = derive_child(&group, &[0, 9]).unwrap();
+            let secp = Secp256k1::verification_only();
+            let sig = Signature::from_slice(&sig).unwrap();
+            let xonly = XOnlyPublicKey::from_slice(&composite.child_pubkey).unwrap();
+            let msg = Message::from_digest(message);
+            secp.verify_schnorr(&sig, &msg, &xonly).unwrap();
+            break;
+        }
+        assert!(
+            exercised_odd_y,
+            "no odd-y group VK produced in 64 dealer runs; branch left untested"
+        );
     }
 
     /// Fewer shares than the threshold refuses without ever computing a
