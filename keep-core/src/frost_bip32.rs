@@ -44,9 +44,17 @@
 //! in tests, so any drift from BIP-32 fails a unit test.
 
 use bitcoin::hashes::{sha256, sha512, Hash as _, HashEngine as _, Hmac, HmacEngine};
-use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 
-use crate::error::{BitcoinError, Result};
+use crate::error::{KeepError, Result};
+
+/// Local shim so downstream call sites (moved from keep-bitcoin in #487 PR2)
+/// keep using the same variant name for BIP-32 pathing errors. Every
+/// derivation failure is reported as `KeepError::Frost(...)` under the hood.
+#[inline]
+fn derivation_path_error(msg: impl Into<String>) -> KeepError {
+    KeepError::Frost(msg.into())
+}
 
 /// Domain separator for the deterministic chaincode. Bumping the version tag
 /// invalidates every previously derived child; keep it stable across releases.
@@ -92,7 +100,7 @@ fn even_lift(xonly: &[u8; 32]) -> Result<PublicKey> {
     compressed[0] = 0x02;
     compressed[1..].copy_from_slice(xonly);
     PublicKey::from_slice(&compressed)
-        .map_err(|e| BitcoinError::DerivationPath(format!("x-only pubkey not on curve: {e}")))
+        .map_err(|e| derivation_path_error(format!("x-only pubkey not on curve: {e}")))
 }
 
 /// One BIP-32 unhardened `ckd_pub` step on a full parent point.
@@ -107,7 +115,7 @@ fn ckd_pub_point(
     index: u32,
 ) -> Result<([u8; 32], [u8; 32], PublicKey)> {
     if index >= HARDENED_INDEX_START {
-        return Err(BitcoinError::DerivationPath(format!(
+        return Err(derivation_path_error(format!(
             "hardened index {index} not supported for FROST groups; \
              only unhardened public derivation is meaningful without a group secret"
         )));
@@ -131,13 +139,13 @@ fn ckd_pub_point(
         // value for i." We surface this so callers can retry at their layer;
         // for the deterministic chaincode + reasonable indexes this has
         // never been observed in practice.
-        BitcoinError::DerivationPath(format!(
+        derivation_path_error(format!(
             "BIP-32 child tweak >= curve order at index {index}; caller must skip to next index"
         ))
     })?;
     let secp = Secp256k1::verification_only();
     let child_point = parent_point.add_exp_tweak(&secp, &scalar).map_err(|e| {
-        BitcoinError::DerivationPath(format!("BIP-32 child tweak produced invalid point: {e}"))
+        derivation_path_error(format!("BIP-32 child tweak produced invalid point: {e}"))
     })?;
     Ok((tweak, child_chaincode, child_point))
 }
@@ -166,6 +174,112 @@ pub fn derive_child(
     })
 }
 
+/// Result of walking a full BIP-32 path, with the aggregate scalar tweak
+/// needed to reproduce the terminal child key from the +even lift of the
+/// group key. Used by FROST signing so every co-signer applies one
+/// composite tweak to its share instead of walking the tree per signer.
+///
+/// BIP-32 unhardened tweaks compose additively over the group:
+/// `child_final = group_lifted + t_agg·G (mod n)` where `t_agg = sum(t_i)`
+/// with each `t_i` computed against the actual on-curve parent point at
+/// its own depth. The stepwise tweaks are NOT interchangeable with the
+/// aggregate at intermediate depths (the HMAC input at level `i+1` depends
+/// on level `i`'s real parity, not on any x-only summary), so callers that
+/// want the aggregate must use this walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeDerivation {
+    /// Aggregate BIP-32 scalar tweak: applying it once to every FROST
+    /// signing share (mod n) and the group verifying key produces a
+    /// tweaked signing set whose aggregate signature verifies under
+    /// [`Self::child_pubkey`]. This is the single scalar the composed
+    /// BIP-32 + BIP-341 sign path passes to `KeyPackage`.
+    pub aggregate_tweak: [u8; 32],
+    /// Terminal chaincode. Callers walking children below the terminal
+    /// node (e.g. a wallet exposing further sub-paths) use it as the
+    /// parent chaincode for the next step.
+    pub terminal_chaincode: [u8; 32],
+    /// Terminal x-only child public key: the address-forming key at the
+    /// end of the path, and the key an aggregated signature must verify
+    /// against.
+    pub child_pubkey: [u8; 32],
+}
+
+/// Walk a BIP-32 path and return the aggregate scalar tweak plus the
+/// terminal chaincode and x-only child pubkey. Refuses hardened indexes
+/// and refuses paths whose stepwise tweaks aggregate to zero mod n (an
+/// invalid signing key; also a BIP-32-spec-mandated retry condition).
+pub fn derive_path_composite(
+    group_pubkey: &[u8; 32],
+    chaincode: &[u8; 32],
+    path: &[u32],
+) -> Result<CompositeDerivation> {
+    if path.is_empty() {
+        return Err(derivation_path_error(
+            "derive_path_composite requires at least one index",
+        ));
+    }
+    let mut parent_point = even_lift(group_pubkey)?;
+    let mut parent_chaincode = *chaincode;
+
+    // Accumulate the scalar tweak in a SecretKey for modular add_tweak
+    // arithmetic. The value is not a secret (chaincodes and unhardened
+    // tweaks are public by construction), we just reuse the API surface
+    // for its mod-n scalar addition. Seed with the first step's tweak.
+    let first_index = path[0];
+    let (first_tweak, first_cc, first_point) =
+        ckd_pub_point(&parent_point, &parent_chaincode, first_index)?;
+    let mut acc = SecretKey::from_slice(&first_tweak).map_err(|e| {
+        derivation_path_error(format!("BIP-32 first tweak is not a valid scalar: {e}"))
+    })?;
+    parent_point = first_point;
+    parent_chaincode = first_cc;
+
+    for &index in &path[1..] {
+        let (step_tweak, step_cc, step_point) =
+            ckd_pub_point(&parent_point, &parent_chaincode, index)?;
+        let step_scalar = Scalar::from_be_bytes(step_tweak).map_err(|_| {
+            derivation_path_error(format!("BIP-32 step tweak >= curve order at index {index}"))
+        })?;
+        acc = acc.add_tweak(&step_scalar).map_err(|e| {
+            derivation_path_error(format!(
+                "BIP-32 aggregate tweak became invalid at index {index}: {e}"
+            ))
+        })?;
+        parent_point = step_point;
+        parent_chaincode = step_cc;
+    }
+
+    let aggregate_tweak = acc.secret_bytes();
+    // Sanity-check invariant: applying the aggregate tweak to the +even
+    // lift of the group key must reproduce the terminal child point.
+    // Any drift here means the composite tweak cannot be used for FROST
+    // signing under the derived child key, which is the whole point of
+    // this helper. Refuse rather than return an unsigned-worthy tweak.
+    let secp = Secp256k1::verification_only();
+    let reproduced = even_lift(group_pubkey)?
+        .add_exp_tweak(
+            &secp,
+            &Scalar::from_be_bytes(aggregate_tweak).map_err(|_| {
+                derivation_path_error("aggregate tweak >= curve order after accumulation")
+            })?,
+        )
+        .map_err(|e| {
+            derivation_path_error(format!("aggregate tweak produced invalid point: {e}"))
+        })?;
+    if reproduced != parent_point {
+        return Err(derivation_path_error(
+            "composed BIP-32 tweak does not reproduce terminal child point; \
+             signing under the aggregate would diverge from stepwise derivation",
+        ));
+    }
+
+    Ok(CompositeDerivation {
+        aggregate_tweak,
+        terminal_chaincode: parent_chaincode,
+        child_pubkey: parent_point.x_only_public_key().0.serialize(),
+    })
+}
+
 /// Walk a full BIP-32 path (all unhardened) starting from the group key and
 /// its deterministic chaincode, returning the terminal derivation. Convenience
 /// wrapper: the descriptor path `m/0/*` at index N is `derive_path(&[0, N])`.
@@ -179,8 +293,8 @@ pub fn derive_path(
     path: &[u32],
 ) -> Result<ChildDerivation> {
     if path.is_empty() {
-        return Err(BitcoinError::DerivationPath(
-            "derive_path requires at least one index".into(),
+        return Err(derivation_path_error(
+            "derive_path requires at least one index",
         ));
     }
     let mut parent_point = even_lift(group_pubkey)?;
@@ -245,7 +359,7 @@ mod tests {
         let cc = deterministic_chaincode(&group);
         let err = derive_child(&group, &cc, HARDENED_INDEX_START)
             .expect_err("hardened index must be refused");
-        assert!(matches!(err, BitcoinError::DerivationPath(_)));
+        assert!(matches!(err, KeepError::Frost(_)));
         // The last unhardened index still works.
         derive_child(&group, &cc, HARDENED_INDEX_START - 1).unwrap();
     }
@@ -401,5 +515,89 @@ mod tests {
         let group = stable_group_pubkey();
         let cc = deterministic_chaincode(&group);
         assert!(derive_path(&group, &cc, &[]).is_err());
+        assert!(derive_path_composite(&group, &cc, &[]).is_err());
+    }
+
+    /// #487 PR2 core: the aggregate scalar tweak returned by
+    /// `derive_path_composite` reproduces the same terminal child point as
+    /// the stepwise walk. This is the invariant every co-signer relies on
+    /// when applying ONE composite tweak to its share instead of walking
+    /// the tree per signer.
+    #[test]
+    fn composite_tweak_reproduces_terminal_child_point() {
+        let group = stable_group_pubkey();
+        let cc = deterministic_chaincode(&group);
+        for path in &[
+            &[0u32][..],
+            &[1u32][..],
+            &[0, 0][..],
+            &[0, 1][..],
+            &[1, 0][..],
+            &[1, 42][..],
+            &[0, 100_000][..],
+        ] {
+            let stepwise = derive_path(&group, &cc, path).unwrap();
+            let composite = derive_path_composite(&group, &cc, path).unwrap();
+
+            // Composite and stepwise walks converge on the same terminal
+            // (chaincode, x-only child pubkey), so callers of either
+            // helper see a consistent tree.
+            assert_eq!(
+                composite.child_pubkey, stepwise.child_pubkey,
+                "path {path:?}: composite child pubkey diverges from stepwise walk"
+            );
+            assert_eq!(
+                composite.terminal_chaincode, stepwise.child_chaincode,
+                "path {path:?}: composite chaincode diverges from stepwise walk"
+            );
+
+            // The aggregate tweak, applied once to the +even lift of the
+            // group pubkey, reproduces the terminal child point. This is
+            // the property the FROST signing path (PR 3 of #487) will
+            // depend on for its one-tweak-per-share optimisation.
+            let secp = Secp256k1::verification_only();
+            let parent = even_lift(&group).unwrap();
+            let scalar = Scalar::from_be_bytes(composite.aggregate_tweak).unwrap();
+            let reproduced = parent.add_exp_tweak(&secp, &scalar).unwrap();
+            assert_eq!(
+                reproduced.x_only_public_key().0.serialize(),
+                composite.child_pubkey,
+                "path {path:?}: applying aggregate tweak to +even group does not reproduce child"
+            );
+        }
+    }
+
+    /// The aggregate tweak for a single-step path equals the stepwise
+    /// tweak byte-for-byte: the composite walker MUST NOT drift away
+    /// from the primitive for the trivial case.
+    #[test]
+    fn composite_matches_stepwise_tweak_at_depth_one() {
+        let group = stable_group_pubkey();
+        let cc = deterministic_chaincode(&group);
+        for &index in &[0u32, 1, 2, 7, 42, 100_000] {
+            let step = derive_child(&group, &cc, index).unwrap();
+            let composite = derive_path_composite(&group, &cc, &[index]).unwrap();
+            assert_eq!(step.tweak, composite.aggregate_tweak, "index {index}");
+        }
+    }
+
+    /// Different composite paths must yield different aggregate tweaks:
+    /// the whole point of derivation is address (and signing-key) diversity.
+    #[test]
+    fn composite_tweaks_differ_across_paths() {
+        let group = stable_group_pubkey();
+        let cc = deterministic_chaincode(&group);
+        let a = derive_path_composite(&group, &cc, &[0, 0])
+            .unwrap()
+            .aggregate_tweak;
+        let b = derive_path_composite(&group, &cc, &[0, 1])
+            .unwrap()
+            .aggregate_tweak;
+        let c = derive_path_composite(&group, &cc, &[1, 0])
+            .unwrap()
+            .aggregate_tweak;
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
     }
 }

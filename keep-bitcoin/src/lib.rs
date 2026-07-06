@@ -7,7 +7,13 @@ mod address;
 pub mod chain_view;
 mod descriptor;
 mod error;
-pub mod frost_bip32;
+/// BIP-32 unhardened child-key primitives for FROST group keys (#487).
+///
+/// Re-exported from `keep_core::frost_bip32` so downstream call sites that
+/// used the pre-#487-PR2 path (`keep_bitcoin::frost_bip32::*`) keep
+/// compiling; the module lives in keep-core because bip32-composed FROST
+/// signing lives there and keep-bitcoin cannot depend upward on keep-core.
+pub use keep_core::frost_bip32;
 pub mod key_proof;
 pub mod psbt;
 pub mod recovery;
