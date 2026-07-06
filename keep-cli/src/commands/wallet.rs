@@ -1848,6 +1848,24 @@ async fn approve_psbt_session(
     node.validate_migration_sweep_destination(&session_descriptor_hash, &psbt.unsigned_tx)
         .map_err(KeepError::Frost)?;
 
+    // #502 responder-side prevout amount validation: BIP-341 sighashes commit
+    // to every input's prevout amount, so an understated `witness_utxo.value`
+    // produces a signature that bypasses every fee cap the responder computed
+    // against the (lied about) claim. Refuse without an authoritative check.
+    // Operators configure the chain view via `KEEP_CHAIN_URL` (esplora /
+    // mempool.space compatible endpoint). The check is REQUIRED on the
+    // recovery-sign path because that is where the fee-caps live; a
+    // missing endpoint refuses closed rather than proceeding blind.
+    let chain = keep_bitcoin::esplora_chain_view_from_env().map_err(KeepError::InvalidInput)?;
+    // `approve_psbt_session` is async and awaited under `rt.block_on` on a
+    // multi-thread runtime, concurrently with the spawned FROST node task.
+    // block_in_place moves the blocking HTTP validation off the async driver
+    // thread so it does not stall the runtime while the request is in flight.
+    tokio::task::block_in_place(|| {
+        keep_bitcoin::validate_prevout_amounts_against_chain(&psbt, &chain)
+    })
+    .map_err(KeepError::Frost)?;
+
     // Display every destination (address + amount) and require explicit
     // operator confirmation before signing. The input-binding check above only
     // proves we control the spent UTXOs; it says nothing about where the funds
