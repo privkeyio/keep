@@ -7,6 +7,7 @@ mod address;
 pub mod chain_view;
 mod descriptor;
 mod error;
+pub mod frost_bip32;
 pub mod key_proof;
 pub mod psbt;
 pub mod recovery;
