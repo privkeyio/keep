@@ -36,9 +36,17 @@ pub const MAX_MESSAGE_TYPE_LENGTH: usize = 64;
 /// across crates so every producer (nip46, mobile, CLI) and every consumer
 /// (signing hooks) agree on one spelling for the same domain.
 pub const MSG_TYPE_NOSTR_EVENT: &str = "nostr-event";
+/// Canonical `message_type` label for a Bitcoin taproot key-spend sighash
+/// signing request. Paired with a [`crate::BitcoinSighashPayload`] structured
+/// payload the responder recomputes and matches against the 32-byte digest.
+pub const MSG_TYPE_BITCOIN_SIGHASH: &str = "bitcoin-sighash";
 /// Canonical `message_type` label for an unstructured 32-byte digest. Refused
 /// by [`crate::RefuseRawSignatureHooks`].
 pub const MSG_TYPE_RAW: &str = "raw";
+/// Upper bound on the structured payload attached to a [`SignRequestPayload`].
+/// Sized to accommodate a Bitcoin PSBT (up to [`MAX_PSBT_SIZE`]) plus wire
+/// overhead; any request exceeding this is refused at protocol validation.
+pub const MAX_STRUCTURED_PAYLOAD_SIZE: usize = MAX_PSBT_SIZE + 4096;
 pub const MAX_RECOVERY_TIERS: usize = 10;
 pub const MAX_KEYS_PER_TIER: usize = 20;
 pub const MIN_XPUB_LENGTH: usize = 111;
@@ -280,6 +288,11 @@ impl KfpMessage {
                 }
                 if p.message_type.len() > MAX_MESSAGE_TYPE_LENGTH {
                     return Err("Message type exceeds maximum length");
+                }
+                if let Some(sp) = p.structured_payload.as_ref() {
+                    if sp.len() > MAX_STRUCTURED_PAYLOAD_SIZE {
+                        return Err("Structured payload exceeds maximum size");
+                    }
                 }
                 if p.participants.len() > MAX_PARTICIPANTS {
                     return Err("Participants list exceeds maximum size");
@@ -964,6 +977,35 @@ pub struct SignRequestPayload {
     /// salted failover (an empty salt reproduces the original derivation).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_salt: Vec<u8>,
+    /// Domain-specific structured payload that lets the responder recompute
+    /// the 32 bytes in `message` from a typed schema (#529 / #524). When
+    /// present, the responder decodes it against `message_type` and refuses
+    /// the request on any mismatch, closing the cross-domain spoof where a
+    /// requester labels a Bitcoin sighash as `"nostr-event"` (or vice versa)
+    /// to get it blind-signed. Kept `Option` + `serde(default)` so peers
+    /// predating #529 stay wire-compatible; operators of hybrid groups
+    /// enforce presence via [`crate::RequireStructuredPayloadHooks`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_bytes_opt"
+    )]
+    pub structured_payload: Option<Vec<u8>>,
+}
+
+mod hex_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => s.serialize_str(&hex::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        opt.map(|h| hex::decode(&h).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 /// A reference to a single pre-exchanged nonce/commitment pair.
@@ -1000,6 +1042,7 @@ impl SignRequestPayload {
             metadata: None,
             nonce_refs: Vec::new(),
             session_salt: Vec::new(),
+            structured_payload: None,
         }
     }
 
@@ -1010,6 +1053,11 @@ impl SignRequestPayload {
 
     pub fn with_nonce_refs(mut self, nonce_refs: Vec<NonceRef>) -> Self {
         self.nonce_refs = nonce_refs;
+        self
+    }
+
+    pub fn with_structured_payload(mut self, structured_payload: Vec<u8>) -> Self {
+        self.structured_payload = Some(structured_payload);
         self
     }
 
@@ -2310,6 +2358,68 @@ mod tests {
     fn test_message_type() {
         let msg = KfpMessage::Ping(PingPayload::new());
         assert_eq!(msg.message_type(), "ping");
+    }
+
+    /// #529 wire compat: a request without a structured_payload MUST omit the
+    /// field on the wire so peers running pre-#529 code parse it unchanged.
+    #[test]
+    fn sign_request_without_structured_payload_omits_field_on_wire() {
+        let payload = SignRequestPayload::new(
+            [2u8; 32],
+            [3u8; 32],
+            vec![4, 5, 6],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        );
+        let msg = KfpMessage::SignRequest(payload);
+        let json = msg.to_json().unwrap();
+        assert!(
+            !json.contains("structured_payload"),
+            "absent structured_payload must serialize as omitted, not null: {json}"
+        );
+    }
+
+    /// #529 wire compat: a request WITH a structured_payload round-trips as
+    /// hex on the wire, matching the `message` / `nonce_id` conventions.
+    #[test]
+    fn sign_request_with_structured_payload_round_trips_hex() {
+        let structured = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let payload = SignRequestPayload::new(
+            [2u8; 32],
+            [3u8; 32],
+            vec![4, 5, 6],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_structured_payload(structured.clone());
+
+        let msg = KfpMessage::SignRequest(payload);
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"deadbeef\""));
+        let parsed: KfpMessage = KfpMessage::from_json(&json).unwrap();
+        match parsed {
+            KfpMessage::SignRequest(p) => {
+                assert_eq!(p.structured_payload.as_deref(), Some(structured.as_slice()));
+            }
+            _ => panic!("expected SignRequest"),
+        }
+    }
+
+    /// #529: a payload above `MAX_STRUCTURED_PAYLOAD_SIZE` is refused at
+    /// validation so responders never allocate arbitrary memory for it.
+    #[test]
+    fn oversized_structured_payload_refused_at_validate() {
+        let oversized = vec![0u8; MAX_STRUCTURED_PAYLOAD_SIZE + 1];
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_structured_payload(oversized);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
     }
 
     #[test]

@@ -691,6 +691,13 @@ impl Nip55Handler {
 
         let event_hash = compute_nostr_event_id(&event)?;
 
+        // #529: attach the structured event body so co-signers can recompute
+        // the id and reject a cross-domain label spoof. Every field in the
+        // NIP-01 id serialization contributes to the digest, so any change
+        // to the body must be reflected in the sig; forwarding the same
+        // canonical fields ensures the responder's recompute matches ours.
+        let structured = build_structured_nostr_payload(&event)?;
+
         let node_arc = self.mobile.node.clone();
         let signature = spawn_async_with_timeout(
             &self.mobile,
@@ -699,9 +706,13 @@ impl Nip55Handler {
             async move {
                 let node_guard = node_arc.read().await;
                 let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
-                node.request_signature(event_hash.to_vec(), keep_frost_net::MSG_TYPE_NOSTR_EVENT)
-                    .await
-                    .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+                node.request_signature_structured(
+                    event_hash.to_vec(),
+                    keep_frost_net::MSG_TYPE_NOSTR_EVENT,
+                    Some(structured),
+                )
+                .await
+                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
             },
         )?;
 
@@ -1005,6 +1016,58 @@ pub(crate) fn compute_nostr_event_id(
 
     let hash = Sha256::digest(json_str.as_bytes());
     Ok(hash.into())
+}
+
+/// Build the `keep_frost_net::NostrEventPayload` structured wire format from
+/// the sign-event request's JSON body so the co-signers can recompute the
+/// event id (#529). Same canonical field extraction as
+/// [`compute_nostr_event_id`], keyed by NIP-01 field order.
+pub(crate) fn build_structured_nostr_payload(
+    event: &serde_json::Value,
+) -> Result<Vec<u8>, KeepMobileError> {
+    let pubkey_hex = event["pubkey"]
+        .as_str()
+        .ok_or(KeepMobileError::InvalidSession)?;
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| KeepMobileError::InvalidSession)?;
+    let pubkey: [u8; 32] = pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeepMobileError::InvalidSession)?;
+    let created_at = event["created_at"]
+        .as_u64()
+        .ok_or(KeepMobileError::InvalidSession)?;
+    let kind = event["kind"]
+        .as_u64()
+        .and_then(|k| u16::try_from(k).ok())
+        .ok_or(KeepMobileError::InvalidSession)?;
+    let tags: Vec<Vec<String>> = event["tags"]
+        .as_array()
+        .ok_or(KeepMobileError::InvalidSession)?
+        .iter()
+        .map(|tag| {
+            tag.as_array()
+                .ok_or(KeepMobileError::InvalidSession)?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or(KeepMobileError::InvalidSession)
+                })
+                .collect()
+        })
+        .collect::<Result<_, _>>()?;
+    let content = event["content"]
+        .as_str()
+        .ok_or(KeepMobileError::InvalidSession)?
+        .to_string();
+    let payload = keep_frost_net::NostrEventPayload {
+        pubkey,
+        created_at,
+        kind,
+        tags,
+        content,
+    };
+    serde_json::to_vec(&payload).map_err(|_| KeepMobileError::InvalidSession)
 }
 
 #[cfg(test)]

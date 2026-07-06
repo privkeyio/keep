@@ -480,7 +480,36 @@ impl KfpNode {
             participants: request.participants.clone(),
             requester,
             message_type: request.message_type.clone(),
+            structured_payload: request.structured_payload.clone(),
         };
+
+        // Recompute the digest from the structured payload BEFORE the pre-sign
+        // hook fires (#529). This closes the cross-domain label spoof where a
+        // requester relabels a Bitcoin sighash as `"nostr-event"` (or the
+        // mirror): the Nostr-canonical hash of the supplied event body would
+        // not equal the sighash bytes, so the responder refuses without
+        // signing. When no structured payload is attached this is a no-op;
+        // enforcement of presence is a policy choice owned by
+        // `RequireStructuredPayloadHooks`.
+        if let Some(sp) = request.structured_payload.as_ref() {
+            if let Err(e) =
+                crate::verify_structured_payload(&request.message_type, &request.message, sp)
+            {
+                warn!(
+                    session_id = %hex::encode(request.session_id),
+                    error = %e,
+                    "Sign request refused: structured payload does not match digest"
+                );
+                self.send_session_error(
+                    &from,
+                    "policy_violation",
+                    &e.to_string(),
+                    request.session_id,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
 
         let hooks = self.hooks.read().clone();
         if let Err(e) = hooks.pre_sign(&session_info) {
@@ -1097,8 +1126,24 @@ impl KfpNode {
 
     pub async fn request_signature(
         &self,
+        message: Vec<u8>,
+        message_type: &str,
+    ) -> Result<[u8; 64]> {
+        self.request_signature_structured(message, message_type, None)
+            .await
+    }
+
+    /// Request a threshold signature and attach a domain-specific structured
+    /// payload the co-signers recompute the digest from (#529). See
+    /// [`crate::NostrEventPayload`] / [`crate::BitcoinSighashPayload`] for the
+    /// wire schemas. Callers that hold the structured body (nip46 sign_event,
+    /// PSBT signing) MUST use this variant so co-signers can catch a
+    /// cross-domain label spoof before signing.
+    pub async fn request_signature_structured(
+        &self,
         mut message: Vec<u8>,
         message_type: &str,
+        structured_payload: Option<Vec<u8>>,
     ) -> Result<[u8; 64]> {
         // On a round timeout the co-signers that failed to commit are treated as
         // unresponsive and excluded, then we re-select from the remaining online
@@ -1118,6 +1163,13 @@ impl KfpNode {
         // real per-participant session id for that). Two requests for the same
         // message intentionally share this id; do not treat it as unique.
         let logical_id = derive_session_id(&message, &[], self.share.metadata.threshold);
+        // On the requester side, verify our own structured payload once before
+        // any round: if it does not recompute to `message` the co-signers will
+        // reject the request anyway, so we fail fast locally with the same
+        // error path (#529).
+        if let Some(sp) = structured_payload.as_ref() {
+            crate::verify_structured_payload(message_type, &message, sp)?;
+        }
         // Drop co-signers that are already unreachable before committing, so the
         // first round goes straight to live peers instead of timing out on a
         // dead one. Peers that drop mid-round are still caught by the failover
@@ -1131,7 +1183,14 @@ impl KfpNode {
                 message.clone()
             };
             let result = self
-                .signing_round(round_message, message_type, &excluded, logical_id, attempt)
+                .signing_round(
+                    round_message,
+                    message_type,
+                    structured_payload.clone(),
+                    &excluded,
+                    logical_id,
+                    attempt,
+                )
                 .await;
 
             match result {
@@ -1227,6 +1286,7 @@ impl KfpNode {
         &self,
         message: Vec<u8>,
         message_type: &str,
+        structured_payload: Option<Vec<u8>>,
         exclude: &[u16],
         logical_id: [u8; 32],
         attempt: usize,
@@ -1312,7 +1372,7 @@ impl KfpNode {
             });
         }
 
-        let request = SignRequestPayload::new(
+        let mut request = SignRequestPayload::new(
             session_id,
             self.group_pubkey,
             message.clone(),
@@ -1321,6 +1381,9 @@ impl KfpNode {
         )
         .with_nonce_refs(nonce_refs)
         .with_session_salt(session_salt.clone());
+        if let Some(sp) = structured_payload.as_ref() {
+            request = request.with_structured_payload(sp.clone());
+        }
 
         let session_info = SessionInfo {
             session_id,
@@ -1329,6 +1392,7 @@ impl KfpNode {
             participants: participants.clone(),
             requester: self.share.metadata.identifier,
             message_type: message_type.to_string(),
+            structured_payload: structured_payload.clone(),
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;

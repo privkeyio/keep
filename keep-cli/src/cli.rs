@@ -567,6 +567,13 @@ pub(crate) enum FrostNetworkCommands {
         /// See #524 for the deeper protocol-level fix.
         #[arg(long)]
         refuse_raw_sign: bool,
+        /// Refuse any sign request that does not carry a structured payload the
+        /// co-signer can recompute the digest from (#529). Combined with
+        /// --refuse-raw-sign this closes the cross-domain label spoof for hybrid
+        /// Nostr + Bitcoin groups. Default off; enable once all peers attach
+        /// structured payloads.
+        #[arg(long)]
+        require_structured_sign: bool,
         /// TOML file pinning each peer's TPM attestation key and the reference
         /// PCRs they must quote. The node verifies a peer's measured-boot state
         /// against this before answering its OPRF evaluation requests. Required

@@ -61,6 +61,7 @@ pub fn cmd_frost_network_serve(
     share_index: Option<u16>,
     auto_contribute_descriptor: bool,
     refuse_raw_sign: bool,
+    require_structured_sign: bool,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
@@ -68,7 +69,7 @@ pub fn cmd_frost_network_serve(
     oprf_auto_approve: bool,
     tpm_tcti: Option<&str>,
 ) -> Result<()> {
-    debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, "starting FROST network node");
+    debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
     // Resolve the attestation policy up front (fail-closed) so a missing or
     // invalid one fails before we prompt for the password or touch the vault.
@@ -161,9 +162,10 @@ pub fn cmd_frost_network_serve(
         } else {
             out.field("Attestation", "DISABLED (--insecure-no-attestation)");
         }
-        if refuse_raw_sign || oprf_auto_approve {
+        if refuse_raw_sign || require_structured_sign || oprf_auto_approve {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
                 refuse_raw_sign,
+                require_structured_payload: require_structured_sign,
                 auto_approve_oprf_eval: oprf_auto_approve,
             }));
         }
@@ -171,6 +173,12 @@ pub fn cmd_frost_network_serve(
             out.field(
                 "Sign policy",
                 "refuse raw (`message_type=raw` rejected, see #524)",
+            );
+        }
+        if require_structured_sign {
+            out.field(
+                "Sign policy",
+                "require structured payload (unstructured requests rejected, see #529)",
             );
         }
         if oprf_auto_approve {
@@ -702,6 +710,7 @@ pub fn cmd_frost_network_sign(
         relay,
         message.as_bytes().to_vec(),
         "raw",
+        None,
     ))?;
 
     out.newline();
@@ -745,6 +754,7 @@ async fn frost_network_sign_round(
     relay: &str,
     message_bytes: Vec<u8>,
     message_type: &str,
+    structured_payload: Option<Vec<u8>>,
 ) -> Result<[u8; 64]> {
     let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
         .await
@@ -796,7 +806,7 @@ async fn frost_network_sign_round(
 
     let spinner = out.spinner("Requesting signature from network...");
     let signature = node
-        .request_signature(message_bytes, message_type)
+        .request_signature_structured(message_bytes, message_type, structured_payload)
         .await
         .map_err(|e| KeepError::Frost(e.to_string()))?;
     spinner.finish();
@@ -902,6 +912,13 @@ pub fn cmd_frost_network_sign_event(
     out.field("Event ID", &event_id.to_hex());
     out.newline();
 
+    // #529: attach the structured event body so co-signers can recompute
+    // the id and reject a cross-domain label spoof.
+    let structured = serde_json::to_vec(&keep_frost_net::NostrEventPayload::from_unsigned_event(
+        &unsigned,
+    ))
+    .map_err(|e| KeepError::Runtime(format!("structured payload: {e}")))?;
+
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     let sig_bytes = rt.block_on(frost_network_sign_round(
@@ -910,6 +927,7 @@ pub fn cmd_frost_network_sign_event(
         relay,
         event_id.as_bytes().to_vec(),
         keep_frost_net::MSG_TYPE_NOSTR_EVENT,
+        Some(structured),
     ))?;
 
     let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {
