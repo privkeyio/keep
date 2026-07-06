@@ -50,6 +50,8 @@ pub mod entropy;
 pub mod error;
 /// FROST threshold signature implementation.
 pub mod frost;
+/// BIP-32 unhardened child-key primitives for FROST group keys (#487).
+pub mod frost_bip32;
 /// Hidden volume storage for plausible deniability.
 pub mod hidden;
 /// In-memory keyring for unlocked keys.

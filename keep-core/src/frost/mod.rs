@@ -6,6 +6,7 @@
 //! This module provides threshold signatures using the FROST protocol,
 //! allowing multiple parties to collaboratively sign messages without
 //! any single party having access to the complete private key.
+pub mod bip32_signing;
 mod coordinator;
 mod dealer;
 mod recover;
