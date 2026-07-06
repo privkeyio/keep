@@ -98,6 +98,34 @@ fn acquire_rotation_lock(path: &Path) -> Result<File> {
     Ok(lock_file)
 }
 
+/// Non-blocking variant of `acquire_rotation_lock`. Returns `None` if the lock
+/// is already held (a rotation is in flight in another process/handle) or the
+/// lock file cannot be opened. Recovery uses this so it never mutates rotation
+/// files out from under a live `rotate_password`/`rotate_data_key`.
+fn try_acquire_rotation_lock(path: &Path) -> Option<File> {
+    let lock_path = path.join(".rotation.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    lock_file.try_lock_exclusive().ok()?;
+    Some(lock_file)
+}
+
+/// Copy `from` over `to` and flush both the file and its directory entry to
+/// disk before returning, so a power loss after the caller deletes the source
+/// backup cannot leave `to` partially written.
+fn restore_file_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    copy_with_retry(from, to)?;
+    // Open with write access so `sync_all` maps to a working flush on every
+    // platform (Windows `FlushFileBuffers` requires a writable handle).
+    OpenOptions::new().write(true).open(to)?.sync_all()?;
+    fsync_dir(to)
+}
+
 fn cleanup_rotation_lock(_path: &Path) {
     // No-op: we intentionally leave the lock file in place to avoid a race
     // condition between drop(lock) and remove_file that could allow concurrent
@@ -123,11 +151,29 @@ fn cleanup_rotation_lock(_path: &Path) {
 /// - `keep.hdr.backup` alone means `rotate_password` was in flight. Both
 ///   possible header states (still-old, or already-rewritten to new) are
 ///   durable and consistent on their own; the backup is stale.
+/// - `keep.db.backup` alone is a post-rotation leftover (a successful rotation
+///   deletes `keep.hdr.backup` before `keep.db.backup`); always stale.
+///
+/// Recovery first takes the rotation lock non-blockingly and does nothing if a
+/// rotation currently holds it, so it never mutates these files out from under
+/// a live rotation.
 ///
 /// Errors are non-fatal on purpose: recovery must not turn a partially
-/// interrupted rotation into an unopenable vault, and every write it performs
-/// is idempotent.
+/// interrupted rotation into an unopenable vault. Crucially, a backup is only
+/// ever deleted once the reconciliation it feeds has provably completed, so a
+/// failed or skipped restore never destroys the sole pristine copy; the next
+/// `open` simply retries. Every write it performs is idempotent.
 pub(crate) fn recover_rotation_artifacts(path: &Path) {
+    // Serialize against a live rotation: `rotate_password`/`rotate_data_key`
+    // hold `.rotation.lock` while they mutate exactly these files. If a rotation
+    // owns the lock, it will clean up its own artifacts, so skip recovery
+    // entirely rather than racing its in-progress DB rewrite (which would
+    // corrupt `keep.db` and delete the backups it needs for its own rollback).
+    let lock = match try_acquire_rotation_lock(path) {
+        Some(lock) => lock,
+        None => return,
+    };
+
     let hdr = path.join("keep.hdr");
     let hdr_tmp = path.join("keep.hdr.tmp");
     let hdr_backup = path.join("keep.hdr.backup");
@@ -140,18 +186,49 @@ pub(crate) fn recover_rotation_artifacts(path: &Path) {
     let db_backup_exists = db_backup.exists();
 
     if hdr_backup_exists && db_backup_exists {
-        let hdr_bytes = fs::read(&hdr).ok();
-        let backup_bytes = fs::read(&hdr_backup).ok();
-        if let (Some(h), Some(b)) = (hdr_bytes, backup_bytes) {
-            if h == b {
-                let _ = copy_with_retry(&db_backup, &db);
+        match (fs::read(&hdr), fs::read(&hdr_backup)) {
+            (Ok(h), Ok(b)) if h == b => {
+                // Header still matches its backup: the rewrite never happened,
+                // so `reencrypt_database` had not committed either. `keep.db`
+                // is the sole readable copy only after being restored from the
+                // OLD-DEK backup the header still pins. If that restore fails,
+                // leave BOTH backups on disk untouched so the next open retries;
+                // never delete the pristine copy behind a failed restore.
+                if let Err(e) = restore_file_durably(&db_backup, &db) {
+                    warn!(
+                        error = %e,
+                        "rotation recovery: database restore failed; leaving backups for retry"
+                    );
+                    drop(lock);
+                    return;
+                }
+            }
+            (Ok(_), Ok(_)) => {
+                // Header differs from its backup: the rewrite completed, so
+                // `reencrypt_database` ran to completion first and `keep.db` is
+                // fully under the NEW DEK. The backups are stale; fall through
+                // and delete them.
+            }
+            _ => {
+                // Could not read the header or its backup. Do not touch the DB
+                // and do not delete the recovery input; retry on the next open.
+                drop(lock);
+                return;
             }
         }
         let _ = secure_delete(&hdr_backup);
         let _ = secure_delete(&db_backup);
     } else if hdr_backup_exists {
+        // Lone header backup: a `rotate_password` artifact, always stale.
         let _ = secure_delete(&hdr_backup);
+    } else if db_backup_exists {
+        // Lone DB backup: a post-rotation leftover (a successful rotation
+        // deletes `hdr.backup` before `db.backup`). Always stale; restoring it
+        // would be a downgrade, so only clean it up.
+        let _ = secure_delete(&db_backup);
     }
+
+    drop(lock);
 }
 
 fn write_header_atomically(path: &Path, header: &Header) -> Result<()> {
@@ -1398,5 +1475,96 @@ mod tests {
             !path.join("keep.hdr.tmp").exists(),
             "stale .hdr.tmp must be deleted on open"
         );
+    }
+
+    /// #662 recovery must never destroy the sole pristine copy. If the DB
+    /// restore fails (here `keep.db` is made read-only so `copy_with_retry`
+    /// cannot write it), BOTH `.backup` files must survive on disk so a later
+    /// open can retry, and a subsequent open with the DB writable again must
+    /// then recover cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_backups_when_db_restore_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "recovery-failrestore-11";
+        let secret;
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Reproduce the mid-reencrypt state: full rotation, header rolled back
+        // to old, both backups present.
+        let old_hdr = fs::read(path.join("keep.hdr")).unwrap();
+        let old_db = fs::read(path.join("keep.db")).unwrap();
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key(pw).unwrap();
+        }
+        fs::write(path.join("keep.hdr"), &old_hdr).unwrap();
+        fs::write(path.join("keep.hdr.backup"), &old_hdr).unwrap();
+        fs::write(path.join("keep.db.backup"), &old_db).unwrap();
+
+        // Make keep.db unwritable so the restore copy fails.
+        let db = path.join("keep.db");
+        let mut perms = fs::metadata(&db).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&db, perms).unwrap();
+
+        // If the mode is ignored (e.g. running as root), the forced-failure
+        // premise does not hold; skip rather than assert a false negative.
+        if OpenOptions::new().write(true).open(&db).is_ok() {
+            return;
+        }
+
+        let _ = Storage::open(&path);
+        assert!(
+            path.join("keep.hdr.backup").exists(),
+            "hdr backup must survive a failed restore"
+        );
+        assert!(
+            path.join("keep.db.backup").exists(),
+            "db backup must survive a failed restore"
+        );
+
+        // Restore writability; the next open must now recover cleanly.
+        let mut perms = fs::metadata(&db).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&db, perms).unwrap();
+        let mut storage = Storage::open(&path).expect("retry open recovers");
+        storage
+            .unlock(pw)
+            .expect("old pw unlocks after successful retry");
+        assert_secret_decrypts(&storage, &secret);
+        assert!(!path.join("keep.hdr.backup").exists());
+        assert!(!path.join("keep.db.backup").exists());
+    }
+
+    /// #662 recovery: a lone `keep.db.backup` (post-rotation leftover, since a
+    /// successful rotation deletes `hdr.backup` before `db.backup`) is always
+    /// stale. It must be cleaned up, never restored over the live DB.
+    #[test]
+    fn recovery_cleans_up_lone_db_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "recovery-lonedb-12";
+        let secret;
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // A stale db backup with no header backup: must be removed, and the
+        // live vault (which restoring the backup would downgrade) left intact.
+        fs::write(path.join("keep.db.backup"), b"stale-old-dek-db").unwrap();
+
+        let mut storage = Storage::open(&path).expect("open cleans up lone db backup");
+        storage.unlock(pw).unwrap();
+        assert_secret_decrypts(&storage, &secret);
+        assert!(!path.join("keep.db.backup").exists());
     }
 }
