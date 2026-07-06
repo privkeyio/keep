@@ -2449,7 +2449,11 @@ mod tests {
         let oversized_hex = "00".repeat(MAX_STRUCTURED_PAYLOAD_SIZE + 1);
         value["structured_payload"] = serde_json::Value::String(oversized_hex);
         let json = serde_json::to_string(&value).unwrap();
-        assert!(KfpMessage::from_json(&json).is_err());
+        // Assert on the deserialize-time message so this pins the before-decode
+        // guard specifically, not the later `validate` size gate (which would
+        // also reject and carries a distinct, capitalized message).
+        let err = KfpMessage::from_json(&json).expect_err("oversized payload must be refused");
+        assert!(err.to_string().contains("structured payload exceeds maximum size"));
     }
 
     #[test]
