@@ -235,8 +235,6 @@ impl SigningSession {
 
 /// Sign using local shares only (no network). Requires threshold shares.
 pub fn sign_with_local_shares(shares: &[super::SharePackage], message: &[u8]) -> Result<[u8; 64]> {
-    use frost::{keys::PublicKeyPackage, round1, round2};
-
     if shares.is_empty() {
         return Err(KeepError::Frost("No shares provided".into()));
     }
@@ -250,14 +248,26 @@ pub fn sign_with_local_shares(shares: &[super::SharePackage], message: &[u8]) ->
         )));
     }
 
-    let signing_shares = &shares[..threshold];
+    let kps: Vec<KeyPackage> = shares[..threshold]
+        .iter()
+        .map(|s| s.key_package())
+        .collect::<Result<Vec<_>>>()?;
+    aggregate_local(&kps, message)
+}
+
+/// Run the FROST round1/round2/aggregate flow over an explicit set of
+/// `KeyPackage`s and return the 64-byte BIP-340 signature. Shared by the
+/// plain local-shares path and the BIP-32 child-key signing path (which
+/// passes tweaked packages). `kps` must be non-empty and already reduced to
+/// exactly the threshold set of signers.
+pub(super) fn aggregate_local(kps: &[KeyPackage], message: &[u8]) -> Result<[u8; 64]> {
+    use frost::{round1, round2};
 
     let mut nonces_map: BTreeMap<Identifier, round1::SigningNonces> = BTreeMap::new();
     let mut commitments_map: BTreeMap<Identifier, round1::SigningCommitments> = BTreeMap::new();
     let mut verifying_shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = BTreeMap::new();
 
-    for share in signing_shares {
-        let kp = share.key_package()?;
+    for kp in kps {
         let (nonces, commitments) = round1::commit(kp.signing_share(), &mut OsRng);
         nonces_map.insert(*kp.identifier(), nonces);
         commitments_map.insert(*kp.identifier(), commitments);
@@ -267,23 +277,20 @@ pub fn sign_with_local_shares(shares: &[super::SharePackage], message: &[u8]) ->
     let signing_package = SigningPackage::new(commitments_map, message);
 
     let mut signature_shares: BTreeMap<Identifier, round2::SignatureShare> = BTreeMap::new();
-
-    for share in signing_shares {
-        let kp = share.key_package()?;
+    for kp in kps {
         let id = *kp.identifier();
         let nonces = nonces_map
             .remove(&id)
             .ok_or_else(|| KeepError::Frost("Missing nonces for share".into()))?;
-        let sig_share = round2::sign(&signing_package, &nonces, &kp)
+        let sig_share = round2::sign(&signing_package, &nonces, kp)
             .map_err(|e| KeepError::Frost(format!("Signing failed: {e}")))?;
         signature_shares.insert(id, sig_share);
     }
 
-    let first_kp = signing_shares[0].key_package()?;
     let pubkey_pkg = PublicKeyPackage::new(
         verifying_shares,
-        *first_kp.verifying_key(),
-        Some(*first_kp.min_signers()),
+        *kps[0].verifying_key(),
+        Some(*kps[0].min_signers()),
     );
     let signature = frost::aggregate(&signing_package, &signature_shares, &pubkey_pkg)
         .map_err(|e| KeepError::Frost(format!("Aggregation failed: {e}")))?;

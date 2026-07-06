@@ -65,6 +65,12 @@ const CHAINCODE_DOMAIN: &[u8] = b"keep-frost-bip32-chaincode-v1";
 /// (see the module doc), so every index must live below the hardened bit.
 pub const HARDENED_INDEX_START: u32 = 0x8000_0000;
 
+/// Maximum derivation-path length accepted by the path walkers. BIP-32's own
+/// serialized `depth` field is a single byte, so 255 is the natural ceiling;
+/// a real receive/change path is length 2. Bounding it keeps a wire-supplied
+/// path (see #487) from forcing unbounded HMAC-SHA512 + EC work on a signer.
+pub const MAX_DERIVATION_DEPTH: usize = 255;
+
 /// Derive the deterministic 32-byte chaincode for a FROST group key.
 ///
 /// `group_pubkey` is the BIP-340 x-only 32-byte aggregated FROST group key.
@@ -218,6 +224,12 @@ pub fn derive_path_composite(
             "derive_path_composite requires at least one index",
         ));
     }
+    if path.len() > MAX_DERIVATION_DEPTH {
+        return Err(derivation_path_error(format!(
+            "derivation path length {} exceeds maximum {MAX_DERIVATION_DEPTH}",
+            path.len()
+        )));
+    }
     let mut parent_point = even_lift(group_pubkey)?;
     let mut parent_chaincode = *chaincode;
 
@@ -296,6 +308,12 @@ pub fn derive_path(
         return Err(derivation_path_error(
             "derive_path requires at least one index",
         ));
+    }
+    if path.len() > MAX_DERIVATION_DEPTH {
+        return Err(derivation_path_error(format!(
+            "derivation path length {} exceeds maximum {MAX_DERIVATION_DEPTH}",
+            path.len()
+        )));
     }
     let mut parent_point = even_lift(group_pubkey)?;
     let mut parent_chaincode = *chaincode;
@@ -516,6 +534,17 @@ mod tests {
         let cc = deterministic_chaincode(&group);
         assert!(derive_path(&group, &cc, &[]).is_err());
         assert!(derive_path_composite(&group, &cc, &[]).is_err());
+    }
+
+    /// A path longer than `MAX_DERIVATION_DEPTH` is refused before doing the
+    /// per-index HMAC + EC work, bounding CPU on a wire-supplied path.
+    #[test]
+    fn overlong_path_refused() {
+        let group = stable_group_pubkey();
+        let cc = deterministic_chaincode(&group);
+        let too_long = vec![0u32; MAX_DERIVATION_DEPTH + 1];
+        assert!(derive_path(&group, &cc, &too_long).is_err());
+        assert!(derive_path_composite(&group, &cc, &too_long).is_err());
     }
 
     /// #487 PR2 core: the aggregate scalar tweak returned by
