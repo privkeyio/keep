@@ -1017,7 +1017,7 @@ pub struct SignRequestPayload {
 
 /// BIP-32 says index >= 2^31 selects hardened derivation (needs the private
 /// key). FROST groups only ever do unhardened public derivation.
-const BIP32_HARDENED_INDEX_START: u32 = 0x8000_0000;
+pub(crate) const BIP32_HARDENED_INDEX_START: u32 = 0x8000_0000;
 
 /// Cap on the derivation path depth carried in a sign request. BIP-86-style
 /// wallets never exceed `/0/*` or `/1/*` (depth 2) below the account xpub,
@@ -2498,6 +2498,39 @@ mod tests {
         assert!(err
             .to_string()
             .contains("structured payload exceeds maximum size"));
+    }
+
+    /// A derivation path deeper than `MAX_DERIVATION_PATH_DEPTH` is refused at
+    /// validation so a hostile peer cannot force a large derivation walk.
+    #[test]
+    fn oversized_derivation_path_refused_at_validate() {
+        let path: Vec<u32> = (0..=MAX_DERIVATION_PATH_DEPTH as u32).collect();
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_derivation_path(path);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
+    }
+
+    /// A hardened index (>= 2^31) is refused: FROST groups have no group
+    /// secret for hardened derivation, only unhardened paths are meaningful.
+    #[test]
+    fn hardened_derivation_index_refused_at_validate() {
+        let payload = SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![1, 2, 3],
+            MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_derivation_path(vec![0, BIP32_HARDENED_INDEX_START]);
+        let msg = KfpMessage::SignRequest(payload);
+        assert!(msg.validate().is_err());
     }
 
     #[test]

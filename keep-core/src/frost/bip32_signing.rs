@@ -40,6 +40,38 @@ use super::SharePackage;
 use crate::error::{KeepError, Result};
 use crate::frost_bip32::{derive_path_composite, deterministic_chaincode, CompositeDerivation};
 
+/// Parity-adjust the aggregate BIP-32 tweak for the group's true verifying
+/// key and return it as a `bitcoin::secp256k1::Scalar` for both the point
+/// additions and the signing-share scalar add.
+///
+/// `derive_path_composite` walks BIP-32 from the +even lift of the x-only
+/// group pubkey, matching what every downstream wallet (and every reference
+/// BIP-32 implementation) does when handed an xpub shaped from an x-only key.
+/// But the FROST verifying key can have either parity. If it is odd-y, then
+/// `real_vk = -even_lift(x_only(real_vk))`, so applying the primitive's `t`
+/// scalar directly lands on `real_vk + t·G = -(even_lift + (-t)·G)` whose
+/// x-coordinate is x_only(even_lift + (-t)·G), NOT x_only(even_lift + t·G).
+/// To land the tweaked key on the same x-only child pubkey wallets derive,
+/// negate the tweak in the odd-y case. The tweaked key ends up as
+/// `-(child_target)`, which BIP-340 accepts (verification is x-only).
+fn effective_tweak_scalar(
+    vk_bytes: &[u8],
+    aggregate_tweak: [u8; 32],
+) -> Result<bitcoin::secp256k1::Scalar> {
+    let real_vk_is_odd = vk_bytes.first() == Some(&0x03);
+    let mut effective_tweak = aggregate_tweak;
+    if real_vk_is_odd {
+        // Negate: n - t, using SecretKey's built-in modular negate (the
+        // `negate` method returns -k mod n).
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&effective_tweak)
+            .map_err(|e| KeepError::Frost(format!("aggregate tweak invalid: {e}")))?;
+        effective_tweak = sk.negate().secret_bytes();
+    }
+    bitcoin::secp256k1::Scalar::from_be_bytes(effective_tweak).map_err(|_| {
+        KeepError::Frost("BIP-32 aggregate tweak >= curve order; refusing to sign".into())
+    })
+}
+
 /// Add the aggregate BIP-32 scalar tweak `t_agg` to every field of a
 /// `KeyPackage`: `signing_share += t_agg`, `verifying_share += t_agg·G`,
 /// `verifying_key += t_agg·G`. Returns the tweaked package.
@@ -52,40 +84,14 @@ use crate::frost_bip32::{derive_path_composite, deterministic_chaincode, Composi
 fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
     let secp = Secp256k1::verification_only();
 
-    // Parity handling. `derive_path_composite` walks BIP-32 from the +even
-    // lift of the x-only group pubkey, matching what every downstream wallet
-    // (and every reference BIP-32 implementation) does when handed an xpub
-    // shaped from an x-only key. But the FROST KeyPackage carries the
-    // group's TRUE verifying_key, which can have either parity. If it is
-    // odd-y, then `real_vk = -even_lift(x_only(real_vk))`, so applying the
-    // primitive's `t` scalar directly lands on `real_vk + t·G = -(even_lift + (-t)·G)`
-    // whose x-coordinate is x_only(even_lift + (-t)·G) — NOT
-    // x_only(even_lift + t·G). To land the tweaked VK on the same x-only
-    // child pubkey wallets derive, negate the tweak in the odd-y case. The
-    // resulting KeyPackage will have `-(child_target)` as its VerifyingKey,
-    // which BIP-340 accepts (verification is x-only, ignores sign).
     let vk_bytes = kp
         .verifying_key()
         .serialize()
         .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
-    let real_vk_is_odd = vk_bytes.first() == Some(&0x03);
-    let mut effective_tweak = *tweak;
-    if real_vk_is_odd {
-        // Negate: n - t, using SecretKey's built-in modular negate (the
-        // `negate` method returns -k mod n).
-        let sk = bitcoin::secp256k1::SecretKey::from_slice(&effective_tweak)
-            .map_err(|e| KeepError::Frost(format!("aggregate tweak invalid: {e}")))?;
-        effective_tweak = sk.negate().secret_bytes();
-    }
-    let tweak = &effective_tweak;
-
-    // Convert the (possibly negated) aggregate tweak into a
-    // bitcoin::secp256k1::Scalar for point additions and into a
-    // bitcoin::secp256k1::SecretKey for the scalar addition on the signing
-    // share. Both accept 32 big-endian bytes.
-    let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(*tweak).map_err(|_| {
-        KeepError::Frost("BIP-32 aggregate tweak >= curve order; refusing to sign".into())
-    })?;
+    // Parity-adjusted aggregate tweak, shared by the signing-share scalar add
+    // and the point additions below so the secret and public tweaks cannot
+    // drift.
+    let scalar = effective_tweak_scalar(&vk_bytes, *tweak)?;
 
     // Signing share: raw 32-byte big-endian scalar. Add tweak modulo n via
     // SecretKey::add_tweak (we abuse the SecretKey type for its modular
@@ -184,16 +190,7 @@ pub fn tweak_public_key_package_at_path(
         .verifying_key()
         .serialize()
         .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
-    let real_vk_is_odd = vk_bytes.first() == Some(&0x03);
-    let mut effective_tweak = composite.aggregate_tweak;
-    if real_vk_is_odd {
-        let sk = bitcoin::secp256k1::SecretKey::from_slice(&effective_tweak)
-            .map_err(|e| KeepError::Frost(format!("aggregate tweak invalid: {e}")))?;
-        effective_tweak = sk.negate().secret_bytes();
-    }
-    let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(effective_tweak).map_err(|_| {
-        KeepError::Frost("BIP-32 aggregate tweak >= curve order; refusing to sign".into())
-    })?;
+    let scalar = effective_tweak_scalar(&vk_bytes, composite.aggregate_tweak)?;
 
     // Tweak every verifying share so aggregation validates the tweaked
     // signature shares. Preserve the identifier ordering the input carried.
@@ -420,6 +417,83 @@ mod tests {
             let composite = derive_child(&group, &[0, 9]).unwrap();
             let secp = Secp256k1::verification_only();
             let sig = Signature::from_slice(&sig).unwrap();
+            let xonly = XOnlyPublicKey::from_slice(&composite.child_pubkey).unwrap();
+            let msg = Message::from_digest(message);
+            secp.verify_schnorr(&sig, &msg, &xonly).unwrap();
+            break;
+        }
+        assert!(
+            exercised_odd_y,
+            "no odd-y group VK produced in 64 dealer runs; branch left untested"
+        );
+    }
+
+    /// Exercise the odd-y group-VK negation branch in
+    /// `tweak_public_key_package_at_path` (the aggregation-side tweak). Loop
+    /// dealer runs until the group's TRUE verifying key serializes to 0x03
+    /// (odd y), then tweak the `PublicKeyPackage` at a non-empty path, run a
+    /// local FROST round with the correspondingly tweaked `KeyPackage`s,
+    /// aggregate against the tweaked pubkey package, and assert the aggregate
+    /// verifies under the derived child pubkey. Without this the negation
+    /// branch of the aggregation-side tweak is only hit ~50% of the time.
+    #[test]
+    fn odd_y_tweaked_pubkey_package_aggregates_under_child() {
+        use frost_secp256k1_tr::rand_core::OsRng;
+        use frost_secp256k1_tr::{round1, round2, SigningPackage};
+        use std::collections::BTreeMap;
+
+        let message = [0x88u8; 32];
+        let path = [0u32, 9];
+        let mut exercised_odd_y = false;
+        for _ in 0..64 {
+            let shares = make_shares(2, 3);
+            let vk_prefix = shares[0]
+                .key_package()
+                .unwrap()
+                .verifying_key()
+                .serialize()
+                .unwrap()[0];
+            if vk_prefix != 0x03 {
+                continue;
+            }
+            exercised_odd_y = true;
+            let group = *shares[0].group_pubkey();
+
+            let pkp = shares[0].pubkey_package().unwrap();
+            let tweaked_pkp = tweak_public_key_package_at_path(&pkp, &group, &path).unwrap();
+
+            let tweaked_kps: Vec<KeyPackage> = shares[..2]
+                .iter()
+                .map(|s| {
+                    tweak_key_package_at_path(&s.key_package().unwrap(), &group, &path).unwrap()
+                })
+                .collect();
+
+            let mut nonces_map = BTreeMap::new();
+            let mut commitments_map = BTreeMap::new();
+            for kp in &tweaked_kps {
+                let (nonces, commitments) = round1::commit(kp.signing_share(), &mut OsRng);
+                nonces_map.insert(*kp.identifier(), nonces);
+                commitments_map.insert(*kp.identifier(), commitments);
+            }
+
+            let signing_package = SigningPackage::new(commitments_map, &message);
+
+            let mut sig_shares = BTreeMap::new();
+            for kp in &tweaked_kps {
+                let id = *kp.identifier();
+                let nonces = &nonces_map[&id];
+                let share = round2::sign(&signing_package, nonces, kp).unwrap();
+                sig_shares.insert(id, share);
+            }
+
+            let signature =
+                frost_secp256k1_tr::aggregate(&signing_package, &sig_shares, &tweaked_pkp).unwrap();
+            let serialized = signature.serialize().unwrap();
+
+            let composite = derive_child(&group, &path).unwrap();
+            let secp = Secp256k1::verification_only();
+            let sig = Signature::from_slice(serialized.as_slice()).unwrap();
             let xonly = XOnlyPublicKey::from_slice(&composite.child_pubkey).unwrap();
             let msg = Message::from_digest(message);
             secp.verify_schnorr(&sig, &msg, &xonly).unwrap();

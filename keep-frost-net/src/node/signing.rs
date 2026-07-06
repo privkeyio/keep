@@ -428,20 +428,6 @@ impl KfpNode {
             "Received sign request"
         );
 
-        // #487 PR3: apply the composite BIP-32 tweak for the requester's
-        // derivation path before we commit. Every subsequent step in this
-        // session (round2 sign, aggregation) must use the SAME tweaked
-        // package for the aggregate signature to verify, so we persist the
-        // path on the session at the same time as the commitment below.
-        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
-            &self.share.key_package()?,
-            &self.group_pubkey,
-            &request.derivation_path,
-        )
-        .map_err(|e| {
-            FrostNetError::Crypto(format!("BIP-32 tweak on responder key package failed: {e}"))
-        })?;
-
         let existing_commitment = {
             let sessions = self.sessions.read();
             sessions
@@ -657,6 +643,22 @@ impl KfpNode {
             .await?;
             return Ok(());
         }
+
+        // #487 PR3: apply the composite BIP-32 tweak for the requester's
+        // derivation path before we commit. Every subsequent step in this
+        // session (round2 sign, aggregation) must use the SAME tweaked package
+        // for the aggregate signature to verify, so we persist the path on the
+        // session at the same time as the commitment below. Computed here, after
+        // the resend early-return, so a duplicate request that just re-echoes our
+        // cached commitment never recomputes the derivation.
+        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+            &self.share.key_package()?,
+            &self.group_pubkey,
+            &request.derivation_path,
+        )
+        .map_err(|e| {
+            FrostNetError::Crypto(format!("BIP-32 tweak on responder key package failed: {e}"))
+        })?;
 
         // `None` signals that the pre-exchange path required a pooled nonce that
         // vanished (consumed, evicted, or lost on restart) between validation
@@ -1206,6 +1208,26 @@ impl KfpNode {
         structured_payload: Option<Vec<u8>>,
         derivation_path: Vec<u32>,
     ) -> Result<[u8; 64]> {
+        // Reject an oversized or hardened path locally, mirroring the wire-side
+        // check in `KfpMessage::validate`, so a bad path fails fast with a clear
+        // message instead of after a network round-trip.
+        if derivation_path.len() > crate::protocol::MAX_DERIVATION_PATH_DEPTH {
+            return Err(FrostNetError::Protocol(format!(
+                "Derivation path depth {} exceeds maximum {}",
+                derivation_path.len(),
+                crate::protocol::MAX_DERIVATION_PATH_DEPTH
+            )));
+        }
+        if derivation_path
+            .iter()
+            .any(|&i| i >= crate::protocol::BIP32_HARDENED_INDEX_START)
+        {
+            return Err(FrostNetError::Protocol(
+                "Derivation path contains a hardened index; only unhardened indexes are \
+                 meaningful for FROST groups"
+                    .into(),
+            ));
+        }
         // On a round timeout the co-signers that failed to commit are treated as
         // unresponsive and excluded, then we re-select from the remaining online
         // peers and retry. This fails over to other live co-signers in seconds
@@ -1367,12 +1389,23 @@ impl KfpNode {
         // unchanged participant set (everyone responded but no signature was
         // produced) derives a distinct id and fresh nonce instead of colliding
         // with the just-completed attempt and tripping the replay guard. Attempt
-        // 0 uses an empty salt to keep the common single-attempt id stable and
-        // wire-compatible with peers that predate salted failover.
-        let session_salt: Vec<u8> = if attempt == 0 {
+        // 0 with an empty path uses an empty salt to keep the common
+        // single-attempt id stable and wire-compatible with peers that predate
+        // salted failover. The derivation path is folded in so two requests over
+        // the same digest + participant set at DISTINCT child paths derive
+        // distinct session ids: otherwise they collide at attempt 0 and a
+        // responder resends its cached commitment for the first path, never
+        // adopting the second. The responder recomputes and validates the id
+        // from the transmitted salt, so this binds the path on both sides.
+        let session_salt: Vec<u8> = if attempt == 0 && derivation_path.is_empty() {
             Vec::new()
         } else {
-            (attempt as u64).to_be_bytes().to_vec()
+            let mut salt = Vec::with_capacity(8 + derivation_path.len() * 4);
+            salt.extend_from_slice(&(attempt as u64).to_be_bytes());
+            for index in &derivation_path {
+                salt.extend_from_slice(&index.to_be_bytes());
+            }
+            salt
         };
         let session_id =
             derive_session_id_salted(&message, &participants, threshold, &session_salt);
