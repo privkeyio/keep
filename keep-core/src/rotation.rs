@@ -886,4 +886,324 @@ mod tests {
             "decrypted secret bytes MUST match the pre-rotation value"
         );
     }
+
+    // === #565: rotation crash-recovery / interleaving tests ===
+    //
+    // These tests simulate every durability point in `rotate_password` and
+    // `rotate_data_key` by manipulating the on-disk artifacts to match what a
+    // real process kill would leave behind: `keep.hdr.tmp`, `keep.hdr.backup`,
+    // `keep.db.backup`, and various header/db combinations. After each
+    // simulated crash, we reopen the vault and assert it is fully usable with
+    // EITHER the old or new credential (never a half-rotated state), and that
+    // no leftover artifact leaves the vault unopenable.
+    //
+    // The rotation code writes the new header atomically via a `tmp` + rename,
+    // and takes `.backup` copies of the header (and DB for data-key rotation)
+    // before mutating anything. So most durability points MUST look like one
+    // of two states from `Storage::open`'s perspective: pre-rotation (old
+    // credential still works) or post-rotation (new credential works). The
+    // exception is a kill mid-`reencrypt_database` for `rotate_data_key`:
+    // some rows are re-encrypted under the new DEK while the header still
+    // pins the old DEK, and no auto-recovery path in `Storage::open` today
+    // patches that up. `crash_mid_reencrypt_data_key_leaves_db_backup_intact`
+    // pins that gap so a fix (auto-restoring from `keep.db.backup`) can be
+    // measured against a real test.
+
+    fn seed_key(storage: &Storage) -> (KeyRecord, Vec<u8>) {
+        let pubkey: [u8; 32] = [0x77; 32];
+        let secret: Vec<u8> = (0u8..24).collect();
+        let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
+        let record = KeyRecord::new(
+            pubkey,
+            crate::keys::KeyType::Nostr,
+            "crash-recovery-seed".into(),
+            encrypted.to_bytes(),
+        );
+        storage.store_key(&record).unwrap();
+        (record, secret)
+    }
+
+    fn assert_secret_decrypts(storage: &Storage, expected: &[u8]) {
+        let data_key = storage.data_key().expect("unlocked storage has data_key");
+        let keys = storage.list_keys().expect("list keys post-crash");
+        assert_eq!(keys.len(), 1, "seeded key must survive simulated crash");
+        let encrypted = crypto::EncryptedData::from_bytes(&keys[0].encrypted_secret)
+            .expect("encrypted secret parses");
+        let decrypted = crypto::decrypt(&encrypted, data_key).expect("decrypt seeded key");
+        let plaintext = decrypted.as_slice().expect("secret bytes");
+        assert_eq!(plaintext.as_slice(), expected);
+    }
+
+    /// #565 C1 — simulated crash in `rotate_password` after `keep.hdr.backup`
+    /// is written but before `write_header_atomically` runs. The vault must
+    /// open with the OLD password (header untouched), and the orphan backup
+    /// file must not prevent open.
+    #[test]
+    fn crash_after_hdr_backup_leaves_vault_openable_with_old_pw() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let old_pw = "old-password-1";
+        let secret;
+        {
+            let storage = Storage::create(&path, old_pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Simulate the copy_with_retry(&header_path, &backup_path) step
+        // completing right before `write_header_atomically` would begin.
+        fs::copy(path.join("keep.hdr"), path.join("keep.hdr.backup")).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open with orphan .hdr.backup");
+        storage.unlock(old_pw).expect("old password unlocks");
+        assert_secret_decrypts(&storage, &secret);
+
+        // A new password from the aborted rotation must not accidentally work.
+        drop(storage);
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.unlock("new-password-1").is_err());
+    }
+
+    /// #565 C2 — simulated crash inside `write_header_atomically` after the
+    /// temp write but before the rename. The vault must still open under the
+    /// OLD password (rename is atomic), and the orphan `.tmp` file must not
+    /// prevent open.
+    #[test]
+    fn crash_between_tmp_write_and_rename_keeps_old_credential() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let old_pw = "old-password-2";
+        let secret;
+        {
+            let storage = Storage::create(&path, old_pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Simulate: backup was made and a bogus (or partial) tmp header exists.
+        fs::copy(path.join("keep.hdr"), path.join("keep.hdr.backup")).unwrap();
+        fs::write(path.join("keep.hdr.tmp"), vec![0xFFu8; 32]).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open ignores .hdr.tmp");
+        storage.unlock(old_pw).expect("old password still unlocks");
+        assert_secret_decrypts(&storage, &secret);
+    }
+
+    /// #565 C3/C4 — simulated crash in `rotate_password` after the new header
+    /// has been renamed into place but before `verify_header_decryption` or
+    /// the backup cleanup runs. From the caller's perspective the rotation
+    /// has completed durably: the NEW password MUST unlock the vault. The
+    /// orphan `keep.hdr.backup` (holding the OLD header) must not prevent
+    /// open or leak an alternative credential.
+    #[test]
+    fn crash_after_header_rename_completes_rotation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let old_pw = "old-password-3";
+        let new_pw = "new-password-3";
+        let secret;
+        {
+            let storage = Storage::create(&path, old_pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Snapshot the old header, run a full rotation, then reintroduce the
+        // pre-rotation header as the orphan backup that a crash between the
+        // rename and the backup-delete would leave behind.
+        let old_hdr_bytes = fs::read(path.join("keep.hdr")).unwrap();
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_password(old_pw, new_pw).unwrap();
+        }
+        fs::write(path.join("keep.hdr.backup"), &old_hdr_bytes).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open with orphan pre-rotate backup");
+        storage
+            .unlock(new_pw)
+            .expect("new password unlocks after rename-completed rotation");
+        assert_secret_decrypts(&storage, &secret);
+
+        // The old password (present in the orphan backup) must NOT unlock —
+        // `Storage::open` reads `keep.hdr`, not `keep.hdr.backup`.
+        drop(storage);
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.unlock(old_pw).is_err());
+    }
+
+    /// #565 D1 — simulated crash in `rotate_data_key` after `keep.hdr.backup`
+    /// is written but before `keep.db.backup`. Same guarantee as C1: OLD
+    /// password unlocks the vault, orphan backup file does not break open.
+    #[test]
+    fn crash_after_hdr_backup_but_before_db_backup_keeps_old_dek() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "same-password-4";
+        let secret;
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        fs::copy(path.join("keep.hdr"), path.join("keep.hdr.backup")).unwrap();
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .unlock(pw)
+            .expect("password unlocks pre-rotation vault");
+        assert_secret_decrypts(&storage, &secret);
+    }
+
+    /// #565 D2 — simulated crash mid `reencrypt_database`. `keep.db.backup`
+    /// holds a pristine snapshot; `keep.db` is partially rewritten under the
+    /// NEW DEK; `keep.hdr` still pins the OLD DEK. This is the one crash
+    /// point `Storage::open` does not auto-recover from today: the vault
+    /// opens and the password unlocks the header, but any list under the old
+    /// DEK hits new-DEK-encrypted rows and fails. The `.backup` files are
+    /// exactly the state a manual recovery would restore from.
+    ///
+    /// This test locks in that observable state so a follow-up that adds
+    /// auto-recovery on open (restore `keep.db.backup` -> `keep.db` when
+    /// present alongside `keep.hdr.backup`) has something concrete to move.
+    #[test]
+    fn crash_mid_reencrypt_data_key_leaves_db_backup_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "same-password-5";
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let _ = seed_key(&storage);
+        }
+
+        // Snapshot the pre-rotation DB and header, then perform a full
+        // rotation so `keep.db` is under a new DEK. Reintroduce the
+        // pre-rotation snapshots as the `.backup` artifacts a real crash
+        // would have left behind, while `keep.hdr` is rolled back to OLD.
+        // The result: header pins OLD DEK, DB rows are under NEW DEK.
+        let old_hdr = fs::read(path.join("keep.hdr")).unwrap();
+        let old_db = fs::read(path.join("keep.db")).unwrap();
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key(pw).unwrap();
+        }
+        // Roll the header back to old; leave the DB in its rotated state.
+        fs::write(path.join("keep.hdr"), &old_hdr).unwrap();
+        fs::write(path.join("keep.hdr.backup"), &old_hdr).unwrap();
+        fs::write(path.join("keep.db.backup"), &old_db).unwrap();
+
+        // The vault opens and the header unlocks, but any decryption under
+        // the OLD DEK against a NEW-DEK row must fail cleanly (no panic, no
+        // silent success). The `.backup` files are the recovery input.
+        let mut storage = Storage::open(&path).expect("mid-reencrypt state opens");
+        storage.unlock(pw).expect("header unlocks under pw");
+        // list_keys attempts to decrypt every row under the old DEK; at least
+        // one row was re-encrypted under the new DEK, so this must fail.
+        let listed = storage.list_keys();
+        assert!(
+            listed.is_err(),
+            "OLD-DEK header + NEW-DEK db must not silently list rows"
+        );
+        assert!(
+            path.join("keep.db.backup").exists(),
+            "backup DB must remain on disk as the recovery input"
+        );
+    }
+
+    /// #565 D3 — simulated crash in `rotate_data_key` after the header has
+    /// been renamed but before `verify_rotation_integrity` runs. From the
+    /// caller's perspective the rotation completed durably: the password
+    /// unlocks the NEW header, the NEW DEK decrypts the DB rows, and the
+    /// orphan `.backup` files (holding old-DEK snapshots) do not leak an
+    /// alternative credential.
+    #[test]
+    fn crash_after_data_key_rotation_completes_before_backup_delete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let pw = "same-password-6";
+        let secret;
+        {
+            let storage = Storage::create(&path, pw, Argon2Params::TESTING).unwrap();
+            let (_r, s) = seed_key(&storage);
+            secret = s;
+        }
+
+        // Snapshot old header + db to place as the orphan `.backup` files
+        // that a real crash-after-verify-before-delete would leave behind.
+        let old_hdr = fs::read(path.join("keep.hdr")).unwrap();
+        let old_db = fs::read(path.join("keep.db")).unwrap();
+
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key(pw).unwrap();
+        }
+
+        fs::write(path.join("keep.hdr.backup"), &old_hdr).unwrap();
+        fs::write(path.join("keep.db.backup"), &old_db).unwrap();
+
+        let mut storage = Storage::open(&path).expect("open with orphan .backup files");
+        storage
+            .unlock(pw)
+            .expect("password still unlocks after data-key rotation");
+        assert_secret_decrypts(&storage, &secret);
+    }
+
+    /// #565 concurrency — two `rotate_password` calls interleaved on the
+    /// same vault must be serialized by the flock in `acquire_rotation_lock`.
+    /// This test drives that path by hand: thread A takes the lock file's
+    /// exclusive lock; thread B's rotation blocks on the same lock; on
+    /// release B proceeds. Neither thread may leave the vault half-rotated,
+    /// and the final on-disk state must match whichever call completed last.
+    #[test]
+    fn concurrent_rotations_serialize_via_flock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let old_pw = "shared-old-7";
+        {
+            let _ = Storage::create(&path, old_pw, Argon2Params::TESTING).unwrap();
+        }
+
+        let lock_path = path.join(".rotation.lock");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+
+        let path_bg = path.clone();
+        let handle = std::thread::spawn(move || {
+            let mut storage = Storage::open(&path_bg).unwrap();
+            storage
+                .rotate_password("shared-old-7", "shared-new-7")
+                .map(|_| ())
+        });
+
+        // Give the background thread time to reach `lock_exclusive()` inside
+        // rotate_password and block. If the flock were not serializing us it
+        // would race to completion here.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !handle.is_finished(),
+            "background rotate must block on the held lock"
+        );
+
+        // Release the lock; the background thread's rotation should complete.
+        drop(holder);
+        let result = handle.join().expect("background thread joins");
+        result.expect("background rotate succeeds once the lock is released");
+
+        // Vault is in a consistent post-rotation state.
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(
+            storage.unlock(old_pw).is_err(),
+            "old password must not unlock after concurrent rotation"
+        );
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .unlock("shared-new-7")
+            .expect("new password unlocks the rotated vault");
+    }
 }
