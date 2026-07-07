@@ -431,3 +431,110 @@ impl KfpNode {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod gate_tests {
+    //! Deterministic responder-gate coverage for the OPRF enrollment ingress
+    //! handlers: build a real node, call the handler directly, no relay run loop.
+
+    use super::*;
+    use crate::node::PeerPolicy;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
+
+    async fn test_node() -> (KfpNode, MockRelay) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("enroll-gate-test").unwrap();
+        // First share -> FROST identifier 1.
+        (
+            KfpNode::new(shares.remove(0), vec![relay]).await.unwrap(),
+            mock,
+        )
+    }
+
+    // target_index 1 == our identifier, so the "addressed to us" gate passes and
+    // the request reaches the replay/policy gates.
+    fn enroll(group: [u8; 32]) -> OprfEnrollPayload {
+        OprfEnrollPayload::new(
+            [1u8; 32],
+            group,
+            2,
+            1,
+            2,
+            3,
+            zeroize::Zeroizing::new(vec![0u8; 1]),
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_ignores_foreign_group() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        // Foreign group -> the membership gate short-circuits (Ok) before the
+        // target/replay/policy gates. If it regressed, target_index 1 still
+        // matches us and an unannounced dealer would trip a later gate (Err).
+        let payload = enroll([0xAAu8; 32]);
+        assert!(node.handle_oprf_enroll(from, payload).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_ignores_wrong_target() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let mut payload = enroll(*node.group_pubkey());
+        payload.target_index = 2; // not our identifier (1) -> silently ignored
+        assert!(node.handle_oprf_enroll(from, payload).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_rejects_stale_replay() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let mut payload = enroll(*node.group_pubkey());
+        payload.created_at = 1; // ancient -> outside the replay window
+        assert!(matches!(
+            node.handle_oprf_enroll(from, payload).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_rejects_future_skew() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let mut payload = enroll(*node.group_pubkey());
+        payload.created_at = Timestamp::now().as_secs() + 3600; // beyond skew bound
+        assert!(matches!(
+            node.handle_oprf_enroll(from, payload).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_rejects_denied_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        let payload = enroll(*node.group_pubkey());
+        assert!(matches!(
+            node.handle_oprf_enroll(from, payload).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_enroll_ack_rejects_unannounced_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = OprfEnrollAckPayload::new([1u8; 32], 2);
+        assert!(matches!(
+            node.handle_oprf_enroll_ack(from, payload).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
+}
