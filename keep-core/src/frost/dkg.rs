@@ -576,11 +576,24 @@ mod tests {
         run_group(3, 3);
     }
 
+    type Round2Wires = Vec<(u16, SoftwareRound2Wire)>;
+
+    /// Assert `err` is a `KeepError::Frost` whose message names the specific
+    /// guard, so a negative test cannot pass on a different Frost error (bad
+    /// hex, deserialize failure, wrong state) than the one it means to pin.
+    fn assert_frost_reason(err: KeepError, needle: &str) {
+        match err {
+            KeepError::Frost(msg) => assert!(
+                msg.contains(needle),
+                "expected Frost error containing {needle:?}, got: {msg}"
+            ),
+            other => panic!("expected KeepError::Frost, got {other:?}"),
+        }
+    }
+
     /// Two 2-of-2 sessions advanced through the round1 exchange and round2
     /// emission, each in `AwaitingRound2` and holding the other's round2 wires.
     /// `a`'s wires carry `sender_index == 1`, `b`'s carry `sender_index == 2`.
-    type Round2Wires = Vec<(u16, SoftwareRound2Wire)>;
-
     fn advanced_2of2() -> (
         SoftwareDkgSession,
         SoftwareDkgSession,
@@ -628,10 +641,13 @@ mod tests {
 
         // `SoftwareDkgResult` holds key material and is intentionally not
         // `Debug`, so match on the error directly rather than `expect_err`.
-        assert!(
-            matches!(sessions[0].finalize(), Err(KeepError::Frost(_))),
-            "a missing peer round2 share must refuse finalize"
-        );
+        // Pin the pre-`part3` completeness guard by name: without the message
+        // check a deleted guard would still be masked by part3's own failure
+        // on the incomplete set.
+        match sessions[0].finalize() {
+            Err(err) => assert_frost_reason(err, "before every peer's round2 arrived"),
+            Ok(_) => panic!("a missing peer round2 share must refuse finalize"),
+        }
     }
 
     /// A peer sending two round2 shares is refused; a late substitution could
@@ -646,7 +662,7 @@ mod tests {
         let err = a
             .receive_share(wire)
             .expect_err("duplicate round2 share must be refused");
-        assert!(matches!(err, KeepError::Frost(_)));
+        assert_frost_reason(err, "duplicate round2 share from peer");
     }
 
     /// A round2 share whose `sender_index` equals our own is refused, so a
@@ -660,7 +676,7 @@ mod tests {
         let err = a
             .receive_share(own_wire)
             .expect_err("a self-echoed round2 share must be refused");
-        assert!(matches!(err, KeepError::Frost(_)));
+        assert_frost_reason(err, "echoes our own share index");
     }
 
     /// `receive_share` before `round2` (wrong state) is refused without
@@ -674,7 +690,7 @@ mod tests {
         let err = fresh
             .receive_share(wire)
             .expect_err("receive_share before round2 must be refused");
-        assert!(matches!(err, KeepError::Frost(_)));
+        assert_frost_reason(err, "receive_share called out of order");
     }
 
     #[test]
