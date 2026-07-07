@@ -123,6 +123,16 @@ impl std::fmt::Debug for SoftwareRound2Wire {
     }
 }
 
+impl Drop for SoftwareRound2Wire {
+    fn drop(&mut self) {
+        // `package_hex` is a plaintext signing share. Scrub it on drop so the
+        // hex string does not linger in freed heap; this covers both the wire
+        // we produce in `round2()` and the one serde deserializes on receive.
+        use zeroize::Zeroize;
+        self.package_hex.zeroize();
+    }
+}
+
 /// Result returned from [`SoftwareDkgSession::finalize`], mirroring the
 /// hardware finalize shape so the CLI can share printing / storage code.
 pub struct SoftwareDkgResult {
@@ -259,8 +269,10 @@ impl SoftwareDkgSession {
                     (secret, our_round1, peer_round1)
                 }
                 other => {
-                    // Put the state back so a caller can recover after seeing
-                    // the error instead of losing the round1 collection.
+                    // Restore the pre-call state on an out-of-order call so the
+                    // caller keeps its round1 collection. This recovery only
+                    // covers the guard-mismatch arm; once the guard passes below,
+                    // the state has already advanced to `Finalized`.
                     self.state = other;
                     return Err(KeepError::Frost(
                         "SoftwareDkgSession::round2 called before every peer's round1 arrived"
@@ -268,6 +280,8 @@ impl SoftwareDkgSession {
                     ));
                 }
             };
+        // Past this point the state is already `Finalized`: a `part2` failure is
+        // a terminal protocol error, so the session is intentionally not rewound.
         let (round2_secret, round2_packages) =
             part2(secret, &peer_round1).map_err(|e| KeepError::Frost(format!("DKG part2: {e}")))?;
 
@@ -385,17 +399,9 @@ impl SoftwareDkgSession {
         let (key_package, public_key_package) = part3(&secret, &round1_peers, &round2)
             .map_err(|e| KeepError::Frost(format!("DKG part3: {e}")))?;
 
-        let vk_bytes = public_key_package
-            .verifying_key()
-            .serialize()
-            .map_err(|e| KeepError::Frost(format!("verifying key serialize: {e}")))?;
-        if vk_bytes.len() < 33 {
-            return Err(KeepError::Frost(
-                "verifying key must be 33-byte compressed pubkey".into(),
-            ));
-        }
-        let mut group_pubkey = [0u8; 32];
-        group_pubkey.copy_from_slice(&vk_bytes[1..33]);
+        // Single source of truth for x-only group pubkey extraction, shared with
+        // the trusted-dealer path so both handle the 32- and 33-byte encodings.
+        let group_pubkey = super::dealer::extract_group_pubkey(&public_key_package)?;
 
         Ok(SoftwareDkgResult {
             key_package,

@@ -10,6 +10,12 @@ use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result}
 use crate::output::Output;
 use crate::signer::HardwareSigner;
 
+/// Upper bound on distinct relay events tracked per software-DKG polling loop.
+/// A DKG topic only ever carries a handful of packages; a set this large means
+/// the relay is flooding junk, so we abort rather than grow memory unbounded
+/// for the 300s timeout window.
+const MAX_DKG_EVENTS_SEEN: usize = 8192;
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(out))]
 pub fn cmd_frost_network_dkg(
@@ -414,16 +420,25 @@ fn cmd_frost_network_dkg_software(
     out.warn(
         "intended for testing (#436) and users without hardware. See #454 for the trade-offs.",
     );
+    out.warn("DKG participants are matched on a first-seen basis over the relay topic and are NOT");
+    out.warn(
+        "authenticated against the group roster: anyone able to write to the relay during the",
+    );
+    out.warn("run can race a participant index (denial of service, or share theft if they win a");
+    out.warn(
+        "threshold-many). Run over a trusted/private relay until roster authentication lands (#674).",
+    );
     out.newline();
 
     let mut session =
         SoftwareDkgSession::init(threshold as u16, participants as u16, our_index as u16)
             .map_err(|e| KeepError::FrostErr(FrostError::invalid_config(e.to_string())))?;
 
-    // `group` is stored as the share name at finalize; reject an out-of-bounds
-    // name now rather than after every network round only for the store to fail.
-    let group_name = group.trim();
-    if group_name.is_empty() || group_name.chars().count() > 64 {
+    // `group` is stored as the share name at finalize and used verbatim as the
+    // relay `d` tag every peer filters on, so validate it as-is (no trim, which
+    // would diverge from what is published) rather than failing after every
+    // network round only for the store to reject it.
+    if group.is_empty() || group.chars().count() > 64 {
         return Err(KeepError::FrostErr(FrostError::invalid_config(
             "group name must be 1..=64 characters".to_string(),
         )));
@@ -494,7 +509,9 @@ fn cmd_frost_network_dkg_software(
             .kind(Kind::Custom(21102))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
 
-        let mut participant_pubkeys: HashMap<u8, PublicKey> = HashMap::new();
+        // Keyed on the u16 wire index (not a truncated u8) so the map cannot
+        // alias two participants if the index type ever widens past 255.
+        let mut participant_pubkeys: HashMap<u16, PublicKey> = HashMap::new();
         let timeout = std::time::Duration::from_secs(300);
         let start = std::time::Instant::now();
         let mut round1_done = 0u32;
@@ -521,6 +538,11 @@ fn cmd_frost_network_dkg_software(
                 if !seen_round1.insert(ev.id) {
                     continue;
                 }
+                if seen_round1.len() > MAX_DKG_EVENTS_SEEN {
+                    return Err(KeepError::NetworkErr(NetworkError::request(
+                        "too many distinct DKG round1 events; aborting to bound memory".to_string(),
+                    )));
+                }
                 // Software-only wire: skip hardware-format events cleanly.
                 let is_software = ev.tags.iter().any(|t| {
                     let slice = t.as_slice();
@@ -537,12 +559,19 @@ fn cmd_frost_network_dkg_software(
                 if wire.sender_index == our_index as u16 {
                     continue;
                 }
-                if participant_pubkeys.contains_key(&(wire.sender_index as u8)) {
+                // SECURITY LIMITATION: index -> ephemeral-key binding is
+                // first-seen-wins and unauthenticated. A relay writer who
+                // publishes a round1 package under a victim's sender_index first
+                // captures that index; the honest peer's later package is then
+                // dropped just below as a duplicate. Upgrade path (#674): pin the
+                // (index -> npub) roster from the kind 21101 group announcement
+                // and require each event to be authored by the expected npub.
+                if participant_pubkeys.contains_key(&wire.sender_index) {
                     continue;
                 }
                 match session.round1_peer(&wire) {
                     Ok(_) => {
-                        participant_pubkeys.insert(wire.sender_index as u8, ev.pubkey);
+                        participant_pubkeys.insert(wire.sender_index, ev.pubkey);
                         round1_done += 1;
                         out.success(&format!(
                             "Received round 1 package from participant {}",
@@ -573,11 +602,9 @@ fn cmd_frost_network_dkg_software(
         spinner.finish();
 
         for (recipient_index, wire) in round2_wires {
-            let recipient_pubkey = participant_pubkeys
-                .get(&(recipient_index as u8))
-                .ok_or_else(|| {
-                    KeepError::FrostErr(FrostError::unknown_participant(recipient_index))
-                })?;
+            let recipient_pubkey = participant_pubkeys.get(&recipient_index).ok_or_else(|| {
+                KeepError::FrostErr(FrostError::unknown_participant(recipient_index))
+            })?;
             // Serialized share is secret until nip44 wraps it; scrub the plaintext.
             let payload = Zeroizing::new(
                 serde_json::to_string(&wire)
@@ -655,6 +682,11 @@ fn cmd_frost_network_dkg_software(
                 if !seen_round2.insert(ev.id) {
                     continue;
                 }
+                if seen_round2.len() > MAX_DKG_EVENTS_SEEN {
+                    return Err(KeepError::NetworkErr(NetworkError::request(
+                        "too many distinct DKG round2 events; aborting to bound memory".to_string(),
+                    )));
+                }
                 let is_software = ev.tags.iter().any(|t| {
                     let slice = t.as_slice();
                     slice.first().map(|s| s.as_str()) == Some("dkg_mode")
@@ -688,7 +720,7 @@ fn cmd_frost_network_dkg_software(
                 // sender's round1 package. Without this a relay writer can race a
                 // forged share to a recipient under a legitimate peer's index; the
                 // honest share is then dropped as a duplicate and finalize aborts.
-                if participant_pubkeys.get(&(wire.sender_index as u8)) != Some(&ev.pubkey) {
+                if participant_pubkeys.get(&wire.sender_index) != Some(&ev.pubkey) {
                     out.warn(&format!(
                         "Ignoring round 2 share for participant {}: sender key does not \
                          match its round 1 package",
