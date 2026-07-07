@@ -44,6 +44,19 @@ pub struct BunkerApprovalRequest {
     pub event_kind: Option<u32>,
     pub event_content: Option<String>,
     pub requested_permissions: Option<String>,
+    /// NIP-98 (kind 27235) HTTP-auth target the UI must show so the user is not
+    /// approving a blind bearer credential. Present only for kind-27235 sign
+    /// requests; `None` otherwise.
+    pub http_auth: Option<BunkerHttpAuthDetails>,
+}
+
+/// The `u` (URL) and `method` a NIP-98 HTTP-auth signature will authenticate.
+/// Render both in the approval prompt; a `None` field means the request omitted
+/// that tag and should read as "unspecified", not be hidden.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct BunkerHttpAuthDetails {
+    pub url: Option<String>,
+    pub method: Option<String>,
 }
 
 /// How long an approval persists. Mirrors keep-android's
@@ -148,6 +161,10 @@ impl ServerCallbacks for CallbackBridge {
                 event_kind: request.event_kind.map(|k| k.as_u16() as u32),
                 event_content: request.event_content,
                 requested_permissions: request.requested_permissions,
+                http_auth: request.http_auth.map(|d| BunkerHttpAuthDetails {
+                    url: d.url,
+                    method: d.method,
+                }),
             })
             .into()
     }

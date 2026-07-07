@@ -9,6 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use keep_nip46::types::HttpAuthDetails;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -47,6 +48,9 @@ pub struct ApprovalRequest {
     pub action: String,
     pub kind: Option<u16>,
     pub content_preview: Option<String>,
+    /// NIP-98 (kind 27235) HTTP-auth target surfaced so the operator can see
+    /// what a bearer-credential sign request authorizes.
+    pub http_auth: Option<HttpAuthDetails>,
     pub response_tx: Sender<bool>,
 }
 
@@ -265,6 +269,20 @@ impl Tui {
             lines.push(Line::from(vec![
                 Span::styled("Kind: ", Style::default().fg(Color::Gray)),
                 Span::styled(kind.to_string(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+
+        if let Some(ref auth) = req.http_auth {
+            lines.push(Line::from(vec![
+                Span::styled("HTTP auth: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(
+                        "{} {}",
+                        auth.method.as_deref().unwrap_or("<no method>"),
+                        auth.url.as_deref().unwrap_or("<no url>"),
+                    ),
+                    Style::default().fg(Color::Red),
+                ),
             ]));
         }
 

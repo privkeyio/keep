@@ -29,6 +29,25 @@ pub fn truncate_npub(npub: &str) -> String {
     keep_core::display::truncate_str(npub, 12, 6)
 }
 
+/// The NIP-98 (kind 27235) HTTP-auth target line shared by the bunker and
+/// local-signer approval cards, so the wording and danger styling stay in sync.
+/// `None` when the request carries no HTTP-auth target (every non-27235 request).
+pub fn http_auth_row<'a, M: 'a>(
+    http_auth: &Option<keep_nip46::types::HttpAuthDetails>,
+) -> Option<iced::Element<'a, M>> {
+    let auth = http_auth.as_ref()?;
+    Some(
+        iced::widget::text(format!(
+            "HTTP auth: {} {}",
+            auth.method.as_deref().unwrap_or("<no method>"),
+            auth.url.as_deref().unwrap_or("<no url>"),
+        ))
+        .size(crate::theme::size::SMALL)
+        .color(crate::theme::color::DANGER)
+        .into(),
+    )
+}
+
 pub enum Screen {
     Unlock(unlock::State),
     ShareList(shares::State),

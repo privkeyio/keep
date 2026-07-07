@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 
 use iced::widget::{button, column, container, qr_code, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
+use keep_nip46::types::HttpAuthDetails;
 
 use crate::theme;
 
@@ -67,6 +68,9 @@ pub struct PendingApprovalDisplay {
     pub event_kind: Option<u32>,
     pub event_content: Option<String>,
     pub requested_permissions: Option<String>,
+    /// NIP-98 (kind 27235) HTTP-auth target surfaced so the user can see what a
+    /// bearer-credential sign request authorizes. `None` for non-27235 requests.
+    pub http_auth: Option<HttpAuthDetails>,
 }
 
 #[derive(Debug, Clone)]
@@ -795,6 +799,10 @@ impl State {
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
             );
+        }
+
+        if let Some(row) = super::http_auth_row(&approval.http_auth) {
+            details = details.push(row);
         }
 
         if let Some(ref content) = approval.event_content {

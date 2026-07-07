@@ -46,6 +46,7 @@ impl ServerCallbacks for TuiCallbacks {
             action: request.method,
             kind: request.event_kind.map(|k| k.as_u16()),
             content_preview: request.event_content,
+            http_auth: request.http_auth,
             response_tx,
         };
 

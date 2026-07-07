@@ -20,9 +20,77 @@ use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
-    ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
-    NIP98_MAX_REMEMBER_SECS,
+    ApprovalRequest, ApprovalResult, HttpAuthDetails, RememberDuration, ServerCallbacks,
+    NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
 };
+
+/// Max displayed length of a NIP-98 `u`/`method` value. A kilobyte-scale tag
+/// would push the approve/deny controls off-screen (layout DoS) and bury the
+/// real request; legitimate HTTP-auth targets are far shorter than this.
+const NIP98_DISPLAY_MAX: usize = 512;
+
+/// Neutralize a NIP-98 `u`/`method` value before it reaches any approval prompt.
+/// The tag is fully attacker-controlled, so strip the characters that let a
+/// signed URL read as a different (trusted) one: bidi overrides/isolates,
+/// zero-width and BOM code points, and every control character (a URL/method is
+/// single-line, so newlines and tabs are stripped too). Then truncate so an
+/// oversized tag cannot hide the rest of the prompt. Applied here at the single
+/// choke point so every surface (CLI/desktop/mobile/web) inherits it.
+fn sanitize_http_auth_field(value: String) -> String {
+    let mut out: String = value
+        .chars()
+        .filter(|c| {
+            // Explicit bidi/format/zero-width code points that are NOT in the
+            // `Cc` control category `is_control()` covers: line/paragraph
+            // separators (Zl/Zp) and the Arabic letter mark (Cf bidi control).
+            !matches!(c,
+                '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+            ) && !c.is_control()
+        })
+        .collect();
+    if out.chars().count() > NIP98_DISPLAY_MAX {
+        out = out.chars().take(NIP98_DISPLAY_MAX).collect::<String>() + "...";
+    }
+    out
+}
+
+/// Extract the NIP-98 (kind 27235) HTTP-auth target from a sign request so the
+/// approval prompt can show the `u`/method the signature will authenticate.
+/// Returns `None` for every other kind. A 27235 event that omits `u` or
+/// `method` still returns `Some` with the missing field as `None`: the prompt
+/// must surface a malformed HTTP-auth request, not silently drop it. The `u`
+/// and `method` values are sanitized (see [`sanitize_http_auth_field`]) since
+/// they are attacker-controlled and land directly in a signing-approval prompt.
+fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
+    if event.kind != NIP98_HTTP_AUTH {
+        return None;
+    }
+    let mut url = None;
+    let mut method = None;
+    // An empty or all-stripped value collapses to `None` so every surface shows
+    // its "unspecified" fallback rather than a blank.
+    let sanitized = |slice: &[String]| {
+        slice
+            .get(1)
+            .cloned()
+            .map(sanitize_http_auth_field)
+            .filter(|s| !s.is_empty())
+    };
+    for tag in event.tags.iter() {
+        let slice = tag.as_slice();
+        match slice.first().map(String::as_str) {
+            Some("u") if url.is_none() => url = sanitized(slice),
+            Some("method") if method.is_none() => method = sanitized(slice),
+            _ => {}
+        }
+    }
+    Some(HttpAuthDetails { url, method })
+}
 
 fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
     match remember.as_seconds() {
@@ -350,6 +418,7 @@ impl SignerHandler {
                     event_kind: None,
                     event_content: None,
                     requested_permissions: permissions.clone(),
+                    http_auth: None,
                 })
                 .await;
             if !result.approved {
@@ -441,6 +510,7 @@ impl SignerHandler {
                     event_kind: Some(kind),
                     event_content: Some(unsigned_event.content.clone()),
                     requested_permissions: None,
+                    http_auth: nip98_http_auth(&unsigned_event),
                 })
                 .await;
 
@@ -580,6 +650,7 @@ impl SignerHandler {
             event_kind: None,
             event_content: None,
             requested_permissions: None,
+            http_auth: None,
         };
         if self.request_approval(request).await.approved {
             Ok(())
@@ -882,11 +953,23 @@ mod tests {
     /// assert which operations triggered an interactive prompt. Approves all.
     struct RecordingCallbacks {
         methods: std::sync::Mutex<Vec<String>>,
+        http_auth: std::sync::Mutex<Option<HttpAuthDetails>>,
+    }
+    impl RecordingCallbacks {
+        fn new() -> Self {
+            Self {
+                methods: std::sync::Mutex::new(Vec::new()),
+                http_auth: std::sync::Mutex::new(None),
+            }
+        }
     }
     impl crate::types::ServerCallbacks for RecordingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
         fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
             self.methods.lock().unwrap().push(request.method);
+            if request.http_auth.is_some() {
+                *self.http_auth.lock().unwrap() = request.http_auth;
+            }
             ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str) {}
@@ -902,9 +985,7 @@ mod tests {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        let cb = Arc::new(RecordingCallbacks {
-            methods: std::sync::Mutex::new(Vec::new()),
-        });
+        let cb = Arc::new(RecordingCallbacks::new());
         // Default connect_grant == Permission::DEFAULT (get_public_key only).
         let handler = SignerHandler::new(keyring, permissions, audit, Some(cb));
 
@@ -933,9 +1014,7 @@ mod tests {
             .await
             .set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        let cb = Arc::new(RecordingCallbacks {
-            methods: std::sync::Mutex::new(Vec::new()),
-        });
+        let cb = Arc::new(RecordingCallbacks::new());
         let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
             .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
 
@@ -958,6 +1037,114 @@ mod tests {
         assert!(
             methods.iter().any(|m| m == "sign_event"),
             "kind 27235 MUST trigger a per-request approval prompt, saw: {methods:?}"
+        );
+
+        // The prompt must carry the `u`/method so the user is not approving a
+        // blind HTTP-auth bearer credential (keep-qjx0).
+        let http_auth = cb.http_auth.lock().unwrap().clone();
+        assert_eq!(
+            http_auth,
+            Some(HttpAuthDetails {
+                url: Some("https://readstr.example/api/feed".into()),
+                method: Some("GET".into()),
+            }),
+            "kind 27235 approval must surface the NIP-98 url/method"
+        );
+    }
+
+    #[test]
+    fn nip98_http_auth_extracts_url_and_method() {
+        let signer_pk = Keys::generate().public_key();
+        let tags = vec![
+            Tag::parse(["u", "https://blossom.example/upload"]).unwrap(),
+            Tag::parse(["method", "PUT"]).unwrap(),
+        ];
+        let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        assert_eq!(
+            nip98_http_auth(&ev),
+            Some(HttpAuthDetails {
+                url: Some("https://blossom.example/upload".into()),
+                method: Some("PUT".into()),
+            })
+        );
+
+        // A malformed 27235 event (missing `u`) still surfaces as Some so the
+        // prompt can flag the omission rather than hide the request.
+        let bare = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, vec![], "");
+        assert_eq!(
+            nip98_http_auth(&bare),
+            Some(HttpAuthDetails {
+                url: None,
+                method: None,
+            })
+        );
+
+        // Every other kind carries no HTTP-auth target.
+        let note = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "hi");
+        assert_eq!(nip98_http_auth(&note), None);
+    }
+
+    #[test]
+    fn nip98_http_auth_sanitizes_spoofing_and_bounds_length() {
+        let signer_pk = Keys::generate().public_key();
+
+        // A `u` carrying an RTL-override, zero-width, line-separator and the
+        // Arabic letter mark (all bidi/format code points) must not be able to
+        // make the displayed URL read as a different host than what is signed.
+        let spoof = "https://evil.com/\u{202E}moc.doog//:sptth\u{200B}\u{2028}\u{2029}\u{061C}";
+        let ev = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            vec![
+                Tag::parse(["u", spoof]).unwrap(),
+                Tag::parse(["method", "GET\u{0007}"]).unwrap(),
+            ],
+            "",
+        );
+        let details = nip98_http_auth(&ev).unwrap();
+        let url = details.url.unwrap();
+        assert_eq!(url, "https://evil.com/moc.doog//:sptth");
+        assert_eq!(details.method.as_deref(), Some("GET"));
+
+        // An empty (or all-stripped) `u`/`method` collapses to `None` so the
+        // prompt shows its "unspecified" fallback, not a blank.
+        let ev = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            vec![
+                Tag::parse(["u", ""]).unwrap(),
+                Tag::parse(["method", "\u{200B}"]).unwrap(),
+            ],
+            "",
+        );
+        assert_eq!(
+            nip98_http_auth(&ev),
+            Some(HttpAuthDetails {
+                url: None,
+                method: None,
+            })
+        );
+
+        // An oversized `u` is truncated so it cannot bury the approve/deny controls.
+        let long = format!("https://evil.example/{}", "a".repeat(5000));
+        let ev = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            NIP98_HTTP_AUTH,
+            vec![Tag::parse(["u", &long]).unwrap()],
+            "",
+        );
+        let url = nip98_http_auth(&ev).unwrap().url.unwrap();
+        assert!(
+            url.chars().count() <= NIP98_DISPLAY_MAX + 3,
+            "displayed url must be length-bounded, got {} chars",
+            url.chars().count()
+        );
+        assert!(
+            url.ends_with("..."),
+            "truncated url must be marked: {url:?}"
         );
     }
 

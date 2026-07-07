@@ -86,12 +86,17 @@ impl ServerCallbacks for WebCallbacks {
             map.insert(id, tx);
         }
 
+        let http_auth = request.http_auth.map(|d| crate::state::HttpAuth {
+            url: d.url,
+            method: d.method,
+        });
         let _ = self.events.send(Event::Approval {
             id,
             app: request.app_name,
             method: request.method,
             kind: request.event_kind.map(|k| k.as_u16()),
             preview: request.event_content,
+            http_auth,
         });
 
         // `block_in_place` requires a multi-thread runtime; both spawners use
