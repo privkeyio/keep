@@ -333,7 +333,7 @@ impl Storage {
     }
 
     fn create_header_with_key(&self, password: &str, data_key: &SecretKey) -> Result<Header> {
-        let mut header = Header::new(self.header.argon2_params());
+        let mut header = Header::new(self.header.argon2_params())?;
         let master_key =
             crypto::derive_key(password.as_bytes(), &header.salt, header.argon2_params())?;
         let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;

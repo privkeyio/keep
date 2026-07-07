@@ -113,19 +113,19 @@ pub(crate) struct Header {
 }
 
 impl Header {
-    pub(crate) fn new(params: Argon2Params) -> Self {
-        Self {
+    pub(crate) fn new(params: Argon2Params) -> Result<Self> {
+        Ok(Self {
             magic: *HEADER_MAGIC,
             version: HEADER_VERSION,
             flags: 0,
-            salt: crypto::random_bytes(),
-            nonce: crypto::random_bytes(),
+            salt: crypto::try_random_bytes()?,
+            nonce: crypto::try_random_bytes()?,
             encrypted_data_key: [0; 48],
             argon2_memory_kib: params.memory_kib,
             argon2_iterations: params.iterations,
             argon2_parallelism: params.parallelism,
             _padding: [0; 140],
-        }
+        })
     }
 
     pub(crate) fn argon2_params(&self) -> Argon2Params {
@@ -282,7 +282,7 @@ impl Storage {
     ) -> Result<Self> {
         validate_new_password(password)?;
 
-        let mut header = Header::new(params);
+        let mut header = Header::new(params)?;
         let data_key = SecretKey::generate()?;
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
         let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
@@ -1448,7 +1448,7 @@ mod tests {
 
     #[test]
     fn test_header_rejects_malicious_argon2_params() {
-        let valid_header = Header::new(Argon2Params::TESTING);
+        let valid_header = Header::new(Argon2Params::TESTING).unwrap();
         let valid_bytes = valid_header.to_bytes();
 
         Header::from_bytes(&valid_bytes).expect("valid header should parse");

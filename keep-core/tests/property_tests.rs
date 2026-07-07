@@ -100,7 +100,7 @@ proptest! {
         outer_size in 0u64..1_000_000,
         total_size in 0u64..10_000_000
     ) {
-        let header = OuterHeader::new(Argon2Params::TESTING, outer_size, total_size);
+        let header = OuterHeader::new(Argon2Params::TESTING, outer_size, total_size).unwrap();
         let bytes = header.to_bytes();
         prop_assert_eq!(bytes.len(), HEADER_SIZE);
         let parsed = OuterHeader::from_bytes(&bytes).unwrap();
@@ -115,7 +115,7 @@ proptest! {
         offset in 1024u64..1_000_000,
         size in 0u64..1_000_000
     ) {
-        let header = HiddenHeader::new(offset, size);
+        let header = HiddenHeader::new(offset, size).unwrap();
         prop_assert!(header.verify_checksum());
         let bytes = header.to_bytes();
         prop_assert_eq!(bytes.len(), HEADER_SIZE);
@@ -159,13 +159,13 @@ proptest! {
 
 #[test]
 fn header_boundary_sizes() {
-    let header = OuterHeader::new(Argon2Params::TESTING, 0, 0);
+    let header = OuterHeader::new(Argon2Params::TESTING, 0, 0).unwrap();
     let bytes = header.to_bytes();
     let parsed = OuterHeader::from_bytes(&bytes).unwrap();
     assert_eq!(parsed.outer_data_size, 0);
     assert_eq!(parsed.total_size, 0);
 
-    let header = OuterHeader::new(Argon2Params::TESTING, u64::MAX, u64::MAX);
+    let header = OuterHeader::new(Argon2Params::TESTING, u64::MAX, u64::MAX).unwrap();
     let bytes = header.to_bytes();
     let parsed = OuterHeader::from_bytes(&bytes).unwrap();
     assert_eq!(parsed.outer_data_size, u64::MAX);

@@ -41,14 +41,14 @@ pub struct OuterHeader {
 
 impl OuterHeader {
     /// Create a new outer header.
-    pub fn new(params: Argon2Params, outer_size: u64, total_size: u64) -> Self {
-        Self {
+    pub fn new(params: Argon2Params, outer_size: u64, total_size: u64) -> Result<Self> {
+        Ok(Self {
             magic: *OUTER_MAGIC,
             version: 1,
             flags: 0,
             reserved: 0,
-            salt: crypto::random_bytes(),
-            nonce: crypto::random_bytes(),
+            salt: crypto::try_random_bytes()?,
+            nonce: crypto::try_random_bytes()?,
             encrypted_data_key: [0; 48],
             argon2_memory_kib: params.memory_kib,
             argon2_iterations: params.iterations,
@@ -57,7 +57,7 @@ impl OuterHeader {
             outer_data_size: outer_size,
             total_size,
             padding: [0; 360],
-        }
+        })
     }
 
     /// The Argon2 parameters.
@@ -196,12 +196,12 @@ pub struct HiddenHeader {
 
 impl HiddenHeader {
     /// Create a new hidden header.
-    pub fn new(hidden_offset: u64, hidden_size: u64) -> Self {
+    pub fn new(hidden_offset: u64, hidden_size: u64) -> Result<Self> {
         let mut header = Self {
             version: 1,
             reserved: 0,
-            salt: crypto::random_bytes(),
-            nonce: crypto::random_bytes(),
+            salt: crypto::try_random_bytes()?,
+            nonce: crypto::try_random_bytes()?,
             encrypted_data_key: [0; 48],
             _align_pad: 0,
             hidden_data_offset: hidden_offset,
@@ -211,7 +211,7 @@ impl HiddenHeader {
         };
 
         header.checksum = header.compute_checksum();
-        header
+        Ok(header)
     }
 
     /// Compute checksum.
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_outer_header_roundtrip() {
-        let header = OuterHeader::new(Argon2Params::TESTING, 1000, 2000);
+        let header = OuterHeader::new(Argon2Params::TESTING, 1000, 2000).unwrap();
         let bytes = header.to_bytes();
         let parsed = OuterHeader::from_bytes(&bytes).unwrap();
 
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_hidden_header_roundtrip() {
-        let header = HiddenHeader::new(1024, 500);
+        let header = HiddenHeader::new(1024, 500).unwrap();
         let bytes = header.to_bytes();
         let parsed = HiddenHeader::from_bytes(&bytes).unwrap();
 
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_hidden_header_checksum_detects_corruption() {
-        let mut header = HiddenHeader::new(1024, 500);
+        let mut header = HiddenHeader::new(1024, 500).unwrap();
         header.hidden_data_size = 999;
         assert!(!header.verify_checksum());
     }

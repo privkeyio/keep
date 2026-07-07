@@ -149,7 +149,7 @@ impl HiddenStorage {
 
         let outer_size = total_size - DATA_START_OFFSET - hidden_size;
 
-        let mut outer_header = OuterHeader::new(params, outer_size, total_size);
+        let mut outer_header = OuterHeader::new(params, outer_size, total_size)?;
 
         let outer_data_key = SecretKey::generate()?;
         let outer_master_key =
@@ -166,7 +166,7 @@ impl HiddenStorage {
         let (hidden_header, hidden_data_key, encrypted_hidden_header) =
             if let Some(hp) = hidden_password {
                 let hidden_offset = DATA_START_OFFSET + outer_size;
-                let mut hh = HiddenHeader::new(hidden_offset, hidden_size);
+                let mut hh = HiddenHeader::new(hidden_offset, hidden_size)?;
 
                 let hidden_data_key = SecretKey::generate()?;
                 let kdf_salt = derive_hidden_salt(&outer_header.salt, hp);
