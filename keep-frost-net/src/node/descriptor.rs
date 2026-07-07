@@ -1482,3 +1482,118 @@ impl KfpNode {
         Ok(Zeroizing::new(bytes))
     }
 }
+
+#[cfg(test)]
+mod gate_tests {
+    //! Deterministic responder-gate coverage for every descriptor-coordination
+    //! ingress handler. Each runs a uniform group -> policy -> replay prefix
+    //! before any session work, so the outcome is observable from the return
+    //! value: build a real node, call the handler directly, no relay run loop.
+
+    use super::*;
+    use crate::node::PeerPolicy;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
+
+    async fn test_node() -> (KfpNode, MockRelay) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("descriptor-gate-test").unwrap();
+        (
+            KfpNode::new(shares.remove(0), vec![relay]).await.unwrap(),
+            mock,
+        )
+    }
+
+    /// For a handler with the group/policy/replay prefix: a payload for a
+    /// foreign group is silently ignored (`Ok`), a policy-denied peer gets
+    /// `PolicyViolation`, and a stale `created_at` (default policy allows) gets
+    /// `ReplayDetected`. `$build` maps a group pubkey to a payload whose other
+    /// fields are irrelevant to these gates.
+    macro_rules! policy_replay_gate_tests {
+        ($mod:ident, $handler:ident, $build:expr) => {
+            mod $mod {
+                use super::*;
+
+                #[tokio::test]
+                async fn ignores_foreign_group() {
+                    let (node, _relay) = test_node().await;
+                    let from = Keys::generate().public_key();
+                    // Foreign group -> the membership gate short-circuits before
+                    // any policy/replay work. If that gate regressed, an
+                    // unannounced peer would trip a later gate and return Err.
+                    let payload = ($build)([0xAAu8; 32]);
+                    assert!(node.$handler(from, payload).await.is_ok());
+                }
+
+                #[tokio::test]
+                async fn rejects_denied_peer() {
+                    let (node, _relay) = test_node().await;
+                    let from = Keys::generate().public_key();
+                    node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+                    let payload = ($build)(*node.group_pubkey());
+                    assert!(matches!(
+                        node.$handler(from, payload).await,
+                        Err(FrostNetError::PolicyViolation(_))
+                    ));
+                }
+
+                #[tokio::test]
+                async fn rejects_stale_replay() {
+                    let (node, _relay) = test_node().await;
+                    let from = Keys::generate().public_key();
+                    let mut payload = ($build)(*node.group_pubkey());
+                    payload.created_at = 1; // ancient -> outside the replay window
+                    assert!(matches!(
+                        node.$handler(from, payload).await,
+                        Err(FrostNetError::ReplayDetected(_))
+                    ));
+                }
+            }
+        };
+    }
+
+    policy_replay_gate_tests!(descriptor_migrate, handle_descriptor_migrate, |g| {
+        DescriptorMigratePayload::new([1u8; 32], g, [2u8; 32], [3u8; 32], 2)
+    });
+    policy_replay_gate_tests!(descriptor_propose, handle_descriptor_propose, |g| {
+        DescriptorProposePayload::new(
+            [1u8; 32],
+            g,
+            Timestamp::now().as_secs(),
+            "signet",
+            WalletPolicy {
+                recovery_tiers: vec![],
+                version: 1,
+            },
+            "xpub",
+            "fingerprint",
+        )
+    });
+    policy_replay_gate_tests!(descriptor_contribute, handle_descriptor_contribute, |g| {
+        DescriptorContributePayload::new([1u8; 32], g, 2, "xpub", "fingerprint")
+    });
+    policy_replay_gate_tests!(descriptor_finalize, handle_descriptor_finalize, |g| {
+        DescriptorFinalizePayload::new(
+            [1u8; 32],
+            g,
+            "ext",
+            "int",
+            [0u8; 32],
+            std::collections::BTreeMap::new(),
+        )
+    });
+    policy_replay_gate_tests!(descriptor_nack, handle_descriptor_nack, |g| {
+        DescriptorNackPayload::new([1u8; 32], g, "reason")
+    });
+    policy_replay_gate_tests!(descriptor_ack, handle_descriptor_ack, |g| {
+        DescriptorAckPayload::new([1u8; 32], g, [0u8; 32], vec![])
+    });
+    policy_replay_gate_tests!(xpub_announce, handle_xpub_announce, |g| {
+        XpubAnnouncePayload::new(g, 2, vec![])
+    });
+}
