@@ -466,4 +466,33 @@ mod gate_tests {
             Err(FrostNetError::PolicyViolation(_))
         ));
     }
+    /// A round2 share from a peer whose share index is not announced is
+    /// rejected (`verify_peer_share_index`). Also pins the whole-function
+    /// "replace with Ok(())" mutation, since the correct path returns Err.
+    #[tokio::test]
+    async fn handle_ecdh_share_rejects_unannounced_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = EcdhSharePayload::new([1u8; 32], 2, vec![0u8; 33]);
+        assert!(matches!(
+            node.handle_ecdh_share(from, payload).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
+
+    /// A completed-secret announcement for an unknown session is rejected
+    /// (session-lookup gate) rather than silently accepted.
+    #[tokio::test]
+    async fn handle_ecdh_complete_rejects_unknown_session() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = EcdhCompletePayload {
+            session_id: [9u8; 32],
+            shared_secret: Zeroizing::new(vec![0u8; 32]),
+        };
+        assert!(matches!(
+            node.handle_ecdh_complete(from, payload).await,
+            Err(FrostNetError::Session(_))
+        ));
+    }
 }
