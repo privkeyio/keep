@@ -23,7 +23,11 @@ pub type SpkiHash = [u8; 32];
 
 #[derive(Clone, Debug, Default)]
 pub struct CertificatePinSet {
-    pins: HashMap<String, SpkiHash>,
+    /// One or more accepted SPKI hashes per hostname. Multiple pins let an
+    /// operator stage a backup pin (RFC 7469) before rotating a relay's
+    /// certificate, so both the current and next key verify during the
+    /// overlap instead of a rotation hard-failing every connection.
+    pins: HashMap<String, Vec<SpkiHash>>,
 }
 
 impl CertificatePinSet {
@@ -31,19 +35,32 @@ impl CertificatePinSet {
         Self::default()
     }
 
+    /// Add an accepted pin for `hostname`. Additive and de-duplicated: an
+    /// existing pin for the host is retained (so a rotation can pre-stage the
+    /// next key alongside the current one), and adding the same hash twice is
+    /// a no-op.
     pub fn add_pin(&mut self, hostname: String, hash: SpkiHash) {
-        self.pins.insert(hostname, hash);
+        let entry = self.pins.entry(hostname).or_default();
+        if !entry.contains(&hash) {
+            entry.push(hash);
+        }
     }
 
-    pub fn get_pin(&self, hostname: &str) -> Option<&SpkiHash> {
-        self.pins.get(hostname)
+    /// All accepted pins for `hostname` (empty slice if none).
+    pub fn get_pins(&self, hostname: &str) -> &[SpkiHash] {
+        self.pins.get(hostname).map_or(&[], Vec::as_slice)
     }
 
-    pub fn remove_pin(&mut self, hostname: &str) -> Option<SpkiHash> {
+    /// Whether `hostname` has at least one pin (used to gate TOFU).
+    pub fn is_pinned(&self, hostname: &str) -> bool {
+        self.pins.get(hostname).is_some_and(|v| !v.is_empty())
+    }
+
+    pub fn remove_pin(&mut self, hostname: &str) -> Option<Vec<SpkiHash>> {
         self.pins.remove(hostname)
     }
 
-    pub fn pins(&self) -> &HashMap<String, SpkiHash> {
+    pub fn pins(&self) -> &HashMap<String, Vec<SpkiHash>> {
         &self.pins
     }
 
@@ -140,18 +157,26 @@ pub async fn verify_relay_certificate(
 
     let spki_hash = hash_spki(spki_bytes);
 
-    if let Some(expected) = pins.get_pin(&hostname) {
-        if spki_hash.ct_ne(expected).into() {
-            return Err(FrostNetError::CertificatePinMismatch {
-                hostname,
-                expected: "***".into(),
-                actual: hex::encode(spki_hash),
-            });
-        }
-        Ok((spki_hash, None))
-    } else {
-        Ok((spki_hash, Some((hostname, spki_hash))))
+    let expected = pins.get_pins(&hostname);
+    if expected.is_empty() {
+        // Trust-on-first-use: no pin yet, surface the observed hash to pin.
+        return Ok((spki_hash, Some((hostname, spki_hash))));
     }
+    // Accept if the observed hash matches ANY pinned key (current or a staged
+    // backup). Fold the constant-time comparisons without short-circuiting so
+    // the match position does not leak via timing.
+    let mut matched = subtle::Choice::from(0u8);
+    for pin in expected {
+        matched |= spki_hash.ct_eq(pin);
+    }
+    if !bool::from(matched) {
+        return Err(FrostNetError::CertificatePinMismatch {
+            hostname,
+            expected: "***".into(),
+            actual: hex::encode(spki_hash),
+        });
+    }
+    Ok((spki_hash, None))
 }
 
 fn hash_spki(spki_der: &[u8]) -> SpkiHash {
@@ -244,12 +269,28 @@ mod tests {
 
         let hash = [42u8; 32];
         pins.add_pin("relay.example.com".into(), hash);
-        assert_eq!(pins.get_pin("relay.example.com"), Some(&hash));
+        assert!(pins.is_pinned("relay.example.com"));
+        assert_eq!(pins.get_pins("relay.example.com"), &[hash]);
         assert!(!pins.is_empty());
 
         let removed = pins.remove_pin("relay.example.com");
-        assert_eq!(removed, Some(hash));
+        assert_eq!(removed, Some(vec![hash]));
         assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn test_multi_pin_for_rotation() {
+        // A host can hold a current pin plus a staged backup; adding is
+        // additive and de-duplicated, and both are accepted.
+        let mut pins = CertificatePinSet::new();
+        let current = [1u8; 32];
+        let backup = [2u8; 32];
+        pins.add_pin("relay.example.com".into(), current);
+        pins.add_pin("relay.example.com".into(), backup);
+        pins.add_pin("relay.example.com".into(), current); // dedup, no-op
+        assert_eq!(pins.get_pins("relay.example.com"), &[current, backup]);
+        assert!(pins.get_pins("other.example.com").is_empty());
+        assert!(!pins.is_pinned("other.example.com"));
     }
 
     #[test]

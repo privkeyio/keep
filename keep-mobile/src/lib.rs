@@ -1257,9 +1257,11 @@ impl KeepMobile {
             .unwrap_or_default()
             .pins()
             .iter()
-            .map(|(hostname, hash)| CertificatePin {
-                hostname: hostname.clone(),
-                spki_hash: hex::encode(hash),
+            .flat_map(|(hostname, hashes)| {
+                hashes.iter().map(move |hash| CertificatePin {
+                    hostname: hostname.clone(),
+                    spki_hash: hex::encode(hash),
+                })
             })
             .collect())
     }
@@ -2586,7 +2588,7 @@ impl KeepMobile {
                 match keep_frost_net::verify_relay_certificate(relay, &pins).await {
                     Ok((_hash, new_pin)) => {
                         if let Some((hostname, hash)) = new_pin {
-                            if pins.get_pin(&hostname).is_none() {
+                            if !pins.is_pinned(&hostname) {
                                 pins.add_pin(hostname, hash);
                                 pins_changed = true;
                             }
@@ -2615,7 +2617,7 @@ impl KeepMobile {
                         return true;
                     }
                     url.host_str()
-                        .map(|h| pins.get_pin(h).is_some())
+                        .map(|h| pins.is_pinned(h))
                         .unwrap_or(false)
                 })
                 .cloned()
