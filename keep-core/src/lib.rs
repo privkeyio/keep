@@ -92,6 +92,7 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
+pub use crate::storage::StatePublisher;
 use crate::storage::Storage;
 pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 

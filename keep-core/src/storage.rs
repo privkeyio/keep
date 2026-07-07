@@ -198,6 +198,20 @@ impl Header {
     }
 }
 
+/// Sink for vault-state changes so a node can replicate its redb records to a standby (the
+/// keep-state-over-wisp design). keep-web installs an implementation that publishes each change as a
+/// Nostr event; keep-core only signals table/record/bytes and never touches the network. `on_record`
+/// carries the record's already-encrypted redb bytes -- the exact bytes stored -- so a peer that
+/// shares the vault key stores them verbatim. Called from inside the write path, so an implementation
+/// MUST NOT block: enqueue and return.
+pub trait StatePublisher: Send + Sync {
+    /// A record was written: `table` is one of keys/descriptors/relay_configs, `record_id` is its
+    /// hex redb key, and `encrypted` is the vault-encrypted bytes as stored.
+    fn on_record(&self, table: &str, record_id: &str, encrypted: &[u8]);
+    /// A record (`table`, hex `record_id`) was deleted.
+    fn on_delete(&self, table: &str, record_id: &str);
+}
+
 /// Encrypted persistent storage for keys and FROST shares.
 pub struct Storage {
     pub(crate) path: PathBuf,
@@ -208,6 +222,9 @@ pub struct Storage {
     /// e.g. two concurrent `upsert_device_registration` calls cannot drop
     /// one another's updates.
     pub(crate) descriptor_lock: std::sync::Mutex<()>,
+    /// Optional replication sink; see [`StatePublisher`]. `RwLock` so keep-web can install it after
+    /// construction (via [`Storage::set_state_publisher`]) while storage methods take `&self`.
+    pub(crate) state_publisher: std::sync::RwLock<Option<std::sync::Arc<dyn StatePublisher>>>,
 }
 
 fn create_storage_dir(path: &Path) -> Result<()> {
@@ -253,6 +270,28 @@ fn chmod_secure(path: &Path) -> std::io::Result<()> {
 }
 
 impl Storage {
+    /// Install the replication sink (keep-web). A later call replaces the previous sink.
+    pub fn set_state_publisher(&self, publisher: std::sync::Arc<dyn StatePublisher>) {
+        if let Ok(mut slot) = self.state_publisher.write() {
+            *slot = Some(publisher);
+        }
+    }
+
+    fn notify_record(&self, table: &str, record_id: &str, encrypted: &[u8]) {
+        if let Ok(slot) = self.state_publisher.read() {
+            if let Some(p) = slot.as_ref() {
+                p.on_record(table, record_id, encrypted);
+            }
+        }
+    }
+
+    fn notify_delete(&self, table: &str, record_id: &str) {
+        if let Ok(slot) = self.state_publisher.read() {
+            if let Some(p) = slot.as_ref() {
+                p.on_delete(table, record_id);
+            }
+        }
+    }
     /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
         create_storage_dir(path)?;
@@ -309,6 +348,7 @@ impl Storage {
             data_key: Some(data_key),
             backend: Some(backend),
             descriptor_lock: std::sync::Mutex::new(()),
+            state_publisher: std::sync::RwLock::new(None),
         })
     }
 
@@ -343,6 +383,7 @@ impl Storage {
             data_key: None,
             backend: None,
             descriptor_lock: std::sync::Mutex::new(()),
+            state_publisher: std::sync::RwLock::new(None),
         })
     }
 
@@ -482,6 +523,7 @@ impl Storage {
         let encrypted_bytes = encrypted.to_bytes();
 
         backend.put(KEYS_TABLE, &record.id, &encrypted_bytes)?;
+        self.notify_record("keys", &hex::encode(record.id), &encrypted_bytes);
         Ok(())
     }
 
@@ -526,6 +568,7 @@ impl Storage {
         debug!(id = %hex::encode(id), "deleting key");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         if backend.delete(KEYS_TABLE, id)? {
+            self.notify_delete("keys", &hex::encode(id));
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(hex::encode(id)))
@@ -647,6 +690,7 @@ impl Storage {
 
         let key = descriptor_storage_key(&descriptor.group_pubkey, descriptor.version);
         backend.put(DESCRIPTORS_TABLE, &key, &encrypted_bytes)?;
+        self.notify_record("descriptors", &hex::encode(&key), &encrypted_bytes);
         Ok(())
     }
 
@@ -844,6 +888,9 @@ impl Storage {
 
         let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         backend.delete_batch(DESCRIPTORS_TABLE, &refs)?;
+        for k in &keys {
+            self.notify_delete("descriptors", &hex::encode(k));
+        }
         Ok(())
     }
 
@@ -852,6 +899,7 @@ impl Storage {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let key = descriptor_storage_key(group_pubkey, version);
         if backend.delete(DESCRIPTORS_TABLE, &key)? {
+            self.notify_delete("descriptors", &hex::encode(&key));
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(
@@ -875,6 +923,7 @@ impl Storage {
             &normalized.group_pubkey,
             &encrypted_bytes,
         )?;
+        self.notify_record("relay_configs", &hex::encode(normalized.group_pubkey), &encrypted_bytes);
         Ok(())
     }
 
@@ -915,6 +964,7 @@ impl Storage {
         debug!(group = %hex::encode(group_pubkey), "deleting relay config");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         if backend.delete(RELAY_CONFIGS_TABLE, group_pubkey)? {
+            self.notify_delete("relay_configs", &hex::encode(group_pubkey));
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(
@@ -1444,6 +1494,57 @@ mod tests {
 
         let keys = storage.list_keys().unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    #[derive(Default)]
+    struct RecordingPublisher {
+        records: std::sync::Mutex<Vec<(String, String)>>,
+        deletes: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl StatePublisher for RecordingPublisher {
+        fn on_record(&self, table: &str, record_id: &str, _encrypted: &[u8]) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((table.into(), record_id.into()));
+        }
+        fn on_delete(&self, table: &str, record_id: &str) {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push((table.into(), record_id.into()));
+        }
+    }
+
+    #[test]
+    fn state_publisher_fires_on_key_writes() {
+        use crate::backend::MemoryBackend;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-publish");
+        let backend = Box::new(MemoryBackend::new());
+        let storage =
+            Storage::create_with_backend(&path, "password", Argon2Params::TESTING, backend).unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+
+        let record = KeyRecord::new(
+            crypto::random_bytes(),
+            crate::keys::KeyType::Nostr,
+            "k".into(),
+            vec![1, 2, 3],
+        );
+        storage.store_key(&record).unwrap();
+        storage.delete_key(&record.id).unwrap();
+
+        // The write hook fires with the record's table + hex id; the encrypted-bytes payload is the
+        // same bytes stored (asserted non-empty). Shares are intentionally NOT hooked (per-node, per
+        // the qmc design), which is enforced by construction: store_share carries no notify call.
+        let records = publisher.records.lock().unwrap();
+        let deletes = publisher.deletes.lock().unwrap();
+        assert_eq!(*records, vec![("keys".to_string(), hex::encode(record.id))]);
+        assert_eq!(*deletes, vec![("keys".to_string(), hex::encode(record.id))]);
     }
 
     #[test]
