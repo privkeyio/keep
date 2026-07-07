@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 
-use bitcoin::bip32::Xpub;
+use bitcoin::bip32::{ChainCode, ChildNumber, Fingerprint, Xpub};
 use bitcoin::hashes::{hash160, Hash};
-use bitcoin::{Network, XOnlyPublicKey};
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Network, NetworkKind, XOnlyPublicKey};
+use keep_core::frost_bip32::deterministic_chaincode;
 use miniscript::{Descriptor, DescriptorPublicKey};
 
 use crate::address::AddressDerivation;
@@ -68,7 +70,20 @@ impl DescriptorExport {
         let fingerprint = Self::pubkey_fingerprint(group_pubkey);
 
         let (descriptor, checksum) = match recovery {
-            None => canonicalize_descriptor(&format!("tr({xonly})"))?,
+            None => {
+                // #487 PR 4/4: emit a BIP-86-style HD taproot descriptor over
+                // the FROST group's own xpub (built from the deterministic
+                // chaincode in PR 1) so `/0/*` and `/1/*` derive distinct
+                // receive- and change-address chains. Downstream wallets
+                // walk the xpub with the standard BIP-32 rules, and the
+                // FROST signing loop applies the matching composite tweak
+                // (PR 2 + PR 3) at spend time.
+                let xpub = group_xpub_string(group_pubkey, network)?;
+                let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+                canonicalize_descriptor(&format!(
+                    "tr([{fingerprint}/86'/{coin_type}'/0']{xpub}/0/*)"
+                ))?
+            }
             Some(config) => {
                 let output = config.build_with_internal_key(&xonly)?;
                 canonicalize_descriptor(&output.descriptor)?
@@ -89,6 +104,15 @@ impl DescriptorExport {
         compressed[1..].copy_from_slice(pubkey);
         let h = hash160::Hash::hash(&compressed);
         hex::encode(&h[..4])
+    }
+
+    /// Return the raw Base58Check-encoded xpub string that
+    /// [`Self::from_frost_wallet`] wraps into its BIP-86 descriptor. Exposed
+    /// so callers exporting to other wallets (Sparrow, Electrum, BDK) can
+    /// hand off just the xpub without also parsing back the wrapping
+    /// descriptor.
+    pub fn frost_group_xpub(group_pubkey: &[u8; 32], network: Network) -> Result<String> {
+        group_xpub_string(group_pubkey, network)
     }
 
     pub fn external_descriptor(&self) -> &str {
@@ -197,6 +221,59 @@ pub fn descriptor_address(descriptor: &str, network: Network) -> Result<bitcoin:
         .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
 }
 
+/// Resolve a ranged OR definite descriptor at a concrete derivation `index` and
+/// return its address on `network`. Unlike [`descriptor_address`], this accepts
+/// a ranged descriptor (`.../0/*`) by resolving it at `index` rather than
+/// rejecting it. Used to pick the single deterministic migration-sweep
+/// destination for a successor FROST wallet descriptor: `index` 0 is the first
+/// external `/0/0` receive address, which both proposer and responder derive
+/// identically from the same persisted descriptor.
+pub fn descriptor_address_at_index(
+    descriptor: &str,
+    network: Network,
+    index: u32,
+) -> Result<bitcoin::Address> {
+    let parsed = parse_descriptor_body(descriptor)?;
+    parsed
+        .at_derivation_index(index)
+        .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?
+        .address(network)
+        .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
+}
+
+/// Build the raw Base58Check-encoded xpub for a FROST group by combining its
+/// x-only pubkey (lifted to its +even secp256k1 point) with the deterministic
+/// chaincode from #487 PR1. Depth 0, no parent, child number 0: this is the
+/// group's own xpub, not a derivation of anything above it.
+///
+/// Downstream wallets consume the xpub through the normal BIP-32 rules, and
+/// keep-frost-net's sign path applies the matching composite tweak (PR 2 +
+/// PR 3) so a `/0/N` receive-address spend produces a signature that BIP-340
+/// verifies against the address's key.
+fn group_xpub_string(group_pubkey: &[u8; 32], network: Network) -> Result<String> {
+    let network_kind = if network == Network::Bitcoin {
+        NetworkKind::Main
+    } else {
+        NetworkKind::Test
+    };
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(group_pubkey);
+    let public_key = PublicKey::from_slice(&compressed)
+        .map_err(|e| BitcoinError::Descriptor(format!("group pubkey not on curve: {e}")))?;
+    let chain_code = ChainCode::from(deterministic_chaincode(group_pubkey));
+    let xpub = Xpub {
+        network: network_kind,
+        depth: 0,
+        parent_fingerprint: Fingerprint::from([0u8; 4]),
+        child_number: ChildNumber::from_normal_idx(0)
+            .map_err(|e| BitcoinError::Descriptor(format!("child number 0: {e}")))?,
+        public_key,
+        chain_code,
+    };
+    Ok(xpub.to_string())
+}
+
 fn parse_definite_descriptor(
     descriptor: &str,
 ) -> Result<Descriptor<miniscript::DefiniteDescriptorKey>> {
@@ -303,6 +380,138 @@ mod tests {
         assert!(json.contains("testnet"));
     }
 
+    /// #487 PR 4: the address a downstream wallet derives from the emitted
+    /// descriptor at `/0/N` MUST have the x-only pubkey that
+    /// `keep_core::frost::bip32_signing::derive_child(group, &[0, N])`
+    /// produces. If these ever drift, wallets receive to addresses that
+    /// keep cannot sign for. Cross-check by pinning the descriptor and
+    /// deriving both sides for a few leaves.
+    #[test]
+    fn descriptor_addresses_match_bip32_signing_derivation() {
+        use bitcoin::bip32::{ChildNumber, DerivationPath, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+        use keep_core::frost::bip32_signing::derive_child;
+
+        let group = test_group_pubkey();
+        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
+
+        // Extract the xpub embedded in the descriptor.
+        let xpub_str = DescriptorExport::frost_group_xpub(&group, Network::Testnet).unwrap();
+        let xpub: Xpub = xpub_str.parse().unwrap();
+        assert!(
+            export.descriptor.contains(xpub_str.as_str()),
+            "descriptor must embed the exact frost_group_xpub value"
+        );
+
+        let secp = Secp256k1::verification_only();
+        for leaf in [0u32, 1, 5, 100] {
+            let child_pubkey_bip32_signing = derive_child(&group, &[0, leaf]).unwrap().child_pubkey;
+
+            let path = DerivationPath::from(vec![
+                ChildNumber::from_normal_idx(0).unwrap(),
+                ChildNumber::from_normal_idx(leaf).unwrap(),
+            ]);
+            let derived_xpub = xpub.derive_pub(&secp, &path).unwrap();
+            let child_pubkey_descriptor = derived_xpub.public_key.x_only_public_key().0.serialize();
+
+            assert_eq!(
+                child_pubkey_descriptor, child_pubkey_bip32_signing,
+                "leaf {leaf}: descriptor-derived key MUST equal FROST-signing child"
+            );
+
+            let change_pubkey_bip32_signing =
+                derive_child(&group, &[1, leaf]).unwrap().child_pubkey;
+
+            let change_path = DerivationPath::from(vec![
+                ChildNumber::from_normal_idx(1).unwrap(),
+                ChildNumber::from_normal_idx(leaf).unwrap(),
+            ]);
+            let derived_change_xpub = xpub.derive_pub(&secp, &change_path).unwrap();
+            let change_pubkey_descriptor = derived_change_xpub
+                .public_key
+                .x_only_public_key()
+                .0
+                .serialize();
+
+            assert_eq!(
+                change_pubkey_descriptor, change_pubkey_bip32_signing,
+                "leaf {leaf}: CHANGE-chain descriptor-derived key MUST equal FROST-signing child"
+            );
+        }
+    }
+
+    /// #487 PR 4: the mainnet output users actually ship uses BIP-86
+    /// `coin_type` 0 and an `xpub` (not tpub) prefix. Testnet/Signet tests
+    /// exercise `coin_type` 1 only, so pin the mainnet branch explicitly.
+    #[test]
+    fn frost_wallet_mainnet_descriptor_uses_coin_type_0() {
+        let group = test_group_pubkey();
+        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Bitcoin).unwrap();
+
+        let fingerprint = export.fingerprint;
+        assert!(
+            export
+                .descriptor
+                .starts_with(&format!("tr([{fingerprint}/86'/0'/0']")),
+            "mainnet descriptor must use coin_type 0: {}",
+            export.descriptor
+        );
+        assert!(
+            export.descriptor.contains("xpub"),
+            "mainnet descriptor must embed an xpub, not a tpub: {}",
+            export.descriptor
+        );
+        assert!(
+            export.descriptor.contains("/0/*)"),
+            "mainnet descriptor must be a ranged external chain: {}",
+            export.descriptor
+        );
+    }
+
+    /// #487 PR 4: the external chain (`/0/*`) and internal chain (`/1/*`)
+    /// produce distinct addresses at every leaf. This is the property that
+    /// justified the whole issue (address diversity for receive vs change).
+    #[test]
+    fn external_and_internal_leaves_produce_distinct_addresses() {
+        use bitcoin::bip32::{ChildNumber, DerivationPath, Xpub};
+        use bitcoin::secp256k1::Secp256k1;
+
+        let group = test_group_pubkey();
+        let xpub_str = DescriptorExport::frost_group_xpub(&group, Network::Testnet).unwrap();
+        let xpub: Xpub = xpub_str.parse().unwrap();
+        let secp = Secp256k1::verification_only();
+
+        for leaf in 0u32..8 {
+            let ext = xpub
+                .derive_pub(
+                    &secp,
+                    &DerivationPath::from(vec![
+                        ChildNumber::from_normal_idx(0).unwrap(),
+                        ChildNumber::from_normal_idx(leaf).unwrap(),
+                    ]),
+                )
+                .unwrap()
+                .public_key
+                .x_only_public_key()
+                .0
+                .serialize();
+            let int = xpub
+                .derive_pub(
+                    &secp,
+                    &DerivationPath::from(vec![
+                        ChildNumber::from_normal_idx(1).unwrap(),
+                        ChildNumber::from_normal_idx(leaf).unwrap(),
+                    ]),
+                )
+                .unwrap()
+                .public_key
+                .x_only_public_key()
+                .0
+                .serialize();
+            assert_ne!(ext, int, "leaf {leaf}: external and internal must differ");
+        }
+    }
+
     fn test_group_pubkey() -> [u8; 32] {
         use bitcoin::secp256k1::{Keypair, Secp256k1};
         let secp = Secp256k1::new();
@@ -322,15 +531,34 @@ mod tests {
 
     #[test]
     fn test_frost_wallet_simple_descriptor() {
+        // #487 PR 4: non-recovery FROST descriptor is now an xpub-shaped
+        // BIP-86 descriptor (`tr([fp/86'/coin_type'/0']xpub/0/*)`) rather
+        // than a static `tr(xonly)`, so `/0/*` and `/1/*` derive distinct
+        // receive- and change-address chains.
         let group_pk = test_group_pubkey();
         let export =
             DescriptorExport::from_frost_wallet(&group_pk, None, Network::Testnet).unwrap();
 
-        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
-        let expected_prefix = format!("tr({xonly})#");
-        assert!(export.descriptor.starts_with(&expected_prefix));
-        assert!(export.descriptor.contains("tr("));
-        assert!(!export.descriptor.contains(','));
+        // Fingerprint is the same lift-then-hash rule as always.
+        let fingerprint = DescriptorExport::pubkey_fingerprint(&group_pk);
+        assert!(
+            export
+                .descriptor
+                .starts_with(&format!("tr([{fingerprint}/86'/1'/0']")),
+            "descriptor must open with the expected BIP-86 origin: got {}",
+            export.descriptor
+        );
+        // Wraps an xpub (tpub for testnet) followed by the receive path.
+        assert!(export.descriptor.contains("tpub"));
+        assert!(export.descriptor.contains("/0/*)"));
+        // A canonicalized checksum is appended after the descriptor body.
+        assert!(export.descriptor.contains('#'));
+        // #487 whole point: internal and external are no longer equal.
+        assert_ne!(
+            export.internal_descriptor().unwrap(),
+            export.descriptor,
+            "external `/0/*` and internal `/1/*` chains MUST differ (#487)"
+        );
     }
 
     #[test]
