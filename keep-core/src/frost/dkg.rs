@@ -44,6 +44,7 @@ use frost_secp256k1_tr::{
     rand_core::OsRng,
     Identifier,
 };
+use zeroize::Zeroizing;
 
 use crate::error::{KeepError, Result};
 
@@ -98,14 +99,28 @@ pub struct SoftwareRound1Wire {
 
 /// Wire-format round2 share, one per recipient. Encrypted per-recipient at
 /// the CLI level (nip44) before publishing.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `package_hex` is a secret signing share, so `Debug` is redacted and must
+/// stay that way: this struct crosses `#[tracing::instrument]` boundaries in
+/// the CLI where a derived `Debug` would leak the share into logs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SoftwareRound2Wire {
     /// Discriminator, same rule as [`SoftwareRound1Wire`].
     pub software_dkg_version: u8,
     /// The 1-indexed participant identifier that produced this share.
     pub sender_index: u16,
-    /// Hex-encoded `round2::Package` for the specific recipient.
+    /// Hex-encoded `round2::Package` for the specific recipient. Secret.
     pub package_hex: String,
+}
+
+impl std::fmt::Debug for SoftwareRound2Wire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SoftwareRound2Wire")
+            .field("software_dkg_version", &self.software_dkg_version)
+            .field("sender_index", &self.sender_index)
+            .field("package_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Result returned from [`SoftwareDkgSession::finalize`], mirroring the
@@ -158,13 +173,10 @@ impl SoftwareDkgSession {
     /// participant broadcasts to every peer. Must be called before any
     /// `round1_peer` step and exactly once per session.
     pub fn round1(&mut self) -> Result<SoftwareRound1Wire> {
-        match self.state {
-            DkgState::Init => {}
-            _ => {
-                return Err(KeepError::Frost(
-                    "SoftwareDkgSession::round1 called out of order (already past round 1)".into(),
-                ));
-            }
+        if !matches!(self.state, DkgState::Init) {
+            return Err(KeepError::Frost(
+                "SoftwareDkgSession::round1 called out of order (already past round 1)".into(),
+            ));
         }
         let (secret, package) = part1(self.identifier, self.max_signers, self.min_signers, OsRng)
             .map_err(|e| KeepError::Frost(format!("DKG part1 failed: {e}")))?;
@@ -264,9 +276,13 @@ impl SoftwareDkgSession {
             let recipient_index = identifier_to_u16(peer_id).ok_or_else(|| {
                 KeepError::Frost("DKG part2 returned package for unknown identifier".into())
             })?;
-            let bytes = package
-                .serialize()
-                .map_err(|e| KeepError::Frost(format!("serialize round2 package: {e}")))?;
+            // `bytes` is a plaintext signing share; keep it in a scrubbed
+            // buffer so it does not linger in freed heap after this loop.
+            let bytes = Zeroizing::new(
+                package
+                    .serialize()
+                    .map_err(|e| KeepError::Frost(format!("serialize round2 package: {e}")))?,
+            );
             wires.push((
                 recipient_index,
                 SoftwareRound2Wire {
@@ -330,8 +346,10 @@ impl SoftwareDkgSession {
                 wire.sender_index
             )));
         }
-        let bytes = hex::decode(&wire.package_hex)
-            .map_err(|e| KeepError::Frost(format!("decode round2 share hex: {e}")))?;
+        let bytes = Zeroizing::new(
+            hex::decode(&wire.package_hex)
+                .map_err(|e| KeepError::Frost(format!("decode round2 share hex: {e}")))?,
+        );
         let package = round2::Package::deserialize(&bytes)
             .map_err(|e| KeepError::Frost(format!("deserialize round2 share: {e}")))?;
         peer_round2.insert(peer_id, package);

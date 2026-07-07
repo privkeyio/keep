@@ -399,6 +399,7 @@ fn cmd_frost_network_dkg_software(
     use keep_core::frost::dkg::{SoftwareDkgSession, SoftwareRound1Wire, SoftwareRound2Wire};
     use keep_core::Keep;
     use secrecy::ExposeSecret;
+    use zeroize::Zeroizing;
 
     out.newline();
     out.header("FROST Distributed Key Generation (software)");
@@ -488,6 +489,9 @@ fn cmd_frost_network_dkg_software(
         let timeout = std::time::Duration::from_secs(300);
         let start = std::time::Instant::now();
         let mut round1_done = 0u32;
+        // Events already examined this round, so a relay re-serving the same
+        // event (or a permanently-rejected one) is not reprocessed every poll.
+        let mut seen_round1: HashSet<EventId> = HashSet::new();
 
         while round1_done < expected_peers as u32 {
             if start.elapsed() > timeout {
@@ -503,6 +507,9 @@ fn cmd_frost_network_dkg_software(
 
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+                if !seen_round1.insert(ev.id) {
                     continue;
                 }
                 // Software-only wire: skip hardware-format events cleanly.
@@ -562,12 +569,15 @@ fn cmd_frost_network_dkg_software(
                 .ok_or_else(|| {
                     KeepError::FrostErr(FrostError::unknown_participant(recipient_index))
                 })?;
-            let payload = serde_json::to_string(&wire)
-                .map_err(|e| KeepError::Runtime(format!("serialize round2: {e}")))?;
+            // Serialized share is secret until nip44 wraps it; scrub the plaintext.
+            let payload = Zeroizing::new(
+                serde_json::to_string(&wire)
+                    .map_err(|e| KeepError::Runtime(format!("serialize round2: {e}")))?,
+            );
             let encrypted_content = nip44::encrypt(
                 keys.secret_key(),
                 recipient_pubkey,
-                &payload,
+                payload.as_str(),
                 nip44::Version::default(),
             )
             .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(e.to_string())))?;
@@ -614,6 +624,7 @@ fn cmd_frost_network_dkg_software(
 
         let start = std::time::Instant::now();
         let mut round2_done = 0u32;
+        let mut seen_round2: HashSet<EventId> = HashSet::new();
         while round2_done < expected_peers as u32 {
             if start.elapsed() > timeout {
                 return Err(KeepError::NetworkErr(NetworkError::timeout(
@@ -630,6 +641,9 @@ fn cmd_frost_network_dkg_software(
 
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+                if !seen_round2.insert(ev.id) {
                     continue;
                 }
                 let is_software = ev.tags.iter().any(|t| {
@@ -651,14 +665,29 @@ fn cmd_frost_network_dkg_software(
                 if recipient_idx_tag != Some(our_index as u16) {
                     continue;
                 }
-                let decrypted = match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
+                let decrypted =
+                    match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
+                        // Plaintext carries the peer's secret signing share; scrub
+                        // it from the heap once this iteration drops it.
+                        Ok(d) => Zeroizing::new(d),
+                        Err(_) => continue,
+                    };
                 let wire: SoftwareRound2Wire = match serde_json::from_str(&decrypted) {
                     Ok(w) => w,
                     Err(_) => continue,
                 };
+                // Bind the round2 share to the ephemeral key that published this
+                // sender's round1 package. Without this a relay writer can race a
+                // forged share to a recipient under a legitimate peer's index; the
+                // honest share is then dropped as a duplicate and finalize aborts.
+                if participant_pubkeys.get(&(wire.sender_index as u8)) != Some(&ev.pubkey) {
+                    out.warn(&format!(
+                        "Ignoring round 2 share for participant {}: sender key does not \
+                         match its round 1 package",
+                        wire.sender_index
+                    ));
+                    continue;
+                }
                 match session.receive_share(&wire) {
                     Ok(_) => {
                         round2_done += 1;
