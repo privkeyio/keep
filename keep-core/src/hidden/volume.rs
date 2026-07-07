@@ -215,7 +215,7 @@ impl HiddenStorage {
 
         file.write_all(&outer_header.to_bytes())?;
 
-        let mut hidden_area: [u8; HEADER_SIZE] = crypto::random_bytes();
+        let mut hidden_area: [u8; HEADER_SIZE] = crypto::try_random_bytes()?;
         if let Some(encrypted_hh) = encrypted_hidden_header {
             hidden_area[..24].copy_from_slice(&encrypted_hh.nonce);
             hidden_area[24..24 + encrypted_hh.ciphertext.len()]

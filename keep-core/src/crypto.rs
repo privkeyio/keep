@@ -627,7 +627,7 @@ pub mod nip44 {
     /// Returns the encrypted payload as raw bytes (version + nonce + ciphertext + MAC).
     pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
         let conversation_key = derive_conversation_key(shared_secret)?;
-        let nonce: [u8; 32] = entropy::random_bytes();
+        let nonce: [u8; 32] = entropy::try_random_bytes()?;
         let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
 
         let padded = pad_plaintext(plaintext)?;
@@ -816,7 +816,7 @@ pub mod nip44 {
         kind: u32,
         scope: &str,
     ) -> Result<Vec<u8>> {
-        let nonce: [u8; 32] = entropy::random_bytes();
+        let nonce: [u8; 32] = entropy::try_random_bytes()?;
         encrypt_v3_with_nonce(shared_secret, plaintext, kind, scope, &nonce)
     }
 
@@ -1049,7 +1049,7 @@ pub mod nip04 {
     ///
     /// Returns the encrypted payload in NIP-04 format: base64(ciphertext)?iv=base64(iv)
     pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<String> {
-        let iv: [u8; 16] = entropy::random_bytes();
+        let iv: [u8; 16] = entropy::try_random_bytes()?;
 
         let cipher = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
         let ciphertext = cipher.encrypt_padded_vec::<Pkcs7>(plaintext);
