@@ -3953,3 +3953,330 @@ async fn test_full_signing_flow_at_derivation_path() {
         "child-derived signature MUST NOT verify under the parent group pubkey"
     );
 }
+
+/// Migration-sweep responder-side guards exercised through the real node
+/// methods and the real `DualDescriptorLookup.successor_for` wiring (#551,
+/// #414/#502). Deterministic: no relay run loop or peer discovery is needed
+/// because every assertion here fails (or passes) before any broadcast.
+///
+///   - `validate_migration_sweep_destination` refuses a sweep paying an attacker
+///     script, and (the core of the #414 gate) refuses one paying the superseded
+///     OLD `/0/0` address, while accepting the re-derived NEW `/0/0` address. OLD
+///     and NEW are genuinely distinct descriptors, so this proves the successor
+///     chain resolves to NEW rather than silently reusing OLD.
+///   - `request_descriptor_migration_sweep` refuses a fee above 1/4 of the swept
+///     input value (#502) and a sweep whose `old_recovery` does not match the
+///     descriptor identified by `old_descriptor_hash`.
+#[tokio::test]
+async fn test_migration_sweep_destination_and_fee_guards() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Keypair, Secp256k1};
+    use bitcoin::{Network, OutPoint};
+    use keep_bitcoin::recovery::{
+        RecoveryConfig, RecoveryTier as BitcoinRecoveryTier, SpendingTier,
+    };
+    use keep_bitcoin::{DescriptorExport, SweepUtxo};
+    use keep_frost_net::{DescriptorSession, FinalizedDescriptor, WalletPolicy};
+
+    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-sweep-guards").unwrap();
+    let share1 = shares.remove(0);
+    let share2 = shares.remove(0);
+
+    let mut node1 = KfpNode::new(share1, vec![relay.clone()])
+        .await
+        .expect("node1 create");
+    let node2 = KfpNode::new(share2, vec![relay])
+        .await
+        .expect("node2 create");
+    let group_pubkey = *node1.group_pubkey();
+
+    let secp = Secp256k1::new();
+    let responder_xpriv =
+        bitcoin::bip32::Xpriv::new_master(Network::Signet, &[7u8; 32]).expect("xpriv");
+    let responder_xpub = bitcoin::bip32::Xpub::from_priv(&secp, &responder_xpriv);
+    let responder_xpub_str = responder_xpub.to_string();
+    let responder_fp = responder_xpub
+        .fingerprint()
+        .to_string()
+        .to_ascii_lowercase();
+    let responder_xonly_bytes = responder_xpub.to_x_only_pub().serialize();
+
+    let recovery_config = RecoveryConfig {
+        primary: SpendingTier {
+            keys: vec![group_pubkey],
+            threshold: 1,
+        },
+        recovery_tiers: vec![BitcoinRecoveryTier {
+            keys: vec![responder_xonly_bytes],
+            threshold: 1,
+            timelock_months: 6,
+        }],
+        network: Network::Signet,
+    };
+    let recovery_output = recovery_config.build().expect("build recovery output");
+
+    let policy = WalletPolicy {
+        recovery_tiers: vec![keep_frost_net::PolicyTier {
+            threshold: 1,
+            key_slots: vec![keep_frost_net::KeySlot::External {
+                xpub: responder_xpub_str.clone(),
+                fingerprint: responder_fp.clone(),
+            }],
+            timelock_months: 6,
+        }],
+        version: 1,
+    };
+    let policy_hash = keep_frost_net::derive_policy_hash(&policy);
+
+    let export =
+        DescriptorExport::from_frost_wallet(&group_pubkey, Some(&recovery_config), Network::Signet)
+            .expect("descriptor export");
+    let external_desc = export.external_descriptor().to_string();
+    let internal_desc = export.internal_descriptor().expect("internal descriptor");
+    let policy_value = serde_json::to_value(&policy).ok();
+
+    // The NEW descriptor must derive a GENUINELY distinct /0/0 address from OLD,
+    // so the destination-rebind gate (#414) is actually exercised. A different
+    // recovery key yields a different taproot output, hence a different external
+    // descriptor and a different /0/0 script. Without this, OLD and NEW would
+    // share an address and a regression that re-derived the destination from the
+    // OLD/session descriptor instead of the resolved NEW successor would pass
+    // unnoticed.
+    let new_responder_xpub = bitcoin::bip32::Xpub::from_priv(
+        &secp,
+        &bitcoin::bip32::Xpriv::new_master(Network::Signet, &[9u8; 32]).expect("new xpriv"),
+    );
+    let new_recovery_config = RecoveryConfig {
+        primary: SpendingTier {
+            keys: vec![group_pubkey],
+            threshold: 1,
+        },
+        recovery_tiers: vec![BitcoinRecoveryTier {
+            keys: vec![new_responder_xpub.to_x_only_pub().serialize()],
+            threshold: 1,
+            timelock_months: 6,
+        }],
+        network: Network::Signet,
+    };
+    let new_export = DescriptorExport::from_frost_wallet(
+        &group_pubkey,
+        Some(&new_recovery_config),
+        Network::Signet,
+    )
+    .expect("new descriptor export");
+    let new_external_desc = new_export.external_descriptor().to_string();
+    let new_internal_desc = new_export
+        .internal_descriptor()
+        .expect("new internal descriptor");
+    assert_ne!(new_external_desc, external_desc);
+
+    let old_descriptor = keep_core::wallet::WalletDescriptor {
+        group_pubkey,
+        external_descriptor: external_desc.clone(),
+        internal_descriptor: internal_desc.clone(),
+        network: "signet".to_string(),
+        created_at: 0,
+        device_registrations: Vec::new(),
+        policy_hash,
+        version: 1,
+        previous_descriptor_hash: None,
+        policy: policy_value.clone(),
+    };
+    let old_descriptor_hash = old_descriptor.canonical_hash();
+
+    let new_descriptor = keep_core::wallet::WalletDescriptor {
+        group_pubkey,
+        external_descriptor: new_external_desc.clone(),
+        internal_descriptor: new_internal_desc.clone(),
+        network: "signet".to_string(),
+        created_at: 0,
+        device_registrations: Vec::new(),
+        policy_hash,
+        version: 2,
+        previous_descriptor_hash: Some(old_descriptor_hash),
+        policy: policy_value,
+    };
+
+    let lookup: std::sync::Arc<dyn keep_frost_net::PersistedDescriptorLookup> =
+        std::sync::Arc::new(DualDescriptorLookup {
+            old: old_descriptor,
+            new: new_descriptor,
+        });
+    node1 = node1.with_descriptor_lookup(lookup.clone());
+    let node2 = node2.with_descriptor_lookup(lookup);
+
+    let migration_session_id = [0xAA; 32];
+    {
+        // The finalized session descriptor must match the NEW lookup entry
+        // (same external/internal/policy_hash/version) so the proposer's
+        // `find_by_hash` version-link check resolves.
+        let finalized = FinalizedDescriptor {
+            external: new_external_desc.clone(),
+            internal: new_internal_desc.clone(),
+            policy_hash,
+        };
+        let mut policy_v2 = policy.clone();
+        policy_v2.version = 2;
+        let session = DescriptorSession::test_completed(
+            migration_session_id,
+            group_pubkey,
+            policy_v2,
+            "signet".to_string(),
+            finalized,
+        );
+        node1.test_inject_descriptor_session(session);
+    }
+
+    // The correctly re-derived NEW /0/0 destination the sweep must pay, and the
+    // superseded OLD /0/0 address a correct rebind gate must refuse. These are
+    // genuinely distinct scripts (NEW is built from a different recovery key),
+    // so paying OLD is a concrete regression the gate has to catch.
+    let expected_script =
+        keep_bitcoin::descriptor_address_at_index(&new_external_desc, Network::Signet, 0)
+            .expect("derive NEW successor address")
+            .script_pubkey();
+    let old_script = keep_bitcoin::descriptor_address_at_index(&external_desc, Network::Signet, 0)
+        .expect("derive OLD address")
+        .script_pubkey();
+    assert_ne!(old_script, expected_script);
+
+    let one_output_tx = |script: bitcoin::ScriptBuf| bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50_000),
+            script_pubkey: script,
+        }],
+    };
+
+    // #414: a sweep paying an attacker script (not the re-derived successor) is
+    // refused by the real node method resolving the real descriptor chain.
+    let attacker_kp = Keypair::from_seckey_slice(&secp, &[0x42; 32]).unwrap();
+    let (attacker_xonly, _) = attacker_kp.x_only_public_key();
+    let attacker_script = bitcoin::ScriptBuf::new_p2tr(&secp, attacker_xonly, None);
+    assert_ne!(attacker_script, expected_script);
+    let err = node2
+        .validate_migration_sweep_destination(&old_descriptor_hash, &one_output_tx(attacker_script))
+        .expect_err("attacker-scripted sweep must be refused");
+    assert!(
+        err.contains("does not pay the persisted NEW descriptor address"),
+        "expected destination-rebind refusal, got: {err}"
+    );
+
+    // #414 core property: a sweep paying the superseded OLD /0/0 address must be
+    // refused. Because the resolved NEW successor address is genuinely distinct
+    // from OLD, this fails only if the gate actually routes to the NEW address; a
+    // regression re-deriving the destination from the OLD/session descriptor
+    // would accept this and be caught here.
+    let err = node2
+        .validate_migration_sweep_destination(&old_descriptor_hash, &one_output_tx(old_script))
+        .expect_err("sweep paying the superseded OLD address must be refused");
+    assert!(
+        err.contains("does not pay the persisted NEW descriptor address"),
+        "expected destination-rebind refusal for OLD address, got: {err}"
+    );
+
+    // #414: the correctly re-derived NEW successor address is accepted, proving
+    // the successor_for -> address derivation wiring resolves the version chain
+    // to the NEW descriptor (not OLD).
+    node2
+        .validate_migration_sweep_destination(&old_descriptor_hash, &one_output_tx(expected_script))
+        .expect("correctly-derived successor destination must be accepted");
+
+    let utxos = vec![
+        SweepUtxo {
+            outpoint: OutPoint {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0,
+            },
+            value_sats: 75_000,
+        },
+        SweepUtxo {
+            outpoint: OutPoint {
+                txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(
+                    [0x11; 32],
+                )),
+                vout: 1,
+            },
+            value_sats: 30_000,
+        },
+    ];
+    let total_in: u64 = utxos.iter().map(|u| u.value_sats).sum();
+
+    // #502: a fee above 1/4 of total input is refused before any build/broadcast.
+    let griefing_fee = total_in / 3;
+    let err = node1
+        .request_descriptor_migration_sweep(
+            migration_session_id,
+            old_descriptor_hash,
+            &recovery_output,
+            0,
+            utxos.clone(),
+            griefing_fee,
+            1,
+            Vec::new(),
+            vec![responder_fp.clone()],
+            Some(60),
+        )
+        .await
+        .expect_err("fee above 1/4 of input must be refused");
+    assert!(
+        err.to_string().contains("exceeds 1/4 of total input"),
+        "expected fee-cap refusal, got: {err}"
+    );
+
+    // An `old_recovery` output that does not match `old_descriptor_hash` must be
+    // refused so a proposer cannot sweep coins from an unrelated recovery output.
+    let other_config = RecoveryConfig {
+        primary: SpendingTier {
+            keys: vec![group_pubkey],
+            threshold: 1,
+        },
+        recovery_tiers: vec![BitcoinRecoveryTier {
+            keys: vec![bitcoin::bip32::Xpub::from_priv(
+                &secp,
+                &bitcoin::bip32::Xpriv::new_master(Network::Signet, &[8u8; 32]).unwrap(),
+            )
+            .to_x_only_pub()
+            .serialize()],
+            threshold: 1,
+            timelock_months: 6,
+        }],
+        network: Network::Signet,
+    };
+    let other_recovery = other_config.build().expect("build other recovery output");
+    assert_ne!(
+        other_recovery.address.script_pubkey(),
+        recovery_output.address.script_pubkey()
+    );
+    let err = node1
+        .request_descriptor_migration_sweep(
+            migration_session_id,
+            old_descriptor_hash,
+            &other_recovery,
+            0,
+            utxos,
+            1_500,
+            1,
+            Vec::new(),
+            vec![responder_fp],
+            Some(60),
+        )
+        .await
+        .expect_err("mismatched old_recovery must be refused");
+    assert!(
+        err.to_string()
+            .contains("old_recovery output does not match the descriptor"),
+        "expected old_recovery-binding refusal, got: {err}"
+    );
+}
