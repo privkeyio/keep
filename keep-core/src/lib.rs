@@ -611,6 +611,56 @@ impl Keep {
         Ok(())
     }
 
+    /// Persist a share produced by [`frost::dkg::SoftwareDkgSession::finalize`]
+    /// (#454). Wraps the finalized `KeyPackage` + `PublicKeyPackage` into a
+    /// [`SharePackage`] with fresh metadata, encrypts under the vault's data
+    /// key, stores it, and writes a `FrostShareImport` audit entry.
+    pub fn frost_store_dkg_share(
+        &mut self,
+        result: &crate::frost::dkg::SoftwareDkgResult,
+        threshold: u16,
+        total_shares: u16,
+        name: &str,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepError::InvalidInput("name cannot be empty".into()));
+        }
+        if name.chars().count() > 64 {
+            return Err(KeepError::InvalidInput(
+                "name must be 64 characters or fewer".into(),
+            ));
+        }
+
+        let metadata = crate::frost::ShareMetadata::new(
+            result.our_index,
+            threshold,
+            total_shares,
+            result.group_pubkey,
+            name.to_string(),
+        );
+        let share = crate::frost::SharePackage::new(
+            metadata,
+            &result.key_package,
+            &result.public_key_package,
+        )?;
+
+        let data_key = self.get_data_key()?;
+        let stored = StoredShare::encrypt(&share, &data_key)?;
+        self.storage.store_share(&stored)?;
+
+        self.audit_event(AuditEventType::FrostShareImport, |e| {
+            e.with_group(&result.group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(vec![result.our_index])
+        });
+
+        Ok(())
+    }
+
     /// Refresh all FROST shares for a group, invalidating old shares.
     pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<frost::ShareMetadata>> {
         if !self.is_unlocked() {

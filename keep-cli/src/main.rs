@@ -365,6 +365,7 @@ fn dispatch_frost_network(
             index,
             relay,
             hardware,
+            path,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_dkg(
@@ -374,7 +375,8 @@ fn dispatch_frost_network(
                 participants,
                 index,
                 relay,
-                &hardware,
+                hardware.as_deref(),
+                path.as_deref(),
             )
         }
         FrostNetworkCommands::Sign {
