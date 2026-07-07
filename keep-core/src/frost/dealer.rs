@@ -159,7 +159,7 @@ impl TrustedDealer {
     }
 }
 
-fn extract_group_pubkey(pubkey_pkg: &PublicKeyPackage) -> Result<[u8; 32]> {
+pub(super) fn extract_group_pubkey(pubkey_pkg: &PublicKeyPackage) -> Result<[u8; 32]> {
     let verifying_key = pubkey_pkg.verifying_key();
     let serialized = verifying_key
         .serialize()

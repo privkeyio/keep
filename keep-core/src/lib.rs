@@ -611,6 +611,56 @@ impl Keep {
         Ok(())
     }
 
+    /// Persist a share produced by [`frost::dkg::SoftwareDkgSession::finalize`]
+    /// (#454). Wraps the finalized `KeyPackage` + `PublicKeyPackage` into a
+    /// [`SharePackage`] with fresh metadata, encrypts under the vault's data
+    /// key, stores it, and writes a `FrostShareImport` audit entry.
+    pub fn frost_store_dkg_share(
+        &mut self,
+        result: &crate::frost::dkg::SoftwareDkgResult,
+        threshold: u16,
+        total_shares: u16,
+        name: &str,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeepError::InvalidInput("name cannot be empty".into()));
+        }
+        if name.chars().count() > 64 {
+            return Err(KeepError::InvalidInput(
+                "name must be 64 characters or fewer".into(),
+            ));
+        }
+
+        let metadata = crate::frost::ShareMetadata::new(
+            result.our_index,
+            threshold,
+            total_shares,
+            result.group_pubkey,
+            name.to_string(),
+        );
+        let share = crate::frost::SharePackage::new(
+            metadata,
+            &result.key_package,
+            &result.public_key_package,
+        )?;
+
+        let data_key = self.get_data_key()?;
+        let stored = StoredShare::encrypt(&share, &data_key)?;
+        self.storage.store_share(&stored)?;
+
+        self.audit_event(AuditEventType::FrostShareImport, |e| {
+            e.with_group(&result.group_pubkey)
+                .with_threshold(threshold)
+                .with_participants(vec![result.our_index])
+        });
+
+        Ok(())
+    }
+
     /// Refresh all FROST shares for a group, invalidating old shares.
     pub fn frost_refresh(&mut self, group_pubkey: &[u8; 32]) -> Result<Vec<frost::ShareMetadata>> {
         if !self.is_unlocked() {
@@ -2240,5 +2290,77 @@ mod tests {
             let expected = dirs::home_dir().unwrap().join(".keep");
             assert_eq!(p, expected);
         });
+    }
+
+    /// Run a software DKG group in-process, persist every finalized share via
+    /// `frost_store_dkg_share`, and confirm the shares reload with intact
+    /// metadata and can be exported. Covers the finalize -> SharePackage ->
+    /// encrypt -> store -> reload bridge that the DKG unit tests do not touch.
+    #[test]
+    fn test_frost_store_dkg_share_roundtrip() {
+        use crate::frost::dkg::{SoftwareDkgSession, SoftwareRound1Wire, SoftwareRound2Wire};
+
+        let (threshold, participants): (u16, u16) = (2, 3);
+
+        let mut sessions: Vec<SoftwareDkgSession> = (1..=participants)
+            .map(|idx| SoftwareDkgSession::init(threshold, participants, idx).unwrap())
+            .collect();
+
+        let round1_wires: Vec<SoftwareRound1Wire> =
+            sessions.iter_mut().map(|s| s.round1().unwrap()).collect();
+        for (i, session) in sessions.iter_mut().enumerate() {
+            for (j, wire) in round1_wires.iter().enumerate() {
+                if i != j {
+                    session.round1_peer(wire).unwrap();
+                }
+            }
+        }
+
+        let mut per_session_round2: Vec<Vec<(u16, SoftwareRound2Wire)>> =
+            sessions.iter_mut().map(|s| s.round2().unwrap()).collect();
+        for (sender_i, wires) in per_session_round2.drain(..).enumerate() {
+            for (recipient_index, wire) in wires {
+                let recipient_i = (recipient_index - 1) as usize;
+                assert_ne!(recipient_i, sender_i);
+                sessions[recipient_i].receive_share(&wire).unwrap();
+            }
+        }
+
+        let results: Vec<_> = sessions.iter_mut().map(|s| s.finalize().unwrap()).collect();
+        let group_pubkey = results[0].group_pubkey;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        for r in &results {
+            keep.frost_store_dkg_share(r, threshold, participants, "dkg-group")
+                .unwrap();
+        }
+
+        let shares = keep.frost_list_shares().unwrap();
+        assert_eq!(shares.len(), participants as usize);
+        for share in &shares {
+            assert_eq!(share.metadata.group_pubkey, group_pubkey);
+            assert_eq!(share.metadata.threshold, threshold);
+            assert_eq!(share.metadata.total_shares, participants);
+            assert_eq!(share.metadata.name, "dkg-group");
+        }
+        let indices: std::collections::BTreeSet<u16> =
+            shares.iter().map(|s| s.metadata.identifier).collect();
+        assert_eq!(indices, (1..=participants).collect());
+
+        // A stored share decrypts and exports under a passphrase.
+        let export = keep
+            .frost_export_share(&group_pubkey, results[0].our_index, "export-pass")
+            .unwrap();
+        drop(export);
+
+        // A locked vault refuses to store.
+        keep.lock();
+        assert!(matches!(
+            keep.frost_store_dkg_share(&results[0], threshold, participants, "dkg-group"),
+            Err(KeepError::Locked)
+        ));
     }
 }

@@ -652,8 +652,20 @@ pub(crate) enum FrostNetworkCommands {
         index: u8,
         #[arg(short, long)]
         relay: Option<String>,
-        #[arg(long, help = "Hardware signer device path (e.g., /dev/ttyACM0)")]
-        hardware: String,
+        #[arg(
+            long,
+            help = "Hardware signer device path (e.g., /dev/ttyACM0). \
+                    Omit to run software DKG in-process, storing the resulting \
+                    share in the vault (#454)."
+        )]
+        hardware: Option<String>,
+        #[arg(
+            long,
+            help = "Vault path override for software DKG. Defaults to the global \
+                    --path / configured vault; the finalized share is stored here \
+                    encrypted under the vault key."
+        )]
+        path: Option<std::path::PathBuf>,
     },
     Sign {
         #[arg(short, long)]

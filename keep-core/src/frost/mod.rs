@@ -9,6 +9,7 @@
 pub mod bip32_signing;
 mod coordinator;
 mod dealer;
+pub mod dkg;
 mod recover;
 mod refresh;
 mod share;

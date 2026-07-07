@@ -365,8 +365,13 @@ fn dispatch_frost_network(
             index,
             relay,
             hardware,
+            path: dkg_path,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
+            // Software DKG needs a vault; honor an explicit --path override but
+            // otherwise fall back to the globally resolved vault path like every
+            // other frost command, instead of erroring on a missing --path.
+            let vault_path = dkg_path.as_deref().or(Some(path));
             commands::frost_network::cmd_frost_network_dkg(
                 out,
                 &group,
@@ -374,7 +379,8 @@ fn dispatch_frost_network(
                 participants,
                 index,
                 relay,
-                &hardware,
+                hardware.as_deref(),
+                vault_path,
             )
         }
         FrostNetworkCommands::Sign {
