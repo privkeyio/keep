@@ -58,7 +58,7 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
             method: request.method,
             event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
             event_content: request.event_content,
-            http_auth: request.http_auth.map(|d| (d.url, d.method)),
+            http_auth: request.http_auth,
         };
         if self
             .tx

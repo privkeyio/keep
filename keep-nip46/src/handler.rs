@@ -1091,8 +1091,7 @@ mod tests {
         // A `u` carrying an RTL-override, zero-width, line-separator and the
         // Arabic letter mark (all bidi/format code points) must not be able to
         // make the displayed URL read as a different host than what is signed.
-        let spoof =
-            "https://evil.com/\u{202E}moc.doog//:sptth\u{200B}\u{2028}\u{2029}\u{061C}";
+        let spoof = "https://evil.com/\u{202E}moc.doog//:sptth\u{200B}\u{2028}\u{2029}\u{061C}";
         let ev = UnsignedEvent::new(
             signer_pk,
             Timestamp::now(),
@@ -1143,7 +1142,10 @@ mod tests {
             "displayed url must be length-bounded, got {} chars",
             url.chars().count()
         );
-        assert!(url.ends_with("..."), "truncated url must be marked: {url:?}");
+        assert!(
+            url.ends_with("..."),
+            "truncated url must be marked: {url:?}"
+        );
     }
 
     // #575: NIP-98 (kind 27235) is never auto-approved, not even per-app via

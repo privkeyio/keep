@@ -289,9 +289,17 @@ pub enum Event {
         kind: Option<u16>,
         preview: Option<String>,
         /// NIP-98 (kind 27235) HTTP-auth target the browser prompt must show so
-        /// the operator does not approve a blind bearer credential. Both `None`
-        /// for non-27235 requests.
-        http_auth_url: Option<String>,
-        http_auth_method: Option<String>,
+        /// the operator does not approve a blind bearer credential. `None` for
+        /// non-27235 requests; the `url`/`method` stay paired so they cannot
+        /// desynchronize.
+        http_auth: Option<HttpAuth>,
     },
+}
+
+/// The `u`/method a NIP-98 HTTP-auth signature will authenticate, surfaced in
+/// the approval prompt. A field is `None` when the request omits that tag.
+#[derive(Clone, Serialize)]
+pub struct HttpAuth {
+    pub url: Option<String>,
+    pub method: Option<String>,
 }

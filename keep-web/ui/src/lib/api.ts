@@ -45,9 +45,8 @@ export interface ApprovalEvent {
   kind: number | null
   preview: string | null
   // NIP-98 (kind 27235) HTTP-auth target, so the operator does not approve a
-  // blind bearer credential. Both null for non-27235 requests.
-  http_auth_url: string | null
-  http_auth_method: string | null
+  // blind bearer credential. null for non-27235 requests; url/method stay paired.
+  http_auth: { url: string | null; method: string | null } | null
 }
 
 export type ServerEvent = LogEvent | ApprovalEvent

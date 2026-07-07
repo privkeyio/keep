@@ -615,8 +615,8 @@
             <strong>{a.app}</strong> requests <strong>{a.method}</strong>{#if a.kind !== null}
               · kind {a.kind}{/if}
             {#if a.preview}<span class="muted"> · {a.preview}</span>{/if}
-            {#if a.kind === 27235}<span class="http-auth"> · HTTP auth: {a.http_auth_method ?? '<no method>'}
-                {a.http_auth_url ?? '<no url>'}</span>{/if}
+            {#if a.kind === 27235}<span class="http-auth"> · HTTP auth: {a.http_auth?.method ?? '<no method>'}
+                {a.http_auth?.url ?? '<no url>'}</span>{/if}
           </span>
           <span class="approval-bar-actions">
             <button class="ok" onclick={() => decide(a, true)}>Approve</button>
