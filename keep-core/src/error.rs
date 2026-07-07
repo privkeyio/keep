@@ -551,6 +551,12 @@ pub enum KeepError {
     Other(String),
 }
 
+impl From<crate::entropy::EntropyHealthError> for KeepError {
+    fn from(e: crate::entropy::EntropyHealthError) -> Self {
+        KeepError::Encryption(e.to_string())
+    }
+}
+
 #[allow(missing_docs)]
 impl KeepError {
     pub fn code(&self) -> Option<ErrorCode> {

@@ -327,7 +327,7 @@ impl SecretKey {
     }
 
     pub fn generate() -> Result<Self> {
-        let bytes: [u8; KEY_SIZE] = entropy::random_bytes();
+        let bytes: [u8; KEY_SIZE] = entropy::try_random_bytes()?;
         Self::new(bytes)
     }
 
@@ -454,7 +454,7 @@ pub fn encrypt_with_aad(plaintext: &[u8], aad: &[u8], key: &SecretKey) -> Result
     let cipher = XChaCha20Poly1305::new_from_slice(&*decrypted)
         .map_err(|_| KeepError::Encryption("Encryption failed".into()))?;
 
-    let nonce: [u8; NONCE_SIZE] = entropy::random_bytes();
+    let nonce: [u8; NONCE_SIZE] = entropy::try_random_bytes()?;
 
     let ciphertext = cipher
         .encrypt(
@@ -528,6 +528,13 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// Generate cryptographically secure random bytes.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     entropy::random_bytes()
+}
+
+/// Generate cryptographically secure random bytes, returning an error instead
+/// of panicking if the RNG health check fails. Preferred over [`random_bytes`]
+/// in key/secret generation paths that can propagate a `Result` (#685).
+pub fn try_random_bytes<const N: usize>() -> Result<[u8; N]> {
+    Ok(entropy::try_random_bytes()?)
 }
 
 /// NIP-44 encryption using a raw ECDH shared secret.
@@ -620,7 +627,7 @@ pub mod nip44 {
     /// Returns the encrypted payload as raw bytes (version + nonce + ciphertext + MAC).
     pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
         let conversation_key = derive_conversation_key(shared_secret)?;
-        let nonce: [u8; 32] = entropy::random_bytes();
+        let nonce: [u8; 32] = entropy::try_random_bytes()?;
         let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(&conversation_key, &nonce)?;
 
         let padded = pad_plaintext(plaintext)?;
@@ -809,7 +816,7 @@ pub mod nip44 {
         kind: u32,
         scope: &str,
     ) -> Result<Vec<u8>> {
-        let nonce: [u8; 32] = entropy::random_bytes();
+        let nonce: [u8; 32] = entropy::try_random_bytes()?;
         encrypt_v3_with_nonce(shared_secret, plaintext, kind, scope, &nonce)
     }
 
@@ -1042,7 +1049,7 @@ pub mod nip04 {
     ///
     /// Returns the encrypted payload in NIP-04 format: base64(ciphertext)?iv=base64(iv)
     pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<String> {
-        let iv: [u8; 16] = entropy::random_bytes();
+        let iv: [u8; 16] = entropy::try_random_bytes()?;
 
         let cipher = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
         let ciphertext = cipher.encrypt_padded_vec::<Pkcs7>(plaintext);
@@ -1081,6 +1088,21 @@ pub mod nip04 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_random_bytes_returns_ok_and_distinct() {
+        let a: [u8; 32] = try_random_bytes().expect("healthy RNG");
+        let b: [u8; 32] = try_random_bytes().expect("healthy RNG");
+        assert_ne!(a, b, "two draws must differ");
+    }
+
+    #[test]
+    fn entropy_health_error_maps_to_keep_encryption_error() {
+        // The RNG-failure path returns a recoverable error rather than panicking
+        // (#685); it surfaces as a crypto/encryption-class KeepError.
+        let err = crate::error::KeepError::from(crate::entropy::EntropyHealthError);
+        assert!(matches!(err, crate::error::KeepError::Encryption(_)));
+    }
 
     #[test]
     fn test_hmac_sha256_rfc4231_case1() {
