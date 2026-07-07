@@ -1923,3 +1923,85 @@ mod tests {
         assert_eq!(nonce_commitment_content_hash(7, &entries), expected);
     }
 }
+
+#[cfg(test)]
+mod gate_tests {
+    //! Deterministic responder-gate coverage for the sign-path ingress
+    //! handlers (#541 lineage). Each handler runs its early-return gates
+    //! before any session work, so the outcome is observable from the return
+    //! value alone: build a real node, call the handler directly, no relay
+    //! run loop or event-timing.
+
+    use super::*;
+    use crate::node::PeerPolicy;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
+
+    async fn test_node() -> (KfpNode, MockRelay) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("signing-gate-test").unwrap();
+        // First share -> FROST identifier 1.
+        let node = KfpNode::new(shares.remove(0), vec![relay]).await.unwrap();
+        (node, mock)
+    }
+
+    /// A stale sign request (created_at outside the replay window) is rejected.
+    #[tokio::test]
+    async fn handle_sign_request_rejects_stale_replay() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let mut req =
+            SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        req.created_at = 1; // ancient -> outside the replay window
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    /// A peer denied by policy cannot open a sign request. Fresh `created_at`
+    /// passes the replay gate so the policy gate is what trips.
+    #[tokio::test]
+    async fn handle_sign_request_rejects_denied_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    /// A nonce commitment from a peer whose share index is not announced is
+    /// rejected (`verify_peer_share_index`).
+    #[tokio::test]
+    async fn handle_commitment_rejects_unannounced_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = CommitmentPayload::new([1u8; 32], 2, vec![0u8; 33]);
+        assert!(matches!(
+            node.handle_commitment(from, payload).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
+
+    /// A signature share from an unannounced peer is rejected.
+    #[tokio::test]
+    async fn handle_signature_share_rejects_unannounced_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = SignatureSharePayload::new([1u8; 32], 2, vec![0u8; 32]);
+        assert!(matches!(
+            node.handle_signature_share(from, payload).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
+}
