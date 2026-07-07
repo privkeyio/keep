@@ -42,10 +42,11 @@ impl CertificatePinSet {
     /// Add an accepted pin for `hostname`. Additive and de-duplicated: an
     /// existing pin for the host is retained (so a rotation can pre-stage the
     /// next key alongside the current one), and adding the same hash twice is
-    /// a no-op.
+    /// a no-op. Capped at `MAX_PINS_PER_HOST`; further pins for a full host are
+    /// ignored so the bounded invariant holds for every caller, not just loads.
     pub fn add_pin(&mut self, hostname: String, hash: SpkiHash) {
         let entry = self.pins.entry(hostname).or_default();
-        if !entry.contains(&hash) {
+        if entry.len() < MAX_PINS_PER_HOST && !entry.contains(&hash) {
             entry.push(hash);
         }
     }
@@ -358,6 +359,15 @@ mod tests {
         assert_eq!(pins.get_pins("relay.example.com"), &[current, backup]);
         assert!(pins.get_pins("other.example.com").is_empty());
         assert!(!pins.is_pinned("other.example.com"));
+    }
+
+    #[test]
+    fn test_add_pin_enforces_max_per_host() {
+        let mut pins = CertificatePinSet::new();
+        for i in 0..(MAX_PINS_PER_HOST as u8 + 3) {
+            pins.add_pin("relay.example.com".into(), [i; 32]);
+        }
+        assert_eq!(pins.get_pins("relay.example.com").len(), MAX_PINS_PER_HOST);
     }
 
     #[test]
