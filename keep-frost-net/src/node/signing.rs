@@ -1980,8 +1980,7 @@ mod gate_tests {
         let (node, _relay) = test_node().await;
         let from = Keys::generate().public_key();
         let group = *node.group_pubkey();
-        let mut req =
-            SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        let mut req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
         req.created_at = 1; // ancient -> outside the replay window
         assert!(matches!(
             node.handle_sign_request(from, req).await,
@@ -1996,8 +1995,7 @@ mod gate_tests {
         let (node, _relay) = test_node().await;
         let from = Keys::generate().public_key();
         let group = *node.group_pubkey();
-        let mut req =
-            SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        let mut req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
         req.created_at = Timestamp::now().as_secs() + 3600; // beyond MAX_FUTURE_SKEW_SECS
         assert!(matches!(
             node.handle_sign_request(from, req).await,
