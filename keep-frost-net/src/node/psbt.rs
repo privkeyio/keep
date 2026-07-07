@@ -2667,4 +2667,24 @@ mod proposer_and_identity_tests {
         let expected = vec!["abcd".to_string()];
         assert!(detect_dual_identity_signer(share_signers, &expected).is_ok());
     }
+
+    #[test]
+    fn dual_identity_match_on_later_fingerprint_rejected() {
+        // A peer's second fingerprint overlaps: the inner loop must scan past
+        // index 0, not just the first fingerprint.
+        let fps = vec!["1111".to_string(), "2222".to_string()];
+        let share_signers = vec![(3u16, fps.as_slice())];
+        let expected = vec!["2222".to_string()];
+        let err = detect_dual_identity_signer(share_signers, &expected).unwrap_err();
+        assert!(err.to_string().contains("2222"), "{err}");
+    }
+
+    #[test]
+    fn empty_expected_fingerprints_accepts_share_signers() {
+        // No fingerprint signers means nothing can overlap, even with peers present.
+        let fps = vec!["abcd".to_string()];
+        let share_signers = vec![(1u16, fps.as_slice())];
+        let expected: Vec<String> = Vec::new();
+        assert!(detect_dual_identity_signer(share_signers, &expected).is_ok());
+    }
 }
