@@ -2048,10 +2048,9 @@ mod snapshot_decode_tests {
             .unwrap();
         let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
-        let prev_txid: Txid =
-            "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap();
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -2169,8 +2168,8 @@ mod snapshot_decode_tests {
     /// must not count. Pins the `leaf_hash != proposed_leaf` filter.
     #[test]
     fn aggregate_partial_psbts_ignores_sig_for_wrong_leaf() {
-        use bitcoin::taproot::{LeafVersion, TapLeafHash};
         use crate::psbt_session::SignerId;
+        use bitcoin::taproot::{LeafVersion, TapLeafHash};
 
         let (proposal_psbt, kp, leaf, prevout) = single_leaf_tapscript_psbt([7u8; 32]);
         let (xonly, _) = kp.x_only_public_key();
@@ -2207,7 +2206,9 @@ mod snapshot_decode_tests {
         let bogus = sign_tap_leaf(&proposal_psbt, &prevout, leaf, &wrong);
 
         let mut partial = proposal_psbt.clone();
-        partial.inputs[0].tap_script_sigs.insert((xonly, leaf), bogus);
+        partial.inputs[0]
+            .tap_script_sigs
+            .insert((xonly, leaf), bogus);
 
         let mut map = std::collections::HashMap::new();
         map.insert(SignerId::Share(1), partial.serialize());
