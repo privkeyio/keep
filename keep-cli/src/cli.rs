@@ -666,6 +666,14 @@ pub(crate) enum FrostNetworkCommands {
                     encrypted under the vault key."
         )]
         path: Option<std::path::PathBuf>,
+        #[arg(
+            long,
+            help = "Name of a vault-stored identity key to sign DKG events with \
+                    (#674). Must be the same npub that appears at --index in the \
+                    signed kind-21101 group announcement. Defaults to the vault's \
+                    primary key."
+        )]
+        identity: Option<String>,
     },
     Sign {
         #[arg(short, long)]
