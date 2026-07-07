@@ -532,6 +532,7 @@ fn cmd_frost_network_dkg_hardware(
 
         let mut received_packages: HashMap<u8, String> = HashMap::new();
         let mut participant_pubkeys: HashMap<u8, PublicKey> = HashMap::new();
+        let mut seen_round1: HashSet<EventId> = HashSet::new();
         let timeout = std::time::Duration::from_secs(300);
         let start = std::time::Instant::now();
 
@@ -550,6 +551,18 @@ fn cmd_frost_network_dkg_hardware(
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
                     continue;
+                }
+                // Bound decoy-flood work: a hostile relay can spam junk round1
+                // events during the 300s window; dedupe so each id is parsed
+                // once and abort past a cap so the set cannot grow unbounded
+                // (mirrors the software path).
+                if !seen_round1.insert(ev.id) {
+                    continue;
+                }
+                if seen_round1.len() > MAX_DKG_EVENTS_SEEN {
+                    return Err(KeepError::NetworkErr(NetworkError::request(
+                        "too many distinct DKG round1 events; aborting to bound memory".to_string(),
+                    )));
                 }
 
                 if let Ok(content) = serde_json::from_str::<serde_json::Value>(&ev.content) {
@@ -666,6 +679,7 @@ fn cmd_frost_network_dkg_hardware(
             .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
 
         let mut received_from_peers: HashSet<u8> = HashSet::new();
+        let mut seen_round2: HashSet<EventId> = HashSet::new();
         let start = std::time::Instant::now();
 
         while received_from_peers.len() < expected_peers as usize {
@@ -685,6 +699,17 @@ fn cmd_frost_network_dkg_hardware(
             for ev in events.iter() {
                 if ev.pubkey == keys.public_key() {
                     continue;
+                }
+                // Bound decoy-flood work as in round1: dedupe on event id and
+                // abort past a cap so a flooded relay cannot grow the set
+                // without limit (mirrors the software path).
+                if !seen_round2.insert(ev.id) {
+                    continue;
+                }
+                if seen_round2.len() > MAX_DKG_EVENTS_SEEN {
+                    return Err(KeepError::NetworkErr(NetworkError::request(
+                        "too many distinct DKG round2 events; aborting to bound memory".to_string(),
+                    )));
                 }
 
                 let recipient_idx_tag = ev.tags.iter().find_map(|t| {
