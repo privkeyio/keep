@@ -2000,20 +2000,38 @@ mod snapshot_decode_tests {
     /// and would instead return `Ok`, so `expect_err` kills it.
     #[test]
     fn aggregate_partial_psbts_rejects_input_below_threshold() {
-        use bitcoin::absolute::LockTime;
+        let (proposal_psbt, _kp, _leaf, _prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        let proposal = proposal_psbt.serialize();
+
+        // No tap_script_sigs => matching == 0, below threshold 1 => error.
+        let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
+            .expect_err("zero matching sigs below threshold 1 must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("below threshold"),
+            "expected a below-threshold error, got {msg}"
+        );
+    }
+
+    /// Build a single-leaf `<key> OP_CHECKSIG` taproot PSBT spending one input,
+    /// returning the proposal PSBT, the committed leaf keypair, the leaf hash,
+    /// and the prevout being spent. Exposes the pieces a positive-path
+    /// aggregation test needs to produce real `tap_script_sigs`.
+    fn single_leaf_tapscript_psbt(
+        leaf_seed: [u8; 32],
+    ) -> (
+        bitcoin::psbt::Psbt,
+        bitcoin::secp256k1::Keypair,
+        bitcoin::taproot::TapLeafHash,
+        bitcoin::TxOut,
+    ) {
         use bitcoin::opcodes::all::OP_CHECKSIG;
-        use bitcoin::secp256k1::{Keypair, Secp256k1};
-        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
-        use bitcoin::transaction::Version;
-        use bitcoin::{
-            Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        };
+        use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
         use std::collections::BTreeMap;
 
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &leaf_seed).unwrap();
         let (xonly, _) = keypair.x_only_public_key();
-        // Single-leaf taproot tree: `<key> OP_CHECKSIG`.
         let leaf_script = ScriptBuf::builder()
             .push_x_only_key(&xonly)
             .push_opcode(OP_CHECKSIG)
@@ -2030,10 +2048,9 @@ mod snapshot_decode_tests {
             .unwrap();
         let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
 
-        let prev_txid: bitcoin::Txid =
-            "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap();
+        let prev_txid: Txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -2051,24 +2068,154 @@ mod snapshot_decode_tests {
                 script_pubkey: ScriptBuf::new(),
             }],
         };
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
+        let prevout = TxOut {
             value: Amount::from_sat(50_000),
             script_pubkey: spk,
-        });
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(prevout.clone());
+        let leaf_hash = TapLeafHash::from_script(&leaf_script, LeafVersion::TapScript);
         let mut tap_scripts = BTreeMap::new();
         tap_scripts.insert(control_block, (leaf_script, LeafVersion::TapScript));
         psbt.inputs[0].tap_scripts = tap_scripts;
-        let proposal = psbt.serialize();
+        (psbt, keypair, leaf_hash, prevout)
+    }
 
-        // No tap_script_sigs => matching == 0, below threshold 1 => error.
-        let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
-            .expect_err("zero matching sigs below threshold 1 must error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("below threshold"),
-            "expected a below-threshold error, got {msg}"
+    /// Produce a real tap-script Schnorr signature over `psbt`'s single input
+    /// for `leaf` under `signer`, using the same sighash the aggregator
+    /// recomputes. Deterministic (no aux rand) so the test is reproducible.
+    fn sign_tap_leaf(
+        psbt: &bitcoin::psbt::Psbt,
+        prevout: &bitcoin::TxOut,
+        leaf: bitcoin::taproot::TapLeafHash,
+        signer: &bitcoin::secp256k1::Keypair,
+    ) -> bitcoin::taproot::Signature {
+        use bitcoin::secp256k1::Message;
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        let secp = Secp256k1::new();
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(std::slice::from_ref(prevout)),
+                leaf,
+                TapSighashType::Default,
+            )
+            .unwrap();
+        let msg = Message::from_digest_slice(sighash.as_ref()).unwrap();
+        let signature = secp.sign_schnorr_no_aux_rand(&msg, signer);
+        bitcoin::taproot::Signature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        }
+    }
+
+    /// A partial carrying one valid `tap_script_sig` for the committed leaf key
+    /// meets threshold 1, and the aggregated PSBT carries that signature. Pins
+    /// the positive counting path (`verify_schnorr` success + `matching`
+    /// increment) that the below-threshold test cannot reach.
+    #[test]
+    fn aggregate_partial_psbts_accepts_valid_sig_at_threshold() {
+        use crate::psbt_session::SignerId;
+
+        let (proposal_psbt, kp, leaf, prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        let (xonly, _) = kp.x_only_public_key();
+        let sig = sign_tap_leaf(&proposal_psbt, &prevout, leaf, &kp);
+
+        let mut partial = proposal_psbt.clone();
+        partial.inputs[0].tap_script_sigs.insert((xonly, leaf), sig);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(SignerId::Share(1), partial.serialize());
+
+        let out = super::aggregate_partial_psbts(&proposal_psbt.serialize(), &map, 1)
+            .expect("one valid tap_script_sig meets threshold 1");
+        let decoded = Psbt::deserialize(&out).unwrap();
+        assert_eq!(
+            decoded.inputs[0].tap_script_sigs.get(&(xonly, leaf)),
+            Some(&sig),
+            "aggregated PSBT must carry the contributed signature unchanged"
         );
+    }
+
+    /// A valid signature for an x-only key that is NOT committed inside the leaf
+    /// script must not count toward the threshold. Pins the committed-keys
+    /// filter so a signer cannot pad with sigs for arbitrary keys.
+    #[test]
+    fn aggregate_partial_psbts_ignores_sig_for_uncommitted_key() {
+        use crate::psbt_session::SignerId;
+
+        let (proposal_psbt, _kp, leaf, prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        // A different keypair whose x-only key is not pushed inside the leaf.
+        let secp = Secp256k1::new();
+        let other = Keypair::from_seckey_slice(&secp, &[11u8; 32]).unwrap();
+        let (other_xonly, _) = other.x_only_public_key();
+        let sig = sign_tap_leaf(&proposal_psbt, &prevout, leaf, &other);
+
+        let mut partial = proposal_psbt.clone();
+        partial.inputs[0]
+            .tap_script_sigs
+            .insert((other_xonly, leaf), sig);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(SignerId::Share(1), partial.serialize());
+
+        let err = super::aggregate_partial_psbts(&proposal_psbt.serialize(), &map, 1)
+            .expect_err("sig for an uncommitted key must not satisfy threshold");
+        assert!(err.to_string().contains("below threshold"));
+    }
+
+    /// A valid signature tagged to a different leaf hash than the one proposed
+    /// must not count. Pins the `leaf_hash != proposed_leaf` filter.
+    #[test]
+    fn aggregate_partial_psbts_ignores_sig_for_wrong_leaf() {
+        use crate::psbt_session::SignerId;
+        use bitcoin::taproot::{LeafVersion, TapLeafHash};
+
+        let (proposal_psbt, kp, leaf, prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        let (xonly, _) = kp.x_only_public_key();
+        let sig = sign_tap_leaf(&proposal_psbt, &prevout, leaf, &kp);
+        // Same committed key, but file the sig under an unrelated leaf hash.
+        let wrong_leaf =
+            TapLeafHash::from_script(&ScriptBuf::from(vec![0x51]), LeafVersion::TapScript);
+
+        let mut partial = proposal_psbt.clone();
+        partial.inputs[0]
+            .tap_script_sigs
+            .insert((xonly, wrong_leaf), sig);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(SignerId::Share(1), partial.serialize());
+
+        let err = super::aggregate_partial_psbts(&proposal_psbt.serialize(), &map, 1)
+            .expect_err("sig for the wrong leaf must not satisfy threshold");
+        assert!(err.to_string().contains("below threshold"));
+    }
+
+    /// A signature filed under the committed key and correct leaf but produced
+    /// by a different key does not verify, so it must not count. Pins the
+    /// `verify_schnorr` rejection branch.
+    #[test]
+    fn aggregate_partial_psbts_rejects_invalid_signature() {
+        use crate::psbt_session::SignerId;
+
+        let (proposal_psbt, kp, leaf, prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        let (xonly, _) = kp.x_only_public_key();
+        // Sign with the wrong key, then file it under the committed key.
+        let secp = Secp256k1::new();
+        let wrong = Keypair::from_seckey_slice(&secp, &[13u8; 32]).unwrap();
+        let bogus = sign_tap_leaf(&proposal_psbt, &prevout, leaf, &wrong);
+
+        let mut partial = proposal_psbt.clone();
+        partial.inputs[0]
+            .tap_script_sigs
+            .insert((xonly, leaf), bogus);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(SignerId::Share(1), partial.serialize());
+
+        let err = super::aggregate_partial_psbts(&proposal_psbt.serialize(), &map, 1)
+            .expect_err("a signature that fails verification must not count");
+        assert!(err.to_string().contains("below threshold"));
     }
 
     /// `decode_psbt_for_snapshot` binds the `non_witness_utxo` to the input's
