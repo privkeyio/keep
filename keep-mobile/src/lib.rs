@@ -451,6 +451,13 @@ pub struct KeepMobile {
     /// a concurrent FFI init racing a delete/rotate cannot interleave into a
     /// node whose tasks were just aborted, or tasks pointing at a nulled node.
     node_lifecycle_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes active-share selection against deletion so the check-then-set
+    /// in `set_active_share` (load a share, then mark it active) cannot
+    /// interleave with a concurrent `delete_share_by_key`, which would leave the
+    /// active pointer aimed at a just-deleted share. Always the outermost lock
+    /// (the teardown it calls takes `node_lifecycle_lock`), so it cannot
+    /// self-deadlock.
+    active_share_lock: Arc<std::sync::Mutex<()>>,
 }
 
 struct PendingRequest {
@@ -594,6 +601,7 @@ impl KeepMobile {
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
+            active_share_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -919,6 +927,12 @@ impl KeepMobile {
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
+        // Serialize the load-then-set against a concurrent delete so the active
+        // pointer cannot be aimed at a share deleted in between.
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage.load_share_by_key(group_pubkey.clone())?;
         self.storage.set_active_share_key(Some(group_pubkey))?;
 
@@ -930,6 +944,12 @@ impl KeepMobile {
     pub fn delete_share_by_key(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
+        // Held for the whole delete so it cannot interleave with the
+        // load-then-set in `set_active_share`.
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let is_active = self
             .storage
             .get_active_share_key()
