@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -154,38 +154,12 @@ pub(crate) fn load_cert_pins(
         Err(KeepMobileError::StorageNotFound) => return Ok(None),
         Err(e) => return Err(e),
     };
-    // Accept both the current per-host list format and the legacy single-hash
-    // format so pins persisted before multi-pin support still load.
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum StoredPins {
-        Single(String),
-        Multiple(Vec<String>),
-    }
-    let map: HashMap<String, StoredPins> =
-        serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to deserialize cert pins: {e}"),
-        })?;
-
-    let mut pins = keep_frost_net::CertificatePinSet::new();
-    let mut malformed = Vec::new();
-    for (hostname, stored) in map {
-        let hashes = match stored {
-            StoredPins::Single(s) => vec![s],
-            StoredPins::Multiple(v) => v,
-        };
-        for hash_hex in hashes {
-            match hex::decode(&hash_hex) {
-                Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
-                    Ok(hash) => pins.add_pin(hostname.clone(), hash),
-                    Err(bytes) => {
-                        malformed.push(format!("{}: invalid length {}", hostname, bytes.len()))
-                    }
-                },
-                Err(e) => malformed.push(format!("{hostname}: hex decode failed: {e}")),
+    let (pins, malformed) =
+        keep_frost_net::CertificatePinSet::from_json_bytes(&data).map_err(|e| {
+            KeepMobileError::StorageError {
+                msg: format!("Failed to deserialize cert pins: {e}"),
             }
-        }
-    }
+        })?;
     if malformed.is_empty() {
         Ok(Some(pins))
     } else {
@@ -203,14 +177,10 @@ pub(crate) fn persist_cert_pins(
     storage: &Arc<dyn SecureStorage>,
     pins: &keep_frost_net::CertificatePinSet,
 ) -> Result<(), KeepMobileError> {
-    let map: HashMap<String, Vec<String>> = pins
-        .pins()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.iter().map(hex::encode).collect()))
-        .collect();
-    let data = serde_json::to_vec(&map).map_err(|e| KeepMobileError::StorageError {
-        msg: format!("Failed to serialize cert pins: {e}"),
-    })?;
+    let data =
+        serde_json::to_vec(&pins.to_hex_map()).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to serialize cert pins: {e}"),
+        })?;
     storage.store_share_by_key(
         CERT_PINS_STORAGE_KEY.into(),
         data,

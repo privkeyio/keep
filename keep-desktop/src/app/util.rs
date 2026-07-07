@@ -153,19 +153,21 @@ pub(crate) fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::Cer
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return keep_frost_net::CertificatePinSet::new();
     };
-    let map: std::collections::HashMap<String, String> =
-        serde_json::from_str(&contents).unwrap_or_default();
-    let mut pins = keep_frost_net::CertificatePinSet::new();
-    for (hostname, hex_hash) in map {
-        let Ok(bytes) = hex::decode(&hex_hash) else {
-            continue;
-        };
-        let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-            continue;
-        };
-        pins.add_pin(hostname, hash);
+    match keep_frost_net::CertificatePinSet::from_json_bytes(contents.as_bytes()) {
+        Ok((pins, malformed)) => {
+            if !malformed.is_empty() {
+                tracing::warn!(
+                    "Dropping malformed certificate pins: {}",
+                    malformed.join(", ")
+                );
+            }
+            pins
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse certificate pins: {e}");
+            keep_frost_net::CertificatePinSet::new()
+        }
     }
-    pins
 }
 
 pub(crate) fn save_cert_pins(
@@ -173,12 +175,7 @@ pub(crate) fn save_cert_pins(
     pins: &keep_frost_net::CertificatePinSet,
 ) {
     let path = cert_pins_path(keep_path);
-    let map: std::collections::HashMap<&String, String> = pins
-        .pins()
-        .iter()
-        .map(|(k, v)| (k, hex::encode(v)))
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
+    if let Ok(json) = serde_json::to_string_pretty(&pins.to_hex_map()) {
         if let Err(e) = write_private(&path, &json) {
             tracing::error!("Failed to save certificate pins: {e}");
         }

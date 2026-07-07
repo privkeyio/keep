@@ -3,7 +3,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::sync::Once;
 
 use keep_frost_net::{
@@ -30,19 +29,9 @@ async fn fetch_pin() -> SpkiHash {
 }
 
 fn roundtrip_pins(original: &CertificatePinSet) -> CertificatePinSet {
-    let map: HashMap<String, String> = original
-        .pins()
-        .iter()
-        .map(|(k, v)| (k.clone(), hex::encode(v)))
-        .collect();
-    let json = serde_json::to_string(&map).expect("serialize");
-    let deserialized: HashMap<String, String> = serde_json::from_str(&json).expect("deserialize");
-    let mut restored = CertificatePinSet::new();
-    for (hostname, hex_hash) in deserialized {
-        let bytes = hex::decode(&hex_hash).expect("hex decode");
-        let h: [u8; 32] = bytes.try_into().expect("32 bytes");
-        restored.add_pin(hostname, h);
-    }
+    let json = serde_json::to_vec(&original.to_hex_map()).expect("serialize");
+    let (restored, malformed) = CertificatePinSet::from_json_bytes(&json).expect("deserialize");
+    assert!(malformed.is_empty());
     restored
 }
 
@@ -117,7 +106,7 @@ async fn test_clear_and_repin() {
     let mut pins = CertificatePinSet::new();
     pins.add_pin(TEST_HOSTNAME.into(), original_hash);
     pins.remove_pin(TEST_HOSTNAME);
-    assert!(pins.get_pin(TEST_HOSTNAME).is_none());
+    assert!(!pins.is_pinned(TEST_HOSTNAME));
 
     let (new_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &pins)
         .await
