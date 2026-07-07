@@ -126,48 +126,10 @@ impl KfpNode {
             "REFUSED: no descriptor lookup configured; cannot confirm migration sweep destination"
                 .to_string()
         })?;
-        let (external_descriptor, network_str) = match lookup
-            .successor_for(&self.group_pubkey, session_descriptor_hash)
-        {
-            super::SuccessorLookup::Tip => return Ok(()),
-            super::SuccessorLookup::Found {
-                external_descriptor,
-                network,
-            } => (external_descriptor, network),
-            super::SuccessorLookup::Unavailable => {
-                return Err("REFUSED: descriptor store unavailable; cannot re-derive the migration sweep destination. Unlock the vault and retry.".to_string());
-            }
-            super::SuccessorLookup::Ambiguous => {
-                return Err("REFUSED: ambiguous descriptor lineage; multiple successors back-point to the session descriptor and no single version+1 successor resolves. Refusing to sign.".to_string());
-            }
-        };
-        // Re-derive against the successor's OWN network, not the OLD
-        // descriptor's, so a (mis)matched network can never silently produce the
-        // wrong expected script.
-        let network = bitcoin::Network::from_str(&network_str).map_err(|e| {
-            format!("REFUSED: successor descriptor has invalid network {network_str}: {e}")
-        })?;
-        let expected_addr =
-            keep_bitcoin::descriptor_address_at_index(&external_descriptor, network, 0).map_err(
-                |e| {
-                    format!(
-                        "REFUSED: could not derive expected sweep destination from persisted successor descriptor: {e}"
-                    )
-                },
-            )?;
-        let expected_script = expected_addr.script_pubkey();
-        if tx.output.len() != 1 {
-            return Err(format!(
-                "REFUSED: session is keyed on an OLD descriptor whose successor (NEW descriptor) is persisted, so this is treated as an automated migration sweep; expected exactly 1 output paying the NEW descriptor address, got {} outputs. Refusing to sign.",
-                tx.output.len()
-            ));
-        }
-        if tx.output[0].script_pubkey != expected_script {
-            return Err(format!(
-                "REFUSED: PSBT output does not pay the persisted NEW descriptor address. Expected {expected_addr}; proposer-supplied script differs. This would route funds away from the group-controlled address; refusing to sign."
-            ));
-        }
-        Ok(())
+        validate_sweep_destination(
+            lookup.successor_for(&self.group_pubkey, session_descriptor_hash),
+            tx,
+        )
     }
 
     /// Return the lowercase xpub fingerprints listed as expected external
@@ -347,16 +309,7 @@ impl KfpNode {
         // 5. Bound the fee relative to total input value before building, so a
         //    fee-griefing proposal is rejected ahead of the looser absolute cap
         //    enforced inside the builder.
-        let total_in: u64 = utxos
-            .iter()
-            .try_fold(0u64, |acc, u| acc.checked_add(u.value_sats))
-            .ok_or_else(|| FrostNetError::Session("sweep input value overflow".into()))?;
-        let fee_cap = total_in / MAX_SWEEP_FEE_FRACTION;
-        if fee_sats > fee_cap {
-            return Err(FrostNetError::Session(format!(
-                "sweep fee {fee_sats} exceeds 1/{MAX_SWEEP_FEE_FRACTION} of total input {total_in}"
-            )));
-        }
+        check_sweep_fee(utxos.iter().map(|u| u.value_sats), fee_sats)?;
 
         // 6. Build the consolidating sweep PSBT under the OLD recovery tier.
         let builder = keep_bitcoin::RecoveryTxBuilder::new(old_recovery.clone());
@@ -1599,6 +1552,77 @@ fn signer_id_sort_key(s: &SignerId) -> (u8, u16, String) {
     }
 }
 
+/// Reject a migration sweep whose fee is disproportionate to the funds moved,
+/// ahead of the builder's looser absolute cap (#502). Sums the input values
+/// (failing closed on u64 overflow) and requires
+/// `fee_sats <= total_in / MAX_SWEEP_FEE_FRACTION`. Pure so the fee-griefing
+/// boundary is directly testable without building a PSBT.
+fn check_sweep_fee(input_values: impl IntoIterator<Item = u64>, fee_sats: u64) -> Result<()> {
+    let total_in = input_values
+        .into_iter()
+        .try_fold(0u64, |acc, v| acc.checked_add(v))
+        .ok_or_else(|| FrostNetError::Session("sweep input value overflow".into()))?;
+    let fee_cap = total_in / MAX_SWEEP_FEE_FRACTION;
+    if fee_sats > fee_cap {
+        return Err(FrostNetError::Session(format!(
+            "sweep fee {fee_sats} exceeds 1/{MAX_SWEEP_FEE_FRACTION} of total input {total_in}"
+        )));
+    }
+    Ok(())
+}
+
+/// Decide whether an automated migration sweep may sign, given the resolved
+/// successor lookup and the proposed transaction (#414). Pure so the
+/// destination-rebind defense is directly testable without a node/relay:
+/// `validate_migration_sweep_destination` only supplies the `successor_for`
+/// result. Fails closed on `Unavailable`/`Ambiguous`; for `Found`, re-derives
+/// the successor's own address and requires the tx to pay exactly it.
+fn validate_sweep_destination(
+    lookup: super::SuccessorLookup,
+    tx: &bitcoin::Transaction,
+) -> std::result::Result<(), String> {
+    let (external_descriptor, network_str) = match lookup {
+        super::SuccessorLookup::Tip => return Ok(()),
+        super::SuccessorLookup::Found {
+            external_descriptor,
+            network,
+        } => (external_descriptor, network),
+        super::SuccessorLookup::Unavailable => {
+            return Err("REFUSED: descriptor store unavailable; cannot re-derive the migration sweep destination. Unlock the vault and retry.".to_string());
+        }
+        super::SuccessorLookup::Ambiguous => {
+            return Err("REFUSED: ambiguous descriptor lineage; multiple successors back-point to the session descriptor and no single version+1 successor resolves. Refusing to sign.".to_string());
+        }
+    };
+    // Re-derive against the successor's OWN network, not the OLD descriptor's,
+    // so a (mis)matched network can never silently produce the wrong expected
+    // script.
+    let network = bitcoin::Network::from_str(&network_str).map_err(|e| {
+        format!("REFUSED: successor descriptor has invalid network {network_str}: {e}")
+    })?;
+    let expected_addr =
+        keep_bitcoin::descriptor_address_at_index(&external_descriptor, network, 0).map_err(
+            |e| {
+                format!(
+                    "REFUSED: could not derive expected sweep destination from persisted successor descriptor: {e}"
+                )
+            },
+        )?;
+    let expected_script = expected_addr.script_pubkey();
+    if tx.output.len() != 1 {
+        return Err(format!(
+            "REFUSED: session is keyed on an OLD descriptor whose successor (NEW descriptor) is persisted, so this is treated as an automated migration sweep; expected exactly 1 output paying the NEW descriptor address, got {} outputs. Refusing to sign.",
+            tx.output.len()
+        ));
+    }
+    if tx.output[0].script_pubkey != expected_script {
+        return Err(format!(
+            "REFUSED: PSBT output does not pay the persisted NEW descriptor address. Expected {expected_addr}; proposer-supplied script differs. This would route funds away from the group-controlled address; refusing to sign."
+        ));
+    }
+    Ok(())
+}
+
 /// Apply the descriptor_hash verification policy given an in-memory match
 /// result and an optional persisted-descriptor fallback. Both the in-memory
 /// path and the persisted-lookup path are equivalent in trust: either one
@@ -2400,5 +2424,158 @@ mod snapshot_decode_tests {
             msg.contains("txid does not match"),
             "expected `txid does not match` error, got {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_validation_tests {
+    use super::{check_sweep_fee, validate_sweep_destination};
+    use crate::node::SuccessorLookup;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    // A concrete ranged taproot descriptor whose /0/0 address is deterministic
+    // (shared with keep-bitcoin's descriptor tests).
+    const TEST_DESCRIPTOR: &str = "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)";
+
+    fn tx_paying(scripts: Vec<ScriptBuf>) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: scripts
+                .into_iter()
+                .map(|script_pubkey| TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey,
+                })
+                .collect(),
+        }
+    }
+
+    fn found() -> SuccessorLookup {
+        SuccessorLookup::Found {
+            external_descriptor: TEST_DESCRIPTOR.to_string(),
+            network: "testnet".to_string(),
+        }
+    }
+
+    fn expected_script() -> ScriptBuf {
+        keep_bitcoin::descriptor_address_at_index(TEST_DESCRIPTOR, Network::Testnet, 0)
+            .unwrap()
+            .script_pubkey()
+    }
+
+    #[test]
+    fn tip_needs_no_validation() {
+        // No successor to validate: any tx is accepted.
+        assert!(validate_sweep_destination(SuccessorLookup::Tip, &tx_paying(vec![])).is_ok());
+    }
+
+    #[test]
+    fn unavailable_fails_closed() {
+        let err = validate_sweep_destination(
+            SuccessorLookup::Unavailable,
+            &tx_paying(vec![expected_script()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("unavailable"), "{err}");
+    }
+
+    #[test]
+    fn ambiguous_fails_closed() {
+        let err = validate_sweep_destination(
+            SuccessorLookup::Ambiguous,
+            &tx_paying(vec![expected_script()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn found_invalid_network_rejected() {
+        let lookup = SuccessorLookup::Found {
+            external_descriptor: TEST_DESCRIPTOR.to_string(),
+            network: "notanetwork".to_string(),
+        };
+        let err =
+            validate_sweep_destination(lookup, &tx_paying(vec![expected_script()])).unwrap_err();
+        assert!(err.contains("invalid network"), "{err}");
+    }
+
+    #[test]
+    fn found_valid_network_bad_descriptor_rejected() {
+        // Valid network string but an unparseable successor descriptor: address
+        // re-derivation fails closed rather than signing an unverified sweep.
+        let lookup = SuccessorLookup::Found {
+            external_descriptor: "notadescriptor".to_string(),
+            network: "testnet".to_string(),
+        };
+        let err =
+            validate_sweep_destination(lookup, &tx_paying(vec![expected_script()])).unwrap_err();
+        assert!(err.contains("could not derive"), "{err}");
+    }
+
+    #[test]
+    fn found_zero_output_rejected() {
+        let err = validate_sweep_destination(found(), &tx_paying(vec![])).unwrap_err();
+        assert!(err.contains("exactly 1 output"), "{err}");
+    }
+
+    #[test]
+    fn found_multi_output_rejected() {
+        let err = validate_sweep_destination(
+            found(),
+            &tx_paying(vec![expected_script(), expected_script()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("exactly 1 output"), "{err}");
+    }
+
+    #[test]
+    fn found_wrong_destination_rejected() {
+        // Single output paying an unrelated script must be refused (#414).
+        let err =
+            validate_sweep_destination(found(), &tx_paying(vec![ScriptBuf::from(vec![0x51])]))
+                .unwrap_err();
+        assert!(err.contains("does not pay"), "{err}");
+    }
+
+    #[test]
+    fn found_correct_destination_accepted() {
+        assert!(validate_sweep_destination(found(), &tx_paying(vec![expected_script()])).is_ok());
+    }
+
+    #[test]
+    fn fee_at_cap_boundary_accepted() {
+        // total_in = 40_000, cap = total_in / 4 = 10_000; fee == cap is allowed.
+        assert!(check_sweep_fee([10_000u64, 30_000], 10_000).is_ok());
+    }
+
+    #[test]
+    fn fee_above_cap_rejected() {
+        let err = check_sweep_fee([40_000u64], 10_001).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn fee_cap_rounds_down_small_totals() {
+        // total_in = 3, cap = 0; any positive fee is rejected, zero is allowed.
+        assert!(check_sweep_fee([1u64, 2], 1).is_err());
+        assert!(check_sweep_fee([1u64, 2], 0).is_ok());
+    }
+
+    #[test]
+    fn input_value_overflow_rejected() {
+        let err = check_sweep_fee([u64::MAX, 1], 0).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 }
