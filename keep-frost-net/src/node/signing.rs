@@ -1950,6 +1950,30 @@ mod gate_tests {
         (node, mock)
     }
 
+    /// A sign request for a different group is silently ignored (returns Ok
+    /// without opening a session). Pins the group-membership early-return: if
+    /// the gate were bypassed the request would fall through to the peer lookup
+    /// and return `UntrustedPeer` (the random `from` is not an announced peer),
+    /// so asserting `Ok` still kills the predicate mutation.
+    #[tokio::test]
+    async fn handle_sign_request_ignores_foreign_group() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let req = SignRequestPayload::new([1u8; 32], [0xAA; 32], vec![0u8; 32], "test", vec![1]);
+        assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
+    /// A sign request whose participant set excludes our own identifier is
+    /// ignored. Same mutation-kill property as the foreign-group case.
+    #[tokio::test]
+    async fn handle_sign_request_ignores_non_participant() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![2, 3]);
+        assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
     /// A stale sign request (created_at outside the replay window) is rejected.
     #[tokio::test]
     async fn handle_sign_request_rejects_stale_replay() {
@@ -1959,6 +1983,22 @@ mod gate_tests {
         let mut req =
             SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
         req.created_at = 1; // ancient -> outside the replay window
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    /// A far-future sign request (created_at beyond the skew bound) is rejected.
+    /// Pins the upper side of the replay window, distinct from the stale case.
+    #[tokio::test]
+    async fn handle_sign_request_rejects_future_skew() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let mut req =
+            SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        req.created_at = Timestamp::now().as_secs() + 3600; // beyond MAX_FUTURE_SKEW_SECS
         assert!(matches!(
             node.handle_sign_request(from, req).await,
             Err(FrostNetError::ReplayDetected(_))
