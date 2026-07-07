@@ -292,6 +292,45 @@ impl Storage {
             }
         }
     }
+
+    /// Apply a record replicated from a peer (the keep-state consumer / standby side). Stores the
+    /// already-vault-encrypted `encrypted` bytes verbatim under `table`, keyed by hex `record_id` --
+    /// the standby shares the vault key, so it later decrypts them like its own. Never notifies the
+    /// publisher, so a consumed record is not echoed back to the relay. Rejects any table but the three
+    /// replicated ones, so a hostile or buggy peer cannot write `shares` or node-local state.
+    pub fn apply_replicated_record(
+        &self,
+        table: &str,
+        record_id: &str,
+        encrypted: &[u8],
+    ) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let table_name = Self::replicated_table(table)?;
+        let key = hex::decode(record_id)
+            .map_err(|e| KeepError::Other(format!("replicated record id not hex: {e}")))?;
+        backend.put(table_name, &key, encrypted)?;
+        Ok(())
+    }
+
+    /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher.
+    pub fn apply_replicated_delete(&self, table: &str, record_id: &str) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let table_name = Self::replicated_table(table)?;
+        let key = hex::decode(record_id)
+            .map_err(|e| KeepError::Other(format!("replicated record id not hex: {e}")))?;
+        backend.delete(table_name, &key)?;
+        Ok(())
+    }
+
+    /// Map a replicated logical table name (as it appears in the event `d`-tag) to its backend table.
+    fn replicated_table(table: &str) -> Result<&'static str> {
+        match table {
+            "keys" => Ok(KEYS_TABLE),
+            "descriptors" => Ok(DESCRIPTORS_TABLE),
+            "relay_configs" => Ok(RELAY_CONFIGS_TABLE),
+            other => Err(KeepError::Other(format!("table {other} is not replicable"))),
+        }
+    }
     /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
         create_storage_dir(path)?;
@@ -923,7 +962,11 @@ impl Storage {
             &normalized.group_pubkey,
             &encrypted_bytes,
         )?;
-        self.notify_record("relay_configs", &hex::encode(normalized.group_pubkey), &encrypted_bytes);
+        self.notify_record(
+            "relay_configs",
+            &hex::encode(normalized.group_pubkey),
+            &encrypted_bytes,
+        );
         Ok(())
     }
 
@@ -1500,13 +1543,15 @@ mod tests {
     struct RecordingPublisher {
         records: std::sync::Mutex<Vec<(String, String)>>,
         deletes: std::sync::Mutex<Vec<(String, String)>>,
+        last_bytes: std::sync::Mutex<Vec<u8>>,
     }
     impl StatePublisher for RecordingPublisher {
-        fn on_record(&self, table: &str, record_id: &str, _encrypted: &[u8]) {
+        fn on_record(&self, table: &str, record_id: &str, encrypted: &[u8]) {
             self.records
                 .lock()
                 .unwrap()
                 .push((table.into(), record_id.into()));
+            *self.last_bytes.lock().unwrap() = encrypted.to_vec();
         }
         fn on_delete(&self, table: &str, record_id: &str) {
             self.deletes
@@ -1517,6 +1562,57 @@ mod tests {
     }
 
     #[test]
+    fn apply_replicated_record_round_trips_and_rejects_nonreplicable_tables() {
+        use crate::backend::MemoryBackend;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-apply");
+        let backend = Box::new(MemoryBackend::new());
+        let storage =
+            Storage::create_with_backend(&path, "password", Argon2Params::TESTING, backend)
+                .unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+
+        let record = KeyRecord::new(
+            crypto::random_bytes(),
+            crate::keys::KeyType::Nostr,
+            "replicated".into(),
+            vec![7, 7, 7],
+        );
+        // Store, capture the exact bytes the publisher shipped, then delete so the vault no longer has
+        // the record locally.
+        storage.store_key(&record).unwrap();
+        let encrypted = publisher.last_bytes.lock().unwrap().clone();
+        storage.delete_key(&record.id).unwrap();
+        assert!(storage.load_key(&record.id).is_err());
+
+        // Applying the replicated bytes reconstructs a loadable record (same vault key decrypts them).
+        storage
+            .apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+            .unwrap();
+        assert_eq!(storage.load_key(&record.id).unwrap().name, "replicated");
+
+        // A non-replicable table (shares / node-local / unknown) is refused, so a peer cannot write it.
+        assert!(storage
+            .apply_replicated_record("shares", &hex::encode(record.id), &encrypted)
+            .is_err());
+        assert!(storage
+            .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted)
+            .is_err());
+
+        // A replicated delete removes it, and never echoes to the publisher: the only recorded delete
+        // is the earlier real delete_key, not this apply.
+        let deletes_before = publisher.deletes.lock().unwrap().len();
+        storage
+            .apply_replicated_delete("keys", &hex::encode(record.id))
+            .unwrap();
+        assert!(storage.load_key(&record.id).is_err());
+        assert_eq!(publisher.deletes.lock().unwrap().len(), deletes_before);
+    }
+
+    #[test]
     fn state_publisher_fires_on_key_writes() {
         use crate::backend::MemoryBackend;
 
@@ -1524,7 +1620,8 @@ mod tests {
         let path = dir.path().join("test-publish");
         let backend = Box::new(MemoryBackend::new());
         let storage =
-            Storage::create_with_backend(&path, "password", Argon2Params::TESTING, backend).unwrap();
+            Storage::create_with_backend(&path, "password", Argon2Params::TESTING, backend)
+                .unwrap();
 
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
         storage.set_state_publisher(publisher.clone());
